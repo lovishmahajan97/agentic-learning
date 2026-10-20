@@ -35,7 +35,12 @@ def status_of(path: Path):
     if not m:
         return "written"
     v = m.group(1).strip().strip("'\"").lower()
-    return v if v in ("fact-checked", "reviewed") else "written"
+    if v not in ("fact-checked", "reviewed"):
+        return "written"
+    # A stamped file that no longer validates (e.g. an agent was killed mid-edit) must be reviewed again;
+    # the fact-checker repairs it.
+    _, errs, _ = build.parse_topic(path)
+    return "written" if errs else v
 
 
 def scan():

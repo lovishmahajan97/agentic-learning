@@ -4,240 +4,252 @@ module: backend-fundamentals
 name: Kubernetes
 kind: tool
 difficulty: core
-est_minutes: 16
+est_minutes: 17
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/ci-cd
   - backend-fundamentals/secrets-management
-  - backend-fundamentals/rbac
-  - deployment/health-checks
+  - fastapi-for-ai/health-readiness-endpoints
+  - fastapi-for-ai/graceful-shutdown-and-worker-draining
   - infra-capacity-economics/keda-autoscaling
   - infra-capacity-economics/ray-kuberay
   - infra-capacity-economics/gpu-infrastructure
 sources:
   - Official docs: Kubernetes
   - Burns, Grant, Oppenheimer, Brewer, Wilkes, 2016 — Borg, Omega, and Kubernetes
-  - Official docs: NVIDIA GPU Operator
+  - Verma et al., 2015 — Large-scale cluster management at Google with Borg
 ---
 
 ## TL;DR
-Kubernetes runs containers across a fleet of machines by continuously reconciling what you declared
-(this image, three replicas, 8 GiB and one GPU each, this health check) with what is actually running.
-It exists because once containers outnumber hosts, placement, restarts, rollouts, discovery and scaling
-become a control problem Docker alone does not solve. It is powerful and heavy: many teams are better
-served by a managed platform until they need GPU pools, custom scheduling or a uniform way to run dozens
-of services.
+Kubernetes runs containers across a fleet of machines by reconciling declared desired state ("three
+replicas of this image, one GPU each, ready when `/ready` returns 200") against what is actually
+running. It exists because once there are more containers than one person can place by hand,
+scheduling, self-healing, rolling updates, service discovery and scaling have to be a platform rather
+than scripts. For AI services, its contract of resource requests, probes and graceful termination is
+what makes GPU-bound, slow-starting, long-streaming workloads deployable without dropping requests.
 
 ## Why it exists
-One host running `docker run` is fine until the host dies at 3 a.m. and nothing restarts the
-containers. Add a second host and you need to decide which containers go where; add a load balancer and
-it needs to learn where they went; ship a new version and you need to replace containers one at a time
-without dropping requests; add a GPU host and only some workloads may land there. Teams at this point
-build an orchestrator out of shell scripts, Compose files, SSH and a spreadsheet, and it is fragile in
-proportion to how clever it had to be.
+Docker gives you a reproducible unit. It does not answer the questions that appear the moment you have
+more than one: which machine should run this container, given its CPU, memory and GPU needs; what
+happens when it crashes at 3 a.m. or its node dies; how a new version replaces the old without
+downtime; how service A finds the current IP of service B when replicas come and go; how to go from
+two replicas to twenty when traffic arrives; how configuration and secrets reach the process.
 
-The naive scalable alternative is one cloud autoscaling group per service with a health check and a
-load balancer. It works, but every service re-implements deployment, discovery, configuration and
-secrets slightly differently, and a GPU-backed model server, a queue worker and a cron-style eval job
-each need their own operational playbook.
+The naive answer is SSH plus `docker run` plus a hand-edited load balancer, or Compose on a few large
+hosts. It fails in a predictable order. Nothing reconciles: a dead container stays dead unless you
+wrote the watchdog yourself. The real state of the system lives in people's heads and shell history,
+so no one can say what is running where. Placement is manual, so expensive GPU nodes sit half empty
+while others are oversubscribed; bin-packing is what makes GPUs affordable, and humans do not bin-pack.
+Every scaling action, update and rollback is a bespoke procedure that differs the second time it runs.
 
-Kubernetes grew out of Google's Borg and took one lesson above all: express the desired state
-declaratively and let controllers reconcile reality toward it forever. Failure handling stops being an
-exception path, because "a pod disappeared" and "I asked for one more replica" are the same event to the
-controller. For AI teams the draw is concrete: GPU scheduling through device plugins, node pools with
-taints, and operators such as KubeRay and KServe that turn a cluster into a serving and training
-platform. Honest alternatives remain: ECS or Cloud Run for a handful of CPU services, Nomad for
-simplicity, a managed inference endpoint when you only have one model.
+Google's Borg solved this at scale with one idea: operators declare the desired state of jobs, and
+controllers converge the cluster toward it, forever. Kubernetes is the open-source generalisation of
+that model. The important shift is from *commands* ("start this here") to *declarations* ("this should
+exist"), because declarations can be reconciled after failures, versioned in git, and reasoned about
+without knowing the current state of every machine.
 
 ## How it works
-### Architecture
-The control plane is an API server (the single door; every object is a REST resource validated and
-persisted here), etcd (a consistent key-value store holding all state), a scheduler (assigns pending
-pods to nodes using requests, affinities and taints) and a controller manager (the reconciliation
-loops). Each node runs a kubelet (makes the pods assigned to it match their spec by driving a container
-runtime such as containerd over CRI), kube-proxy or an eBPF equivalent (implements Service virtual IPs)
-and a CNI plugin that gives every pod its own IP on a flat network.
+### Control plane and reconciliation
+The API server is the only component that reads and writes etcd, where every object lives. Controllers
+each watch one kind of object and act to make reality match its spec. The scheduler assigns Pods that
+have no node to a node whose free resources satisfy their requests. On every node, the kubelet starts
+containers through the container runtime and reports status; kube-proxy and the CNI plugin provide
+networking. When you `kubectl apply` a manifest, nothing executes a command: you changed desired state
+in the API server, and the controllers converge toward it, repeatedly. That is why a deleted Pod comes
+back and why a `docker run` on a node is invisible to the cluster.
 
-### The reconciliation loop
-Every controller runs the same loop: read desired state from the spec, observe actual state, compute
-the difference, act, repeat. It is level-triggered, comparing states rather than reacting to events,
-*because* a missed event must not leave the system wrong forever. A node dies, its pods vanish, the
-ReplicaSet controller sees two of three, creates a pod, the scheduler places it, the kubelet starts it.
-Nobody is paged for that. Every action is idempotent, so controllers can retry freely.
+### The objects you actually use
+- **Pod**: one or more containers sharing a network namespace and volumes; the unit of scheduling;
+  ephemeral, never created directly in production.
+- **Deployment → ReplicaSet → Pods**: a replica count, a Pod template and a rollout strategy. Changing
+  the image creates a new ReplicaSet and scales it up while the old one scales down, bounded by
+  `maxSurge` and `maxUnavailable`; a bad rollout rolls back to the previous ReplicaSet.
+- **Service**: a stable virtual IP and DNS name that load-balances to Pods matching a label selector,
+  with membership gated by readiness. An Ingress or Gateway brings HTTP in from outside.
+- **ConfigMap** and **Secret**: configuration injected as environment variables or mounted files.
+- **Job** and **CronJob** for run-to-completion work (evals, batch embedding, fine-tuning);
+  **StatefulSet** for stable identity and storage (vector databases); **DaemonSet** for one Pod per
+  node (the GPU device plugin, a log shipper).
+- **Namespace**, RBAC and **ResourceQuota** to share a cluster across teams.
 
-### The objects you touch daily
-- **Pod:** one or more containers sharing a network namespace (they talk over `localhost`) and
-  volumes. Ephemeral; you almost never create pods directly.
-- **Deployment → ReplicaSet → Pods:** a Deployment holds a pod template and a replica count. Changing
-  the template creates a new ReplicaSet and rolls pods across according to `maxSurge` and
-  `maxUnavailable`, moving on only as new pods become ready. Rollback points the Deployment back at the
-  previous ReplicaSet.
-- **Service:** a stable DNS name and virtual IP that load-balances to pods selected by labels. Only
-  *ready* pods are endpoints, which is what makes readiness probes matter. **Ingress** or the Gateway
-  API bring HTTP in from outside.
-- **ConfigMap and Secret:** configuration injected as environment variables or files. A Secret is
-  base64, not encryption; see secrets management.
-- **Namespace** scopes names, RBAC and quotas. **PersistentVolumeClaim** requests durable storage.
-  **StatefulSet** gives stable identities for databases, **Job** and **CronJob** run batch work such as
-  evaluation runs, **DaemonSet** runs one pod per node (the GPU device plugin, a log shipper).
+### Scheduling: requests, limits and GPUs
+Requests are what the scheduler reserves on a node; limits are what the cgroup enforces at run time.
+Exceeding a CPU limit throttles the container; exceeding a memory limit gets it OOM-killed (exit code
+137). GPUs are exposed by the NVIDIA device plugin as the extended resource `nvidia.com/gpu`: whole
+integers, request equal to limit, no overcommit, because a GPU cannot be time-shared transparently the
+way CPU can. GPU node pools are usually tainted so that only Pods with a matching toleration land on
+them, keeping CPU-only work off expensive hardware. Fractional sharing needs MIG partitions or
+time-slicing configured on the node.
 
-### Requests, limits and GPUs
-`requests` are what the scheduler reserves for placement; `limits` are what the kernel enforces through
-cgroups. CPU above its limit is throttled; memory above its limit is OOMKilled (exit 137) and restarted.
-Because memory cannot be throttled, set memory request equal to limit so a pod is never scheduled onto
-RAM it cannot actually get; many teams set no CPU limit at all to avoid throttling latency. GPUs are
-extended resources exposed by the NVIDIA device plugin as `nvidia.com/gpu`; they are requested as whole
-devices (sharing via time-slicing or MIG exists on supporting hardware), request must equal limit, and
-GPU nodes are normally tainted so only pods that tolerate the taint land there.
+### Probes: the contract that makes rollouts safe
+- **Startup probe**: for slow starts such as loading model weights; while it has not passed, the other
+  probes are paused, *because* otherwise the liveness probe would kill the Pod mid-load and produce a
+  CrashLoopBackOff.
+- **Readiness probe**: whether to send traffic; failing removes the Pod from Service endpoints without
+  restarting it, because overload or a dependency outage should shed traffic, not restart the process.
+- **Liveness probe**: whether to restart; it should be cheap and must not depend on downstream systems,
+  or an incident in the database becomes a restart storm in the API.
 
-### Probes
-A **startup** probe gives a model server minutes to load weights before anything else judges it; a
-**readiness** probe controls whether the pod receives traffic and should fail while loading or when
-overloaded; a **liveness** probe restarts the container and should fail only when it is genuinely stuck.
-Get these wrong and a healthy-but-slow model server lives in CrashLoopBackOff.
+### Termination
+When a Pod is deleted it is marked Terminating, removed from Service endpoints (asynchronously, so
+traffic can still arrive for a moment), its `preStop` hook runs, PID 1 receives SIGTERM, and after
+`terminationGracePeriodSeconds` (30 by default) it receives SIGKILL. The server must stop accepting,
+drain in-flight requests, including streams, and exit. For LLM responses that can run for minutes,
+raise the grace period and add a short `preStop` sleep so endpoint removal propagates first.
 
 ### Scaling
-The HorizontalPodAutoscaler scales replicas on CPU, memory or custom metrics such as in-flight
-requests or queue depth; KEDA scales on event sources, including to zero. The cluster autoscaler or
-Karpenter adds nodes, but a GPU node takes minutes to boot and pull a multi-gigabyte image, so capacity
-is provisioned ahead of demand and warm pools are kept.
+The Horizontal Pod Autoscaler changes replica counts on CPU, memory or custom metrics. For GPU-bound
+services CPU is a poor signal; scale on queue depth, in-flight requests or tokens waiting, through KEDA
+or custom metrics. The Cluster Autoscaler or Karpenter adds nodes, but a GPU node takes minutes to boot
+and pull a multi-gigabyte image, so reactive scaling needs headroom or a warm pool.
 
-### Access and isolation
-Kubernetes RBAC (Role, RoleBinding, ClusterRole) governs who may do what to which objects.
-Namespaces plus ResourceQuota and NetworkPolicy isolate teams or tenants. Workload identity lets a pod
-assume a cloud role without a stored key.
+### AI workloads specifically
+Model weights can be baked into the image (simple, slow to pull), on a shared read-only volume, or
+fetched by an init container from object storage into an `emptyDir` with a node-local cache. Serving
+stacks such as vLLM or KServe run as Deployments with the pattern above; distributed training or
+inference runs on Ray via KubeRay; a PodDisruptionBudget stops node maintenance from evicting every
+replica at once.
 
 ## Example
-A Deployment and Service for a GPU-backed embedding API. The image is pinned by digest, the pod only
-lands on the GPU pool, memory request equals limit, a generous startup probe covers model loading, and
-the rollout strategy never drops below full capacity.
+A Deployment and Service for a GPU-backed inference API. The rollout never drops below three ready
+replicas, the startup probe allows up to ten minutes of model loading before liveness checks begin,
+the readiness endpoint gates traffic, and the grace period plus `preStop` sleep let long streaming
+responses finish before SIGKILL. The image is referenced by digest so every node runs the same bytes.
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: embed-api }
+metadata: {name: llm-api}
 spec:
   replicas: 3
-  strategy: { type: RollingUpdate, rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }
-  selector: { matchLabels: { app: embed-api } }
+  strategy: {rollingUpdate: {maxSurge: 1, maxUnavailable: 0}}   # never below 3 ready
+  selector: {matchLabels: {app: llm-api}}
   template:
-    metadata: { labels: { app: embed-api } }
+    metadata: {labels: {app: llm-api}}
     spec:
-      nodeSelector: { accelerator: nvidia-l4 }                 # GPU node pool only
-      tolerations: [{ key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }]
-      terminationGracePeriodSeconds: 60                        # time to drain in-flight requests
+      terminationGracePeriodSeconds: 120       # let long streaming responses finish
+      nodeSelector: {accelerator: nvidia-l4}
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
       containers:
       - name: api
-        image: registry.example.com/embed-api@sha256:3f9c0e...  # digest, never a mutable tag
-        ports: [{ containerPort: 8000 }]
-        env:
-        - { name: MODEL_NAME, valueFrom: { configMapKeyRef: { name: embed-cfg, key: model } } }
-        - { name: HF_TOKEN,   valueFrom: { secretKeyRef:    { name: embed-secrets, key: hf_token } } }
+        image: registry.example.com/llm-api@sha256:3f9c...   # immutable digest, not :latest
+        ports: [{containerPort: 8000}]
+        envFrom: [{secretRef: {name: llm-api-secrets}}]
         resources:
-          requests: { cpu: "2", memory: 8Gi, nvidia.com/gpu: 1 }
-          limits:   { memory: 8Gi, nvidia.com/gpu: 1 }        # memory = request; no CPU limit
-        startupProbe:   { httpGet: { path: /healthz, port: 8000 }, periodSeconds: 5, failureThreshold: 60 }
-        readinessProbe: { httpGet: { path: /ready,   port: 8000 }, periodSeconds: 5 }
-        livenessProbe:  { httpGet: { path: /healthz, port: 8000 }, periodSeconds: 20 }
+          requests: {cpu: "2", memory: 8Gi, nvidia.com/gpu: 1}
+          limits:   {memory: 8Gi, nvidia.com/gpu: 1}          # no CPU limit: avoids throttling
+        startupProbe:                            # model load may take minutes
+          httpGet: {path: /health, port: 8000}
+          periodSeconds: 10
+          failureThreshold: 60                   # up to 10 min before giving up
+        readinessProbe:
+          httpGet: {path: /ready, port: 8000}    # 200 only after the model is loaded and warm
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: {path: /health, port: 8000}   # cheap, no downstream calls
+          periodSeconds: 30
+        lifecycle:
+          preStop: {exec: {command: ["sleep", "5"]}}   # let endpoint removal propagate
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: embed-api }
+metadata: {name: llm-api}
 spec:
-  selector: { app: embed-api }
-  ports: [{ port: 80, targetPort: 8000 }]
+  selector: {app: llm-api}
+  ports: [{port: 80, targetPort: 8000}]
 ```
 
-`kubectl apply -f embed-api.yaml` then `kubectl rollout status deployment/embed-api` waits until the
-new ReplicaSet is fully ready. When something is wrong, `kubectl describe pod <name>` shows scheduling
-events ("0/12 nodes available: insufficient nvidia.com/gpu") and `kubectl logs <name> --previous`
-shows why the last container died.
-
 ## Trade-offs
-- Self-healing, a uniform deployment model and portability across clouds and customer sites, paid for
-  with a steep learning curve and real cluster operations; it flips to a managed platform when you run
-  fewer than a handful of CPU-only services.
-- Declarative reconciliation makes recovery automatic, but "why has my change not applied" becomes a
-  trace through controllers, events and conditions rather than a stack trace.
-- Bin-packing many pods per node raises utilisation but invites noisy neighbours; requests, limits and
-  QoS classes contain it only if they are set honestly.
-- Managed control planes (EKS, GKE, AKS) remove etcd and API-server operations, but node pools,
-  upgrades, the GPU operator and autoscalers remain yours to run.
-- Fractional GPU sharing through time-slicing or MIG raises utilisation for small models but weakens
-  memory isolation between tenants; whole-GPU allocation is simpler and safer.
+- Declarative reconciliation gives self-healing and repeatable deploys, but you pay in a large object
+  model and a control plane to operate; for one service on one box a managed container service is less
+  to learn, and the balance flips once you have several services, GPUs, batch jobs and more than one
+  team.
+- `maxUnavailable: 0` keeps capacity during rollouts but requires a spare GPU for the surge Pod; when
+  GPUs are scarce you choose between a brief capacity dip and permanently reserved headroom.
+- CPU limits protect neighbours from a runaway process but throttle latency-sensitive Pods through the
+  CFS quota; the common compromise is to always set requests and memory limits and rarely set CPU
+  limits.
+- Autoscaling on queue depth tracks load correctly, but GPU node provisioning takes minutes, so
+  reactive scaling needs idle headroom that costs money every hour it is not used.
 
 ## Pitfalls
-- An aggressive liveness probe on a model server; the symptom is CrashLoopBackOff while weights are
-  still loading. Add a startup probe with a long failure threshold.
-- Pods without resource requests; the symptom is everything packed onto one node, followed by evictions
-  and OOMKilled containers with exit code 137.
-- A mutable `latest` tag with `imagePullPolicy: IfNotPresent`; the symptom is nodes running different
-  versions of "the same" image. Deploy by digest.
-- A readiness probe that only checks the process is up; the symptom is 5xx during every rollout as
-  traffic reaches pods still loading.
-- A GPU pod stuck Pending; the events say no node has `nvidia.com/gpu`, the toleration is missing, or
-  the device plugin is not installed. `kubectl describe pod` names which.
-- No PodDisruptionBudget; the symptom is a node upgrade draining every replica at once and a short
-  outage during routine maintenance.
-- Running a database in a Deployment without a PersistentVolumeClaim; the symptom is data gone after a
-  reschedule.
-- Treating Kubernetes Secrets as encrypted; the symptom is any namespace reader dumping credentials.
+- No resource requests; the symptom is nodes overloaded and Pods evicted, or, with requests set too
+  high, Pods stuck Pending with `Insufficient nvidia.com/gpu` in the events.
+- A liveness probe that calls the model or the database; the symptom is a restart storm during an
+  incident that turns a slow dependency into a full outage.
+- No startup probe on a service that loads weights for minutes; the symptom is CrashLoopBackOff with
+  the Pod restarting roughly every minute during load.
+- Readiness returning 200 before the model is loaded; the symptom is a burst of 5xx responses right
+  after every deploy.
+- The default 30-second grace period with no drain logic; the symptom is streaming responses cut
+  mid-token on every rollout and node drain.
+- Deploying a `:latest` tag; the symptom is Pods on different nodes running different code depending on
+  when each node last pulled.
+- OOMKilled with no application log; the symptom is restarts under load because the memory request was
+  set below the real peak of tokenizer plus model plus batch.
+- Treating `emptyDir` or local disk as durable for an index; the symptom is data gone after the Pod is
+  rescheduled.
+- HPA on CPU for a GPU-bound service; the symptom is a growing queue while the autoscaler sees low CPU
+  and never adds replicas.
 
 ## When to use
-Reach for Kubernetes when you run many services, need GPU node pools and custom scheduling, serve
-several teams or tenants from shared infrastructure, or must deploy into customers' clusters, which
-enterprise buyers increasingly require. Avoid it for a single API plus a worker; Cloud Run, ECS or a
-PaaS will cost less in attention. Measure rollout duration, pod restart counts, time pods spend Pending,
-and node and GPU utilisation. Day to day you write manifests or Helm charts, read events, and tune
-probes and resources. In interviews, be ready to explain the reconciliation loop, requests versus limits,
-the three probes, how a rolling update and a Service interact, and how to diagnose a Pending or
-crash-looping pod.
+Reach for Kubernetes when you run several services, need GPU scheduling, run batch jobs beside serving,
+share infrastructure across teams, or deploy into enterprises that already run it, which is most of
+them. Avoid it for a single container with modest load, where a managed serverless container platform
+costs less to operate. Measure time-to-ready for a new Pod, rollout duration, restart counts, Pending
+Pods, and GPU allocation versus actual utilization. Day to day you live in `kubectl get`, `describe`,
+`logs` and `exec`, read events, write Deployments, Jobs and autoscalers, and package them with Helm or
+Kustomize. In interviews, explain reconciliation, how a Deployment rolls out, the three probes,
+requests versus limits, GPU scheduling and graceful termination.
 
 ## Role lens
-- **Engineer:** Writes Deployments with honest requests, startup probes sized to model load time and
-  digest-pinned images, and reads events and previous logs to debug restarts.
-- **Architect:** Decides whether a cluster is warranted, designs node pools and GPU allocation,
-  namespace and quota boundaries, and the autoscaling policy that keeps warm GPU capacity.
-- **FDE:** Deploys the product into the customer's existing cluster within the namespace and RBAC they
-  grant, adapts to their ingress, storage classes and GPU operator, and explains Pending pods to their
-  platform team.
+- **Engineer:** Writes manifests or Helm charts, sets probes, requests and grace periods correctly, and
+  debugs CrashLoopBackOff, OOMKilled and Pending Pods from `describe` output and events.
+- **Architect:** Designs the cluster topology (GPU node pools, taints, namespaces, quotas), chooses
+  autoscaling signals, decides where weights live, and picks managed versus self-run control planes.
+- **FDE:** Deploys into the customer's cluster with their CNI, ingress, Pod Security Standards,
+  registry mirrors, GPU operator version and restricted RBAC, and sizes node pools with their platform
+  team.
 
 ## Check yourself
-**Q:** A new version of a model server is rolled out; the rollout stalls, some pods show
-CrashLoopBackOff, and the old pods keep serving. Walk through how you would diagnose it and what the
-usual causes are.
-**A:** `kubectl rollout status` confirms the stall, and `kubectl get pods` shows the new ReplicaSet's
-pods restarting while the old ones remain because `maxUnavailable: 0` protects capacity. `kubectl
-describe pod` on a new pod reveals which probe is failing and the restart reason; `kubectl logs
---previous` shows the container's last output. The common causes are a liveness probe firing before the
-model has loaded (fix with a startup probe and a larger failure threshold), an OOMKilled container
-because the new model needs more memory than the limit (raise request and limit together), a missing
-ConfigMap or Secret key referenced in the new template (CreateContainerConfigError), or a GPU request
-that no node can satisfy (Pending rather than crashing). After fixing, `kubectl rollout undo` is the
-fast path back if users are affected.
+**Q:** After each deploy of your vLLM-based service, users see a burst of errors and some streaming
+responses are cut off, even though the Deployment uses a rolling update. What is happening and how do
+you fix it?
+**A:** Two separate failures. The errors at the start come from new Pods reporting ready before the
+engine has loaded, so the Service routes to them; fix it by making `/ready` return 200 only after the
+model is loaded and a warm-up request succeeded, and add a startup probe with a generous
+`failureThreshold` so liveness does not kill Pods during load. The cut-off streams come from old Pods
+receiving SIGTERM and either exiting immediately or hitting the 30-second default grace period
+mid-stream; fix it by handling SIGTERM to stop accepting and drain in-flight requests, raising
+`terminationGracePeriodSeconds` to cover the longest stream, and adding a `preStop` sleep so endpoint
+removal propagates before shutdown begins. Set `maxUnavailable: 0` with `maxSurge: 1` so capacity never
+dips, accepting one spare GPU during rollout, and verify by watching 5xx and stream-abort metrics
+across a rollout.
 
 ## Quiz
-### Q: Why does a readiness probe matter during a rolling update?
-- [ ] It restarts containers that fail so the update can retry
-- [x] A Service only routes to ready pods, so the rollout waits for new pods to pass readiness before removing old ones and traffic never reaches a pod still loading
-- [ ] It tells the scheduler which node has enough memory for the new pod
-- [ ] It controls how many pods may be unavailable at once
-> Readiness gates both Service endpoints and rollout progress. Without it, Kubernetes considers a pod
-> ready as soon as its container starts, and requests hit a server whose model is still loading.
+### Q: What does `kubectl apply` of a Deployment manifest actually do?
+- [ ] Starts the containers on the node your kubeconfig points at
+- [x] Records desired state in the API server; controllers then create ReplicaSets and Pods and keep converging reality toward that spec
+- [ ] Builds the image and pushes it to the cluster's registry
+- [ ] Sends the manifest to every kubelet, which executes it once
+> Kubernetes is declarative: `apply` changes the stored spec and the Deployment and ReplicaSet
+> controllers do the work, repeatedly, which is why Pods are recreated after failures. Nothing builds
+> images, and kubelets only run Pods the scheduler has bound to their node.
 
-### Q: A pod requests 4 GiB of memory with an 8 GiB limit and is OOMKilled on a node that has free RAM. What is the most likely explanation?
-- [ ] The node's kubelet reserved the memory for system daemons
-- [ ] The limit is ignored when it is larger than the request
-- [x] The container exceeded its 8 GiB limit; the cgroup enforces the limit regardless of free memory on the node
-- [ ] The scheduler placed the pod on a node with less memory than requested
-> Limits are enforced by cgroups on the container, not by node pressure. Free RAM on the node does not
-> help a process that passes its own limit; this is why memory request and limit are usually set
-> equal.
+### Q: Which probe should decide whether a Pod receives traffic, without restarting it?
+- [ ] livenessProbe
+- [x] readinessProbe
+- [ ] startupProbe
+- [ ] the preStop hook
+> A failing readiness probe removes the Pod from Service endpoints and nothing else, which is the right
+> response to overload or a dependency outage. Liveness failure restarts the container, the startup
+> probe only gates the other probes during initialisation, and preStop runs at termination.
 
-### Q: What does the reconciliation model mean for how you should think about a Deployment?
-- [ ] It is an imperative command that runs once and reports success or failure
-- [x] It is a declared desired state that a controller keeps enforcing, so a crashed pod is recreated without any action on your part
-- [ ] It is a script executed on each node by the kubelet
-- [ ] It is a snapshot of the cluster that must be re-applied after any change
-> Controllers compare spec with status in a loop and act on the difference, forever. Recovery and
-> rollout are the same mechanism, which is why `kubectl apply` of the same file is always safe.
+### Q: Why do GPU Pods often sit Pending while CPU Pods on the same cluster schedule immediately?
+- [ ] GPU Pods must be created with `kubectl run` rather than a Deployment
+- [ ] The scheduler only honours GPU requests in the kube-system namespace
+- [x] `nvidia.com/gpu` is an integer, non-overcommittable resource exposed by the device plugin, and GPU nodes are usually tainted, so the Pod needs a free whole GPU plus a matching toleration
+- [ ] GPU nodes do not run the kubelet
+> CPU can be oversubscribed and sliced, so a CPU Pod almost always fits somewhere. A GPU request needs
+> an entire unallocated device on a node whose taint the Pod tolerates; if none is free the Pod waits
+> until one is released or a new node is provisioned.

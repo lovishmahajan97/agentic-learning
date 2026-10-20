@@ -4,224 +4,226 @@ module: python-for-ai
 name: Object model and mutability
 kind: concept
 difficulty: core
-est_minutes: 15
+est_minutes: 16
 related:
   - python-for-ai/dataclasses
-  - python-for-ai/race-conditions-and-synchronization-primitives
   - python-for-ai/memory-and-performance-profiling
+  - python-for-ai/race-conditions-and-synchronization-primitives
   - python-for-ai/numpy
   - python-for-ai/pytorch
-  - agent-reliability/state-persistence-and-conversation-recovery
+  - python-for-ai/decorators
+  - agent-reliability/idempotent-tool-execution
 sources:
-  - Official docs: Python Language Reference, Data model
-  - Batchelder, 2015 — Facts and Myths about Python Names and Values (PyCon talk)
+  - Official docs: The Python Language Reference, Data model
+  - Official docs: copy module
 ---
 
 ## TL;DR
-In Python every value is an object with an identity, and names, attributes, container slots and
-function parameters are all just references to objects. Assignment never copies. Mutable objects
-(lists, dicts, sets, most instances) can be changed through any reference; immutable ones (ints,
-strings, tuples) cannot, so "changing" them makes a new object. Most mysterious AI-pipeline bugs,
-from conversation histories bleeding between requests to tensors changing under you, are aliasing
-bugs that follow directly from these rules.
+In Python a variable is a name bound to an object, never a box holding a value, and assignment never
+copies. Objects are either mutable (list, dict, set, most classes, arrays and tensors) or immutable
+(int, str, tuple, frozenset). Nearly every "the value changed by itself" bug in AI code is aliasing: two
+names, a default argument, a class attribute or a slice sharing one mutable object. Knowing which
+operations rebind a name and which mutate the object is the difference between a leak across tenants
+and a correct program.
 
 ## Why it exists
-The object model is not a feature you opt into; it is the semantics of the language, and the reason
-to study it is that intuitions from other languages are wrong in ways that produce silent
-corruption. An engineer coming from C expects assignment to copy a struct. One coming from
-JavaScript expects objects to behave like Python's but is surprised that a default argument is
-evaluated once. One coming from Rust expects the compiler to stop two names from mutating the same
-value. Python does none of these: it hands out references freely and trusts you.
+A chat helper is written as `def ask(question, history=[])`. It works in the unit test, then in
+production every user sees every other user's messages. A prompt template dict is `.copy()`-ed per
+tenant and the `tools` list inside it still accumulates everyone's tools. An embedding matrix is
+sliced for normalisation and the original rows change too. A tensor is updated with an in-place
+`add_` and autograd raises on the backward pass. None of these are library bugs; they are the same
+fact seen four times: Python passes and stores *references to objects*, and mutating through any
+reference is visible through all of them.
 
-That trust is cheap and fast, which is why the model was chosen: no copying on assignment, no
-ownership tracking, one allocation per object. The price is that the programmer must know, at
-every mutation, who else holds a reference. In AI code the stakes are concrete. An agent loop that
-appends to a `messages` list it received as an argument has just modified the caller's
-conversation. A `messages=[]` default shared across requests leaks one user's chat into another's.
-A prompt template stored as a module-level dict and "customized" per request by assignment mutates
-it for every subsequent request. A NumPy slice or a PyTorch `view` shares memory with its source,
-so normalizing the slice in place normalizes the original. Each of these produces no error, only
-wrong outputs that appear under concurrency or after the second call.
-
-The naive defence, "copy everything", costs memory and time and still misses nested sharing, since
-a shallow copy of a list of dicts shares the dicts. Understanding the model lets you copy exactly
-where needed and make the rest immutable.
+The intuition most engineers bring from C-like languages, "a variable holds a value and assignment
+copies it", is wrong here and nothing in the syntax warns you. `a = b` is indistinguishable from a
+copy until someone mutates. The naive defence, "copy everything defensively", costs memory and time
+that AI workloads cannot spare (copying a gigabyte of embeddings per request) and still fails because
+shallow copies share their contents. The real defence is a correct model: know what an object is, know
+which names point at it, know which operations create a new object and which change the existing one,
+and prefer immutable values for anything shared. That model is also what makes concurrency with
+threads and async tasks tractable, because immutable data cannot race.
 
 ## How it works
-### Objects, names and references
-Every object has an identity (`id(x)`, its address in CPython), a type and a value. A name is an
-entry in a namespace dict that refers to an object; `a = b` makes `a` refer to the same object `b`
-refers to, and nothing is duplicated. `is` tests identity (same object); `==` calls `__eq__` and
-tests value. Containers hold references too: a list of three dicts is a list of three pointers,
-which is *why* `copy.copy(lst)` yields a new list whose elements are the same dicts (shallow), and
-`copy.deepcopy` must recurse to produce independent elements.
+### Objects, names and identity
+Every value is an object with an identity (`id()`, its address in CPython), a type and a value.
+Namespaces (module globals, function locals, instance `__dict__`) are mappings from names to
+objects. `x = expr` binds the name `x` to whatever object `expr` produced; `y = x` binds a second name
+to the *same* object, so `x is y` is `True`. Nothing was copied, because the language is designed so
+that binding is O(1) regardless of what is bound. `==` asks whether two objects have equal values;
+`is` asks whether they are the same object. Use `is` only for singletons like `None`: CPython caches
+small integers and interns some strings, so `is` on numbers or text gives answers that depend on
+implementation details.
 
 ### Mutable versus immutable
-Immutable types (`int`, `float`, `str`, `bytes`, `tuple`, `frozenset`, `bool`, `None`) have no
-operation that changes them in place; `s += "x"` evaluates `s + "x"` into a new string and rebinds
-`s`, leaving every other reference to the old string untouched. Mutable types (`list`, `dict`,
-`set`, `bytearray`, user-defined instances by default) can be changed in place, and every reference
-sees the change. The same operator differs by type: `lst += [x]` calls `list.__iadd__`, which
-extends in place, while `tup += (x,)` has no `__iadd__` and rebinds. A tuple is immutable in its
-references only; a tuple containing a list can still have that list mutated, which is also why such
-a tuple is unhashable.
+Immutable objects (`int`, `float`, `str`, `bytes`, `tuple`, `frozenset`, `bool`, `None`) cannot
+change; every operation yields a new object. `s += "x"` therefore *rebinds* `s` and any other name
+still sees the old string. Mutable objects (`list`, `dict`, `set`, `bytearray`, user-defined class
+instances, NumPy arrays, PyTorch tensors) change in place: `lst += [1]` calls `__iadd__`, which
+extends the existing list, and every alias sees the change. The same `+=` spelling does opposite
+things, which is why the distinction has to live in your head and not in the syntax. Methods that
+mutate conventionally return `None` (`list.sort`, `dict.update`, `random.shuffle`) precisely so
+that `x = lst.sort()` fails loudly rather than letting you believe you got a copy.
 
-### Hashability
-Dict keys and set members must be hashable: `__hash__` must return a value that never changes
-while the object is alive, and must agree with `__eq__`. Mutable built-ins set `__hash__ = None`
-*because* a key whose hash changed after insertion could never be found again. A user class is
-hashable by identity by default; defining `__eq__` without `__hash__` removes hashability, since
-value-equal objects would otherwise hash differently. Dataclasses and Pydantic encode these rules
-in their `frozen` options.
+### Function arguments
+Python passes object references by assignment. Inside a function, a parameter is a new local name
+bound to the caller's object. Mutating that object (`items.append`) is visible to the caller;
+rebinding the name (`items = []`) is not. Default argument values are evaluated *once*, at `def`
+time, and stored on the function object, which is why a mutable default is shared by all calls and
+`None` with an in-body `if x is None: x = []` is the idiom.
 
-### Function calls and defaults
-Arguments are passed by assignment: the parameter name is bound to the caller's object. Mutating
-the object inside the function is visible to the caller; rebinding the parameter is not. Default
-values are evaluated once, when `def` runs, and stored on the function object, so a mutable default
-is one object shared by every call that omits the argument. The idiom `param=None` followed by
-`param = [] if param is None else param` exists purely because of this evaluation rule.
+### Containers hold references
+A list of lists built with `[[0] * 3] * 3` holds three references to one inner list; changing
+`grid[0][0]` changes every row. Shallow copies (`list(x)`, `x[:]`, `dict.copy()`, `copy.copy`)
+create a new outer container that references the *same* inner objects. `copy.deepcopy` recurses, at
+O(size) cost, and cannot copy things like locks, sockets or SDK clients. Class attributes are shared
+by all instances: `class Agent: history = []` is one list for every agent; the per-instance version
+must be created in `__init__`.
 
-### Class attributes and instance attributes
-Attributes assigned in the class body live on the class and are shared by all instances. Reading
-`self.cache` finds the class attribute if the instance has none; `self.cache["k"] = v` then mutates
-the shared dict, while `self.cache = {}` creates an instance attribute that shadows it. Instance
-attributes live in the instance's `__dict__` unless the class declares `__slots__`, which stores
-them in fixed slots, saving memory and forbidding new attribute names.
+### Hashing and equality
+Dict keys and set members must be hashable, and the data model requires equal objects to hash
+equally. Mutable built-ins are unhashable for that reason; a user class is hashable by identity
+unless it defines `__eq__` without `__hash__`, in which case it becomes unhashable, which is the rule
+`@dataclass` applies. Mutating an object after using it as a key (through a custom `__hash__`) makes
+it unfindable.
 
-### Identity caching and lifetime
-CPython caches small integers and interns many strings, so `a is b` may be `True` for equal ints by
-accident of implementation. Use `is` only for singletons (`None`, `True`, `False`, sentinel objects)
-and `==` for values. Objects live while any reference exists: CPython frees them by reference
-counting immediately when the count hits zero, plus a cycle collector for reference cycles. `del
-name` removes one reference; it does not destroy the object if another name, a container, a closure
-or an exception traceback still points to it, which is how "deleted" tensors keep GPU memory alive.
+### Arrays and tensors
+NumPy basic slicing (`a[:, :10]`, `a[::2]`) returns a *view* sharing the buffer, so normalising the
+slice normalises the original; `a.copy()` or fancy indexing returns an independent array. PyTorch
+distinguishes in-place methods by a trailing underscore (`t.add_()`), and autograd refuses in-place
+changes to values it still needs for the backward pass. In both libraries in-place operations exist
+to avoid allocating gigabytes, so the trade is explicit: memory versus aliasing risk.
+
+### Lifetime
+CPython frees an object when its reference count drops to zero; cycles are collected by the garbage
+collector later. A large tensor stays resident while any name, container, closure, cached traceback
+or notebook output history references it, which is why `del x` sometimes frees nothing.
 
 ## Example
-The shared-default bug, aliasing through a shallow copy, and the `+=` asymmetry, each shown with the
-output that reveals it.
+Four aliasing bugs that occur in real LLM code, each followed by the fix: a shared mutable default
+argument that leaks conversation history between callers, a shallow-copied prompt template that
+leaks tools between tenants, the `+=` difference between a list and a string, and nested-list
+multiplication that aliases rows. Every print shows the surprising result and, where applicable, the
+correct version beside it.
 
 ```python
 import copy
 
-SYSTEM = {"role": "system", "content": "You are terse."}
-
-def run_agent(user_text: str, history: list[dict] = []) -> list[dict]:   # bug: one default list
-    history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": f"echo: {user_text}"})
+def ask(question: str, history: list[dict] = []) -> list[dict]:   # BUG: one list for every call
+    history.append({"role": "user", "content": question})
     return history
 
-a = run_agent("hi"); b = run_agent("again")
-print(len(a), len(b), a is b)        # 4 4 True: the second caller sees the first caller's chat
+print(len(ask("a")), len(ask("b")))              # 1 2  -> the second caller sees the first turn
 
-def run_agent_ok(user_text: str, history: list[dict] | None = None) -> list[dict]:
-    history = [] if history is None else list(history)   # new list; caller's list untouched
-    history.append({"role": "user", "content": user_text})
-    return history
+def ask_ok(question: str, history: list[dict] | None = None) -> list[dict]:
+    history = [] if history is None else history  # fresh list per call unless one is passed
+    return [*history, {"role": "user", "content": question}]
 
-base = [SYSTEM]
-h1 = run_agent_ok("hi", base)
-print(len(base), len(h1))            # 1 2: the outer list was not modified...
-h1[0]["content"] = "You are verbose."
-print(SYSTEM["content"])             # 'You are verbose.': ...but the inner dict is shared (shallow copy)
+BASE = {"system": "You are a support bot.", "tools": ["search"]}
 
-h2 = copy.deepcopy(base)
-h2[0]["content"] = "something else"
-print(SYSTEM["content"])             # still 'You are verbose.': deepcopy broke the alias
+def per_tenant(tenant: str) -> dict:
+    cfg = BASE.copy()                            # shallow: cfg["tools"] IS BASE["tools"]
+    cfg["tools"].append(f"{tenant}_crm")         # leaks into every later tenant
+    return cfg
 
-x = [1, 2]; y = x; y += [3]; print(x)      # [1, 2, 3]: += on a list mutates the shared object
-t = (1, 2); u = t; u += (3,); print(t)     # (1, 2): += on a tuple rebinds u only
+per_tenant("acme"); print(BASE["tools"])        # ['search', 'acme_crm']
 
-class Agent:
-    tools: dict[str, str] = {}             # class attribute, shared by every Agent
-    def register(self, name: str) -> None:
-        self.tools[name] = "registered"    # mutates the shared dict
-Agent().register("search"); print(Agent().tools)   # {'search': 'registered'} on a brand-new instance
+def per_tenant_ok(tenant: str) -> dict:
+    cfg = copy.deepcopy(BASE)                    # or rebuild; or store BASE as tuples
+    cfg["tools"] = [*cfg["tools"], f"{tenant}_crm"]
+    return cfg
+
+a = [1, 2]; b = a; c = a[:]
+b.append(3)
+print(a is b, a == c, c)                        # True False [1, 2]  (c is a shallow copy)
+s = "x"; t = s; s += "y"                        # str is immutable: += rebinds s only
+print(t)                                        # x
+grid = [[0] * 2] * 2; grid[0][0] = 9            # both rows are the same inner list
+print(grid, [[0] * 2 for _ in range(2)])        # [[9, 0], [9, 0]] [[0, 0], [0, 0]]
 ```
 
-Every surprising line prints without an exception. That is the point: the object model never warns
-you; it just does what the references say.
-
 ## Trade-offs
-- Reference semantics make assignment and argument passing free, but every mutation must consider
-  who else holds the object; the cost flips to the copying side only when records are small and
-  shared widely, where defensive copies are cheap insurance.
-- Immutable records (frozen dataclasses, tuples, strings) are safe to share across tasks and usable
-  as keys, but every "update" allocates a new object, which matters in tight loops over large data.
-- Deep copies guarantee independence but walk the whole object graph; for a conversation of a few
-  hundred messages this is negligible, for a multi-gigabyte tensor it is a disaster, so copy at the
-  smallest boundary that needs it.
-- Class-level mutable attributes give a cheap shared cache or registry, but they are process-global
-  state that leaks between requests and tests; move them to instances or explicit singletons when
-  isolation matters.
-- `__slots__` cuts per-instance memory and blocks attribute typos, but removes `__dict__`, which
-  breaks libraries that attach attributes dynamically or pickle by `__dict__`.
+- Immutable values (tuples, frozen dataclasses, `MappingProxyType`) are safe to share across tenants,
+  threads and tasks and usable as cache keys, but every change allocates; for hot loops over large
+  state, controlled in-place mutation wins.
+- In-place array and tensor operations avoid copying gigabytes, at the cost of aliasing and autograd
+  hazards; when memory is not the constraint, out-of-place operations are easier to reason about.
+- `deepcopy` guarantees isolation but is O(size), can be slower than reconstructing the object, and
+  fails on unpicklable members such as clients and locks; rebuild from a factory instead.
+- Freezing a container is shallow: a tuple of lists still has mutable lists inside, so the protection
+  must be applied at every level or the invariant is only cosmetic.
 
 ## Pitfalls
-- A mutable default argument (`messages=[]`, `cache={}`); the symptom is state from an earlier call
-  appearing in a later one, often only visible under concurrency or in the second test.
-- Appending to a `messages` list received as a parameter; the symptom is the caller's conversation
-  growing with every agent invocation and prompts getting longer until the context overflows.
-- Shallow-copying a list of dicts and editing an inner dict; the symptom is a change in one request
-  showing up in another request's system prompt or tool definition.
-- Comparing with `is` for values (`if x is 5`, `if s is "stop"`); it may work for small ints or
-  interned strings and then fail in production, and recent Pythons emit a `SyntaxWarning` for it.
-- Normalizing a NumPy slice or a PyTorch view in place and corrupting the original array or tensor;
-  the symptom is training data or embeddings that change after the first batch.
-- Holding a reference to an exception or a traceback in a long-lived structure, so every local in
-  that frame, including large tensors, stays alive; the symptom is memory that never returns.
+- A mutable default argument; the symptom is state leaking between calls, and tests that pass in
+  isolation but fail when run together.
+- A mutable class attribute used as per-instance state; every `Agent` shares one `history` and the
+  symptom is cross-conversation contamination.
+- Shallow-copying a nested config; the symptom is tenant A's tools or headers appearing in tenant
+  B's requests.
+- `x = lst.sort()` or `cfg = d.update(...)`; the symptom is `AttributeError: 'NoneType' object has no
+  attribute`, because mutating methods return `None` by convention.
+- Mutating a list or dict while iterating over it; lists skip elements silently, dicts raise
+  `RuntimeError: dictionary changed size during iteration`.
+- Normalising a NumPy slice or a tensor view in place and discovering the source matrix changed;
+  the symptom is retrieval scores that drift between runs.
+- GPU memory that does not come back after `del`; another reference (a list, an exception traceback,
+  a notebook `Out[]` entry) is still holding the tensor.
+- Using `is` to compare strings or integers; it works in tests because of interning and fails on
+  values built at runtime.
 
 ## When to use
-You do not choose the object model; you choose how to live with it. Default to immutability for
-anything shared: frozen dataclasses for configs, tuples for sequences that do not change, strings
-for prompts. Copy at boundaries, not everywhere: a function that must not alter its input makes
-one copy on entry and mutates that. Treat module-level and class-level mutable state as a bug
-unless it is an explicit, documented cache with a lock. When debugging "the data changed and nobody
-changed it", reach for `id()` and `is` to find the shared object, and `copy.deepcopy` or an
-immutable type to break the alias. Interviews probe this with the mutable-default question and the
-`+=` asymmetry; the expected depth is explaining them from "assignment binds a name to an object"
-rather than as isolated trivia.
+This is not a tool you choose; it is the model you need every time a value is shared. Reach for
+immutability by default for anything passed between layers, stored in a cache, or used by more than
+one task: tuples instead of lists for fixed sequences, frozen dataclasses for configs, `None` plus
+in-body construction for defaults. Reach for deliberate mutation when memory or speed demands it,
+and contain it inside one function with an explicit docstring note. The measures are simple: no
+mutable defaults in the codebase (linters flag them), no class-level mutable attributes, copies at
+every tenant boundary. In interviews, "what does this print" questions about `+=`, default
+arguments and nested list multiplication are the standard probe of this model.
 
 ## Role lens
-- **Engineer:** Never mutates a caller's message list, uses `default_factory` and copies on entry,
-  and knows a PyTorch view shares storage with its source before writing in-place ops.
-- **Architect:** Specifies that conversation state and shared configs are immutable values passed
-  between components, so concurrency and caching never depend on who mutates what.
-- **FDE:** Diagnoses a customer's "responses contain another user's data" report by tracing the
-  shared mutable default or module-level dict that aliases state across their requests.
+- **Engineer:** Builds per-request message lists from scratch, keeps shared prompt templates
+  immutable, and uses views and in-place tensor ops only where the memory saving is measured.
+- **Architect:** Sets the rule that cross-tenant and cross-request state is immutable or copied at
+  the boundary, and designs caches around hashable, frozen keys.
+- **FDE:** Diagnoses "customer B saw customer A's context" incidents by tracing which shared object
+  was mutated, usually a template or default argument in a customisation layer.
 
 ## Check yourself
-**Q:** A FastAPI service builds a prompt by taking a module-level `BASE_MESSAGES` list, appending
-the user's turn, and sending it to the model. Under load, users occasionally receive answers that
-reference other users' questions. No locks, no threads in your code. Explain the bug and the fix.
-**A:** `BASE_MESSAGES` is one object. Each request appends to it, so the list grows and every
-subsequent request sends a prompt containing earlier users' turns; under concurrent requests the
-interleaving makes it look random. There is no exception because appending to a shared list is
-perfectly legal. The fix is to never mutate the shared object: build a fresh list per request
-(`messages = [*BASE_MESSAGES, user_turn]`), and make the base immutable (a tuple of frozen message
-objects) so an accidental append raises. The general rule is that module-level mutable state is
-process-wide state and must be treated as such.
+**Q:** A multi-tenant service builds each request's config with `cfg = DEFAULTS.copy()` then
+`cfg["headers"]["X-Tenant"] = tenant`. Under load, requests intermittently carry the wrong tenant
+header. Explain the mechanism and give two fixes with their costs.
+**A:** `dict.copy()` is shallow: the new `cfg` is a different outer dict, but `cfg["headers"]` is the
+very same inner dict object that `DEFAULTS["headers"]` references, so every request writes its
+tenant into one shared dict. With concurrency, request B's write lands between A's write and A's
+HTTP call, so A sends B's header. Fix one: `copy.deepcopy(DEFAULTS)` per request, which isolates
+everything at O(size) cost per call and breaks if DEFAULTS ever holds a client or lock. Fix two,
+usually better: make DEFAULTS immutable (tuples, `MappingProxyType`, a frozen dataclass) and build the
+per-request headers as a new dict `{**DEFAULTS["headers"], "X-Tenant": tenant}`, which costs only the
+small structure that actually changes and makes the sharing impossible rather than merely avoided.
 
 ## Quiz
-### Q: What does `b = a` do when `a` refers to a list?
-- [ ] Creates a shallow copy of the list and binds `b` to it
-- [ ] Creates a deep copy of the list and binds `b` to it
-- [x] Binds `b` to the same list object; both names refer to one object
-- [ ] Creates an immutable view of the list
-> Assignment binds a name to an object and never copies. Any mutation through `b` is visible through
-> `a`, which is the root of most aliasing bugs. Copies must be requested explicitly.
+### Q: What does `def f(x, acc=[]): acc.append(x); return acc` return on the second call `f(2)` after `f(1)`?
+- [ ] `[2]`, because the default is re-evaluated on every call
+- [x] `[1, 2]`, because the default list was created once at definition time and is shared
+- [ ] A `TypeError`, because mutable defaults are rejected
+- [ ] `[1, 2]` only if both calls happen in the same thread
+> Default values are evaluated once when `def` executes and stored on the function object. Every call
+> that omits `acc` mutates that one list, which is why `None` plus in-body creation is the idiom.
 
-### Q: Why does a mutable default argument retain changes between calls?
-- [ ] Python caches function results when arguments are omitted
-- [x] The default expression is evaluated once at `def` time and the same object is reused for every call
-- [ ] Lists are passed by reference but ints are passed by value
-- [ ] The function's closure captures the default
-> Defaults live on the function object and are evaluated once. Each call that omits the argument
-> binds the parameter to that same stored object, so mutations accumulate.
+### Q: Why does `s += "a"` leave other names bound to the old string unchanged, while `lst += [1]` changes every alias of the list?
+- [ ] Strings are copied on assignment and lists are not
+- [ ] The `+=` operator is only defined for mutable types
+- [x] `str` is immutable so `+=` rebinds the name to a new object, whereas `list.__iadd__` extends the existing object in place
+- [ ] Lists are stored by reference and strings by value in the interpreter
+> Same spelling, different semantics: immutable types have no in-place operator, so a new object is
+> created and only the assigned name moves. Mutable types implement in-place augmentation and all
+> references observe it.
 
-### Q: After `x = [1]; y = x; y += [2]` versus `s = "a"; t = s; t += "b"`, what are `x` and `s`?
-- [ ] `[1]` and `"ab"`
-- [x] `[1, 2]` and `"a"`
-- [ ] `[1, 2]` and `"ab"`
-- [ ] `[1]` and `"a"`
-> `list.__iadd__` mutates in place, so `x` sees the change. Strings are immutable: `+=` builds a new
-> string and rebinds only `t`, leaving `s` as `"a"`.
+### Q: After `row = emb[0]; row /= row.sum()` with a NumPy array `emb`, what happened to `emb`?
+- [ ] Nothing; indexing returns an independent copy of the row
+- [x] Its first row was modified, because basic indexing returns a view sharing the same buffer
+- [ ] It was converted to a float array but its values are unchanged
+- [ ] A `ValueError` was raised because views cannot be modified in place
+> Basic slicing and indexing in NumPy return views, so an in-place operation on the view writes into
+> the original buffer. `emb[0].copy()` or an out-of-place expression avoids the side effect.

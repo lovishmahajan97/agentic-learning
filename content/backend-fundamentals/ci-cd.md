@@ -13,7 +13,7 @@ related:
   - llmops-platform/evaluation-gates-for-production-releases
   - llmops-platform/canary-shadow-deployments
   - llmops-platform/rollback
-  - evals/regression-tests
+  - node-ts-for-ai/docker-ci-cd-deployment
 sources:
   - Humble, Farley, 2010 — Continuous Delivery
   - Forsgren, Humble, Kim, 2018 — Accelerate
@@ -21,238 +21,227 @@ sources:
 ---
 
 ## TL;DR
-Continuous integration means every change lands on the shared mainline often and is automatically built
-and tested there; continuous delivery means the resulting artifact is always deployable through an
-automated, repeatable path; continuous deployment means it ships without a human click. The practice
-exists because integration pain and the cost of a defect both grow with the size and age of the batch.
-For AI systems the same pipeline versions prompts and models and gates releases on evals.
+Continuous integration means every change is merged to the main line often and verified by an
+automated build and test run on a clean machine; continuous delivery means every verified build
+becomes one immutable artifact that can reach production through a repeatable, automated path, and
+continuous deployment removes the final button. The pipeline replaces trust in laptops with evidence
+and makes releases small and routine enough that failure is cheap to detect and reverse. For AI
+systems it must gate prompts and models too, whose tests are evaluations.
 
 ## Why it exists
-Integrate once a sprint and the merge is a week of conflicts nobody remembers the context for. Deploy
-once a month and the diff is five hundred commits, so when production breaks there is no way to tell
-which one did it, and the rollback is a project of its own. Fear of that makes teams deploy less often,
-which makes batches bigger, which makes deploys scarier: a loop that only ends when a change is small
-enough to understand and automatic enough to repeat. The research summarised in *Accelerate* found that
-teams deploying more frequently also had lower change-failure rates, not higher; small batches are the
-safe option, not the reckless one.
+Without a pipeline, integration happens late: weeks of divergent branches meet at release time and the
+merge is where the bugs live. Tests run on developer machines with whatever happens to be installed,
+so "passes locally" carries no information about production. Deployment is a runbook followed by a
+person, usually under time pressure, and the second execution differs from the first in some detail
+nobody wrote down. Nobody can say which commit is in production, and rollback means "redeploy the old
+one", which cannot be rebuilt because the dependency resolution has moved on.
 
-The naive alternatives fail predictably. Nightly builds give feedback in hours and attribute a failure
-to "everyone who committed yesterday". Release branches with a manual QA week work but drift from
-mainline and turn every hotfix into a cherry-pick exercise. Deploying from a laptop means the artifact
-depends on which laptop, which Python, and whose credentials, and leaves production secrets on
-developer machines.
+Each of these is a feedback-delay problem. The cost of a defect grows with the distance between the
+change that introduced it and the moment it is detected, because context is lost and other changes
+pile on top. Continuous integration shrinks that distance by integrating at least daily against a
+build that must stay green. Continuous delivery extends the idea through to production with a
+deployment pipeline whose stages give fast, cheap feedback first and slow, expensive feedback later.
+The DORA research reported in *Accelerate* found that teams deploying more often with shorter lead
+times also had *lower* change failure rates: small, frequent changes are safer than large, rare ones,
+which is the opposite of the intuition behind "test everything manually before the big release".
 
-AI systems add a specific reason. A prompt edit or a model-version bump changes behaviour as much as a
-code change does, but it is tempting to make it in a vendor dashboard with no diff, no test and no
-rollback. Putting prompts, model configuration and evaluation suites into the same pipeline as code is
-how those changes get history, review and a gate.
+AI systems raise the stakes. A prompt edit is a behaviour change with no type checker; a model version
+bump can silently regress a task the team never wrote a test for; a retrieval index rebuild changes
+answers without touching code. Without a pipeline that treats these as changes to be verified,
+quality drift ships unnoticed and is discovered by users.
 
 ## How it works
-### Continuous integration
-Work on trunk or on branches that live hours, not weeks. A pull request triggers the pipeline: check
-out, restore the dependency cache keyed by the lockfile hash, lint and type-check, run unit tests, and
-in parallel run integration tests against real dependencies started as containers. Protected branches
-require these checks to pass before merge. The pipeline must be fast enough that people wait for it, on
-the order of ten minutes (illustrative), which is achieved by splitting fast and slow suites, sharding
-tests across runners and caching aggressively. Flaky tests are quarantined and fixed, not retried until
-green, *because* a retry loop hides real intermittent failures.
+### The stages of a deployment pipeline
+1. **Commit stage, minutes.** Check out on a clean runner, install from the lockfile, lint, type-check,
+   run unit tests with the model client mocked or recorded, scan for secrets. It runs on every push,
+   so it must be cheap and deterministic; it exists to fail fast on the majority of mistakes.
+2. **Build.** Build the container image once, tag it with the git SHA, push it to a registry. The image
+   digest is now the artifact. "Build once, promote many" is a rule *because* rebuilding per
+   environment can resolve different dependencies or base layers, so production would run something
+   that was never tested.
+3. **Acceptance.** Start the real dependencies (Postgres, Redis) as service containers, run API tests
+   against the built image, run contract tests against provider APIs, and run a small, fixed
+   evaluation set against the prompts and model with pass thresholds.
+4. **Supply chain.** Audit dependencies, scan the image, produce a software bill of materials, sign the
+   image so later stages can verify they are deploying what this stage produced.
+5. **Staging.** Deploy automatically, run smoke tests against a production-shaped environment.
+6. **Production.** Promote the same digest, gated by an approval (delivery) or automatically
+   (deployment), progressively: a canary takes a slice of traffic while error rate, latency and online
+   quality metrics are compared against the baseline, then full rollout or automatic rollback.
 
-### Build once, promote the same artifact
-After tests pass on mainline, build the container image once, tag it with the git SHA, push it to the
-registry and record the immutable digest. Every later environment deploys that digest. Rebuilding per
-environment reintroduces "it worked in staging" because a dependency can resolve differently an hour
-later. Configuration and secrets are injected at deploy time, never baked in, so one artifact serves
-every environment. Generate an SBOM and scan the image for known vulnerabilities at this stage; sign it
-if your supply-chain requirements call for it.
+With GitOps, the pipeline's last step is a commit of the new digest to a configuration repository, and
+a controller (Argo CD, Flux) reconciles the cluster to it. The config repo becomes the audit log of
+what ran when, and rollback is `git revert`.
 
-### Continuous delivery: the path to production
-Deploy the digest to staging; run smoke tests and contract tests against it; for AI services run the
-evaluation gate on a sampled, versioned case set with thresholds rather than exact matches, since model
-output is nondeterministic. Promote to production using a strategy that limits blast radius: rolling
-(the Kubernetes default), blue-green (two full stacks and a switch), or canary (a small share of traffic
-compared on error rate, latency and quality metrics, with automatic abort). Rollback is redeploying the
-previous digest, which is fast precisely because the artifact already exists. Database migrations must
-be backward compatible (expand, migrate, contract) so old and new versions coexist during a roll.
-Feature flags separate deploying code from releasing behaviour.
+### Principles that make the stages work
+- **Trunk-based development with feature flags.** Small pull requests into a main branch that is
+  always deployable; flags separate *deploying* code from *releasing* behaviour.
+- **Pipeline as code**, versioned next to the application, so a pipeline change is reviewed like any
+  other change.
+- **Reproducibility.** Lockfiles for dependencies, base images pinned by digest, third-party pipeline
+  actions pinned to a commit SHA rather than a mutable tag.
+- **Fast feedback.** Cache dependencies keyed on the lockfile hash, parallelise test shards, and move
+  slow suites to a nightly or on-demand lane rather than letting the commit stage grow to thirty
+  minutes, because a slow pipeline makes developers batch changes, which is exactly the large, risky
+  merge the pipeline exists to prevent.
+- **Secrets through identity.** The CI job presents an OIDC token the cloud exchanges for a short-lived
+  role credential, instead of a stored long-lived key; secrets are masked in logs and never exposed to
+  jobs triggered by untrusted pull requests.
+- **Environment protection.** Production deploys require a reviewer, a branch rule, or both.
 
-### Continuous deployment versus delivery
-Delivery means every mainline build *could* go to production through the automated path, with a human
-approval where policy requires one. Deployment removes the approval. The second needs strong
-observability and automatic rollback; the first is the right default for customer-visible AI behaviour
-changes, where a human reviews the eval diff before promotion.
+### What changes for AI systems
+- **Non-determinism.** Model outputs vary between runs, so unit tests mock or record the client and
+  assert on structure and control flow, while quality is measured in an evaluation stage with
+  thresholds over many cases, never with exact-match asserts on generated text.
+- **Cost and quota.** Real-model tests spend money and rate limit. Run a small smoke evaluation on
+  every pull request, the full set on main or nightly, under a CI-only key with a spend limit.
+- **Artifacts beyond code.** Model weights and indexes live in a registry or object store, referenced
+  by version; a change to a prompt template, a model version or a retrieval index must trigger the
+  evaluation gate exactly as a code change triggers tests.
+- **GPU work.** Tests that need a GPU run on self-hosted runners or as cluster Jobs, never on the
+  default runner.
+- **Rollback scope.** The deployable unit pins code, prompt and model version together, so a rollback
+  reverts all three.
 
-### Push versus pull deployment
-A push pipeline runs `kubectl`, Helm or a cloud CLI with credentials obtained through OIDC federation.
-A pull (GitOps) model has the pipeline update a manifest repository and a reconciler in the cluster
-(Argo CD, Flux) apply it, *because* then no pipeline holds cluster credentials, git is the audit log,
-and drift is corrected automatically. Push is simpler for a few services; pull pays off with many
-clusters or strict audit requirements.
-
-### Securing the pipeline
-Ephemeral runners, least-privilege `permissions`, OIDC federation instead of long-lived cloud keys
-stored as secrets, third-party actions pinned to a commit SHA, no secrets exposed to workflows triggered
-by pull requests from forks, and protected environments with required reviewers for production.
-
-### What changes for AI
-Prompts, model ids, decoding parameters and eval cases are versioned files. The deterministic subset of
-the eval suite runs on every pull request; the full suite runs on mainline or nightly because it costs
-real money and minutes. Provider keys come from the secret store with spend caps. Model weights and
-datasets are cached between runs. A model or prompt change is promoted through shadow or canary traffic
-measured on quality, not only on errors.
+### How you know it is working
+The four DORA metrics: deployment frequency, lead time for changes, change failure rate, and time to
+restore service. Add pipeline duration and flake rate; a pipeline nobody trusts is one nobody waits for.
 
 ## Example
-A GitHub Actions workflow: tests on every pull request, a single image build on mainline tagged with the
-commit and recorded by digest, and a production deploy of that exact digest using OIDC to assume a
-cloud role, with the job failing if the rollout does not complete.
+A GitHub Actions workflow with two jobs. Every pull request runs lint, types and mocked unit tests,
+plus a small smoke evaluation that only runs when the secret is available (pushes and same-repository
+pull requests). On `main`, the image is built once, pushed with the commit SHA as its tag, and the
+exact digest is rolled out to the cluster using short-lived credentials obtained through OIDC rather
+than a stored cloud key. The `production` environment carries required-reviewer protection.
 
 ```yaml
-name: ci-cd
+name: ci
 on:
   pull_request:
-  push:
-    branches: [main]
-permissions:
-  contents: read
-  packages: write
-  id-token: write                      # OIDC: the job gets a short-lived cloud credential, no stored key
-
+  push: {branches: [main]}
+permissions: {contents: read, packages: write, id-token: write}   # id-token: OIDC to the cloud
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12", cache: pip }     # cache keyed on the lockfile hash
-      - run: pip install -r requirements-dev.txt
-      - run: ruff check . && mypy src
-      - run: pytest -q -m "not llm"                      # fast suite; paid-model evals run on main
-  build:
+      - uses: actions/checkout@v4             # pin to a commit SHA in a real repository
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - run: uv run ruff check . && uv run mypy src
+      - run: uv run pytest -q tests/unit      # model client mocked: deterministic, free, fast
+      - run: uv run pytest -q -m smoke tests/eval   # ~20 golden cases against a cheap model
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        env: {LLM_API_KEY: "${{ secrets.CI_LLM_KEY }}"}
+  build-and-deploy:
     needs: test
-    if: github.ref == 'refs/heads/main'                  # PRs only test; mainline produces the artifact
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
+    environment: production                  # protection rule: required reviewers
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: push
+        with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
+      - id: build
         uses: docker/build-push-action@v6
-        with:
-          push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment: production                              # required reviewers and env-scoped secrets
-    steps:
+        with: {push: true, tags: "ghcr.io/${{ github.repository }}:${{ github.sha }}"}
       - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::123456789012:role/gha-deploy
-          aws-region: eu-west-1
-      - run: aws eks update-kubeconfig --name prod
-      - run: |
-          kubectl set image deployment/embed-api \
-            api="ghcr.io/${{ github.repository }}@${{ needs.build.outputs.digest }}"
-          kubectl rollout status deployment/embed-api --timeout=5m   # non-zero exit fails the deploy
+        with: {role-to-assume: "arn:aws:iam::123456789012:role/ci-deploy", aws-region: us-east-1}
+      - run: |                                 # promote the exact digest that was built and tested
+          aws eks update-kubeconfig --name prod
+          kubectl set image deployment/llm-api api=ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          kubectl rollout status deployment/llm-api --timeout=10m
 ```
 
-The `environment: production` gate is where continuous delivery and continuous deployment differ:
-remove its required reviewers and every green mainline build ships itself. Rollback is the same
-`kubectl set image` with the previous digest. Pin the action versions to the current releases when you
-copy this.
-
 ## Trade-offs
-- Small, frequent deploys cut risk per change but demand investment in test quality, automation and
-  feature flags; it flips to a formal release cadence when you ship a regulated or on-premises artifact,
-  where delivery means always deployable rather than always deployed.
-- A fast pipeline and a thorough one pull against each other; split by trigger so pull requests get the
-  fast subset, mainline the full suite, and nightly the expensive evals.
-- Continuous deployment removes the human bottleneck but requires observability good enough to abort
-  automatically; a manual approval on the eval diff is the better default for user-visible AI changes.
-- GitOps removes cluster credentials from CI and gives a git audit trail, but adds a reconciler and a
-  manifest repository to run; push deployment is simpler below a handful of services.
-- Dependency and layer caches make builds fast but stale caches cause phantom failures; key them on
-  the lockfile hash and bust them deliberately.
+- Running evaluations on every pull request catches prompt regressions early, but costs money, time and
+  attention when the eval is noisy; the balance flips to a small smoke set per pull request plus a full
+  nightly run once eval cost per run exceeds what you would spend on a human review.
+- Continuous deployment maximises flow by removing the human gate, but for regulated customers or
+  high-blast-radius changes continuous delivery with an approval and a canary is the right stopping
+  point.
+- Build-once-promote-many guarantees production runs what was tested, but forces every environment
+  difference into runtime configuration rather than a rebuild, which demands discipline about config
+  injection.
+- GitOps gives an auditable, declarative rollback path, but adds a reconciliation delay and another
+  controller to operate; direct `kubectl` from the pipeline is simpler for a single team and few
+  services.
+- Aggressive caching keeps pipelines fast, but a stale cache produces "green in CI, broken in prod";
+  key caches on lockfile hashes and expire them on base-image changes.
 
 ## Pitfalls
-- Rebuilding the image per environment; the symptom is staging green and production different. Build
-  once and promote by digest.
-- Long-lived cloud keys stored as CI secrets; the symptom is one leaked runner log compromising
-  production. Use OIDC federation and least-privilege permissions.
-- Auto-retrying flaky tests; the symptom is real intermittent failures that reach production unnoticed.
-  Quarantine and fix.
-- Third-party actions referenced by a mutable tag or `@main`; the symptom is a supply-chain compromise
-  that runs with your repository's permissions. Pin to a commit SHA.
-- Running the full paid-model eval suite on every push; the symptom is forty-minute pull-request checks
-  and a surprising provider bill. Sample on pull requests, run fully on mainline.
-- A non-backward-compatible migration in a rolling deploy; the symptom is old pods crashing
-  mid-rollout. Expand, migrate, then contract.
-- A deploy step that does not wait for `rollout status`; the symptom is a green pipeline and a failed
-  rollout nobody noticed.
-- Prompts edited in a vendor dashboard outside the pipeline; the symptom is behaviour that changed with
-  no diff and nothing to roll back to.
+- Tolerating flaky tests; the symptom is a "just re-run it" culture in which a real failure is merged
+  because red no longer means anything. Quarantine flaky tests immediately and fix or delete them.
+- Unit tests that call the real model and assert exact strings; the symptom is intermittent failures
+  that start the day the provider updates the model.
+- Rebuilding the image at deploy time; the symptom is production behaving differently from staging
+  with the "same" commit because dependency resolution drifted between builds.
+- Long-lived cloud keys stored as CI secrets; the symptom is a leaked runner log or compromised action
+  yielding permanent credentials. Use OIDC federation.
+- Third-party actions referenced by a mutable tag or branch; the symptom is a supply-chain compromise
+  of that action silently running in your pipeline. Pin to a commit SHA.
+- Only code is versioned and rolled back; the symptom is a bad prompt requiring a hotfix pull request
+  under pressure instead of a one-click revert.
+- Secret-bearing jobs that run on pull requests from forks via `pull_request_target`; the symptom is a
+  malicious pull request exfiltrating secrets through a log line.
+- A commit stage that grows past half an hour; the symptom is rising pull-request size and lead time,
+  because developers batch changes to avoid waiting.
 
 ## When to use
-Everything deployed goes through a pipeline; the decisions are how deep the gates go and where humans
-sit. Track the four measures from the DORA research: deployment frequency, lead time for changes,
-change-failure rate and time to restore service; they expose whether the pipeline is helping. Day to
-day you maintain workflow files, keep the pipeline under the time people will wait, add an eval gate
-when prompts or models change, and make rollback a one-command operation. In interviews, be ready to
-explain build-once-promote-everywhere, how rollback works when migrations are involved, how a canary
-decides to abort, and what makes CI for AI different: nondeterministic tests, eval cost, and treating
-prompts as versioned artifacts.
+Set up a pipeline on day one for any codebase with more than one contributor or more than one deploy;
+a five-minute lint-and-test workflow is enough to start. Add stages as risk grows: image build and scan
+once you deploy containers, an evaluation gate once prompt or model changes affect users, canaries once
+traffic is large enough for a comparison to mean something. Use path filters so documentation changes
+skip the heavy stages. Track the four DORA metrics plus pipeline duration, flake rate and eval-gate pass
+rate. In interviews, explain build-once-promote-many, why small frequent deploys are safer, how you test
+non-deterministic model code, and how a CI job authenticates to the cloud without a stored key.
 
 ## Role lens
-- **Engineer:** Writes and maintains the workflow files, keeps the fast suite fast, tags images by
-  commit, and wires the eval gate so a prompt change fails the build when quality drops.
-- **Architect:** Sets the promotion path, the rollout strategy per service, the delivery-versus-deployment
-  policy for AI behaviour changes, and the push-versus-GitOps decision across clusters.
-- **FDE:** Adapts the pipeline to the customer's CI system, registry and change-management process,
-  and proves to their reviewers that what runs in their cluster is the digest that passed the gates.
+- **Engineer:** Writes the workflow, mocks the model client in unit tests, maintains the smoke
+  evaluation set, pins actions and base images, and reads failed job logs before anyone else does.
+- **Architect:** Defines the promotion path, environments and gates (eval thresholds, approvals,
+  canary criteria), the artifact and config repositories, and the rollback policy that covers prompt
+  and model versions.
+- **FDE:** Fits delivery into the customer's tooling (GitLab, Jenkins, Azure DevOps), their change
+  windows and approval requirements, and builds the evaluation gate on their data.
 
 ## Check yourself
-**Q:** Pull-request checks take thirty-five minutes because they run the full 500-case LLM evaluation
-suite against the provider on every push, and production deploys rebuild the image from `main`. Redesign
-the pipeline and justify each change.
-**A:** Split the suite by trigger: pull requests run lint, types, unit tests and a deterministic
-sampled subset of evals with cached responses where possible, finishing in minutes; mainline runs the
-full suite once per merge, nightly runs the expensive variants, and results are recorded against the
-commit. Build the image once on mainline after tests pass, tag it with the SHA, record the digest, and
-have staging and production deploy that digest, so what was tested is what runs. Put an eval gate with
-thresholds between staging and production, with a human approval on the eval diff for prompt and model
-changes. Obtain cloud credentials through OIDC rather than stored keys, pin actions by SHA, and make the
-deploy step wait on rollout status so failure is visible. Rollback becomes redeploying the previous
-digest, which the pipeline already has.
+**Q:** A pull request changes the system prompt of your RAG assistant and bumps the model version.
+Describe what the pipeline should do before this reaches users, and how you keep it affordable.
+**A:** Treat it as code first: the commit stage runs lint, types and unit tests with the model mocked,
+which costs nothing. Because files under the prompt and model paths changed, the evaluation gate
+triggers: a fixed golden set of a few hundred questions with graded references runs against the new
+configuration, scored by deterministic checks and an LLM judge, and compared with the baseline from
+main using thresholds on groundedness, refusal rate and output format; the pull request fails if it
+regresses beyond tolerance. Keep cost down by running a twenty-case smoke subset on every push and the
+full set only when those paths change or a label is applied, under a CI-only key with a spend limit.
+Then build the image once, deploy to staging, smoke-test, and canary a small share of production
+traffic while watching the same metrics online, with the prompt and model version pinned in the same
+artifact so a rollback reverts both.
 
 ## Quiz
-### Q: Why should the container image be built once and promoted by digest rather than rebuilt for each environment?
-- [ ] Building is slow and the registry charges per build
-- [x] Rebuilding can resolve dependencies differently later, so the production image would not be the one that passed tests
-- [ ] Digests are shorter than tags and easier to type in deploy scripts
-- [ ] Kubernetes refuses to pull an image that was built more than once
-> The artifact that passed the gates is the only thing proven to work. A rebuild is a new artifact with
-> potentially different base layers or packages, and the digest is how you guarantee identity.
+### Q: Why build the image once and promote the same digest through environments rather than rebuilding per environment?
+- [ ] Because container registries charge per build
+- [x] Because a rebuild can resolve different dependencies or base layers, so production would run an artifact that was never tested; promoting one digest guarantees identity
+- [ ] Because Kubernetes can only pull a given image once per cluster
+- [ ] Because tests only execute on the first build of a commit
+> The artifact that passed acceptance tests is the only thing known to work; any rebuild is a new,
+> untested artifact. Registries do not limit pulls this way and test execution is a pipeline choice,
+> not a constraint.
 
-### Q: What distinguishes continuous delivery from continuous deployment?
-- [ ] Delivery uses containers while deployment uses virtual machines
-- [ ] Delivery applies to libraries and deployment to services
-- [x] Delivery keeps every mainline build deployable through an automated path, possibly with a human approval; deployment removes the approval and ships automatically
-- [ ] Delivery runs tests before merge while deployment runs them after
-> Both automate the path to production. The difference is only whether a person clicks; for
-> user-visible AI behaviour changes a review of the eval diff before promotion is usually worth the
-> click.
+### Q: Unit tests for code that calls an LLM fail intermittently with slightly different wording in the output. What is the best fix?
+- [ ] Raise the temperature so outputs become more consistent
+- [ ] Automatically retry each failing test three times
+- [x] Mock or record the model client in unit tests, and move quality checks to an evaluation stage with thresholds rather than exact-match asserts
+- [ ] Pin the tests to one model version and assert the exact string
+> Generated text is non-deterministic by nature, so exact matches will keep breaking. Unit tests should
+> verify control flow against a stubbed client, while quality is measured statistically over many
+> cases. Retries hide real failures and higher temperature increases variance.
 
-### Q: What does OIDC federation in a CI pipeline replace, and why is it safer?
-- [ ] It replaces the git credentials used to check out the repository
-- [x] It replaces long-lived cloud access keys stored as CI secrets with short-lived tokens issued per job and trusted only for a specific repository and branch
-- [ ] It replaces the container registry login with anonymous pulls
-- [ ] It replaces unit tests with signed attestations
-> A stored key can be leaked from a log or a fork and lives until rotated. A per-job OIDC token
-> expires in minutes and the cloud role's trust policy limits which repository and branch may assume
-> it.
+### Q: Why is OIDC federation preferred over a stored cloud access key in a CI pipeline?
+- [ ] OIDC tokens never expire, so the pipeline never needs to re-authenticate
+- [x] The job presents a short-lived signed identity token that the cloud exchanges for temporary credentials, so there is no long-lived secret to leak or rotate
+- [ ] Kubernetes requires OIDC for any `kubectl` access from a pipeline
+- [ ] Stored keys cannot be restricted to a single repository
+> The credential exists only for the duration of the job and is bound to the repository and workflow
+> that requested it, which removes the single most common CI leak. OIDC tokens are deliberately
+> short-lived, and `kubectl` access works with many credential types.

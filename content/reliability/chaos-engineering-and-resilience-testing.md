@@ -5,6 +5,7 @@ name: Chaos engineering & resilience testing
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - reliability/fmea
   - reliability/circuit-breakers

@@ -5,6 +5,7 @@ name: Disaster recovery (RPO / RTO)
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - reliability/business-continuity
   - reliability/high-availability
@@ -53,8 +54,8 @@ Picture a timeline. The disaster strikes at T. The most recent recoverable state
 before T; the gap is the **recovery point**, and the RPO is the maximum gap you have agreed to
 tolerate. Service comes back at some point after T; that gap is the **recovery time**, and the RTO is
 the maximum you have agreed to tolerate. The objectives are promises set with the business; the
-measured results of a real recovery or drill are the actuals (often written RPA and RTA), and the gap
-between objective and actual is the finding.
+measured results of a real recovery or drill are the actuals (some teams write them RPA and RTA), and
+the gap between objective and actual is the finding.
 
 Both numbers follow from the mechanism:
 - RPO is bounded by **how often state is copied away**. Nightly snapshot: up to 24 h. Continuous

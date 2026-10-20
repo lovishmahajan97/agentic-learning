@@ -2,227 +2,238 @@
 id: metadata-filtering
 module: rag-retrieval
 name: Metadata filtering
-kind: concept
+kind: pattern
 difficulty: core
 est_minutes: 14
 related:
-  - rag-retrieval/vector-databases
   - rag-retrieval/ann-indexes
+  - rag-retrieval/vector-databases
   - rag-retrieval/acl-aware-retrieval
   - rag-retrieval/hybrid-search
-  - rag-retrieval/recall-vs-precision-trade-off
+  - rag-retrieval/query-rewriting
+  - rag-retrieval/embedding-pipelines
   - rag-retrieval/freshness-document-deletion-index-consistency
-  - system-design/tenant-isolation
   - data-architecture/vector-database-architecture
 sources:
-  - Malkov & Yashunin, 2018 — Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs
-  - Official docs: Qdrant (filtering and payload indexes)
+  - Official docs: Qdrant filtering and payload indexes
   - Official docs: pgvector
+  - Official docs: Weaviate filtered vector search
 ---
 
 ## TL;DR
-Vector similarity ranks by meaning only, but most real queries also carry hard constraints: this
-tenant, this document type, this date range, this language. Metadata filtering evaluates those
-predicates *inside* the nearest-neighbour search so the top-k is computed over the eligible set
-rather than over everything. Where the predicate is applied (after, before, or during the ANN walk)
-decides whether you get k results at all, how fast the query runs, and whether a very selective
-filter quietly destroys recall.
+An embedding encodes what a chunk is about, not which tenant owns it, when it was written or which
+product version it describes. Metadata filtering stores those structured attributes next to each vector
+and applies them as hard predicates *inside* the search, because applying them afterwards to an
+approximate top-k returns too few results, or none, as soon as the predicate is selective. The
+engineering question is where the predicate runs: before the ANN walk, during it, or after it.
 
 ## Why it exists
-An embedding of "Q3 revenue summary" is close to every Q3 revenue summary ever written. Nothing in
-the vector says which tenant it belongs to, whether the document is a draft or the signed version, or
-whether it was superseded last month. Those facts live in metadata, and users expect them to be
-honoured exactly: a filter is a promise ("only 2025 contracts"), not a preference.
+Similarity is a soft score; many real constraints are hard. "Only the 2025 version of the travel policy",
+"only this customer's tickets", "only contracts, not emails", "only French". A query embedding cannot
+exclude the 2024 policy, because the 2024 and 2025 versions are near-duplicates and therefore each
+other's nearest neighbours. The top-k fills with the wrong year and the model confidently answers from
+stale rules.
 
-The naive approach is to run the vector search unfiltered and drop non-matching results in
-application code (post-filtering). It fails arithmetically. Suppose one tenant owns 1% of a
-million-chunk index. The unfiltered top-10 is drawn from all tenants, so on average it contains
-about 0.1 chunks from the one you want. You compensate by asking for the top-1,000 and filtering
-down, which costs ten to a hundred times the work and *still* gives no guarantee: a rare tenant with
-unusual vocabulary may have zero chunks in the top-1,000. The symptom is a search that returns
-three results instead of ten, or none at all, for exactly the users with the least data.
+The first naive fix is to write the attribute into the text ("Year: 2025. Tenant: acme.") and hope the
+embedding carries it. An embedding compresses hundreds of tokens into one vector; a short attribute
+barely moves it, so the "filter" is probabilistic at best, and it cannot express ranges, negation or
+list membership at all.
 
-The other naive approach, one index per filter value, explodes combinatorially (tenant × document
-type × year) and cannot express ranges. So the search engine itself has to understand predicates,
-and the interesting engineering is in how it combines a boolean predicate with a graph-based
-approximate index that was never designed to skip nodes.
+The second naive fix is post-filtering: fetch the top-k by similarity, then drop rows that fail the
+predicate. If a fraction *s* of the corpus passes the filter and the unfiltered top-k is roughly a random
+sample with respect to that attribute, the expected number of survivors is about *k·s*. For k = 10 and a
+filter that keeps 1% of rows, that is 0.1 results: usually an empty list. Over-fetching k/s = 1,000
+candidates recovers ten on average, but ANN recall degrades at large k, latency grows, and the survivors
+are still not guaranteed to be the true top-10 among matching rows, because those may sit outside the
+unfiltered top-1,000 entirely. The predicate therefore has to be part of the search, which is why vector
+databases ship payload indexes and filtered graph traversal rather than leaving it to the caller.
 
 ## How it works
-### Three places to apply the predicate
-1. **Post-filtering.** Run ANN for the top-k, then discard non-matching hits. Simple and index-agnostic,
-   but the result count is unpredictable and the cost of inflating k is paid on every query. It is
-   acceptable only when the filter is loose (matches most of the corpus).
-2. **Pre-filtering.** Evaluate the predicate first, usually through a secondary index on the metadata
-   field (an inverted index or bitmap), producing the set of eligible IDs. If that set is small,
-   search it exhaustively with exact distance computations. This is exact, and cheap *because* the
-   set is small: 5,000 eligible vectors of 1,024 dimensions is about five million multiply-adds,
-   a few milliseconds on one core. It becomes expensive when the filter matches, say, 60% of a
-   50-million-vector corpus, because brute force then touches 30 million vectors.
-3. **In-graph (integrated) filtering.** Walk the HNSW graph as usual, but only count nodes that pass
-   the predicate as candidates for the result list, while still being allowed to traverse through
-   non-matching nodes to keep moving. The predicate is checked per visited node against a bitset or
-   payload index. This keeps the cost near the unfiltered cost for moderately selective filters.
-   Its weakness is the opposite of pre-filtering's: when very few nodes match, almost every
-   neighbour fails the check, the beam fills with far-away matches or none at all, and recall
-   collapses, because the subgraph of matching nodes is not connected enough to walk.
+### Representing metadata
+Each vector carries a payload: `tenant_id`, `doc_id`, `source`, `doc_type`, `language`, `created_at`
+(as an integer timestamp, not a string), `version`, `section_path`, and for access control a list of
+allowed principals. Types matter because they determine which predicates are possible and fast: keyword
+fields support exact and set membership (`in [...]`), numeric and datetime fields support ranges, boolean
+and geo fields have their own operators, and array fields support "any of". A filterable field needs a
+secondary index on the payload (a bitmap or inverted index keyed by value), exactly as a relational
+column needs an index; without it the engine scans every candidate's payload and filtered latency grows
+linearly with collection size.
 
-### The planner: choosing by cardinality
-Production engines combine 2 and 3 with a cost-based rule, exactly as a SQL planner chooses between
-an index scan and a sequential scan. The payload index gives an estimate of how many points satisfy
-the filter. Below a threshold (tens of thousands of points, engine-dependent) the engine brute-forces
-the filtered set and the answer is exact; above it, it walks the graph with the predicate applied.
-Qdrant additionally builds extra graph edges among points that share common payload values so that
-filtered traversal stays connected; Lucene-based engines (Elasticsearch, OpenSearch) compute the
-filter bitset first and switch to exact search when the bitset is small. The design goal in all of
-them is the same: never let a selective filter turn into either an empty result or a full scan.
+### Three places the predicate can run
+1. **Pre-filtering.** Evaluate the predicate first, using the payload index, to get the set of allowed
+   IDs. If that set is small (hundreds to a few tens of thousands of vectors) the cheapest and most
+   accurate thing is a brute-force exact distance computation over just those IDs; no ANN structure is
+   needed at all. If it is large, the allowed set is passed into the ANN search as a bitmap mask. The
+   result is exact with respect to the predicate; the cost scales with the size of the allowed set.
+2. **Post-filtering.** ANN top-k′, then drop failures. Trivial to implement and acceptable only when the
+   predicate passes most rows, for example excluding the 2% of documents flagged as deleted. For a
+   selective predicate it is broken by the arithmetic above.
+3. **Filtered traversal (in-search filtering).** The HNSW greedy walk evaluates the predicate on every
+   candidate and only admits passing nodes to the result set, while still traversing through failing
+   nodes so the graph stays connected. This is the default in most engines, and it has a failure mode:
+   when the predicate is very selective, the walk visits many failing nodes before it finds passing ones,
+   and the passing nodes may be poorly connected to each other, so recall drops and latency spikes.
+   Engines therefore switch strategy on estimated cardinality: below a threshold they brute-force the
+   pre-filtered set, above it they run filtered traversal. Qdrant exposes such a threshold in its HNSW
+   configuration, Weaviate has a flat-search cutoff, and pgvector historically behaved like a
+   post-filter (the planner pulls `ef_search` candidates from the index, then applies `WHERE`, so a
+   selective predicate returns fewer than `LIMIT` rows); recent pgvector versions add iterative index
+   scans that keep walking until enough rows pass, and partial indexes (`CREATE INDEX ... WHERE
+   tenant_id = ...`) remain the pre-filter option.
 
-### pgvector: filters are WHERE clauses, with a catch
-In Postgres, `WHERE tenant_id = $1 ORDER BY embedding <=> $2 LIMIT 10` looks like pre-filtering but
-is not. When the planner picks the HNSW index, the index scan yields roughly `hnsw.ef_search`
-candidates in distance order (default 40), and the WHERE clause is applied to *those*, so a selective
-filter returns fewer than 10 rows. Mitigations: raise `hnsw.ef_search`; use a B-tree index on the
-filter column so the planner can filter first and sort exactly when the subset is small; build a
-partial HNSW index per large tenant; or, in recent pgvector versions, enable iterative index scans,
-which keep pulling candidates from the index until the LIMIT is satisfied.
+### The decision rule is selectivity
+Let *s* be the fraction of the corpus that passes. When *s* is tiny, pre-filter and brute-force: exact,
+cheap, and the ANN index is irrelevant. When *s* is large (most rows pass), filtered traversal costs
+about the same as an unfiltered search and even post-filtering with a modest over-fetch works. The
+dangerous middle (roughly 0.1% to 10%, model it for your engine) is where filtered traversal can lose
+recall, so this is the band to measure: run your labeled queries with their real filters and compute
+recall@k per selectivity bucket, not just unfiltered.
 
-### Designing the metadata itself
-- Index every field you filter on (payload index, GIN, B-tree). An unindexed predicate forces the
-  engine to read each candidate's payload during the walk and blinds the cardinality estimate.
-- Denormalise document-level fields onto every chunk at ingest, because the search runs at chunk
-  granularity and a join at query time is not available inside the ANN loop.
-- Prefer low-cardinality enums, numeric ranges and keyword IDs. Free-text fields are for search,
-  not filters.
-- Store dates as integers or native dates, never as strings with mixed formats; range predicates on
-  strings compare lexicographically.
+### Multi-tenancy is the most common filter
+Options: one collection per tenant (strong isolation, simple queries, but thousands of small graphs cost
+memory and operations), one shared collection with a `tenant_id` predicate on every query (one index,
+cheap, but enforcement must live in code the caller cannot bypass), or tenant-aware layouts that
+co-locate a tenant's vectors so the filtered search touches one region (Qdrant's tenant payload index
+option, Weaviate's native per-tenant shards). The ACL-aware retrieval lesson covers the security side;
+the point here is that the tenant predicate must be the cheapest predicate you have, because it is on
+every request.
 
-### Where the filter values come from
-Hard filters can be set by the application (tenant, permissions) or inferred from the query
-("policies updated since January for the EU team" → `doc_type=policy, updated_at>=2025-01-01,
-region=EU` plus the semantic part). Inferred filters must be validated against the schema and the
-set of known enum values, with a fallback to no filter on parse failure, otherwise a hallucinated
-value produces an empty result set. Distinguish constraints from preferences: "prefer recent" should
-be a score boost in a hybrid ranker, not a predicate that excludes everything older.
+### Where filter values come from
+From the UI (date pickers, product selectors), from the authenticated request (tenant, principals; never
+from the request body or the model), or from an LLM that parses natural-language constraints ("last
+quarter's incident reports") into structured predicates: the self-query pattern from query rewriting.
+LLM-derived filters must be validated against an allowlist of fields and values, must never touch
+security fields, and need a fallback (retry without the filter, or ask) because a misparsed predicate
+silently returns an empty result set.
+
+### Filters and the rest of the pipeline
+The same predicate must be applied in every retrieval arm (BM25 and dense in hybrid search) and before
+reranking, otherwise one arm surfaces documents the other excluded. Metadata updates are payload writes,
+not re-embeds: changing a document's status or ACL should never trigger re-computing its vectors.
 
 ## Example
-A Qdrant collection where the tenant, document type and update day are indexed payload fields and
-every query carries a filter. With a selective filter (one small tenant, one type, last 30 days) the
-engine's planner brute-forces the few hundred matching points and the result is exact; with a loose
-filter it walks the graph with the predicate checked per node.
+A self-contained simulation of the two strategies on 200k random unit vectors split across 100 tenants,
+so any single tenant's filter keeps about 1% of rows. `pre_filter` evaluates the predicate first and does
+an exact search inside it; `post_filter` takes the unfiltered top-k′ and drops other tenants, as a
+post-filtering engine would.
 
 ```python
-from qdrant_client import QdrantClient, models
+import numpy as np
+rng = np.random.default_rng(0)
+N, d, k = 200_000, 64, 10
+X = rng.standard_normal((N, d)).astype(np.float32); X /= np.linalg.norm(X, axis=1, keepdims=True)
+tenant = rng.integers(0, 100, N)                      # 100 tenants: each filter keeps ~1% of rows
+q = rng.standard_normal(d).astype(np.float32); q /= np.linalg.norm(q)
+sims = X @ q                                          # cosine similarity of every row to the query
 
-client = QdrantClient(url="http://localhost:6333")
-COL = "chunks"
+def pre_filter():                                     # predicate first, exact search inside it
+    allowed = np.flatnonzero(tenant == 7)             # ~2,000 ids, straight from a payload index
+    return allowed[np.argsort(-sims[allowed])[:k]]
 
-# Index every field that appears in predicates. Without an index the engine reads
-# each visited point's payload during the HNSW walk and cannot estimate cardinality.
-client.create_payload_index(COL, "tenant_id", field_schema="keyword")
-client.create_payload_index(COL, "doc_type", field_schema="keyword")
-client.create_payload_index(COL, "updated_day", field_schema="integer")  # days since epoch
+def post_filter(k_fetch):                             # unfiltered top-k_fetch, then drop other tenants
+    top = np.argpartition(-sims, k_fetch)[:k_fetch]
+    keep = top[tenant[top] == 7]
+    return keep[np.argsort(-sims[keep])][:k]
 
-def search(qvec, tenant, doc_types, since_day, k=10):
-    flt = models.Filter(must=[
-        models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant)),
-        models.FieldCondition(key="doc_type", match=models.MatchAny(any=doc_types)),
-        models.FieldCondition(key="updated_day", range=models.Range(gte=since_day)),
-    ])
-    res = client.query_points(COL, query=qvec, query_filter=flt, limit=k,
-                              search_params=models.SearchParams(hnsw_ef=128))
-    return [(p.id, p.score, p.payload["doc_id"]) for p in res.points]
-
-# Diagnostic: compare against post-filtering to see the shortfall for a small tenant.
-def post_filtered(qvec, tenant, k=10, overfetch=100):
-    res = client.query_points(COL, query=qvec, limit=overfetch)
-    hits = [p for p in res.points if p.payload["tenant_id"] == tenant]
-    return hits[:k]          # often fewer than k for tenants with little data
+truth = set(pre_filter())
+for kf in (10, 100, 1_000, 10_000):
+    got = post_filter(kf)
+    print(f"over-fetch {kf:>6}: {len(got):>2} results, {len(set(got) & truth):>2}/{k} correct")
+# Output with this seed: over-fetch 10 -> 0 results; 100 -> 0; 1,000 -> 9 results, 9/10 correct;
+# 10,000 -> 10 results, 10/10 correct, at 5x the candidate volume of the exact pre-filtered search.
 ```
 
-Illustrative arithmetic for the diagnostic: if the tenant owns 1% of the collection and its chunks
-are not unusually close to the query, over-fetching 100 yields about one matching hit, so the
-post-filtered path returns one result where the filtered path returns ten.
+The pre-filtered search touched ~2,000 rows and was exact. Post-filtering needed to over-fetch 5% of
+the whole corpus to match it, and at k′ = 10 (what a naive `top_k=10` call does) it returned nothing.
+The expected survivor count k′·s predicts these numbers: 0.1, 1, 10 and 100 for the four over-fetch
+sizes, with the last two capped at k.
 
 ## Trade-offs
-- Pre-filtering with brute force is exact, and its cost scales with the size of the filtered set; it
-  stops being the right choice once the filter matches more than a few percent of a large corpus.
-- Post-filtering needs no engine support and no payload indexes, but the result count is
-  unpredictable; it is defensible only for loose filters where over-fetching a little is cheap.
-- Indexing every metadata field costs write throughput and memory; the cost is justified only for
-  fields that actually appear in predicates, so unused payload indexes should be dropped.
-- Denormalising document metadata onto chunks makes filters fast, but a change to one document's
-  metadata (reclassified, re-dated) must be written to every chunk; if metadata churns faster than
-  content, keep a document table and filter by an ID list instead.
-- A hard filter guarantees the constraint but returns nothing when nothing matches; a soft boost
-  degrades gracefully but can violate the user's intent, so the choice depends on whether the
-  constraint is a rule or a preference.
+- Pre-filtering is exact with respect to the predicate, but its cost scales with the allowed set; once
+  the filter passes most of the corpus, brute force becomes a full scan and you need the graph instead.
+- Post-filtering needs no engine support and is adequate when nearly every row passes; it flips to
+  useless as the pass fraction drops, and it never guarantees the true filtered top-k.
+- Payload indexes make predicates fast but cost memory and write throughput per indexed field; indexing
+  every field you might ever filter on is the vector-store version of indexing every column.
+- One collection per tenant gives isolation and trivially cheap predicates, but thousands of small HNSW
+  graphs cost more memory and operations than one shared graph; the flip depends on tenant count and
+  size skew.
+- LLM-derived filters make natural-language constraints work, but every misparse silently empties the
+  result set, so they cost a validation layer and a fallback path.
 
 ## Pitfalls
-- Fewer than k results, or an empty list, as soon as a filter is added; the symptom of post-filtering
-  or of a candidate-limited index scan (pgvector with a low `ef_search`).
-- Result quality that is fine for large tenants and poor for small ones; the symptom of in-graph
-  filtering losing connectivity under a selective predicate, fixed by the engine's brute-force
-  fallback threshold or by partitioning small tenants.
-- A p99 latency cliff after adding a new predicate; almost always an unindexed payload field.
-- Enabling LLM-inferred filters without schema validation; the symptom is a jump in the
-  "no results" rate because the model invented an enum value or a date format.
-- Dates stored as strings in mixed formats, so range filters silently include or exclude the wrong
-  rows; the symptom is a "since last month" query returning two-year-old documents.
-- Using the metadata filter as the authorization mechanism but computing the filter value from
-  request parameters the client controls; see the ACL-aware retrieval lesson.
+- Post-filtering an ANN top-k; the symptom is small tenants or rare document types returning fewer than
+  k results, or none, while the same query without the filter returns plenty.
+- Filtering on a field with no payload index; the symptom is filtered queries whose latency grows with
+  collection size while unfiltered queries stay flat.
+- Storing dates as strings in mixed formats so range predicates compare lexically; the symptom is
+  "newest document" queries returning old content or nothing for certain date windows.
+- Re-embedding and re-inserting documents to change their metadata; a status or ACL change is a payload
+  update and should cost milliseconds, not an embedding job.
+- Accepting `tenant_id` or ACL values from the client request or from the model; the symptom is
+  cross-tenant leakage the moment someone edits a request body.
+- Applying the predicate in only one arm of hybrid search or after reranking; the symptom is documents
+  appearing in results that the filter should have excluded.
+- Evaluating recall only without filters; the symptom is a filtered-traversal recall collapse that shows
+  up in production for selective filters and never in the eval.
 
 ## When to use
-Use a filter whenever the query carries a constraint that must hold exactly: tenant and permission
-boundaries always, then document type, status, language, date range and product version as the
-application demands. Do not use a filter for preferences ("recent", "from my team") that should
-influence ranking rather than eligibility; those belong in a hybrid scorer. Measure three things per
-filter: the shortfall rate (queries returning fewer than k), filtered recall against an exhaustive
-search on a golden set bucketed by selectivity, and p99 latency by selectivity. In day-to-day work
-this shows up as the first question when someone says "search is empty for customer X"; in
-interviews, expect to explain pre-, post- and in-graph filtering and why a highly selective filter is
-the hard case for a graph index.
+Reach for a metadata filter whenever a constraint is a hard predicate rather than a preference: tenant,
+access control, date range, document type, language, product version, publication status. Do not use
+filters for soft preferences such as "prefer recent"; those belong in score boosting or reranking, where
+they trade off against relevance instead of excluding it. Measure three things: filtered recall@k on
+labeled queries bucketed by selectivity, p95 latency per bucket, and the rate of queries that return
+fewer than k results. In day-to-day work the filter builder is where security, UX and retrieval quality
+meet, which is why interviewers ask "what happens in your vector database when a filter matches 0.5% of
+the rows": the expected answer covers pre-, post- and in-traversal filtering, the k·s arithmetic, and the
+cardinality threshold at which the engine should switch to brute force.
 
 ## Role lens
-- **Engineer:** Declares payload indexes, builds the filter from server-side context, validates
-  inferred filters against the schema, and benchmarks filtered recall per selectivity bucket.
-- **Architect:** Decides which fields are hard constraints, whether tenants share one index or get
-  partitions, and which engine's filtering model matches the corpus's selectivity profile.
-- **FDE:** Maps the customer's document taxonomy (types, regions, statuses) onto filterable metadata at
-  ingest and proves on their data that small business units get the same recall as large ones.
+- **Engineer:** Designs the payload schema with typed fields, creates payload indexes for every filtered
+  field, writes a validated filter builder, and tests the fewer-than-k cases explicitly.
+- **Architect:** Decides the tenant layout (shared collection with predicate versus collection per
+  tenant), which fields are filterable, and the rule that security predicates derive from identity, never
+  from request bodies.
+- **FDE:** Maps the customer's document attributes (SharePoint sites, Confluence spaces, product lines,
+  regions) onto filterable metadata during ingestion and checks that the filters match how users actually
+  scope their questions.
 
 ## Check yourself
-**Q:** After adding a `tenant_id` filter, a vector search returns 3 results instead of 10 for a small
-tenant, and the quality for that tenant is visibly worse than for large tenants. What is happening,
-and what are your options?
-**A:** Two mechanisms produce this. Either the engine post-filters (or, as in pgvector's default HNSW
-scan, filters a fixed candidate list), so a tenant owning a small fraction of the index rarely has
-enough chunks among the candidates; or the engine filters in-graph and the tenant's few points are
-poorly connected, so the walk cannot reach them. Options: use a payload index so the engine can
-estimate cardinality and brute-force the small tenant's points exactly; raise the candidate count
-(`ef_search`) or enable iterative scanning; partition small tenants into their own collection or
-partial index; and add a regression test that measures filtered recall per tenant-size bucket
-against an exhaustive scan so the problem cannot return silently.
+**Q:** A support search over 5 million ticket chunks lets agents scope to one customer. One customer owns
+300,000 chunks, another owns 400. The index is HNSW with post-filtering. What happens for each customer,
+and how would you redesign the filter?
+**A:** Post-filtering survives roughly k·s of the fetched candidates. The large customer is 6% of the
+corpus, so an over-fetch of ~170 candidates yields about 10 results, which is workable. The small customer
+is 0.008% of the corpus; even a top-1,000 over-fetch yields 0.08 expected survivors, so agents see empty
+results. Redesign: put a payload index on `customer_id` and let the engine pick the strategy by
+cardinality: brute-force exact search over the 400 chunks for the small customer (cheaper than any graph
+walk), filtered traversal or a tenant-aware layout for the large one. Verify with filtered recall@k
+measured per customer-size bucket, add an alert on fewer-than-k results, and never accept `customer_id`
+from the client without checking the caller is authorized for it.
 
 ## Quiz
-### Q: Why does post-filtering return fewer than k results for a selective filter?
-- [ ] Because the vector index cannot store metadata alongside vectors
-- [x] Because the top-k is fixed before the predicate is applied, so matches outside that top-k are never considered
-- [ ] Because filtered vectors are normalised differently from unfiltered ones
-- [ ] Because post-filtering requires an exact search that times out
-> The filter runs on a result list that was already truncated to k by similarity alone; anything
-> matching the filter but ranked below k is gone. Over-fetching reduces, but cannot eliminate, the shortfall.
+### Q: Why does post-filtering an ANN top-k fail for selective predicates?
+- [ ] The ANN index cannot compute distances for rows that carry metadata
+- [x] Only about k·s of the k candidates pass, and the true filtered top-k may not be in the unfiltered candidates at all
+- [ ] Post-filtering forces the engine to rebuild the HNSW graph for each query
+- [ ] The predicate is evaluated before the embedding is computed, so it is ignored
+> With selectivity s, the expected survivors are k·s (0.1 for k = 10 and s = 1%). Over-fetching helps
+> only partly, because matching rows ranked outside the unfiltered candidate set are never seen.
 
-### Q: When is exhaustively scanning the filtered subset the right strategy?
-- [ ] Whenever the collection has fewer than one million vectors
-- [ ] Never; HNSW is always faster than brute force
-- [x] When the predicate is highly selective, so the eligible set is small enough to score exactly in milliseconds
-- [ ] Only when the metadata field is unindexed
-> Brute force costs one distance computation per eligible vector; for a few thousand vectors that is
-> cheaper and exact, whereas a graph walk restricted to a sparse set of matching nodes loses recall.
+### Q: A filter matches 300 vectors out of 10 million. Which execution strategy is best?
+- [ ] Raise ef_search until the filtered HNSW walk finds enough matches
+- [ ] Post-filter with an over-fetch of 10,000 candidates
+- [x] Pre-filter via the payload index and run an exact brute-force search over the 300 matching IDs
+- [ ] Build a separate HNSW index for every distinct value of the filtered field
+> Three hundred exact distance computations are cheaper and more accurate than any graph traversal.
+> Engines do this automatically below a cardinality threshold; over-fetching and ef_search tuning fight
+> the arithmetic instead of avoiding it, and per-value indexes do not scale to arbitrary predicates.
 
-### Q: Why can a very selective filter reduce recall for in-graph (filtered HNSW) traversal?
-- [ ] The engine falls back to keyword search for selective filters
-- [ ] Selective filters force the vectors to be re-embedded at query time
-- [x] Few visited nodes pass the predicate, so the matching subgraph is poorly connected and the search beam cannot reach the true neighbours
-- [ ] HNSW stores filtered vectors in a separate lower layer with fewer edges
-> Graph search relies on neighbours leading to better neighbours; when nearly all neighbours fail the
-> predicate, the walk stalls, which is why engines add filter-aware edges or switch to brute force.
+### Q: A date-range filter returns nothing even though matching documents exist. What is the most likely cause?
+- [ ] HNSW indexes cannot support range predicates
+- [x] Dates were stored as strings in inconsistent formats, so the range comparison is lexical and misses
+- [ ] The embedding model does not encode dates
+- [ ] The query vector was not normalized before the search
+> Range predicates need a numeric or datetime field; mixed string formats compare lexically and silently
+> exclude rows. The embedding is irrelevant to a metadata predicate, and HNSW engines support ranges via
+> payload indexes.

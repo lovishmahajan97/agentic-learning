@@ -5,6 +5,7 @@ name: High availability
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - reliability/fault-tolerance
   - reliability/multi-region-architecture

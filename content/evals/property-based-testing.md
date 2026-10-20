@@ -104,10 +104,14 @@ the counterexample to `text=''`, which is exactly the bug.
 from hypothesis import given, settings, strategies as st
 
 def chunk(text: str, size: int, overlap: int) -> list[str]:
-    if not text:                          # without this guard the properties below find text=''
+    if not text:                          # without this guard the loop emits one empty chunk for ""
         return []
-    step = size - overlap
-    return [text[i:i + size] for i in range(0, len(text), step)]
+    step, chunks, i = size - overlap, [], 0
+    while True:                           # emit windows until one reaches the end of the text
+        chunks.append(text[i:i + size])
+        if i + size >= len(text):
+            return chunks
+        i += step
 
 params = st.integers(min_value=1, max_value=200).flatmap(
     lambda size: st.tuples(st.just(size), st.integers(min_value=0, max_value=size - 1)))

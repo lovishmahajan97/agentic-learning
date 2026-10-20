@@ -5,6 +5,7 @@ name: FMEA (Failure Mode and Effects Analysis)
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - reliability/chaos-engineering-and-resilience-testing
   - reliability/fault-tolerance

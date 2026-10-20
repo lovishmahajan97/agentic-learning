@@ -5,6 +5,7 @@ name: Durable workflow execution
 kind: pattern
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-and-checkpoint-stores
