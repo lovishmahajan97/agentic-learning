@@ -1,0 +1,220 @@
+---
+id: asgi-lifecycle
+module: fastapi-for-ai
+name: ASGI lifecycle
+kind: concept
+difficulty: core
+est_minutes: 14
+related:
+  - fastapi-for-ai/lifespan
+  - fastapi-for-ai/middleware-ordering
+  - fastapi-for-ai/uvicorn-gunicorn-workers
+  - fastapi-for-ai/graceful-shutdown-and-worker-draining
+  - fastapi-for-ai/cancellation-on-client-disconnect
+  - python-for-ai/asyncio
+  - backend-fundamentals/fastapi
+sources:
+  - ASGI specification (asgiref project)
+  - Official docs: Starlette
+  - Official docs: Uvicorn
+---
+
+## TL;DR
+ASGI is the contract between an async server (Uvicorn, Hypercorn) and your application: the app is a
+single `async def app(scope, receive, send)` that the server calls once per connection, plus one special
+`lifespan` connection per process for startup and shutdown. Everything FastAPI does at runtime —
+lifespan, middleware, streaming, disconnect detection, per-worker state — is a move in this message
+protocol, so knowing the sequence explains behaviour that otherwise looks like magic.
+
+## Why it exists
+WSGI, the previous Python web contract, is a synchronous function call: `app(environ, start_response)`
+returns an iterable of bytes, and the server dedicates a thread or process to the request until that
+iterable is exhausted. That model worked for millisecond database-backed pages. It breaks for AI
+services: an LLM call can hold a connection for 30–120 seconds while the handler does nothing but wait
+on a socket, token streaming wants to write partial output for the whole of that time, voice and agent
+UIs want WebSockets, and a single request often fans out to several provider calls at once. Under
+thread-per-request, 500 concurrent streaming chats means 500 mostly idle threads, each with a stack,
+all contending on the GIL for the little Python work there is, and no way to say "wait for this socket
+without holding a thread".
+
+The naive fixes fail. "Add more threads" hits memory and scheduler cost long before 10k connections,
+and still offers no WebSocket or server-push semantics. "Monkey-patch with gevent" makes blocking
+libraries cooperative by stealth, which is fragile with C extensions and GPU libraries. Neither gives a
+startup/shutdown protocol, so model loading ends up at import time (slow tests, no failure signal) or
+on the first request (one unlucky user pays the cold start).
+
+ASGI replaces call-and-return with asynchronous message passing over an awaitable callable. One event
+loop can hold thousands of connections, each parked cheaply on `await`, and the protocol has explicit
+messages for request body chunks, response chunks, disconnects, WebSocket frames and process lifecycle.
+The cost is that every layer must speak the protocol, which is exactly what Starlette and FastAPI do
+for you.
+
+## How it works
+### One callable, three kinds of scope
+An ASGI application is `async def app(scope, receive, send)`. `scope` is a plain dict describing the
+connection; its `type` is `"http"`, `"websocket"` or `"lifespan"`. For HTTP it also carries `method`,
+`path`, `query_string`, `headers` (a list of `(bytes, bytes)` pairs), `client`, `server` and a `state`
+dict. `receive` is an async callable that returns the next event from the server; `send` pushes an
+event back. The server calls `app` once per connection: for HTTP/1.1 keep-alive, every request on the
+socket is its own call with a fresh scope, so nothing leaks between requests unless you create it.
+
+### The lifespan connection
+When a worker process starts, the server opens one connection with `scope["type"] == "lifespan"` and
+calls the app. The app awaits `receive()` and gets `{"type": "lifespan.startup"}`; it runs startup
+work, then sends `lifespan.startup.complete` (or `lifespan.startup.failed` with a message). It then
+parks on `receive()` until the server sends `lifespan.shutdown`, runs teardown, and answers
+`lifespan.shutdown.complete`. FastAPI's `lifespan` context manager is literally the code before and
+after the `yield` in this exchange. Uvicorn completes the startup handshake *before* it starts
+accepting connections on its socket, so a worker whose startup fails never receives traffic, and a
+worker that is still loading a model is simply not serving yet. Uvicorn's `--lifespan` flag chooses
+`auto` (tolerate apps that do not implement the protocol), `on` (require it) or `off`.
+
+### An HTTP request, message by message
+1. The server parses the request line and headers, builds the scope and calls `app`.
+2. The app reads the body by looping on `receive()`: each `http.request` event carries a `body` chunk
+   and a `more_body` flag. FastAPI's JSON parsing and `UploadFile` streaming are both built on this
+   loop, which is why a body can be read only once.
+3. The app sends exactly one `http.response.start` with `status` and `headers`, then one or more
+   `http.response.body` events. Setting `more_body: True` keeps the response open, which is how
+   `StreamingResponse` emits tokens as they arrive; the final event has `more_body: False`.
+4. If the client goes away, the next `receive()` returns `http.disconnect`. Nothing is raised
+   automatically, *because* the app is the one doing the awaiting; this is why Starlette offers
+   `request.is_disconnected()` and why a token generator only notices a vanished client when it next
+   tries to send.
+
+### WebSockets
+A `websocket` scope begins with a `websocket.connect` event; the app answers `websocket.accept`
+(optionally with a subprotocol) or `websocket.close`. Frames then flow as `websocket.receive` /
+`websocket.send` events with `text` or `bytes`, until `websocket.disconnect`. The same callable
+signature handles it, which is why a FastAPI app can serve REST and WebSocket routes from one process.
+
+### Where FastAPI sits in the chain
+FastAPI subclasses Starlette, and Starlette's `__call__` builds a stack on first use:
+`ServerErrorMiddleware` → your middleware → `ExceptionMiddleware` → `Router` → route → endpoint. Every
+layer has the same `(scope, receive, send)` signature, so a middleware can wrap `send` to add a header
+or count bytes, or wrap `receive` to cap body size. The router sends lifespan scopes to the lifespan
+handler and dispatches http/websocket scopes by path.
+
+### Processes and event loops
+One worker process runs one event loop and one app instance. `uvicorn --workers 4` (or Gunicorn with a
+Uvicorn worker class) forks four processes, each of which runs its own lifespan handshake and holds its
+own copies of anything loaded there. "Load once" therefore means once per worker, which matters when
+the thing loaded is a multi-gigabyte model.
+
+## Example
+A raw ASGI app with no framework, showing the lifespan handshake, body reading and a streamed response.
+Run it with `uvicorn asgi_demo:app --lifespan on` and `curl -N -d "the kv cache stores keys"
+localhost:8000` to watch words arrive one at a time. FastAPI's `lifespan=` and `StreamingResponse`
+generate exactly these messages for you.
+
+```python
+import asyncio
+
+STATE = {}
+
+async def app(scope, receive, send):
+    if scope["type"] == "lifespan":
+        while True:
+            msg = await receive()
+            if msg["type"] == "lifespan.startup":
+                STATE["gen"] = lambda text: (w + " " for w in text.split())  # stand-in for a model
+                await send({"type": "lifespan.startup.complete"})
+            elif msg["type"] == "lifespan.shutdown":
+                STATE.clear()
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+    elif scope["type"] == "http":
+        body = b""
+        while True:                                   # read the whole request body
+            msg = await receive()
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/plain")]})
+        for token in STATE["gen"](body.decode() or "hello world"):
+            await send({"type": "http.response.body", "body": token.encode(), "more_body": True})
+            await asyncio.sleep(0.2)                  # pretend each token costs time
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+```
+
+## Trade-offs
+- One event loop serves thousands of idle connections cheaply, but a single blocking call anywhere
+  stalls all of them; the win flips into a loss the moment CPU-bound inference runs on the loop.
+- The message protocol gives you streaming, WebSockets and disconnect events, at the price of every
+  middleware having to handle `send`/`receive` correctly; a sloppy middleware can buffer a token stream
+  into one lump.
+- Per-worker lifespan isolates failures and avoids cross-process locks, but multiplies memory for
+  app-scoped models by the worker count; past one or two workers a separate model server usually wins.
+- A failing startup keeps a broken worker off the network, which is safe, but it also means a slow
+  model load delays readiness; orchestrators need startup probes tuned to the load time.
+
+## Pitfalls
+- Reading the request body twice (for example in a logging middleware and then in the endpoint); the
+  second reader hangs or gets an empty body because `http.request` events are consumed once. Symptom:
+  422s or timeouts only when that middleware is enabled.
+- Assuming a client disconnect raises an exception in the handler; it does not, so a long LLM call
+  keeps burning provider tokens for a user who left. Symptom: provider spend higher than responses
+  actually delivered.
+- Treating `app.state` as shared memory across workers; each worker has its own, so caches and
+  counters diverge. Symptom: rate limits or cache hit rates that look random under `--workers 4`.
+- Putting model loading at import time instead of the lifespan handshake; tests, migrations and CLI
+  tools that import the module pay the load, and a load failure surfaces as an import error with no
+  `startup.failed` message. Symptom: twenty-second test collection.
+
+## When to use
+You do not choose ASGI versus WSGI per endpoint; you choose it per service, and for anything that
+streams, holds long connections or awaits remote models the answer is ASGI. Reach for raw protocol
+knowledge when something behaves oddly at the edges: a streaming response that arrives all at once, a
+disconnect that nobody noticed, a startup that hangs under Gunicorn, a body that reads as empty.
+Measure event-loop lag (how late a no-op task scheduled every second actually runs) under load; it
+tells you whether something is blocking. In interviews, being able to walk through the lifespan and
+HTTP message sequence, and to say where FastAPI's lifespan, middleware and `StreamingResponse` plug
+into it, separates people who have read the docs from people who have debugged a server.
+
+## Role lens
+- **Engineer:** Writes pure-ASGI middleware when `BaseHTTPMiddleware` breaks streaming, reads
+  `http.disconnect` to cancel abandoned LLM calls, and keeps startup work inside lifespan.
+- **Architect:** Decides worker count versus a dedicated model server from the fact that lifespan state
+  is per process, and sets probe timings around measured startup cost.
+- **FDE:** Diagnoses "the stream only shows up at the end" at a customer site by checking which proxy or
+  middleware is buffering `http.response.body` events.
+
+## Check yourself
+**Q:** A streaming chat endpoint works locally but, behind a customer's gateway, tokens arrive only
+after the full answer is complete, and abandoned chats keep running to completion. Using the ASGI
+message model, explain both symptoms and what you would check.
+**A:** Streaming is a sequence of `http.response.body` events with `more_body: True`; something between
+the app and the browser is accumulating them until `more_body: False`. Candidates are a
+`BaseHTTPMiddleware` that reads the whole response, a compression layer, or the gateway buffering
+upstream responses; test by curling the app directly with `-N`, then each hop outward. Abandoned chats
+continue because a disconnect arrives as an `http.disconnect` event on `receive()`, not as an
+exception; if the handler never polls `request.is_disconnected()` or tries a send, it keeps awaiting
+the provider. The fix is to check for disconnect between tokens, or run the provider call in a task
+that is cancelled when the disconnect event arrives, and to confirm the gateway actually forwards the
+connection close.
+
+## Quiz
+### Q: When does Uvicorn start accepting HTTP connections for a FastAPI app with a lifespan handler?
+- [ ] As soon as the process starts; startup runs concurrently with the first requests
+- [x] After the app sends `lifespan.startup.complete`
+- [ ] After the first request triggers lazy initialisation
+- [ ] When the health endpoint first returns 200
+> The lifespan handshake completes before the server begins serving on its socket, so a worker that is
+> still loading a model is not serving yet, and a failed startup never receives traffic.
+
+### Q: How does an ASGI app learn that the client closed the connection mid-stream?
+- [ ] An exception is raised at the next `await` in the handler
+- [ ] The server cancels the handler's task immediately
+- [x] A subsequent `receive()` returns an `http.disconnect` event
+- [ ] The scope's `client` field becomes `None`
+> Disconnect is a message, not an exception; the handler must read it, which is what
+> `request.is_disconnected()` does, otherwise a long model call keeps running for nobody.
+
+### Q: With `uvicorn --workers 4`, how many times does the lifespan startup code run?
+- [ ] Once, in the master process, with state shared by fork
+- [x] Four times, once per worker process
+- [ ] Once per request until every worker is warm
+- [ ] Twice: once at bind time and once at first request
+> Each worker is a separate process with its own event loop and app instance, so a model loaded in
+> lifespan is loaded four times and occupies four times the memory.

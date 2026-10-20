@@ -21,11 +21,11 @@ sources:
 
 ## TL;DR
 Pydantic turns a class with type hints into a validator, parser, serialiser and JSON Schema generator.
-It exists because the data entering AI systems (HTTP bodies, LLM output, config, queue messages) is
-untrusted and type hints alone check nothing at runtime. One `BaseModel` gives you the schema you send
-to the model or the API docs, the parser that rejects bad output with a precise error list, and the
-object your code can trust afterwards. Validation is compiled once per class into Rust
-(`pydantic-core`), so the per-instance cost is small but not zero.
+It exists because data entering AI systems (HTTP bodies, LLM output, config, queue messages) is
+untrusted and type hints check nothing at runtime. One `BaseModel` yields the schema you send to the
+model, the parser that rejects bad output with a precise error list, and an object your code can
+trust. Validation is compiled once per class into Rust (`pydantic-core`), so per-instance cost is
+small but not zero.
 
 ## Why it exists
 The boundary problem is simple to state: a function annotated `def handle(order: Order)` is only safe
@@ -162,8 +162,10 @@ print(good.customer, good.items[0].qty, good.total)  # ACME 2 19.0   ("2" was co
   and the error list shows `type: missing` for it.
 - Assuming assignment is validated: `order.qty = -5` succeeds silently unless `validate_assignment=
   True`, so an object that passed on entry can be invalid when it leaves.
-- Naming a field `model_name` or similar; the `model_` prefix is a protected namespace in v2 and
-  emits a warning until you rename or override `protected_namespaces`.
+- Naming a field so that it collides with Pydantic's own `model_*` methods (current releases warn for
+  names starting with `model_validate` or `model_dump`; early 2.x releases warned for the whole
+  `model_` prefix); the symptom is a protected-namespace warning at class creation, fixed by renaming
+  or setting `protected_namespaces`.
 - Calling `json.dumps(obj.model_dump())` with datetimes or enums inside and hitting `TypeError`; use
   `model_dump(mode="json")` or `model_dump_json()`.
 - Building a response model from `model_validate` on a dict that was already the model's own

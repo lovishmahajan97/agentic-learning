@@ -5,6 +5,7 @@ name: Multi-region architecture
 kind: pattern
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - reliability/high-availability
   - reliability/disaster-recovery
@@ -119,8 +120,9 @@ Incident: `us-east` becomes unreachable. The global load balancer marks it unhea
 failed checks and routes all users to `eu-west`. The on-call engineer confirms the region, not the
 checks, is the problem and runs the promotion step; `eu-west`'s replica of US tenants becomes primary
 at T+6 min. Writes that `us-east` accepted in its last ~2 s before the loss never replicated: the RPO
-for US tenants is about 2 s, and those writes appear in an idempotency log that reconciliation will
-replay later. Agent runs that were mid-step in `us-east` resume in `eu-west` from their last
+for US tenants is about 2 s. Those writes are stranded in `us-east` until it returns; clients that
+hold their idempotency keys can safely resubmit now, and anything else is reconciled from
+`us-east`'s log at failback. Agent runs that were mid-step in `us-east` resume in `eu-west` from their last
 checkpoint, re-executing only the interrupted step.
 
 Capacity: `eu-west` now carries both regions' traffic, 40% + 40% = 80% of one region, so compute

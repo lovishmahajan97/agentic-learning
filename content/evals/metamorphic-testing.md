@@ -20,11 +20,11 @@ sources:
 
 ## TL;DR
 Metamorphic testing checks a system without knowing the right answer. Instead of asserting that an output
-equals an expected value, you transform the input in a way whose effect on the output is predictable
-(paraphrase it: same answer; add an irrelevant paragraph: same answer; swap two options: the choice
-swaps) and assert that the relation holds between the two outputs. It exists because most inputs to an
-LLM system have no label, and relation violations are cheap to generate and expose brittleness that a
-golden set, which sees each item once in one form, cannot.
+equals an expected value, you transform the input in a way whose effect is predictable (paraphrase: same
+answer; add an irrelevant paragraph: same answer; swap two options: the choice swaps) and assert that
+relation between the two outputs. It exists because most LLM inputs have no label, and relation
+violations are cheap to generate and expose brittleness a golden set, which sees each item once in one
+form, cannot.
 
 ## Why it exists
 Testing needs an oracle, something that says what the correct output is. For an LLM system the oracle

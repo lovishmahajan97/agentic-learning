@@ -5,6 +5,7 @@ name: Backpressure & load shedding
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - fastapi-for-ai/backpressure
   - serving-inference/backpressure
@@ -84,8 +85,10 @@ mechanics that matter:
   tracks the service's real capacity as model sizes, prompt lengths and downstream speed change.
 
 ### Where retries fit
-Retries are a load multiplier. A client that retries three times turns a 10% overload into a 40%
-one. Shedding only works if clients back off on 429/503 with jitter, honour `Retry-After`, and keep a
+Retries are a load multiplier. If a client retries each rejected request up to three times, every
+one of them comes back three more times, so a 10% excess becomes roughly 40% at first order; and
+because the retries are themselves rejected, total attempts can approach four times the original
+traffic before the budget runs out. Shedding only works if clients back off on 429/503 with jitter, honour `Retry-After`, and keep a
 retry budget. Circuit breakers on the client side stop the storm entirely once rejection rates are
 high; bulkheads keep one overloaded dependency from consuming every worker.
 
@@ -141,8 +144,10 @@ async def chat(req: Request):
         slots.release()
 ```
 
-Walk the numbers: if inference averages 640 ms per request with 32 slots, service rate is about
-50 req/s; a 64-deep queue therefore represents roughly 1.3 s of wait, inside the 2 s budget, and
+One runtime caveat: before Python 3.12, `asyncio.wait_for` could cancel `Semaphore.acquire()` at the
+same instant it succeeded and leak the slot; on older interpreters wrap the acquire so a timed-out
+acquisition releases what it won. Walk the numbers: if inference averages 640 ms per request with 32
+slots, service rate is about 50 req/s; a 64-deep queue therefore represents roughly 1.3 s of wait, inside the 2 s budget, and
 anything beyond is rejected in microseconds with a `Retry-After` the client should honour. Export
 `waiting`, rejections by priority and queue wait time, and the picture of an overload becomes a
 flat goodput line instead of a cliff.

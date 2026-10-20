@@ -39,35 +39,35 @@ Live numbers and the per-module remaining work:
     python3 scripts/make_workflow.py --status
     python3 scripts/build.py --report        # validator view: ok / missing / invalid
 
-Snapshot when this file was written:
+Snapshot when this file was last updated:
 
 ```
-# 2026-10-20 13:55 UTC
-lessons written 308/584 | fact-checked 115/584 | reviewed 0/584 | guides 0/30
-agents still needed: write 48, fact-check 68, teach-check 85, guides 30 = 231 total
+# 2026-10-20 14:13 UTC
+lessons written 385/584 | fact-checked 171/584 | reviewed 0/584 | guides 0/30
+agents still needed: write 33, fact-check 60, teach-check 85, guides 30 = 208 total
 remaining by module:
   ml-fundamentals                    tier 1  chunks to write= 0 fact-check= 0 teach-check= 3 guide=todo
   model-internals                    tier 1  chunks to write= 0 fact-check= 0 teach-check= 3 guide=todo
   training-adaptation                tier 1  chunks to write= 0 fact-check= 1 teach-check= 4 guide=todo
   prompting                          tier 1  chunks to write= 0 fact-check= 2 teach-check= 2 guide=todo
-  rag-retrieval                      tier 1  chunks to write= 4 fact-check= 5 teach-check= 5 guide=todo
-  agents                             tier 1  chunks to write= 1 fact-check= 3 teach-check= 3 guide=todo
-  agent-reliability                  tier 1  chunks to write= 1 fact-check= 2 teach-check= 2 guide=todo
-  evals                              tier 1  chunks to write= 2 fact-check= 4 teach-check= 4 guide=todo
+  rag-retrieval                      tier 1  chunks to write= 2 fact-check= 5 teach-check= 5 guide=todo
+  agents                             tier 1  chunks to write= 0 fact-check= 3 teach-check= 3 guide=todo
+  agent-reliability                  tier 1  chunks to write= 0 fact-check= 2 teach-check= 2 guide=todo
+  evals                              tier 1  chunks to write= 0 fact-check= 4 teach-check= 4 guide=todo
   serving-inference                  tier 1  chunks to write= 0 fact-check= 0 teach-check= 4 guide=todo
   observability                      tier 1  chunks to write= 0 fact-check= 0 teach-check= 2 guide=todo
-  safety-security                    tier 1  chunks to write= 0 fact-check= 1 teach-check= 2 guide=todo
-  multimodal                         tier 1  chunks to write= 0 fact-check= 1 teach-check= 1 guide=todo
-  backend-fundamentals               tier 1  chunks to write= 3 fact-check= 3 teach-check= 3 guide=todo
-  python-for-ai                      tier 1  chunks to write= 7 fact-check= 7 teach-check= 7 guide=todo
+  safety-security                    tier 1  chunks to write= 0 fact-check= 0 teach-check= 2 guide=todo
+  multimodal                         tier 1  chunks to write= 0 fact-check= 0 teach-check= 1 guide=todo
+  backend-fundamentals               tier 1  chunks to write= 0 fact-check= 3 teach-check= 3 guide=todo
+  python-for-ai                      tier 1  chunks to write= 6 fact-check= 7 teach-check= 7 guide=todo
   fastapi-for-ai                     tier 1  chunks to write= 5 fact-check= 5 teach-check= 5 guide=todo
-  node-ts-for-ai                     tier 1  chunks to write= 3 fact-check= 3 teach-check= 3 guide=todo
-  system-design                      tier 2  chunks to write= 0 fact-check= 5 teach-check= 5 guide=todo
-  reliability                        tier 2  chunks to write= 0 fact-check= 2 teach-check= 2 guide=todo
+  node-ts-for-ai                     tier 1  chunks to write= 0 fact-check= 3 teach-check= 3 guide=todo
+  system-design                      tier 2  chunks to write= 0 fact-check= 0 teach-check= 5 guide=todo
+  reliability                        tier 2  chunks to write= 0 fact-check= 1 teach-check= 2 guide=todo
   agent-runtime-architecture         tier 2  chunks to write= 0 fact-check= 0 teach-check= 1 guide=todo
   data-architecture                  tier 2  chunks to write= 0 fact-check= 2 teach-check= 2 guide=todo
   infra-capacity-economics           tier 2  chunks to write= 4 fact-check= 4 teach-check= 4 guide=todo
-  llmops-platform                    tier 2  chunks to write= 2 fact-check= 2 teach-check= 2 guide=todo
+  llmops-platform                    tier 2  chunks to write= 0 fact-check= 2 teach-check= 2 guide=todo
   security-governance-compliance     tier 2  chunks to write= 2 fact-check= 2 teach-check= 2 guide=todo
   strategy                           tier 2  chunks to write= 1 fact-check= 1 teach-check= 1 guide=todo
   scoping                            tier 3  chunks to write= 3 fact-check= 3 teach-check= 3 guide=todo
