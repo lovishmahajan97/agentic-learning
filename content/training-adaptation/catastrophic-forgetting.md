@@ -22,12 +22,11 @@ sources:
 ---
 
 ## TL;DR
-When you fine-tune a network on new data, the gradients only care about the new loss; nothing stops them
-from overwriting the weights that encoded older capabilities, so the model forgets what it is not being
-trained on. For an LLM this means a fine-tune on your task can silently lose general instruction
-following, reasoning or safety behaviour, because your evaluation set measures only your task. The
-defences are to mix in general data, keep the update small, isolate it in adapters, pull back toward the
-original weights, and gate every fine-tune on a general regression suite.
+Fine-tuning computes gradients of the new loss only; nothing stops them overwriting the weights that
+encoded older capabilities, so the model forgets what it is not being trained on. For an LLM, a fine-tune
+on your task can silently lose general instruction following, reasoning or safety behaviour, because your
+evaluation measures only your task. Defences: mix in general data, keep the update small, isolate it in
+adapters, pull back toward the original weights, and gate every fine-tune on a general regression suite.
 
 ## Why it exists
 A neural network stores everything in one shared set of weights. There is no region for "French", one for

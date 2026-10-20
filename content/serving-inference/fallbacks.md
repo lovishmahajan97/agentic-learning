@@ -5,6 +5,7 @@ name: Fallbacks
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - system-design/model-fallback-strategies
   - reliability/circuit-breakers
@@ -32,7 +33,7 @@ Hosted models fail in ways a retry cannot fix: a provider returns 529 overloaded
 during a demand spike, a region has an incident, a deployment pushes elevated 5xx, a model is deprecated,
 a content filter refuses, latency triples under load. Self-hosted engines add their own: a GPU node dies,
 a rollout ships a bad build, a long-context burst preempts everything. A retry assumes the target will be
-healthy a second later; during an incident it is not, and three retries against a 30-second timeout is a
+healthy a second later; during an incident it is not, and three attempts against a 30-second timeout is a
 90-second path to the same error. The alternative to a fallback is showing the user an error, which is
 sometimes right (a medical triage assistant should fail closed) but for most product surfaces a slightly
 worse answer beats none.
@@ -55,8 +56,8 @@ results without synthesis, a template); and finally an explicit error with a ret
 costs quality, so the ladder is built to exhaust the cheapest-in-quality options first.
 
 ### Trigger classification
-Only some failures justify a fallback. Transient capacity errors (429, 500, 502, 503, 504, 529,
-connection failures, timeouts before the first token) justify one retry on the same target and then a
+Only some failures justify a fallback. Transient capacity errors (429, 500, 502, 503, 504, 529 (Anthropic's
+overloaded status), connection failures, timeouts before the first token) justify one retry on the same target and then a
 fallback. Request-specific errors (400 for a malformed body, a context-length overflow, an unsupported
 parameter) will fail identically on any equivalent target; the one exception is a context overflow,
 which may legitimately route to a model with a larger window. Authentication and billing errors are
@@ -106,7 +107,7 @@ class Breaker:
     def __init__(self, threshold=5, cooldown_s=30):
         self.failures, self.open_until = 0, 0.0
         self.threshold, self.cooldown_s = threshold, cooldown_s
-    def available(self): return time.monotonic() >= self.open_until
+    def available(self): return time.monotonic() >= self.open_until   # after cooldown: next call is the probe
     def record_ok(self):  self.failures = 0
     def record_fail(self):
         self.failures += 1

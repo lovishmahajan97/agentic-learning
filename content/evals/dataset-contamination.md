@@ -21,12 +21,12 @@ sources:
 ---
 
 ## TL;DR
-Dataset contamination is the presence of evaluation items, their paraphrases or their solutions in a
-model's training data, so that a score measures memorization instead of capability. It is the LLM
-version of train/test leakage, made unavoidable by training on web-scale crawls that contain the very
-benchmarks used to grade the result. It matters because the inflation is uneven across models and
-tasks, so contaminated comparisons point to the wrong model, and because your own golden dataset can
-be contaminated just as easily through few-shot prompts and fine-tuning data.
+Dataset contamination is the presence of evaluation items, their paraphrases or solutions in a
+model's training data, so a score measures memorization instead of capability. It is train/test
+leakage at LLM scale, made unavoidable by training on web crawls that contain the benchmarks used to
+grade the result. It matters because the inflation is uneven across models and tasks, so contaminated
+comparisons pick the wrong model, and because your own golden dataset is contaminated as easily
+through few-shot prompts and fine-tuning data.
 
 ## Why it exists
 In classical machine learning the train/test split was yours: you held out rows and nothing in

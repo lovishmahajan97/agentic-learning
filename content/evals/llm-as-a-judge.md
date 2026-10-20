@@ -21,12 +21,11 @@ sources:
 ---
 
 ## TL;DR
-LLM-as-a-judge uses a model, given a rubric, the output to assess and usually a reference answer or a
-second output, to produce a grade in place of a human reviewer. It exists because open-ended outputs
-have no exact-match answer and human grading does not scale to hundreds of items per prompt
-iteration. It is only as good as its agreement with human labels on your task, which must be measured,
-because judges carry known biases (position, verbosity, self-preference) and grade confidently whether
-or not they are right.
+LLM-as-a-judge uses a model, given a rubric, the output to assess and often a reference or a second
+output, to grade in place of a human reviewer. It exists because open-ended outputs have no
+exact-match answer and human grading does not scale to hundreds of items per prompt iteration. It is
+only as good as its measured agreement with human labels on your task, because judges carry known
+biases (position, verbosity, self-preference) and grade confidently, right or wrong.
 
 ## Why it exists
 A summarizer, a support reply or an agent's final report cannot be graded by string equality. The

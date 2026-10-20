@@ -22,12 +22,12 @@ sources:
 ---
 
 ## TL;DR
-Overfitting is a model fitting the particulars of its training examples (label noise, phrasing, field
-order) instead of the pattern that transfers to new data. The signature is training loss that keeps
-falling while held-out loss stalls and then rises. It happens because a network with far more parameters
-than examples can memorise anything; the remedies are more or cleaner data, fewer steps, less trainable
-capacity, regularisation, and early stopping on a held-out set. Fine-tuning a small set for many epochs
-is the most common way engineers overfit an LLM.
+Overfitting is a model fitting the particulars of its training examples (label noise, phrasing) instead
+of the pattern that transfers to new data. The signature is training loss that keeps falling while
+held-out loss stalls and then rises. It happens because a network with far more parameters than examples
+can memorise anything; the remedies are more or cleaner data, fewer steps, less trainable capacity,
+regularisation and early stopping. Fine-tuning a small set for many epochs is the commonest way engineers
+overfit an LLM.
 
 ## Why it exists
 A training objective asks only one thing: lower the loss on these examples. A model with enough capacity

@@ -5,6 +5,7 @@ name: CPU offloading
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - serving-inference/gpu-memory-optimization
   - serving-inference/kv-cache-paging-and-eviction
@@ -52,8 +53,8 @@ when they resume rather than on every step.
 1. **Weights**, usually at layer granularity. Hugging Face Accelerate's `device_map="auto"` places
    layers on GPU until it is full and the rest on CPU (or disk via `offload_folder`); vLLM has a
    `--cpu-offload-gb` option; DeepSpeed's ZeRO-Inference and FlexGen stream weights with prefetching.
-2. **KV cache**, at block granularity: vLLM's `--swap-space` reserves pinned host memory to swap the
-   blocks of preempted sequences; tiered prefix caches keep warm system-prompt blocks in CPU RAM.
+2. **KV cache**, at block granularity: vLLM's `--swap-space` (its V0 scheduler; the V1 engine preempts
+   by recomputation only) reserves pinned host memory to swap the blocks of preempted sequences; tiered prefix caches keep warm system-prompt blocks in CPU RAM.
 3. **Activations and optimizer state**, which matter for training (ZeRO-Offload, ZeRO-Infinity) and
    barely at all for inference.
 
@@ -170,7 +171,8 @@ reports 3 tokens/s. They ask whether a faster CPU would help. What is your analy
 **A:** A 4-bit 70B model is around 40 GB of weights; with KV cache and runtime overhead it slightly
 exceeds 48 GB, so a few gigabytes are offloaded. If the engine streams those layers over PCIe, step time
 is dominated by offloaded bytes divided by bus bandwidth, roughly 40 ms per gigabyte on Gen4, and a
-faster CPU changes nothing. If it computes them on the CPU, host memory bandwidth and CPU matmul speed
+faster CPU changes nothing; 3 tokens/s is about 330 ms per token, consistent with roughly 7–8 GB crossing
+a Gen4 link every step. If it computes them on the CPU, host memory bandwidth and CPU matmul speed
 matter, and a faster CPU helps a little but not to GPU-class speed. The real fix is to remove the
 overflow: cap context length so the KV cache shrinks, use a slightly smaller quantization or a model
 with fewer KV heads, or add a second GPU with tensor parallelism. I would measure the offloaded size and

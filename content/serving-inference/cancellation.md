@@ -5,6 +5,7 @@ name: Cancellation
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - serving-inference/timeouts
   - serving-inference/streaming

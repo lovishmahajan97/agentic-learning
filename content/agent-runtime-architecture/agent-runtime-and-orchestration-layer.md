@@ -5,6 +5,7 @@ name: Agent runtime & orchestration layer
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -163,8 +164,8 @@ class Runtime:
 - Adopting a durable workflow engine saves you from writing checkpointing and timers, but its programming
   model (deterministic replay, versioned workflow code) constrains how agent code can change; bespoke
   runtimes are more flexible and more work.
-- Hosted vendor agent runtimes remove the loop entirely, but you inherit their state model, pay per step,
-  and still have to build policy, tenancy and credential handling around them.
+- Hosted vendor agent runtimes remove the loop entirely, but you inherit their state model, pay their per-call and
+  per-tool pricing, and still have to build policy, tenancy and credential handling around them.
 
 ## Pitfalls
 - Executing the tool before persisting the model's decision; the symptom is duplicated side effects

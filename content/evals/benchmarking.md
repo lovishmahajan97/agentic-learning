@@ -21,12 +21,12 @@ sources:
 ---
 
 ## TL;DR
-A benchmark is a fixed dataset plus a fixed scoring rule, so different models can be compared on the
-same task. MMLU measures broad knowledge via multiple choice, HumanEval measures Python function
-synthesis via unit tests, SWE-bench measures resolving real GitHub issues in real repositories, and
-GPQA measures expert-level science reasoning that web search does not help with. Benchmarks exist so
-that model comparison is not anecdote, but each one measures something narrow, saturates, and leaks
-into training data; treat a leaderboard as a screening filter, never as evidence your task will work.
+A benchmark is a fixed dataset with a fixed scoring rule, so models can be compared on the same
+task. MMLU measures broad knowledge by multiple choice, HumanEval measures Python function synthesis
+by unit tests, SWE-bench measures resolving real GitHub issues, and GPQA measures expert science
+reasoning that web search cannot shortcut. Benchmarks exist so model comparison is not anecdote, but
+each measures something narrow, saturates and leaks into training data: treat a leaderboard as a
+screening filter, never as evidence your task will work.
 
 ## Why it exists
 Before shared benchmarks, every lab reported results on tasks of its own choosing, with its own

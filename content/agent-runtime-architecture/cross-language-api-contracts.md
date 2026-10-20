@@ -5,6 +5,7 @@ name: Cross-language API contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agents/typed-tool-contracts
   - agents/tool-schemas-and-argument-validation

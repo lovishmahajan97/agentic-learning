@@ -5,6 +5,7 @@ name: Streaming (SSE)
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - serving-inference/ttft
   - serving-inference/tpot

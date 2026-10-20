@@ -5,6 +5,7 @@ name: Multi-tenant state isolation
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - system-design/multi-tenancy
   - system-design/tenant-isolation
@@ -111,8 +112,10 @@ from contextlib import contextmanager
 DDL = """
 alter table agent_steps enable row level security;
 alter table agent_steps force row level security;               -- owner is not exempt
-create policy tenant_rows on agent_steps
-  using (tenant_id = current_setting('app.tenant_id')::uuid);   -- applies to SELECT/UPDATE/DELETE
+create policy tenant_rows on agent_steps                        -- FOR ALL by default; with no
+  using (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid);  -- WITH CHECK, USING
+-- also gates INSERT/UPDATE rows. missing_ok=true plus nullif: an unset or reset ('') setting compares
+-- as NULL and yields zero rows instead of an error, so an unscoped request fails closed.
 """
 
 @contextmanager

@@ -5,6 +5,7 @@ name: Secrets & credential isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - backend-fundamentals/secrets-management
   - backend-fundamentals/oauth-2-0-oidc
@@ -66,7 +67,8 @@ The architecture has three zones with different access:
    make the call, and returns only the business result to the loop. It never returns the token.
 3. **Code sandboxes** hold nothing. Outbound calls from generated code go through an egress proxy that
    injects authentication for allow-listed hosts; the sandbox sees a plain request and an allow-list, never
-   a key. Everything else is blocked, because an outbound HTTP request with the secret in the URL is the
+   a key. For HTTPS this means the proxy terminates TLS with a certificate the sandbox trusts, because a
+   pass-through `CONNECT` tunnel is opaque and no header can be added to it. Everything else is blocked, because an outbound HTTP request with the secret in the URL is the
    universal exfiltration channel.
 
 This split exists because the damage from a leak is bounded by what the leaking component can reach. A loop
@@ -110,10 +112,11 @@ class CredentialBroker:
     def __init__(self, vault, oauth):
         self.vault, self.oauth = vault, oauth
 
-    def access_token(self, ctx, integration, scopes, ttl_s=300):
+    def access_token(self, ctx, integration, scopes):
         path = f"tenants/{ctx.tenant_id}/users/{ctx.user_id}/{integration}/refresh_token"
         refresh = self.vault.read(path)                     # decrypted with the tenant's key
-        tok = self.oauth.exchange(refresh, scope=" ".join(sorted(scopes)), ttl_s=ttl_s)
+        tok = self.oauth.exchange(refresh, scope=" ".join(sorted(scopes)))
+        # lifetime (expires_in) is decided by the authorization server; configure it to minutes there
         self.vault.audit(run_id=ctx.run_id, integration=integration, scopes=scopes)
         return tok                                          # short-lived, down-scoped, never logged
 
@@ -135,7 +138,10 @@ def run_crm_search(ctx, args, broker, http):
     return {"status": r.status_code, "body": scrub(r.text)[:20_000]}
 
 # Sandbox side: generated code only ever sees this; the proxy adds auth for allow-listed hosts.
-SANDBOX_ENV = {"HTTPS_PROXY": "http://egress-proxy:3128", "ALLOWED_HOSTS": "api.github.com"}
+# For HTTPS the proxy must terminate TLS with a CA the sandbox trusts (SSL_CERT_FILE); a plain
+# CONNECT tunnel is opaque end to end and nothing can be injected into it.
+SANDBOX_ENV = {"HTTPS_PROXY": "http://egress-proxy:3128", "SSL_CERT_FILE": "/etc/egress-ca.pem",
+               "ALLOWED_HOSTS": "api.github.com"}
 ```
 
 ## Trade-offs

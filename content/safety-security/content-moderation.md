@@ -5,6 +5,7 @@ name: Content moderation
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - safety-security/llama-guard
   - safety-security/input-output-guardrails

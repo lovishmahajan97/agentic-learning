@@ -99,7 +99,8 @@ class ErrorKind(str, Enum):
 
 class ToolError(Exception):
     def __init__(self, kind: ErrorKind, message: str, retryable: bool = False):
-        super().__init__(message); self.body = {"kind": kind.value, "message": message, "retryable": retryable}
+        super().__init__(message)
+        self.body = {"kind": kind.value, "message": message, "retryable": retryable}
 
 class SearchOrdersIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -116,7 +117,7 @@ class SearchOrdersOut(BaseModel):
 @dataclass
 class Tool:
     name: str; description: str; input_model: type[BaseModel]; output_model: type[BaseModel]
-    handler: Callable; read_only: bool = True; parallel_safe: bool = True
+    handler: Callable; read_only: bool = True; parallel_safe: bool = True   # harness-only metadata
 
     def spec(self) -> dict:                                 # what the model sees, derived from types
         return {"name": self.name, "description": self.description,
@@ -125,10 +126,11 @@ class Tool:
     def run(self, raw_input: dict) -> tuple[str, bool]:     # (content, is_error)
         try:
             args = self.input_model.model_validate(raw_input)
-            out = self.output_model.model_validate(self.handler(args))
-            return out.model_dump_json(), False
         except ValidationError as e:
-            return json.dumps(ToolError(ErrorKind.invalid_argument, str(e)).body), True
+            return json.dumps({"kind": "invalid_argument", "message": str(e), "retryable": False}), True
+        try:
+            out = self.output_model.model_validate(self.handler(args))   # output is checked too
+            return out.model_dump_json(), False
         except ToolError as e:
             return json.dumps(e.body), True
 
@@ -139,9 +141,8 @@ def search_orders(args: SearchOrdersIn) -> dict:
         raise ToolError(ErrorKind.not_found, f"customer {args.customer_id} not found")
     return {"orders": rows[:args.limit], "total_matches": len(rows), "truncated": len(rows) > args.limit}
 
-REGISTRY = {t.name: t for t in [Tool("search_orders", "Find a customer's orders. Call when the user "
-                                     "asks about their orders without giving an order id.",
-                                     SearchOrdersIn, SearchOrdersOut, search_orders)]}
+SEARCH = Tool("search_orders", "Find a customer's orders. Call when the user asks about their "
+              "orders without giving an order id.", SearchOrdersIn, SearchOrdersOut, search_orders)
 ```
 
 ## Trade-offs

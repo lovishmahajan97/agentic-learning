@@ -5,6 +5,7 @@ name: Caching (semantic, prompt)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - serving-inference/prefix-caching
   - prompting/prompt-caching
@@ -158,7 +159,8 @@ once within the TTL is already cheaper than not caching (1.35× versus 2×).
 
 ## Pitfalls
 - A timestamp, request id or user name early in the system prompt; the symptom is
-  `cache_read_input_tokens` stuck at zero while the bill is unchanged.
+  `cache_read_input_tokens` stuck at zero while the bill is unchanged or slightly higher, because every
+  request pays the write premium for an entry nothing ever reads.
 - A prefix shorter than the model's minimum; the symptom is no cache-creation tokens ever reported despite
   the breakpoint.
 - Tool definitions rendered in nondeterministic order, or a tool list that varies per request; the symptom

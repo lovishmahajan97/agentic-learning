@@ -5,6 +5,7 @@ name: GPU memory optimization (VRAM math)
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
