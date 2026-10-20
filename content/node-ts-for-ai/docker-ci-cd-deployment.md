@@ -188,8 +188,8 @@ jobs:
   the full grace period to stop and users whose streams cut off at every deploy.
 - Copying the whole source before `npm ci`; the symptom is a dependency install on every commit and a
   ten-minute build for a one-line change.
-- Passing the provider key as a build `ARG` or `ENV`; the symptom is the key readable in `docker
-  history` and in every registry that image was pushed to.
+- Passing the provider key as a build `ARG` or `ENV`; the symptom is the key readable in the image
+  history (`docker history`) and in every registry that image was pushed to.
 - Leaving the default heap size; the symptom is OOM kills by the kernel under load with no JavaScript
   heap error in the logs.
 - Running `npm install` instead of `npm ci`; the symptom is a dependency version in production that no

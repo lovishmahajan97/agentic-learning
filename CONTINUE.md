@@ -16,8 +16,9 @@ before launching anything.
 2. **Session 2 (cloud, branch `claude/wizardly-wozniak-5lduqj`).** Fixed the three TL;DRs, generated a
    resumable workflow from the on-disk state, launched it as 8 parallel runs (the cloud box has 4 CPUs,
    so each run gets only 2 concurrent agents), and auto-committed `content/` to this branch every
-   15 minutes. That session may also be cut off by the usage limit at any point: **the branch is the
-   source of truth, not any session.**
+   15 minutes. **Stopped on request at 2026-10-20 14:17 UTC** with everything on disk validated, committed and
+   pushed; no cloud agents are running any more, so local work can start immediately. **The branch is
+   the source of truth, not any session.**
 
 ## The failed / unfinished task, in one sentence
 
@@ -42,9 +43,10 @@ Live numbers and the per-module remaining work:
 Snapshot when this file was last updated:
 
 ```
-# 2026-10-20 14:13 UTC
-lessons written 385/584 | fact-checked 171/584 | reviewed 0/584 | guides 0/30
-agents still needed: write 33, fact-check 60, teach-check 85, guides 30 = 208 total
+# 2026-10-20 14:17 UTC
+topics ok=400/584 missing=184 invalid=0 | modules missing=30 invalid=0
+lessons written 400/584 | fact-checked 177/584 | reviewed 0/584 | guides 0/30
+agents still needed: write 33, fact-check 59, teach-check 85, guides 30 = 207 total
 remaining by module:
   ml-fundamentals                    tier 1  chunks to write= 0 fact-check= 0 teach-check= 3 guide=todo
   model-internals                    tier 1  chunks to write= 0 fact-check= 0 teach-check= 3 guide=todo
@@ -63,7 +65,7 @@ remaining by module:
   fastapi-for-ai                     tier 1  chunks to write= 5 fact-check= 5 teach-check= 5 guide=todo
   node-ts-for-ai                     tier 1  chunks to write= 0 fact-check= 3 teach-check= 3 guide=todo
   system-design                      tier 2  chunks to write= 0 fact-check= 0 teach-check= 5 guide=todo
-  reliability                        tier 2  chunks to write= 0 fact-check= 1 teach-check= 2 guide=todo
+  reliability                        tier 2  chunks to write= 0 fact-check= 0 teach-check= 2 guide=todo
   agent-runtime-architecture         tier 2  chunks to write= 0 fact-check= 0 teach-check= 1 guide=todo
   data-architecture                  tier 2  chunks to write= 0 fact-check= 2 teach-check= 2 guide=todo
   infra-capacity-economics           tier 2  chunks to write= 4 fact-check= 4 teach-check= 4 guide=todo

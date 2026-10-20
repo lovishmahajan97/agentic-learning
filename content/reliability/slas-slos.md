@@ -5,6 +5,7 @@ name: SLAs / SLOs (and SLIs, error budgets)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - reliability/high-availability
   - reliability/fmea
@@ -208,9 +209,10 @@ the measurement.
 - [ ] 4.32 minutes
 - [x] 43.2 minutes
 - [ ] 7.2 hours
-- [ ] 432 minutes
+- [ ] 21.6 minutes
 > 30 days is 43,200 minutes; 0.1 percent of that is 43.2 minutes. The 4.32-minute figure belongs to
-> 99.99 percent and 7.2 hours to 99 percent; the arithmetic is the same multiplication each time.
+> 99.99 percent, 21.6 minutes to 99.95 percent and 7.2 hours to 99 percent; the arithmetic is the same
+> multiplication each time.
 
 ### Q: Why should the internal SLO be stricter than the external SLA?
 - [ ] Because SLAs are measured over longer windows than SLOs

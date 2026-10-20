@@ -5,6 +5,7 @@ name: Bulkheads
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - reliability/circuit-breakers
   - reliability/tenant-level-quotas-and-noisy-neighbor-isolation
@@ -36,9 +37,11 @@ and the pool is full. Requests that need only the LLM and the vector store, both
 now rejected or queued. Health checks share the pool too, so the orchestrator restarts the pods. One slow
 dependency became a complete outage.
 
-The usual first responses do not solve this. A bigger pool delays the moment of exhaustion by the ratio
-you grew it. Timeouts bound each call, but the arithmetic above already includes the timeout; aggregate
-occupancy is rate × timeout, and a shorter timeout only shrinks the number, it does not cap it. A circuit
+The usual first responses do not solve this. A bigger pool only raises the threshold: occupancy under a
+hang is still rate × timeout, a number set by the caller's traffic and not by you, and client retries
+push that rate up until any fixed pool fills. Timeouts bound each call, but the arithmetic above
+already includes the timeout; aggregate occupancy is rate × timeout, and a shorter timeout only shrinks
+the number, it does not cap it. A circuit
 breaker helps once it trips, but it needs a minimum number of observed failures first, and a hung
 dependency that never returns an error can take minutes to register. None of these stops the healthy
 paths from being starved in the meantime.
@@ -121,7 +124,8 @@ class Bulkhead:
             self.sem.release()                                  # released on success, error or cancellation
 
 # Little's law: concurrency = call rate x latency, plus headroom. Illustrative numbers:
-# LLM 20 rps x 4 s = 80 -> cap 100; vector DB 40 rps x 0.05 s = 2 -> cap 10; CRM 5 rps x 2 s = 10 -> cap 20.
+# LLM 20 rps x 3 s = 60 -> cap 100; vector DB 40 rps x 0.05 s = 2 -> cap 10; CRM 5 rps x 0.3 s = 1.5 -> cap 20
+# (generous headroom for the CRM, but still a tenth of the 200-worker pool, so a hang can take at most 20).
 LLM = Bulkhead("llm", 100)
 VEC = Bulkhead("vector_db", 10)
 CRM = Bulkhead("crm_api", 20, max_wait=0.05)
