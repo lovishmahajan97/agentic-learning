@@ -21,8 +21,8 @@ sources:
 
 ## TL;DR
 PagedAttention stores each request's KV cache in fixed-size blocks (usually 16 tokens) behind a
-per-request block table, so memory is allocated on demand and shared. Decode is memory-bound, so the
-recovered memory becomes more concurrent requests, the source of vLLM's throughput gains.
+per-request block table, allocated on demand and shareable. Because decode is memory-bound, the recovered
+memory becomes more concurrent requests, the source of vLLM's throughput gains.
 
 ## Why it exists
 - **Every token in flight costs memory.** About 0.5 MB per token for a Llama-2-7B-style model in fp16

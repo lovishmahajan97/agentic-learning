@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-A fallback is a pre-decided alternative path when the primary fails or is too slow: another endpoint, a
-smaller model, a cached answer, or an honest "unavailable". Retrying a broken target only burns the
-latency budget; the hard parts are deciding fast, staying compatible, and not crushing the backup.
+A fallback is a pre-decided alternative when the primary fails or is slow: another endpoint, a smaller
+model, a cached answer, or an honest "unavailable". Retrying a broken target burns the latency budget;
+the hard parts are fast decisions, compatibility and protecting the backup.
 
 ## Why it exists
 - **Hosted models fail in ways a retry cannot fix.** A provider returns 529 overloaded or 429 for minutes

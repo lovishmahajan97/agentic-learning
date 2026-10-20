@@ -1,5 +1,49 @@
 # Continuing the lesson build (handoff)
 
+## Snapshot 2026-10-21: crisp rewrite stopped on request
+
+**What this phase does.** Every lesson is rewritten from long prose into a scannable format (SPEC v2 in
+`content/SPEC.md`): bullets, steps and tables, a mermaid **Diagram**, 2+ **Examples**, a new
+**Production patterns** section, and 4-6 **Interview questions**. Facts are never dropped:
+`scripts/compare_lesson.py` compares each rewrite with the tag `pre-crisp` (the last commit before the
+rewrite) and fails on any lost number, code block, inline code span, quiz, check-yourself answer or role
+lens. The app was also rearranged into one track of 6 stages (Python first) defined in `curriculum.json`;
+the role-path dropdown is gone (role data is kept in `taxonomy.json`).
+
+**State at the stop point**
+
+| Item | Done |
+|---|---|
+| Lessons in crisp format | 583 / 584 (`multimodal/document-understanding` still in the old format) |
+| Lessons independently verified (`status: crisp-verified`) | 90 / 584 |
+| Module guides made crisp (with a mermaid map) | 0 / 30 |
+| `python3 scripts/build.py` | ok=584/584, modules invalid=0 |
+| `python3 scripts/compare_lesson.py --all` | 583 crisp lessons, 0 lost data |
+| Diagrams parsed with mermaid 10.9.1 | 583 / 583 parse |
+| Prose paragraphs | 2,201 → 636; median 81 → 28 words |
+
+Remaining work: rewrite 1 chunk, verify 72 chunks, 30 guides (103 agents).
+
+**Resume**
+
+    python3 scripts/make_crisp_workflow.py --status      # what is left (reads the files, no session state)
+    python3 scripts/make_crisp_workflow.py --groups 3    # regenerates scripts/lms-crisp.workflow.js
+
+Then launch `scripts/lms-crisp.workflow.js` three times in one message with args
+`{"group": 0, "groups": 3}`, `{"group": 1, "groups": 3}`, `{"group": 2, "groups": 3}`. When they finish:
+`python3 scripts/build.py`, `python3 scripts/compare_lesson.py --all`, parse every diagram in the browser
+(see the mermaid rules in SPEC.md), commit, push, and republish the artifact in place
+(https://claude.ai/artifact/F7P3j3rqGSKnXKCCb2vH1b; page `site/page.html` plus `app.js`, `styles.css`,
+`data.js` and every `data/<module>.js`). The published artifact still shows the previous version.
+
+**Gotchas from this phase**
+- Workflow prompts are JavaScript template strings: never put backticks in prompt text.
+- Do not move the `pre-crisp` tag; it is the no-loss baseline.
+- Agents left over-long TL;DRs (46-50 words) in 6 lessons; they were trimmed by hand.
+
+---
+
+
 > **Status 2026-10-20 (session 3, local): the build is complete.** 584/584 lessons written, fact-checked
 > and pedagogy-reviewed; 30/30 module guides; `python3 scripts/build.py` reports `ok=584/584`,
 > `modules missing=0 invalid=0`. The cloud branch was merged into `main` and deleted, so work on `main`.

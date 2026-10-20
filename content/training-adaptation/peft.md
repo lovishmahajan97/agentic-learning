@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-PEFT freezes the base model and trains a small set of extra parameters. LoRA learns each weight update as
-two thin matrices; QLoRA also stores the frozen base in 4-bit, so the job fits one consumer GPU, keeps most of full
-fine-tuning's quality, and yields swappable adapters.
+PEFT freezes the base model and trains a few extra parameters. LoRA learns each weight update as two
+thin matrices; QLoRA also stores the base in 4-bit, so one consumer GPU suffices, quality stays close to
+full fine-tuning, and adapters are swappable.
 
 ## Why it exists
 - **Full fine-tuning does not fit.** Updating every weight of a 7B model needs on the order of 100 GB of

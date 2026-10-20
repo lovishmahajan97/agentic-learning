@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 FastAPI and uvicorn impose no per-request time limit, so a slow LLM call holds a connection, memory and
-a concurrency slot for as long as the dependency lets it. Timeouts turn that hang into a fast, known
-error: phase timeouts per call, one request deadline, innermost firing first.
+a concurrency slot indefinitely. Timeouts turn that hang into a fast, known error: phase timeouts per
+call, one request deadline, innermost firing first.
 
 ## Why it exists
 - **An LLM endpoint is mostly waiting.** On the model provider, the vector store, a tool's API. Most

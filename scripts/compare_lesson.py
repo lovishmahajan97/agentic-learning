@@ -56,7 +56,7 @@ def numbers(md):
 
 
 def inline_code(md):
-    return {norm(x) for x in re.findall(r"(?<!`)`([^`\n]+)`(?!`)", prose(md))}
+    return {norm(x) for x in re.findall(r"(?<!`)`([^`]+)`(?!`)", prose(md))}   # spans may wrap lines
 
 
 def compare(old_text, new_text):
@@ -88,8 +88,10 @@ def compare(old_text, new_text):
     lost = sorted(numbers(old_rest) - new_nums, key=lambda x: (len(x), x))
     if lost:
         problems.append(f"numbers lost from prose: {', '.join(lost[:15])}")
-    new_inline = inline_code(new_rest) | {norm(x) for x in re.findall(r"`([^`\n]+)`", new_rest)}
-    lost_ic = sorted(x for x in inline_code(old_rest) - new_inline if x not in norm(new_rest))
+    new_inline = inline_code(new_rest) | {norm(x) for x in re.findall(r"`([^`]+)`", new_rest)}
+    squash = lambda x: re.sub(r"\s+", "", x)
+    new_sq = squash(new_rest)
+    lost_ic = sorted(x for x in inline_code(old_rest) - new_inline if squash(x) not in new_sq)
     if lost_ic:
         problems.append(f"inline code lost: {', '.join(repr(x) for x in lost_ic[:10])}")
     return problems
@@ -116,7 +118,7 @@ def main(argv):
         for p in sorted((ROOT / "content").glob("*/*.md")):
             if p.name.startswith("_"):
                 continue
-            if re.search(r"^status:\s*crisp\s*$", p.read_text(encoding="utf-8")[:2000], re.M):
+            if re.search(r"^status:\s*crisp(-verified)?\s*$", p.read_text(encoding="utf-8")[:2000], re.M):
                 files.append(str(p.relative_to(ROOT)))
     bad = 0
     for f in files:

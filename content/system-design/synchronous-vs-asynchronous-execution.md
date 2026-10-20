@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-Synchronous: the caller holds a connection until the result arrives; asynchronous: it gets a job id and
+Synchronous: the caller holds a connection until the result arrives. Asynchronous: it gets a job id and
 the result later. LLM calls take seconds and agent runs minutes, longer than proxies and people wait, so
-most AI work goes asynchronous, or streams when a person is watching.
+most AI work goes async, or streams when someone watches.
 
 ## Why it exists
 - **AI work outlives connections.** A classic web request completes in tens of milliseconds, so holding
