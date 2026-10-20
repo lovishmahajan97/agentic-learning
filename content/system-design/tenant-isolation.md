@@ -5,6 +5,7 @@ name: Tenant isolation
 kind: pattern
 difficulty: advanced
 est_minutes: 17
+status: fact-checked
 related:
   - system-design/multi-tenancy
   - safety-security/cross-tenant-data-leakage
@@ -111,10 +112,13 @@ without a tenant setting, this turns isolation into something you can show an au
 
 ## Example
 PostgreSQL row-level security on a pooled `documents` table that also holds embeddings. The policy uses
-a transaction-local setting; if the application forgets to set it, `current_setting(..., true)` returns
-NULL, the predicate is NULL, and the query returns no rows, so the failure mode is "empty", not "leak".
-The ranking happens after the policy, so a forgotten filter in the vector query still cannot cross
-tenants.
+a transaction-local setting. If the application forgets to set it, `current_setting(..., true)` returns
+NULL on a fresh connection but an empty string on a connection that has used the setting before (the
+placeholder persists for the session), so the policy wraps it in `NULLIF`; either way the predicate is
+NULL and the query returns no rows. The failure mode is "empty", not "leak". The policy predicate is
+applied as a filter on the scan, so a forgotten filter in the vector query still cannot cross tenants;
+with an approximate index (HNSW, IVFFlat) the filter may leave fewer than k rows, which is a recall
+problem, not an isolation problem.
 
 ```sql
 CREATE TABLE documents (
@@ -128,8 +132,8 @@ ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;   -- owner is not exempt (migrations, admin scripts)
 
 CREATE POLICY tenant_rows ON documents
-    USING      (tenant_id = current_setting('app.tenant_id', true)::uuid)   -- reads
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);  -- inserts/updates
+    USING      (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)   -- reads
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);  -- inserts/updates
 
 -- The application connects as a role with no BYPASSRLS and no ownership of the table.
 CREATE ROLE app_rw LOGIN NOBYPASSRLS;
@@ -141,7 +145,7 @@ SET LOCAL app.tenant_id = '2b6f1c1e-6c0a-4f7e-9d7e-1b8c3b2d9a10';
 SELECT id, body
 FROM   documents
 ORDER  BY embedding <=> $1      -- cosine distance to the query embedding
-LIMIT  8;                        -- policy is applied before ranking, so top-8 is within-tenant
+LIMIT  8;                        -- policy filters the scan, so the 8 rows are within-tenant
 COMMIT;
 ```
 

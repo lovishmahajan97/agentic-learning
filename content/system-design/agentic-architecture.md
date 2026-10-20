@@ -5,6 +5,7 @@ name: Agentic architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -153,7 +154,8 @@ instead of holding a thread while a human decides.
 - Approval gates stop damage from bad tool calls but add latency and human load; the threshold for what
   counts as consequential is a product decision, not a technical one.
 - Giving an agent many tools broadens what it can do while lowering tool-selection accuracy and inflating
-  context; narrow tool sets per task, or sub-agents, win once the tool list grows past a couple of dozen.
+  context; narrow tool sets per task, or sub-agents, win once the tool list grows large (the exact
+  threshold is model-dependent, so measure tool-selection accuracy rather than assume a number).
 - Asynchronous execution with streamed events fits long runs and survives restarts, but complicates
   clients, which must handle partial results, resumption and cancellation.
 

@@ -5,6 +5,7 @@ name: Event-driven architecture
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - system-design/synchronous-vs-asynchronous-execution
   - system-design/outbox-inbox-patterns
@@ -81,7 +82,8 @@ work distribution but lose replay.
 Both styles deliver **at least once**: a consumer that crashes after processing but before acknowledging
 will see the message again. Consumers must therefore be idempotent, by recording processed `event_id`s or
 by making the effect naturally repeatable. Exactly-once is a property you build at the consumer, not one
-the broker gives you.
+the broker gives you end to end: Kafka's transactional producers cover only Kafka-to-Kafka read-process-write
+loops, and any effect outside the log (a database write, an HTTP call) still needs idempotence.
 
 ### Producing reliably
 The producer writes its own database row and publishes the event. Doing those as two separate operations

@@ -5,6 +5,7 @@ name: Memory architecture
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - agents/agent-memory
   - agents/memory-retrieval-update-deletion-policies
@@ -111,7 +112,7 @@ stand-ins for your model, embedding model and database.
 ```python
 import math, time
 
-RECENT_TURNS, SUMMARY_EVERY, MEM_BUDGET_TOKENS = 10, 20, 800
+RECENT_TURNS, SUMMARY_EVERY, MEM_BUDGET_TOKENS = 10, 10, 800   # summary cadence <= recent window: no turn falls between them
 
 def build_context(user, tenant, convo_id, query, store, w_rel=1.0, w_rec=0.5, w_imp=0.3):
     turns = store.turns(convo_id)                                    # session state: full transcript

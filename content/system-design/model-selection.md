@@ -5,6 +5,7 @@ name: Model selection
 kind: decision
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - evals/model-evaluation
   - evals/benchmarking
@@ -78,7 +79,7 @@ Cost per request is input tokens × input price plus output tokens × output pri
 prefixes. Measure the tokens from the eval runs rather than estimating, *because* tokenizers differ
 across families (the same document can be 20–30% more tokens in one than another, and more for
 non-English text) and because output verbosity differs. For reasoning models the hidden reasoning
-tokens are billed as output and can dominate, so price per token alone misleads. Measure time to
+tokens are billed as output on most providers and can dominate, so price per token alone misleads. Measure time to
 first token and total latency at p50 and p95, under realistic concurrency, at the hours you will run.
 
 ### Step 5: find the frontier and apply the rule
@@ -113,16 +114,19 @@ class Candidate:
     call: Callable           # prompt -> (text, input_tokens, output_tokens)
 
 def evaluate(c: Candidate, golden, score, runs=3):
-    scores, lat, cost = [], [], []
+    per_example, lat, cost = [], [], []
     for ex in golden:
+        s = []
         for _ in range(runs):
             t0 = time.perf_counter()
             text, n_in, n_out = c.call(ex["prompt"])
             lat.append(time.perf_counter() - t0)
-            scores.append(score(text, ex["expected"]))
+            s.append(score(text, ex["expected"]))
             cost.append((n_in * c.price_in + n_out * c.price_out) / 1e6)
-    mean = statistics.mean(scores)
-    half_width = 1.96 * statistics.pstdev(scores) / len(scores) ** 0.5   # rough 95% CI
+        per_example.append(statistics.mean(s))   # repeats of one example are not independent samples
+    n = len(per_example)                          # the CI is over examples, not over example x run
+    mean = statistics.mean(per_example)
+    half_width = 1.96 * statistics.pstdev(per_example) / n ** 0.5   # rough 95% CI
     p95 = sorted(lat)[int(0.95 * (len(lat) - 1))]
     return {"model": c.name, "quality": mean, "lower": mean - half_width,
             "p95_s": p95, "cost_per_1k": 1000 * statistics.mean(cost)}

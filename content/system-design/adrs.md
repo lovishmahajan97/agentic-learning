@@ -5,6 +5,7 @@ name: ADRs (architecture decision records)
 kind: practice
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - system-design/trade-off-analysis
   - system-design/nfrs

@@ -5,6 +5,7 @@ name: Model routing / cascading
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - system-design/model-selection
   - system-design/slm-vs-llm-trade-offs
@@ -101,7 +102,9 @@ talks to several providers. The number to watch in production is `escalated`; it
 ```python
 import json, litellm
 
-SMALL, LARGE, JUDGE = "openai/gpt-4o-mini", "anthropic/claude-sonnet-4-20250514", "openai/gpt-4o-mini"
+# Model ids are illustrative and date quickly; use your providers' current ids. The judge should be a
+# different model from the generator it grades: models rate their own outputs favourably.
+SMALL, LARGE, JUDGE = "openai/gpt-4o-mini", "anthropic/claude-sonnet-4-20250514", "anthropic/claude-3-5-haiku-20241022"
 
 def ask(model, messages, **kw):
     r = litellm.completion(model=model, messages=messages, temperature=0, **kw)
@@ -110,7 +113,7 @@ def ask(model, messages, **kw):
 def passes_check(question, answer):
     try:                                              # 1) deterministic gate: valid JSON, required fields
         obj = json.loads(answer)
-        if not {"answer", "confidence"} <= obj.keys():
+        if not isinstance(obj, dict) or not {"answer", "confidence"} <= obj.keys():
             return False
     except json.JSONDecodeError:
         return False
@@ -133,7 +136,10 @@ print(cascade("Our invoice says net-45 but the signed contract says net-30. Whic
 ```
 
 Note that the deterministic gate runs first *because* it is free and catches the most common failure
-(unparseable output); the judge only spends tokens on answers that are at least well-formed.
+(unparseable output); the judge only spends tokens on answers that are at least well-formed. The judge is
+deliberately a different model from the small generator: LLMs show self-preference bias when grading their
+own outputs, so a same-model judge under-escalates, and the judge itself needs a calibration check against
+human labels before its verdicts drive production routing.
 
 ## Trade-offs
 - Mean cost falls substantially, but tail latency rises on escalated requests; this flips when the

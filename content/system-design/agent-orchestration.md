@@ -5,6 +5,7 @@ name: Agent orchestration
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agents/workflows-vs-agents
   - agents/state-machines

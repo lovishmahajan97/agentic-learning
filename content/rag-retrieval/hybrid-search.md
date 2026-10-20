@@ -63,9 +63,9 @@ k damps the top: without it, rank 1 would be worth 1.0 and rank 2 only 0.5, whic
 top hit dominate. With k = 60, rank 1 scores 1/61 ≈ 0.0164 and rank 10 scores 1/70 ≈ 0.0143, so a
 document that is rank 10 in both arms (≈ 0.0286) beats one that is rank 1 in a single arm (≈ 0.0164).
 That is the design intent: agreement between retrievers is stronger evidence than a confident vote from
-one. RRF needs no tuning, no normalization and no knowledge of the score scales, which is why it is the
-default in Elasticsearch, OpenSearch, Weaviate and most RAG frameworks. Its weakness is that it throws
-away magnitude: a dense hit at cosine 0.92 and the next at 0.55 are treated as adjacent ranks.
+one. RRF needs no tuning, no normalization and no knowledge of the score scales, which is why Elasticsearch,
+OpenSearch, Weaviate and most RAG frameworks ship it and many use it as the default. Its weakness is that
+it throws away magnitude: a dense hit at cosine 0.92 and the next at 0.55 are treated as adjacent ranks.
 
 ### Weighted score fusion
 The alternative keeps scores: normalize each arm's scores per query (min–max to [0, 1], or z-scores),

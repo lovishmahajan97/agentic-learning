@@ -5,6 +5,7 @@ name: AI / solution architecture
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - system-design/reference-architectures
   - system-design/nfrs

@@ -5,6 +5,7 @@ name: Multi-tenancy
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - system-design/tenant-isolation
   - reliability/tenant-level-quotas-and-noisy-neighbor-isolation
@@ -102,7 +103,9 @@ sets, because quality differs by corpus).
 ## Example
 A FastAPI slice that resolves the tenant from a verified token, stores it in a context variable so
 deeper layers and `asyncio` tasks inherit it, scopes retrieval and configuration by it, and meters
-token usage against it. Nothing downstream takes `tenant_id` from user input.
+token usage against it. Nothing downstream takes `tenant_id` from user input. One detail matters: the
+dependency is `async def`. FastAPI runs a plain `def` dependency in a worker thread with a *copy* of
+the context, so a `ContextVar.set` made there is silently discarded before the endpoint runs.
 
 ```python
 from contextvars import ContextVar
@@ -112,12 +115,12 @@ from fastapi import Depends, FastAPI, Header
 tenant_ctx: ContextVar[str] = ContextVar("tenant_id")
 app = FastAPI()
 
-def current_tenant(authorization: str = Header(...)) -> str:
+async def current_tenant(authorization: str = Header(...)) -> str:
     token = authorization.removeprefix("Bearer ")
     claims = jwt.decode(token, PUBLIC_KEY, algorithms=["RS256"], audience="assistant-api")
     tenant_id = claims["tenant_id"]           # minted by the IdP, never read from the body
-    tenant_ctx.set(tenant_id)                 # inherited by asyncio tasks created from here
-    return tenant_id
+    tenant_ctx.set(tenant_id)                 # async dep: same context as the endpoint and its tasks
+    return tenant_id                          # (a sync `def` dep would set it in a thread's copy)
 
 @app.post("/v1/chat")
 async def chat(req: ChatRequest, tenant_id: str = Depends(current_tenant)):
@@ -158,8 +161,9 @@ async def enqueue_ingestion(doc_id: str):
   curious customer, reading another tenant's conversations by editing one field.
 - Forgetting the tenant key on the vector search or on a semantic cache; the symptom is an answer that
   cites a document the user's organisation never uploaded.
-- Letting tenant context evaporate at a process boundary (queues, cron jobs, thread pools); the symptom
-  is background jobs that run as "no tenant" and either fail or write into the wrong partition.
+- Letting tenant context evaporate at a process or thread boundary (queues, cron jobs, thread pools,
+  a sync FastAPI dependency that sets a `ContextVar` in a worker thread); the symptom is background jobs
+  or handlers that run as "no tenant" and either fail or write into the wrong partition.
 - Hard-coding exceptions for a big customer in the code; the symptom is a release that breaks only for
   them, discovered in production because the test suite has no such tenant.
 - Measuring cost per model but not per tenant; the symptom is a tenant on a flat plan quietly consuming

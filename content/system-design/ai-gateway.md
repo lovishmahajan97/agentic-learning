@@ -5,6 +5,7 @@ name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/litellm
   - system-design/model-fallback-strategies

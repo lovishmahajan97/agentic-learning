@@ -5,6 +5,7 @@ name: Exactly-once processing limitations
 kind: concept
 difficulty: advanced
 est_minutes: 15
+status: fact-checked
 related:
   - system-design/outbox-inbox-patterns
   - system-design/event-driven-architecture
@@ -56,8 +57,9 @@ That is achievable, with conditions, and the conditions are the content of this 
 ### Effectively-once: the recipe
 Take at-least-once delivery and make processing idempotent. Two mechanisms do this:
 
-1. **Deduplication.** The consumer records each processed message id (an inbox table, a Redis set with
-   TTL, Kafka's per-partition sequence number) and skips repeats. It works for any effect, but only if the
+1. **Deduplication.** The receiver records each processed message id (an inbox table, a Redis set with
+   TTL; on the broker side, Kafka dedupes producer retries by per-partition sequence number) and skips
+   repeats. It works for any effect, but only if the
    record and the effect commit atomically, which is why the inbox row lives in the same database
    transaction as the business write.
 2. **Natural idempotency.** The effect is defined so that applying it twice equals applying it once:

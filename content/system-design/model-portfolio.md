@@ -5,6 +5,7 @@ name: Model portfolio
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - system-design/model-selection
   - system-design/model-routing-cascading
