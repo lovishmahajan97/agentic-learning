@@ -5,6 +5,7 @@ name: Structured / constrained generation
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - prompting/structured-outputs-json-mode
   - prompting/function-tool-calling
@@ -162,8 +163,9 @@ print(repr(tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)))   # -> 
   enum), visible as high time to first token from grammar compilation on each call.
 - Using JSON Schema features the backend ignores (`format: date`, `minimum`, `pattern` in some modes)
   and discovering in production that values outside the range come through.
-- Forgetting that whitespace is part of the grammar; an automaton that forbids newlines inside strings
-  can make the model emit `\n` escapes in places that break a downstream naive parser.
+- Forgetting that whitespace is part of the grammar. A schema-derived regex that allows unbounded
+  whitespace between tokens lets a model loop on spaces or newlines until `max_tokens`; one that forbids it
+  forces minified JSON the model rarely saw in training. Set the whitespace pattern deliberately.
 
 ## When to use
 Use constrained decoding whenever output is consumed by code: extraction, classification into a fixed

@@ -5,6 +5,7 @@ name: Regression
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/loss-functions
@@ -198,7 +199,7 @@ pays off.
 > score looks too good.
 
 ### Q: You need a p95 latency estimate for SLO planning. What is the most defensible approach?
-- [ ] Fit MSE and multiply the prediction by 1.645
+- [ ] Fit MSE and add 1.645 times the residual standard deviation to the prediction
 - [x] Fit a quantile (pinball) loss at the 0.95 level
 - [ ] Fit MAE and add the largest residual seen in training
 - [ ] Train a classifier for "slow versus fast" and report its threshold

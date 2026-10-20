@@ -5,6 +5,7 @@ name: TPOT (time per output token)
 kind: metric
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - serving-inference/ttft
   - serving-inference/tokens-sec
@@ -104,8 +105,8 @@ multi-second gap.
 
 ### How fast is fast enough
 Adults read prose at roughly 200–300 words per minute, about 4–5 words per second, which at the
-usual 1.3 tokens per English word is around 5–7 tokens per second, so a TPOT near 150–200 ms is
-already faster than a reader for plain chat. Products still aim much lower because users skim, scroll
+usual 1.3 tokens per English word is around 5–7 tokens per second, so a TPOT near 150–200 ms
+already keeps pace with a reader for plain chat. Products still aim much lower because users skim, scroll
 and want code to appear in blocks, and because agentic workloads consume tokens by machine: a
 planner that makes eight sequential calls of 300 tokens each turns a 30 ms TPOT into over a minute
 of waiting before anyone reads a word.
@@ -121,12 +122,12 @@ because even at batch 100 the decode FLOPs per step (`2 × 8e9 × 100 = 1.6e12`)
 Batch 1, 4k-token context: bytes per step = 16 GB + 4,000 × 128 KB ≈ 16.5 GB → 16.5 / 3350 ≈ 4.9 ms →
 about 200 tokens per second for that one user.
 
-Batch 32, each at 4k context: KV reads = 32 × 4,000 × 128 KB ≈ 16.4 GB, so bytes per step ≈ 32.4 GB →
-about 9.7 ms per step. Each user now sees roughly 100 tokens per second, but the server emits
+Batch 32, each at 4k context: KV reads = 32 × 4,000 × 131,072 B ≈ 16.8 GB, so bytes per step ≈ 32.8 GB →
+about 9.8 ms per step. Each user now sees roughly 100 tokens per second, but the server emits
 32 × 100 ≈ 3,300 tokens per second. Sixteen times the throughput for twice the TPOT.
 
-Batch 32 at 32k context: KV reads = 32 × 32,000 × 128 KB ≈ 131 GB, which does not even fit next to the
-weights in 80 GB, and would take about 40 ms per step if it did. Long context, not model size, is
+Batch 32 at 32k context: KV reads = 32 × 32,000 × 131,072 B ≈ 134 GB, which does not even fit next to the
+weights in 80 GB, and would take about 45 ms per step if it did. Long context, not model size, is
 what pushes TPOT up at scale. Measured numbers will be worse than every figure here; the point is
 the ratios and which term dominates.
 

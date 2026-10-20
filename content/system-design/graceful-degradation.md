@@ -5,6 +5,7 @@ name: Graceful degradation
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - system-design/model-fallback-strategies
   - reliability/backpressure-and-load-shedding
@@ -116,7 +117,10 @@ async def answer(q, user, h, deadline_s=6.0):
     if user.tier == "free" and h.queue_depth > 50:              # shed low priority first
         level = max(level, Level.REDUCED)
     t0 = time.monotonic()
-    docs = await keyword_or_vector_search(q, k=20 if level == Level.FULL else 5)
+    try:
+        docs = await keyword_or_vector_search(q, k=20 if level == Level.FULL else 5)
+    except Exception:                                           # even the non-AI path is down
+        docs, level = [], Level.UNAVAILABLE
     if level <= Level.REDUCED:
         full = level == Level.FULL
         try:

@@ -21,11 +21,10 @@ sources:
 
 ## TL;DR
 Serverless GPUs bill per second of actual use and scale to zero, so a bursty or low-volume workload
-pays only for busy seconds instead of for a card that idles most of the day. The price is a cold
-start — pulling the image, loading weights into VRAM and warming the engine, typically tens of
-seconds to minutes — and a per-second rate above on-demand hourly pricing. The decision is a
-utilisation break-even shifted by cold-start overhead, gated by whether your latency SLO can absorb
-a cold start at all.
+pays only for busy seconds instead of for a card that idles most of the day. The price is a cold start
+of tens of seconds to minutes (pull the image, load weights into VRAM, warm the engine) and a
+per-second rate above on-demand hourly pricing. Decide on utilisation break-even shifted by cold-start
+overhead, gated by whether your latency SLO can absorb a cold start at all.
 
 ## Why it exists
 A dedicated GPU costs the same per hour whether it serves ten thousand requests or none. Most

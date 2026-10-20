@@ -5,6 +5,7 @@ name: Retry strategies
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - serving-inference/timeouts
   - serving-inference/idempotency
@@ -17,6 +18,7 @@ sources:
   - Brooker, 2015 — Exponential Backoff and Jitter (AWS Architecture Blog)
   - Beyer et al., 2016 — Site Reliability Engineering (Handling Overload)
   - Official docs: Anthropic SDK (retries and timeouts)
+  - Dean & Barroso, 2013 — The Tail at Scale
 ---
 
 ## TL;DR
@@ -35,9 +37,10 @@ a single well-placed retry cuts it to about 10, because the probability of two i
 
 The arithmetic breaks when failures are correlated, and during an incident they always are. If the
 provider is saturated, each retry is new load on a system that is already dropping requests. Three
-immediate retries quadruple the offered load; stack an SDK that retries twice, a service that retries
-three times and a browser that retries three times, and one user click becomes up to 36 attempts. That
-is the retry storm, and it routinely turns a 30-second blip into a 20-minute outage.
+immediate retries quadruple the offered load; stack an SDK that retries twice (3 attempts), a service that
+retries three times (4) and a browser that retries three times (4), and one user click becomes up to
+3 × 4 × 4 = 48 attempts. That is the retry storm, and it can turn a 30-second blip into an outage that
+lasts many minutes.
 
 LLM calls raise the stakes further. Each attempt costs seconds and real money, a timed-out call may have
 already done its work (or, in an agent, executed a tool with side effects), and a streaming response
@@ -60,7 +63,7 @@ retries at the same instant, so the load arrives in synchronized waves at 1 s, 2
 the synchrony. With *full jitter* the wait is uniform between 0 and the exponential ceiling; with
 *decorrelated jitter* it is uniform between the base and three times the previous wait, capped.
 Brooker's simulations showed both complete the same work with far fewer total calls than un-jittered
-backoff, which is why full jitter is the default in most libraries.
+backoff, which is why full jitter is a common library default.
 
 ### Honour the server's schedule
 If the response carries `Retry-After`, use it instead of your own schedule: the server knows when
@@ -86,9 +89,13 @@ own the policy, or let it be the only retrying layer; two layers multiply.
 - Never retry a stream after the first token has been forwarded; restart it as a new message id so the
   client can discard the partial one.
 - Give every retried operation an idempotency key, so a retried tool call does not send a second email.
-- Prompt caching makes retried prefill cheaper, since the retry reads the prefix the first attempt wrote.
-- A hedged request (start a second attempt at the p95 latency and keep whichever finishes first) cuts
-  tail latency at roughly double cost; it needs cancellation of the loser to be worth it.
+- Prompt caching makes retried prefill cheaper, since the retry reads the prefix the first attempt wrote,
+  provided the first attempt got far enough to write it (on Anthropic an entry becomes readable once the
+  first response begins).
+- A hedged request (start a second attempt once the first has exceeded the p95 latency and keep whichever
+  finishes first) cuts tail latency for a few percent of extra load, since only the slowest 5% of calls
+  spawn a hedge; firing it immediately would double the load. It needs cancellation of the loser to be
+  worth it (Dean and Barroso's "tail at scale" pattern).
 - A wrong answer is not a transient failure. Validation-driven regeneration is a separate loop with its
   own bound and usually a changed prompt or temperature.
 
@@ -135,8 +142,9 @@ def call_with_retry(send):
   the retry budget is what makes the trade safe, and without it the first incident proves the point.
 - A higher backoff cap is gentler on the provider but worse for the user; for interactive features cap at
   one or two short retries and then fall back, for batch pipelines cap in minutes and let the queue absorb it.
-- Hedged requests cut tail latency but double cost and need cancellation; they pay off only when
-  time-to-first-token variance is high and the call is cheap relative to the user's time.
+- Hedged requests cut tail latency but add load (a few percent when fired at the p95, up to double when
+  fired immediately) and need cancellation; they pay off only when time-to-first-token variance is high
+  and the call is cheap relative to the user's time.
 - Retrying after timeouts recovers from stalls but risks duplicated effects; without idempotency keys the
   safe choice is to surface the timeout rather than retry.
 

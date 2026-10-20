@@ -5,6 +5,7 @@ name: Tooling (Unsloth, Axolotl, TRL)
 kind: tool
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - training-adaptation/peft
   - training-adaptation/supervised-fine-tuning
@@ -51,7 +52,9 @@ the right escape hatch for a genuinely new loss, but not the way to ship a fine-
 
 ## How it works
 ### TRL: trainers as the primitive
-TRL sits on top of `transformers` and PEFT, and the other two tools call into it. `SFTTrainer` with
+TRL sits on top of `transformers` and PEFT. Unsloth hands its patched model to TRL trainers, and Axolotl
+uses TRL for its preference and RL trainers (its SFT path subclasses the Transformers `Trainer` directly,
+with its own packing and loss masking). `SFTTrainer` with
 `SFTConfig` accepts a dataset of `messages` (conversational) or plain `text`, renders it with the
 tokenizer's chat template, optionally packs sequences, applies LoRA through a `peft_config`, and runs
 the standard `Trainer` loop. `DPOTrainer` takes `prompt`/`chosen`/`rejected` rows, computes the
@@ -114,8 +117,8 @@ open-source release has historically been single-GPU focused, so check the curre
 a multi-GPU run around it. It exports merged 16-bit weights, bare adapters, or GGUF for llama.cpp.
 
 ### How they compose
-TRL is the base; Axolotl configures TRL/PEFT/`accelerate` from YAML; Unsloth swaps in faster kernels
-underneath a TRL trainer. Similar config-driven frameworks exist (LLaMA-Factory, torchtune) and the
+TRL is the base; Axolotl configures Transformers/TRL/PEFT/`accelerate` from YAML; Unsloth swaps in faster
+kernels underneath a TRL trainer. Similar config-driven frameworks exist (LLaMA-Factory, torchtune) and the
 same mental model applies.
 
 ## Example
@@ -221,8 +224,8 @@ adapter or merge it into the bf16 base.
 - [x] TRL provides the trainers; Axolotl configures them from YAML; Unsloth accelerates the kernels beneath them
 - [ ] Axolotl is the base library and TRL is its command-line wrapper
 - [ ] Unsloth replaces TRL entirely with its own trainer classes
-> TRL is the primitive layer. Axolotl orchestrates TRL, PEFT and accelerate from a config file, and Unsloth
-> patches the model's forward and backward passes, then hands the model to a TRL trainer.
+> TRL is the primitive layer. Axolotl orchestrates Transformers, TRL, PEFT and accelerate from a config file,
+> and Unsloth patches the model's forward and backward passes, then hands the model to a TRL trainer.
 
 ### Q: What is the actual mechanism behind Unsloth's speed and memory savings?
 - [ ] It silently trains a smaller distilled model in place of the one you loaded

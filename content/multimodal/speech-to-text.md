@@ -5,6 +5,7 @@ name: Speech-to-text (Whisper)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - multimodal/tts
   - multimodal/vision-language-models
@@ -79,7 +80,8 @@ previous text as decoder context for consistency. This is also where failures co
 a language model, so on silence, music or garbled audio it can hallucinate fluent text or loop on a
 phrase. The reference implementation guards against this with heuristics: if the output's compression
 ratio is too high (repetition), or the average log-probability too low, decoding is retried at higher
-temperature; if the no-speech probability is high the window is skipped. Voice activity detection
+temperature; if the no-speech probability is high (and, in the reference implementation, the average
+log-probability is also low) the window is treated as silence and skipped. Voice activity detection
 (VAD) before transcription removes most of the silence that triggers hallucinations.
 
 ### Model sizes and runtimes

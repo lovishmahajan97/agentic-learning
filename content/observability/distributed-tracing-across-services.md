@@ -5,6 +5,7 @@ name: Distributed tracing across services
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - observability/tracing
   - observability/spans
@@ -109,7 +110,7 @@ to third-party APIs, so a tenant name or user email in baggage is a data leak by
 
 ### Clock skew
 Each service timestamps with its own clock. A child span that starts before its parent, or a negative
-network gap, is the symptom. Keep hosts under NTP or equivalent; trace viewers do not correct for it.
+network gap, is the symptom. Keep hosts under NTP or equivalent; most trace viewers do not correct for it.
 
 ## Example
 The same two primitives, `inject` and `extract`, cover HTTP and queues; only the carrier changes.

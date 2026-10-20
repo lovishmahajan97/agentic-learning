@@ -5,6 +5,7 @@ name: Tensor parallelism at inference
 kind: concept
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - training-adaptation/distributed-training
   - model-internals/grouped-query-attention
@@ -37,7 +38,8 @@ a single request still passes through the GPUs one after another, so per-token l
 and keeping both GPUs busy needs several requests in flight at different stages. Offloading keeps part of
 the weights in CPU memory and streams them in, but PCIe bandwidth is roughly two orders of magnitude
 below HBM, so decode slows to seconds per token. Quantization halves or quarters the bytes but costs
-quality and still leaves a 4-bit 70B model with little KV room on one card.
+quality, and a 4-bit 70B model still needs about 40 GB, which fits an 80 GB card but leaves no room on
+the 24–48 GB cards most teams have.
 
 Tensor parallelism splits *inside* each layer. Every GPU works on the same token at the same time on its
 slice of every matrix, so the memory bandwidth of N GPUs is pooled: decode, which is bandwidth-bound,
@@ -70,7 +72,7 @@ often the real reason to choose TP = 4 over TP = 2 even when the weights fit at 
 Grouped-query attention adds a constraint. Llama-3-70B has 8 KV heads, so TP up to 8 gives each GPU at
 least one; beyond that, KV heads must be replicated across GPUs that share them, which engines support
 but which forfeits part of the memory saving. The number of attention heads, the MLP intermediate size
-and the vocabulary should all be divisible by the TP degree, which is why TP degrees are powers of two.
+and the vocabulary should all be divisible by the TP degree, which is why TP degrees are almost always powers of two.
 
 ### Why the interconnect decides everything
 Each all-reduce exchanges a [tokens_in_step, hidden] activation. For a decode step with 32 sequences on

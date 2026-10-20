@@ -5,6 +5,7 @@ name: Supervised fine-tuning (SFT)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - training-adaptation/instruction-tuning
   - training-adaptation/post-training

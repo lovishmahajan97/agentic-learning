@@ -5,6 +5,7 @@ name: Backpressure
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/timeouts
@@ -185,8 +186,9 @@ would add and the numbers you would set.
 
 **A:** By Little's law steady state needs about 32 concurrent requests; at 12 requests per second it
 needs 96, so with the engine capped near 32 the queue grows by roughly 8 requests every second. After a
-minute some 480 requests are waiting and queue time is near a minute; clients time out at 30 s and
-retry, raising the arrival rate further, while the GPU prefills prompts for abandoned connections.
+minute some 480 requests are waiting and a new arrival faces roughly two minutes of queueing (the wait
+grows by about two seconds every second, since 8 join per second and 4 leave); clients time out at 30 s
+and retry, raising the arrival rate further, while the GPU prefills prompts for abandoned connections.
 Useful throughput falls below the original 4 per second: that is the collapse. With backpressure: keep
 the engine limit near its true capacity, put a semaphore with a 1–2 s wait budget in front of it, return
 503 with Retry-After for the rest, cancel generation on client disconnect, and shed batch traffic before

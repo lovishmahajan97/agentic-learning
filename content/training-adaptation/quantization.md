@@ -5,6 +5,7 @@ name: Quantization (INT8/INT4, GPTQ, AWQ, GGUF)
 kind: concept
 difficulty: core
 est_minutes: 18
+status: fact-checked
 related:
   - training-adaptation/peft
   - training-adaptation/pruning
@@ -30,7 +31,7 @@ GGUF is the llama.cpp file format for shipping such models to CPUs and laptops.
 
 ## Why it exists
 Two numbers drive everything. A 70B-parameter model in bf16 is 140 GB of weights, which does not fit on
-one 80 GB GPU; at 4 bits it is about 35–40 GB and does. A 7B model goes from 14 GB to under 4 GB, which is
+one 80 GB GPU; at 4 bits it is about 35–40 GB and does. A 7B model goes from 14 GB to about 4 GB, which is
 the difference between a data-centre card and a laptop. That is the memory argument.
 
 The speed argument is subtler. During decode the GPU reads every weight once per generated token, and the
@@ -162,10 +163,12 @@ for name, W_hat in [("int8 per-tensor", quant_sym(W, 8)),
                     ("int4 group=32", quant_grouped(W, 4, 32))]:
     err = np.linalg.norm(X @ W_hat.T - ref) / np.linalg.norm(ref)
     print(f"{name:17s} relative output error = {err:.3f}")
+# Prints roughly 0.32 / 0.85 / 0.68 / 0.16 / 0.10 (int8 per-tensor already hurts with a 40x outlier).
 # Per-channel still fails here because every output row contains the outlier column, so every
 # row's scale is set by it; grouping isolates the damage to 1/32 (g=128) or 1/128 (g=32) of the weights.
 # GPTQ would additionally push each group's rounding error into its neighbours; AWQ would rescale
-# channel 7 before rounding. Bits per weight: 8 / 4 / 4 / ~4.16 / ~4.6 respectively.
+# channel 7 before rounding. Bits per weight with an fp16 scale + 4-bit zero-point per group, as in
+# the ladder above: 8 / 4 / 4 / ~4.16 / ~4.6 respectively (this symmetric toy stores no zero-point).
 ```
 
 ## Trade-offs

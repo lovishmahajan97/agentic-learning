@@ -5,6 +5,7 @@ name: Fine-tune vs RAG vs prompt decision
 kind: decision
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/peft

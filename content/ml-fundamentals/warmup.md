@@ -5,6 +5,7 @@ name: Warmup
 kind: practice
 difficulty: core
 est_minutes: 11
+status: fact-checked
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/optimizers
@@ -40,9 +41,11 @@ observed gradients happened to be small gets an update that is far too large. Th
 precise: the effective per-parameter step size has divergent variance in the first iterations, and a
 learning-rate warmup is a cheap way to keep updates small until `v` has enough samples to be trusted.
 
-Architecture adds a third reason. In the original Post-LN transformer, the gradient norm near the output
-layers at initialization grows with depth, so the first updates are disproportionately large there; the
-paper that analysed this showed Post-LN is unstable without warmup, while Pre-LN tolerates its absence.
+Architecture adds a third reason. In the original Post-LN transformer, the expected gradient norm at the
+layers nearest the output is large at initialization and does not shrink with depth, while in Pre-LN it
+scales down roughly as `1/√L`; in a deep Post-LN model the first updates are therefore disproportionately
+large near the output, and the paper that analysed this showed Post-LN is unstable without warmup, while
+Pre-LN tolerates its absence.
 Large-batch training is a fourth: a bigger batch justifies a bigger learning rate, but only once the
 model has left the chaotic initial region, so the ImageNet-in-one-hour recipe ramped the rate linearly
 over the first five epochs rather than starting at the scaled peak.
@@ -147,8 +150,9 @@ need, and the cosine decay would never reach its floor.
   trace first, which jumps before the loss does.
 - Reusing a pre-training warmup length (thousands of steps) for a fine-tuning run of 500 steps, so the
   model never reaches its intended learning rate.
-- Starting LoRA fine-tuning at a high peak rate with no warmup; the adapters are zero-initialized and the
-  first few updates can set a bad direction that later steps only partially undo.
+- Starting LoRA fine-tuning at a high peak rate with no warmup; the adapter's `B` matrix is zero-initialized
+  so the update starts as a no-op, and the first few steps can set a bad direction that later steps only
+  partially undo.
 
 ## When to use
 Use warmup in essentially every run that uses Adam-family optimizers, which is every run in modern

@@ -5,6 +5,7 @@ name: GRPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
+status: fact-checked
 related:
   - training-adaptation/rlhf
   - training-adaptation/dpo
@@ -22,10 +23,10 @@ sources:
 
 ## TL;DR
 GRPO is a policy-gradient method that drops PPO's value model: for each prompt it samples a group of
-responses, scores them, and uses the group's mean and spread as the baseline, so each response's
-advantage is "how much better than its siblings". It keeps PPO's clipped update and a KL term to a
+responses, scores them, and uses the group's mean and spread as the baseline, so each advantage is
+"how much better than its siblings". It keeps PPO's clipped update and a KL term to a
 reference. It exists because a critic the size of the policy is costly and unstable for sequence-level
-rewards, and it became the standard algorithm for training reasoning models on verifiable rewards.
+rewards, and it is the usual choice for training open reasoning models with verifiable rewards.
 
 ## Why it exists
 PPO estimates how good each token was by comparing the reward it eventually earned against a
@@ -52,7 +53,8 @@ possible.
 ## How it works
 ### Sampling the group
 For each prompt q in a batch, the current policy (the "old" policy for this iteration) samples G
-responses o₁ … o_G, with G typically in the range of 4 to 16 (larger for hard tasks). Each response
+responses o₁ … o_G, with G commonly between 8 and 16 in open recipes and as high as 64 in
+DeepSeekMath (larger groups suit harder tasks). Each response
 gets a scalar reward r_i from a reward function: a rule-based verifier, a reward model, or a sum of
 several terms (accuracy plus format, for instance).
 
@@ -65,7 +67,10 @@ The advantage for response i is its reward standardised within the group:
 
 The same Â_i is assigned to every token of response i, because the reward is for the whole outcome
 and nothing finer-grained is known. This replaces the value model with two numbers per prompt. It is
-cheap, unbiased as a baseline, and has the "difficulty-adaptive" property described above. A group with
+cheap, nearly unbiased (the group mean includes the sample's own reward, a small bias that a
+leave-one-out baseline such as RLOO removes), and has the "difficulty-adaptive" property described
+above. Dividing by the standard deviation is a separate choice that up-weights prompts with few
+successes, which is debated (see below). A group with
 all-equal rewards has zero variance and contributes nothing; implementations add a small epsilon to
 the denominator and often filter such prompts out of the batch.
 
@@ -78,7 +83,7 @@ L_clip  = mean over tokens of  min( ratio_t · Â_i ,  clip(ratio_t, 1−ε, 1+�
 ```
 
 The ratio compares the policy being updated to the one that generated the samples, and the clip
-stops any token's probability from moving by more than a factor of about 1±ε in one update. This lets
+removes the gradient incentive to move any token's probability ratio beyond about 1±ε in one update. This lets
 the same batch of samples be reused for a few gradient steps without the policy running away from the
 data, which is the whole point of PPO-style methods over plain policy gradient.
 
@@ -144,8 +149,8 @@ print("loss:", grpo_loss(logp_new, logp_old, logp_ref, adv, mask).item())
 
 The printed advantages show the mechanism: on a prompt the model gets right three times in eight,
 each success receives a push of about +1.2 and each failure about −0.7. Had it been right seven times,
-the single failure would get a large negative push and the successes a tiny positive one, which is
-exactly where the gradient should go.
+the single failure would get a large negative push (about −2.5) and each success a small positive one
+(about +0.35), which is exactly where the gradient should go.
 
 ## Trade-offs
 - Removing the value model halves trainable memory and eliminates critic instability, but the group

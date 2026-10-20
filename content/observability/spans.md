@@ -5,6 +5,7 @@ name: Spans
 kind: concept
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - observability/tracing
   - observability/distributed-tracing-across-services

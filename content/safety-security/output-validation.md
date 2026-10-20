@@ -5,6 +5,7 @@ name: Output validation (Pydantic, Instructor, Outlines)
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/pydantic
   - python-for-ai/instructor
@@ -217,7 +218,7 @@ being in the prompt, so fix the prompt before raising retry limits, and track fa
 > The retry carries the failed attempt and the exact error text, which is why most retries converge in
 > one round; an identical resend would mostly reproduce the same mistake.
 
-### Q: Which failure can only be caught by validation code, not by a JSON schema constraint?
+### Q: Which failure needs validation code, rather than the shape schema a provider or constrained decoder enforces?
 - [ ] A missing required key
 - [ ] A string where an integer was expected
 - [x] A cross-field rule such as "a denied refund must have an amount of zero"

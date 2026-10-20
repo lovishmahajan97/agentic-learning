@@ -5,6 +5,7 @@ name: Residual connections
 kind: concept
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - ml-fundamentals/normalization
   - ml-fundamentals/backpropagation

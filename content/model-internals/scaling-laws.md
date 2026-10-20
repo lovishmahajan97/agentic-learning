@@ -5,6 +5,7 @@ name: Scaling laws
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - model-internals/small-language-models
   - model-internals/mixture-of-experts

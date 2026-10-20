@@ -5,6 +5,7 @@ name: Throughput vs latency
 kind: decision
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - serving-inference/continuous-batching
   - serving-inference/batching-and-concurrency-limits

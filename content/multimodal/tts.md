@@ -5,6 +5,7 @@ name: TTS (text-to-speech)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - multimodal/speech-to-text
   - serving-inference/streaming
@@ -56,8 +57,8 @@ neural models downstream faithfully pronounce whatever the front end hands them.
 
 ### Stage 2: acoustic model
 The phoneme (or character) sequence is mapped to an intermediate acoustic representation, classically
-a mel-spectrogram: a time-frequency picture at roughly 80 bands per frame, hundreds of frames per
-second of speech. Two designs matter. Autoregressive models (Tacotron 2) generate frames one at a time
+a mel-spectrogram: a time-frequency picture at roughly 80 bands per frame and on the order of a hundred
+frames per second of speech (a 10–12.5 ms hop), hundreds of times fewer values than the waveform. Two designs matter. Autoregressive models (Tacotron 2) generate frames one at a time
 with attention over the input text; natural, but slow and prone to skipping or repeating words when
 attention wanders. Non-autoregressive models (FastSpeech 2) first predict each phoneme's *duration*,
 expand the sequence accordingly, predict pitch and energy per phoneme, and then generate all frames in

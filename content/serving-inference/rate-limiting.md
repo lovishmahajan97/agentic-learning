@@ -5,6 +5,7 @@ name: Rate limiting
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - serving-inference/backpressure
   - serving-inference/retry-strategies

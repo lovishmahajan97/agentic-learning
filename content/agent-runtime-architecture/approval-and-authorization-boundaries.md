@@ -5,6 +5,7 @@ name: Approval & authorization boundaries
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agents/human-in-the-loop
   - agents/approval-gates-for-consequential-actions
@@ -134,7 +135,9 @@ def gate(run, call, approvals):
         return ("allow", f"approved by {rec['approver']}")
     if rec and rec["decision"] == "rejected":
         return ("deny", f"rejected by {rec['approver']}")
-    approvals.create(run.id, fp, call, ttl_s=4 * 3600)   # park the run; a human decides later
+    if rec and rec["decision"] == "pending":
+        return ("wait", fp)                  # already asked; do not spam approvers with duplicates
+    approvals.create(run.id, fp, call, ttl_s=4 * 3600)   # new or expired: park the run, a human decides
     return ("wait", fp)
 ```
 

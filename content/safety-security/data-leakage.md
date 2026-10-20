@@ -5,6 +5,7 @@ name: Data leakage
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - safety-security/pii-redaction
   - safety-security/cross-tenant-data-leakage

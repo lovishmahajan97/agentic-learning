@@ -5,6 +5,7 @@ name: Distributed systems
 kind: concept
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - system-design/data-consistency
   - system-design/exactly-once-processing-limitations
@@ -47,8 +48,8 @@ latency is zero, bandwidth is infinite, topology does not change, there is one a
 fallacy becomes an outage.
 
 The naive strategy, "add retries and bigger timeouts", converts invisible failures into duplicate
-effects and cascading overload: ten services each retrying three times turn one slow dependency into
-tens of thousands of extra requests. The alternative, "make everything strongly consistent and
+effects and cascading overload: when each of five layers in a call chain retries three times, one failed
+call at the bottom can fan out into up to 4⁵ ≈ 1,000 attempts against the slow dependency. The alternative, "make everything strongly consistent and
 coordinated", runs into mathematics: coordination costs round trips, and in an asynchronous network with
 even one crashed process, no deterministic protocol can guarantee that agreement terminates (the FLP
 result). Working systems live between those poles, and knowing where is the skill this lesson orients.
@@ -88,8 +89,8 @@ id is often a poor sole key for an AI platform.
 ### Consensus and leases
 Some decisions need all nodes to agree: who is the leader, what is the next log entry, who holds a lock.
 Raft solves this with terms, leader election and majority-replicated logs; a majority quorum tolerates
-the failure of fewer than half the nodes. Systems such as etcd, ZooKeeper and Consul package it so
-applications store small, critical state (configuration, leadership, locks) there and keep bulk data
+the failure of fewer than half the nodes. Systems such as etcd and Consul (Raft) and ZooKeeper (its own
+Zab protocol, same majority principle) package consensus so applications store small, critical state (configuration, leadership, locks) there and keep bulk data
 elsewhere, *because* each consensus write costs a majority round trip. Locks and leadership are granted
 as **leases** with an expiry, since a holder that dies must not hold the lock forever. The subtle part is
 that a holder may *believe* it still has the lease after it expired (it paused, or its clock lagged). A

@@ -5,6 +5,7 @@ name: Backpropagation
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/loss-functions
@@ -82,7 +83,9 @@ recomputes the interior during the backward pass, trading roughly a third more c
 memory reduction. Fused attention kernels recompute attention probabilities in the backward pass rather
 than storing the T × T matrix. Freezing weights, as in LoRA, removes their gradient and optimizer-state
 memory, but the backward sweep still has to pass through the frozen layers to reach trainable ones
-earlier in the network, so activation memory does not disappear and compute per step falls only modestly.
+earlier in the network, so activation memory does not disappear. What is skipped is the weight-gradient
+matmul for each frozen layer, roughly half the backward FLOPs, so compute per step falls by at most about a
+third, nowhere near in proportion to the parameter count.
 
 ### Vanishing and exploding gradients
 The adjoint at the first layer is the upstream adjoint multiplied by the Jacobian of every layer above
@@ -143,7 +146,8 @@ print(dW1[i, j], numeric)        # agree to ~1e-10; the saved h, h_pre, X are th
   graphs fuse operations and run faster; the compiled route pays off once the model is stable and the
   step time matters more than iteration speed.
 - Freezing most weights cuts gradient and optimizer memory sharply, but the backward pass still
-  traverses the frozen layers, so step time and activation memory fall far less than parameter counts suggest.
+  traverses the frozen layers, so step time (at most about a third less) and activation memory fall far
+  less than parameter counts suggest.
 - Fused kernels that recompute intermediate results in the backward pass trade FLOPs for memory
   bandwidth and capacity; they win when the saved tensors would dominate memory, as attention does at long sequence lengths.
 
@@ -211,9 +215,9 @@ diagnosis before and after by logging per-layer gradient norms.
 
 ### Q: You freeze all weights except small LoRA adapters. What happens to the cost of the backward pass?
 - [ ] The backward pass becomes essentially free
-- [x] Gradient and optimizer memory for the frozen weights disappears, but the backward sweep still propagates through them to reach the adapters, so compute per step drops only modestly
+- [x] Gradient and optimizer memory for the frozen weights disappears, but the backward sweep still propagates through them to reach the adapters, so compute per step drops by at most about a third
 - [ ] Activations no longer need to be stored at all
 - [ ] The forward pass becomes twice as cheap
 > Adapters in early layers need the adjoint of the loss with respect to their outputs, which can only be
 > obtained by backpropagating through every frozen layer above them. What is skipped is the weight-gradient
-> matmul and the optimizer state for frozen parameters.
+> matmul (about half the backward FLOPs) and the optimizer state for frozen parameters.

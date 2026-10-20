@@ -5,6 +5,7 @@ name: Pre-training
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - training-adaptation/post-training
   - training-adaptation/supervised-fine-tuning

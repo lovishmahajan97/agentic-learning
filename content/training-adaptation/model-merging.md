@@ -5,6 +5,7 @@ name: Model merging
 kind: concept
 difficulty: advanced
 est_minutes: 15
+status: fact-checked
 related:
   - training-adaptation/peft
   - training-adaptation/supervised-fine-tuning

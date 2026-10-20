@@ -5,6 +5,7 @@ name: Logits
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - model-internals/softmax
   - model-internals/sampling-strategies

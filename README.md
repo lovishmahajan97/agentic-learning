@@ -21,6 +21,8 @@ the browser's localStorage. Export/import it from Settings.
     content/SPEC.md            authoring spec every lesson follows
     content/<module>/<slug>.md one lesson per topic; _module.md is the module guide
     scripts/build.py           validator + bundler (--check <files>, --check-module <id>, --report)
+    scripts/make_workflow.py   emits scripts/lms-continue.workflow.js with only the lesson work still left on disk
+    CONTINUE.md                handoff: state of the 584-lesson build and how to resume it locally
     site/page.html             app markup (artifact form); index.html is generated from it
     site/styles.css, app.js    the app
     site/data.js               generated bundle of all lessons

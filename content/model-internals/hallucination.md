@@ -5,6 +5,7 @@ name: Hallucination
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - model-internals/sampling-strategies
   - model-internals/small-language-models
@@ -51,12 +52,15 @@ durable fix is architectural: supply evidence, verify outputs, and make abstenti
 
 ## How it works
 ### A taxonomy that determines the fix
-- **Faithfulness (intrinsic) hallucination**: the output contradicts or is unsupported by the source it was
-  given, such as a summary that invents a figure absent from the document. Detectable by comparing against
-  the source; reduced by grounding and verification.
-- **Factuality (extrinsic) hallucination**: the output contradicts the world when no source was given, such
-  as a wrong date or an invented citation. Needs external knowledge to detect; reduced by retrieval, tools
-  and abstention.
+- **Faithfulness hallucination**: the output is not supported by the source it was given. The NLG
+  literature (Maynez et al., Ji et al.) splits this further into *intrinsic* (the output contradicts the
+  source, such as a summary that reverses a figure in the document) and *extrinsic* (the output adds content
+  the source neither states nor contradicts, such as an invented figure, which may or may not be true in the
+  world). Both are detectable by comparing against the source; reduced by grounding and verification.
+- **Factuality hallucination**: the output contradicts the world, judged against reality rather than against
+  a given source, such as a wrong date or an invented citation in a closed-book answer. Needs external
+  knowledge to detect; reduced by retrieval, tools and abstention. Note the axes are different: an extrinsic
+  addition can be factually true, and a faithful summary of a wrong document is factually wrong.
 - **Structural hallucination**: invented tool names, parameters that do not exist, API functions that were
   never defined. Common in agents and code generation; eliminated almost entirely by schema validation.
 
@@ -138,6 +142,8 @@ def faithfulness_report(answer, passages):
     return {"claims": len(claims), "unsupported": unsupported,
             "unsupported_rate": len(unsupported) / max(1, len(claims))}
 
+retrieved_passages = ["Refunds are issued within 14 days of a returned item being received."]
+answer_text = "Refunds take 14 days and are paid to the original card."   # second claim is unsupported
 report = faithfulness_report(answer_text, retrieved_passages)
 if report["unsupported_rate"] > 0:
     # Options: regenerate with the unsupported claims listed as "do not state",
@@ -189,7 +195,8 @@ abstention path and offline claim-level verification. For agents, validate every
 schema and verify consequential actions before executing them. Measure the unsupported-claim rate, the
 abstention rate on unanswerable items, calibration of confidence against correctness, and per-category
 error analysis. In interviews, explain the mechanism (objective, decoding, incentives), the
-intrinsic/extrinsic split, three mitigations with their costs, and why temperature 0 is not a fix.
+faithfulness/factuality split and the intrinsic/extrinsic subdivision, three mitigations with their costs,
+and why temperature 0 is not a fix.
 
 ## Role lens
 - **Engineer:** Builds the grounding pipeline, adds an "insufficient evidence" output path, validates tool
@@ -204,7 +211,8 @@ intrinsic/extrinsic split, three mitigations with their costs, and why temperatu
 documents. Walk through how you would diagnose and reduce it, and name one thing you would refuse to do.
 **A:** First get the failing examples labelled and split them. Did retrieval return the passage containing
 the answer? If not, it is a corpus or retrieval problem: chunking, embeddings, missing documents. If it did,
-did the model contradict the passage (faithfulness) or add unsupported detail (extrinsic)? Was the question
+did the model contradict the passage (intrinsic) or add detail the passage does not support (extrinsic)?
+Both are faithfulness failures with different fixes. Was the question
 answerable at all, in which case abstention is the correct output and the eval must reward it? Then fix
 retrieval first, since it is usually the largest share; require citations with quoted spans; add an
 "insufficient information" path; lower the temperature on the answer step; add claim-level verification for

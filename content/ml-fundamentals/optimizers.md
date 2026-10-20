@@ -5,6 +5,7 @@ name: Optimizers (Adam, AdamW)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/backpropagation

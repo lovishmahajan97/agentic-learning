@@ -5,6 +5,7 @@ name: Latency percentiles (p50/p95/p99)
 kind: metric
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - observability/monitoring
   - observability/tracing

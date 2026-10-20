@@ -5,6 +5,7 @@ name: Caching strategy & cache invalidation
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - serving-inference/caching
   - prompting/prompt-caching
@@ -28,7 +29,7 @@ and its own way of going stale. The design question is always the key: what must
 cached result to still be correct, and how you find out when it no longer is.
 
 ## Why it exists
-A cache hit returns in milliseconds and costs nothing; a miss takes seconds and bills every token.
+A cache hit returns in milliseconds and costs almost nothing; a miss takes seconds and bills every token.
 Prompts are dominated by content that repeats across requests: a system prompt, tool definitions,
 few-shot examples and retrieved documents can be thousands of tokens that are identical for every user
 of a feature. That makes caching the single biggest lever on cost and latency after model choice.
@@ -53,9 +54,13 @@ so the prefill of the shared part is not recomputed. The key is the exact prefix
 within* the cached span invalidates everything after it, because each cached key and value depends on all
 earlier positions. Design consequence: put static content first (system prompt, tools, few-shot, long
 documents) and dynamic content last, keep the ordering stable, and never inject a timestamp or the user's
-name near the top. Providers bill cached input tokens at a lower rate with short time-to-live windows
-(figures are vendor-specific and change); engines such as vLLM offer automatic prefix caching across
-requests that share a prefix. The metric is cached-token share in usage reports.
+name near the top. Providers bill cached input tokens at a lower rate with short time-to-live windows,
+some charge a premium for the cache *write*, and most enforce a minimum cacheable prefix length of
+roughly a thousand tokens or more, so a short system prompt alone may never cache (all figures are
+vendor- and model-specific and change); engines such as vLLM offer automatic prefix caching across
+requests that share a prefix. The metric is cached-token share in usage reports, checked after every
+change to prompt assembly, because a regression there is silent: requests keep succeeding and only the
+bill moves.
 
 ### Layer 2: exact response cache
 Key = hash of model id and version, sampling parameters, the full normalised message list, tool schemas,

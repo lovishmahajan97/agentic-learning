@@ -5,6 +5,7 @@ name: Perplexity
 kind: metric
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - ml-fundamentals/loss-functions
   - model-internals/tokenization

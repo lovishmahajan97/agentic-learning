@@ -5,6 +5,7 @@ name: Pruning
 kind: concept
 difficulty: advanced
 est_minutes: 14
+status: fact-checked
 related:
   - training-adaptation/quantization
   - training-adaptation/knowledge-distillation
@@ -144,7 +145,8 @@ for name, Wp in [("magnitude 50%", prune_rows(W, magnitude)), ("wanda 50%", prun
 - Unstructured pruning gives the best accuracy per removed weight but almost no GPU speedup; it only pays
   on sparse-aware CPU runtimes or at extreme sparsity, so for GPU serving it flips to being a reporting
   exercise rather than a cost saving.
-- 2:4 sparsity is guaranteed to halve matmul cost on supporting GPUs and cut weight bytes to about 56%,
+- 2:4 sparsity can run matmuls at up to twice the dense rate on supporting GPUs (realised gains are
+  smaller and kernel-dependent) and cuts weight bytes to about 56%,
   but it is a fixed 50%, usually needs recovery training, and only helps decode if the kernel reads the
   compressed form; on hardware without sparse tensor cores it is pure quality loss.
 - Structured pruning speeds up everything everywhere, but costs more quality per parameter and needs the

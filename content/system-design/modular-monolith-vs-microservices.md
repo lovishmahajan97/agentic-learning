@@ -5,6 +5,7 @@ name: Modular monolith vs microservices
 kind: decision
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - system-design/domain-driven-design-and-bounded-contexts
   - system-design/event-driven-architecture

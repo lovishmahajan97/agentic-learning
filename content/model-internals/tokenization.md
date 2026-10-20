@@ -5,6 +5,7 @@ name: Tokenization (BPE, SentencePiece)
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - model-internals/embeddings
   - model-internals/context-window

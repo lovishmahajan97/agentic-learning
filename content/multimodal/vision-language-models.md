@@ -5,6 +5,7 @@ name: Vision-language models
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - multimodal/clip
   - multimodal/image-embeddings
@@ -102,7 +103,9 @@ more pretraining compute. For an application engineer the interface is identical
 ## Example
 Any VLM served behind an OpenAI-compatible chat API (vLLM does this for open models; hosted vendors use
 the same shape) accepts an image as a base64 data URL inside the message content. The snippet downsizes
-the image first, asks a question that a caption could not answer, and forces a JSON reply for parsing.
+the image first, asks a question that a caption could not answer, and requests a JSON-only reply for
+parsing (`response_format` is honoured by vLLM and most hosted APIs; if a server ignores it, strip code
+fences before `json.loads`).
 
 ```python
 import base64, io, json
@@ -128,6 +131,7 @@ resp = client.chat.completions.create(
         {"type": "image_url", "image_url": {"url": to_data_url("q_revenue.png")}},
     ]}],
     temperature=0,
+    response_format={"type": "json_object"},
 )
 answer = json.loads(resp.choices[0].message.content)
 print(answer)   # {'quarter': 'Q3', 'previous_value': 4.2, 'value': 3.1, 'units': 'USD millions'}

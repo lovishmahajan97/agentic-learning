@@ -5,6 +5,7 @@ name: Model serving
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - serving-inference/engines
   - serving-inference/prefill-vs-decode
@@ -121,17 +122,18 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 t0 = time.perf_counter()
 first = None
 n = 0
-with client.chat.completions.stream(
+stream = client.chat.completions.create(
     model="meta-llama/Meta-Llama-3-8B-Instruct",
     messages=[{"role": "system", "content": "You are a terse assistant."},
               {"role": "user", "content": "Explain continuous batching in 3 sentences."}],
     max_tokens=200,
-) as stream:
-    for event in stream:
-        if event.type == "content.delta":
-            if first is None:
-                first = time.perf_counter() - t0      # time to first token
-            n += 1
+    stream=True,                                   # SSE: one chunk per sampled token
+)
+for chunk in stream:
+    if chunk.choices and chunk.choices[0].delta.content:
+        if first is None:
+            first = time.perf_counter() - t0      # time to first token
+        n += 1
 total = time.perf_counter() - t0
 print(f"TTFT={first*1000:.0f} ms, chunks={n}, "
       f"TPOT≈{(total-first)/max(n-1,1)*1000:.1f} ms/chunk")
@@ -156,7 +158,8 @@ print(f"TTFT={first*1000:.0f} ms, chunks={n}, "
 - Measuring latency with a single request and shipping; symptom is TPOT doubling the first time real
   concurrency arrives, because decode steps now read many caches per iteration.
 - Putting a generic HTTP load balancer in front of replicas with prefix caching enabled; symptom is a
-  cache hit rate near zero because identical system prompts land on different GPUs.
+  fleet-wide prefix hit rate far below what one replica achieves, because turn *n* of a conversation lands
+  on a GPU that never prefilled turns 1 to *n−1*.
 - Treating `max_tokens` as cosmetic; symptom is a few runaway requests holding cache blocks for minutes
   and starving the queue, visible as TTFT spikes unrelated to request rate.
 - Ignoring client disconnects; symptom is GPU time spent generating tokens nobody reads, showing up as

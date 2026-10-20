@@ -5,6 +5,7 @@ name: Gradient descent
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - ml-fundamentals/loss-functions
   - ml-fundamentals/backpropagation

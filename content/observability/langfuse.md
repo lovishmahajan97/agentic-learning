@@ -5,6 +5,7 @@ name: Langfuse
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - observability/tracing
   - observability/token-cost-tracking

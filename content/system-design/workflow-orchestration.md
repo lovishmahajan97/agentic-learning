@@ -5,6 +5,7 @@ name: Workflow orchestration (Temporal, Prefect, Airflow)
 kind: tool
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - reliability/durable-workflow-execution
   - agent-reliability/durable-execution-and-checkpointing
@@ -67,8 +68,9 @@ rather than a static graph. The orchestration layer (Prefect server or Cloud) tr
 caching of task results, schedules and concurrency limits, while your own workers execute the code, a
 hybrid model chosen *because* data and credentials then never leave your infrastructure. It suits the
 many AI pipelines where the number of documents, the branches and the parameters are discovered as the
-flow runs. It is still a pipeline tool: flows are expected to finish, not to live for weeks awaiting
-events.
+flow runs. It is still a pipeline tool: a flow run can be paused or suspended to wait for human input,
+but there is no replayable event history, so a stateful process that must survive anything for weeks is
+not its design centre.
 
 ### Temporal: durable execution
 Temporal (descended from Uber's Cadence) solves a different problem: making ordinary code durable. You

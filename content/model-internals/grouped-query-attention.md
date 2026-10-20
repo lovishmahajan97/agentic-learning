@@ -5,6 +5,7 @@ name: Grouped-query attention (GQA)
 kind: concept
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - model-internals/multi-head-attention
   - model-internals/kv-cache

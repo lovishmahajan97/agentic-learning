@@ -5,6 +5,7 @@ name: Document understanding
 kind: concept
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - multimodal/ocr
   - multimodal/vision-language-models

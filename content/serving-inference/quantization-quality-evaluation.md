@@ -5,6 +5,7 @@ name: Quantization quality evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - training-adaptation/quantization
   - model-internals/perplexity
@@ -33,7 +34,8 @@ aggregate numbers hide the failures that matter.
 A 4-bit checkpoint lets a 70B model fit where a 16-bit one did not and roughly quarters the bytes decode
 must stream, so the pressure to quantize is constant. The method lesson in Training & adaptation covers
 *how* GPTQ, AWQ, int8 and fp8 work; this one is about *whether the result is still the model you tested*.
-The card that ships with a quantized checkpoint typically says "perplexity 5.47 → 5.62 on WikiText-2",
+The card that ships with a quantized checkpoint says something like "perplexity 5.47 → 5.62 on
+WikiText-2" (illustrative numbers),
 and teams read that as "lossless enough" and deploy.
 
 That inference is unsafe for several reasons. Perplexity averages log-loss over every token of generic
@@ -78,7 +80,7 @@ remove sampling noise, then repeat with the production configuration over severa
 same task graders; for open-ended outputs, use pairwise LLM-as-judge with the fp16 output as the
 reference and randomised position. Because every prompt is scored under both models, use *paired*
 statistics (paired bootstrap or a sign test on per-item wins) rather than comparing two independent
-means; pairing typically shrinks the detectable effect size several-fold at the same sample size.
+means; pairing can shrink the detectable effect size substantially at the same sample size.
 
 ### Step 4: stress the known weak spots
 Add targeted slices *because* average scores mask them: long-context retrieval (needle-style prompts at

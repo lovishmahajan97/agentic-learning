@@ -5,6 +5,7 @@ name: Positional encoding (RoPE)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - model-internals/self-attention
   - model-internals/context-window

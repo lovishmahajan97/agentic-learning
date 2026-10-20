@@ -5,6 +5,7 @@ name: Transformer
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - model-internals/attention-mechanism
   - model-internals/self-attention
@@ -25,7 +26,7 @@ A transformer is a stack of identical blocks. Each block first lets every positi
 other positions through attention, then transforms each position on its own with a feed-forward network,
 with residual connections and normalization holding the stack together. It replaced recurrence because
 all positions of a sequence are processed in parallel as one matrix multiplication and any two positions
-are a single attention step apart, which is what made training on web-scale text affordable. Every
+are a single attention step apart, which made training on web-scale text affordable. Nearly every
 current LLM is a decoder-only variant of this design.
 
 ## Why it exists

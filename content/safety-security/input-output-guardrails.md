@@ -5,6 +5,7 @@ name: Input / output guardrails
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - safety-security/prompt-injection
   - safety-security/output-validation

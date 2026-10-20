@@ -5,6 +5,7 @@ name: Outbox / inbox patterns
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - system-design/event-driven-architecture
   - system-design/exactly-once-processing-limitations

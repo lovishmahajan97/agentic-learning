@@ -5,6 +5,7 @@ name: Sampling strategies (temperature, top-k / top-p, greedy vs beam)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - model-internals/logits
   - model-internals/softmax
@@ -73,7 +74,8 @@ already appeared.
 Greedy is beam search with `B = 1`. Beam search expands each of *B* partial sequences by the vocabulary,
 scores all candidates by cumulative log-probability, keeps the best *B*, and repeats until each beam
 ends; a length penalty is usually applied because longer sequences accumulate more negative log-prob and
-would otherwise lose unfairly. The cost is *B* forward passes per step and *B* KV caches, and results
+would otherwise lose unfairly. The cost is *B* sequences' worth of compute per step (one batched pass)
+and *B* KV caches, and results
 cannot be streamed cleanly because the winning beam is only known at the end. Beam search is the right
 tool when there is a single correct target and the metric rewards likelihood: machine translation,
 speech recognition, grammar correction. For chat and creative generation it is rarely used.
