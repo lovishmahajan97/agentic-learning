@@ -5,7 +5,7 @@ name: Self-host vs API
 kind: decision
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - system-design/build-vs-buy
   - system-design/open-weight-vs-proprietary
@@ -20,9 +20,9 @@ sources:
 ---
 
 ## TL;DR
-An API buys capability, elasticity and zero operations per token; self-hosting buys control, data
-locality and lower *marginal* cost, but only once GPUs are busy. Start on the API unless a hard
-constraint forces hosting, and re-run the numbers as traffic grows.
+An API buys capability, elasticity and no operations; self-hosting buys control, data locality and
+lower *marginal* cost, but only with busy GPUs. Start on the API unless residency, an air gap,
+customisation or sustained volume forces hosting; re-run the numbers as traffic grows.
 
 ## Why it exists
 - **Opposite cost structures.** An API is pure variable cost: pay per token, scale to zero, someone else
@@ -102,18 +102,19 @@ price reach opposite answers.
    moves with them.
 
 ## Diagram
-Read it top to bottom: hard constraints decide first, then quality on your eval, then the cost model at
-real utilisation; most paths end in the API or a hybrid split, not a full migration.
+Read it top to bottom: hard constraints (including a ban on any third-party processor) decide first,
+then quality on your eval, then the cost model at real peak and utilisation with people included; most
+paths end in the API or a hybrid split, not a full migration.
 
 ```mermaid
 flowchart TD
-    S["New task or quarterly review"] --> C{"Hard constraint? air gap, no third-party processor, adapters, version pin"}
+    S["New task or quarterly review"] --> C{"Hard constraint? air gap, adapters, version pin"}
     C -->|"yes"| H["Self-host this task"]
     C -->|"no"| T{"Do zero-retention terms or an in-cloud platform satisfy legal?"}
     T -->|"no"| H
     T -->|"yes"| E{"Open model passes the golden-set eval?"}
     E -->|"no"| A["Stay on the API"]
-    E -->|"yes"| U{"Self-host cost at real peak and utilisation, plus people, below API cost?"}
+    E -->|"yes"| U{"Cheaper at real peak, people included?"}
     U -->|"no"| A
     U -->|"yes"| HY["Hybrid: move this one task, keep the long tail on the API"]
     A -.->|"revisit as volume and prices move"| S

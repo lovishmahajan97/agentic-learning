@@ -5,7 +5,7 @@ name: SME review & annotation guidelines
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - evals/rubrics
   - evals/inter-annotator-agreement
@@ -17,76 +17,103 @@ related:
 ---
 
 ## TL;DR
-Annotation guidelines are the written contract for how a customer's SMEs judge model outputs: the label
-set, an operational definition of each label, a decision order, worked boundary examples and an explicit
-"unsure" path. SME review is the protocol around them: blind, randomised, independently labelled, with
-agreement measured and disagreements fed back into the guideline. Without both, every eval number
-inherits the unmeasured noise of experts applying different private standards.
+Guidelines are the written contract for how customer SMEs judge outputs: labels, definitions, decision
+order, boundary examples, an "unsure" path. Review protocol keeps judging blind, randomised and
+independent, with agreement measured. Without both, eval numbers inherit unmeasured expert noise.
 
 ## Why it exists
-When you ask three senior experts "is this answer good?", you get three answers shaped by three private
-standards. One fails an answer for a missing caveat, one for a slightly wrong tone, one passes anything
-factually correct. Each is a reasonable expert; together they produce labels whose disagreement is
-indistinguishable from model error. If the eval set is labelled this way, a prompt change can move the
-score just by changing which reviewer saw which items.
-
-The naive approach is to trust expertise: "they are the SMEs, they know what good looks like". Expertise
-tells you what an individual expert believes, but an eval needs a *shared* standard that can be applied
-consistently, audited later, taught to a new reviewer and eventually encoded into an LLM judge. The
-second naive approach is a one-line rubric ("rate 1 to 5 for quality"), which invites each reviewer to
-fill in their own meaning of 3 versus 4. Guidelines exist to turn tacit, individual standards into an
-explicit, shared one; review protocol exists to prevent the process itself (seeing which model produced
-an output, reviewing in a fixed order, discussing before labelling) from biasing the result.
+- **Experts apply private standards.** Ask three senior experts "is this answer good?" and one fails it for
+  a missing caveat, one for a slightly wrong tone, one passes anything factually correct. Each is
+  reasonable; together their disagreement is indistinguishable from model error.
+- **Unmanaged noise moves scores.** If the eval set is labelled this way, a prompt change can move the score
+  just by changing which reviewer saw which items.
+- **"Trust the SMEs" is not enough.** Expertise tells you what one expert believes, but an eval needs a
+  *shared* standard that can be applied consistently, audited later, taught to a new reviewer and
+  eventually encoded into an LLM judge.
+- **A one-line rubric fails too.** "Rate 1 to 5 for quality" invites each reviewer to fill in their own
+  meaning of 3 versus 4.
+- **What the two pieces buy.** Guidelines turn tacit, individual standards into an explicit shared one;
+  the review protocol stops the process itself (seeing which model produced an output, a fixed order,
+  discussing before labelling) from biasing the result.
 
 ## How it works
 ### Two jobs, one guideline
-SMEs do two different things with customer data. **Annotation** creates the reference: the expert sees
-only the input and writes the correct label or answer. **Review** judges a system's output against the
-input (and sometimes a reference). Review is faster per item, because recognising an error is easier
-than producing the answer, but it is anchored by what the system wrote: a plausible output pulls the
-reviewer toward accepting it. Annotation is slower and unanchored. Use annotation for the golden set's
-references and review for judging runs, and write one guideline that both follow, so "correct" means the
-same thing in the reference and in the verdict.
+| | Annotation | Review |
+|---|---|---|
+| What the SME sees | only the input | the input, the system's output, sometimes a reference |
+| What they produce | the correct label or answer (the reference) | a verdict on the output |
+| Speed | slower | faster, because recognising an error is easier than producing the answer |
+| Bias | unanchored | anchored: a plausible output pulls the reviewer toward accepting it |
+| Use for | the golden set's references | judging runs |
+
+- **Write one guideline both follow,** so "correct" means the same thing in the reference and in the verdict.
 
 ### What goes in the guideline
-1. **Scope.** What the reviewer is judging and, just as important, what they are not: "judge whether the
+1. **Scope.** What the reviewer judges and, just as important, what they do not: "judge whether the
    answer is correct for this policy; do not judge writing style unless it misleads".
 2. **Label set.** Prefer binary or small categorical labels per criterion over a single 1–5 score,
-   *because* narrow questions get consistent answers and broad scales hide which criterion failed.
-3. **Operational definitions.** For each label, the observable conditions: "Fail on completeness if the
-   answer omits an eligibility condition stated in the source policy".
-4. **Decision order.** Which criteria to check first and which are disqualifying, so reviewers do not
-   weigh a tone problem against a factual error differently.
+   because narrow questions get consistent answers and broad scales hide which criterion failed.
+3. **Operational definitions.** Observable conditions per label: "Fail on completeness if the answer omits
+   an eligibility condition stated in the source policy".
+4. **Decision order.** Which criteria come first and which are disqualifying, so reviewers do not weigh a
+   tone problem against a factual error differently.
 5. **Boundary examples.** Pairs of real cases just either side of each line, with the reason.
-6. **Unsure and out-of-scope paths.** A legitimate "cannot judge" label with a reason field, *because*
-   forcing a choice on ambiguous items turns policy gaps into silent noise.
+6. **Unsure and out-of-scope paths.** A legitimate "cannot judge" label with a reason field, because forcing
+   a choice on ambiguous items turns policy gaps into silent noise.
 7. **Rationale requirement.** A short free-text reason on every fail, citing the guideline section.
 
 ### The review protocol
-- **Blind.** Hide which system, prompt version or model produced the output, and mix in reference
-  answers, *because* reviewers who know which is the "new" version rate it differently.
+- **Blind.** Hide which system, prompt version or model produced the output, and mix in reference answers,
+  because reviewers who know which is the "new" version rate it differently.
 - **Randomised order.** Shuffle per reviewer, so fatigue and anchoring effects spread evenly.
-- **Independent first, discuss second.** Labels are committed before any group discussion; otherwise
-  the most senior voice becomes the label.
-- **Measure agreement.** On a double-labelled subset, compute raw agreement and a chance-corrected
-  statistic such as Cohen's κ = (p_obs − p_chance)/(1 − p_chance), where p_chance is the agreement two
-  reviewers would reach by labelling at random with their own label rates. Raw agreement alone is
-  inflated when one label dominates. Because κ itself drops when one label is very rare even if
-  reviewers are good, also report agreement specific to the label you care about: for fails,
-  2·n_both_fail / (2·n_both_fail + n_disagree). For more than two reviewers use Fleiss' κ; when items receive
-  different numbers of labels or the scale is ordinal, Krippendorff's α handles both.
+- **Independent first, discuss second.** Labels are committed before any group discussion; otherwise the
+  most senior voice becomes the label.
 - **Attribute disagreement.** Use the cited guideline sections to see which criterion causes splits; fix
   that section, not the reviewers.
-- **Version the guideline.** Store guideline version per label, because a definition change can
+- **Version the guideline.** Store the guideline version per label, because a definition change can
   invalidate earlier labels in that category.
 
-### When to stop iterating
-Iterate calibration rounds until agreement is stable and adequate for the decision the labels support.
-There is no universal threshold; κ bands such as Landis and Koch's are conventions, and a high-stakes
-acceptance set warrants more agreement than an exploratory error analysis.
+### Measuring agreement
+On a double-labelled subset, report raw agreement plus a chance-corrected statistic:
 
-## Example
-A benefits-policy assistant for an HR customer. Two HR SMEs review 50 answers independently against
+```
+Cohen's κ = (p_obs − p_chance) / (1 − p_chance)
+  p_chance = agreement two reviewers would reach labelling at random with their own label rates
+fail-specific agreement = 2·n_both_fail / (2·n_both_fail + n_disagree)
+```
+
+- **Raw agreement alone is inflated** when one label dominates.
+- **κ itself drops when one label is very rare,** even if reviewers are good, so also report agreement
+  specific to the label you care about (for fails, the formula above).
+- **More than two reviewers:** use Fleiss' κ.
+- **Items with different numbers of labels, or an ordinal scale:** Krippendorff's α handles both.
+
+### When to stop iterating
+- **Iterate calibration rounds** until agreement is stable and adequate for the decision the labels support.
+- **There is no universal threshold.** κ bands such as Landis and Koch's are conventions, and a high-stakes
+  acceptance set warrants more agreement than an exploratory error analysis.
+
+## Diagram
+Calibration is a loop: low agreement is traced to the guideline section reviewers cite, that section is
+rewritten, and a fresh batch is labelled before scaling up.
+
+```mermaid
+flowchart TD
+    G["Guideline version N"] --> Q["Blind, shuffled review queue"]
+    Q --> L["Independent labels plus rationale"]
+    L --> S["Double-labelled subset"]
+    S --> K["Raw, kappa, fail-specific agreement"]
+    K -->|"adequate for the decision"| U["Scale up or build LLM judge"]
+    K -->|"too low"| A["Group splits by cited section"]
+    A --> R["Rewrite section, add boundary pair"]
+    R -->|"version N plus 1"| G
+    A -->|"genuine policy gap"| P["Policy owner decides"]
+    P --> R
+```
+
+## Examples
+### Agreement on a benefits-policy calibration batch
+An HR customer's benefits-policy assistant. Two HR SMEs review 50 answers independently against
 guideline v0.3, labelling pass or fail and citing the section behind each fail.
 
 ```python
@@ -113,47 +140,87 @@ both_fail, disagree = 10, 10
 print(f"agreement on fails {2 * both_fail / (2 * both_fail + disagree):.2f}")  # 0.67
 ```
 
-Raw agreement of 80% looks fine, but chance agreement here is about 58% because both reviewers pass most
-answers, so κ is only about 0.52. Fail-specific agreement is 0.67: when either reviewer fails an
-answer, the other agrees only two times in three, and the fails are what the eval exists to find. Seven
-of ten disagreements cite completeness: one SME fails answers
-that omit the waiting-period rule even when the question did not ask about it. The fix is in G3 ("an
-answer is incomplete only if it omits a condition that changes the answer to the question asked"), plus
-two boundary examples, then a fresh calibration batch, not more reviewer training.
+| Number | What it says |
+|---|---|
+| raw agreement 80% | looks fine |
+| chance agreement about 58% | both reviewers pass most answers |
+| κ about 0.52 | much of the 80% is chance |
+| fail-specific agreement 0.67 | when either reviewer fails an answer, the other agrees only two times in three, and the fails are what the eval exists to find |
+| 7 of 10 disagreements cite completeness | one SME fails answers that omit the waiting-period rule even when the question did not ask about it |
+
+- **The fix is in G3,** not more reviewer training: "an answer is incomplete only if it omits a condition
+  that changes the answer to the question asked", plus two boundary examples, then a fresh calibration batch.
+
+### A one-page decision card (guideline excerpt)
+Long guidelines go unread, so reviewers work from a card like this and the full document holds the
+appendix. The section ids are what reviewers cite on each fail.
+
+```text
+Benefits assistant review card - guideline v0.4
+Scope: judge correctness for the employee's question under the cited policy.
+       Do NOT judge style unless it misleads.
+Check in order; the first FAIL decides, cite its section.
+  G1 accuracy      FAIL if any stated eligibility, amount or date contradicts the policy.
+  G2 grounding     FAIL if a claim has no support in the retrieved policy text.
+  G3 completeness  FAIL only if it omits a condition that changes the answer to the
+                   question asked (e.g. a waiting period for a "can I enrol now?" question).
+  G5 tone          FAIL only if wording could mislead the employee into a wrong action.
+UNSURE: use when the policy itself does not decide the case. Write why.
+Boundary pair for G3: see appendix A, items 12 and 13.
+```
+
+## Production patterns
+- **Blinded, shuffled review queue.** Strip system and version identifiers before items reach reviewers,
+  mix in reference answers, and shuffle with a per-reviewer seed. Monitor each reviewer's pass rate on the
+  mixed-in references, because a reviewer who fails correct references is misreading the guideline.
+- **Known-answer check items.** Seed a small share of items whose correct label the policy owner has
+  fixed, and track each reviewer's accuracy on them over time. Use drops as a prompt for a recalibration
+  session, not as a performance score.
+- **Guideline as the single versioned source.** Keep the guideline in version control, store its version
+  with every label, and derive the LLM judge prompt from the same file. After each guideline change,
+  rerun judge-versus-human agreement before trusting the judge again.
+- **Per-criterion agreement report.** After every double-labelled batch, compute κ and fail-specific
+  agreement per criterion and list disagreements by cited section. Monitor the trend per section across
+  guideline versions.
+- **Unsure-rate tracking.** Report the "cannot judge" share per reviewer and per criterion. A climbing rate
+  goes to the next calibration session for boundary examples, or to the policy owner when the policy is silent.
 
 ## Trade-offs
-- Binary per-criterion labels give higher agreement and clear diagnosis, but lose gradations of quality;
-  when choosing between two good systems, add pairwise preference judgements alongside them.
-- Detailed guidelines raise consistency, but long documents go unread; past a few pages, move rarely
-  needed detail into an appendix and keep a one-page decision card for reviewers.
-- Review of system outputs costs less expert time than annotating from scratch, but anchors on the
-  output; for golden references and hard strata, annotate unaided, and keep review for judging runs.
-- Blind review removes version bias, but hides context reviewers sometimes need, such as which data
-  source a system had; provide the input context, never the system identity.
-- An "unsure" label surfaces policy gaps honestly, but some reviewers overuse it; when its rate climbs,
-  review those items in session and add boundary examples.
+- **Binary per-criterion labels vs gradation.** Higher agreement and clear diagnosis, but gradations of
+  quality are lost; when choosing between two good systems, add pairwise preference judgements alongside.
+- **Detailed guidelines vs being read.** They raise consistency, but long documents go unread; past a few
+  pages, move rarely needed detail into an appendix and keep a one-page decision card for reviewers.
+- **Review vs annotation.** Reviewing outputs costs less expert time than annotating from scratch, but
+  anchors on the output; for golden references and hard strata, annotate unaided, and keep review for
+  judging runs.
+- **Blind review vs context.** It removes version bias but hides context reviewers sometimes need, such as
+  which data source a system had; provide the input context, never the system identity.
+- **"Unsure" label vs overuse.** It surfaces policy gaps honestly, but some reviewers overuse it; when its
+  rate climbs, review those items in session and add boundary examples.
 
 ## Pitfalls
-- Building references by having SMEs approve system outputs; the symptom is a golden set that agrees
+- **Building references by having SMEs approve system outputs.** Symptom: a golden set that agrees
   suspiciously well with the system that drafted it and scores a different system unfairly low.
-- Using a single holistic 1–5 score; the symptom is reviewers agreeing on the average but rarely on any
+- **Using a single holistic 1–5 score.** Symptom: reviewers agree on the average but rarely on any
   individual item.
-- Discussing items as a group before labelling; the symptom is suspiciously high agreement that drops
+- **Discussing items as a group before labelling.** Symptom: suspiciously high agreement that drops
   sharply when the same reviewers label a new batch alone.
-- Reporting raw agreement only; the symptom is "90% agreement" on a set where 90% of items are passes and
+- **Reporting raw agreement only.** Symptom: "90% agreement" on a set where 90% of items are passes and
   reviewers almost never agree on the failures.
-- Editing the guideline without versioning labels; the symptom is a metric jump between dataset versions
-  that nobody can attribute to the model or the definition change.
-- Letting reviewers see which model produced each output; the symptom is the new version winning by
-  more in SME review than in blind or automated checks.
+- **Editing the guideline without versioning labels.** Symptom: a metric jump between dataset versions that
+  nobody can attribute to the model or the definition change.
+- **Letting reviewers see which model produced each output.** Symptom: the new version wins by more in SME
+  review than in blind or automated checks.
 
 ## When to use
-Write guidelines before any SME labels more than a calibration batch, and before you build an LLM judge,
-since the judge's prompt should be derived from the same document. Use the full protocol (blind,
-randomised, double-labelled subset, κ) for acceptance sets and judge calibration; a lighter version is
-fine for exploratory error analysis. Track agreement per criterion, unsure rate and guideline version.
-In interviews, the strong signal is treating low agreement as a guideline defect and showing how
-disagreement is attributed to a specific criterion.
+- **Write guidelines first:** before any SME labels more than a calibration batch, and before you build an
+  LLM judge, since the judge's prompt should be derived from the same document.
+- **Full protocol** (blind, randomised, double-labelled subset, κ) for acceptance sets and judge
+  calibration.
+- **Lighter version** is fine for exploratory error analysis.
+- **Measure** agreement per criterion, unsure rate and guideline version.
+- **Interviews:** the strong signal is treating low agreement as a guideline defect and attributing
+  disagreement to a specific criterion.
 
 ## Role lens
 - **Engineer:** Builds the review tool with blinding, per-reviewer shuffling, rationale fields and
@@ -172,6 +239,42 @@ which items fail, which are exactly the items the eval is about. I would look at
 items either reviewer failed, and group disagreements by the guideline criterion cited. If one criterion
 dominates, the guideline definition is ambiguous. I would also confirm reviewers labelled independently
 and blind to system identity, since discussion or version knowledge inflates agreement.
+
+## Interview questions
+### What is the difference between SME annotation and SME review, and when do you use each?
+- **Annotation** produces the reference from the input alone, so it is slower but unanchored: use it for
+  golden-set references and hard strata.
+- **Review** judges a system's output, which is faster but anchored, because a plausible output pulls the
+  reviewer toward accepting it: use it for judging runs.
+- **Both follow one guideline,** so "correct" means the same thing in the reference and in the verdict.
+
+### How would you draft annotation guidelines for a new customer task in the first week?
+- **Start from real cases:** sit with two SMEs on a batch of real outputs and record why each passes or fails.
+- **Turn reasons into structure:** scope, per-criterion binary labels, operational definitions, decision
+  order, boundary pairs, an unsure path and a required rationale.
+- **Calibrate before scaling:** a small double-labelled batch, agreement per criterion, then revise the
+  sections that cause splits.
+
+### Three reviewers label overlapping subsets, and the scale is ordinal. Which agreement statistic?
+- **Cohen's κ is for exactly two reviewers;** Fleiss' κ extends to more raters.
+- **Krippendorff's α** handles both items with different numbers of labels and ordinal scales, so it fits here.
+- **Still report label-specific agreement** on the failure class, because chance-corrected statistics drop
+  when that class is rare.
+
+### A new prompt version wins by 12 points in SME review but only 2 points in automated checks. What do you suspect?
+- **Version leakage first:** reviewers may know which output is "new", so check blinding and whether
+  outputs carry tells such as a changed format.
+- **Then order and anchoring:** confirm per-reviewer shuffling and that the two versions were interleaved,
+  not reviewed in separate sessions.
+- **Then the checks themselves:** the automated checks may miss the criterion SMEs care about, so compare
+  per-criterion results.
+
+### When is a lighter review protocol acceptable?
+- **Exploratory error analysis:** single-labelled, unblinded review is fine to find failure themes,
+  because no ship decision rests on the number.
+- **Not for acceptance sets or judge calibration,** where unmeasured reviewer noise directly becomes the
+  decision or the judge.
+- **The cost difference is mostly the double-labelled subset,** so scale its size with the stakes.
 
 ## Quiz
 ### Q: Why are binary per-criterion labels usually preferred over one 1–5 quality score for SME review?

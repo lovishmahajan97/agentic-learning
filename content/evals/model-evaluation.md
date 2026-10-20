@@ -5,7 +5,7 @@ name: Model evaluation
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -135,7 +135,7 @@ Follow one item through the eval, then the loop back: per-slice scores gate the 
 failures return to the dataset.
 
 ```mermaid
-flowchart LR
+flowchart TD
     D[("Golden dataset, versioned")] --> S["System under test: pinned model, prompt, index"]
     S --> O["Raw output"]
     O --> G["Grader chosen by output type"]

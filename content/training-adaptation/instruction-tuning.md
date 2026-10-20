@@ -5,7 +5,7 @@ name: Instruction tuning
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/post-training
@@ -102,23 +102,24 @@ single format, for the same reason as templates: learn the intent, not one surfa
   latent ability, it does not create it.
 
 ## Diagram
-Follow how many narrow sources become one wide, balanced mixture, and note that evaluation holds out
-whole task families rather than rows.
+Follow how many narrow sources become one wide, balanced mixture: formats are mixed (zero-shot,
+few-shot, chain-of-thought), large tasks are capped before proportional mixing, and the SFT loss masks
+the instruction. Evaluation holds out whole task families and real user requests, not rows.
 
 ```mermaid
 flowchart TD
-    BM["Public benchmarks"] -->|"several templates and inversions per task"| P["Instruction pool"]
-    HW["Human-written real requests"] --> P
-    SD["Seed tasks"] --> SI["Self-Instruct: teacher invents and answers"]
-    SI -->|"filter for quality and diversity"| P
-    P --> MX["Mix formats: zero-shot, few-shot, chain-of-thought"]
-    MX --> CAP["Examples-proportional mixing with a per-task cap"]
-    CAP --> SFT["SFT loss: instruction masked, output supervised"]
+    BM["Public benchmarks"] -->|"several templates and inversions"| P["Instruction pool"]
+    HW["Human-written requests"] --> P
+    SD["Seed tasks"] --> SI["Self-Instruct: teacher generates"]
+    SI -->|"filter quality and diversity"| P
+    P --> MX["Mix prompt formats"]
+    MX --> CAP["Proportional mixing, per-task cap"]
+    CAP --> SFT["SFT, instruction masked"]
     SFT --> IT["Instruction-tuned model"]
-    HO["Held-out task families and real user requests"] --> EV{"Works on unseen tasks?"}
+    HO["Held-out task families"] --> EV{"Works on unseen tasks?"}
     IT --> EV
     EV -->|"no: add tasks and phrasings"| P
-    EV -->|"yes"| NX["Preference training and safety data"]
+    EV -->|"yes"| NX["Preference and safety training"]
 ```
 
 ## Examples
@@ -286,12 +287,13 @@ tend to overfit seen tasks.
 - **Instruction tuning pays** when requests are open-ended and users will word them in ways you cannot
   enumerate.
 
-### Your tuned model handles training phrasings but fails on paraphrases. What went wrong?
-- **Too few templates per task**, so the model keyed on wording instead of intent.
-- **Fix the data:** write several phrasings per task including inversions, and add genuine user-style
-  requests.
-- **Fix the eval:** test on paraphrases and task families never seen in training, and track score
-  variance across phrasings of the same request.
+### In the original FLAN work, small models got worse on held-out tasks after instruction tuning. Why, and what does it imply?
+- **The usual reading is capacity:** small models lack room to learn both the seen tasks and the
+  meta-skill of following instructions, so they overfit the seen tasks.
+- **Instruction tuning surfaces latent ability; it does not create it.** If the base cannot do a task
+  few-shot, tuning on instructions will not make it appear.
+- **Implication:** check the base's few-shot ability on your task families before tuning, and expect
+  better mixtures to narrow, not erase, the gap for small models.
 
 ### What are the risks of scaling instruction data with Self-Instruct, and how do you control them?
 - **The student inherits the teacher's errors and style**, and generated tasks cluster around what the

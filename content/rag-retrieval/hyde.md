@@ -5,7 +5,7 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -193,8 +193,9 @@ Illustrative A/B on a golden set for an internal wiki; the shape of the decision
 - **Recall vs latency and cost.** One generation per query adds latency on the order of several hundred
   milliseconds to a few seconds (a whole passage must be decoded before search starts) and a per-query
   cost; using it only as a fallback when first-pass scores are weak keeps it off the common path.
-- **Robust to small errors vs fragile to entity confusion.** On private or novel domains the model writes a
-  generic passage, and retrieval becomes generic with it.
+- **Robust to small errors vs fragile to entity confusion.** A wrong number or date in the hypothetical
+  barely moves the vector, but a wrong entity does; on private or novel domains the model writes a generic
+  passage, and retrieval becomes generic with it.
 - **Stability vs cost of samples.** Several samples stabilise the aggregated vector at linear cost; one is
   cheaper and noisier, and the right number depends on how much the hypotheticals disagree.
 

@@ -5,7 +5,7 @@ name: Pre-training
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/post-training
   - training-adaptation/supervised-fine-tuning
@@ -134,21 +134,22 @@ Training runs in stages:
 - **The base carries knowledge and latent skills**; it is the asset every downstream stage starts from.
 
 ## Diagram
-Follow the data from raw text to a base model: the pipeline and tokenizer come first, then the
-training stages, with checkpoints as the rollback path when loss spikes.
+Follow the data from raw text to a base model. The pipeline (language ID, quality filter, dedup,
+decontamination) and the frozen tokenizer come first; the main run uses short sequences with AdamW and
+warmup then decay; checkpoints are the rollback path when loss spikes.
 
 ```mermaid
 flowchart TD
-    R["Raw corpus: web, code, books, papers"] --> P["Pipeline: language ID, quality filter, dedup, decontaminate"]
+    R["Raw corpus: web, code, books"] --> P["Filter, dedup, decontaminate"]
     P --> M["Weighted data mixture"]
     S["Corpus sample"] --> TK["Train and freeze tokenizer"]
-    TK --> M
-    M --> MR["Main run: short sequences, AdamW, warmup then decay"]
+    TK -->|"tokenize"| M
+    M --> MR["Main run: short sequences"]
     MR --> LC["Long-context stage"]
-    LC --> AN["Annealing on high-quality data, LR near zero"]
-    AN --> B["Base model: completes text, no instruction following"]
+    LC --> AN["Anneal: high-quality data, LR to 0"]
+    AN --> B["Base model: completes text"]
     MR -->|"save at fixed intervals"| CK[("Checkpoints")]
-    CK -.->|"roll back on loss spike, skip batches"| MR
+    CK -.->|"roll back on spike, skip batches"| MR
     B --> PT["Post-training"]
 ```
 
@@ -308,8 +309,8 @@ failure cases, and only then decide whether adaptation of the weights is justifi
 ### Why is pre-training called self-supervised, and why did that unlock scale?
 - **The text is its own label.** At each position the target is the next token already in the document,
   so the loss is cross-entropy against data that needs no annotator.
-- **So the corpus can be the web.** Trillions of tokens become usable, which is the only way to set
-  billions of parameters without overfitting.
+- **So the corpus can be the web.** Trillions of tokens become usable, whereas no labelled downstream
+  dataset is large enough to set billions of parameters without overfitting.
 - **Causal beats masked for generation** because every position is supervised in one pass and the trained
   model is already a left-to-right sampler.
 

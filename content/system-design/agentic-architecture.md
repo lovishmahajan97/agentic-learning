@@ -203,6 +203,12 @@ Three boundaries are visible:
 - **Idempotency key from run id and step.** A worker that crashes after the refund but before the
   checkpoint re-executes the step without paying twice.
 
+What the sketch leaves out, so you do not copy it as-is:
+- **Validation errors should be observations.** Here `validate` raises and ends the run; in production
+  catch the error and return it like the unknown-tool case, so the model can fix its arguments.
+- **One status covers two caps.** Hitting `max_steps` and hitting `budget_usd` both record
+  `budget_exhausted`; record them separately if you alert on them separately.
+
 ### Walking one run through the runtime
 | Step | What happens | Status after |
 |---|---|---|
@@ -274,7 +280,8 @@ for label, growth in [("raw output in context", 1.0), ("artifacts by reference",
 - **Pasting full tool outputs into context.** Symptom: cost grows step over step and quality falls as
   the window fills with raw JSON. Fix: store artifacts and reference them.
 - **Treating a demo loop as the architecture.** Symptom: the first production requirement (resume,
-  audit, cancel, approve) requires a rewrite.
+  audit, cancel, approve) requires a rewrite. Fix: build the runtime boundaries (external state, budgets,
+  gates, events) before adding tools.
 
 ## When to use
 - **Use when:** the number and order of steps genuinely depend on intermediate results, tools exist to

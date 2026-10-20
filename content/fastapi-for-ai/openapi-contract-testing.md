@@ -185,21 +185,23 @@ for line in breaking(old, new, requests=["ChatIn"], responses=["Usage"]):
 # Usage: response field 'total_tokens' removed
 ```
 
-### Worked scenario: one change split across two pull requests
+### Worked scenario: a break that slips into the baseline
 | Pull request | Diff vs previous commit | Diff vs last release |
 |---|---|---|
-| PR 1: add `usage.tokens` | additive, passes | additive, passes |
-| PR 2: remove `usage.total_tokens` "cleanup" | flagged only if someone reads it | removed response field: breaking |
-| Combined effect at release | looked like two harmless changes | a rename every client feels |
+| PR 1: rename `usage.total_tokens` to `usage.tokens`, merged with an override ("alias before release") | breaking, overridden once | breaking |
+| PR 2 to PR 9: unrelated work | clean: the break is now in the baseline | still breaking |
+| Release day, alias never added | nothing flags it | blocks until the alias returns or the version is bumped |
 
-Diffing against the last released schema catches the cumulative break, which is why Layer 1 step 3
-insists on it.
+- **Why the previous-commit diff goes quiet:** once a break lands on `main`, every later diff starts from
+  the broken schema, so the break is invisible from then on.
+- **Why the release diff does not:** it compares against what clients actually run, so the cumulative
+  change keeps showing until it is fixed or released on purpose. That is why Layer 1 step 3 insists on it.
 
 ## Production patterns
 - **Snapshot plus release baseline.** Keep `openapi.snapshot.json` for "something changed" and store the
   schema of each release (a git tag or a published artifact) as the baseline for the breaking-change
-  report, for example `oasdiff breaking released.json current.json` in CI. Monitor: breaking changes caught
-  before release.
+  report, for example `oasdiff breaking released.json current.json --fail-on ERR` in CI (without
+  `--fail-on` it only prints the report and exits 0). Monitor: breaking changes caught before release.
 - **Stub the model, keep the wiring.** Override the LLM client with `app.dependency_overrides` in the
   contract suite, as above, and never put real provider keys in that CI job. Monitor: provider spend from
   CI, which should be zero.

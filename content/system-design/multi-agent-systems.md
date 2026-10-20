@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-A multi-agent system splits a task across several model loops with their own instructions, tools and
-context, coordinated by a topology. It helps when one agent's context, tools and privileges stop
-scaling; coordination costs, so each split must buy a named gain.
+A multi-agent system splits a task across model loops with their own instructions, tools and context.
+It helps when one agent's context, tools and privileges stop scaling, but duplicated context,
+compounding errors and harder tracing mean each split must buy a named gain.
 
 ## Why it exists
 - **A single agent degrades as the task grows.** Its context fills with tool definitions, instructions
@@ -179,7 +179,8 @@ The choices that matter:
   trace.
 - **Detectable failure.** Null answer, bad JSON or timeout, so a worker can be retried in isolation.
 - **Quorum before synthesis.** The supervisor declines to synthesize when most workers failed instead of
-  producing a confident answer from thin evidence.
+  producing a confident answer from thin evidence. `(n + 1) // 2` is a strict majority only for odd n;
+  for four workers it accepts two, so use `n // 2 + 1` if you need a majority.
 
 ### Worked scenario: a data-residency question across three markets
 | Step | Result |
@@ -247,15 +248,18 @@ print(round(quorum(0.9, 5, 3), 3))                # 0.991 ...or a 3-of-5 quorum,
 
 ## Pitfalls
 - **Splitting along an org chart or for "cleanliness."** No isolation, parallelism or specialization
-  gain. Symptom: higher cost and latency than the single-agent baseline with no quality gain.
+  gain. Symptom: higher cost and latency than the single-agent baseline with no quality gain. Fix: keep
+  one agent until you can name the gain.
 - **Forwarding full transcripts between agents.** Symptom: worker contexts that are mostly the
-  supervisor's history, and costs that grow with every added agent.
+  supervisor's history, and costs that grow with every added agent. Fix: send a typed sub-task.
 - **A worker that reads untrusted content holding write tools.** Symptom: an action nobody asked for,
-  traced back to instructions inside a fetched page.
+  traced back to instructions inside a fetched page. Fix: read-only tools for readers, enforced at
+  dispatch.
 - **Synthesizing over failed or low-confidence workers.** Symptom: fluent final answers whose citations
-  point at sub-results that said "not found".
+  point at sub-results that said "not found". Fix: filter on the explicit null and confidence, and apply
+  a quorum before synthesis.
 - **No shared run id across agents.** Symptom: an incident where five logs disagree about what happened
-  and nobody can say which agent introduced the error.
+  and nobody can say which agent introduced the error. Fix: one trace per run, one child span per agent.
 
 ## When to use
 - **Use when you can name the gain:** independent branches that can run in parallel, a privilege boundary

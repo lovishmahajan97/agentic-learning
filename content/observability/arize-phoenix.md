@@ -5,7 +5,7 @@ name: Arize Phoenix
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -23,87 +23,112 @@ sources:
 
 ## TL;DR
 Arize Phoenix is a self-hostable (source-available, Elastic License 2.0) LLM observability and evaluation
-tool built directly on OpenTelemetry: applications send ordinary OTel spans annotated with OpenInference conventions (LLM,
-retriever, tool, agent span kinds) and Phoenix stores, visualises and evaluates them. Its strengths are
-ingestion without a proprietary SDK, an evaluation library that runs LLM-as-a-judge over traces as
-DataFrames and writes verdicts back onto spans, and embedding visualisation for retrieval failures. Arize
-AX is the separate commercial platform.
+tool built on OpenTelemetry: it stores OTel spans with OpenInference attributes, runs LLM judges over them,
+writes verdicts back onto spans and visualises embeddings.
 
 ## Why it exists
-Debugging a retrieval-augmented system means answering three questions per request: which chunks were
-retrieved, were they relevant, and did the answer stay inside them. That needs traces that carry the
-documents and the messages, plus a quality judgement next to each span, and classic APMs offered neither.
-Early LLM tools solved it with their own SDKs and wire formats, which meant one more agent in the process
-and traces that could not join the rest of the system's telemetry.
-
-Phoenix made a different bet: do not invent a tracing protocol. Standardise the *attribute names* for LLM
-work on top of OpenTelemetry (that specification is OpenInference, Apache-2.0 licensed, unlike the ELv2
-Phoenix server), publish instrumentors that emit those
-spans for OpenAI, Anthropic, Bedrock, LangChain, LlamaIndex, DSPy and others, and compete on what you do with
-the data. Because the spans are plain OTel, a Collector can send the same stream to Phoenix and to Tempo or
-Datadog, and switching away costs nothing.
-
-The second bet is that evaluation belongs next to traces. A trace says what happened; an evaluation says
-whether it was good; hand-labelling does not scale. Phoenix ships judge templates (hallucination, QA
-correctness, retrieval relevance, toxicity) and a runner that scores spans in bulk and attaches the result
-as a span evaluation, so you can filter a project to "hallucinated = true" and read those traces. Its
-embedding visualisation comes from Arize's ML-monitoring origins: retrieval failures cluster, and a UMAP
-projection of query embeddings coloured by evaluation shows the empty region of the corpus at a glance.
+- **RAG debugging needs three answers per request:** which chunks were retrieved, were they relevant, and did
+  the answer stay inside them. That needs traces carrying the documents and messages plus a quality judgement
+  next to each span; classic APMs offered neither.
+- **Early LLM tools brought their own SDKs and wire formats,** which meant one more agent in the process and
+  traces that could not join the rest of the system's telemetry.
+- **Bet one: do not invent a tracing protocol.** Standardise the *attribute names* for LLM work on top of
+  OpenTelemetry (that specification is OpenInference, Apache-2.0 licensed, unlike the ELv2 Phoenix server),
+  publish instrumentors for OpenAI, Anthropic, Bedrock, LangChain, LlamaIndex, DSPy and others, and compete on
+  what you do with the data. Because spans are plain OTel, a Collector can send the same stream to Phoenix and
+  to Tempo or Datadog, and switching away costs nothing.
+- **Bet two: evaluation belongs next to traces.** A trace says what happened; an evaluation says whether it was
+  good; hand-labelling does not scale. Judge templates (hallucination, QA correctness, retrieval relevance,
+  toxicity) score spans in bulk and attach results as span evaluations, so you can filter to
+  "hallucinated = true".
+- **Embedding visualisation** comes from Arize's ML-monitoring origins: retrieval failures cluster, and a UMAP
+  projection of query embeddings coloured by evaluation shows the empty region of the corpus at a glance.
+  Arize AX is the separate commercial platform.
 
 ## How it works
 ### Deployment
-`pip install arize-phoenix` and `phoenix serve` (or the Docker image) start a single process serving the UI
-and an OTLP HTTP receiver on port 6006 (`/v1/traces`) plus OTLP gRPC on 4317. Storage is SQLite by default,
-which is fine for a laptop; production points `PHOENIX_SQL_DATABASE_URL` at Postgres. Projects separate
-applications and environments. In a notebook, `px.launch_app()` runs the same server in-process. Optional
-authentication and API keys are enabled through environment variables.
+- **One process.** `pip install arize-phoenix` and `phoenix serve` (or the Docker image) serve the UI and an
+  OTLP HTTP receiver on port 6006 (`/v1/traces`) plus OTLP gRPC on 4317.
+- **Storage.** SQLite by default, fine for a laptop; production points `PHOENIX_SQL_DATABASE_URL` at Postgres.
+- **Projects** separate applications and environments.
+- **Notebook mode.** `px.launch_app()` runs the same server in-process.
+- **Security.** Optional authentication and API keys are enabled through environment variables.
 
 ### Ingestion: OpenTelemetry plus OpenInference
-`from phoenix.otel import register` configures a standard OTel `TracerProvider` with an OTLP exporter and
-a resource attribute naming the project; `auto_instrument=True` activates whichever OpenInference
-instrumentors are installed. An instrumentor patches a client library and emits spans whose attributes
-follow the OpenInference specification: `openinference.span.kind` set to `LLM`, `CHAIN`, `RETRIEVER`,
-`EMBEDDING`, `TOOL`, `AGENT`, `RERANKER`, `GUARDRAIL` or `EVALUATOR`; `input.value` and `output.value` with
-MIME types; `llm.model_name`; messages flattened as `llm.input_messages.{i}.message.role` and
-`.content`; `llm.token_count.prompt`, `.completion`, `.total`; `retrieval.documents.{i}.document.content`
-and `.score`; `tool.name` and `tool.parameters`. Lists are flattened into indexed keys *because* OTel
-attributes are flat key–value pairs, and the span kind is an attribute rather than the OTel `SpanKind`
-because OTel's kinds describe RPC roles, not LLM roles. Any OTel SDK can send spans; those using other
-conventions still arrive but render with less structure.
+1. **`from phoenix.otel import register`** configures a standard OTel `TracerProvider` with an OTLP exporter
+   and a resource attribute naming the project.
+2. **`auto_instrument=True`** activates whichever OpenInference instrumentors are installed.
+3. **An instrumentor** patches a client library and emits spans whose attributes follow the OpenInference
+   specification.
+
+| Attribute | Meaning |
+|---|---|
+| `openinference.span.kind` | `LLM`, `CHAIN`, `RETRIEVER`, `EMBEDDING`, `TOOL`, `AGENT`, `RERANKER`, `GUARDRAIL` or `EVALUATOR` |
+| `input.value`, `output.value` | Inputs and outputs, with MIME types |
+| `llm.model_name` | Model |
+| `llm.input_messages.{i}.message.role` and `.content` | Flattened messages |
+| `llm.token_count.prompt`, `.completion`, `.total` | Token counts |
+| `retrieval.documents.{i}.document.content` and `.score` | Retrieved documents |
+| `tool.name`, `tool.parameters` | Tool calls |
+
+- **Lists are flattened into indexed keys** *because* OTel attributes are flat key–value pairs.
+- **Span kind is an attribute, not OTel `SpanKind`,** because OTel's kinds describe RPC roles, not LLM roles.
+- **Any OTel SDK can send spans;** those using other conventions still arrive but render with less structure.
 
 ### The evaluation library
-`phoenix.evals` is a DataFrame-oriented runner. `llm_classify` applies a judge prompt template to each row
-with a model wrapper (`OpenAIModel`, `AnthropicModel`, `LiteLLMModel`, …), constrains the answer to a set of
-rails such as `["factual", "hallucinated"]`, optionally asks for an explanation, and runs rows concurrently.
-The rails exist *because* a judge's free-text verdict cannot be counted: the output is snapped to one of the
-allowed labels (or marked unparseable), so a column of labels can become a rate, a filter and a trend line.
-The explanation is the opposite trade, unaggregatable but the only way a human can audit why the judge
-decided, which is what calibration needs.
-Pre-built evaluators (`HallucinationEvaluator`, `QAEvaluator`, `RelevanceEvaluator`,
-`ToxicityEvaluator`, …) wrap tested templates; `run_evals(dataframe, evaluators)` returns one DataFrame per
-evaluator. Helper queries build the rows from traces: `get_qa_with_reference` yields one row per answered
-question with its retrieved context, `get_retrieved_documents` one row per retrieved document for relevance
-scoring. Results go back with `log_evaluations(SpanEvaluations(...))` or `DocumentEvaluations(...)`, after
-which the UI shows per-span labels and aggregates such as precision@k or NDCG derived from document
-relevance labels.
+`phoenix.evals` is a DataFrame-oriented runner.
+- **`llm_classify`** applies a judge prompt template to each row with a model wrapper (`OpenAIModel`,
+  `AnthropicModel`, `LiteLLMModel`, …), constrains the answer to rails such as `["factual", "hallucinated"]`,
+  optionally asks for an explanation, and runs rows concurrently.
+- **Why rails:** a judge's free-text verdict cannot be counted. The output is snapped to an allowed label (or
+  marked unparseable), so a column of labels becomes a rate, a filter and a trend line.
+- **Why explanations:** the opposite trade, unaggregatable but the only way a human can audit why the judge
+  decided, which is what calibration needs.
+- **Pre-built evaluators** (`HallucinationEvaluator`, `QAEvaluator`, `RelevanceEvaluator`,
+  `ToxicityEvaluator`, …) wrap tested templates; `run_evals(dataframe, evaluators)` returns one DataFrame per
+  evaluator.
+- **Helper queries build rows from traces:** `get_qa_with_reference` yields one row per answered question with
+  its retrieved context; `get_retrieved_documents` one row per retrieved document for relevance scoring.
+- **Write back** with `log_evaluations(SpanEvaluations(...))` or `DocumentEvaluations(...)`. The UI then shows
+  per-span labels and aggregates such as precision@k or NDCG derived from document relevance labels.
 
 ### Datasets, experiments, prompts, sessions, annotations
-Spans or DataFrames can be turned into datasets; `run_experiment(dataset, task, evaluators)` executes a
-task over the examples and scores it, and the UI compares experiments. Prompts are versioned, and the
-playground replays a captured span against an edited prompt or a different model. A `session.id` attribute
-groups traces into conversations; humans add labels and scores as annotations in the UI or via the API.
+- **Datasets** come from spans or DataFrames; `run_experiment(dataset, task, evaluators)` executes a task over
+  the examples and scores it, and the UI compares experiments.
+- **Prompts** are versioned; the playground replays a captured span against an edited prompt or another model.
+- **Sessions.** A `session.id` attribute groups traces into conversations.
+- **Annotations.** Humans add labels and scores in the UI or via the API.
 
 ### Embeddings
-`px.Inferences` with embedding columns produces a UMAP projection with clustering, coloured by evaluation
-label or by drift between a primary and a reference dataset, which is the original Phoenix feature and still
-the quickest way to see that a cluster of user queries has no nearby documents.
+- **`px.Inferences`** with embedding columns produces a UMAP projection with clustering, coloured by
+  evaluation label or by drift between a primary and a reference dataset.
+- **The original Phoenix feature,** and still the quickest way to see that a cluster of user queries has no
+  nearby documents.
 
-## Example
-A RAG answer traced with plain OpenTelemetry plus OpenInference attributes, with the OpenAI instrumentor
-producing the `LLM` span, followed by a notebook step that judges every answered question for hallucination
-against its retrieved context and writes the verdicts back onto the spans. Function names follow the
-long-standing evaluator/`run_evals` interface of `phoenix.evals`; newer releases add a redesigned API
-alongside it, so pin the version and check the import paths against the release you install.
+## Diagram
+Instrumented spans travel as plain OTLP, so a Collector can feed Phoenix and a general store. Evaluations
+are computed off the request path and attached back to the spans they judge.
+
+```mermaid
+flowchart TD
+    APP["App with OpenInference instrumentors"] --> SDK["OTel SDK and exporter"]
+    SDK --> COL["OTel Collector"]
+    COL -->|"OTLP HTTP 6006"| PX[("Phoenix: Postgres")]
+    COL --> TEMPO[("Tempo or Datadog")]
+    PX --> Q["get_qa_with_reference"]
+    Q --> J["run_evals: judge with rails"]
+    J -->|"log_evaluations"| PX
+    PX --> UI["UI: filter hallucinated spans"]
+```
+
+## Examples
+### Tracing a RAG answer and judging it for hallucination
+Plain OpenTelemetry plus OpenInference attributes, with the OpenAI instrumentor producing the `LLM` span,
+then a notebook step that judges every answered question against its retrieved context and writes verdicts
+back.
+
+Function names follow the long-standing evaluator/`run_evals` interface of `phoenix.evals`; newer
+releases add a redesigned API alongside it, so pin the version and check import paths for your release.
 
 ```python
 # pip install arize-phoenix openinference-instrumentation-openai openai
@@ -152,61 +177,117 @@ qa = get_qa_with_reference(px_client)                      # columns: input, out
 px_client.log_evaluations(SpanEvaluations(eval_name="Hallucination", dataframe=halluc))
 ```
 
-In the UI the trace reads `support.answer` → `retrieve` and `support.answer` → `ChatCompletion`, the chain
-span now carries a `Hallucination` label with the judge's explanation, and the project view lets you filter
-to the hallucinated ones.
+- **In the UI** the trace reads `support.answer` → `retrieve` and `support.answer` → `ChatCompletion`; the chain
+  span carries a `Hallucination` label with the judge's explanation, and the project view filters to the
+  hallucinated ones.
 
-The join is the part worth understanding. `get_qa_with_reference` returns a DataFrame indexed by the span id
-of each root span that has an input and an output, with `reference` built by concatenating the document
-contents found on the retriever spans of the same trace. For this request that is one row: input "How do I reset
-my password?", the model's answer, and the one-sentence reference. The judge receives all three in its
-template and returns a row with `label` (`factual` or `hallucinated`), a numeric `score` derived from the label and an
-`explanation`, still indexed by span id, and `log_evaluations` attaches that row to exactly that span. Run
-it over a day with 2,000 answered questions and you get 2,000 labels; if 140 are `hallucinated`, the
-project shows a 7% rate you can filter, open and read. If the retriever span had carried no documents, the
-reference would be empty and the judge would be grading against nothing, the pitfall listed below.
+### How the join works, with a day of numbers
+The part worth understanding is how a verdict lands on exactly the right span.
+
+| Step | What happens |
+|---|---|
+| Query | `get_qa_with_reference` returns a DataFrame indexed by the span id of each root span with an input and an output |
+| Reference | Built by concatenating the document contents on the retriever spans of the same trace |
+| This request | One row: input "How do I reset my password?", the model's answer, the one-sentence reference |
+| Judge | Receives all three in its template; returns `label` (`factual` or `hallucinated`), a numeric `score` derived from the label, and an `explanation`, still indexed by span id |
+| Write back | `log_evaluations` attaches that row to exactly that span |
+| A day of traffic | 2,000 answered questions give 2,000 labels; if 140 are `hallucinated`, the project shows a 7% rate you can filter, open and read |
+
+If the retriever span had carried no documents, the reference would be empty and the judge would be grading
+against nothing, a pitfall listed below.
+
+### Fanning one trace stream out to Phoenix and Tempo
+A Collector config that keeps the existing tracing store and adds Phoenix, with no application change. The
+`otlphttp` exporter appends `/v1/traces` to its endpoint.
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch: {}
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls: {insecure: true}
+  otlphttp/phoenix:
+    endpoint: http://phoenix:6006
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo, otlphttp/phoenix]
+```
+
+Spans without OpenInference attributes still arrive in Phoenix, but only enriched spans render as LLM,
+retriever and tool steps.
+
+## Production patterns
+- **Postgres from day one.** Set `PHOENIX_SQL_DATABASE_URL` to a managed Postgres for any shared deployment,
+  with backups and a retention policy. Monitor database size and UI query latency.
+- **Collector fan-out instead of a second SDK.** Add Phoenix as one more exporter on the existing Collector so
+  infrastructure and LLM views share trace ids. Monitor exporter failures per destination.
+- **Scheduled, sampled evaluation job.** Run a daily job that pulls the previous day's question–answer–reference
+  and retrieved-document rows, samples to the judge budget, runs hallucination and relevance evaluators, and
+  logs span and document evaluations. Monitor the hallucination rate and relevance aggregates over time.
+- **Judge with a different model.** Use a judge from another model family than the generator to limit
+  self-preference bias, and calibrate against about a hundred human-labelled examples. Monitor judge-human
+  agreement.
+- **Control payload size.** Use OpenInference's trace configuration to hide or truncate inputs and messages
+  where content is sensitive or large, and sample high-volume routes. Monitor storage growth per project.
+- **Pin `arize-phoenix` and instrumentor versions** and run the evaluation job in CI against a fixture
+  project, because evaluator import paths have changed across releases.
 
 ## Trade-offs
-- OTel-native ingestion means no lock-in and one instrumentation for every backend, against a less mature
-  product loop for per-user cost accounting and prompt-release workflows than Langfuse or LangSmith offer at
-  the time of writing (Phoenix has been adding these, so check the current release); flips when the team wants a managed product loop more than portability.
-- A single container with SQLite is zero-ops for development, but production needs Postgres and you own
-  retention, backups and access control; multi-team scale and RBAC are what the commercial platform sells.
-- Evaluations as DataFrames in notebooks are flexible, scriptable and cheap to iterate, but the loop is one
-  you run or schedule yourself, whereas server-side online evaluators in other tools score traffic
-  continuously without a job.
-- Pre-built judge templates save prompt engineering and are tested by the maintainers, yet still need
-  calibration against a human-labelled sample from your own domain before anyone trusts the numbers.
-- Embedding visualisation is the fastest way to find corpus gaps, but only if you log query and document
-  embeddings, which multiplies storage per trace.
+- **Portability vs product loop.** OTel-native ingestion means no lock-in and one instrumentation for every
+  backend, against a less mature loop for per-user cost accounting and prompt-release workflows than Langfuse
+  or LangSmith offer at the time of writing (Phoenix has been adding these, so check the current release).
+  Flips when the team wants a managed product loop more than portability.
+- **Zero-ops vs ownership.** A single container with SQLite is zero-ops for development, but production needs
+  Postgres and you own retention, backups and access control; multi-team scale and RBAC are what the
+  commercial platform sells.
+- **Notebook evals vs continuous scoring.** DataFrame evaluations are flexible, scriptable and cheap to
+  iterate, but the loop is one you run or schedule yourself, whereas server-side online evaluators in other
+  tools score traffic continuously without a job.
+- **Pre-built templates vs calibration.** They save prompt engineering and are tested by the maintainers, yet
+  still need calibration against a human-labelled sample from your own domain before anyone trusts the numbers.
+- **Embedding views vs storage.** Embedding visualisation is the fastest way to find corpus gaps, but only if
+  you log query and document embeddings, which multiplies storage per trace.
 
 ## Pitfalls
-- Calling an instrumentor after the client library is already in heavy use, or never calling it; the
-  symptom is `CHAIN` and `RETRIEVER` spans with no `LLM` child and no token counts.
-- Exporter and port mismatch, HTTP spans sent to 4317 or gRPC spans to 6006; the symptom is an empty
-  project with no error in the application.
-- SQLite under production concurrency; the symptom is a sluggish UI, locked-database errors and lost spans
-  at peak traffic.
-- Running the hallucination evaluator on traces whose retriever spans carry no documents, so the reference
-  column is empty; the symptom is verdicts that are uniformly "factual" or evaluator errors.
-- Judging a model's outputs with the same model; the symptom is suspiciously high scores that a human
-  spot-check contradicts, the self-preference bias of LLM judges.
-- Logging full documents and prompts on every span at high volume without sampling or truncation; the
-  symptom is storage growth that outpaces the traces' usefulness.
-- A project name on `register()` that differs from the one queried in the notebook; the symptom is
+- **Instrumentor called late or never.** Called after the client library is already in heavy use. Symptom:
+  `CHAIN` and `RETRIEVER` spans with no `LLM` child and no token counts.
+- **Exporter and port mismatch.** HTTP spans sent to 4317 or gRPC spans to 6006. Symptom: an empty project with
+  no error in the application.
+- **SQLite under production concurrency.** Symptom: a sluggish UI, locked-database errors and lost spans at
+  peak traffic.
+- **Empty references.** Running the hallucination evaluator on traces whose retriever spans carry no
+  documents. Symptom: verdicts that are uniformly "factual" or evaluator errors.
+- **Self-judging.** Judging a model's outputs with the same model. Symptom: suspiciously high scores that a
+  human spot-check contradicts, the self-preference bias of LLM judges.
+- **Unbounded payloads.** Full documents and prompts on every span at high volume without sampling or
+  truncation. Symptom: storage growth that outpaces the traces' usefulness.
+- **Project name mismatch.** The name on `register()` differs from the one queried in the notebook. Symptom:
   "no data" despite a busy UI.
 
 ## When to use
-Reach for Phoenix when you already emit or intend to emit OpenTelemetry traces and want LLM-aware analysis
-without a second SDK, when the work is evaluation-heavy (hallucination, retrieval relevance, agent
-trajectories) and your team lives in notebooks, or when self-hosting is a requirement and the budget for a
-commercial platform is zero (check that the Elastic License 2.0 is acceptable to your legal team; it forbids
-offering Phoenix itself as a managed service, which is rarely an issue for internal use). Prefer Langfuse when prompt management and per-user cost are
-the daily workflow; prefer LangSmith when the stack is LangGraph and a hosted product is acceptable. Measure
-span completeness per project, judge-versus-human agreement on a labelled sample, and the retrieval
-relevance aggregates over time. Day to day it is the place you replay a bad RAG answer, see the chunks that
-came back, and run a relevance judge over last week's retrievals; in interviews, be able to explain why
-building on OTel and OpenInference matters and how a span evaluation gets back onto a trace.
+- **Use when** you already emit or intend to emit OpenTelemetry traces and want LLM-aware analysis without a
+  second SDK, or the work is evaluation-heavy (hallucination, retrieval relevance, agent trajectories) and your
+  team lives in notebooks.
+- **Use when self-hosting is required** and the budget for a commercial platform is zero. Check that the
+  Elastic License 2.0 is acceptable to your legal team; it forbids offering Phoenix itself as a managed
+  service, which is rarely an issue for internal use.
+- **Prefer Langfuse** when prompt management and per-user cost are the daily workflow; **prefer LangSmith**
+  when the stack is LangGraph and a hosted product is acceptable.
+- **Measure:** span completeness per project, judge-versus-human agreement on a labelled sample, and retrieval
+  relevance aggregates over time.
+- **Day to day,** it is where you replay a bad RAG answer, see the chunks that came back, and run a relevance
+  judge over last week's retrievals.
+- **Interviews:** explain why building on OTel and OpenInference matters and how a span evaluation gets back
+  onto a trace.
 
 ## Role lens
 - **Engineer:** Registers the tracer provider, installs the right OpenInference instrumentors, adds
@@ -228,6 +309,40 @@ pulls question–answer–reference rows and retrieved-document rows, runs the h
 evaluators on a sample sized to the judge budget, and logs the results back as span and document
 evaluations. Calibrate the judge against a hundred human-labelled examples before publishing the numbers, add
 `session.id` for conversation review, and separate environments by project.
+
+## Interview questions
+### What is OpenInference, and why does it flatten lists into indexed attribute keys?
+- **Definition:** an Apache-2.0 attribute specification on top of OpenTelemetry for LLM work: span kinds such
+  as `LLM` and `RETRIEVER`, messages, token counts, documents and tool calls.
+- **Why flatten:** OTel attributes are flat key–value pairs, so a document list becomes
+  `retrieval.documents.{i}.document.content`, which also lets each document be labelled individually.
+- **Why its own span kind:** OTel `SpanKind` describes RPC roles, not LLM roles.
+
+### The hallucination rate is 0% for a week, but users report made-up answers. How do you debug it?
+- **Check the reference column first.** If retriever spans carry no document attributes, the judge grades
+  against empty context and returns uniformly "factual" or errors.
+- **Then check the judge:** same model as the generator (self-preference), unparseable outputs silently
+  dropped, or a project name mismatch so the job read the wrong project.
+- **Confirm with humans:** label a small sample by hand and compare with the judge's labels.
+
+### When would you not choose Phoenix?
+- **When the daily workflow is prompt releases and per-user cost,** where Langfuse or LangSmith have a more
+  complete product loop at the time of writing.
+- **When you need continuous server-side scoring** without running your own scheduled job.
+- **When your legal team rejects ELv2,** for example if you intend to offer Phoenix itself as a managed service.
+
+### Why do judge templates constrain output to rails, and what do you lose?
+- **Rails make verdicts countable:** snapping to `factual` or `hallucinated` turns a column into a rate, a
+  filter and a trend line.
+- **You lose nuance,** which is why the explanation is kept: unaggregatable, but it is what a human audits
+  during calibration.
+
+### You judge 2,000 answers a day and see 140 hallucinated. What do you report, and what would you check?
+- **Report a 7% judged rate** with the sample definition and the judge model, not as ground truth.
+- **Check calibration:** agreement with about a hundred human-labelled examples tells you whether 7% is
+  closer to the real rate or to judge bias.
+- **Slice:** open the flagged traces, group by retrieval relevance and route, and see whether failures cluster
+  where the corpus has gaps, which the embedding view shows.
 
 ## Quiz
 ### Q: What most distinguishes Phoenix from an LLM observability tool with its own SDK?

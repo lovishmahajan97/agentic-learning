@@ -5,7 +5,7 @@ name: LangSmith
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - observability/tracing
   - observability/langfuse
@@ -21,98 +21,119 @@ sources:
 ---
 
 ## TL;DR
-LangSmith is LangChain Inc.'s closed-source platform for tracing, evaluating and monitoring LLM
-applications, hosted with enterprise self-hosting available. It records every unit of work as a run
-(LLM, chain, tool, retriever) in a tree with inputs, outputs, tokens, latency and cost, attaches feedback
-and online evaluators, and runs offline experiments against datasets. Any Python or JavaScript code can
-send traces through `@traceable`, but it is the natural choice for LangChain and LangGraph apps, where
-tracing is an environment-variable switch.
+LangSmith is LangChain Inc.'s closed-source platform for tracing, evaluating and monitoring LLM apps: run
+trees with tokens, latency and cost, feedback, online evaluators and dataset experiments. Any code can use
+`@traceable`, but for LangChain and LangGraph tracing is an environment-variable switch.
 
 ## Why it exists
-LangChain's abstractions made it hard to see what actually went to the model: a chain composed prompt
-templates, retrievers and parsers, and when the answer was wrong you could not tell which piece produced
-the bad input. The framework already had a callback system that fired on every chain, LLM and tool start
-and end; LangSmith grew out of turning those callbacks into persistent, queryable run trees. The naive
-alternative, `verbose=True` printing to the console, does not persist, cannot be searched by user or
-compared across versions, and vanishes in production.
-
-The second half of the problem is evaluation. "The new prompt seems better" is not evidence. Teams need a
-dataset of inputs with reference outputs, a way to run a candidate against it, evaluators that score each
-result, and a side-by-side view of two experiments. LangSmith ties this to production tracing: a bad trace
-becomes a dataset example with one click, an experiment is itself a set of traces, and feedback from users,
-annotators and judges lives on the same runs.
-
-Against the module's alternatives, LangSmith is the most integrated with LangGraph (node-level state,
-tool calls and token streams appear without instrumentation) and the least portable: it is proprietary,
-your data sits in LangChain's cloud unless you self-host under an enterprise agreement, and its data model
-is its own. Langfuse offers the comparable loop as open source; Phoenix offers it on plain OpenTelemetry.
+- **Abstractions hid the model input.** A LangChain chain composed prompt templates, retrievers and parsers;
+  when the answer was wrong you could not tell which piece produced the bad input.
+- **Callbacks were already there.** The framework fired a callback on every chain, LLM and tool start and
+  end; LangSmith grew out of turning those into persistent, queryable run trees.
+- **`verbose=True` is not observability.** Console output does not persist, cannot be searched by user or
+  compared across versions, and vanishes in production.
+- **"The new prompt seems better" is not evidence.** Teams need a dataset with reference outputs, a way to
+  run a candidate, evaluators that score each result, and a side-by-side view. LangSmith ties this to
+  production: a bad trace becomes a dataset example with one click, an experiment is itself a set of traces,
+  and feedback from users, annotators and judges lives on the same runs.
+- **Most integrated, least portable.** Deepest LangGraph fit (node-level state, tool calls and token streams
+  appear without instrumentation), but proprietary, its own data model, and your data sits in LangChain's
+  cloud unless you self-host under an enterprise agreement. Langfuse offers the comparable loop as open
+  source; Phoenix offers it on plain OpenTelemetry.
 
 ## How it works
 ### Runs, traces, projects and threads
-Each unit of work is a **run** with a `run_type` (`llm`, `chain`, `tool`, `retriever`, `embedding`,
-`prompt`, `parser`), inputs, outputs, start and end times, an error if any, tags, metadata and a parent run
-id. The root run is the **trace**. A **project** is a container for traces, usually one per application
-and environment. **Threads** are traces that share a conversation key in metadata (`session_id`,
-`thread_id` or `conversation_id`); the UI reassembles them into a conversation view, which is how you read
-a multi-turn chat the way the user experienced it.
+| Object | What it is |
+|---|---|
+| **Run** | One unit of work with a `run_type` (`llm`, `chain`, `tool`, `retriever`, `embedding`, `prompt`, `parser`), inputs, outputs, start and end times, an error if any, tags, metadata and a parent run id |
+| **Trace** | The root run and its tree |
+| **Project** | A container for traces, usually one per application and environment |
+| **Thread** | Traces sharing a conversation key in metadata (`session_id`, `thread_id` or `conversation_id`), reassembled into a conversation view so you read a multi-turn chat as the user experienced it |
 
-Each run also carries its `trace_id` (the root's id) and a `dotted_order` string built from the start time
-and id of every ancestor. That field exists *because* runs arrive out of order: a child usually finishes,
-and is posted, before its parent, and batches from two processes interleave. Sorting by `dotted_order`
-reconstructs the tree and the sibling order deterministically without waiting for the parent to land.
+- **Every run carries `trace_id`** (the root's id) and a `dotted_order` string built from the start time and
+  id of every ancestor.
+- **Why `dotted_order` exists:** runs arrive out of order. A child usually finishes, and is posted, before its
+  parent, and batches from two processes interleave. Sorting by `dotted_order` reconstructs the tree and
+  sibling order deterministically without waiting for the parent.
 
 ### How runs get created
-With LangChain or LangGraph, setting `LANGSMITH_TRACING=true` plus an API key and project name installs a
-tracer callback handler, and every chain, node, model call and tool invocation becomes a run with no code
-change. Outside the framework, `@traceable(run_type=...)` wraps any function: it reads the current run from
-a context variable, creates a child run, records arguments, return value and exceptions, and restores the
-parent on exit. `wrap_openai` and `wrap_anthropic` wrap provider clients so each completion becomes an `llm`
-run with token usage, including streamed responses, which the wrapper reassembles. A `RunTree` object gives
-manual control when decorators do not fit. Across services, the caller serialises its current run tree
-to headers (`get_current_run_tree().to_headers()`) and the callee opens `tracing_context(parent=headers)`,
-so its runs become children in the same trace; this is LangSmith's own propagation format, not W3C
-`traceparent`, which matters when the hop also runs through OpenTelemetry-instrumented middleware.
+| Path | Mechanism |
+|---|---|
+| LangChain or LangGraph | `LANGSMITH_TRACING=true` plus an API key and project name installs a tracer callback handler; every chain, node, model call and tool invocation becomes a run with no code change |
+| `@traceable(run_type=...)` | Wraps any function: reads the current run from a context variable, creates a child run, records arguments, return value and exceptions, restores the parent on exit |
+| `wrap_openai`, `wrap_anthropic` | Wrap provider clients so each completion becomes an `llm` run with token usage, including streamed responses, which the wrapper reassembles |
+| `RunTree` | Manual control when decorators do not fit |
+
+- **Across services,** the caller serialises its run tree to headers (`get_current_run_tree().to_headers()`)
+  and the callee opens `tracing_context(parent=headers)`, so its runs become children in the same trace.
+- **This is LangSmith's own format, not W3C `traceparent`,** which matters when the hop also runs through
+  OpenTelemetry-instrumented middleware.
 
 ### Transport
-Runs are queued and posted in background batches to the LangSmith API, so tracing stays off the request
-path. A run is typically sent twice, once on start (inputs, start time, parent) and once on end (outputs,
-error, end time, usage), which is why an in-flight agent step shows up in the UI as pending and why a crash
-leaves runs with inputs but no end; a short-lived process must wait for the queue to drain (`wait_for_all_tracers()` or the client's
-flush) or child runs are lost. LangSmith also exposes an OTLP endpoint, so OpenTelemetry-instrumented
-services can send spans into a project without the SDK.
+- **Background batches.** Runs are queued and posted to the LangSmith API, so tracing stays off the request
+  path.
+- **Posted twice.** Once on start (inputs, start time, parent) and once on end (outputs, error, end time,
+  usage). That is why an in-flight agent step shows as pending, and why a crash leaves runs with inputs but
+  no end.
+- **Drain before exit.** A short-lived process must wait for the queue (`wait_for_all_tracers()` or the
+  client's flush) or child runs are lost.
+- **OTLP endpoint.** OpenTelemetry-instrumented services can send spans into a project without the SDK.
 
 ### Feedback and online evaluation
-**Feedback** is a record with a key, a numeric score or categorical value and an optional comment, attached
-to a run. Sources: end-user signals sent with the run id, human **annotation queues**, **online evaluators**
-(LLM-as-a-judge or code rules applied to a sampled percentage of incoming traces, writing feedback
-automatically), and **automation rules** that act on a filter: add matching traces to a dataset, send them to
-an annotation queue, or call a webhook. Because all of these produce feedback on runs, monitoring charts can
-plot them over time next to latency, token and cost series.
+- **Feedback** is a record with a key, a numeric score or categorical value and an optional comment, attached
+  to a run.
+- **Sources:**
+  1. End-user signals sent with the run id.
+  2. Human **annotation queues**.
+  3. **Online evaluators**: LLM-as-a-judge or code rules on a sampled percentage of incoming traces, writing
+     feedback automatically.
+  4. **Automation rules** acting on a filter: add matching traces to a dataset, send them to an annotation
+     queue, or call a webhook.
+- **One shape for all,** so monitoring charts plot feedback over time next to latency, token and cost series.
 
 ### Datasets and experiments
-A **dataset** holds examples with inputs, reference outputs and metadata, with versions and splits.
-`evaluate(target, data, evaluators, experiment_prefix)` runs the target on every example, traces each run,
-applies the evaluators (plain functions or LLM judges that receive inputs, outputs and reference outputs)
-and records their results as feedback; the result is an **experiment** you compare with others in the UI.
-Pairwise evaluators score two experiments against each other for preference judgements. The same
-experiments can be launched from the playground to test prompt variants and models without code.
+- **A dataset** holds examples with inputs, reference outputs and metadata, with versions and splits.
+- **`evaluate(target, data, evaluators, experiment_prefix)`** runs the target on every example, traces each
+  run, applies the evaluators (plain functions or LLM judges that receive inputs, outputs and reference
+  outputs) and records results as feedback. The result is an **experiment** you compare with others.
+- **Pairwise evaluators** score two experiments against each other for preference judgements.
+- **The playground** launches the same experiments to test prompt variants and models without code.
 
 ### Branding scope
 As of late 2025 LangChain uses the LangSmith name for its broader platform, including the agent deployment
-product previously called LangGraph Platform. This lesson concerns only the observability and evaluation
-part; tracing does not require deploying through LangSmith.
+product previously called LangGraph Platform. This lesson concerns only observability and evaluation;
+tracing does not require deploying through LangSmith.
 
 ### Prompts and monitoring
-The prompt hub versions prompts by commit; `client.pull_prompt("name")` returns a LangChain prompt
-template, and runs record which commit they used. Project dashboards show trace volume, error rate,
-latency percentiles, tokens, cost (from a model price map you can extend) and feedback trends, with
-threshold alerts.
+- **Prompt hub** versions prompts by commit; `client.pull_prompt("name")` returns a LangChain prompt template,
+  and runs record which commit they used.
+- **Project dashboards** show trace volume, error rate, latency percentiles, tokens, cost (from a model price
+  map you can extend) and feedback trends, with threshold alerts.
 
-## Example
-Plain Python with no LangChain: a traced retriever and chain, a wrapped OpenAI client so the model call is
-an `llm` run with tokens, a `session_id` so the traces form a thread, then an offline experiment with a code
-evaluator against a one-example golden dataset. Evaluator signatures and the `{"output": ...}` wrapping
-follow the current SDK; older releases used `(run, example)` evaluators.
+## Diagram
+Production runs land in a project; online evaluators and rules turn some into feedback and dataset examples;
+`evaluate` turns a candidate into an experiment you compare before shipping.
+
+```mermaid
+flowchart TD
+    APP["App: traceable or LangGraph"] -->|"start and end posts"| PJ[("Project: run trees")]
+    PJ --> TH["Threads and dashboards"]
+    PJ --> OE["Online evaluators on a sample"]
+    OE --> FB["Feedback on runs"]
+    PJ --> AR["Automation rule on a filter"]
+    AR --> AQ["Annotation queue"]
+    AR --> DS[("Dataset")]
+    DS --> EV["evaluate on candidate"]
+    EV --> EXP["Experiment vs baseline"]
+    EXP -->|"ship if better"| APP
+```
+
+## Examples
+### Tracing plus an offline experiment, without LangChain
+A traced retriever and chain, a wrapped OpenAI client so the model call is an `llm` run with tokens, a
+`session_id` so traces form a thread, then an experiment with a code evaluator against a one-example golden
+dataset. Evaluator signatures and the `{"output": ...}` wrapping follow the current SDK; older releases used
+`(run, example)` evaluators.
 
 ```python
 # pip install langsmith openai ; env: LANGSMITH_TRACING=true LANGSMITH_API_KEY=... LANGSMITH_PROJECT=support-bot
@@ -154,58 +175,113 @@ evaluate(lambda inputs: answer(inputs["question"]),      # a str result is store
          experiment_prefix="system-prompt-v2")
 ```
 
-The production trace appears as `support_answer` → `retrieve` and `support_answer` → `ChatOpenAI`-style
-`llm` run; the experiment appears under the dataset with one traced run per example and a
-`mentions_reference` feedback score you can compare with the next prompt version.
+- **In the UI:** `support_answer` → `retrieve` and `support_answer` → `ChatOpenAI`-style `llm` run; the
+  experiment appears under the dataset with one traced run per example and a `mentions_reference` score.
+- **Mechanically,** the production call creates three runs sharing one `trace_id`. `retrieve` starts and ends
+  first, so its end record is often posted before `support_answer` has ended; `dotted_order` puts it in place.
+- **The `llm` run** records the messages, the response and the provider's usage, from which cost is priced.
+- **Thread grouping reads the root.** The `session_id` is set on the root call.
+- **In the experiment,** `evaluate` calls the lambda once per example, so each example yields its own trace,
+  and the evaluator's boolean becomes a feedback row keyed `mentions_reference` on that trace's root run.
 
-Mechanically, the production call creates three runs sharing one `trace_id`. `retrieve` starts and ends
-first, so its end record is often posted before `support_answer` has ended; `dotted_order` puts it in place.
-The `llm` run records the messages, the response and the provider's usage, from which cost is priced. The
-`session_id` is set on the root call, which is what thread grouping reads. In the
-experiment, `evaluate` calls the lambda once per example, so each example yields its own trace, and the
-evaluator's boolean becomes a feedback row keyed `mentions_reference` on that trace's root run. With 200
-examples and two experiments, the comparison view lines up 200 pairs of runs by example id, which is what
-makes "v2 fixed 14 examples and broke 3" a readable statement rather than an average.
+### Joining a tool service to the caller's trace
+LangSmith's propagation across an HTTP hop: the caller sends its run tree as headers, the callee continues it.
+`do_work` is your own `@traceable` function.
+
+```python
+import httpx
+import langsmith as ls
+from fastapi import FastAPI, Request
+from langsmith.run_helpers import get_current_run_tree
+
+@ls.traceable(run_type="chain")
+def call_tool_service(payload: dict) -> dict:
+    headers = get_current_run_tree().to_headers()        # LangSmith trace headers, not W3C traceparent
+    return httpx.post("http://tools:8000/run", json=payload, headers=headers).json()
+
+app = FastAPI()                                          # the tool service
+
+@app.post("/run")
+async def run(request: Request):
+    payload = await request.json()
+    with ls.tracing_context(parent=request.headers):     # runs inside become children of the caller's run
+        return await do_work(payload)
+```
+
+If a proxy strips unknown headers, the callee's runs appear as separate root traces.
+
+### Worked comparison: reading two experiments
+Illustrative numbers for a 200-example golden set, baseline versus `system-prompt-v2`.
+
+| | Baseline | v2 |
+|---|---|---|
+| Examples passing `mentions_reference` | 150 | 161 |
+| Fixed by v2 (fail → pass) | | 14 |
+| Broken by v2 (pass → fail) | | 3 |
+
+The comparison view lines up 200 pairs of runs by example id, which is what makes "v2 fixed 14 examples and
+broke 3" a readable statement rather than an average. Open the 3 regressions before shipping.
+
+## Production patterns
+- **Project per environment.** Set `LANGSMITH_PROJECT` per deployment (for example `support-bot-dev`,
+  `-ci`, `-prod`) so test runs never pollute dashboards or spend online-evaluator budget. Monitor trace
+  volume per project.
+- **Experiments as a CI gate.** Run `evaluate` against the golden dataset on every prompt or model change and
+  fail the build if the pass rate drops or any tagged critical example regresses. Monitor pass rate per
+  experiment over time.
+- **Rules that grow the dataset.** An automation rule on low user feedback or long traces routes matches to an
+  annotation queue and a dataset, so the golden set tracks real failures. Monitor queue backlog.
+- **Sampled online judges, calibrated.** Apply online evaluators to a small percentage of production traces
+  and compare with annotation-queue labels weekly. Monitor judge-human agreement and judge cost.
+- **Hide sensitive payloads.** Configure the client's `hide_inputs` and `hide_outputs` processors to redact
+  personal data before runs are posted. Monitor a sampled audit of stored runs.
+- **Drain in serverless.** Call `wait_for_all_tracers()` or the client's flush at the end of each handler.
+  Monitor root runs with missing children.
 
 ## Trade-offs
-- Deepest LangChain and LangGraph integration (node state, tool calls, streamed tokens for free) against
-  lock-in to a proprietary data model and hosted service; flips when procurement requires data residency
-  and enterprise self-hosting is not on the table.
-- Managed SaaS means zero operations, but pricing follows ingested traces with retention tiers, so at high
-  volume you either sample, shorten retention, or move to a self-hosted open-source alternative.
-- `@traceable` records arguments and return values automatically, which is high fidelity and also captures
-  personal data and large payloads; input and output processors or hiding inputs trade that fidelity back.
-- Online evaluators give a continuous quality signal on production traffic at judge-model cost per sampled
-  trace and with judge bias; annotation queues are the calibration, not an optional extra.
-- The prompt hub decouples prompt edits from deploys for LangChain templates, but your runtime now depends
-  on a pull at start-up or request time; cache it and fall back to a bundled version.
+- **Integration vs lock-in.** Deepest LangChain and LangGraph integration (node state, tool calls, streamed
+  tokens for free) against a proprietary data model and hosted service. Flips when procurement requires data
+  residency and enterprise self-hosting is not on the table.
+- **Zero operations vs volume pricing.** Managed SaaS needs no operations, but pricing follows ingested traces
+  with retention tiers, so at high volume you sample, shorten retention, or move to a self-hosted open-source
+  alternative.
+- **Fidelity vs privacy.** `@traceable` records arguments and return values automatically, which is high
+  fidelity and also captures personal data and large payloads; input and output processors or hiding inputs
+  trade that fidelity back.
+- **Online judges vs cost and bias.** Online evaluators give a continuous quality signal on production
+  traffic at judge-model cost per sampled trace and with judge bias; annotation queues are the calibration,
+  not an optional extra.
+- **Prompt hub vs runtime dependency.** It decouples prompt edits from deploys for LangChain templates, but
+  your runtime now depends on a pull at start-up or request time; cache it and fall back to a bundled version.
 
 ## Pitfalls
-- No traces at all because the wrong environment-variable family is set (the older `LANGCHAIN_TRACING_V2`
-  and `LANGCHAIN_API_KEY` names versus the current `LANGSMITH_*` names) or the key belongs to another
-  workspace; the symptom is a working app and an empty project.
-- Truncated traces from serverless functions because the process returned before the background queue
-  drained; the symptom is root runs with missing children, fixed by waiting for tracers before returning.
-- A wrapped client called outside any traceable context, so every model call is its own trace; the symptom
-  is hundreds of one-run traces and no threads.
-- Threads that never group because the metadata key is missing or was set on a child run rather than the
-  root; the symptom is a conversation view with one turn per thread.
-- Evaluators that read `outputs["answer"]` when the target returned a string (stored as `{"output": ...}`)
-  or a dict with a different key; the symptom is every example erroring or scoring zero.
-- Development, CI and production traffic in one project; the symptom is dashboards and online evaluators
-  polluted by test runs, and sampled judges spending budget on fixtures.
+- **Wrong environment-variable family.** The older `LANGCHAIN_TRACING_V2` and `LANGCHAIN_API_KEY` names versus
+  the current `LANGSMITH_*` names, or a key from another workspace. Symptom: a working app and an empty
+  project.
+- **Serverless returns before the queue drains.** Symptom: root runs with missing children. Fix: wait for
+  tracers before returning.
+- **Wrapped client outside any traceable context.** Every model call is its own trace. Symptom: hundreds of
+  one-run traces and no threads.
+- **Thread key on the wrong run.** The metadata key is missing or set on a child rather than the root.
+  Symptom: a conversation view with one turn per thread.
+- **Evaluators reading the wrong key.** They read `outputs["answer"]` when the target returned a string
+  (stored as `{"output": ...}`) or a dict with a different key. Symptom: every example erroring or scoring
+  zero.
+- **Dev, CI and production in one project.** Symptom: dashboards and online evaluators polluted by test runs,
+  and sampled judges spending budget on fixtures.
 
 ## When to use
-Pick LangSmith when the application is built on LangChain or LangGraph and a hosted platform is acceptable:
-you get agent-level traces, threads and evaluations with almost no instrumentation work, and the
-dataset-to-experiment loop is mature. It still works for plain Python or TypeScript through `@traceable`,
-but then the integration advantage shrinks and Langfuse (open source, self-hostable) or Phoenix
-(OpenTelemetry-native) deserve a direct comparison on data residency and cost. Measure trace completeness
-per environment, the fraction of production traces that receive feedback, and judge-versus-human agreement
-on the annotation queue. In day-to-day work it is where you reproduce a customer's bad conversation and
-where a prompt change proves itself against the golden dataset before release; in interviews, expect to
-explain the run tree, how threads are formed, and the difference between online evaluators and offline
-experiments.
+- **Use when** the app is built on LangChain or LangGraph and a hosted platform is acceptable: agent-level
+  traces, threads and evaluations with almost no instrumentation, and a mature dataset-to-experiment loop.
+- **Compare first when** the code is plain Python or TypeScript through `@traceable`: the integration
+  advantage shrinks, and Langfuse (open source, self-hostable) or Phoenix (OpenTelemetry-native) deserve a
+  direct comparison on data residency and cost.
+- **Measure:** trace completeness per environment, the fraction of production traces that receive feedback,
+  and judge-versus-human agreement on the annotation queue.
+- **Day to day,** it is where you reproduce a customer's bad conversation and where a prompt change proves
+  itself against the golden dataset before release.
+- **Interviews:** explain the run tree, how threads are formed, and the difference between online evaluators
+  and offline experiments.
 
 ## Role lens
 - **Engineer:** Wraps provider clients, decorates service boundaries with `@traceable`, sets session metadata
@@ -227,6 +303,40 @@ which usually reveals a missing observation in state, an ambiguous tool descript
 instruction. Fix the prompt or add a step budget, then run `evaluate` against the looping dataset with a code
 evaluator that counts tool runs in the trace, and compare the experiment with the baseline. Ship behind a
 canary project, and keep an online evaluator or feedback key tracking the loop rate over time.
+
+## Interview questions
+### What is a run tree, and why does each run carry a dotted_order?
+- **Definition:** every unit of work is a run with a type, inputs, outputs, timing and a parent; the root run
+  and its descendants form the trace.
+- **Why `dotted_order`:** children usually finish and post before parents and batches interleave across
+  processes; an ancestor-encoded sort key rebuilds the tree deterministically without waiting.
+
+### Each chat turn shows as a separate conversation in the Threads view. How do you debug it?
+- **Threads group by a metadata key** (`session_id`, `thread_id` or `conversation_id`) on the root run.
+- **Check** the key exists on every turn, is set on the root rather than a child, and is stable across turns
+  (not regenerated per request).
+- **Also check** model calls are inside a traceable context, otherwise each becomes its own trace.
+
+### When would you not choose LangSmith?
+- **When data must stay in your network** and enterprise self-hosting is not available; prompts with customer
+  data then rule out the hosted service.
+- **When volume makes per-trace pricing dominant** and sampling would hide the failures you need.
+- **When the stack is not LangChain,** the integration advantage shrinks, so compare Langfuse or Phoenix on
+  cost and residency.
+
+### Some runs show inputs but never an output or end time. What happened?
+- **Runs are posted twice,** once on start and once on end, so a run with only a start record means the end
+  post never arrived.
+- **Likely causes:** the process crashed or was killed mid-step, or a serverless handler returned before the
+  background queue drained.
+- **Fix:** wait for tracers or flush at the end of each handler, and treat persistent pending runs as a crash
+  signal worth alerting on.
+
+### How would you size online judge evaluation for 20,000 traces a day?
+- **Pick a sampled percentage,** for example 5% gives about 1,000 judged traces a day; multiply by judge prompt
+  plus trace tokens and the judge model price (rough planning figures).
+- **Budget human calibration** too: a weekly annotation queue sized to estimate judge-human agreement, because
+  that agreement is what makes the automated number trustworthy.
 
 ## Quiz
 ### Q: Which setup produces full traces for a LangGraph application with the least code?

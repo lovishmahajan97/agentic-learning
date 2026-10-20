@@ -5,7 +5,7 @@ name: Excessive agency
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - safety-security/tool-privilege-escalation
   - agents/approval-gates-for-consequential-actions
@@ -20,87 +20,120 @@ sources:
 ---
 
 ## TL;DR
-Excessive agency is an LLM system that can do more than its task needs: too many functions, too much
-permission, or too much autonomy. Then a bad decision, from a hallucinated intent, an injected
-instruction or an ambiguous request, becomes real damage. The fix is not a smarter model but a smaller
-blast radius: minimal tools, credentials scoped to the user and enforced outside the model, and human
-checkpoints before irreversible or external actions.
+Excessive agency is an LLM system that can do more than its task needs: too many functions, permissions
+or autonomy. The fix is a smaller blast radius: minimal tools, user-scoped credentials enforced outside
+the model, and human checkpoints.
 
 ## Why it exists
-Agents act, and the decision to call a tool is a probabilistic output in the same way a sentence is.
-Its upstream causes are the usual ones: an ambiguous request, a hallucinated detail, an injected
-instruction in a document, a loop that never converges. In a traditional application the damage from a
-user's mistaken click is bounded by the UI; an agent holding a shell, a database client or an API token
-is bounded only by its credentials and by whatever the runtime refuses to do. That is the confused
-deputy problem in a new costume: a component with privileges that can be talked into using them on
-behalf of someone who should not have them.
-
-The naive mitigations are instructions aimed at the model, and instructions are exactly what an attacker
-or a hallucination overrides. "Be careful with destructive actions" is not enforcement. "Ask the model to
-confirm" makes the same model both actor and reviewer. "Trust the user's instructions" ignores that the
-user did not write the email the agent just read. OWASP lists excessive agency in its Top 10 for LLM
-applications because the incidents are already familiar: agents that mass-mailed, deleted data, ran
-destructive commands or made purchases while technically doing what they were told.
+- **Tool calls are probabilistic outputs.** The decision to call a tool is sampled like a sentence, with
+  the usual upstream causes: an ambiguous request, a hallucinated detail, an injected instruction in a
+  document, a loop that never converges. A bad decision becomes real damage.
+- **Agents are bounded only by credentials.** A user's mistaken click is bounded by the UI; an agent
+  holding a shell, a database client or an API token is bounded only by its credentials and whatever the
+  runtime refuses to do.
+- **It is the confused deputy in a new costume:** a component with privileges that can be talked into
+  using them on behalf of someone who should not have them.
+- **Naive mitigations are instructions, which are what gets overridden.** "Be careful with destructive
+  actions" is not enforcement. "Ask the model to confirm" makes the same model actor and reviewer. "Trust
+  the user's instructions" ignores that the user did not write the email the agent just read.
+- **The incidents are familiar.** OWASP lists excessive agency in its Top 10 for LLM applications because
+  agents have mass-mailed, deleted data, run destructive commands or made purchases while technically
+  doing what they were told. The fix is not a smarter model.
 
 ## How it works
 ### Three axes
-OWASP frames the problem along three dimensions, and each has its own controls.
+OWASP frames the problem along three dimensions, each with its own controls.
 
-1. **Excessive functionality.** Tools beyond the task (a summariser that can also send email), broad
-   tools where narrow ones would do (a shell, raw SQL, a generic HTTP client), leftover development tools,
-   or a third-party tool server exposing forty functions when three are needed.
-2. **Excessive permissions.** Credentials broader than the user's: an admin service account shared by
-   everyone, unscoped or long-lived tokens, no tenant or row-level enforcement. The agent can touch
-   everything the service can, regardless of who is asking.
-3. **Excessive autonomy.** Irreversible or high-impact actions without confirmation, no budgets for steps,
-   time or money, no dry run, no kill switch.
+| Axis | What it looks like |
+|---|---|
+| 1. Excessive functionality | tools beyond the task (a summariser that can also send email); broad tools where narrow ones would do (a shell, raw SQL, a generic HTTP client); leftover development tools; a third-party tool server exposing forty functions when three are needed |
+| 2. Excessive permissions | credentials broader than the user's: an admin service account shared by everyone, unscoped or long-lived tokens, no tenant or row-level enforcement; the agent can touch everything the service can, regardless of who asks |
+| 3. Excessive autonomy | irreversible or high-impact actions without confirmation; no budgets for steps, time or money; no dry run; no kill switch |
 
-### Controls per axis
-**Functionality.** Select a tool set per workflow, not globally. Split read from write tools, *because*
-the risk profile differs and the split lets you grant read widely. Prefer narrow typed tools over generic
-executors, *because* a typed `issue_refund(order_id, amount)` can be policed while `run_sql(query)`
-cannot. Keep a deny-by-default registry and review every tool before it is exposed.
+### Controls: functionality
+- **Select a tool set per workflow,** not globally.
+- **Split read from write tools,** *because* the risk profile differs and the split lets you grant read
+  widely.
+- **Prefer narrow typed tools,** *because* a typed `issue_refund(order_id, amount)` can be policed while
+  `run_sql(query)` cannot.
+- **Deny by default:** keep a registry and review every tool before it is exposed.
 
-**Permissions.** Act as the user, not as the service: delegated or on-behalf-of tokens scoped to the
-user's resources and tenant, with short lifetimes. Enforce in the resource layer (database row-level
-security, API authorisation) rather than in the prompt, *because* enforcement there is deterministic and
-survives any model behaviour. Give each tool its own credential, and never place secrets in the context
-window.
+### Controls: permissions
+- **Act as the user, not the service:** delegated or on-behalf-of tokens scoped to the user's resources
+  and tenant, with short lifetimes.
+- **Enforce in the resource layer** (database row-level security, API authorisation) rather than in the
+  prompt, *because* enforcement there is deterministic and survives any model behaviour.
+- **One credential per tool,** and never place secrets in the context window.
 
-**Autonomy.** Classify every action by consequence: read, reversible write, irreversible write, external
-communication, financial. Gate the last three with human approval that displays the exact arguments, not
-the model's description of them. Offer a dry-run or plan-review mode for destructive operations. Set
-budgets per session for steps, tokens, spend and rows affected; apply rate limits; prefer reversible
-designs (drafts instead of sends, soft deletes). Keep a kill switch and an audit log of every call.
+### Controls: autonomy
+1. **Classify every action by consequence:** read, reversible write, irreversible write, external
+   communication, financial.
+2. **Gate the last three with human approval** that displays the exact arguments, not the model's
+   description of them.
+3. **Offer dry-run or plan review** for destructive operations.
+4. **Set budgets per session** for steps, tokens, spend and rows affected; apply rate limits.
+5. **Prefer reversible designs:** drafts instead of sends, soft deletes.
+6. **Keep a kill switch** and an audit log of every call.
 
 ### Runtime pattern: the model proposes, policy disposes
-Each proposed tool call passes through a policy check outside the model: who is asking, which tool, with
-which arguments, at which consequence tier, with how much budget left. The outcomes are allow, require
-approval, or deny with a reason returned to the model so it can choose another path. This is where the
-guarantees live, *because* a deterministic executor can be tested, logged and audited while a prompt
-cannot. Approval ergonomics matter: batch low-risk actions and escalate rarely, otherwise humans
-rubber-stamp and the gate becomes theatre.
+- **Every proposed call passes a policy check outside the model:** who is asking, which tool, which
+  arguments, which consequence tier, how much budget is left.
+- **Three outcomes:** allow, require approval, or deny with a reason returned to the model so it can
+  choose another path.
+- **This is where the guarantees live,** *because* a deterministic executor can be tested, logged and
+  audited while a prompt cannot.
+- **Approval ergonomics matter:** batch low-risk actions and escalate rarely, otherwise humans
+  rubber-stamp and the gate becomes theatre.
 
 ### Blast radius as arithmetic
-The worst case of a tool is roughly *what one call can do × how many calls can happen before a human
-notices*. Take an email tool with no recipient restriction and no rate limit on an agent that runs
-overnight. At one call per second for eight hours, that is 28,800 sends before anyone looks. A
-per-session cap of 25 calls, a recipient allowlist and a daily limit of 200 turn the worst case into
-200 emails to known addresses. Each control attacks a different factor: narrower tools shrink the
-damage per call, scoped credentials shrink what any call can reach, budgets shrink the count, and
-alerting shrinks the time until someone notices. When reviewing an agent, compute this product per
-tool; the largest one is your first fix.
+```
+worst case ≈ what one call can do × how many calls can happen before a human notices
+```
+
+| Setup | Worst case |
+|---|---|
+| Email tool, no recipient restriction, no rate limit, agent runs overnight at one call per second for eight hours | 28,800 sends before anyone looks |
+| Per-session cap of 25 calls, a recipient allowlist, a daily limit of 200 | 200 emails to known addresses |
+
+Each control attacks a different factor:
+- **Narrower tools** shrink the damage per call.
+- **Scoped credentials** shrink what any call can reach.
+- **Budgets** shrink the count.
+- **Alerting** shrinks the time until someone notices.
+
+When reviewing an agent, compute this product per tool; the largest one is your first fix.
 
 ### Measuring agency
-Count tools exposed versus tools actually used per workflow; the gap is unnecessary surface. Track the
-share of calls requiring approval and the approval acceptance rate; a rate near 100% means the gate is
-either too broad or being rubber-stamped. Map the blast radius of each credential: what is the worst
-query or action it permits? Review incidents for which axis failed.
+- **Tools exposed vs tools used** per workflow; the gap is unnecessary surface.
+- **Share of calls requiring approval and the approval acceptance rate;** a rate near 100% means the gate
+  is either too broad or being rubber-stamped.
+- **Blast radius per credential:** what is the worst query or action it permits?
+- **Incident reviews:** record which axis failed.
 
-## Example
-A tool registry with consequence tiers and required scopes, and an executor that enforces the user's
-scopes, a step budget, a spend cap and human approval for tier-2 actions. The model never sees
-credentials and cannot talk its way past a scope it does not hold.
+## Diagram
+Every proposed call goes through the executor's checks in order; denials return a reason to the model and
+are audited just like executions.
+
+```mermaid
+flowchart TD
+    M["Model proposes tool call"] --> B{"Budget left?"}
+    B -->|"no"| D["Deny with reason to model"]
+    B -->|"yes"| S{"User token has scopes?"}
+    S -->|"no"| D
+    S -->|"yes"| T{"Consequence tier"}
+    T -->|"read or reversible"| E["Execute"]
+    T -->|"irreversible, external, money"| C{"Spend cap and human approval"}
+    C -->|"approved"| E
+    C -->|"denied or over cap"| D
+    E --> L[("Audit log")]
+    D --> L
+```
+
+## Examples
+### Tool registry and policy-enforcing executor
+Consequence tiers and required scopes per tool; the executor enforces the user's scopes, a step budget, a
+spend cap and human approval for tier-2 actions. The model never sees credentials and cannot talk its way
+past a scope it does not hold.
 
 ```python
 from dataclasses import dataclass, field
@@ -150,47 +183,99 @@ print(execute(s, TOOLS["issue_refund"], {"order_id": "ORD-104233", "amount_cents
 #    however persuasive the model, the customer, or an injected ticket is about it.
 ```
 
+### Blast-radius calculator
+Pure Python: the count factor is the smallest of the rate-limited throughput and every cap in force.
+
+```python
+def worst_case_calls(rate_per_s: float, hours: float, session_cap=None, daily_cap=None, sessions=1):
+    uncapped = int(rate_per_s * hours * 3600)
+    caps = [uncapped]
+    if session_cap is not None:
+        caps.append(session_cap * sessions)
+    if daily_cap is not None:
+        caps.append(daily_cap)
+    return min(caps)
+
+print(worst_case_calls(1, 8))                                         # 28800 sends overnight
+print(worst_case_calls(1, 8, session_cap=25, daily_cap=200, sessions=40))  # 200: the daily cap binds
+print(worst_case_calls(1, 8, session_cap=25, daily_cap=200, sessions=1))   # 25: one runaway session
+```
+
+### Enforcing tenant scope in the resource layer
+A production snippet for PostgreSQL row-level security: the agent's connection sets the tenant for the
+transaction, and the database refuses other tenants' rows whatever SQL the tool sends.
+
+```sql
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;   -- otherwise the table owner bypasses the policy
+CREATE POLICY tenant_isolation ON orders
+  USING (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- per request, inside the tool's transaction, from the user's verified identity (never from the model):
+BEGIN;
+SET LOCAL app.tenant_id = '6f1c2d3e-0000-4000-8000-000000000001';
+SELECT id, total FROM orders WHERE id = 'ORD-104233';   -- other tenants' rows are invisible
+COMMIT;
+```
+
+## Production patterns
+- **Draft-only launch, then earn autonomy.** Ship write tools in approval-only or draft mode, track the
+  approval rejection rate and task accuracy from the audit log, and enable direct execution per tool only
+  when the numbers justify it.
+- **Delegated, short-lived credentials per user.** Use on-behalf-of tokens scoped to the user's tenant
+  and resources, plus row-level security in the database (as above), so isolation holds regardless of the
+  model. Monitor scope-denied calls per user.
+- **Consequence-tier registry, deny by default.** Every tool declares a tier and required scopes before it
+  can be exposed; tier 2 always routes to approval showing exact arguments. Monitor approval share and
+  acceptance rate, and investigate a rate near 100%.
+- **Pin and diff third-party tool servers.** Pin the server version and diff the exposed tool list and
+  descriptions on every update, blocking new or redefined functions until reviewed.
+- **Budgets per task class with a kill switch.** Set step, spend and rows-affected caps per workflow, have
+  the agent report "budget exhausted" rather than fail silently, and alert on sessions that hit caps.
+
 ## Trade-offs
-- Narrow typed tools are policeable but every new capability is engineering work; this flips for
-  exploratory tasks such as coding agents, where one broad tool inside a strong sandbox beats fifty narrow
-  ones.
-- Approval gates bound damage but create fatigue; they work only while they are rare and informative,
-  and once users rubber-stamp, the gate is theatre with a false sense of safety.
-- Per-user delegated credentials remove the confused-deputy risk but require identity plumbing with every
-  downstream system; for unattended batch jobs with no user, fall back to a tightly scoped service
-  identity with hard budgets.
-- Budgets stop runaway loops but can cut off legitimate long tasks; set them per task class and let the
-  agent report "budget exhausted" instead of failing silently.
-- Dry-run and plan review catch destructive mistakes at the cost of a second round trip; apply them to
-  irreversible tiers only, not to reads.
+- **Narrow typed tools vs engineering effort.** They are policeable, but every new capability is work;
+  this flips for exploratory tasks such as coding agents, where one broad tool inside a strong sandbox
+  beats fifty narrow ones.
+- **Approval gates vs fatigue.** They bound damage but work only while rare and informative; once users
+  rubber-stamp, the gate is theatre with a false sense of safety.
+- **Delegated credentials vs identity plumbing.** Per-user credentials remove the confused-deputy risk but
+  need identity integration with every downstream system; for unattended batch jobs with no user, fall
+  back to a tightly scoped service identity with hard budgets.
+- **Budgets vs long tasks.** They stop runaway loops but can cut off legitimate long tasks; set them per
+  task class and let the agent report "budget exhausted" instead of failing silently.
+- **Dry-run vs round trips.** Plan review catches destructive mistakes at the cost of a second round trip;
+  apply it to irreversible tiers only, not to reads.
 
 ## Pitfalls
-- One admin service account behind the agent for all users; the symptom is the agent answering questions
-  about another customer's records when asked nicely.
-- Showing the human the model's summary instead of the actual arguments; the symptom is approving "send
-  the update to the team" and four hundred people receiving it.
-- Asking the model "are you sure?" as the gate; the symptom is that it says yes.
-- Shipping shell, raw SQL or generic HTTP tools "for flexibility"; the symptom is an incident report with
-  a destructive command or an outbound call to an unknown host.
-- No step or spend budget; the symptom is a loop that burned thousands of calls overnight.
-- Passing secrets through tool arguments; the symptom is API keys in traces and occasionally in model
-  output.
-- Reviewing a third-party tool server once and trusting it afterwards; the symptom is new or redefined
-  functions appearing after an upstream update that nobody approved, which version pinning and a
-  diff of the exposed tool list on every change would have caught.
-- Auditing only executed calls; the symptom is an incident review that cannot tell how many times the
-  agent tried a denied action before it found one that worked.
-- Irreversible actions without a draft or soft-delete mode; the symptom is a misfire with nothing to roll
+- **One admin service account for all users.** Symptom: the agent answers questions about another
+  customer's records when asked nicely.
+- **Showing the human the model's summary, not the arguments.** Symptom: approving "send the update to the
+  team" and four hundred people receiving it.
+- **Asking the model "are you sure?" as the gate.** Symptom: it says yes.
+- **Shipping shell, raw SQL or generic HTTP tools "for flexibility".** Symptom: an incident report with a
+  destructive command or an outbound call to an unknown host.
+- **No step or spend budget.** Symptom: a loop that burned thousands of calls overnight.
+- **Passing secrets through tool arguments.** Symptom: API keys in traces and occasionally in model output.
+- **Reviewing a third-party tool server once.** Symptom: new or redefined functions appear after an
+  upstream update nobody approved; version pinning and a diff of the exposed tool list on every change
+  would have caught it.
+- **Auditing only executed calls.** Symptom: an incident review that cannot tell how many times the agent
+  tried a denied action before one worked.
+- **Irreversible actions without a draft or soft-delete mode.** Symptom: a misfire with nothing to roll
   back.
 
 ## When to use
-Apply these controls whenever a model output can cause a side effect, which is every agent and most
-tool-using assistants. Start from the task's minimal list of verbs, grant the user's scopes rather than
-the service's, tier every tool by consequence, gate the irreversible and external tiers, budget every
-session and log every call. Measure tools exposed versus used, approval rates and the blast radius per
-credential. Day to day this is the review you run before enabling a new tool server and the first
-question in an incident review. In interviews, name the three axes and explain "the model proposes, the
-policy disposes" with an example of enforcement living in the resource layer.
+- **Apply when:** a model output can cause a side effect, which is every agent and most tool-using
+  assistants.
+- **Recipe:** start from the task's minimal list of verbs, grant the user's scopes rather than the
+  service's, tier every tool by consequence, gate the irreversible and external tiers, budget every
+  session and log every call.
+- **Measure:** tools exposed versus used, approval rates and the blast radius per credential.
+- **Day to day:** the review you run before enabling a new tool server, and the first question in an
+  incident review.
+- **Interviews:** name the three axes and explain "the model proposes, the policy disposes" with an
+  example of enforcement living in the resource layer.
 
 ## Role lens
 - **Engineer:** Builds the tool registry with tiers and scopes, the executor that enforces them, and
@@ -212,6 +297,38 @@ details exactly; cap spend per session and per day; treat any change of vendor b
 separate verification step, since that is the classic fraud pattern; produce a dry-run matching report;
 log every call; keep a kill switch. Launch in draft-only mode, measure match accuracy and approval
 rejection rate, and enable submission only when the numbers justify it.
+
+## Interview questions
+### What is excessive agency, and why can't a better prompt fix it?
+- **Definition:** the system can do more than the task needs, through too many functions, too broad
+  permissions or too much autonomy, so a bad decision becomes real damage.
+- **Prompts are not enforcement:** injected text or a hallucination overrides "be careful"; controls must
+  live in the executor and resource layer where they are deterministic.
+
+### An agent answered a question using another tenant's data. Debug it.
+- **Check the credential first:** a shared admin service account means the agent can read everything the
+  service can, regardless of who asked.
+- **Fix at the resource layer:** delegated per-user tokens and row-level security keyed to the verified
+  tenant, never to a value the model supplies.
+- **Audit:** use the call log, including denied calls, to find every request that crossed tenants.
+
+### When would you give an agent a broad tool like a shell?
+- **For exploratory work such as coding agents,** where fifty narrow tools would never cover the task.
+- **Only inside a strong sandbox:** no production credentials, restricted network egress, disposable
+  environment, and budgets on steps and time, so the blast radius stays small even though the tool is
+  broad.
+
+### How do you compute and reduce the blast radius of an email tool?
+- **Multiply damage per call by calls before a human notices:** at one call per second for eight hours
+  that is 28,800 sends.
+- **Shrink each factor:** recipient allowlist, a per-session cap of 25 calls and a daily limit of 200 cut
+  it to 200 emails to known addresses; alerting shortens the time factor.
+
+### Your approval gate has a 99% acceptance rate. Is that good?
+- **Probably not:** it suggests the gate is too broad or being rubber-stamped, so it adds friction without
+  scrutiny.
+- **Narrow it to irreversible, external and financial actions,** batch low-risk ones, and always show
+  exact arguments so the rare approvals that remain get real attention.
 
 ## Quiz
 ### Q: Which of these is not one of OWASP's three roots of excessive agency?

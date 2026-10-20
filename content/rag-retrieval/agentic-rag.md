@@ -5,7 +5,7 @@ name: Agentic RAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - prompting/react
@@ -21,9 +21,9 @@ sources:
 ---
 
 ## TL;DR
-Agentic RAG makes retrieval tools the model calls in a loop: it decides whether and what to search, which
-source to use, whether results suffice, and when to stop. It answers multi-hop and multi-source questions,
-at the cost of latency, tokens and predictability.
+Agentic RAG makes retrieval tools the model calls in a loop, deciding what to search, where, and when to
+stop. It exists because multi-hop, ambiguous and multi-source questions defeat one query against one
+index, and it costs latency, tokens and predictability.
 
 ## Why it exists
 - **Classic RAG is a straight line:** embed the question, fetch top-k, generate. It assumes the user's
@@ -301,13 +301,13 @@ verification against retrieved IDs, and trajectory-level metrics for steps and c
 - **Verify in CI:** run an injection red-team suite on every change and alert on denied-access events;
   prompting the model to be careful helps but is not a boundary.
 
-### When would you not build an agent for retrieval?
-- **When failures are single-hop retrieval bugs:** if ranking or parsing causes most misses, an agent just
-  retries a broken retriever and adds latency.
-- **When simpler shapes pass the eval:** a router, a single sufficiency-triggered retry or up-front
-  decomposition may be enough, and each degree of freedom adds latency and failure modes.
-- **When you must explain every answer deterministically:** dynamic plans are harder to cache, debug and test,
-  which matters most in regulated settings.
+### Your questions are genuinely multi-hop. When would you still keep a fixed pipeline?
+- **When the latency budget is tight:** each step adds a model call, so latency and cost multiply by step
+  count; a fixed decompose-then-retrieve workflow bounds both up front.
+- **When there is one well-tuned index:** letting the model route between tools adds tool-selection errors,
+  and with a single source a fixed pipeline is usually more accurate and cheaper.
+- **When you must explain every answer exactly:** dynamic plans are nondeterministic and harder to cache,
+  debug and test, which matters most in regulated settings.
 
 ### Why does an agent's token cost grow faster than its step count, and what do you do about it?
 - **Each step re-sends the history:** with base prompt *b* and *r* tokens added per step, *n* steps cost about
@@ -324,6 +324,14 @@ verification against retrieved IDs, and trajectory-level metrics for steps and c
   tracks dependent hops rather than total searches.
 - **Stop earlier:** use the novelty check and a hard step and time budget, returning a partial answer that
   states the gap.
+
+### Your agent passes the answer-accuracy eval, yet cost per query spikes and answers vary between runs. What is missing?
+- **Trajectory evaluation:** an answer-only eval hides wasteful or lucky paths, so log every tool name,
+  arguments, returned IDs and token counts per step and score the path as well as the answer.
+- **Signals to watch:** steps per query, budget-exhaustion rate, repeated near-identical queries (looping or
+  query drift) and citation-verification rejections.
+- **Then bound it:** tighten step and token budgets in code, prune evidence between steps, and route
+  single-hop traffic away from the agent.
 
 ## Quiz
 ### Q: What capability most distinguishes agentic RAG from a pipeline with up-front query decomposition?

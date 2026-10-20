@@ -5,7 +5,7 @@ name: Learning rate
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/warmup
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-The learning rate is the optimiser's step size, and the most sensitive hyperparameter because a gradient
-gives direction, not a safe distance. Too large diverges, too small crawls; peak, warmup and decay are
-chosen together, far lower for fine-tuning.
+The learning rate is the optimiser's step size, its most sensitive hyperparameter: a gradient gives
+direction, not a safe distance. Too large diverges, too small crawls. Peak, warmup and decay are set
+together; fine-tuning runs far lower to stay near the pretrained weights.
 
 ## Why it exists
 - **A gradient is local.** Gradient descent is `θ ← θ − η·∇L(θ)`. The gradient says which direction is
@@ -126,7 +126,7 @@ move the peak or warmup until neither spikes nor a flat plateau appears.
 flowchart TD
     P{"What is trained?"} -->|"full fine-tune"| F["Start in the low 1e-5 range"]
     P -->|"LoRA or adapters"| L["Start about 10x higher"]
-    F --> G["Range test or x3 grid: 1e-5, 3e-5, 1e-4"]
+    F --> G["Range test or x3 grid around the start"]
     L --> G
     G --> T["Trajectory: warmup few percent, peak, cosine or linear decay"]
     T --> R["Short run: loss, gradient norm, clip rate"]
@@ -201,7 +201,7 @@ def range_test(lr_min=1e-4, lr_max=10.0, steps=200, batch=16):
     return history
 
 edge = range_test()[-1][0]
-print(f"loss exploded near lr={edge:.2f}; try a peak around {edge / 10:.2f}")
+print(f"loss exploded near lr={edge:.2f}; try a peak around {edge / 10:.2f}")   # conservative: ~10x below
 # The edge lands between about 3 and 6 depending on the seed (smoothing lags the blow-up).
 ```
 
@@ -257,17 +257,19 @@ A team fine-tunes on 2,400 examples at batch 16 for 2 epochs and copies a fixed 
 ## Pitfalls
 - **Copying a rate across optimisers, batch sizes or parameterisations** (SGD versus AdamW, full
   fine-tune versus LoRA). Symptom: a run that diverges immediately or one that barely moves in the
-  budget.
+  budget. Fix: re-run a short grid for the new setup.
 - **Changing step count while the schedule is defined in steps** (epochs, dataset size). Symptom: two
-  "identical" configs with different effective rates at the same step and incomparable results.
+  "identical" configs with different effective rates at the same step and incomparable results. Fix:
+  define warmup as a ratio and log the per-step rate.
 - **Letting gradient clipping hide an excessive rate.** Symptom: the clip triggers on almost every step
-  while the loss creeps rather than drops.
+  while the loss creeps rather than drops. Fix: lower the peak until clipping is occasional.
 - **Skipping or truncating warmup with Adam.** Symptom: divergence or a permanent loss plateau in the
-  first few hundred steps that no later schedule repairs.
+  first few hundred steps that no later schedule repairs. Fix: restore a warmup of a few percent.
 - **Raising the rate without noticing AdamW's decay scales with it.** Symptom: weights shrinking faster
-  than intended and underfitting that looks like a data problem.
+  than intended and underfitting that looks like a data problem. Fix: re-check weight decay when the
+  best rate moves.
 - **Reporting "learning rate 2e-5" with no warmup, schedule or batch size.** Symptom: nobody, including
-  you, can reproduce the run.
+  you, can reproduce the run. Fix: record the whole trajectory with the batch size.
 
 ## When to use
 Every training run sets a learning rate; the decision is how to choose it and its trajectory.

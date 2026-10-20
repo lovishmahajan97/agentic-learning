@@ -5,7 +5,7 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - evals/model-evaluation
   - evals/dataset-contamination
@@ -154,16 +154,18 @@ pass@k = 1 − C(n−c, k) / C(n, k)
 
 ## Diagram
 The decision path for a leaderboard number: each check can send the claim back for re-running, and
-even a clean claim only earns a place on the shortlist.
+even a clean claim only earns a place on the shortlist. "Same protocol" means shots, chain-of-thought,
+pass@1 or pass@k, subset and scaffold all match; contamination is checked against a private look-alike
+set.
 
 ```mermaid
 flowchart TD
-    R["Reported benchmark score"] --> P{"Same protocol? shots, CoT, pass@1 or pass@k, subset, scaffold"}
+    R["Reported benchmark score"] --> P{"Same protocol for both?"}
     P -->|"no"| RR["Re-run both under one protocol, or discard"]
     RR --> P
-    P -->|"yes"| N{"Gap larger than the interval for this n?"}
+    P -->|"yes"| N{"Gap larger than the interval?"}
     N -->|"no"| NOISE["Treat as a tie"]
-    N -->|"yes"| C{"Contamination ruled out? private look-alike set"}
+    N -->|"yes"| C{"Contamination ruled out?"}
     C -->|"no"| DISC["Discount the score"]
     C -->|"yes"| SL["Shortlist the model"]
     NOISE --> SL
@@ -225,7 +227,8 @@ reaches a selection memo.
   the subset, shots, chain-of-thought setting, pass@1 or pass@k, scaffold, date, and the 95% interval
   computed as above. Monitor how often memo rankings agree with the golden-dataset run that follows.
 - **Reproduce before trusting.** Re-run claimed scores with an open harness such as EleutherAI's
-  lm-evaluation-harness (for example `lm_eval --tasks mmlu --num_fewshot 5`) or Inspect, pinning the
+  lm-evaluation-harness (for example `lm_eval --tasks mmlu --num_fewshot 5`, plus `--model` and
+  `--model_args` naming the model under test) or Inspect, pinning the
   same protocol for every model. Monitor the gap between your number and the reported one.
 - **Benchmark in your own scaffold.** For coding agents, run SWE-bench Verified instances through your
   agent loop and tools, and log resolved rate and cost per task together. Monitor cost per resolved
@@ -330,13 +333,13 @@ nothing more.
 - **Trade-off:** benchmarks give free comparability for shortlisting, but that comparability decays as
   items saturate and leak into training data.
 
-### Two models are 4 points apart on GPQA Diamond. Is that a real difference?
-- **Compute the interval:** at p ≈ 0.6 and n = 198 the standard error is about ±3.5 points, so the 95%
-  interval is roughly ±7 points, wider than the gap.
-- **Reasoning models add run-to-run noise;** one run on 198 items can move several points on a re-run,
-  so average several runs per item.
-- **Only a paired comparison** on the same items with per-item results can tighten it; published tables
-  do not give you that.
+### Two frontier models score 89% and 91% on MMLU. Does the 2-point gap mean anything?
+- **Statistically it can be real:** at p ≈ 0.9 and about 14,000 items the 95% interval is roughly
+  ±0.5 points, so sampling noise alone does not explain 2 points.
+- **But it may not be capability:** near the ceiling, mislabeled or ambiguous items cap the effective
+  maximum below 100%, so the remaining gap can reflect which model agrees with the label errors.
+- **Protocol and leakage can move it too:** log-probability versus generated-letter scoring, shot count
+  and contamination each shift scores, so the gap supports a shortlist, not a ranking.
 
 ## Quiz
 ### Q: Why did HumanEval grade solutions by running unit tests instead of comparing them to a reference solution?

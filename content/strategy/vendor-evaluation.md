@@ -5,7 +5,7 @@ name: Vendor evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/model-selection
   - system-design/build-vs-buy
@@ -18,90 +18,111 @@ related:
 ---
 
 ## TL;DR
-Vendor evaluation is choosing a model provider, vector database, eval tool or AI platform by testing
-candidates on your own task and constraints rather than on demos and public leaderboards. The method:
-hard gates first (data terms, residency, security, compliance), then a bake-off on your own labelled data
-measuring quality, latency under your load and cost per successful task, then contract and exit terms.
-It matters because AI vendors differ most on exactly the things a demo never shows.
+Vendor evaluation picks a model provider, vector database, eval tool or AI platform by testing candidates
+on your own task: hard gates first, then a bake-off on your labelled data (quality, latency under load,
+cost per successful task), then contract and exit terms.
 
 ## Why it exists
-AI vendors are unusually hard to compare. Public benchmarks measure tasks that may look nothing like
-yours, and some benchmark data has leaked into training sets, so a leaderboard gap may not transfer.
-Demos are run on the vendor's chosen examples. Pricing is per token, per query, per seat or per
-"credit", which makes headline prices incomparable until you convert them to cost per unit of your work.
-And the decisive properties are often non-functional: whether your data is retained or used for training,
-which regions process it, what rate limits you get, how much notice you get before a model is deprecated,
-and how hard it is to leave.
-
-The naive process, a feature checklist plus a demo plus the lowest list price, fails predictably. The
-checklist rewards breadth over fit. The demo hides the failure modes on your messy inputs. The list price
-ignores that a cheaper model needing two retries, longer prompts or more human review can cost more per
-correct outcome. Teams that choose this way discover the gaps after integration, when switching is
-expensive, and then live with a vendor that fails a security review or throttles them at peak.
-
-Evaluation also recurs: model vendors ship new versions frequently, so the same harness should be
-re-runnable when a new candidate appears, rather than a one-off procurement exercise.
+- **AI vendors differ most on what a demo never shows.** The decisive properties are often
+  non-functional: whether your data is retained or used for training, which regions process it, what rate
+  limits you get, how much notice before a model is deprecated, and how hard it is to leave.
+- **Public benchmarks do not transfer reliably.** They measure tasks that may look nothing like yours, and
+  some benchmark data has leaked into training sets, so a leaderboard gap may not transfer.
+- **Demos and prices are not comparable.** Demos run on the vendor's chosen examples; pricing is per token,
+  per query, per seat or per "credit", incomparable until converted to cost per unit of your work.
+- **The naive process fails predictably.** A feature checklist rewards breadth over fit; a demo hides
+  failure modes on your messy inputs; the list price ignores that a cheaper model needing two retries,
+  longer prompts or more human review can cost more per correct outcome. Teams discover the gaps after
+  integration, when switching is expensive, and live with a vendor that fails a security review or
+  throttles them at peak.
+- **Evaluation recurs.** Model vendors ship new versions frequently, so the harness should be re-runnable
+  when a new candidate appears, not a one-off procurement exercise.
 
 ## How it works
 ### 1. Write requirements as gates and weighted criteria
-Separate **must-haves** (pass/fail) from **differentiators** (scored). Gates typically cover data use
-(no training on your data, retention period, zero-retention options), data residency, security
-attestations and the answers your security questionnaire needs, required deployment mode (API, VPC,
-self-hosted), and compliance obligations. A vendor that fails a gate is out regardless of score,
-*because* a weighted average lets a high quality score compensate for a disqualifying flaw. Fix the
-weights for the differentiators **before** seeing results, so the scoring is not reverse-engineered to
-justify a favourite.
+- **Must-haves are pass/fail gates:** data use (no training on your data, retention period, zero-retention
+  options), data residency, security attestations and the answers your security questionnaire needs,
+  required deployment mode (API, VPC, self-hosted), and compliance obligations.
+- **A vendor that fails a gate is out regardless of score**, *because* a weighted average lets a high
+  quality score compensate for a disqualifying flaw.
+- **Differentiators are scored**, with weights fixed **before** seeing results, so the scoring is not
+  reverse-engineered to justify a favourite.
 
 ### 2. Build a task-specific evaluation set
-Use a few hundred real, representative, labelled examples from your workflow, including the hard and
-ugly cases (scanned PDFs, long threads, other languages). Keep it private and never send it to vendors
-for "tuning" before the test, *because* then you are measuring their preparation, not their product.
-
-Size the set for the differences you need to detect. The 95% interval on an accuracy *p* measured on *n*
-items is roughly ±1.96 × √(p(1−p)/n): at p = 0.95 and n = 400 that is about ±2 points. So two vendors 1
-point apart on 400 items are tied, and the decision must rest on cost, latency or terms. Because every
-vendor runs on the same items, compare them *paired*: count the items A gets right and B gets wrong, and
-vice versa. Only the disagreements carry information, which makes paired comparison more sensitive than
-comparing two headline percentages, and reading those disagreements tells you *what kind* of input each
-vendor fails on.
+- **A few hundred real, representative, labelled examples** from your workflow, including the hard and ugly
+  cases (scanned PDFs, long threads, other languages).
+- **Keep it private.** Never send it to vendors for "tuning" before the test, *because* then you are
+  measuring their preparation, not their product.
+- **Size it for the differences you need to detect.** The 95% interval on accuracy *p* measured on *n*
+  items is roughly ±1.96 × √(p(1−p)/n): at p = 0.95 and n = 400 that is about ±2 points. Two vendors 1
+  point apart on 400 items are tied, and the decision must rest on cost, latency or terms.
+- **Compare *paired*.** Every vendor runs on the same items, so count items A gets right and B gets wrong,
+  and vice versa. Only the disagreements carry information, which makes paired comparison more sensitive
+  than comparing two headline percentages; reading them tells you *what kind* of input each vendor fails
+  on.
 
 ### 3. Run a controlled bake-off
-Same harness, same scoring, and an equal prompt-engineering budget per vendor, tuned on a separate
-development split and scored once on the held-out test split. Reusing prompts tuned for the incumbent
-quietly favours it, *because* those prompts encode that model's quirks. If outputs are sampled, run each
-item more than once or fix the decoding settings, and report the spread. For each candidate measure:
-- **Quality** on your metric (accuracy, faithfulness, pass rate on acceptance criteria).
-- **Latency** at p50 and p95 at your expected concurrency, not single requests, *because* rate limits and
-  queueing appear only under load.
-- **Cost per successful task:** total cost (tokens, retries, fixed fees, human review of failures)
-  divided by tasks completed correctly. Count each cost once: if a human fixes a failure, that task is
-  delivered and its review cost is in the numerator; if failures are simply discarded, there is no review
-  cost but they drop out of the denominator. This is the number that makes different pricing models
-  comparable.
-- **Operational fit:** quotas in your region, SLA terms, observability hooks, SDK quality, support.
+1. **Same harness, same scoring, and an equal prompt-engineering budget per vendor**, tuned on a separate
+   development split and scored once on the held-out test split.
+2. **Do not reuse prompts tuned for the incumbent**, *because* they encode that model's quirks and quietly
+   favour it.
+3. **If outputs are sampled**, run each item more than once or fix the decoding settings, and report the
+   spread.
+4. **Measure for each candidate:**
 
-The same structure applies to non-model vendors with different metrics: a vector database is measured on
-recall@k and p95 query latency at your corpus size and with your metadata filters, plus ingestion and
-update throughput, *because* index behaviour changes with scale and filter selectivity in ways a small
-demo corpus never shows.
+| Metric | How |
+|---|---|
+| **Quality** | Your metric: accuracy, faithfulness, pass rate on acceptance criteria. |
+| **Latency** | p50 and p95 at your expected concurrency, not single requests, *because* rate limits and queueing appear only under load. |
+| **Cost per successful task** | Total cost (tokens, retries, fixed fees, human review of failures) divided by tasks completed correctly. The number that makes different pricing models comparable. |
+| **Operational fit** | Quotas in your region, SLA terms, observability hooks, SDK quality, support. |
+
+- **Count each cost once.** If a human fixes a failure, that task is delivered and its review cost is in
+  the numerator. If failures are simply discarded, there is no review cost but they drop out of the
+  denominator.
+- **Non-model vendors use the same structure with different metrics.** A vector database is measured on
+  recall@k and p95 query latency at your corpus size and with your metadata filters, plus ingestion and
+  update throughput, *because* index behaviour changes with scale and filter selectivity in ways a small
+  demo corpus never shows.
 
 ### 4. Assess the vendor, not just the product
-Financial and roadmap stability, model deprecation policy and notice period, how they communicate
-changes, and whether a model version can be pinned. For a small vendor, ask what happens to your data
-and service if they are acquired or shut down.
+- **Stability:** financial and roadmap stability.
+- **Change management:** model deprecation policy and notice period, how changes are communicated, and
+  whether a model version can be pinned.
+- **Small vendors:** ask what happens to your data and service if they are acquired or shut down.
 
 ### 5. Price the exit before you enter
-Estimate the cost of leaving: proprietary formats, embeddings that must be regenerated, prompts tuned to
-one model, contractual minimums. Prefer vendors that fit behind your own interface (gateway, standard
-APIs), *because* a low exit cost is what keeps the next negotiation honest.
+- **Estimate the cost of leaving:** proprietary formats, embeddings that must be regenerated, prompts tuned
+  to one model, contractual minimums.
+- **Prefer vendors that fit behind your own interface** (gateway, standard APIs), *because* a low exit
+  cost is what keeps the next negotiation honest.
 
 ### 6. Decide, document, and schedule re-evaluation
-Record the scores, the gates and the reasoning in a decision record, and re-run the harness when a
-material new option or price change appears.
+- **Decision record:** the scores, the gates and the reasoning.
+- **Re-run the harness** when a material new option or price change appears.
 
-## Example
-Scoring three model providers for invoice field extraction. Quality and latency come from a bake-off on
-400 labelled invoices; prices and figures are illustrative.
+## Diagram
+Gates remove candidates before any scoring; only survivors reach the bake-off, and a gap inside the noise
+sends the decision to cost, latency and terms.
+
+```mermaid
+flowchart TD
+    C["Candidate vendors"] --> G{"Pass every gate?"}
+    G -->|"no: data use, residency, security"| X["Excluded"]
+    G -->|"yes"| T["Tune prompts on dev split"]
+    T --> B["Bake-off on held-out set at load"]
+    B --> M["Quality, p95, cost per success"]
+    M --> P{"Paired gap outside noise?"}
+    P -->|"yes"| S["Weighted score, fixed weights"]
+    P -->|"no"| CT["Decide on cost, latency, terms"]
+    S --> D["Decision record and exit cost"]
+    CT --> D
+    D -.->|"new model or price change"| B
+```
+
+## Examples
+### Scoring three providers for invoice field extraction
+Quality and latency come from a bake-off on 400 labelled invoices; prices and figures are illustrative.
 
 ```python
 vendors = {
@@ -133,48 +154,103 @@ for v, (acc, p95, cps) in rows.items():
 # B: acc=0.91 p95=1.2s cost/success=$0.0470 score=0.792
 ```
 
-B's call price is five times lower, but its extra 5 points of errors each need a 50-cent human fix, so
-its cost per successful extraction is higher than A's ($0.047 vs $0.030). C has the best accuracy and is
-out anyway, and its one-point lead over A is inside the ±2-point noise on 400 items, so it was not a
-clear winner even before the gate. A's 5-point lead over B is outside it. The model assumes failures are
-caught (by validation rules or review); if they slip through undetected, their downstream cost belongs in
-the review term and usually dwarfs the call price. Note that accuracy enters twice, inside cost per
-success and as its own weighted term; that is defensible only if the accuracy weight stands for something
-cost does not capture (undetected errors, user trust). Otherwise drop it, or the scoring double-counts.
+- **The cheap call is the expensive outcome.** B's call price is five times lower, but its extra 5 points
+  of errors each need a 50-cent human fix, so its cost per successful extraction is higher than A's
+  ($0.047 vs $0.030).
+- **C is out anyway.** It has the best accuracy, but its one-point lead over A is inside the ±2-point noise
+  on 400 items, so it was not a clear winner even before the gate. A's 5-point lead over B is outside it.
+- **The model assumes failures are caught** (by validation rules or review). If they slip through
+  undetected, their downstream cost belongs in the review term and usually dwarfs the call price.
+- **Accuracy enters twice**, inside cost per success and as its own weighted term. That is defensible only
+  if the accuracy weight stands for something cost does not capture (undetected errors, user trust);
+  otherwise drop it, or the scoring double-counts.
+
+### Is the gap real? A paired comparison on the same 400 items
+Counts of items only one vendor got right are illustrative but consistent with the accuracies above.
+
+```python
+from math import comb, sqrt
+
+def ci95(p, n):
+    return 1.96 * sqrt(p * (1 - p) / n)        # normal approximation to the 95% interval
+
+def paired_p(only_a, only_b):
+    # exact two-sided sign test on the disagreements (McNemar's exact test)
+    k, m = min(only_a, only_b), only_a + only_b
+    tail = sum(comb(m, i) for i in range(k + 1)) / 2 ** m
+    return min(1.0, 2 * tail)
+
+n = 400
+print(f"+/- {ci95(0.95, n):.3f} at p=0.95, n={n}")
+for name, only_x, only_y in [("A vs B", 26, 6), ("C vs A", 10, 6)]:
+    gap = (only_x - only_y) / n
+    print(f"{name}: gap {gap:+.3f}, disagreements {only_x + only_y}, p = {paired_p(only_x, only_y):.4f}")
+# +/- 0.021 at p=0.95, n=400
+# A vs B: gap +0.050, disagreements 32, p = 0.0005
+# C vs A: gap +0.010, disagreements 16, p = 0.4545
+```
+
+| Pair | Only first right | Only second right | Gap | Verdict |
+|---|---|---|---|---|
+| A vs B | 26 | 6 | 5 points | Real: decide on it |
+| C vs A | 10 | 6 | 1 point | Tied: decide on cost, latency, terms |
+
+- **Read the 32 and 16 disagreeing items by hand**; they show which input types (scans, other languages)
+  each vendor fails on.
+
+## Production patterns
+- **Re-runnable bake-off harness** — keep the held-out set, each vendor's prompts (tuned on the dev split)
+  and the scorer in one versioned job that emits the quality, p95 and cost-per-success table. Re-run it
+  when a vendor ships a model or changes price; monitor deltas against the current choice.
+- **Load test at production concurrency** — drive each candidate with a load tool such as Locust or k6 at
+  expected peak concurrency, within the quota you will actually be granted in your region. Record p50, p95
+  and the rate of HTTP 429 (rate-limited) responses, not just averages.
+- **Weights and gates in the decision record before results** — commit the gates, weights and latency
+  budget (like `P95_BUDGET` above) to the record before the bake-off runs. Monitor whether later audits or
+  new stakeholders can reproduce the decision from it.
+- **Pinned versions and a deprecation calendar** — configure a dated model version rather than a floating
+  alias in the gateway, and log each vendor's deprecation notices with a re-validation date well before
+  retirement. Monitor days of notice remaining per pinned model.
+- **Exit-cost line in every contract review** — record proprietary formats, embedding regeneration cost and
+  contractual minimums alongside price, and prefer short terms in fast-moving categories. Monitor the
+  estimate at each renewal.
 
 ## Trade-offs
-- A rigorous bake-off on your data gives decisions that transfer to production, but costs weeks of
-  labelling and engineering; for low-risk, easily reversible choices a lighter pilot is enough.
-- Multi-vendor setups behind a gateway reduce lock-in and outage risk, but multiply security reviews,
-  contracts and prompt maintenance; they pay off when volume or criticality is high.
-- Choosing the top-quality vendor maximises accuracy, but may cost more per call; it flips when error
-  costs are low and a cheaper model's failures are cheap to catch.
-- Long-term commitments buy discounts, but raise exit cost in a market where prices often fall and
-  better models appear; keep terms short when the category is moving fast.
+- **Rigorous bake-off vs speed.** Decisions transfer to production, but cost weeks of labelling and
+  engineering; for low-risk, easily reversible choices a lighter pilot is enough.
+- **Multi-vendor vs simplicity.** Several vendors behind a gateway reduce lock-in and outage risk, but
+  multiply security reviews, contracts and prompt maintenance; they pay off when volume or criticality is
+  high.
+- **Top quality vs price.** The top-quality vendor maximises accuracy but may cost more per call; it flips
+  when error costs are low and a cheaper model's failures are cheap to catch.
+- **Commitment discounts vs exit cost.** Long-term commitments buy discounts, but raise exit cost in a
+  market where prices often fall and better models appear; keep terms short when the category is moving
+  fast.
 
 ## Pitfalls
-- Trusting public leaderboards for a domain task; the symptom is a vendor that ranked first but loses
-  on your own invoices or tickets.
-- Comparing list prices instead of cost per successful task; the cheap option turns out expensive once
+- **Trusting public leaderboards for a domain task.** Symptom: a vendor that ranked first loses on your
+  own invoices or tickets. Fix: your own labelled set.
+- **Comparing list prices instead of cost per successful task.** The cheap option turns out expensive once
   retries and human correction are counted.
-- Testing latency with single requests; production hits rate limits or queueing at peak and p95 latency
-  breaks the user-facing budget.
-- Setting weights after seeing results; the decision record reads like a justification, and the next
+- **Testing latency with single requests.** Production hits rate limits or queueing at peak and p95
+  latency breaks the user-facing budget.
+- **Setting weights after seeing results.** The decision record reads like a justification, and the next
   audit or new stakeholder challenges it.
-- Ignoring deprecation policy; a pinned model is retired with short notice and the team must re-validate
-  prompts and evals in a hurry.
-- Running challengers on prompts tuned for the incumbent; the incumbent wins every bake-off, and the gap
-  shrinks or vanishes once someone spends a few days prompting the challenger properly.
-- Declaring a winner on a one- or two-point gap from a few hundred items; the "better" vendor's lead
+- **Ignoring deprecation policy.** A pinned model is retired with short notice and the team must
+  re-validate prompts and evals in a hurry.
+- **Running challengers on prompts tuned for the incumbent.** The incumbent wins every bake-off, and the
+  gap shrinks or vanishes once someone spends a few days prompting the challenger properly.
+- **Declaring a winner on a one- or two-point gap from a few hundred items.** The "better" vendor's lead
   evaporates on the next re-run or the production sample.
 
 ## When to use
-Run a structured evaluation whenever the choice is expensive to reverse or touches sensitive data:
-primary model provider, vector store, platform vendors, anything inside the customer's data boundary.
-Use a light version (gates plus a small bake-off) for tools that are cheap to swap. Measure quality on
-your own set with its confidence interval, p95 latency at load, cost per successful task, and exit cost. Re-run when new models ship
-or prices change. In interviews, the signal is separating gates from scores, insisting on your own data,
-and converting pricing to cost per correct outcome.
+- **Use the full process when** the choice is expensive to reverse or touches sensitive data: primary
+  model provider, vector store, platform vendors, anything inside the customer's data boundary.
+- **Use a light version** (gates plus a small bake-off) for tools that are cheap to swap.
+- **Measure:** quality on your own set with its confidence interval, p95 latency at load, cost per
+  successful task, and exit cost. Re-run when new models ship or prices change.
+- **Interviews:** the signal is separating gates from scores, insisting on your own data, and converting
+  pricing to cost per correct outcome.
 
 ## Role lens
 - **Engineer:** Builds the reusable bake-off harness, runs candidates on the same labelled set, and
@@ -194,6 +270,38 @@ more human correction, and if failures cost real review time, a small accuracy g
 large token discount. I would also check p95 latency and rate limits at our concurrency, the deprecation
 policy and version pinning, and the exit cost. If X still wins on cost per success within the latency
 budget, X is the right call; if not, the table makes the case to procurement in their own terms.
+
+## Interview questions
+### Why not just pick the model that tops the public leaderboard?
+- **Leaderboards measure someone else's task.** Benchmarks may look nothing like your inputs, and some
+  benchmark data has leaked into training sets, so a leaderboard gap may not transfer.
+- **The decisive properties are elsewhere:** data terms, residency, rate limits, deprecation notice and
+  exit cost, plus quality on your own messy inputs, which only your own labelled set measures.
+
+### How large does your evaluation set need to be to choose between two vendors?
+- **Work from the interval:** ±1.96 × √(p(1−p)/n) is about ±2 points at 95% accuracy on 400 items, so a
+  1-point gap at that size is a tie.
+- **Use paired comparison** on the same items: only the disagreements carry information, so a sign test on
+  them is more sensitive than comparing two headline percentages.
+- **If you need to detect smaller gaps,** label more items or let cost, latency and terms decide.
+
+### The incumbent vendor wins every bake-off you run. What might be wrong?
+- **Prompt bias:** challengers are run on prompts tuned for the incumbent, which encode its quirks.
+- **Fix the protocol:** an equal prompt-engineering budget per vendor on a development split, a single
+  scoring run on the held-out split, and fixed decoding settings or repeated runs for sampled outputs.
+- **Check the set** too: if it was built from cases the incumbent already handles, it is biased toward it.
+
+### When is a cheaper, less accurate model the right choice?
+- **When errors are cheap to catch.** If validation rules flag failures and a fix costs little, cost per
+  successful task can favour the cheaper model despite lower accuracy.
+- **Not when failures slip through undetected,** because their downstream cost belongs in the review term
+  and usually dwarfs the call price; compute cost per success both ways before deciding.
+
+### How would you evaluate vector database vendors differently from model providers?
+- **Same structure, different metrics:** gates first, then a bake-off on recall@k and p95 query latency at
+  your corpus size and with your metadata filters, plus ingestion and update throughput.
+- **Test at real scale and filter selectivity,** because index behaviour changes with both in ways a small
+  demo corpus never shows; then price exit, since embeddings may need regenerating.
 
 ## Quiz
 ### Q: Why are must-have requirements handled as gates instead of heavily weighted criteria?

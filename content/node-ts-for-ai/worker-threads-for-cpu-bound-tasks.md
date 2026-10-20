@@ -5,7 +5,7 @@ name: Worker threads for CPU-bound tasks
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/bullmq-and-durable-jobs
@@ -18,117 +18,143 @@ sources:
 ---
 
 ## TL;DR
-The event loop runs all your JavaScript on one thread, so a CPU-heavy step freezes every concurrent
-request. `worker_threads` run JavaScript in separate V8 isolates on other OS threads, communicating by
-message passing (structured clone, or zero-copy transfer of `ArrayBuffer`s and shared memory via
-`SharedArrayBuffer`). Use a pool of them for sustained computation such as tokenizing, parsing large
-documents or vector math; use them sparingly, because each worker is a separate heap with its own
-startup cost, and messages are copied unless transferred.
+`worker_threads` run JavaScript in separate V8 isolates on other threads, so tokenizing, parsing or vector
+math stops freezing the event loop. Pool them, since each has its own heap and startup cost, and transfer
+or share large data.
 
 ## Why it exists
-Most of an AI service is waiting on the network, which the event loop handles beautifully. But some
-steps are genuinely compute: counting tokens with a BPE tokenizer over a 200-page document before
-deciding how to chunk it, parsing a 50 MB PDF, computing cosine similarity between a query and a few
-hundred thousand embeddings held in memory, hashing files for deduplication, decompressing a large
-export. Each of these can take hundreds of milliseconds to seconds of pure JavaScript, and during that
-time the single thread serves nobody: streamed tokens for every other user stop, and health checks fail.
-
-The naive fixes do not work. Marking the function `async` does nothing; `async` only yields at `await`
-and there is nothing to await in a tight loop. Chunking with `setImmediate` keeps the loop responsive
-but makes the heavy job slower and still spends the one core on it; two heavy requests at once halve
-each other's throughput. Spawning a child process per job works but costs a whole Node runtime (tens of
-megabytes and tens of milliseconds, illustrative) and serializes everything through pipes. Before
-`worker_threads` existed, the standard advice was "Node is not for CPU work; call out to another
-service". Worker threads changed the trade: a worker is a second V8 isolate inside the same process,
-starts far cheaper than a process, can share memory with the main thread, and lets the main loop keep
-streaming while real parallel work happens on the other cores.
+- **Some AI steps are genuinely compute.** Counting tokens with a BPE tokenizer over a 200-page document,
+  parsing a 50 MB PDF, cosine similarity against a few hundred thousand in-memory embeddings, hashing files
+  for deduplication, decompressing a large export.
+- **On one thread they stall everyone.** Each can take hundreds of milliseconds to seconds of pure
+  JavaScript, during which streamed tokens for every other user stop and health checks fail.
+- **`async` does nothing.** It only yields at `await`, and there is nothing to await in a tight loop.
+- **Chunking and child processes fall short.** `setImmediate` chunking keeps the loop responsive but slows the
+  job and still spends the one core; two heavy requests halve each other's throughput. A child process per
+  job costs a whole Node runtime (tens of megabytes and tens of milliseconds, illustrative) and serializes
+  everything through pipes.
+- **Workers changed the trade.** The old advice was "Node is not for CPU work; call another service". A
+  worker is a second V8 isolate in the same process: far cheaper to start than a process, able to share
+  memory, and running real parallel work on other cores while the main loop keeps streaming.
 
 ## How it works
 ### Isolates, not shared heaps
-`new Worker(file, { workerData })` starts an OS thread running its own V8 isolate and its own event
-loop. The worker has a separate heap and global scope: no variables, no module instances, no open
-sockets are shared with the parent. This is *because* V8's heap is not thread-safe; isolating heaps is
-what makes it possible to run JavaScript in parallel at all, and it is also why you cannot "just call
-a function on another thread". Each worker therefore costs memory (its own heap, its own copies of
-loaded modules) and startup time (loading and compiling the worker script), which is why workers are
-pooled and reused rather than created per request.
+- **`new Worker(file, { workerData })`** starts an OS thread with its own V8 isolate and its own event loop.
+- **Nothing is shared by default:** separate heap and global scope, so no variables, module instances or open
+  sockets are shared with the parent.
+- **Why:** V8's heap is not thread-safe. Isolating heaps is *because* of that, it is what makes parallel
+  JavaScript possible at all, and it is why you cannot "just call a function on another thread".
+- **Cost:** each worker has its own heap and copies of loaded modules, and pays startup time to load and
+  compile its script, which is why workers are pooled and reused rather than created per request.
 
 ### Message passing and structured clone
-Parent and worker talk through `MessagePort`s: `worker.postMessage(value)` on one side,
-`parentPort.on('message', ...)` on the other. Values are copied with the structured clone algorithm,
-which handles plain objects, arrays, `Map`, `Set`, `Date`, typed arrays and `Error`s. Functions and
-symbols throw a `DataCloneError`, and class instances arrive as plain objects with their prototype and
-methods gone, so a `Tokenizer` object cannot be sent, only the data needed to rebuild one. Cloning is O(size): sending a 100 MB string to a
-worker copies 100 MB, and the copy itself happens on the sending thread, blocking it. The design
-consequence is that the message should be a job description (a file path, an id, a small payload), and
-large data should be transferred or shared rather than cloned.
+- **Channels are `MessagePort`s:** `worker.postMessage(value)` on one side, `parentPort.on('message', ...)` on
+  the other.
+- **Values are copied by structured clone,** which handles plain objects, arrays, `Map`, `Set`, `Date`, typed
+  arrays and `Error`s.
+- **What does not survive.** Functions and symbols throw a `DataCloneError`; class instances arrive as plain
+  objects with prototype and methods gone, so a `Tokenizer` object cannot be sent, only the data to rebuild
+  one.
+- **Cloning is O(size) on the sender.** Sending a 100 MB string copies 100 MB, and the copy blocks the sending
+  thread.
+- **Design consequence:** the message is a job description (a file path, an id, a small payload); large data
+  is transferred or shared, not cloned.
 
 ### Transfer and shared memory
-`postMessage(value, [arrayBuffer])` lists `ArrayBuffer`s to *transfer*: ownership moves to the
-receiver in O(1) and the sender's view becomes detached (length 0). This is the right way to hand a
-`Float32Array` of embeddings or a `Buffer` of file bytes to a worker and get a result buffer back. For
-data that both sides must read concurrently, `SharedArrayBuffer` gives genuinely shared memory, with
-`Atomics` for synchronization (`Atomics.add`, `Atomics.wait`/`notify`). Shared memory is fast and
-dangerous in the usual ways: no structural locking, so keep it to numeric arrays and a clear protocol.
+| Mechanism | Cost | Semantics | Use for |
+|---|---|---|---|
+| Structured clone | O(size), on sender | Independent copies | Small job descriptions and results |
+| Transfer: `postMessage(value, [arrayBuffer])` | O(1) | Ownership moves; sender's view becomes detached (length 0) | A `Float32Array` of embeddings or a `Buffer` of file bytes, and the result buffer back |
+| `SharedArrayBuffer` | No copy | Genuinely shared memory; `Atomics` for sync (`Atomics.add`, `Atomics.wait`/`notify`) | Data both sides read concurrently |
+
+- **Shared memory is fast and dangerous in the usual ways:** no structural locking, so keep it to numeric
+  arrays and a clear protocol.
 
 ### Pooling
-A pool keeps N workers (typically the CPU count, minus one for the main thread) alive, queues jobs, and
-dispatches each to an idle worker, resolving a promise with the result. Writing one is about forty
-lines; `piscina` (created by Node.js core contributors) is the common library and adds idle timeouts,
-cancellation and `AbortSignal` support. The pool is also your concurrency limit: with a queue in front,
-a burst of 1,000 tokenization requests becomes N parallel jobs and a bounded wait, instead of 1,000
-threads. Check the CPU count the runtime reports against the container's CPU quota; on older Node
-versions and some orchestrators `availableParallelism()` reflects the host, and a pool sized to 64 host
-cores inside a 2-CPU container just thrashes.
+- **Shape.** A pool keeps N workers alive (typically the CPU count, minus one for the main thread), queues
+  jobs, dispatches each to an idle worker, and resolves a promise with the result.
+- **Build or borrow.** Writing one is about forty lines; `piscina` (created by Node.js core contributors) is
+  the common library and adds idle timeouts, cancellation and `AbortSignal` support.
+- **The pool is your concurrency limit.** With a queue in front, a burst of 1,000 tokenization requests
+  becomes N parallel jobs and a bounded wait, instead of 1,000 threads.
+- **Check the CPU count against the container quota.** On older Node versions and some orchestrators
+  `availableParallelism()` reflects the host, and a pool sized to 64 host cores inside a 2-CPU container just
+  thrashes.
 
 ### Parallelism across jobs versus within one job
-A pool parallelises *across* jobs: eight queries on eight workers can finish in about the time of
-one, if there are eight free cores and the work is compute-bound. A brute-force scan of a 1.2 GB matrix
-is often limited by memory bandwidth instead, so eight concurrent scans share that bandwidth and the
-speed-up is smaller; measure it rather than assuming linear scaling.
-It does nothing for the latency of a single query, which still scans every vector on one thread. To
-cut one job's latency, split the data: give each of N workers a range of rows in the shared matrix,
-have each return its local top-k, and merge the N small lists on the main thread. That divides the
-scan by up to N (less when memory bandwidth is the limit), at the cost of N messages and a merge per query, and it occupies the whole pool
-for one request, so it fits low-concurrency, latency-sensitive paths rather than high-throughput ones.
+- **A pool parallelises *across* jobs.** Eight queries on eight workers can finish in about the time of one,
+  if there are eight free cores and the work is compute-bound.
+- **Memory bandwidth can cap it.** A brute-force scan of a 1.2 GB matrix is often bandwidth-limited, so eight
+  concurrent scans share that bandwidth and the speed-up is smaller; measure rather than assume linear
+  scaling.
+- **It does nothing for one query's latency,** which still scans every vector on one thread.
+- **To cut one job's latency, split the data.** Give each of N workers a range of rows in the shared matrix,
+  have each return a local top-k, and merge the N small lists on the main thread.
+- **Cost of splitting.** Up to N× faster (less when memory bandwidth is the limit), at the cost of N messages
+  and a merge per query; it occupies the whole pool for one request, so it fits low-concurrency,
+  latency-sensitive paths, not high-throughput ones.
 
 ### Cancelling work inside a worker
-A worker running a tight synchronous loop is in the same position as the main thread was: its own
-event loop is blocked, so it cannot receive a `'message'` saying "stop". Passing an `AbortSignal`
-does not help either, since the abort is delivered as a callback the busy worker never runs. Two real
-options exist. `worker.terminate()` stops the thread at the next safe point regardless of what it is
-doing, which is reliable but throws away the worker (the pool must spawn a replacement, paying
-startup again). Or the job checks a cancellation flag in a `SharedArrayBuffer` with `Atomics.load`
-every few thousand iterations, which the main thread sets with `Atomics.store`; that keeps the worker
-alive but requires the job to cooperate. Libraries such as `piscina` map an `AbortSignal` onto these
-mechanisms for you.
+- **A busy worker cannot hear "stop".** In a tight synchronous loop its own event loop is blocked, so a
+  `'message'` is never handled; an `AbortSignal` does not help either, since the abort is a callback the busy
+  worker never runs.
+
+| Option | How | Cost |
+|---|---|---|
+| `worker.terminate()` | Stops the thread at the next safe point regardless of what it is doing | Reliable, but throws away the worker; the pool must spawn a replacement and pay startup again |
+| Shared cancel flag | Job checks a flag in a `SharedArrayBuffer` with `Atomics.load` every few thousand iterations; main thread sets it with `Atomics.store` | Keeps the worker alive, but the job must cooperate |
+
+- **Libraries such as `piscina`** map an `AbortSignal` onto these mechanisms for you.
 
 ### Memory limits per worker
-Each worker has its own V8 heap limits. `new Worker(file, { resourceLimits: { maxOldGenerationSizeMb } })`
-caps a worker's heap so one runaway document parse kills that worker (an `'error'` the pool can
-handle) instead of pushing the whole process into the container's out-of-memory killer. Budget
-container memory as main heap + N × worker heap + shared buffers.
+- **Each worker has its own V8 heap limits.**
+- **Cap them:** `new Worker(file, { resourceLimits: { maxOldGenerationSizeMb } })` makes one runaway document
+  parse kill that worker (an `'error'` the pool can handle) instead of pushing the process into the
+  container's out-of-memory killer.
+- **Budget:** container memory = main heap + N × worker heap + shared buffers.
 
 ### Workers versus `cluster` and child processes
-`cluster` (or several replicas behind a load balancer) runs N copies of the whole server so I/O-bound
-traffic uses N cores; each copy still blocks on its own CPU work. Worker threads keep one server and
-move the CPU work aside. Child processes give stronger isolation (a crash or native-module segfault
-does not take down the server) at higher memory and IPC cost. Many production services use replicas
-for I/O scale and a worker pool inside each replica for CPU steps.
+| Option | What it scales | Isolation | Cost |
+|---|---|---|---|
+| `cluster` or replicas behind a load balancer | N copies of the whole server use N cores for I/O-bound traffic; each still blocks on its own CPU work | Per process | N full runtimes |
+| Worker threads | One server, CPU work moved aside | Shared process | One heap per worker |
+| Child processes | Separate programs | Strong: a crash or native-module segfault does not take down the server | Higher memory and IPC |
+
+- **Common combination:** replicas for I/O scale, plus a worker pool inside each replica for CPU steps.
 
 ### What workers are not for
-I/O-bound work gains nothing: a worker waiting on an HTTP call is a wasted thread. Work that native
-code already runs off the loop (the async `crypto` and `zlib` APIs use libuv's pool) does not need a
-worker.
-And work that needs more than one machine's cores, or must survive a process crash, belongs in a job
-queue (see the BullMQ lesson), not in threads. Workers also complicate observability: logs, traces and
-metrics from inside a worker need to be forwarded or tagged, because the worker has its own globals.
+- **I/O-bound work gains nothing:** a worker waiting on an HTTP call is a wasted thread.
+- **Native code already off the loop** (the async `crypto` and `zlib` APIs use libuv's pool) does not need a
+  worker.
+- **Multi-machine or crash-durable work** belongs in a job queue (see the BullMQ lesson), not in threads.
+- **Observability gets harder:** logs, traces and metrics from inside a worker need to be forwarded or tagged,
+  because the worker has its own globals.
 
-## Example
-A minimal pool that dispatches top-k cosine-similarity jobs to workers, transferring the query vector
-instead of cloning it. The embedding matrix lives in a `SharedArrayBuffer`: passing an ordinary
-`Float32Array` as `workerData` would structured-clone the whole ~1.2 GB matrix into every worker. The worker file and the pool live in separate modules; this listing shows both
-with the worker guarded by `isMainThread`.
+## Diagram
+The main thread keeps serving I/O while jobs queue for a fixed pool; large inputs are transferred or shared,
+and only small results are cloned back.
+
+```mermaid
+flowchart TD
+    R["HTTP request on main loop"] --> Q["Pool queue (bounded)"]
+    Q --> I{"Idle worker?"}
+    I -->|"no"| Q
+    I -->|"yes"| W["Worker isolate on another core"]
+    R -->|"transfer ArrayBuffer, O(1)"| W
+    S[("SharedArrayBuffer matrix")] -.->|"read, no copy"| W
+    W -->|"clone small top-k result"| M["Main thread resolves promise"]
+    M --> O["Stream reply, loop never blocked"]
+    W -.->|"error or exit"| X["Pool replaces worker"]
+```
+
+## Examples
+### A minimal pool for top-k similarity
+A minimal pool that dispatches top-k cosine-similarity jobs to workers, transferring the query vector instead
+of cloning it.
+
+The embedding matrix lives in a `SharedArrayBuffer`: passing an ordinary `Float32Array` as
+`workerData` would structured-clone the whole ~1.2 GB matrix into every worker. The worker file and the pool
+live in separate modules; this listing shows both with the worker guarded by `isMainThread`.
 
 ```ts
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -179,48 +205,100 @@ if (!isMainThread) {
 }
 ```
 
+### Cooperative cancellation with a shared flag
+Save as `cancel.mjs` and run `node cancel.mjs`. The worker polls a shared `Int32Array` every 100,000
+iterations, so the main thread can stop it after 200 ms without `terminate()` and without a worker restart.
+
+```js
+import { Worker, isMainThread, workerData, parentPort } from "node:worker_threads";
+
+if (!isMainThread) {
+  const flag = new Int32Array(workerData.flag);
+  let i = 0;
+  while (true) {
+    i++;                                                   // stand-in for a long scoring or parse loop
+    if (i % 100_000 === 0 && Atomics.load(flag, 0) === 1) break;   // cheap poll, not every iteration
+  }
+  parentPort.postMessage(`stopped after ${i} iterations`);
+} else {
+  const flag = new Int32Array(new SharedArrayBuffer(4));
+  const w = new Worker(new URL(import.meta.url), { workerData: { flag: flag.buffer } });
+  w.once("message", (m) => console.log(m));
+  setTimeout(() => Atomics.store(flag, 0, 1), 200);       // user abandoned the request after 200 ms
+}
+```
+
+### Worked scenario: sizing a pool in a 4-CPU, 4 GB container
+Illustrative numbers for an ingestion service that also answers chat.
+
+| Item | Choice | Memory |
+|---|---|---|
+| Main thread heap (HTTP, streaming) | 1 thread | ~0.5 GB |
+| Worker pool | 4 CPUs − 1 = 3 workers, `maxOldGenerationSizeMb: 512` each | ≤ 1.5 GB |
+| Shared embedding matrix | 200k × 1536 × 4 B in a `SharedArrayBuffer` | ~1.2 GB, once |
+| Total budget | main + 3 × worker + shared | ~3.2 GB, leaving headroom under 4 GB |
+| If the pool were sized from 64 host cores | 63 workers | Thrashing, and up to ~32 GB of worker heap allowed |
+
+## Production patterns
+- **Use a maintained pool library.** `piscina` with `maxThreads` set from the container CPU quota, a bounded
+  `maxQueue`, an `idleTimeout`, and `run(task, { signal })` for cancellation. Monitor queue size, wait time
+  and run time per job.
+- **Size from the quota, not the host.** Read the CPU limit from an environment variable set by the deploy
+  (or verify `availableParallelism()` inside the container) and keep one core for the main loop. Monitor
+  event-loop lag on the main thread and CPU throttling on the container.
+- **Cap every worker's heap.** Pass `resourceLimits: { maxOldGenerationSizeMb }` so one malformed document
+  kills a worker, not the pod; replace workers on `'error'` and `'exit'`. Alert on worker restart rate and
+  pool size dropping below target.
+- **Transfer in, clone out.** Send file bytes and vectors in the transfer list and return small results;
+  keep read-mostly matrices in a `SharedArrayBuffer`. Watch main-thread lag around `postMessage` calls for
+  accidental large clones.
+- **Tag worker telemetry.** Include the worker's `threadId` and the job id in every log line, and propagate the
+  trace id in the job message, since workers have their own globals.
+
 ## Trade-offs
-- Workers give true parallelism for JavaScript on multi-core machines, but every worker is a separate
-  heap, so memory scales with pool size; on a small container two workers may be all you can afford.
-- Structured clone is convenient and safe, while transfer is O(1) but detaches the sender's buffer;
-  choose transfer for large payloads and accept the discipline of not touching them afterwards.
-- `SharedArrayBuffer` avoids copying entirely and suits read-mostly data like an embedding matrix, but
-  it reintroduces data races that JavaScript otherwise never has, so keep it to numeric arrays with
-  `Atomics` guarding writes.
-- A pool bounds concurrency and amortizes startup, but a job that blocks a worker for seconds blocks
-  that slot; give long jobs their own pool or move them to a queue.
-- `terminate()` cancels anything instantly but costs a worker restart, while a shared-memory cancel flag
-  is cheap but needs the job to poll it; terminate wins for rare cancellations of untrusted or
-  third-party code, the flag wins when cancellation is routine (users abandoning requests).
-- Compared with a separate service, workers are simpler to deploy and share the process's memory, yet
-  they die with the process and cannot scale beyond one machine; durable or horizontally scaled work
-  belongs in a job queue.
+- **Parallelism vs memory.** Workers give true parallelism for JavaScript on multi-core machines, but every
+  worker is a separate heap, so memory scales with pool size; on a small container two workers may be all you
+  can afford.
+- **Clone vs transfer.** Structured clone is convenient and safe; transfer is O(1) but detaches the sender's
+  buffer. Choose transfer for large payloads and accept the discipline of not touching them afterwards.
+- **Shared memory vs races.** `SharedArrayBuffer` avoids copying entirely and suits read-mostly data like an
+  embedding matrix, but reintroduces data races JavaScript otherwise never has; keep it to numeric arrays
+  with `Atomics` guarding writes.
+- **Bounded pool vs slot blocking.** A pool bounds concurrency and amortizes startup, but a job that blocks a
+  worker for seconds blocks that slot; give long jobs their own pool or move them to a queue.
+- **`terminate()` vs cancel flag.** `terminate()` cancels instantly but costs a worker restart; a shared-memory
+  flag is cheap but needs the job to poll it. Terminate wins for rare cancellations of untrusted or
+  third-party code; the flag wins when cancellation is routine (users abandoning requests).
+- **Workers vs a separate service.** Workers are simpler to deploy and share the process's memory, yet they
+  die with the process and cannot scale beyond one machine; durable or horizontally scaled work belongs in a
+  job queue.
 
 ## Pitfalls
-- Creating a new `Worker` per request; the symptom is latency dominated by worker startup and memory
-  spikes under load, often worse than running the job inline.
-- Sending large buffers without the transfer list; the symptom is the main thread stalling on the copy,
-  which is the very problem the worker was meant to solve.
-- Reading from a `TypedArray` after transferring its buffer; the symptom is zero-length arrays or
-  `TypeError`s about detached buffers far from the `postMessage` call.
-- Using workers for I/O-bound steps like calling the model API; the symptom is no throughput gain plus
-  extra memory and harder debugging.
-- Forgetting that workers have their own globals; the symptom is missing logs and traces, or a
-  database client initialized twice because the module was loaded again in the worker.
-- Not handling `'error'` and `'exit'` events; the symptom is a pool that silently shrinks after a
-  worker crashes and eventually hangs with all jobs queued.
-- Expecting a timeout or abort to stop a worker mid-computation; the symptom is the request returning
-  an error while the worker's CPU stays at 100% and its pool slot stays busy until the job finishes.
+- **A new `Worker` per request.** Symptom: latency dominated by worker startup and memory spikes under load,
+  often worse than running the job inline.
+- **Large buffers without the transfer list.** Symptom: the main thread stalls on the copy, the very problem
+  the worker was meant to solve.
+- **Reading a `TypedArray` after transferring its buffer.** Symptom: zero-length arrays or `TypeError`s about
+  detached buffers far from the `postMessage` call.
+- **Workers for I/O-bound steps** like calling the model API. Symptom: no throughput gain plus extra memory and
+  harder debugging.
+- **Forgetting workers have their own globals.** Symptom: missing logs and traces, or a database client
+  initialized twice because the module was loaded again in the worker.
+- **Not handling `'error'` and `'exit'`.** Symptom: a pool that silently shrinks after a worker crashes and
+  eventually hangs with all jobs queued.
+- **Expecting a timeout or abort to stop a worker mid-computation.** Symptom: the request returns an error
+  while the worker's CPU stays at 100% and its pool slot stays busy until the job finishes.
 
 ## When to use
-Reach for worker threads when a code path performs sustained synchronous computation (more than a few
-tens of milliseconds, repeatedly) that must not stall the event loop and that fits in one machine's
-memory: tokenization at scale, document parsing, embedding math in JS, compression and hashing of large
-payloads. Prefer `setImmediate` chunking for rare, medium-sized jobs, native or WASM libraries that
-release the thread when they exist, and a job queue for anything that must be durable or spread across
-machines. Measure event-loop lag before and after, per-job time inside the worker, pool queue depth, and
-process RSS. Interviewers typically ask why `async` does not help, how data crosses to a worker, and
-when a worker is the wrong tool; be ready to compare with Python's multiprocessing and the GIL.
+- **Use when** a code path does sustained synchronous computation (more than a few tens of milliseconds,
+  repeatedly) that must not stall the event loop and fits in one machine's memory: tokenization at scale,
+  document parsing, embedding math in JS, compression and hashing of large payloads.
+- **Prefer instead:** `setImmediate` chunking for rare, medium-sized jobs; native or WASM libraries that
+  release the thread when they exist; a job queue for anything durable or spread across machines.
+- **Measure:** event-loop lag before and after, per-job time inside the worker, pool queue depth, and process
+  RSS.
+- **Interviews:** why `async` does not help, how data crosses to a worker, and when a worker is the wrong tool;
+  be ready to compare with Python's multiprocessing and the GIL.
 
 ## Role lens
 - **Engineer:** Moves tokenization and parsing into a pooled worker, transfers buffers instead of
@@ -243,6 +321,38 @@ text as the result. The pool also bounds concurrency so a bulk upload becomes a 
 thundering herd. If uploads can exceed the memory of one process or must survive restarts, push jobs
 into a durable queue with separate worker processes instead, and keep the API process for I/O only.
 Measure event-loop lag to confirm the chat path no longer stalls.
+
+## Interview questions
+### How do worker threads differ from threads in Java or Go?
+- **No shared heap:** each worker is a separate V8 isolate with its own heap, globals and module instances,
+  because V8's heap is not thread-safe.
+- **Communication is by message:** structured clone copies, transfer moves `ArrayBuffer` ownership, and only
+  `SharedArrayBuffer` gives shared memory, guarded by `Atomics`.
+
+### After adding a worker pool, the main thread still lags during big uploads. What do you check?
+- **Accidental clones:** a large `Buffer` or string posted without the transfer list is copied on the main
+  thread, blocking it for the copy.
+- **Work still inline:** parsing or `JSON.parse` of the result may still run on the main thread; profile with
+  `--cpu-prof`.
+- **Oversized pool:** more workers than container CPUs starves the main thread of a core.
+
+### When would you choose a child process or a separate service over a worker thread?
+- **Isolation:** native modules that can segfault, or untrusted code, are safer in a process whose crash does
+  not take down the server.
+- **Durability and scale:** work that must survive restarts or exceed one machine belongs in a job queue with
+  separate worker processes.
+
+### How would you size a worker pool and its memory for a 4-CPU container?
+- **Threads:** about CPU quota minus one, so 3 workers, verified against what the runtime reports inside the
+  container.
+- **Memory:** main heap + 3 × per-worker `maxOldGenerationSizeMb` + shared buffers must fit under the
+  container limit with headroom.
+- **Validate under load:** watch queue depth, per-job time and RSS, and adjust.
+
+### How do you cancel a job that is already running in a worker?
+- **`terminate()`** is reliable but discards the worker, so the pool pays startup for a replacement.
+- **A shared cancel flag** polled with `Atomics.load` keeps the worker alive but needs the job to cooperate;
+  prefer it when users routinely abandon requests.
 
 ## Quiz
 ### Q: Why does moving a CPU-heavy function into an `async` function not stop it from blocking the event loop?

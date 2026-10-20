@@ -5,7 +5,7 @@ name: Data profiling & quality assessment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - enterprise-integration/data-onboarding
   - enterprise-integration/data-mapping-and-canonical-schemas
@@ -21,63 +21,80 @@ sources:
 ---
 
 ## TL;DR
-Profiling measures what a client's data actually contains (null rates, value sets, formats, duplicates,
-freshness, document types) instead of what its documentation claims. Quality assessment judges those
-measurements against what the use case needs and turns them into decisions: usable, fixable, or
-blocking. The findings then become automated checks on every load, because data that was fine at
-onboarding drifts, and an AI system degrades quietly on bad data rather than crashing.
+Profiling measures what a client's data actually contains (nulls, value sets, formats, duplicates,
+freshness); assessment judges that against the use case as usable, fixable or blocking. Findings become
+automated checks on every load, because AI systems degrade quietly on bad data.
 
 ## Why it exists
-A schema tells you a column is called `resolution_notes` and is a text field. It does not tell you that
-40% of rows contain "see email", that one region writes in French, or that rows before a 2021 migration
-are truncated at 255 characters. Documentation, when it exists, describes the system as designed, and
-the people who know the quirks are busy. Every enterprise dataset has these surprises, and an AI system
-is unusually sensitive to them because it rarely fails loudly. A pipeline that crashes on a bad date gets
-fixed the same day. A retriever that indexes 30,000 empty notes returns them as top results, and a
-summarizer given "see email" invents a resolution, and both look like model quality problems.
-
-The naive approach is to look at a few records, decide the data "looks fine", and build. Eyeballing
-finds the obvious and misses what matters, which is distributional: the 11% null rate in one region, the
-duplicate records from a merge, the share of scanned PDFs. A second naive approach is to treat quality
-as absolute ("is this data clean?"). Quality is fitness for a purpose: a field 30% null is irrelevant if
-the use case never reads it and blocking if it is the retrieval filter. Wang and Strong's framing of
-quality as defined by the data's consumers is the useful one.
-
-Profiling exists to replace impressions with measurements early, when findings change the plan cheaply,
-and assessment exists to connect each measurement to a decision someone owns.
+- **Schemas and documentation hide the quirks.** A column called `resolution_notes` is a text field; the
+  schema does not say 40% of rows contain "see email", one region writes in French, or rows before a 2021
+  migration are truncated at 255 characters. Documentation describes the system as designed, and the
+  people who know the quirks are busy.
+- **AI fails quietly on bad data.** A pipeline that crashes on a bad date gets fixed the same day. A
+  retriever that indexes 30,000 empty notes returns them as top results, and a summarizer given "see
+  email" invents a resolution; both look like model quality problems.
+- **Eyeballing misses what matters,** which is distributional: the 11% null rate in one region, the
+  duplicate records from a merge, the share of scanned PDFs.
+- **Quality is fitness for a purpose, not absolute.** A field 30% null is irrelevant if the use case never
+  reads it and blocking if it is the retrieval filter. Wang and Strong's framing of quality as defined by
+  the data's consumers is the useful one.
+- **What it buys:** measurements instead of impressions early, when findings change the plan cheaply, and
+  a decision someone owns for every measurement.
 
 ## How it works
 ### What to profile in structured data
-For each column: type conformance, null and empty rate, distinct count and cardinality, top values and
-their frequencies, min and max, length distribution for text, and **format patterns**, the shape of
-values after replacing digits and letters with placeholders (for example `9999-99-99` versus
-`99/99/9999` for dates). Across columns and tables: candidate key uniqueness, referential integrity
-(do child rows point to existing parents), functional dependencies you rely on, exact and near
-duplicates, and freshness (how old is the newest record, how often does it change).
+Per column:
 
-Two checks deserve to be called out because standard null counts miss them. **Disguised missing
-values** are placeholders that are not null: `N/A`, `-`, `0`, `1900-01-01`, `unknown`, "see email". They
-show up as a single value with suspiciously high frequency in the top-values list, or as a date
-distribution with a spike on one day, and the real completeness of the field is the null rate *plus*
-their share. A **sensitivity scan** (pattern and dictionary detection of emails, phone numbers, national
-ID formats, card numbers, and names in free text) tells you which fields need redaction or tighter
-handling before anything is indexed or sent to a model; free-text fields often hold identifiers that the
-schema never declared.
+| Metric | What it reveals |
+|---|---|
+| Type conformance | values that do not parse as the declared type |
+| Null and empty rate | completeness |
+| Distinct count and cardinality | free text vs codes; undocumented values |
+| Top values and frequencies | dominant values, disguised nulls |
+| Min and max; length distribution for text | out-of-range values, truncation |
+| **Format patterns** | value shapes after replacing digits and letters with placeholders, e.g. `9999-99-99` versus `99/99/9999` for dates |
+
+Across columns and tables:
+- **Candidate key uniqueness.**
+- **Referential integrity:** do child rows point to existing parents.
+- **Functional dependencies** you rely on.
+- **Exact and near duplicates.**
+- **Freshness:** how old is the newest record, how often does it change.
+
+Two checks that standard null counts miss:
+- **Disguised missing values.** Placeholders that are not null: `N/A`, `-`, `0`, `1900-01-01`, `unknown`,
+  "see email". They show as one value with suspiciously high frequency in the top-values list, or a date
+  distribution with a spike on one day. Real completeness is the null rate *plus* their share.
+- **Sensitivity scan.** Pattern and dictionary detection of emails, phone numbers, national ID formats,
+  card numbers and names in free text tells you which fields need redaction or tighter handling before
+  anything is indexed or sent to a model; free-text fields often hold identifiers the schema never
+  declared.
 
 ### How big a sample
-A sample can only report problems it contains. If a defect affects a share *p* of records, a random
-sample of *n* contains at least one with probability `1 − (1 − p)^n`, which is about `1 − e^(−np)`. For a
-0.1% defect, 2,000 rows catch it about 86% of the time and 5,000 rows over 99% of the time. The converse,
-the "rule of three": if *n* rows show zero defects, the 95% upper bound on the true rate is roughly
-`3 / n`, so a clean 5,000-row sample still allows up to about 0.06%. Apply this per slice, not overall: a
-stratum with 200 sampled rows can hide a defect rate up to about 1.5%. This is why cheap metrics run on
-the full table and the sample is reserved for checks that need human eyes or heavy compute.
+A sample can only report problems it contains.
+- **Detection probability.** If a defect affects a share *p* of records, a random sample of *n* contains at
+  least one with probability `1 − (1 − p)^n`, which is about `1 − e^(−np)`.
+
+| Defect rate | Sample size | Chance the sample contains one |
+|---|---|---|
+| 0.1% | 2,000 rows | about 86% |
+| 0.1% | 5,000 rows | over 99% |
+
+- **The converse, the "rule of three":** if *n* rows show zero defects, the 95% upper bound on the true
+  rate is roughly `3 / n`. A clean 5,000-row sample still allows up to about 0.06%.
+- **Apply it per slice, not overall:** a stratum with 200 sampled rows can hide a defect rate up to about
+  1.5%.
+- **So run cheap metrics on the full table** and reserve the sample for checks that need human eyes or
+  heavy compute.
 
 ### What to profile in document corpora
-File type mix; share of PDFs with a usable text layer versus image-only scans; encrypted or corrupt
-files; page counts and sizes; languages; exact duplicates by content hash and near duplicates by
-shingling or MinHash (drafts, versions, forwarded copies); date range; and the share of boilerplate
-(signatures, disclaimers, templates). These determine parsing routes, chunking and cost estimates.
+- **File type mix,** and the share of PDFs with a usable text layer versus image-only scans.
+- **Encrypted or corrupt files;** page counts and sizes; languages; date range.
+- **Exact duplicates by content hash** and near duplicates by shingling or MinHash (drafts, versions,
+  forwarded copies).
+- **Share of boilerplate** (signatures, disclaimers, templates).
+
+These determine parsing routes, chunking and cost estimates.
 
 ### Slice everything
 Compute every metric per meaningful slice (source system, region, year, department, document folder),
@@ -85,30 +102,55 @@ Compute every metric per meaningful slice (source system, region, year, departme
 the one region the pilot serves.
 
 ### Assess against quality dimensions
-Turn measurements into a judgement along standard dimensions, each tied to the use case:
-- **Completeness:** are the fields the use case reads populated?
-- **Validity:** do values conform to type, format and allowed sets?
-- **Consistency:** do related fields and systems agree (a closed ticket with no close date)?
-- **Uniqueness:** are entities represented once?
-- **Timeliness:** is data fresh enough for the decisions it supports?
-- **Accuracy:** does the data match reality? This one cannot be profiled; it needs a sample checked by
-  the client's experts against ground truth, *because* a perfectly formatted wrong value passes every
-  automated test.
+| Dimension | Question for the use case |
+|---|---|
+| **Completeness** | are the fields the use case reads populated? |
+| **Validity** | do values conform to type, format and allowed sets? |
+| **Consistency** | do related fields and systems agree (a closed ticket with no close date)? |
+| **Uniqueness** | are entities represented once? |
+| **Timeliness** | is data fresh enough for the decisions it supports? |
+| **Accuracy** | does the data match reality? |
+
+Accuracy cannot be profiled; it needs a sample checked by the client's experts against ground truth,
+*because* a perfectly formatted wrong value passes every automated test.
 
 ### From findings to decisions
-Each finding is classified as acceptable, fixable in the pipeline (normalize, deduplicate, route scans
-to OCR), fixable only at the source (the client's data owner must act), or blocking (the use case
-cannot work without it). The assessment document names an owner for each, and it is shared with the
-client, because many fixes are theirs.
+Classify each finding:
+1. **Acceptable.**
+2. **Fixable in the pipeline:** normalize, deduplicate, route scans to OCR.
+3. **Fixable only at the source:** the client's data owner must act.
+4. **Blocking:** the use case cannot work without it.
+
+The assessment names an owner for each and is shared with the client, because many fixes are theirs.
 
 ### From one-off profile to continuous checks
-The thresholds discovered at onboarding become expectations evaluated on every load: null rate of
-`loss_date` below 2%, `status` within the agreed set, row count within a band of yesterday's. Tools such
-as Great Expectations or dbt tests express these declaratively. A failed check quarantines the batch or
-alerts, *because* source-side changes (an upgrade, a new form, a renamed picklist) are a common cause of
-sudden AI quality drops.
+- **Thresholds become expectations on every load:** null rate of `loss_date` below 2%, `status` within the
+  agreed set, row count within a band of yesterday's.
+- **Express them declaratively** with tools such as Great Expectations or dbt tests.
+- **A failed check quarantines the batch or alerts,** *because* source-side changes (an upgrade, a new
+  form, a renamed picklist) are a common cause of sudden AI quality drops.
 
-## Example
+## Diagram
+Profiling runs per slice on the full table for cheap metrics and on a sample for expensive ones; each
+finding gets a decision and an owner, and accepted thresholds become load-time checks.
+
+```mermaid
+flowchart TD
+    D[("Client data")] --> F["Cheap metrics on full table"]
+    D --> S["Stratified sample"]
+    S --> E["Expensive checks: near dups, sensitivity, SME accuracy"]
+    F --> SL["Slice by source, region, year"]
+    E --> SL
+    SL --> A{"Fit for the use case?"}
+    A -->|"acceptable"| X["Expectations on every load"]
+    A -->|"pipeline fix"| P["Normalize, dedupe, OCR"]
+    A -->|"source fix or blocking"| O["Client data owner"]
+    P --> X
+    X -->|"check fails"| Q["Quarantine batch or alert"]
+```
+
+## Examples
+### A sliced profiler for a ticket export
 A compact profiler over a client's ticket export using pandas, sliced by region. It computes the
 measurements that most often change an onboarding plan.
 
@@ -137,53 +179,104 @@ print(r["dup_keys"], r["status"]["distinct"], r["opened_at"]["shapes"])
 print(r["null_pct_by_slice"][["closed_at", "resolution_notes"]])
 ```
 
-Illustrative output on a 5,000-row stratified sample: 212 duplicate `ticket_id` values (a past
-migration loaded one year twice); `status` has 23 distinct values against 8 documented; `opened_at` has
-two shapes, `9999-99-99 99:99` and `99/99/9999 99:99`, meaning one source system writes slash dates
-whose order (US `MM/DD` or European `DD/MM`) the shape cannot reveal, so you check for values with a
-first field above 12 and confirm with the source owner; and `resolution_notes` is 4% null overall but 37% null in the APAC slice. The assessment then
-reads: deduplicate on key plus latest version (pipeline fix); crosswalk the 23 statuses with the support
-lead (mapping); parse dates per source once the order is confirmed (pipeline fix); and for APAC, ask whether notes live in another
-system, because a resolution assistant without resolutions is blocked there (source question). The
-`top` entries are also where disguised nulls show: if "see email" is the most common
-`resolution_notes` value, the field's effective completeness is far below what `null_pct` reports.
+Illustrative output on a 5,000-row stratified sample, and the assessment it leads to:
+
+| Finding | Decision |
+|---|---|
+| 212 duplicate `ticket_id` values (a past migration loaded one year twice) | deduplicate on key plus latest version (pipeline fix) |
+| `status` has 23 distinct values against 8 documented | crosswalk the 23 statuses with the support lead (mapping) |
+| `opened_at` has two shapes, `9999-99-99 99:99` and `99/99/9999 99:99` | parse dates per source once the order is confirmed (pipeline fix) |
+| `resolution_notes` is 4% null overall but 37% null in the APAC slice | ask whether notes live in another system; a resolution assistant without resolutions is blocked there (source question) |
+
+- **Slash dates hide their order.** The shape cannot reveal whether one source writes US `MM/DD` or
+  European `DD/MM`, so you check for values with a first field above 12 and confirm with the source owner.
+- **Disguised nulls show in `top`.** If "see email" is the most common `resolution_notes` value, the
+  field's effective completeness is far below what `null_pct` reports.
+
+### Sample sizing and disguised nulls in plain Python
+A runnable helper: how many rows you need to see a rare defect, and the effective completeness once
+placeholders are counted.
+
+```python
+import math
+from collections import Counter
+
+def rows_to_detect(p, confidence=0.95):
+    return math.ceil(math.log(1 - confidence) / math.log(1 - p))
+
+def rule_of_three_bound(n):
+    return 3 / n                          # 95% upper bound when n rows show zero defects
+
+print(rows_to_detect(0.001))              # 2995 rows for a 0.1% defect at 95%
+print(f"{rule_of_three_bound(5000):.2%}") # 0.06%
+print(f"{rule_of_three_bound(200):.1%}")  # 1.5% per 200-row slice
+
+PLACEHOLDERS = {"", "n/a", "-", "0", "unknown", "1900-01-01", "see email"}
+notes = ["see email"] * 40 + [None] * 4 + ["Reset VPN token"] * 30 + ["Replaced dock"] * 26
+real = [v for v in notes if v is not None and v.strip().lower() not in PLACEHOLDERS]
+print(f"null rate {notes.count(None) / len(notes):.0%}, "
+      f"effective completeness {len(real) / len(notes):.0%}")   # 4% null, 56% complete
+print(Counter(notes).most_common(1))      # [('see email', 40)] is the tell
+```
+
+## Production patterns
+- **Baseline profile per tenant and source.** Use from onboarding on. Store the onboarding profile (per
+  slice) as a versioned artifact and diff each new profile against it. Monitor per-slice null rate,
+  distinct count and shape changes on the fields retrieval and prompts read.
+- **Load-time expectations, warn first.** Use for every recurring load. Declare thresholds in Great
+  Expectations or dbt tests, run them as warnings until their natural variance is known, then promote
+  stable ones to blocking with quarantine. Monitor check failure rate and false-alarm rate.
+- **Disguised-null registry.** Use for free-text and date fields. Keep a per-source list of placeholder
+  values found during profiling and report effective completeness alongside the raw null rate. Monitor the
+  placeholder share per load.
+- **Sensitivity scan before indexing.** Use for any field or document sent to a model. Pattern and
+  dictionary detection on a sample and on new loads, routing hits to redaction. Monitor detections per
+  field, especially in fields the schema did not declare as sensitive.
+- **SME accuracy review on a schedule.** Use where answers drive decisions. A small, structured sample per
+  quarter or per source change, checked against ground truth by the client's experts. Monitor the share
+  of sampled values rejected.
 
 ## Trade-offs
-- Profiling a stratified sample is fast and cheap, but can miss rare problems; profile the full dataset
-  for cheap metrics (counts, nulls, key uniqueness) and use samples for expensive ones such as near
-  duplicate detection and manual accuracy review.
-- Strict load-time checks stop bad batches before they reach users, but every false alarm blocks fresh
-  data; start checks as warnings, learn their natural variance, then promote stable ones to blocking.
-- Fixing quality in your pipeline is fast and under your control, but hides the problem from the client
-  and must be maintained forever; for errors that originate at entry, pushing the fix to the source
-  costs more time now and less over the life of the deployment.
-- Automated metrics scale across tenants, but cannot measure accuracy; SME review of a sample is slow and
-  expensive yet is the only way to learn whether correctly formatted data is actually right.
+- **Sample vs full scan.** Profiling a stratified sample is fast and cheap but can miss rare problems;
+  profile the full dataset for cheap metrics (counts, nulls, key uniqueness) and use samples for expensive
+  ones such as near duplicate detection and manual accuracy review.
+- **Strict checks vs fresh data.** Strict load-time checks stop bad batches before they reach users, but
+  every false alarm blocks fresh data; start as warnings, learn natural variance, then promote stable ones
+  to blocking.
+- **Pipeline fix vs source fix.** Fixing quality in your pipeline is fast and under your control, but hides
+  the problem from the client and must be maintained forever; for errors that originate at entry, pushing
+  the fix to the source costs more time now and less over the life of the deployment.
+- **Automated metrics vs SME review.** Automated metrics scale across tenants but cannot measure accuracy;
+  SME review of a sample is slow and expensive yet is the only way to learn whether correctly formatted
+  data is actually right.
 
 ## Pitfalls
-- Reporting only aggregate metrics; the symptom is a dataset judged healthy that fails badly for the
-  one department or region the pilot serves.
-- Profiling once at onboarding and never again; the symptom is a sudden quality drop months later traced
-  to a source-side upgrade that renamed a picklist value.
-- Counting only true nulls; the symptom is a field reported 98% complete whose most frequent value is
-  `N/A` or `1900-01-01`, and prompts or filters that treat the placeholder as real data.
-- Treating format validity as accuracy; the symptom is clean-looking data that SMEs reject because
-  values are stale, defaulted or entered into the wrong field.
-- Ignoring duplicates and near duplicates in document corpora; the symptom is retrieval returning five
+- **Reporting only aggregate metrics.** Symptom: a dataset judged healthy that fails badly for the one
+  department or region the pilot serves.
+- **Profiling once at onboarding and never again.** Symptom: a sudden quality drop months later traced to
+  a source-side upgrade that renamed a picklist value.
+- **Counting only true nulls.** Symptom: a field reported 98% complete whose most frequent value is `N/A`
+  or `1900-01-01`, and prompts or filters that treat the placeholder as real data.
+- **Treating format validity as accuracy.** Symptom: clean-looking data that SMEs reject because values
+  are stale, defaulted or entered into the wrong field.
+- **Ignoring duplicates and near duplicates in document corpora.** Symptom: retrieval returning five
   versions of the same policy and answers citing an outdated draft.
-- Producing a profile report with no decisions or owners; the symptom is the same findings rediscovered
-  in the pilot, after users have already seen the consequences.
-- Copying production data to a laptop to profile it; the symptom is a security finding, because
-  profiling exposes the most sensitive columns first; profile inside the approved environment.
+- **A profile report with no decisions or owners.** Symptom: the same findings rediscovered in the pilot,
+  after users have already seen the consequences.
+- **Copying production data to a laptop to profile it.** Symptom: a security finding, because profiling
+  exposes the most sensitive columns first. Fix: profile inside the approved environment.
 
 ## When to use
-Profile every new source during onboarding before mapping or building, and again whenever a source
-changes version, a new tenant joins on the same system, or AI quality drops without a model or prompt
-change. Keep the profile tied to the use case: start from the fields and documents the product reads
-and the slices users care about. Measure per-slice null rates, quarantine counts and check failures over
-time. In customer conversations, a short written assessment with owners is often the most valuable
-artifact of the first weeks. In interviews, distinguishing profiling (measurement) from assessment
-(fitness for a purpose) is the point to make.
+- **Profile every new source** during onboarding before mapping or building.
+- **Profile again** whenever a source changes version, a new tenant joins on the same system, or AI quality
+  drops without a model or prompt change.
+- **Tie the profile to the use case:** start from the fields and documents the product reads and the
+  slices users care about.
+- **Measure:** per-slice null rates, quarantine counts and check failures over time.
+- **Customer conversations:** a short written assessment with owners is often the most valuable artifact
+  of the first weeks.
+- **Interviews:** distinguishing profiling (measurement) from assessment (fitness for a purpose) is the
+  point to make.
 
 ## Role lens
 - **Engineer:** Writes the profiling job and the load-time expectations, slices metrics by source and
@@ -203,6 +296,40 @@ to a new field, or switched documents to scanned attachments with no text layer.
 freshness of the newest records. Any shift localized to a slice points to a source-side change. Then I
 would add an expectation that would have caught it, so the next one quarantines a batch instead of
 reaching users.
+
+## Interview questions
+### What is the difference between data profiling and quality assessment?
+- **Profiling is measurement:** null rates, value sets, format shapes, duplicates and freshness, computed
+  per slice.
+- **Assessment is judgement against a purpose:** the same 30% null rate is irrelevant for an unused field
+  and blocking for a retrieval filter, so each finding becomes acceptable, pipeline fix, source fix or
+  blocking, with an owner.
+
+### A field shows 2% nulls but the summarizer keeps inventing answers from it. What do you check?
+- **Disguised missing values:** look at the top values for placeholders like `N/A`, `-` or "see email"
+  with suspiciously high frequency.
+- **Recompute effective completeness** as nulls plus placeholder share, and add the placeholders to a
+  per-source registry so filters and prompts treat them as missing.
+
+### How big a sample do you profile, and what can a clean sample tell you?
+- **Detection:** a sample of *n* catches a defect of rate *p* with probability `1 − (1 − p)^n`; a 0.1%
+  defect needs roughly 3,000 rows for 95% confidence.
+- **Upper bound:** zero defects in *n* rows bounds the true rate at about `3 / n`, so 5,000 clean rows
+  still allow 0.06%, and a 200-row slice allows 1.5%.
+- **So** cheap metrics run on the full table and samples are reserved for expensive checks.
+
+### When would you fix quality at the source rather than in your pipeline?
+- **When the error originates at data entry** and will keep recurring, such as a form that lets users skip
+  a required field; a pipeline patch must then be maintained forever and hides the problem from the client.
+- **Fix in the pipeline** when it is a stable format issue you can normalize reliably, such as known date
+  formats per source.
+
+### How would you turn an onboarding profile into production monitoring?
+- **Convert thresholds into expectations** evaluated on every load, such as null rate of a key field below
+  2% or status within the agreed set.
+- **Start as warnings** to learn natural variance, then make stable checks blocking with quarantine.
+- **Diff each load's per-slice profile against the baseline,** because source-side upgrades are a common
+  cause of sudden AI quality drops.
 
 ## Quiz
 ### Q: Why should profiling metrics be computed per slice (region, source, year) rather than only overall?

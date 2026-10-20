@@ -5,7 +5,7 @@ name: Loop detection
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/max-step-budgets
@@ -16,106 +16,117 @@ related:
 ---
 
 ## TL;DR
-Agents get stuck in loops: the same tool call with the same arguments, a two-state oscillation, or a
-stretch of actions that produces no new information. Budgets eventually stop them, but only after
-burning the whole allowance. Loop detection watches the action stream for exact repeats, short cycles
-and no-progress runs, and responds with an escalation ladder (tell the model, block the call, force a
-replan, abort) because the cheapest fix is usually to make the repetition visible to the model.
+Loop detection watches an agent's actions for exact repeats, short cycles and no-progress stretches, then
+escalates (tell the model, block, replan, abort), because budgets stop loops only after burning the whole
+allowance and making repetition visible is the cheapest fix.
 
 ## Why it exists
-A model picks its next action from the context, and if the context after a failed action looks almost
-identical to the context before it, the most likely next action is the same one. Typical triggers: a
-file read that returns an error the model does not interpret; a search that returns nothing; a test
-command failing the same way; two edits that undo each other; a flaky tool returning different errors
-so the model keeps "trying one more time". The model has no counter; nothing in its input says "this
-is attempt four".
-
-A budget alone is a poor answer. With a thirty-step budget, a loop that starts at step five burns
-twenty-five steps of increasingly expensive calls, then yields an exhausted partial, and you learn
-nothing about *why*. Detecting the loop at step eight saves most of the cost and, more importantly,
-creates a chance to recover: a model told explicitly "you have run this exact command three times with
-the same output" will often change strategy. What is obvious to a human watching the trace is not
-obvious to the model from inside the context, because repeated blocks look like ordinary history.
-
-The naive rule, "abort if the same tool is called twice", fails in both directions. It kills
-legitimate repeats (polling a job status, reading two files with the same tool, re-running tests after
-each edit) and it misses loops where the arguments differ trivially (whitespace, a reworded query) or
-where the cycle spans several steps.
+- **Same context in, same action out.** A model picks its next action from the context; if the context
+  after a failed action looks almost identical to before, the likeliest next action is the same one. The
+  model has no counter; nothing in its input says "this is attempt four".
+- **Typical triggers.** A file read returning an error the model does not interpret; a search returning
+  nothing; a test command failing the same way; two edits that undo each other; a flaky tool returning
+  different errors so the model keeps "trying one more time".
+- **A budget alone is a poor answer.** With a thirty-step budget, a loop starting at step five burns
+  twenty-five increasingly expensive steps, yields an exhausted partial, and teaches you nothing about
+  *why*. Detecting it at step eight saves most of the cost and creates a chance to recover.
+- **Telling the model works.** "You have run this exact command three times with the same output" often
+  makes it change strategy. What is obvious to a human watching the trace is not obvious from inside the
+  context, because repeated blocks look like ordinary history.
+- **"Abort if the same tool is called twice" fails both ways.** It kills legitimate repeats (polling a
+  job status, reading two files with the same tool, re-running tests after each edit) and misses loops
+  where arguments differ trivially (whitespace, a reworded query) or the cycle spans several steps.
 
 ## How it works
 ### Signals
-1. **Exact repeats.** Canonicalize each action: tool name plus arguments with sorted keys and
-   normalized whitespace, then hash. Keep a count per hash within the run and flag at a threshold
-   (three is a common starting point). Canonicalization matters because models vary key order and
-   formatting between attempts.
-2. **Short cycles.** Keep the sequence of action hashes and look for a repeated subsequence of period
-   *p* in the recent window (A B A B, or A B C A B C). Compare the last *p* actions with the *p*
-   before them for *p* from 2 to a small maximum *P* (period 1 is just an exact repeat, which signal
-   1 already counts); with hashed actions this is O(P²) comparisons per step, trivial for P ≈ 4.
-3. **No progress.** Hash the tool *result* as well. If the pair (action, result) repeats, nothing in
-   the world changed, which is the strongest loop signal. Alternatively track a task-specific
-   progress metric (failing test count, files changed, distinct URLs visited) and count steps since
-   it last improved.
-4. **Semantic near-duplicates.** Embed the action or the model's stated intent and flag cosine
-   similarity above a threshold with a recent action ("trying the same thing in different words").
-   This costs an embedding call per step and produces false positives, so reserve it for high-value
-   runs or run it offline over traces.
-5. **Reflection text patterns.** The model repeating phrases such as "let me try again" is a weak
-   signal, useful only as a tie-breaker.
+| # | Signal | How | Cost and caveat |
+|---|---|---|---|
+| 1 | **Exact repeats** | Canonicalize tool name plus arguments (sorted keys, normalized whitespace), hash, count per hash; flag at a threshold (three is a common start) | Cheap. Canonicalization matters because models vary key order and formatting between attempts |
+| 2 | **Short cycles** | Compare the last *p* action hashes with the *p* before them, for *p* from 2 to a small max *P* (A B A B, A B C A B C) | O(P²) comparisons per step, trivial for P ≈ 4; period 1 is just signal 1 |
+| 3 | **No progress** | Hash the tool *result* too; a repeating (action, result) pair means nothing in the world changed | The strongest signal. Alternative: a task metric (failing test count, files changed, distinct URLs visited) and steps since it last improved |
+| 4 | **Semantic near-duplicates** | Embed the action or stated intent; flag cosine similarity above a threshold with a recent action | An embedding call per step and false positives; reserve for high-value runs or run offline over traces |
+| 5 | **Reflection text patterns** | The model repeating "let me try again" | Weak; a tie-breaker only |
 
 ### Legitimate repetition
-Polling (`get_job_status(id)` every few seconds), re-running tests after each edit, and re-reading a
-file after modifying it are all repeats that must be allowed. Handle them by marking tools as
-pollable in the schema (a higher repeat ceiling or a time budget instead of a count), by including a
-monotonically changing argument such as an attempt number in the key for those tools, or by relying
-on the result hash: polling that returns a changing status is progress, while polling that returns the
-identical status ten times is a loop.
+Polling (`get_job_status(id)` every few seconds), re-running tests after each edit and re-reading a file
+after modifying it must be allowed. Three ways:
+- **Mark tools as pollable in the schema:** a higher repeat ceiling, or a time budget instead of a count.
+- **Add a changing argument to the key:** for those tools, include a monotonically changing value such as
+  an attempt number.
+- **Rely on the result hash:** polling that returns a changing status is progress; polling that returns
+  the identical status ten times is a loop.
 
 ### Escalation ladder
-Information is the cheapest intervention, so the rungs are ordered by cost and severity:
-1. **Inform.** Inject a message: "You have called `run_tests` with identical arguments three times and
-   the output was identical each time. Explain what you will do differently, or report the blocker."
-   This alone resolves many loops.
-2. **Block.** Return a harness-generated tool error for the repeated call instead of executing it
-   ("refused: identical to call 12, whose result did not change"). This saves the tool cost and forces
-   a different action.
+Information is the cheapest intervention, so rungs are ordered by cost and severity:
+1. **Inform.** Inject: "You have called `run_tests` with identical arguments three times and the output
+   was identical each time. Explain what you will do differently, or report the blocker." This alone
+   resolves many loops.
+2. **Block.** Return a harness-generated tool error instead of executing ("refused: identical to call 12,
+   whose result did not change"). It saves the tool cost and forces a different action.
 3. **Force a replan or reflection.** Switch to a reflection prompt, invoke a planner, or narrow the
    available tool set.
-4. **Abort.** End the run with status `stuck`, attach the loop evidence, and checkpoint the state for
-   a human.
-Each rung has its own threshold, for example inform at three, block at four, abort at six.
+4. **Abort.** End the run with status `stuck`, attach the loop evidence, and checkpoint the state for a
+   human.
+- **Each rung has its own threshold,** for example inform at three, block at four, abort at six.
 
 ### Loops above the tool stream
-Not every loop is one tool called twice. Two agents can hand a task back and forth (a router sends
-it to the billing agent, which decides it is a support question and sends it back); a
-critique-and-revise loop can fail to converge, each revision trading one flagged issue for another;
-a planner can regenerate essentially the same plan after every failure; a sub-agent can delegate to a
-copy of itself. The same three signals apply one level up. Hash handoffs as (from, to, task) and
-count repeats; treat a revision whose critique score did not improve as a no-progress step; and cap
-delegation depth. These loops are usually invisible to a per-agent guard, because each agent sees
-only its own short, healthy-looking history, so the detector has to live where the whole run is
-visible: the orchestrator.
+Not every loop is one tool called twice:
+- **Handoff ping-pong.** A router sends a task to the billing agent, which decides it is a support
+  question and sends it back.
+- **Non-converging critique-and-revise.** Each revision trades one flagged issue for another.
+- **Plan regeneration.** A planner regenerates essentially the same plan after every failure.
+- **Self-delegation.** A sub-agent delegates to a copy of itself.
+
+The same three signals apply one level up:
+1. Hash handoffs as (from, to, task) and count repeats.
+2. Treat a revision whose critique score did not improve as a no-progress step.
+3. Cap delegation depth.
+- **Put the detector in the orchestrator.** Each agent sees only its own short, healthy-looking history,
+  so these loops are invisible to a per-agent guard.
 
 ### Why deterministic settings make it worse
-A loop is the model making the same choice from nearly the same context. Greedy or low-temperature
-decoding makes "nearly the same context in, same action out" more likely, which is why agents run at
-temperature 0 for reproducibility tend to repeat exactly rather than drift. That is an argument for
-detection, not for raising temperature: changing the context (the inform message) changes the
-choice for a reason, while sampling noise changes it at random.
+- **Low temperature favours exact repeats.** Greedy or low-temperature decoding makes "nearly the same
+  context in, same action out" more likely, which is why agents run at temperature 0 for reproducibility
+  tend to repeat exactly rather than drift.
+- **That argues for detection, not for raising temperature.** Changing the context (the inform message)
+  changes the choice for a reason; sampling noise changes it at random.
 
 ### Where it lives
-In the harness, between the model's response and tool dispatch, so it sees every action regardless of
-which model is used. Log every detection with its evidence (hashes, window contents, counts): this is
-also the best data for improving tools and prompts, because it shows which error messages failed to
-help the model change course.
+- **In the harness, between the model's response and tool dispatch,** so it sees every action regardless
+  of which model is used.
+- **Log every detection with its evidence** (hashes, window contents, counts). This is also the best data
+  for improving tools and prompts, because it shows which error messages failed to help the model change
+  course.
 
-## Example
-The guard escalates on *stale* repeats: calls with identical canonical (tool, args) whose result
-matched an earlier result for the same call. Calls whose results keep changing (re-running tests
-after each edit) never escalate by count; the cycle check catches them only if the actions
-themselves start repeating, such as two edits undoing each other. Pollable tools get the same ladder
-with thresholds scaled up, as a stand-in for a time budget. A refused call counts as stale, because
-blocking made no progress either, so a model that keeps insisting climbs to abort.
+## Diagram
+Every proposed call passes the guard before dispatch; only results that repeat earlier results move a
+call up the ladder.
+
+```mermaid
+flowchart TD
+    M["Model proposes tool call"] --> H["Canonicalize and hash name plus args"]
+    H --> S{"Stale count for this hash?"}
+    S -->|"at abort threshold"| A["Abort: status stuck, checkpoint"]
+    S -->|"at block threshold"| B["Refuse call, return harness error"]
+    S -->|"at inform threshold"| I["Run call, attach exact-repeat warning"]
+    S -->|"below"| C{"Recent actions form a cycle?"}
+    C -->|"yes"| I
+    C -->|"no"| R["Run call"]
+    I --> RH["Hash result"]
+    R --> RH
+    RH -->|"same action and result seen before"| U["Increment stale count"]
+    B --> U
+```
+
+## Examples
+### A result-aware loop guard
+- **Escalates on *stale* repeats:** calls with identical canonical (tool, args) whose result matched an
+  earlier result for the same call.
+- **Changing results never escalate by count** (re-running tests after each edit); the cycle check
+  catches them only if the actions themselves repeat, such as two edits undoing each other.
+- **Pollable tools** get the same ladder with thresholds scaled up, as a stand-in for a time budget.
+- **A refused call counts as stale,** because blocking made no progress either, so a model that keeps
+  insisting climbs to abort.
 
 ```python
 import hashlib, json
@@ -162,51 +173,91 @@ class LoopGuard:
         self.seen.add(k)
 ```
 
-Trace a failing `run_tests` that prints the same 40-line failure each time. Call 1 runs; call 2
-runs and its result matches call 1 (stale = 1). Call 3 runs with an inform message attached. Call 4
-is refused (stale was 2), as is call 5, and call 6 aborts the run as `stuck`: inform at three,
-block at four, abort at six. Now trace a healthy edit-test cycle: every `run_tests` output differs
-because the failing count drops, so stale stays at 0 and nothing fires. A deploy poller declared
-pollable that returns "building" over and over is informed on call 12 (ten results that repeated an
-earlier one) and refused from call 22, by which point a wall-clock budget should normally have taken over.
+### Worked traces through the guard
+| Scenario | What happens |
+|---|---|
+| Failing `run_tests` printing the same 40-line failure each time | Call 1 runs; call 2 runs and matches call 1 (stale = 1); call 3 runs with an inform message; calls 4 and 5 are refused (stale was 2); call 6 aborts as `stuck`. Inform at three, block at four, abort at six |
+| Healthy edit-test cycle | Every `run_tests` output differs because the failing count drops, so stale stays at 0 and nothing fires |
+| Deploy poller declared pollable, returning "building" over and over | Informed on call 12 (ten results that repeated an earlier one) and refused from call 22, by which point a wall-clock budget should normally have taken over |
+
+### Runnable driver: exercise the guard without an LLM
+Paste below the class above and run with plain Python.
+- **First loop:** reproduces the failing-test trace.
+- **Second loop:** two edits undo each other (text "a", then "b"). Every result differs, so the stale
+  count never moves, but the A B A B cycle is caught at call 4. The second edit lists its keys in a
+  different order, which `canon()` normalizes away when that edit recurs.
+
+```python
+g = LoopGuard()
+for i in range(1, 7):                            # same call, same result every time
+    verdict, _ = g.before("run_tests", {"path": "tests/"})
+    print(i, verdict)                            # ok, ok, inform, block, block, abort
+    if verdict in ("ok", "inform"):
+        g.after("run_tests", {"path": "tests/"}, "FAILED test_x")
+
+g = LoopGuard()
+undo = [("edit", {"line": 3, "text": "a"}), ("edit", {"text": "b", "line": 3})]
+for i, (name, args) in enumerate([*undo, *undo, *undo], 1):
+    print(i, *g.before(name, args))             # inform from call 4: period 2
+    g.after(name, args, f"ok {i}")              # results differ, so only the cycle fires
+```
+
+## Production patterns
+- **Guard in the dispatch path, one per run.** Instantiate the guard per run in the harness (not per
+  agent), call `before()` ahead of every tool dispatch and `after()` on every result. Monitor detections
+  per hundred runs, broken down by tool.
+- **Strip volatile fields before hashing results.** Remove timestamps, request ids and durations from
+  tool output (a per-tool list of JSON paths to drop) before computing the result hash, otherwise
+  no-progress detection never fires. Monitor tools whose results never repeat at all, a hint that a
+  volatile field slipped through.
+- **Pollable flag in the tool registry.** Mark status-check tools as pollable with a scaled threshold or a
+  wall-clock cap, and use backoff between polls. Monitor poll counts per job and time-to-terminal-status.
+- **Orchestrator-level handoff counter.** In multi-agent systems, count (from, to, task) handoffs and
+  delegation depth in the orchestrator and route to a human after a small repeat count. Monitor
+  handoff-repeat detections per agent pair.
+- **Offline trace mining.** Run exact and semantic repeat detection as a batch job over budget-exhausted
+  runs to find loops the online guard missed, then tune thresholds or tool error messages. Monitor the
+  share of exhausted runs containing an undetected repeat pattern.
 
 ## Trade-offs
-- Exact-match detection is cheap with near-zero false positives, but misses loops with trivially
-  varied arguments; normalization or semantic similarity widens coverage at the cost of false alarms
-  on legitimate variation.
-- Informing the model before blocking preserves autonomy and often recovers the run, but spends an
-  extra model call per warning; if warnings rarely change a given model's behaviour, move the block
-  rung earlier.
-- Result-hash no-progress detection is the most reliable signal, yet requires hashing possibly large
-  outputs and fails on outputs that embed timestamps or ids; strip volatile fields first.
-- Tight thresholds catch loops early but break legitimate polling and edit-test cycles; per-tool
-  thresholds and result-aware rules restore those at the price of more configuration.
+- **Exact match vs coverage.** Exact-match detection is cheap with near-zero false positives, but misses
+  loops with trivially varied arguments; normalization or semantic similarity widens coverage at the cost
+  of false alarms on legitimate variation.
+- **Inform before block vs extra calls.** Informing preserves autonomy and often recovers the run, but
+  spends an extra model call per warning; if warnings rarely change a given model's behaviour, move the
+  block rung earlier.
+- **Result-hash detection vs hashing cost.** It is the most reliable signal, yet requires hashing possibly
+  large outputs and fails on outputs that embed timestamps or ids; strip volatile fields first.
+- **Tight thresholds vs legitimate repeats.** They catch loops early but break polling and edit-test
+  cycles; per-tool thresholds and result-aware rules restore those at the price of more configuration.
 
 ## Pitfalls
-- Keying only on the tool name, so every file read looks like a repeat; the symptom is aborts on
-  perfectly healthy runs that read several files.
-- Blocking polling tools; the symptom is long-running jobs that never complete because the status
-  check is refused after the third call.
-- Detecting the loop but only logging it; the symptom is traces showing "loop detected" at step six
-  and budget exhaustion at step thirty.
-- Warning the model vaguely ("you seem stuck"); the symptom is the model acknowledging and repeating.
-  Include the exact call, the count and the fact that the result was identical.
-- Hashing arguments without canonicalization; the symptom is obvious repeats with reordered JSON keys
-  that are never counted.
-- Escalating on raw call counts instead of unchanged results; the symptom is healthy edit-test
-  cycles aborted as "stuck" on the sixth test run while every run was making progress.
-- Running the detector per agent in a multi-agent system; the symptom is a task bouncing between two
-  agents for the whole budget while each agent's guard reports nothing.
+- **Keying only on the tool name.** Every file read looks like a repeat; the symptom is aborts on
+  perfectly healthy runs that read several files. Fix: hash name plus canonical args.
+- **Blocking polling tools.** The symptom is long-running jobs that never complete because the status
+  check is refused after the third call. Fix: mark them pollable and rely on the result hash.
+- **Detecting but only logging.** The symptom is traces showing "loop detected" at step six and budget
+  exhaustion at step thirty. Fix: wire the ladder.
+- **Vague warnings ("you seem stuck").** The symptom is the model acknowledging and repeating. Fix:
+  include the exact call, the count and the fact that the result was identical.
+- **Hashing arguments without canonicalization.** The symptom is obvious repeats with reordered JSON keys
+  that are never counted. Fix: sorted keys and normalized whitespace.
+- **Escalating on raw call counts instead of unchanged results.** The symptom is healthy edit-test cycles
+  aborted as "stuck" on the sixth test run while every run was making progress. Fix: count stale repeats.
+- **Running the detector per agent in a multi-agent system.** The symptom is a task bouncing between two
+  agents for the whole budget while each agent's guard reports nothing. Fix: detect in the orchestrator.
 
 ## When to use
-Any agent that calls tools more than a few times per run, and especially anything that runs
-unattended. Start with exact-repeat and (action, result) no-progress detection in the harness, which
-is an afternoon of work, plus the inform/block/abort ladder. Add cycle detection when traces show
-oscillation, and semantic detection only when exact matching demonstrably misses loops you care
-about. Measure loop detections per hundred runs by tool, the recovery rate after the inform rung, and
-the share of budget-exhausted runs that contained an undetected repeat pattern (mine the traces
-offline). In interviews, describe the signals, the legitimate-repeat problem, and why informing the
-model comes before aborting.
+- **Use when:** any agent calls tools more than a few times per run, and especially anything that runs
+  unattended.
+- **Start with:** exact-repeat and (action, result) no-progress detection in the harness, an afternoon of
+  work, plus the inform/block/abort ladder.
+- **Add later:** cycle detection when traces show oscillation; semantic detection only when exact matching
+  demonstrably misses loops you care about.
+- **Measure:** detections per hundred runs by tool, recovery rate after the inform rung, and the share of
+  budget-exhausted runs that contained an undetected repeat pattern (mine the traces offline).
+- **Interviews:** describe the signals, the legitimate-repeat problem, and why informing the model comes
+  before aborting.
 
 ## Role lens
 - **Engineer:** Implements the guard in the tool-dispatch path, canonicalizes arguments, tunes
@@ -227,6 +278,35 @@ pollable with a higher repeat ceiling or a time budget, strip volatile fields su
 before hashing results, and apply the ladder: after three identical (call, result) pairs inform the
 model with the exact command and output, refuse the fourth, and abort with status stuck if it
 persists. Log both cases so the thresholds can be tuned from real traces rather than guesses.
+
+## Interview questions
+### Why not just rely on the step budget to stop looping agents?
+- **It fires too late.** A loop starting at step five of thirty burns twenty-five increasingly expensive
+  steps before the budget stops it.
+- **It teaches nothing and recovers nothing.** Detecting at step eight saves most of the cost, records the
+  evidence, and gives the model a chance to change strategy once told about the repeat.
+
+### How would you tell a stuck loop apart from legitimate repetition such as polling?
+- **Hash the result as well as the action.** Polling that returns a changing status is progress; an
+  identical (action, result) pair means the world did not change.
+- **Mark pollable tools** with a higher ceiling or a time budget, and strip volatile fields such as
+  timestamps before hashing, or every result looks new.
+
+### A task bounces between a router and a billing agent for the whole budget. Why did no guard fire, and what do you change?
+- **Each agent saw a short, healthy history,** so a per-agent guard had nothing to flag.
+- **Move detection to the orchestrator:** hash handoffs as (from, to, task), count repeats, cap delegation
+  depth and escalate to a human after a small count.
+
+### When would you add semantic near-duplicate detection, and what does it cost?
+- **Only when exact matching demonstrably misses loops you care about,** such as reworded search queries.
+- **Cost:** an embedding call per step plus false positives on legitimate variation, so reserve it for
+  high-value runs or run it offline over traces.
+
+### Would raising the temperature fix an agent that keeps repeating the same call?
+- **It would change the action at random, not for a reason.** Low temperature does make exact repeats more
+  likely, but the fix is to change the context.
+- **Inform the model** with the exact call, the count and the unchanged result; that changes its choice
+  deliberately and keeps runs reproducible.
 
 ## Quiz
 ### Q: Why is the pair (action, result) a stronger loop signal than the action alone?

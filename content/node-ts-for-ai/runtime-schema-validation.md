@@ -5,7 +5,7 @@ name: Runtime schema validation (Zod)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -20,96 +20,127 @@ sources:
 ---
 
 ## TL;DR
-TypeScript types vanish at compile time, so nothing checks the JSON that arrives from an HTTP client, a
-webhook, an environment variable or a language model. Runtime schema validation defines the shape once
-as a value (a Zod schema), derives the static type from it, and parses untrusted input into a typed
-value or a structured list of errors. The same schema becomes the JSON Schema sent to the model for
-tool calling, so the contract the model follows is the contract you enforce.
+TypeScript types vanish at runtime, so nothing checks JSON from clients, webhooks, env vars or models. A Zod
+schema defines the shape once, derives the type, parses untrusted input into typed values or errors, and
+becomes the model's tool JSON Schema.
 
 ## Why it exists
-Every interesting input to an AI service is untrusted. A request body can be anything the client sent.
-A model's "JSON" output can be a markdown-fenced blob with a trailing comment, a number where a string
-was asked for, or an argument object with a field the tool never defined. An environment variable is
-a string even when the code needs a port number. A compile-time type on any of these is a comment,
-not a check: `JSON.parse(body) as ChatRequest` tells the compiler to trust you, and the first missing
-field becomes `undefined` deep inside business logic, usually as a `TypeError` after the model call
-was already billed.
-
-The naive alternatives fail in predictable ways. Hand-written `if (typeof x.messages !== "object")`
-checks drift from the type the rest of the code uses and are never complete. Writing a TypeScript
-interface *and* a separate JSON Schema for the model doubles the surface and lets them disagree, so the
-model is instructed to produce one shape and the code checks another. Validating only at the HTTP
-layer misses the inputs that bypass it: queue messages, model outputs, tool results. The schema-as-value
-approach exists to make one definition serve three purposes: the static type (`z.infer`), the runtime
-parser (`schema.parse`), and the machine-readable contract handed to the model (JSON Schema). The
-principle is "parse, don't validate": the output of a parse is a *new* value of a narrower type, so
-code after it cannot forget that the check happened.
+- **Every interesting input is untrusted.** A request body can be anything the client sent. A model's "JSON"
+  can be a markdown-fenced blob with a trailing comment, a number where a string was asked for, or a field
+  the tool never defined. An environment variable is a string even when the code needs a port number.
+- **A compile-time type here is a comment, not a check.** `JSON.parse(body) as ChatRequest` tells the
+  compiler to trust you; the first missing field becomes `undefined` deep in business logic, usually a
+  `TypeError` after the model call was billed.
+- **Hand-written checks drift.** `if (typeof x.messages !== "object")` checks diverge from the type the rest of
+  the code uses and are never complete.
+- **Two definitions disagree.** A TypeScript interface *and* a separate JSON Schema for the model doubles the
+  surface, so the model is told one shape and the code checks another. Validating only at HTTP misses queue
+  messages, model outputs and tool results.
+- **One definition, three uses.** The static type (`z.infer`), the runtime parser (`schema.parse`) and the
+  model contract (JSON Schema). The principle is "parse, don't validate": a parse returns a *new* value of a
+  narrower type, so later code cannot forget the check happened.
 
 ## How it works
 ### Schema as a value
-Zod schemas are built by composition: `z.object({ model: z.string(), temperature:
-z.number().min(0).max(2).default(1), messages: z.array(Message).min(1) })`. Each combinator returns a
-schema object carrying both the runtime checks and the phantom static type, which `z.infer<typeof
-Schema>` extracts. The type is derived from the schema rather than the reverse *because* a type
-cannot be inspected at runtime, while a value can be both executed and reflected on.
+- **Built by composition:** `z.object({ model: z.string(), temperature: z.number().min(0).max(2).default(1),
+  messages: z.array(Message).min(1) })`.
+- **Each combinator carries both** the runtime checks and a phantom static type, which
+  `z.infer<typeof Schema>` extracts.
+- **Type from schema, not the reverse,** *because* a type cannot be inspected at runtime, while a value can be
+  both executed and reflected on.
 
-A schema has two types, not one. `z.input<typeof S>` is what the producer may send; `z.output<typeof
-S>` (which is what `z.infer` returns) is what `parse` gives back. They differ whenever a field has a
-`.default()` (optional on input, required on output) or a `.transform()` (a string in, a `Date` out).
-Use the input type for whoever constructs the payload, including the model, and the output type for
-the code that consumes it.
+### Input type vs output type
+| Type | What it describes | Use for |
+|---|---|---|
+| `z.input<typeof S>` | What the producer may send | Whoever constructs the payload, including the model |
+| `z.output<typeof S>` | What `parse` gives back | The code that consumes it |
+
+- **`z.infer` is the output side:** `z.output<typeof S>` (which is what `z.infer` returns) is what `parse`
+  gives back.
+- **They differ** whenever a field has a `.default()` (optional on input, required on output) or a
+  `.transform()` (a string in, a `Date` out).
 
 ### `parse` versus `safeParse`
-`Schema.parse(input)` returns the typed value or throws a `ZodError`; `Schema.safeParse(input)` returns
-`{ success: true, data }` or `{ success: false, error }` without throwing. Use `parse` at boundaries
-where failure should become an HTTP 400 through a central error handler, and `safeParse` where failure
-is an expected branch, such as a model output you intend to repair. `error.issues` is an array of
-`{ path, code, message }`, which is both what you return to a client and what you feed back to a model.
+| Call | Returns | Use where |
+|---|---|---|
+| `Schema.parse(input)` | The typed value, or throws a `ZodError` | Boundaries where failure becomes an HTTP 400 through a central error handler |
+| `Schema.safeParse(input)` | `{ success: true, data }` or `{ success: false, error }`, never throws | Failure is an expected branch, such as a model output you intend to repair |
+
+- **`error.issues`** is an array of `{ path, code, message }`: what you return to a client and what you feed
+  back to a model.
 
 ### Transform, refine, coerce
-Validation often needs to change the value: `z.string().transform((s) => s.trim())`, `z.coerce.number()`
-for a port read from `process.env`, `.refine((v) => v.end > v.start, { message })` for cross-field
-rules, `.pipe()` to chain a transform into a further schema. A transform makes the output type differ
-from the input type, which is exactly what `parse` is for: the result is a domain value, not the wire
-shape. Refinements that need I/O (does this `customerId` exist?) can be async, but then only
-`parseAsync`/`safeParseAsync` will run them; keep such checks few, because they turn a cheap pure
-parse into a database round trip at every boundary. `.brand<"CustomerId">()` makes the output a
-branded type, so code that requires a `CustomerId` cannot be handed an unparsed string.
+- **Change the value while parsing:** `z.string().transform((s) => s.trim())`, `z.coerce.number()` for a port
+  read from `process.env`, `.refine((v) => v.end > v.start, { message })` for cross-field rules, `.pipe()` to
+  chain a transform into a further schema.
+- **Transforms are the point of `parse`:** the output type differs from the input type, so the result is a
+  domain value, not the wire shape.
+- **Async refinements cost a round trip.** Checks that need I/O (does this `customerId` exist?) can be async,
+  but then only `parseAsync`/`safeParseAsync` run them; keep them few, because they turn a cheap pure parse
+  into a database round trip at every boundary.
+- **Brand the output.** `.brand<"CustomerId">()` makes it a branded type, so code requiring a `CustomerId`
+  cannot be handed an unparsed string.
 
 ### Objects: strict, strip, passthrough
-By default Zod *strips* unknown keys from objects. `.strict()` rejects them, which is what you want for
-tool arguments (an unexpected key usually means the model misread the schema) and for request bodies
-where silently dropping a typo'd field hides a client bug. `.passthrough()` keeps them, useful for
-forwarding provider payloads you do not fully model. (Zod 4 keeps these methods but prefers the
-equivalent `z.strictObject()` and `z.looseObject()` constructors.) Discriminated unions (`z.discriminatedUnion("type",
-[...])`) validate tagged variants like stream events and give the compiler the same narrowing that a
-hand-written union would.
+| Mode | Unknown keys | Use for |
+|---|---|---|
+| Default (*strip*) | Silently removed | General parsing |
+| `.strict()` | Rejected | Tool arguments (an unexpected key usually means the model misread the schema) and request bodies, where dropping a typo'd field hides a client bug |
+| `.passthrough()` | Kept | Forwarding provider payloads you do not fully model |
+
+- **Zod 4 naming.** It keeps these methods but prefers the equivalent `z.strictObject()` and `z.looseObject()`
+  constructors.
+- **Tagged variants.** `z.discriminatedUnion("type", [...])` validates stream events and similar, and gives
+  the compiler the same narrowing as a hand-written union.
 
 ### From schema to the model, and back
-Tool calling and structured outputs require a JSON Schema describing the arguments or the response.
-Generating it from the Zod schema (Zod 4 ships `z.toJSONSchema`; earlier versions use the
-`zod-to-json-schema` package; the OpenAI Node SDK has Zod helpers and the Vercel AI SDK accepts Zod
-schemas directly)
-keeps the model's contract and the code's in sync, with `.describe()` strings becoming the field
-descriptions the model reads. Two details matter: a field with `.default()` is optional on input but
-present on output, so generate the *input* schema for the model (`{ io: "input" }` in Zod 4); and
-providers' strict structured-output modes accept only a subset of JSON Schema (some reject or ignore
-keywords such as `format` or length bounds, and some require every property to be listed as
-required), so check what your provider supports rather than assuming the whole schema is enforced. The round trip is: schema → JSON Schema → model → JSON text →
-`safeParse` → typed value. Even with provider-side constrained decoding, keep the parse: it is the only
-check for `refine` rules, it guards against provider bugs, and it is where a failed parse becomes a
-repair prompt ("the field `due_date` must be ISO 8601; you returned `tomorrow`").
+The round trip is: schema → JSON Schema → model → JSON text → `safeParse` → typed value.
+
+1. **Generate the JSON Schema from Zod.** Zod 4 ships `z.toJSONSchema`; earlier versions use the
+   `zod-to-json-schema` package; the OpenAI Node SDK has Zod helpers and the Vercel AI SDK accepts Zod schemas
+   directly. `.describe()` strings become the field descriptions the model reads.
+2. **Generate the *input* schema** (`{ io: "input" }` in Zod 4), because a field with `.default()` is optional
+   on input but present on output.
+3. **Check your provider's subset.** Strict structured-output modes accept only part of JSON Schema: some
+   reject or ignore keywords such as `format` or length bounds, and some require every property to be listed
+   as required.
+4. **Always parse the reply,** even with provider-side constrained decoding: it is the only check for
+   `refine` rules, it guards against provider bugs, and a failed parse becomes a repair prompt ("the field
+   `due_date` must be ISO 8601; you returned `tomorrow`").
 
 ### Alternatives in the ecosystem
-Valibot offers the same model with smaller bundles; TypeBox and Ajv work JSON-Schema-first, which suits
-teams whose source of truth is an OpenAPI document; ArkType trades Zod's chaining for a type-syntax
-string. The choice rarely matters as much as the discipline: one schema per boundary, the type derived
-from it, and no `as` casts on untrusted data.
+| Library | Style | Suits |
+|---|---|---|
+| Valibot | Same model as Zod | Smaller bundles |
+| TypeBox, Ajv | JSON-Schema-first | Teams whose source of truth is an OpenAPI document |
+| ArkType | A type-syntax string instead of chaining | Preference for TS-like syntax |
 
-## Example
-A tool definition whose Zod schema produces both the TypeScript argument type and the JSON Schema sent
-to the model, with a repair loop that feeds validation issues back when the model's arguments do not
-parse. Unknown keys are rejected because an extra key from a model usually means it misread the schema.
+- **The discipline matters more than the library:** one schema per boundary, the type derived from it, and no
+  `as` casts on untrusted data.
+
+## Diagram
+One schema feeds the model's contract and the parser that checks the model's reply; invalid replies loop back
+as repair prompts, a bounded number of times.
+
+```mermaid
+flowchart TD
+    Z["Zod schema"] --> T["z.infer: static type"]
+    Z --> J["z.toJSONSchema, io input"]
+    J --> M["Model tool call"]
+    M --> X["JSON text arguments"]
+    X --> P{"safeParse"}
+    P -->|"success"| R["Typed value: run tool"]
+    P -->|"issues"| B{"Repairs left?"}
+    B -->|"yes"| F["Repair prompt with issues"]
+    F --> M
+    B -->|"no"| E["Fail the call"]
+```
+
+## Examples
+### Tool schema, JSON Schema and a repair loop
+A tool definition whose Zod schema produces both the TypeScript argument type and the JSON Schema sent to the
+model, with a repair loop that feeds validation issues back when the model's arguments do not parse. Unknown
+keys are rejected because an extra key from a model usually means it misread the schema.
 
 ```ts
 import { z } from "zod";
@@ -157,48 +188,114 @@ const port = z.coerce.number().int().min(1).max(65535).parse(process.env.PORT ??
 void port;
 ```
 
+### Boot-time config and a request body that returns 400
+Zod 4. Config is parsed once at startup so a bad deploy crashes immediately, not on the first request. The
+request parser returns path and message only, never the raw input, so client responses cannot leak payloads.
+
+```ts
+import { z } from "zod";
+
+const Env = z.object({
+  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  MODEL_API_KEY: z.string().min(1),
+  ENABLE_TOOLS: z.stringbool().default(false),           // "false" -> false, unlike z.coerce.boolean()
+  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+});
+export const env = Env.parse(process.env);                // throws at boot with every bad variable listed
+
+const ChatRequest = z.strictObject({
+  model: z.enum(["fast", "smart"]),
+  messages: z.array(z.strictObject({
+    role: z.enum(["user", "assistant"]),
+    content: z.string().min(1).max(32_000),
+  })).min(1).max(100),
+  temperature: z.number().min(0).max(2).default(1),
+});
+export type ChatRequest = z.output<typeof ChatRequest>;
+
+export function parseChatRequest(body: unknown) {
+  const r = ChatRequest.safeParse(body);
+  if (r.success) return { ok: true as const, data: r.data };   // temperature filled in: 1
+  return {
+    ok: false as const,
+    status: 400,
+    issues: r.error.issues.map((i) => ({ path: i.path.join(".") || "(root)", message: i.message })),
+  };
+}
+// parseChatRequest({ model: "gpt-x", messages: [], temprature: 0.2 }) yields three issues:
+// model (invalid option), messages (too small), (root) (unrecognized key "temprature")
+```
+
+### Worked scenario: a model upgrade raises tool-argument failures
+A team tracks `safeParse` failures per tool after switching model versions (illustrative numbers).
+
+| Metric for `schedule_event` | Before | After upgrade | Reading |
+|---|---|---|---|
+| Argument parse failure rate | 0.5% | 6% | The model's behaviour changed, not the code |
+| Top issue path | mixed | `start` (invalid ISO datetime) | It now sends local times without an offset |
+| Repair success within 2 attempts | 90% | 70% | Repairs cost an extra call each; fix the root cause |
+| Fix | — | `.describe()` text gives an example with offset; failures back near baseline | The schema description is part of the prompt |
+
+## Production patterns
+- **Validate config at boot.** Parse `process.env` with one schema in the entry module, using
+  `z.coerce.number()` for ports and `z.stringbool()` or an enum transform for flags, so a bad deploy fails its
+  readiness check instead of serving errors. Monitor crash-on-start in deploy dashboards.
+- **Central `ZodError` → 400 mapping.** Route handlers call `parse`; one error handler converts `ZodError` to
+  a 400 with `path` and `message` only (Zod 4's `z.flattenError` helps), never raw input. Monitor 400 rate per
+  route and per issue path to spot client bugs.
+- **Shared contracts package.** Tool, request and event schemas live in one package consumed by every service,
+  with types derived via `z.infer`, so producers and consumers cannot drift. Track schema changes in review
+  like API changes.
+- **Additive schema evolution.** Add new fields as optional with `.default()`, deploy all producers (including
+  queued messages and prompts), then tighten. Monitor validation failures by producer version during
+  rollouts.
+- **Bounded repair with metrics.** `safeParse` model output, send `issues` back at most two times, then fail
+  explicitly. Emit failure rate, repair success rate and extra tokens per tool; a rising failure rate usually
+  means a prompt or model change.
+
 ## Trade-offs
-- One schema gives type, parser and model contract together, but it couples the wire format to the
-  domain type; when they must diverge, add a `transform` or a second schema rather than casting.
-- Validating every boundary costs CPU proportional to payload size, negligible against a model call
-  but noticeable on hot internal paths with large arrays; validate at the edge, trust inside.
-- `.strict()` catches model and client mistakes early, yet it breaks when a provider adds a harmless
-  field; use `strip` for payloads you forward and `strict` for arguments you act on.
-- Repairing invalid model output with a retry prompt improves success rates at the cost of another
-  model call and latency; bound the attempts and prefer provider structured-output modes that reduce
-  the failure rate in the first place.
-- JSON-Schema-first tools (TypeBox, Ajv) align with OpenAPI-driven teams, while Zod's TypeScript-first
-  style is more ergonomic for application code; mixing both in one service is where contracts drift.
-- Tightening a schema (a new required field, a narrower enum) protects consumers but breaks producers
-  still sending the old shape, such as queued messages written before a deploy or a prompt not yet
-  updated; add fields as optional with a default first, and tighten only once every producer has moved.
+- **One schema vs coupling.** One schema gives type, parser and model contract together, but couples the wire
+  format to the domain type; when they must diverge, add a `transform` or a second schema rather than casting.
+- **Safety vs CPU.** Validating every boundary costs CPU proportional to payload size, negligible against a
+  model call but noticeable on hot internal paths with large arrays; validate at the edge, trust inside.
+- **`.strict()` vs forward compatibility.** Strict catches model and client mistakes early, yet breaks when a
+  provider adds a harmless field; use `strip` for payloads you forward and `strict` for arguments you act on.
+- **Repair vs latency and cost.** A repair prompt improves success rates at the cost of another model call and
+  latency; bound the attempts and prefer provider structured-output modes that reduce failures in the first
+  place.
+- **JSON-Schema-first vs TypeScript-first.** TypeBox and Ajv align with OpenAPI-driven teams; Zod is more
+  ergonomic for application code. Mixing both in one service is where contracts drift.
+- **Tighter schemas vs old producers.** A new required field or narrower enum protects consumers but breaks
+  producers still sending the old shape (queued messages written before a deploy, a prompt not yet updated).
+  Add fields as optional with a default first, and tighten only once every producer has moved.
 
 ## Pitfalls
-- Casting untrusted JSON with `as` instead of parsing; the symptom is a `TypeError` on an `undefined`
-  field deep in business logic, after the model call was billed.
-- Maintaining a TypeScript interface and a hand-written JSON Schema separately; the symptom is the
-  model returning a field the code rejects, or the code expecting a field the model was never told about.
-- Using default `strip` behaviour on tool arguments; the symptom is a model hallucinating an extra
-  parameter that is silently dropped, so the tool runs with half of what the model intended.
-- Returning raw `ZodError` messages to end users or logging full payloads in issues; the symptom is
-  leaked internal field names or PII in client responses and logs.
-- Skipping the parse because the provider "guarantees" the schema; the symptom is `refine` rules never
-  running and a provider-side change or bug reaching production unchecked.
-- Reading `process.env` without coercion; the symptom is `"3000" + 1` style bugs and a port compared as a
-  string.
-- Using `z.coerce.boolean()` for env flags; it applies JavaScript truthiness, so the symptom is
-  `FEATURE_X=false` turning the feature *on* because `"false"` is a non-empty string. Parse with an enum
+- **Casting untrusted JSON with `as` instead of parsing.** Symptom: a `TypeError` on an `undefined` field deep
+  in business logic, after the model call was billed.
+- **A TypeScript interface and a hand-written JSON Schema kept separately.** Symptom: the model returns a field
+  the code rejects, or the code expects a field the model was never told about.
+- **Default `strip` on tool arguments.** Symptom: a hallucinated extra parameter is silently dropped, so the
+  tool runs with half of what the model intended.
+- **Returning raw `ZodError` messages to end users or logging full payloads in issues.** Symptom: leaked
+  internal field names or PII in client responses and logs.
+- **Skipping the parse because the provider "guarantees" the schema.** Symptom: `refine` rules never run, and a
+  provider-side change or bug reaches production unchecked.
+- **Reading `process.env` without coercion.** Symptom: `"3000" + 1` style bugs and a port compared as a string.
+- **`z.coerce.boolean()` for env flags.** It applies JavaScript truthiness, so `FEATURE_X=false` turns the
+  feature *on* because `"false"` is a non-empty string. Parse with an enum
   (`z.enum(["true", "false"]).transform((v) => v === "true")`) or Zod 4's `z.stringbool()` instead.
 
 ## When to use
-Parse at every boundary where data enters the process: HTTP bodies and query strings, webhook payloads,
-queue messages, environment configuration, model outputs and tool-call arguments, and responses from
-third-party APIs you depend on. Derive types from schemas rather than the reverse, generate the model's
-JSON Schema from the same source, and use `safeParse` with a bounded repair loop where the model is the
-producer. Do not validate internal function calls between already-typed modules; that is what the
-compiler is for. Measure the validation failure rate per boundary (a rising rate on model outputs
-usually means a prompt or model change) and the repair success rate. Interviewers ask why types alone
-are insufficient, how a Zod schema becomes a tool definition, and how to handle invalid model output.
+- **Parse at every boundary where data enters the process:** HTTP bodies and query strings, webhook payloads,
+  queue messages, environment configuration, model outputs and tool-call arguments, and responses from
+  third-party APIs you depend on.
+- **Derive types from schemas,** generate the model's JSON Schema from the same source, and use `safeParse`
+  with a bounded repair loop where the model is the producer.
+- **Avoid when** calls are internal between already-typed modules; that is what the compiler is for.
+- **Measure:** the validation failure rate per boundary (a rising rate on model outputs usually means a prompt
+  or model change) and the repair success rate.
+- **Interviews:** why types alone are insufficient, how a Zod schema becomes a tool definition, and how to
+  handle invalid model output.
 
 ## Role lens
 - **Engineer:** Defines one Zod schema per tool and per endpoint, derives types with `z.infer`, generates
@@ -221,6 +318,36 @@ compiler cannot help. Third, the provider is an external system that can change 
 parse is the only place that failure is caught before a tool runs with bad arguments. Finally, the
 schema is already written, so the validation is a single `safeParse` call whose cost is negligible next
 to the model call. The constrained mode reduces repairs; it does not replace the boundary check.
+
+## Interview questions
+### What does "parse, don't validate" mean, and why does it matter for AI services?
+- **Definition:** a parse turns `unknown` input into a new value of a narrower type, or fails; a validator only
+  answers yes or no and leaves the original untyped value in circulation.
+- **Why here:** model outputs, tool arguments and webhooks are untrusted, and a parsed value means every later
+  line can rely on the shape without re-checking or casting.
+
+### A tool keeps running with missing parameters although the model "sent them". How do you debug it?
+- **Suspect stripping:** the default object mode drops unknown keys, so a misspelled or extra key from the
+  model vanishes silently; log the raw arguments next to the parsed ones.
+- **Fix:** make tool-argument schemas `.strict()` so the mismatch becomes an issue fed back into a repair
+  prompt, and improve `.describe()` text if the model keeps misnaming the field.
+
+### When would you not validate with a runtime schema?
+- **Between already-typed internal modules:** the compiler already checks those calls, and re-parsing adds CPU
+  and code with no new safety.
+- **On hot paths with large arrays you produced yourself,** validate once at the edge and trust inside.
+
+### How do you change a schema that queued messages and prompts already depend on?
+- **Additive first:** add the new field as optional with `.default()`, so old producers still parse.
+- **Then migrate producers:** deploy writers, drain or reprocess queued messages, update prompts and tool
+  descriptions.
+- **Tighten last,** and watch validation failure rates by producer version during the rollout.
+
+### What do you monitor around schema validation in production?
+- **Failure rate per boundary and per issue path:** a jump on model outputs after a deploy usually means a
+  prompt or model change; on HTTP, a client bug.
+- **Repair metrics:** repair success within the attempt bound and extra tokens spent, since each repair is
+  another model call.
 
 ## Quiz
 ### Q: Why derive the TypeScript type from the Zod schema with `z.infer` rather than writing the interface first and the schema to match?

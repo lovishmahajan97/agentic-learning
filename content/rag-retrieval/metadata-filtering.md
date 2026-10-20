@@ -5,7 +5,7 @@ name: Metadata filtering
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/ann-indexes
   - rag-retrieval/vector-databases
@@ -236,8 +236,8 @@ def build_filter(llm_filter, tenant_id):
 
 def search(run, query, llm_filter, tenant_id, k=10):
     hits = run(query, build_filter(llm_filter, tenant_id), k)
-    if len(hits) < k and llm_filter:                               # likely misparse: relax, keep tenant
-        return run(query, build_filter({}, tenant_id), k), "relaxed"
+    if not hits and llm_filter:                                    # empty: likely misparse, relax, keep tenant
+        return run(query, build_filter({}, tenant_id), k), "relaxed"   # log the reason, or ask the user
     return hits, "filtered"
 
 f = build_filter({"doc_type": "contract", "tenant_id": "evil", "year": "2025"}, "acme")

@@ -5,7 +5,7 @@ name: Observability stack
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - observability/tracing
   - observability/opentelemetry
@@ -23,108 +23,146 @@ sources:
 ---
 
 ## TL;DR
-An observability stack is the pipeline that turns every AI request into something you can query
-later: instrumentation that emits traces carrying LLM-specific attributes, a collector that redacts
-and samples, separate stores for traces, metrics and payloads, an analysis layer where scores and
-evaluations attach to traces, and alerting on top. It is a stack because each layer has a different
-owner, retention rule and cost. The deep topics live in the Observability module; this lesson is how
-they fit together as a platform.
+An AI observability stack turns every request into queryable data: LLM-aware traces, a collector that
+redacts and samples, separate stores for traces, metrics and payloads, analysis tools where scores attach
+to traces, and alerting. Each layer has its own owner, retention and cost.
 
 ## Why it exists
-A single team with one chatbot can get by with a vendor SDK that logs prompts and completions to a
-hosted dashboard. The moment there are several teams, several models and a compliance function, that
-arrangement breaks in four places at once. Each team instruments differently, so there is no way to
-answer "what did we spend on model X across the company" or "which tenants were affected by the
-provider's outage". Prompts containing customer data flow into whichever SaaS the team picked, with
-retention nobody checked. A request that crosses the gateway, the application, a retriever and three
-tool calls appears as four unrelated records in four systems. And the evaluation loop, which needs
-to pull failed traces into a dataset and re-score them, has no join key between the trace store and
-the eval tool.
-
-The naive fix, "pick one vendor and make everyone use it", solves consistency and creates lock-in:
-every span is emitted in that vendor's format, every dashboard is theirs, and migrating means
-re-instrumenting every service. The other naive fix, "reuse the existing APM stack", gives you
-latency and errors but not tokens, cost, prompt versions, judge scores or the ability to open a span
-and read the completion, because classic APM has no notion of a generation.
-
-An observability stack exists to separate the concerns: a neutral wire format at the edge so
-instrumentation is written once; a collection layer where policy (redaction, sampling, routing) is
-applied centrally; stores chosen per signal type; and LLM-specific analysis tools that consume the
-same data rather than owning it. The goal is that any alert, invoice line or quality score can be
-traced back to the exact requests behind it, across teams, without the data leaving your control.
+- **One team, one vendor SDK works; many teams break it in four places at once.**
+  - **No common answers:** each team instruments differently, so nobody can say "what did we spend on
+    model X across the company" or "which tenants did the provider outage hit".
+  - **Uncontrolled data:** prompts with customer data flow into whichever SaaS a team picked, with
+    retention nobody checked.
+  - **Fragmented requests:** one request through the gateway, application, retriever and three tool calls
+    appears as four unrelated records in four systems.
+  - **No eval join key:** pulling failed traces into a dataset and re-scoring them needs a key shared by
+    the trace store and the eval tool.
+- **"Pick one vendor for everyone" trades consistency for lock-in.** Every span is in their format, every
+  dashboard theirs, and migrating means re-instrumenting every service.
+- **"Reuse the existing APM" sees latency and errors only.** It has no tokens, cost, prompt versions,
+  judge scores or a way to open a span and read the completion, because classic APM has no notion of a
+  generation.
+- **The stack separates concerns:** a neutral wire format at the edge (instrument once), central policy
+  (redaction, sampling, routing), stores per signal, and LLM analysis tools that consume the data rather
+  than own it. Any alert, invoice line or quality score traces back to its requests, across teams, without
+  data leaving your control.
+- **Scope:** the deep topics live in the Observability module; this lesson is how they fit together as a
+  platform.
 
 ## How it works
+### The five layers
+| Layer | Job | Typical owner |
+|---|---|---|
+| 1. Instrumentation | emit spans with GenAI and platform attributes | application teams |
+| 2. Collection | redact, sample, batch, fan out | platform |
+| 3. Storage by signal | traces, metrics, payloads in separate stores | platform and data governance |
+| 4. LLM analysis and evals | trace viewer, scores, datasets | AI engineering |
+| 5. Metrics, SLOs, alerting | dashboards and pages linked to traces | SRE and product owners |
+
 ### Layer 1: instrumentation
-Applications emit traces: a tree of spans per request, with one span per model call, retrieval,
-tool call and guardrail check. OpenTelemetry is the standard SDK and wire format *because* it is
-vendor-neutral and already carries W3C trace context across HTTP and queue boundaries, which is what
-makes the gateway's span and the application's span part of one trace. The GenAI semantic
-conventions name the LLM-specific attributes: operation, provider, requested and actual model, input
-and output token counts, finish reasons, and optionally the prompt and completion content as events.
-Those conventions are still evolving and attribute names have changed between versions, so the
-platform pins a version and keeps a mapping layer. On top of the standard attributes, every span
-carries the platform's own keys: tenant, user (pseudonymous), bundle and prompt version, config
-version, and request id. These are mandatory *because* every later question is a group-by on them.
+- **Traces, one tree of spans per request:** one span per model call, retrieval, tool call and guardrail
+  check.
+- **OpenTelemetry as SDK and wire format**, *because* it is vendor-neutral and already carries W3C trace
+  context across HTTP and queue boundaries, which makes the gateway's span and the application's span one
+  trace.
+- **GenAI semantic conventions** name the LLM attributes: operation, provider, requested and actual model,
+  input and output token counts, finish reasons, and optionally prompt and completion content as events.
+- **Pin a conventions version and keep a mapping layer**, because the conventions are still evolving and
+  attribute names have changed between versions.
+- **Mandatory platform keys on every span:** tenant, user (pseudonymous), bundle and prompt version, config
+  version, request id. Mandatory *because* every later question is a group-by on them.
 
 ### Layer 2: collection
-Services send to an OpenTelemetry Collector rather than straight to a backend. The collector is where
-platform policy runs: an attributes or redaction processor strips or hashes payload fields according
-to the tenant's data classification; a tail-sampling processor keeps 100% of traces with errors, low
-scores or high latency and a small fraction of the rest; a batch processor reduces write amplification;
-exporters fan the same stream out to several backends. Centralising this exists *because* each
-application team getting redaction right independently is the thing that fails. Tail sampling, which
-decides after the trace is complete, is chosen over head sampling *because* the traces you want are
-rare and only identifiable at the end.
+Services send to an OpenTelemetry Collector, not straight to a backend. Platform policy runs there:
+1. **Redaction:** an attributes or redaction processor strips or hashes payload fields per the tenant's
+   data classification.
+2. **Tail sampling:** keep 100% of traces with errors, low scores or high latency and a small fraction of
+   the rest.
+3. **Batching:** a batch processor reduces write amplification.
+4. **Fan-out:** exporters send the same stream to several backends.
 
-Two consequences of tail sampling are easy to miss. First, "complete" means "no new spans for a
-configured wait", typically seconds, and all spans of a trace must reach the same collector instance
-(a trace-id-aware load balancer in front). An online judge score that arrives minutes later, or an
-agent session whose spans trickle in over an hour, is outside that window, so the sampler cannot use
-it; such signals need their own path, for example keeping all payloads in a short-retention hot store
-and promoting the ones a later score flags. Second, anything you *count* must be derived before the
-sampler drops spans. The collector's pipelines are ordered so that metrics (and token-usage series)
-are computed from the full stream, and only the trace export is sampled.
+- **Centralised *because*** each application team getting redaction right independently is what fails.
+- **Tail over head sampling *because*** the traces you want are rare and only identifiable once the trace
+  is complete.
+
+**Two easy-to-miss consequences of tail sampling:**
+- **"Complete" means "no new spans for a configured wait"**, typically seconds, and all spans of a trace
+  must reach the same collector instance (a trace-id-aware load balancer in front). A judge score arriving
+  minutes later, or an agent session trickling spans over an hour, is outside the window. Such signals need
+  their own path, for example keeping all payloads in a short-retention hot store and promoting the ones a
+  later score flags.
+- **Anything you *count* must be derived before the sampler drops spans.** Order the pipelines so metrics
+  and token-usage series come from the full stream; only the trace export is sampled.
 
 ### Layer 3: storage, by signal
-Three signals, three stores, chosen by cardinality and retention. **Traces** (high volume, structured,
-weeks of retention) go to a trace store. **Metrics** (low cardinality, long retention) go to a time
-series database; a spanmetrics connector in the collector derives request rate, error rate and
-latency histograms per model, bundle and tenant from the spans, so nobody hand-instruments counters.
-It does not sum attribute values, so token and cost series come from a token-usage metric emitted by
-the instrumentation (the GenAI conventions define one) or from a job over an *unsampled* copy of the
-model spans; a job over the tail-sampled trace store would undercount spend by roughly the fraction
-of normal traces discarded.
-**Payloads**, the prompts and completions, are the sensitive, bulky part and live in a store with
-their own access control and retention, referenced from spans by id. A full RAG trace with retrieved
-chunks can be tens of kilobytes; at a million requests a day that is tens of gigabytes a day
-(illustrative), which is why payload retention is a budget decision, not a default.
+Three signals, three stores, chosen by cardinality and retention:
+
+| Signal | Shape | Store | Notes |
+|---|---|---|---|
+| **Traces** | high volume, structured, weeks of retention | trace store | tail-sampled |
+| **Metrics** | low cardinality, long retention | time-series database | derived from spans, unsampled |
+| **Payloads** (prompts, completions) | sensitive, bulky | own store with its own access control and retention | referenced from spans by id |
+
+- **Span-derived metrics:** a spanmetrics connector in the collector derives request rate, error rate and
+  latency histograms per model, bundle and tenant, so nobody hand-instruments counters.
+- **It does not sum attribute values.** Token and cost series come from a token-usage metric emitted by the
+  instrumentation (the GenAI conventions define one) or a job over an *unsampled* copy of the model spans.
+  A job over the tail-sampled trace store undercounts spend by roughly the fraction of normal traces
+  discarded.
+- **Payload size is a budget decision.** A full RAG trace with retrieved chunks can be tens of kilobytes;
+  at a million requests a day that is tens of gigabytes a day (illustrative), so payload retention is not
+  a default.
 
 ### Layer 4: LLM-specific analysis and the evaluation loop
-Langfuse, LangSmith and Arize Phoenix sit here: a trace viewer that renders prompts and completions,
-sessions and users, prompt-version comparison, and, crucially, **scores** attached to traces: user
-feedback, human annotation and LLM-as-a-judge results. Scores on traces are what close the loop:
-filter traces by low score, add them to a dataset, run the candidate bundle against that dataset,
-compare. These tools increasingly accept OpenTelemetry ingestion, so they consume the same stream
-the collector exports rather than requiring their own instrumentation; whether to self-host or use
-their cloud is a data-residency decision.
+- **Tools:** Langfuse, LangSmith and Arize Phoenix: a trace viewer rendering prompts and completions,
+  sessions and users, prompt-version comparison.
+- **Scores attached to traces are the crucial part:** user feedback, human annotation and LLM-as-a-judge
+  results.
+- **The loop:** filter traces by low score → add them to a dataset → run the candidate bundle against it →
+  compare.
+- **Shared stream:** these tools increasingly accept OpenTelemetry ingestion, so they consume what the
+  collector exports instead of needing their own instrumentation. Self-host versus their cloud is a
+  data-residency decision.
 
 ### Layer 5: metrics, SLOs and alerting
-Dashboards and alerts consume the derived metrics: latency percentiles, error classes, tokens and
-cost per tenant and feature, and the behavioural proxies and judge aggregates from the monitoring
-lesson. Every alert links to a trace query *because* an alert without examples is a two-hour hunt.
+- **Inputs:** latency percentiles, error classes, tokens and cost per tenant and feature, plus behavioural
+  proxies and judge aggregates from the monitoring lesson.
+- **Every alert links to a trace query**, *because* an alert without examples is a two-hour hunt.
 
 ### What makes it a platform rather than a tool
-Trace context propagated through the gateway so cost attribution and debugging work end to end; one
-redaction policy; one set of mandatory attributes; one place where a judge score and a user's
-thumbs-down land on the same trace; and the ability to swap any backend by changing an exporter.
+- **Trace context through the gateway**, so cost attribution and debugging work end to end.
+- **One redaction policy and one set of mandatory attributes.**
+- **One place where a judge score and a user's thumbs-down land on the same trace.**
+- **Swappable backends:** change an exporter, not the instrumentation.
 
-## Example
-Instrumenting one request with the OpenTelemetry SDK: a root span for the request, child spans for
-retrieval and the model call, GenAI attributes on the model span, and the platform's mandatory keys.
-`retrieve` and `call_model` are the application's existing functions; the exporter sends to a
-collector whose address comes from the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable. The
-completion preview is a custom event rather than a semantic-convention one, because the conventions'
-content-capture names have changed several times and content capture is opt-in.
+## Diagram
+Note the fork after redaction: metrics are computed from the full stream, and only the trace export is
+tail-sampled; payloads sit in their own store, linked by reference.
+
+```mermaid
+flowchart TD
+    A["App and gateway spans, OTel SDK"] --> C["OTel Collector"]
+    A -->|"payload by ref"| PS[("Payload store, own TTL")]
+    C --> R["Redaction by data class"]
+    R --> SM["Spanmetrics, full stream"]
+    R --> TS["Tail sampling"]
+    SM --> M[("Metrics DB")]
+    TS --> T[("Trace store")]
+    T --> L["LLM analysis and scores"]
+    L -->|"low-score traces"| D[("Eval datasets")]
+    M --> AL["Alerts and SLOs"]
+    AL -.->|"link to trace query"| T
+```
+
+## Examples
+### Instrumenting one request with the OpenTelemetry SDK
+A root span for the request, child spans for retrieval and the model call, GenAI attributes on the model
+span, and the platform's mandatory keys.
+- **`retrieve` and `call_model`** are the application's existing functions.
+- **The exporter sends to a collector** whose address comes from the standard
+  `OTEL_EXPORTER_OTLP_ENDPOINT` variable.
+- **The completion preview is a custom event**, not a semantic-convention one, because the conventions'
+  content-capture names have changed several times and content capture is opt-in.
 
 ```python
 from opentelemetry import trace
@@ -160,51 +198,146 @@ def answer(question, tenant, bundle="support-assistant@41", config_version=118):
         return resp.text
 ```
 
-The collector pipeline for this stream, in prose: an OTLP receiver; a redaction processor that drops
-`preview` for tenants classified as confidential; tail sampling keeping every trace with an error
-status or latency above the budget plus a 5% sample (illustrative) of the rest; a spanmetrics
-connector producing per-model, per-bundle rate, error and latency series; and exporters to the trace
-store, the metrics database and the LLM analysis tool.
+The collector pipeline for this stream, in prose:
+1. **An OTLP receiver.**
+2. **A redaction processor** that drops `preview` for tenants classified as confidential.
+3. **Tail sampling** keeping every trace with an error status or latency above the budget plus a 5% sample
+   (illustrative) of the rest.
+4. **A spanmetrics connector** producing per-model, per-bundle rate, error and latency series.
+5. **Exporters** to the trace store, the metrics database and the LLM analysis tool.
+
+### The same pipeline as Collector configuration
+A sketch using components from the OpenTelemetry Collector contrib distribution; check field names against
+the collector version you run. Two trace pipelines read the same receiver: one feeds spanmetrics from the
+full stream, the other tail-samples for storage.
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc: {}
+      http: {}
+processors:
+  attributes/redact:              # span attributes; event-level redaction needs the transform processor
+    actions:
+      - key: enduser.id
+        action: hash
+      - key: app.raw_prompt
+        action: delete
+  tail_sampling:
+    decision_wait: 10s            # "complete" = no new spans for this long
+    policies:
+      - name: errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: slow
+        type: latency
+        latency: {threshold_ms: 8000}
+      - name: baseline
+        type: probabilistic
+        probabilistic: {sampling_percentage: 5}
+  batch: {}
+connectors:
+  spanmetrics:
+    dimensions:                   # bounded-cardinality labels only
+      - name: gen_ai.request.model
+      - name: app.bundle
+exporters:
+  otlphttp/traces:
+    endpoint: https://traces.internal.example:4318
+  prometheusremotewrite:
+    endpoint: https://metrics.internal.example/api/v1/write
+service:
+  pipelines:
+    traces/all:                   # unsampled: every span counts toward metrics
+      receivers: [otlp]
+      processors: [attributes/redact, batch]
+      exporters: [spanmetrics]
+    traces/sampled:
+      receivers: [otlp]
+      processors: [attributes/redact, tail_sampling, batch]
+      exporters: [otlphttp/traces]
+    metrics:
+      receivers: [spanmetrics]
+      processors: [batch]
+      exporters: [prometheusremotewrite]
+```
+
+### Worked numbers: payload budget and the sampled-cost trap
+Illustrative platform: 1,000,000 requests a day, 30 KB average payload, 2% of traces with errors or slow.
+
+| Quantity | Calculation | Result |
+|---|---|---|
+| Payload volume | 1,000,000 × 30 KB | ~30 GB a day |
+| 90-day payload retention | 30 GB × 90 | ~2.7 TB |
+| Traces kept by tail sampling | 2% + 5% of the other 98% | ~6.9% of traces |
+| Cost job run on the trace store | sees ~6.9% of calls, skewed to slow, expensive ones | attributed spend far below the invoice and shifts whenever sampling changes |
+| Cost from a token-usage metric on the full stream | every call counted before sampling | matches the invoice within pricing error |
+
+## Production patterns
+- **Trace-aware load balancing in front of tail samplers.** Run a first collector tier with the
+  `loadbalancing` exporter routing by trace id, so every span of a trace reaches the same sampling
+  instance. Monitor late-arriving spans and sampling-decision counts per policy.
+- **Token usage as a metric, not a trace query.** Emit the GenAI conventions' client token-usage histogram
+  (`gen_ai.client.token.usage`) from instrumentation, labelled by model and token type, and price it in the
+  metrics layer. Monitor the gap between attributed spend and the provider invoice each month.
+- **Payload store with per-tenant TTL.** Write prompts and completions to object storage or a database
+  keyed by a reference id, with retention set by data classification; spans carry only the reference.
+  Monitor payload bytes per tenant per day and expired-object deletion lag.
+- **Opt-in content capture.** Leave prompt and completion capture off by default in instrumentation
+  libraries (they gate it behind an explicit setting) and enable it per service after a data review.
+  Monitor which services have it on.
+- **Scores written back by trace id.** Analysis tools such as Langfuse attach scores to a trace id; have
+  the online judge and the feedback endpoint write scores keyed by the same id the gateway generated.
+  Monitor the share of scores that join to a stored trace.
+- **Mandatory-attribute contract test.** A CI test runs the service against a stub model and asserts every
+  model span carries tenant, bundle and config version; dashboards track the share of production model
+  spans missing them. Monitor that share; above zero means attribution is leaking.
 
 ## Trade-offs
-- OpenTelemetry keeps instrumentation vendor-neutral and composable, but vendor SDKs capture richer
-  LLM detail with less code; the balance tips toward the SDK only for a single team with one tool
-  and no residency constraints.
-- Tail sampling keeps every interesting trace at the cost of buffering whole traces in the collector,
-  which needs memory and sticky routing; head sampling is cheap but throws away the errors you wanted.
-- Storing full prompts and completions makes any incident reproducible but creates a sensitive store
-  with retention and access obligations; hashing or short previews trade debuggability for safety,
-  and the right answer differs per tenant classification.
-- Deriving metrics from spans removes hand-written counters and guarantees consistency, but the
-  cardinality of the labels you allow (tenant × bundle × model) sets the metrics bill.
-- Self-hosting the analysis tool keeps data in your boundary but adds an operational surface; the
-  vendor cloud is simpler until the first customer asks where their prompts are stored.
+- **OpenTelemetry vs vendor SDKs.** OTel keeps instrumentation neutral and composable; vendor SDKs capture
+  richer LLM detail with less code. The SDK wins only for a single team with one tool and no residency
+  constraints.
+- **Tail vs head sampling.** Tail keeps every interesting trace but buffers whole traces in the collector,
+  needing memory and sticky routing; head sampling is cheap but throws away the errors you wanted.
+- **Full payloads vs safety.** Storing prompts and completions makes incidents reproducible but creates a
+  sensitive store with obligations; hashing or short previews trade debuggability for safety, differently
+  per tenant classification.
+- **Span-derived metrics: consistency vs cardinality bill.** No hand-written counters, but the labels you
+  allow (tenant × bundle × model) set the metrics bill.
+- **Self-hosted vs cloud analysis tool.** Self-hosting keeps data in your boundary but adds an operational
+  surface; the vendor cloud is simpler until the first customer asks where their prompts are stored.
 
 ## Pitfalls
-- Breaking trace context at the gateway or a queue; the symptom is cost attributed to "unknown" and
-  model spans with no parent, so a slow request cannot be followed end to end.
-- Logging prompts as text lines in the application logger; the symptom is customer data in the log
-  SaaS, discovered during a retention audit, with no per-tenant redaction possible.
-- Using user id or request id as a metric label; the symptom is the metrics database running out of
-  memory or the vendor bill multiplying as series count explodes.
-- Head sampling at a flat percentage; the symptom is an error-rate alert with no example traces,
-  because the failures were in the discarded 90%.
-- Mandatory attributes left optional; the symptom is a regression visible in aggregate but not
-  attributable to a bundle or prompt version, so rollback becomes guesswork.
-- Judge scores stored in the eval tool without the trace id; the symptom is a quality dashboard that
-  cannot be joined to the requests it describes.
-- Computing cost or volume from the sampled trace store; the symptom is attributed spend that is a
-  small, unstable fraction of the invoice and moves whenever someone changes the sampling rate.
+- **Breaking trace context at the gateway or a queue.** Symptom: cost attributed to "unknown" and model
+  spans with no parent, so a slow request cannot be followed end to end. Fix: propagate W3C trace context
+  everywhere.
+- **Logging prompts as text lines in the application logger.** Symptom: customer data in the log SaaS,
+  discovered during a retention audit, with no per-tenant redaction possible. Fix: payload store plus
+  collector redaction.
+- **User id or request id as a metric label.** Symptom: the metrics database runs out of memory or the
+  vendor bill multiplies as series count explodes. Fix: keep those in traces.
+- **Head sampling at a flat percentage.** Symptom: an error-rate alert with no example traces, because the
+  failures were in the discarded 90%. Fix: tail sampling with error and latency policies.
+- **Mandatory attributes left optional.** Symptom: a regression visible in aggregate but not attributable
+  to a bundle or prompt version, so rollback becomes guesswork. Fix: contract tests.
+- **Judge scores stored without the trace id.** Symptom: a quality dashboard that cannot be joined to the
+  requests it describes. Fix: write scores keyed by trace id.
+- **Computing cost or volume from the sampled trace store.** Symptom: attributed spend that is a small,
+  unstable fraction of the invoice and moves whenever someone changes the sampling rate. Fix: an
+  unsampled token-usage metric.
 
 ## When to use
-Build the stack, rather than adopting one tool, as soon as a second team, a second model provider or
-a compliance requirement appears; before that, a single LLM-tracing tool with OpenTelemetry under it
-is enough and migrates cleanly later. Start with tracing through the gateway and the mandatory
-attributes, then the collector with redaction, then derived metrics and scores. Measure the stack by
-the share of model spend that is attributed to a tenant and feature, the time from an alert to an
-example trace, and whether a judge score can be joined to its request. In interviews, be ready to
-draw the five layers and justify two choices: why the collector is where redaction and sampling
-live, and why payloads are stored separately from spans.
+- **Build the stack, not one tool,** as soon as a second team, a second model provider or a compliance
+  requirement appears.
+- **Before that,** a single LLM-tracing tool with OpenTelemetry under it is enough and migrates cleanly
+  later.
+- **Order:** tracing through the gateway and mandatory attributes, then the collector with redaction, then
+  derived metrics and scores.
+- **Measure:** share of model spend attributed to a tenant and feature, time from an alert to an example
+  trace, and whether a judge score joins to its request.
+- **Interviews:** draw the five layers and justify two choices: why redaction and sampling live in the
+  collector, and why payloads are stored separately from spans.
 
 ## Role lens
 - **Engineer:** Instruments model, retrieval and tool calls with the standard attributes, propagates
@@ -231,6 +364,39 @@ and the payload store: if account numbers are redacted before export for the rel
 the answer is a configuration document plus a query over the payload store for that tenant's
 retention window. If prompts were logged as plain log lines in a third-party log service, there is no
 reliable answer, which is the failure the stack exists to prevent.
+
+## Interview questions
+### Why put an OpenTelemetry Collector between services and backends?
+- **Central policy:** redaction, sampling and routing run once, instead of every team reimplementing them
+  and some getting it wrong.
+- **Fan-out and portability:** the same stream goes to the trace store, metrics database and LLM analysis
+  tool, and swapping a backend is an exporter change.
+- **Correct ordering:** metrics can be derived from the full stream before tail sampling drops traces.
+
+### Your error-rate alert fires but there are no example traces. What went wrong?
+- **Likely head sampling:** a flat percentage decided at request start discarded most failures.
+- **Or a broken tail-sampling setup:** spans of one trace spread across collector instances, so no instance
+  saw the error span with its trace.
+- **Fix:** tail sampling with error and latency policies behind a trace-id-aware load balancer, and link
+  each alert to a trace query.
+
+### How do you design payload storage for prompts and completions?
+- **Separate store, referenced from spans by id**, because payloads are bulky and sensitive.
+- **Retention and access per data classification:** for example short TTL and redaction for confidential
+  tenants; spans keep only the pointer.
+- **Budget it:** at a million requests a day and tens of kilobytes each, payloads are tens of gigabytes a
+  day (illustrative), so retention is a cost decision.
+
+### Attributed spend is 30% below the invoice. What are the candidate causes?
+- **Missing attributes:** spans without tenant or bundle, so mandatory keys are not enforced.
+- **Bypass:** calls made outside the gateway with their own keys.
+- **Measurement:** cost computed from the tail-sampled trace store, or SDK retries hidden below one span.
+
+### When is a single vendor SDK the right call instead of a full stack?
+- **One team, one tool, no residency constraints:** the SDK captures richer LLM detail with less code.
+- **Keep an exit:** use OpenTelemetry underneath where possible, so moving to the full stack later is a
+  configuration change rather than re-instrumentation.
+- **Switch** when a second team, a second provider or a compliance requirement appears.
 
 ## Quiz
 ### Q: Why does a platform route telemetry through an OpenTelemetry Collector instead of exporting directly from each service to the backend?

@@ -5,7 +5,7 @@ name: Spans
 kind: concept
 difficulty: core
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - observability/tracing
   - observability/distributed-tracing-across-services
@@ -18,110 +18,128 @@ sources:
 ---
 
 ## TL;DR
-A span is the unit a trace is built from: one named operation with a start time, an end time, a
-parent, a status and a set of attributes, plus optional timestamped events. Traces are only as useful
-as their spans, so the real skill is choosing span boundaries that match the questions you will ask,
-and recording the attributes (model, tokens, chunk ids, tool arguments) that let a span be filtered,
-aggregated and understood on its own.
+A span is one named, timed operation with a parent, a status, attributes and optional events. Traces are
+only as useful as their spans, so the skill is choosing boundaries that match your questions and
+recording attributes that make each span filterable on its own.
 
 ## Why it exists
-Once you accept that a request should be recorded as a tree, you need a unit for the nodes. That
-unit has to do three jobs at once. It must carry *timing*, so durations can be summed and compared.
-It must carry *structure*, a parent reference, so trees can be assembled from pieces emitted by
-different code paths, threads or services that never see each other. And it must carry *meaning*:
-enough attributes that a span can be found and interpreted without reading the code that emitted it.
-
-The naive units each fail one of those jobs. A single span per request has timing but no
-attribution: you learn the turn took 6 s and nothing about why. A span per function call, as a
-profiler would produce, has structure but no meaning: hundreds of nameless frames, none of which say
-"this was the reranker" or "this generation hit max tokens". Plain log lines have meaning but neither
-duration nor a reliable parent.
-
-LLM applications sharpen the requirement because the operations that matter are not functions in
-the profiler sense. "One generation", "one retrieval", "one tool call", "one agent iteration" are
-semantic units whose interesting properties (which model, how many tokens, which documents, what
-arguments, why it stopped) are data, not code locations. Spans are the container that lets you attach
-that data to a timed, nested operation, and the conventions around them are what let spans from
-different teams and libraries land in one backend and still be comparable.
+- **A trace tree needs a node unit that does three jobs.** *Timing*, so durations can be summed and
+  compared. *Structure*, a parent reference, so trees assemble from pieces emitted by code paths, threads
+  or services that never see each other. *Meaning*, enough attributes to find and interpret the span
+  without reading the code that emitted it.
+- **One span per request has timing but no attribution.** You learn the turn took 6 s and nothing about
+  why.
+- **One span per function call has structure but no meaning.** A profiler-style tree is hundreds of
+  nameless frames, none saying "this was the reranker" or "this generation hit max tokens".
+- **Plain log lines have meaning but** neither duration nor a reliable parent.
+- **LLM operations are semantic units.** "One generation", "one retrieval", "one tool call", "one agent
+  iteration" have properties (which model, how many tokens, which documents, what arguments, why it
+  stopped) that are data, not code locations. Spans attach that data to a timed, nested operation, and
+  shared conventions let spans from different teams and libraries stay comparable in one backend.
 
 ## How it works
 ### Anatomy of a span
-Every tracing system converges on roughly the same fields; OpenTelemetry's names are used here
-because they are the lingua franca.
-- `trace_id` (128-bit) shared by the whole request, and `span_id` (64-bit) unique to this span.
-- `parent_span_id`, empty for the root. This single field turns a bag of spans into a tree.
-- `name`: a low-cardinality label for the *operation*, such as `generation`, `retrieval.hybrid`,
-  `tool.get_order`. Low cardinality *because* names are what you group and compare by; a name that
-  embeds a user id makes every span unique and aggregation impossible.
-- `start_time`, `end_time`: duration is derived, never stored. Clock skew between services therefore
-  shows up as children that appear to start before their parent.
-- `kind`: `INTERNAL`, `CLIENT`, `SERVER`, `PRODUCER`, `CONSUMER`. It tells the backend which side of a
-  network call the span represents, so the gap between a client span and its matching server span can
-  be read as network and queueing time.
-- `status`: unset, `OK`, or `ERROR` with a description. Recording an exception on a span does not by
-  itself mark it failed; you set the status, *because* a caught, retried failure inside an otherwise
-  successful operation should not paint the operation red. OpenTelemetry's convention is that
-  libraries leave a successful span `UNSET` and only application code asserts `OK`, so backends treat
-  "not error" as success.
-- `attributes`: key-value pairs with primitive or array values. This is where LLM semantics live.
-- `events`: timestamped points inside the span, each with its own attributes, for things that happen
-  *during* an operation but are not operations themselves: first token received, retry attempted,
-  cache hit decided.
-- `links`: references to spans in other traces, for fan-in cases such as a batch job that processes
-  messages originating from many requests.
+Every tracing system converges on roughly the same fields; OpenTelemetry's names are used because they
+are the lingua franca.
+
+| Field | What it is | Why it matters |
+|---|---|---|
+| `trace_id` / `span_id` | 128-bit id shared by the request / 64-bit id unique to this span | groups spans into one request |
+| `parent_span_id` | empty for the root | this single field turns a bag of spans into a tree |
+| `name` | low-cardinality operation label: `generation`, `retrieval.hybrid`, `tool.get_order` | names are what you group and compare by; one embedding a user id makes every span unique and aggregation impossible |
+| `start_time`, `end_time` | duration is derived, never stored | so clock skew between services shows up as children starting before their parent |
+| `kind` | `INTERNAL`, `CLIENT`, `SERVER`, `PRODUCER`, `CONSUMER` | tells the backend which side of a network call this is, so the client-to-server gap reads as network and queueing time |
+| `status` | unset, `OK`, or `ERROR` with a description | see below |
+| `attributes` | key-value pairs with primitive or array values | where LLM semantics live |
+| `events` | timestamped points inside the span, with their own attributes | things that happen *during* an operation: first token received, retry attempted, cache hit decided |
+| `links` | references to spans in other traces | fan-in, such as a batch job processing messages from many requests |
+
+- **Recording an exception does not mark the span failed;** you set the status, *because* a caught,
+  retried failure inside an otherwise successful operation should not paint it red.
+- **OpenTelemetry's convention:** libraries leave a successful span `UNSET` and only application code
+  asserts `OK`, so backends treat "not error" as success.
 
 ### Lifecycle and context
-A span is started, becomes "current" for the code running beneath it, is enriched, and is ended
-exactly once. "Current" lives in a context (a `ContextVar` in Python, `AsyncLocalStorage` in Node) so
-a child started anywhere downstream can discover its parent. The end must happen on every exit path,
-which is why idiomatic APIs are context managers or decorators: a span that is never ended never
-exports, and the trace then looks truncated at exactly the step that failed, the one you most wanted.
+1. **Start** the span.
+2. **Make it current** for the code beneath it. "Current" lives in a context (a `ContextVar` in Python,
+   `AsyncLocalStorage` in Node), so a child started anywhere downstream discovers its parent.
+3. **Enrich** it with attributes and events.
+4. **End it exactly once, on every exit path.** That is why idiomatic APIs are context managers or
+   decorators: a span never ended never exports, and the trace looks truncated at exactly the failing
+   step, the one you most wanted.
 
-Ending a span freezes it. Attributes set afterwards are dropped (the SDK at most logs a warning),
-which bites streaming code hardest: if a function opens a span, starts a provider stream and returns
-the iterator, the span ends when the function returns, milliseconds in, while the tokens, the
-first-token time and the usage all arrive later during iteration. The span must stay open until the
-stream is exhausted, so wrap the iteration itself (a generator that holds the span) rather than the
-call that creates the stream.
+### The streaming trap
+- **Ending a span freezes it.** Attributes set afterwards are dropped (the SDK at most logs a warning).
+- **Streaming hits this hardest.** If a function opens a span, starts a provider stream and returns the
+  iterator, the span ends when the function returns, milliseconds in. Tokens, first-token time and usage
+  all arrive later, during iteration.
+- **Fix:** keep the span open until the stream is exhausted by wrapping the iteration itself (a generator
+  that holds the span), not the call that creates the stream.
 
-Finished spans go to a *span processor*. A simple processor exports synchronously as each span ends,
-which is fine for a demo and puts the exporter's network call on your request path in production. A
-batch processor queues ended spans and exports them in the background, *because* tracing must never
-add the backend's latency to the user's; the cost is that its queue is bounded, so under overload or a
-dead backend it drops spans rather than block, and an abrupt process exit loses whatever was still
-queued unless the provider is shut down (flushed) on exit.
+### Span processors
+| Processor | Behaviour | Use |
+|---|---|---|
+| **Simple** | exports synchronously as each span ends | demos; in production it puts the exporter's network call on your request path |
+| **Batch** | queues ended spans, exports in the background | production, *because* tracing must never add the backend's latency to the user's |
+
+- **Batch cost:** the queue is bounded, so under overload or a dead backend it drops spans rather than
+  block.
+- **Abrupt exit loses** whatever was still queued unless the provider is shut down (flushed) on exit.
 
 ### Attributes for LLM spans
-What to record follows from the questions you will ask. For a generation span: provider, model id,
-request parameters (temperature, max tokens, tool choice), input and output token counts, finish
-reason, time to first token as an event, and the prompt and completion either inline or as a
-reference to a blob. For retrieval: the query, the index name, top-k, the returned ids and scores. For
-a tool call: tool name, the arguments as the model produced them, result size and status, and whether
-an approval gate fired. OpenTelemetry publishes generative-AI semantic conventions (attribute names
-prefixed `gen_ai.`) that standardise these; at the time of writing they were still marked
-experimental, so check the exact names against the current specification rather than memorising them.
+What to record follows from the questions you will ask:
+- **Generation:** provider, model id, request parameters (temperature, max tokens, tool choice), input
+  and output token counts, finish reason, time to first token as an event, and the prompt and completion
+  inline or as a reference to a blob.
+- **Retrieval:** the query, index name, top-k, returned ids and scores.
+- **Tool call:** tool name, the arguments as the model produced them, result size and status, and
+  whether an approval gate fired.
+- **Conventions:** OpenTelemetry publishes generative-AI semantic conventions (attribute names prefixed
+  `gen_ai.`). At the time of writing they were still marked experimental, so check exact names against
+  the current specification rather than memorising them.
 
 ### Events versus child spans
-If the thing has a duration you care about on its own, make it a child span; if it is an instant,
-make it an event. "Waiting for the first token" is a duration, but it is part of the generation, so
-most teams record a `first_token` event on the generation span and derive TTFT as event time minus
-span start. A retry is normally a new child span *because* you want its own status and duration.
+- **Rule:** a duration you care about on its own is a child span; an instant is an event.
+- **First token:** "waiting for the first token" is a duration but part of the generation, so most teams
+  record a `first_token` event on the generation span and derive TTFT as event time minus span start.
+- **Retry:** normally a new child span, *because* you want its own status and duration.
 
 ### Size and cardinality
-Attributes are indexed and sometimes turned into metrics; events and payloads are stored but rarely
-indexed. Putting a 40 KB prompt into an attribute is tolerated by LLM-focused backends and punished by
-general-purpose ones. Putting a free-text value into a *name*, or into any label used for
-aggregation, is punished everywhere. The rule: identifiers and enums as attributes, bulky text as
-payload or by reference, nothing per-user in names.
+- **Attributes are indexed** and sometimes turned into metrics; events and payloads are stored but rarely
+  indexed.
+- **A 40 KB prompt in an attribute** is tolerated by LLM-focused backends and punished by general-purpose
+  ones.
+- **Free text in a name,** or any label used for aggregation, is punished everywhere.
+- **Rule:** identifiers and enums as attributes, bulky text as payload or by reference, nothing per-user
+  in names.
 
-## Example
-A streaming generation instrumented with the OpenTelemetry SDK. The console exporter prints two
-spans sharing one `trace_id`; the `generation` span has the root's id as its parent, carries model
-and usage attributes, and holds a `first_token` event from which TTFT can be derived. The span is
-held open across the whole iteration of the stream, which is why its duration and usage are real. The attribute
-names follow the `gen_ai.` conventions; verify them against the current spec before relying on them.
-`start_as_current_span` already records uncaught exceptions and sets the error status; the explicit
-handler is there to show the mechanism.
+## Diagram
+A span's lifecycle: once ended it is frozen and handed to a processor, so late attributes are lost.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Started: start_as_current_span
+    Started --> Current: context attached
+    Current --> Current: set_attribute, add_event
+    Current --> Ended: end on every exit path
+    Ended --> Ended: late set_attribute dropped
+    Ended --> Queued: batch processor
+    Queued --> Exported: background export
+    Queued --> Dropped: queue full or no flush on exit
+    Exported --> [*]
+```
+
+## Examples
+### A streaming generation with the OpenTelemetry SDK
+- **Output:** the console exporter prints two spans sharing one `trace_id`. The `generation` span has the
+  root's id as its parent, carries model and usage attributes, and holds a `first_token` event from which
+  TTFT can be derived.
+- **The span stays open across the whole iteration of the stream,** which is why its duration and usage
+  are real.
+- **Attribute names follow the `gen_ai.` conventions;** verify them against the current spec before
+  relying on them.
+- **`start_as_current_span` already records uncaught exceptions** and sets the error status; the explicit
+  handler is there to show the mechanism.
 
 ```python
 import time
@@ -165,47 +183,97 @@ with tracer.start_as_current_span("chat.turn") as root:
     print(generate("Where is my order?"))
 ```
 
+### Production snippet: a span that lives as long as the stream
+When the caller must receive the iterator (a web framework streaming tokens to the client), make the
+wrapper itself a generator. `start_span` does not make the span current, so no context is left attached
+across `yield`; `finally` ends it even if the client disconnects and the generator is closed.
+
+```python
+from opentelemetry.trace import Status, StatusCode
+
+def traced_stream(tracer, make_stream, model):
+    span = tracer.start_span("generation")         # parent = context current at first next()
+    span.set_attribute("gen_ai.request.model", model)
+    first, n = True, 0
+    try:
+        for tok in make_stream():
+            if first:
+                span.add_event("first_token"); first = False
+            n += 1
+            yield tok
+        span.set_attribute("gen_ai.usage.output_tokens", n)   # real code: provider usage
+        span.set_status(Status(StatusCode.OK))
+    except Exception as e:
+        span.record_exception(e)
+        span.set_status(Status(StatusCode.ERROR, str(e)))
+        raise
+    finally:
+        span.end()                                  # runs on exhaustion, error or close()
+```
+
+| Version | Generation span duration | Usage and first token |
+|---|---|---|
+| Span around the call that returns the stream | a few ms | missing: set after the span ended |
+| `traced_stream` around the iteration | full stream time | recorded |
+
+## Production patterns
+- **Batch processor, flushed on shutdown.** Use `BatchSpanProcessor` in every service and call
+  `provider.shutdown()` (or `force_flush()`) in the process exit hook, because the queue is in memory.
+  Tune queue size and export delay through the standard `OTEL_BSP_*` environment variables. Monitor
+  dropped-span counts and exporter errors.
+- **Attribute limits as a guardrail.** Set the SDK's attribute value length limit (for example via
+  `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT`) so an accidental inline prompt is truncated instead of exploding
+  the backend. Monitor bytes per span.
+- **A naming registry.** Keep an allowlist of span names (`generation`, `retrieval.hybrid`,
+  `tool.<name>`) and fail a CI test or lint when code emits a name containing digits or ids. Monitor the
+  count of distinct span names per service; a sudden jump means an id leaked into a name.
+- **Attempt spans under an aggregate.** For retries, one `generation` parent with `attempts=N` and one
+  child per attempt carrying its provider request id and status. Monitor attempts per generation as a
+  leading indicator of provider overload.
+- **Status agreement check.** Periodically compare the count of `status=ERROR` spans per operation with
+  your error-rate metric for the same window. Monitor the gap; it reveals missing `set_status` calls.
+
 ## Trade-offs
-- Fine-grained spans give precise attribution, but each span costs export bandwidth and storage and
-  adds a little overhead; it flips to coarser spans when the operation is sub-millisecond or runs
+- **Fine-grained spans vs overhead.** Precise attribution, but each span costs export bandwidth, storage
+  and a little overhead. It flips to coarser spans when the operation is sub-millisecond or runs
   thousands of times per request (tokenisation, per-chunk scoring).
-- Inline prompts and completions make a span self-contained for debugging, but they bloat the trace
-  store and spread PII; it flips to by-reference storage once volume or a compliance review makes the
-  trace backend the largest copy of user data you hold.
-- Rich attributes make spans filterable and aggregatable, but every attribute you index costs backend
-  resources; it flips when an attribute's cardinality approaches the number of requests, at which
-  point the value belongs in the payload, not the index.
-- Events are cheaper than child spans and keep the tree readable, but they have no duration or status
-  of their own; it flips to a child span the moment you need to chart or alert on that sub-step's
-  latency or failure rate.
+- **Inline payloads vs PII and bloat.** Inline prompts and completions make a span self-contained, but
+  bloat the trace store and spread PII. It flips to by-reference storage once volume or a compliance
+  review makes the trace backend the largest copy of user data you hold.
+- **Rich attributes vs index cost.** Spans become filterable and aggregatable, but every indexed attribute
+  costs backend resources. It flips when an attribute's cardinality approaches the number of requests; the
+  value then belongs in the payload, not the index.
+- **Events vs child spans.** Events are cheaper and keep the tree readable but have no duration or status
+  of their own. It flips to a child span the moment you need to chart or alert on that sub-step's latency
+  or failure rate.
 
 ## Pitfalls
-- Ending spans only on the happy path; the symptom is traces that stop exactly at the failing step,
-  so the span you needed most is missing rather than marked as an error.
-- Starting a child span in a thread-pool worker, or in a background task created before the parent
-  span became current, without carrying context; the symptom is a single-span trace with no parent
-  appearing at the same moment the real trace shows an unexplained gap.
-- Encoding dynamic values in span names (`tool.get_order_88213`); the symptom is a backend listing
-  thousands of distinct operations with one data point each, so no latency chart is possible.
-- Recording an exception without setting the status, or the reverse; the symptom is error-rate
-  dashboards that disagree with the exceptions visible in the trace detail.
-- Wrapping the function that *creates* a provider stream instead of the loop that consumes it; the
-  symptom is generation spans lasting a few milliseconds with no usage or first-token event while the
-  root span takes seconds.
-- Shipping the simple (synchronous) span processor to production; the symptom is request latency that
-  rises whenever the trace backend is slow, and requests that hang when it is down.
-- Capturing the prompt *template* instead of the rendered prompt; the symptom is a span that cannot
-  reproduce the model's behaviour because the variables, truncation and history are missing.
+- **Ending spans only on the happy path.** Symptom: traces stop exactly at the failing step, so the span
+  you needed most is missing rather than marked as an error.
+- **Child spans in a thread-pool worker or early-created background task without context.** Symptom: a
+  single-span trace with no parent appears at the same moment the real trace shows an unexplained gap.
+- **Dynamic values in span names (`tool.get_order_88213`).** Symptom: thousands of distinct operations
+  with one data point each, so no latency chart is possible.
+- **Recording an exception without setting the status, or the reverse.** Symptom: error-rate dashboards
+  that disagree with the exceptions visible in trace detail.
+- **Wrapping the function that *creates* a provider stream instead of the loop that consumes it.**
+  Symptom: generation spans of a few milliseconds with no usage or first-token event while the root takes
+  seconds.
+- **Shipping the simple (synchronous) span processor to production.** Symptom: latency rises whenever the
+  trace backend is slow, and requests hang when it is down.
+- **Capturing the prompt *template* instead of the rendered prompt.** Symptom: the span cannot reproduce
+  the model's behaviour because variables, truncation and history are missing.
 
 ## When to use
-Create a span whenever a unit of work has a duration, a success or failure outcome, or data you will
-want to filter by later; in an LLM app that is every model call, retrieval, reranking pass, tool call
-and agent iteration, plus the user-facing turn as the root. Do not create spans for pure functions
-that take microseconds, or for loops with thousands of iterations; use one span with counts in its
-attributes. Measure spans per trace and bytes per span to keep the trace store honest, and check that
-`status=ERROR` on spans agrees with your error metrics. Interviewers probe this by asking what
-attributes you would put on a generation span and why, and whether a retry should be an event or a
-child span; the answer should be reasoned from the questions you will ask of the data.
+- **Use a span** whenever work has a duration, a success or failure outcome, or data you will filter by:
+  every model call, retrieval, reranking pass, tool call and agent iteration, plus the user-facing turn as
+  the root.
+- **Avoid** spans for pure functions taking microseconds, or loops with thousands of iterations; use one
+  span with counts in its attributes.
+- **Measure** spans per trace and bytes per span to keep the trace store honest, and check that
+  `status=ERROR` on spans agrees with your error metrics.
+- **Interviews:** expect "what attributes go on a generation span, and why" and "is a retry an event or a
+  child span"; reason the answer from the questions you will ask of the data.
 
 ## Role lens
 - **Engineer:** Writes the `start_as_current_span` blocks, decides what goes in attributes versus events
@@ -230,6 +298,36 @@ attributes taken from the successful attempt, an `attempts=2` attribute, and sta
 the operation the caller asked for succeeded. Marking the parent as an error would make the error
 rate count a recovered failure as user-visible, while hiding the retry entirely would leave the
 latency unexplainable.
+
+## Interview questions
+### What fields does a span have, and which one makes a trace a tree?
+- **Fields:** trace id, span id, parent span id, name, start and end time, kind, status, attributes,
+  events and links.
+- **The tree comes from the parent span id** together with the shared trace id; names and timestamps
+  describe spans but cannot establish containment, especially across services.
+
+### Your generation spans show 3 ms durations and no token usage, but users wait seconds. What happened?
+- **Likely cause:** the span wraps the function that creates the provider stream, so it ends when the
+  iterator is returned and later attributes are dropped.
+- **Fix:** hold the span in a generator around the iteration and end it in `finally`, so duration, the
+  first-token event and usage are recorded.
+
+### When would you make something an event instead of a child span?
+- **Events for instants inside an operation:** first token, cache hit decided, a guardrail decision.
+  They are cheap and keep the tree readable.
+- **Child spans when you will chart or alert on it:** a retry attempt or a rerank call has its own
+  duration, status and request id, so it needs to be a span.
+
+### Why must span names be low-cardinality, and where do identifiers go?
+- **Names are the grouping key:** backends compute latency percentiles and error rates per name, so an
+  order id in the name yields thousands of one-sample series.
+- **Identifiers go in attributes,** and bulky text such as prompts goes to a payload store by reference.
+
+### A service's p99 latency jumps every time the tracing backend is degraded. Why, and what do you change?
+- **It is exporting synchronously:** the simple span processor puts the export network call on the
+  request path.
+- **Switch to the batch processor,** which exports in the background and drops spans when its bounded
+  queue fills instead of blocking, and flush it on shutdown so exits do not lose the queue.
 
 ## Quiz
 ### Q: What single field turns a set of independently emitted spans into a trace tree?

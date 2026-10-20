@@ -5,7 +5,7 @@ name: Stakeholder management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - strategy/stakeholder-alignment
   - adoption/exec-communication
@@ -17,85 +17,124 @@ related:
 ---
 
 ## TL;DR
-Stakeholder management is the ongoing work of knowing who can help, block or be affected by an AI
-deployment, what each of them needs to see, and engaging them on purpose rather than by accident. It
-exists because AI projects often stall for reasons that have nothing to do with the model: when a security reviewer, data owner or
-team lead who was never engaged says no late, or when a sponsor's expectations drift away from what the
-system can deliver.
+Stakeholder management means knowing who can help, block or be affected by an AI deployment and engaging
+each on purpose, because AI projects often stall on a late "no" from someone never engaged, not on the
+model.
 
 ## Why it exists
-An enterprise AI deployment touches more groups than most software projects. The sponsor funds it, a
-process owner's team uses it, IT runs the integration, security and legal review the data flow, a data
-owner controls access to the source systems, procurement handles the contract, and in some regions a works
-council or union must be consulted when work changes. Each can slow or stop the project, and each defines
-success differently: the sponsor wants a business metric, the users want less tedium and no blame,
-security wants no new exposure, the data owner wants no surprises.
-
-AI raises the stakes in two ways. First, sending company data to a model triggers reviews (data
-classification, residency, vendor risk) that ordinary tools may not, and those reviewers have real veto
-power. Second, quality is probabilistic, so expectations need active management: a sponsor who heard
-"it works" in the demo will treat a 5% error rate as a failure unless someone set that expectation early.
-
-The naive approach, talking mostly to the sponsor and the friendly champion, fails because it optimizes
-for the people already on your side. Blockers are discovered when they block, typically at the security
-review or the go-live decision, when changes are most expensive. Treating everyone the same (a weekly
-update email to all) fails too: it is noise to most readers and too shallow for the few who decide.
+- **AI deployments touch many groups.** The sponsor funds it, a process owner's team uses it, IT runs the
+  integration, security and legal review the data flow, a data owner controls source-system access,
+  procurement handles the contract, and in some regions a works council or union must be consulted when
+  work changes.
+- **Each can slow or stop the project, and each defines success differently.** The sponsor wants a
+  business metric, users want less tedium and no blame, security wants no new exposure, the data owner
+  wants no surprises.
+- **Sending company data to a model triggers reviews** (data classification, residency, vendor risk) that
+  ordinary tools may not, and those reviewers have real veto power.
+- **Probabilistic quality needs expectation management.** A sponsor who heard "it works" in the demo will
+  treat a 5% error rate as a failure unless someone set that expectation early; expectations drift away
+  from what the system can deliver.
+- **The naive approaches fail.** Talking mostly to the sponsor and friendly champion optimizes for people
+  already on your side, so blockers surface when they block (at the security review or go-live, when
+  changes cost most). A weekly email to everyone is noise to most and too shallow for the few who decide.
 
 ## How it works
 ### 1. Identify everyone, including the quiet vetoes
-List people and groups, not departments. For each, ask: can they approve, block, fund, or are they
-affected? Probe specifically for the roles AI projects forget: data owners, security, privacy, legal,
-compliance, IT operations, team leads of end users, and employee representatives. Ask each stakeholder
-"who else should I talk to?", *because* informal vetoes are often invisible on the org chart.
+- **List people and groups, not departments.** For each, ask: can they approve, block, fund, or are they
+  affected?
+- **Probe for the roles AI projects forget:** data owners, security, privacy, legal, compliance, IT
+  operations, team leads of end users, and employee representatives.
+- **Ask each stakeholder "who else should I talk to?"**, *because* informal vetoes are often invisible on
+  the org chart.
 
 ### 2. Map influence, interest and stance
-The power-interest grid (usually attributed to Mendelow) sorts people into four groups: high power and high interest (manage closely),
-high power and low interest (keep satisfied), low power and high interest (keep informed), low power and
-low interest (monitor). Add a third attribute, current stance (supporter, neutral, skeptic, blocker), and
-what each person needs to believe to support the project and what they fear. *Because* engagement effort is
-finite, the grid tells you where to spend it. Stance is the attribute that changes, so record the
-evidence for it ("asked twice about data residency") rather than a label, and expect to revise it.
+The power-interest grid (usually attributed to Mendelow) sorts people into four groups:
+
+| | Low interest | High interest |
+|---|---|---|
+| **High power** | Keep satisfied | Manage closely |
+| **Low power** | Monitor | Keep informed |
+
+- **Add stance** (supporter, neutral, skeptic, blocker), plus what each person needs to believe to support
+  the project and what they fear.
+- **Why the grid:** engagement effort is finite, so the grid tells you where to spend it.
+- **Stance is the attribute that changes.** Record the evidence for it ("asked twice about data
+  residency") rather than a label, and expect to revise it.
 
 For each important stakeholder, write down what they are measured on and what this project does to that
-measure. A security lead is rewarded for incidents that did not happen and gains nothing from your
-launch; a team lead is judged on throughput that the pilot will dent for a few weeks; a data owner is
-blamed if their data leaks through someone else's system. Most "irrational" resistance becomes
-predictable once you see the project from their scorecard, and the fix is usually to change what the
-project costs them (a complete review package, a protected target during the pilot, a narrower data
-scope), not to argue harder about the benefits.
+measure:
+
+| Stakeholder | Scorecard | What the project does to it |
+|---|---|---|
+| Security lead | Rewarded for incidents that did not happen | Gains nothing from your launch |
+| Team lead | Judged on throughput | The pilot dents it for a few weeks |
+| Data owner | Blamed if their data leaks | Leak risk through someone else's system |
+
+- **Most "irrational" resistance becomes predictable** once you see the project from their scorecard.
+- **The fix is usually to change what the project costs them** (a complete review package, a protected
+  target during the pilot, a narrower data scope), not to argue harder about the benefits.
 
 ### 3. Define decision rights
-For each key decision (scope, data access, go-live, rollback), agree who is responsible, accountable,
-consulted and informed (RACI). This prevents the classic stall where three people each think another one
-approves the release, *because* an AI go-live usually needs sign-off from several functions.
+- **For each key decision** (scope, data access, go-live, rollback), agree who is responsible,
+  accountable, consulted and informed (RACI).
+- **Why:** it prevents the classic stall where three people each think another one approves the release,
+  *because* an AI go-live usually needs sign-off from several functions.
 
 ### 4. Sequence by lead time, not by friendliness
-Some approvals have long, fixed lead times: a security or vendor-risk review queue, a data-access
-request, a works-council consultation, a procurement cycle. Lay them out like a project plan and work
-backwards from go-live, *because* the latest-starting long-lead review sets the real launch date
-regardless of how fast the engineering goes. If go-live is in ten weeks and the security queue is
-running at six, the review package must be submitted by week four, which means the data-flow design
-must be stable before then.
+- **Some approvals have long, fixed lead times:** a security or vendor-risk review queue, a data-access
+  request, a works-council consultation, a procurement cycle.
+- **Lay them out like a project plan and work backwards from go-live**, *because* the latest-starting
+  long-lead review sets the real launch date regardless of how fast the engineering goes.
+- **Worked case:** go-live is in ten weeks and the security queue is running at six, so the review package
+  must be submitted by week four, which means the data-flow design must be stable before then.
 
 ### 5. Plan engagement per person
-Manage-closely stakeholders get one-to-ones and early drafts. Security and legal get the architecture and
-data-flow documentation before they ask, *because* a reviewer who receives a complete package early is
-far less likely to block late. Users and team leads get workshops and pilots. Executives get short
-decision-focused updates.
+| Who | Engagement |
+|---|---|
+| Manage-closely stakeholders | One-to-ones and early drafts |
+| Security and legal | Architecture and data-flow documentation before they ask |
+| Users and team leads | Workshops and pilots |
+| Executives | Short decision-focused updates |
+
+Security and legal get the package early *because* a reviewer who receives a complete package early is
+far less likely to block late.
 
 ### 6. Escalate with options, not complaints
-When a stakeholder blocks and one-to-one work has not resolved it, escalate through the sponsor, but
-bring the blocker's concern stated fairly, two or three options (narrow scope, add a control, delay)
-and their costs. Tell the blocker before you escalate. Escalation framed as "they are in the way"
-costs you the relationship for the rest of the project; escalation framed as "we need a decision
-between these options" usually gets one.
+1. **Escalate only after one-to-one work fails**, through the sponsor.
+2. **State the blocker's concern fairly**, with two or three options (narrow scope, add a control, delay)
+   and their costs.
+3. **Tell the blocker before you escalate.**
+4. **Frame it as a decision.** "They are in the way" costs you the relationship for the rest of the
+   project; "we need a decision between these options" usually gets one.
 
 ### 7. Maintain the map
-Keep a register with owner, stance, last contact and next action, review it weekly, and update it when
-people change roles. When a sponsor leaves, the successor inherits a project they did not choose and may cut it, so
-build relationships with more than one senior supporter.
+- **Keep a register** with owner, stance, last contact and next action; review it weekly.
+- **Update it when people change roles.**
+- **Build more than one senior supporter.** When a sponsor leaves, the successor inherits a project they
+  did not choose and may cut it.
 
-## Example
+## Diagram
+Each stakeholder is routed by power and interest, then stance decides whether this week needs action; the
+weekly review loops everyone back through.
+
+```mermaid
+flowchart TD
+    S["Stakeholder in register"] --> P{"High power?"}
+    P -->|"yes"| PI{"High interest?"}
+    P -->|"no"| LI{"High interest?"}
+    PI -->|"yes"| MC["Manage closely"]
+    PI -->|"no"| KS["Keep satisfied"]
+    LI -->|"yes"| KI["Keep informed"]
+    LI -->|"no"| MO["Monitor"]
+    MC --> ST{"Supporter and recent contact?"}
+    KS --> ST
+    ST -->|"no"| A["Act this week: package, one-to-one"]
+    ST -->|"yes"| W["Weekly register review"]
+    A --> W
+```
+
+## Examples
+### A stakeholder register with an overdue-attention check
 A minimal stakeholder register, the kind an FDE keeps alongside the project plan, with a check that flags
 where attention is overdue. The rule encodes the grid: high-power people who are not supporters, or whom
 nobody has spoken to recently, need action this week.
@@ -133,34 +172,84 @@ def actions(today, stale_days=21):
 actions(date(2026, 10, 20))
 ```
 
-On this data the check flags Marc (skeptic with a veto, 48 days without contact: send the data-flow
-package and book a review), Lena (neutral data owner, 30 days: confirm access terms) and Tom (a team lead
-blocking adoption: a one-to-one about what he fears, usually blame for AI errors or his team's metrics).
+What the check flags on this data:
+
+| Who | Flag | Action |
+|---|---|---|
+| Marc | Skeptic with a veto, 48 days without contact | Send the data-flow package and book a review |
+| Lena | Neutral data owner, 30 days | Confirm access terms |
+| Tom | Team lead blocking adoption | One-to-one about what he fears, usually blame for AI errors or his team's metrics |
+
 The sponsor and the champion need nothing this week.
 
+### Worked scenario: back-scheduling approvals from go-live
+Go-live is in ten weeks. Lay out each long-lead approval and find its latest start; the security figure
+comes from the case above, the others are illustrative.
+
+| Approval | Lead time (weeks) | Latest submission week | Prerequisite |
+|---|---|---|---|
+| Security review queue | 6 | 4 | Data-flow design stable |
+| Data-access request | 3 (illustrative) | 7 | Data scope agreed with owner |
+| Works-council consultation | 8 (illustrative) | 2 | Impact on roles written down |
+
+- **The binding constraint is the works council**, not engineering: it must start in week 2, so the
+  role-impact statement is due before any build is finished.
+- **Security is next:** the data-flow design must stabilize by week 4, which forces architecture decisions
+  early.
+- **Friendliness is irrelevant to the order.** Engaging the friendliest reviewer first would leave the
+  project waiting in a queue after the build is done.
+
+## Production patterns
+- **Approval lead-time plan** — at kickoff, ask each reviewing function for its current queue length and
+  put every approval on the project plan as a dependency with a latest-start date. Monitor the gap between
+  planned and actual submission dates each week.
+- **Review package ready before the ask** — prepare the architecture and data-flow diagram, data
+  classification, storage location and retention, vendor terms, access controls and logging as one bundle.
+  Monitor the number of reviewer follow-up questions and the time from submission to decision.
+- **Register with automated staleness flags** — keep the register in a sheet or tracker and run a weekly
+  check like the one above (high power and not a supporter, or no contact past a threshold). Monitor how
+  many high-power entries are stale at each weekly review.
+- **RACI in the project charter** — write the RACI for scope, data access, go-live and rollback into the
+  charter the sponsor signs. Monitor decisions that slip past their due date, which usually point at an
+  unclear accountable owner.
+- **Eval-anchored expectations** — include the current eval error rate, the baseline and the mitigation in
+  every sponsor update from the first demo onward. Monitor whether the sponsor can restate the expected
+  error rate unprompted.
+
 ## Trade-offs
-- Mapping everyone formally catches hidden vetoes, but costs time; a small internal tool with one team needs only a short list.
-- Engaging blockers early surfaces objections while they are cheap, but can slow momentum; skip only when their approval is genuinely not required.
-- A single strong sponsor makes decisions fast, but creates a single point of failure if that person moves; cultivate a second senior supporter.
-- Tailoring messages per stakeholder improves relevance, but risks inconsistent stories; keep one source of truth that every message draws from.
-- Sharing the error rate openly sets realistic expectations, but can alarm cautious stakeholders unless paired with the mitigation and the baseline.
+- **Formal mapping vs time.** Mapping everyone catches hidden vetoes but costs time; a small internal tool
+  with one team needs only a short list.
+- **Engaging blockers early vs momentum.** It surfaces objections while they are cheap but can slow
+  momentum; skip only when their approval is genuinely not required.
+- **Single strong sponsor vs resilience.** One sponsor makes decisions fast but is a single point of
+  failure if that person moves; cultivate a second senior supporter.
+- **Tailored messages vs consistency.** Tailoring improves relevance but risks inconsistent stories; keep
+  one source of truth that every message draws from.
+- **Open error rates vs alarm.** Sharing the error rate sets realistic expectations but can alarm cautious
+  stakeholders unless paired with the mitigation and the baseline.
 
 ## Pitfalls
-- Talking mainly to supporters; the symptom is a surprise "no" from security or legal at the go-live review.
-- Leaving decision rights implicit, revealed when go-live waits for weeks because nobody knows who signs off.
-- Ignoring team leads of end users, which shows up as adoption varying sharply between teams with the same tool.
-- Letting the sponsor's expectations drift from the eval results, so a normal error rate is read as project failure.
-- Never updating the map after reorganizations, discovered when a new executive cancels a project they never heard of.
-- Engaging long-lead reviewers in priority order of friendliness rather than lead time, revealed when the build is done and the project waits weeks in a review queue.
+- **Talking mainly to supporters.** Symptom: a surprise "no" from security or legal at the go-live review.
+- **Leaving decision rights implicit.** Revealed when go-live waits for weeks because nobody knows who
+  signs off.
+- **Ignoring team leads of end users.** Shows up as adoption varying sharply between teams with the same
+  tool.
+- **Letting the sponsor's expectations drift from the eval results.** A normal error rate is then read as
+  project failure.
+- **Never updating the map after reorganizations.** Discovered when a new executive cancels a project they
+  never heard of.
+- **Engaging long-lead reviewers by friendliness rather than lead time.** Revealed when the build is done
+  and the project waits weeks in a review queue.
 
 ## When to use
-Keep a stakeholder map on any AI deployment that crosses team boundaries, needs data access from another
-owner, or requires security or compliance review, which covers most enterprise work. Build it in the first
-week of scoping and review it weekly through rollout and hypercare. Measure it indirectly: no late vetoes,
-decisions made on schedule, approvals submitted ahead of each reviewer's lead time, and sponsors whose
-expectations match the evals. For a small internal tool used
-by one team, a short list of approvers is enough. In interviews, show that you look for blockers and veto
-holders first, not just sponsors.
+- **Use when** an AI deployment crosses team boundaries, needs data access from another owner, or requires
+  security or compliance review, which covers most enterprise work.
+- **Timing:** build the map in the first week of scoping and review it weekly through rollout and
+  hypercare.
+- **Measure indirectly:** no late vetoes, decisions made on schedule, approvals submitted ahead of each
+  reviewer's lead time, and sponsors whose expectations match the evals.
+- **Scale down** for a small internal tool used by one team: a short list of approvers is enough.
+- **Interviews:** show that you look for blockers and veto holders first, not just sponsors.
 
 ## Role lens
 - **Engineer:** Produces the artifacts reviewers need, such as data-flow diagrams, eval results and access logs, and answers technical objections precisely.
@@ -170,6 +259,42 @@ holders first, not just sponsors.
 ## Check yourself
 **Q:** Two weeks before go-live, the customer's security team, never formally engaged, asks to review the system and signals concern. How do you respond, and what would you have done differently?
 **A:** Now: treat it as legitimate, not an obstacle. I would meet them immediately with a complete package (architecture and data-flow diagram, data classification, where data is stored and for how long, vendor terms, access controls, logging) and ask for their specific concerns in writing so we can resolve them one by one. I would tell the sponsor honestly that go-live may move. Earlier: security has a veto on any system that sends company data to a model, so they belong in the high-power quadrant from week one, with their review lead time on the plan and the data-flow design reviewed before integration was built. I would also ask what they are accountable for, because a package that answers their specific exposure questions moves faster than one that argues the business value.
+
+## Interview questions
+### What is a power-interest grid, and what do you add to it for an AI project?
+- **Definition:** a two-by-two of power and interest giving four strategies: manage closely, keep
+  satisfied, keep informed, monitor; it tells you where finite engagement effort goes.
+- **Add stance with evidence** (supporter, neutral, skeptic, blocker) and what each person is measured on,
+  because resistance becomes predictable from their scorecard.
+- **For AI specifically**, probe for data owners, security, privacy and works councils, who hold vetoes
+  but rarely appear in the first list.
+
+### A team lead is quietly steering his team away from the pilot. How do you handle it?
+- **One-to-one first**, to learn what he fears: blame for AI errors, or the pilot denting his team's
+  throughput.
+- **Change what the project costs him:** a protected target during the pilot, a clear rule on who owns
+  AI errors, involvement in the pilot review.
+- **Escalate only with options** if that fails, and tell him before you do.
+
+### Your go-live date is set by engineering estimates. Why might that be wrong?
+- **Approvals have fixed lead times** (security queue, data access, procurement, works council) that do
+  not shrink when engineering speeds up.
+- **The latest-starting long-lead review sets the real date.** With a six-week security queue and go-live in
+  ten weeks, the package is due in week four.
+- **So** back-schedule approvals first and let them drive when designs must be stable.
+
+### When is a full stakeholder map overkill?
+- **A small internal tool used by one team**, with no new data access and no security or compliance
+  review, needs only a short list of approvers.
+- **It flips back** as soon as the tool crosses team boundaries or sends company data to a model, because
+  those bring vetoes you cannot see from inside the team.
+
+### How do you escalate a blocker without burning the relationship?
+- **Tell the blocker first**, so the escalation is not a surprise.
+- **State their concern fairly** and bring two or three options (narrow scope, add a control, delay) with
+  costs.
+- **Ask for a decision, not a ruling against a person:** "we need a decision between these options" gets
+  one; "they are in the way" costs you the rest of the project.
 
 ## Quiz
 ### Q: On a power-interest grid, a security reviewer who rarely engages but can block go-live belongs where?

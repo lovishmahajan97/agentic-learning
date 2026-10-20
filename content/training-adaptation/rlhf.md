@@ -5,7 +5,7 @@ name: RLHF
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/dpo
   - training-adaptation/grpo
@@ -40,8 +40,9 @@ policy learns to exploit the reward model's errors.
 - **The recipe has a lineage.** Christiano et al. showed it in 2017 for control tasks: fit a reward model
   to comparisons, optimise the policy, keep collecting comparisons on the new policy. Stiennon et al. and
   InstructGPT applied it to language: the jump from "completes text" to "helps".
-- **The reward model amortises human labels.** PPO scores hundreds of thousands of samples or more per
-  run, far beyond what raters could label. Tens of thousands of comparisons train a model that scores
+- **The reward model amortises human labels.** Optimising directly against human ratings is hopeless at
+  RL's data appetite: PPO scores hundreds of thousands of samples or more per run, far beyond what raters
+  could label. Tens of thousands of comparisons train a model that scores
   every sample for free. The price: it is wrong in places, and the policy will find them.
 
 ## How it works
@@ -143,16 +144,16 @@ under a KL leash, and fresh comparisons on the new policy restart the cycle.
 flowchart TD
     SFT["SFT model"] -->|"frozen copy"| REF["Reference policy"]
     SFT -->|"initialise"| POL["Policy"]
-    POL -->|"two or more responses per prompt"| RAT["Raters or AI judge rank them"]
-    RAT -->|"chosen and rejected pairs"| RM["Reward model, Bradley-Terry loss"]
-    POL -->|"sample responses"| SC["Score: RM at final token, minus beta times per-token KL"]
-    RM --> SC
-    REF --> SC
-    SC --> VM["Value model: GAE advantages"]
+    POL -->|"two or more responses"| RAT["Raters or AI judge rank"]
+    RAT -->|"chosen and rejected pairs"| RM["Reward model, Bradley-Terry"]
+    POL -->|"sample responses"| SC["Shaped reward: RM score, KL penalty"]
+    RM -->|"score at final token"| SC
+    REF -->|"per-token log-probs"| SC
+    SC --> VM["Value model, GAE advantages"]
     VM --> PPO["PPO clipped update"]
     PPO --> POL
-    PPO -.->|"KL climbs, human win rate falls: overoptimisation"| CHK{"Stop, raise beta or recollect?"}
-    CHK -.->|"new comparisons on current policy"| RAT
+    PPO -.->|"proxy up, win rate down"| CHK{"Overoptimised?"}
+    CHK -.->|"raise beta, recollect pairs"| RAT
 ```
 
 ## Examples
@@ -251,13 +252,15 @@ print([round(a, 3) for a in gae(rewards, values)])
 
 ## Pitfalls
 - **Trusting the reward model's score as success.** Symptom: rising proxy reward with flat or falling
-  human win rate, the overoptimisation signature.
+  human win rate, the overoptimisation signature. Fix: select checkpoints by held-out human or judge win
+  rate.
 - **Length and sycophancy bias in comparisons.** Raters prefer longer, more agreeable answers, so the
   policy learns verbosity and flattery, visible as answer length creeping up round over round.
 - **Noisy or inconsistent labels.** Low inter-annotator agreement yields a reward model that cannot
   separate good from bad, and PPO then optimises noise.
 - **Reusing a reward model after the policy moved.** Trained on an old policy's comparisons, it is
-  confidently wrong on the new policy's typical outputs.
+  confidently wrong on the new policy's typical outputs. Fix: collect comparisons on the current policy
+  and retrain it each round.
 - **Treating PPO hyperparameters as defaults.** A too-large clip range or learning rate shows up as sudden
   KL spikes and a collapse into repetitive text within a few hundred steps.
 

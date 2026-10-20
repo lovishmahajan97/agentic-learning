@@ -5,7 +5,7 @@ name: Prompt templates
 kind: practice
 difficulty: core
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - prompting/prompt-engineering
   - prompting/system-prompt
@@ -22,98 +22,126 @@ sources:
 ---
 
 ## TL;DR
-A prompt template separates the fixed instructions from the per-request variables and renders them into
-the message structure the API expects. It exists because a prompt is code that runs on data: string
-concatenation mixes the two, breaks on stray braces and delimiters, cannot be unit-tested or versioned,
-and silently destroys cache hits by putting variable text before stable text. There are two template
-layers, yours and the model's chat template, and you need to understand both.
+A prompt template separates fixed instructions from per-request variables and renders them into the
+message structure the API expects, making prompts typed, tested, versioned and cache-friendly. Two layers
+exist: yours and the model's chat template.
 
 ## Why it exists
-The first prompt in any codebase is an f-string with the user's text dropped into the middle. It works
-until it does not. User text gets concatenated into a string that is later passed to `str.format`, the
-text contains braces, and the call raises or silently substitutes the wrong value. A document contains the
-phrase "ignore the above" and, with no delimiter between instruction and data, the model obeys it. The
-same persona paragraph gets copied into six services and drifts in each. A production trace shows a bad
-answer and nobody can say which wording produced it, because the prompt was assembled from fragments at
-the call site. And after prompt caching is enabled the bill barely moves, because per-request fields were
-interpolated above the instructions and every prefix is unique.
-
-Each of these is a symptom of treating a prompt as a string instead of as a program with inputs. A
-template fixes them structurally: the instructions become a named, versioned artefact; the inputs become
-typed variables with a schema; rendering becomes a pure function that can be snapshot-tested with
-adversarial values; and the layout is fixed once, static block first, dynamic block last, so caching
-works by construction. The naive alternative, careful concatenation in code, does all this implicitly and
-therefore inconsistently, and it collapses at the scale of thirty prompts and four teams.
+- **The first prompt is always an f-string**, with the user's text dropped into the middle. It works until
+  it does not.
+- **Braces break it.** User text concatenated into a string later passed to `str.format` contains braces,
+  and the call raises or silently substitutes the wrong value.
+- **No delimiters, no boundary.** A document says "ignore the above" and, with nothing separating
+  instruction from data, the model obeys it.
+- **Copies drift and nothing is traceable.** The same persona paragraph copied into six services drifts in
+  each. A bad answer in a trace cannot be tied to a wording, because the prompt was assembled from
+  fragments at the call site.
+- **Caching silently fails.** After prompt caching is enabled the bill barely moves, because per-request
+  fields were interpolated above the instructions and every prefix is unique. Careful concatenation fixes
+  all this implicitly, therefore inconsistently, and collapses at thirty prompts and four teams.
 
 ## How it works
+### A template fixes the symptoms structurally
+| Symptom of prompt-as-string | Template fix |
+|---|---|
+| Wording scattered across call sites | Instructions become a named, versioned artefact |
+| Missing or malformed inputs | Inputs become typed variables with a schema |
+| Untestable assembly | Rendering is a pure function, snapshot-tested with adversarial values |
+| Cache misses | Layout fixed once, static block first, dynamic block last, so caching works by construction |
+
 ### Two template layers
-1. Your application template turns variables into message content: a system string, a user string,
-   optionally a list of example turns. This is the layer you write, with Jinja, Mustache or a framework's
-   template class.
-2. The model's chat template turns the list of role-tagged messages into one token sequence with the
+1. **Your application template** turns variables into message content: a system string, a user string,
+   optionally a list of example turns. You write it, with Jinja, Mustache or a framework's template class.
+2. **The model's chat template** turns the list of role-tagged messages into one token sequence with the
    role markers the model was trained on. Hosted APIs apply it server-side; self-hosted stacks apply the
-   tokenizer's template, for example Hugging Face's `apply_chat_template`. You rarely write this layer,
-   but you must know it exists: render chat text by hand with the wrong markers and quality drops
-   silently, and the model may emit role tokens in its output.
+   tokenizer's template, for example Hugging Face's `apply_chat_template`.
+- **You rarely write layer 2, but must know it exists.** Hand-render chat text with the wrong markers and
+  quality drops silently, and the model may emit role tokens in its output.
 
 ### Layout
-A rendered prompt has three zones, in this order because prompt caches match a byte-identical prefix.
-The static zone: role, rules, format, fixed examples, tool descriptions. The dynamic zone: retrieved
-context, per-tenant settings, the user's input, each inside its own delimiter tags. The ask: a short
-restatement of the task at the end, where recency helps. Anything that varies per request belongs after
-the last static byte, and if the cache boundary is marked explicitly, it goes on that byte.
+The order is fixed because prompt caches match a byte-identical prefix:
+1. **Static zone:** role, rules, format, fixed examples, tool descriptions.
+2. **Dynamic zone:** retrieved context, per-tenant settings, the user's input, each inside its own
+   delimiter tags.
+3. **The ask:** a short restatement of the task at the end, where recency helps.
+- **Anything that varies per request belongs after the last static byte**; an explicit cache boundary goes
+  on that byte.
 
-"Static" is a matter of cardinality, not of whether a value is a variable. Every distinct rendering of
-the static zone is its own cache entry, so the number of entries is the product of the distinct values
-of every variable in it. Two audiences and a per-tenant glossary across 50 tenants is at most 100
-prefixes, each warm if its tenant has steady traffic. Put a free-form per-request number such as a
-word limit there and the count multiplies by every value seen, entries go cold before reuse, and the hit
-rate falls with no single line looking wrong. Rule of thumb: tenant- or product-level settings may live
-in the static zone; anything chosen per request goes in the dynamic zone.
+### "Static" means low cardinality
+- **Every distinct static rendering is its own cache entry**, so the entry count is the product of the
+  distinct values of every variable in the static zone.
+- **Low cardinality is fine.** Two audiences and a per-tenant glossary across 50 tenants is at most 100
+  prefixes, each warm if its tenant has steady traffic.
+- **High cardinality is silent poison.** A free-form per-request number such as a word limit multiplies
+  the count by every value seen; entries go cold before reuse and the hit rate falls with no single line
+  looking wrong.
+- **Rule of thumb:** tenant- or product-level settings may live in the static zone; anything chosen per
+  request goes in the dynamic zone.
 
 ### Rendering rules, and why
-- Insert variables as data, never as template source. A template engine substitutes a variable's value
-  verbatim; it does not re-parse it. Feeding user text into the engine as a template is template
-  injection: braces in the input become code.
-- Validate inputs with a schema before rendering. A missing variable must fail at render time, not become
-  the literal word "None" in a prompt the model politely answers.
-- Render deterministically. No timestamps, random IDs or unsorted collections in the static zone; stable
-  whitespace and line endings. Every byte of difference is a cache miss.
-- Control whitespace explicitly (Jinja's `trim_blocks` and `lstrip_blocks`, or the `-` modifiers),
-  because a template that is readable to humans otherwise leaks blank lines into the prompt, and the
-  prefix bytes change whenever someone reformats it.
-- Budget length in tokens, not characters, and truncate the dynamic zone deliberately with a visible
+- **Insert variables as data, never as template source.** An engine substitutes a value verbatim and does
+  not re-parse it. Feeding user text in as a template is template injection: braces become code.
+- **Validate inputs with a schema before rendering.** A missing variable must fail at render time, not
+  become the literal word "None" in a prompt the model politely answers.
+- **Render deterministically.** No timestamps, random IDs or unsorted collections in the static zone;
+  stable whitespace and line endings. Every byte of difference is a cache miss.
+- **Control whitespace explicitly** (Jinja's `trim_blocks` and `lstrip_blocks`, or the `-` modifiers).
+  Otherwise a human-readable template leaks blank lines into the prompt, and prefix bytes change whenever
+  someone reformats it.
+- **Budget length in tokens, not characters**, and truncate the dynamic zone deliberately with a visible
   marker, never silently.
-- Use conditionals and loops for optional sections (examples only if provided, a glossary only for
-  tenants that have one) rather than maintaining near-duplicate templates.
-- Check the data for your own delimiters. A closing tag inside a document can end the data zone early;
-  escape it or reject it, because delimiters only separate data from instructions if the data cannot
-  contain them.
+- **Use conditionals and loops for optional sections** (examples only if provided, a glossary only for
+  tenants that have one) rather than near-duplicate templates.
+- **Check the data for your own delimiters.** A closing tag inside a document can end the data zone early;
+  escape or reject it, because delimiters only separate data from instructions if the data cannot contain
+  them.
 
 ### Testing
-Snapshot tests pin the rendered output for a fixed input, so a reformatting that changes bytes shows up
-as a diff. Adversarial-value tests render with inputs containing braces, closing tags and injection
-phrases and assert that the value landed inside its delimiters and the instructions are untouched. A
-token-count assertion catches a template that grew past the context budget or shrank below the cache
-minimum.
+| Test | Catches |
+|---|---|
+| **Snapshot** of rendered output for a fixed input | A reformatting that changes bytes shows up as a diff |
+| **Adversarial values** (braces, closing tags, injection phrases) | Asserts the value landed inside its delimiters and instructions are untouched |
+| **Token-count assertion** | A template grown past the context budget or shrunk below the cache minimum |
 
 ### Identity and storage
-Give every template a name and a version, and record a content hash on every trace, so a complaint maps
-to the exact wording. Store templates in the repository next to their tests, or in a prompt registry once
-non-engineers need to edit them; in the second case the variable schema is the contract between the
-registry and the code, and it needs contract tests. Promotion and rollback are covered in the versioning
-lesson.
+- **Name, version and hash.** Give every template a name and version, and record a content hash on every
+  trace, so a complaint maps to the exact wording.
+- **Repository or registry.** Keep templates next to their tests, or in a prompt registry once
+  non-engineers need to edit them. Then the variable schema is the contract between registry and code,
+  and it needs contract tests.
+- **Promotion and rollback** are covered in the versioning lesson.
 
 ### Templates that produce messages, not strings
-For chat APIs the template's output is a structure: a system string plus a list of messages, which may
-include few-shot pairs. Render to that structure and let the SDK serialise it; flattening everything into
-one string throws away the role boundaries the model was trained on.
+- **Output a structure** for chat APIs: a system string plus a list of messages, possibly with few-shot
+  pairs, and let the SDK serialise it.
+- **Do not flatten** everything into one string: that throws away the role boundaries the model was
+  trained on.
 
-## Example
-A Jinja template with a Pydantic schema for its variables, a content hash as the prompt id, a static
-zone rendered from per-tenant settings and a dynamic zone built last, plus the two tests that catch the
-common failures: user text treated as template source, and a prefix that is not deterministic. The
-document is also stripped of any closing delimiter it contains, so it cannot end the data zone early.
+## Diagram
+Variables are validated, the static zone renders identically for the same tenant settings, the dynamic
+zone comes last, and the chat template turns messages into tokens.
+
+```mermaid
+flowchart TD
+    V["Request variables"] --> S{"Schema valid?"}
+    S -->|"no"| X["Fail at render time"]
+    S -->|"yes"| ST["Static zone: rules, format, examples"]
+    S -->|"yes"| DY["Dynamic zone: context, user input in tags"]
+    ST --> MSG["System plus messages structure"]
+    DY --> MSG
+    MSG --> ID["Log prompt id and hash"]
+    MSG --> CT["Model chat template adds role markers"]
+    CT --> C[("Prefix cache on static bytes")]
+    C --> M["Model"]
+```
+
+## Examples
+### A typed, tested Jinja template
+A Jinja template with a Pydantic schema for its variables, a content hash as the prompt id, a static zone
+rendered from per-tenant settings and a dynamic zone built last.
+- **Two tests catch the common failures:** user text treated as template source, and a prefix that is not
+  deterministic.
+- **The document is stripped of any closing delimiter** it contains, so it cannot end the data zone early.
 
 ```python
 import hashlib, anthropic
@@ -156,46 +184,102 @@ def test_user_text_is_data_not_template():              # tests/test_templates.p
     assert again == system                                            # deterministic prefix: same bytes
 ```
 
+### Auditing static-zone cardinality
+Pure Python: hash the static zone of each request in a traffic sample and count distinct prefixes. Here a
+per-request word limit leaks into the static zone in the second run.
+
+```python
+import hashlib, random, collections
+
+def static_zone(tenant, audience, max_words=None):
+    s = f"You summarize documents for tenant {tenant}, {audience} audience."
+    if max_words is not None:
+        s += f" At most {max_words} words."         # the per-request value leaked into the prefix
+    return s
+
+def audit(requests, word_limit_in_static):
+    """Count distinct static prefixes and how many requests could reuse a cached one."""
+    seen = collections.Counter()
+    for tenant, audience, words in requests:
+        prefix = static_zone(tenant, audience, words if word_limit_in_static else None)
+        seen[hashlib.sha256(prefix.encode()).hexdigest()] += 1
+    reusable = sum(n - 1 for n in seen.values())     # first request per prefix is a write
+    return len(seen), reusable / len(requests)
+
+rng = random.Random(0)
+traffic = [(f"t{rng.randrange(50)}", rng.choice(["exec", "engineer"]), rng.randrange(50, 400))
+           for _ in range(10_000)]
+for leaked in (False, True):
+    n, share = audit(traffic, leaked)
+    print(f"word limit in static zone={leaked}: {n} prefixes, best-case reuse {share:.0%}")
+# word limit in static zone=False: 100 prefixes, best-case reuse 99%
+# word limit in static zone=True: 8730 prefixes, best-case reuse 13%
+```
+
+| Static zone contains | Distinct prefixes in 10,000 requests | Best-case reuse |
+|---|---|---|
+| 50 tenants × 2 audiences | 100 | 99% |
+| Plus a per-request word limit (350 possible values) | 8,730 | 13% |
+
+- **Best case ignores expiry.** Real caches evict idle entries after minutes, so the leaked layout does even
+  worse than 13%.
+- **The fix is one line:** move the word limit into the dynamic zone, next to the document.
+
+## Production patterns
+- **Templates as a shared package.** Keep every prompt as a named template file with its variable schema
+  and tests in one package that services import, so a shared persona edit is one pull request. Monitor
+  that each trace carries the prompt id and hash.
+- **Render-time validation.** Use a schema (for example a Pydantic model) and Jinja's `StrictUndefined` so
+  missing or malformed variables raise before any API call. Monitor render-error counts per template after
+  deploys.
+- **Prefix stability check in CI.** Render each template twice with different dynamic values and assert
+  the system zone is byte-identical, plus a token-count assertion against the cache minimum and context
+  budget. Monitor the cache-read token count in production after each release.
+- **Cardinality budget for the static zone.** Allow only tenant- or product-level variables there and audit
+  distinct prefix hashes from a traffic sample, as above. Alert when cache writes start to outnumber reads.
+- **Registry with contract tests.** When non-engineers edit wording in a prompt registry, pin the variable
+  schema as the contract and run contract tests that render every registry version with the code's
+  variables before promotion.
+
 ## Trade-offs
-- A single tested artefact per prompt against an extra layer between code and the model; for a one-off
-  script the layer is overhead, and the trade flips as soon as a prompt is called from more than one
-  place or edited by more than one person.
-- Typed variables catch missing and malformed inputs at render time against rigidity: every new slot is
-  a schema change with a review; that rigidity is the point once prompts are shared across services.
-- Static-first layout maximises cache hits against the recency effect that favours putting the ask last;
-  resolve it by keeping rules in the static zone and repeating a one-line restatement of the task at the
-  end of the dynamic zone.
-- Storing templates in a registry lets non-engineers iterate without deploys against decoupling the
+- **One tested artefact vs an extra layer.** For a one-off script the layer is overhead; the trade flips as
+  soon as a prompt is called from more than one place or edited by more than one person.
+- **Typed variables vs rigidity.** They catch missing and malformed inputs at render time, but every new
+  slot is a schema change with a review; that rigidity is the point once prompts are shared across
+  services.
+- **Static-first caching vs recency.** Static-first layout maximises cache hits against the recency effect
+  that favours putting the ask last; resolve it by keeping rules static and repeating a one-line
+  restatement of the task at the end of the dynamic zone.
+- **Registry agility vs coupling.** A registry lets non-engineers iterate without deploys, but decouples
   wording from the code that supplies the variables; without contract tests a renamed variable breaks
   production at render time.
 
 ## Pitfalls
-- Passing user content through the template engine as template source; the symptom is a crash or a
-  changed prompt when the input contains `{{` or `{%`.
-- Missing variables rendering as empty strings or "None"; the symptom is the model answering a question
-  about "None" or ignoring a section that was supposed to be there.
-- A timestamp or request ID in the static zone; the symptom is a cache-read token count of zero on every
-  call.
-- A high-cardinality variable (a per-request limit, a user's locale string) rendered into the static
-  zone; the symptom is a hit rate that decays as traffic diversifies, with cache writes far
-  outnumbering reads.
-- Whitespace or line-ending drift between environments; the symptom is a cache hit rate that differs
-  between staging and production for the same template.
-- Truncating the dynamic zone by characters; the symptom is cut-off sentences and context overflows that
+- **Passing user content through the engine as template source.** Symptom: a crash or a changed prompt when
+  the input contains `{{` or `{%`.
+- **Missing variables rendering as empty strings or "None".** Symptom: the model answers a question about
+  "None" or ignores a section that was supposed to be there.
+- **A timestamp or request ID in the static zone.** Symptom: a cache-read token count of zero on every call.
+- **A high-cardinality variable in the static zone** (a per-request limit, a user's locale string).
+  Symptom: a hit rate that decays as traffic diversifies, with cache writes far outnumbering reads.
+- **Whitespace or line-ending drift between environments.** Symptom: a cache hit rate that differs between
+  staging and production for the same template.
+- **Truncating the dynamic zone by characters.** Symptom: cut-off sentences and context overflows that
   still happen on token-dense inputs.
-- Copies of the same template drifting across services; the symptom is the same feature behaving
-  differently depending on which service answered.
-- Hand-rendering chat text with the wrong role markers when self-hosting; the symptom is role tokens in
-  the output and a quality drop that no prompt edit fixes.
+- **Copies of the same template drifting across services.** Symptom: the same feature behaving differently
+  depending on which service answered.
+- **Hand-rendering chat text with the wrong role markers when self-hosting.** Symptom: role tokens in the
+  output and a quality drop that no prompt edit fixes.
 
 ## When to use
-Any prompt that is called from code more than once gets a template, a name, a schema and a test; the only
-exception is a throwaway experiment. Measure render-test coverage of the adversarial cases, prompt-cache
-hit rate as a proxy for prefix stability, tokens per rendered prompt and the presence of a prompt id on
-every trace. Day to day it is editing a template file, updating its schema, running its snapshot tests
-and watching the cache metric after deploy. In interviews the signal is being able to derive the
-static-first layout from the caching mechanism, the data-versus-template-source distinction from
-injection, and the two template layers from how chat models are trained.
+- **Use always** for any prompt called from code more than once: it gets a template, a name, a schema and a
+  test. The only exception is a throwaway experiment.
+- **Measure:** render-test coverage of the adversarial cases, prompt-cache hit rate as a proxy for prefix
+  stability, tokens per rendered prompt and a prompt id on every trace.
+- **Day to day:** editing a template file, updating its schema, running its snapshot tests and watching the
+  cache metric after deploy.
+- **Interviews:** derive the static-first layout from the caching mechanism, the data-versus-template-source
+  distinction from injection, and the two template layers from how chat models are trained.
 
 ## Role lens
 - **Engineer:** Writes templates with typed variables and snapshot tests, keeps the static zone
@@ -218,6 +302,36 @@ lists, controlled whitespace. Add snapshot tests and adversarial-value tests, an
 every trace. Verification: cache-read tokens per request should jump once the static prefix exceeds the
 cache minimum, the hit rate should move from fifteen percent toward the share of traffic that shares a
 prefix, and a persona edit should produce one diff, one deploy and a new hash in the traces.
+
+## Interview questions
+### What is the difference between your prompt template and the model's chat template?
+- **Application template:** turns your variables into message contents (system string, user turns, example
+  pairs), written in Jinja or similar.
+- **Chat template:** turns role-tagged messages into one token sequence with the role markers used in
+  fine-tuning, applied server-side by hosted APIs or by `apply_chat_template` when self-hosting.
+- **Why it matters:** wrong markers when self-hosting cause silent quality drops and role tokens in output.
+
+### A user's message crashed rendering in production. Walk through the cause and the fix.
+- **Likely cause:** user text was rendered as template source, so `{{` or `{%` was parsed as code.
+- **Fix:** render the template once and pass user text only as a variable value, which engines insert
+  verbatim; add an adversarial-value test with braces and closing tags.
+
+### When is a template layer not worth it?
+- **A throwaway experiment or one-off script**, where the extra layer is overhead.
+- **The trade flips** as soon as the prompt is called from more than one place or edited by more than one
+  person, because drift and untraceable wording start costing more than the layer.
+
+### Caching is on but writes outnumber reads. How do you find which variable is to blame?
+- **Hash the static zone per request** over a traffic sample and count distinct prefixes.
+- **Look for high-cardinality variables** such as per-request limits or locale strings; a per-request word
+  limit can take 100 prefixes to thousands.
+- **Move them to the dynamic zone** and confirm cache-read tokens rise after deploy.
+
+### How do you make prompt changes traceable in production?
+- **Name, version and content hash** for every template, recorded on every trace, so a complaint maps to
+  the exact wording.
+- **Snapshot tests** turn any byte change into a reviewed diff, and registry edits go through contract
+  tests against the code's variable schema.
 
 ## Quiz
 ### Q: Why should the fixed instructions come before the per-request data in a rendered prompt?

@@ -5,7 +5,7 @@ name: Private endpoints
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - deployment/customer-vpc-on-prem-air-gapped
   - deployment/vpn
@@ -22,96 +22,122 @@ sources:
 ---
 
 ## TL;DR
-A private endpoint gives a managed service (an LLM API, object storage, a vector database, your SaaS)
-a private IP address inside the consumer's own network, so traffic to it never crosses the public
-internet and the service can have its public access switched off. It exists because enterprises want
-to call cloud services without opening internet egress, and it works by pairing a network interface
-with a DNS override. The DNS half is where most failures live.
+A private endpoint gives a managed service a private IP inside the consumer's network, so traffic never
+crosses the internet and public access can be switched off. It pairs a network interface with a DNS
+override; the DNS half is where most failures live.
 
 ## Why it exists
-A bank's application subnet has no route to the internet: that is the point of the subnet. Now the
-team wants to call a hosted model API, read documents from object storage and push traces to a SaaS
-observability tool. Every one of those has a public hostname that resolves to a public IP.
-
-The naive options all weaken the perimeter. Adding a NAT gateway gives the subnet outbound internet,
-so the same path that reaches the model API also reaches a paste site, which is exactly what the
-data-loss team was preventing. Allowlisting the provider's IP ranges on a firewall is brittle, because
-cloud services use large, shared and changing address pools, so the allowlist ends up permitting a
-huge slice of the cloud. VPC peering with the provider is usually not offered for multi-tenant
-services, and where it is, it connects entire networks, requires non-overlapping CIDR ranges and
-exposes far more than one API.
-
-What the security team actually wants is narrower: "this subnet may reach this one service, over a
-path we control, and that service refuses calls that did not come through that path." A private
-endpoint expresses exactly that. It also gives the service side a lever: once every legitimate
-consumer arrives privately, the provider-side resource can disable public network access entirely,
-so a leaked API key is useless from the internet.
+- **The subnet has no internet route on purpose.** A bank's application subnet still needs a hosted
+  model API, object storage and a SaaS observability tool, and every one has a public hostname that
+  resolves to a public IP.
+- **A NAT gateway opens everything.** The same path that reaches the model API also reaches a paste
+  site, which is exactly what the data-loss team was preventing.
+- **IP allowlists are brittle.** Cloud services use large, shared and changing address pools, so the
+  allowlist ends up permitting a huge slice of the cloud.
+- **Peering is too broad.** It is usually not offered for multi-tenant services; where it is, it connects
+  entire networks, requires non-overlapping CIDR ranges and exposes far more than one API.
+- **A private endpoint says exactly what security wants.** "This subnet may reach this one service, over
+  a path we control, and that service refuses calls that did not come through that path." Once every
+  consumer arrives privately, the provider can disable public network access, so a leaked API key is
+  useless from the internet.
 
 ## How it works
-The three large clouds implement the same idea under different names: AWS PrivateLink (interface VPC
-endpoints), Azure Private Link (private endpoints) and Google Cloud Private Service Connect. The
-mechanism has four parts.
+The three large clouds implement the same idea under different names:
+
+| Cloud | Name | Consumer object | Publishing your own SaaS |
+|---|---|---|---|
+| AWS | PrivateLink | interface VPC endpoint | endpoint service fronted by a Network Load Balancer |
+| Azure | Private Link | private endpoint | Private Link service behind a Standard Load Balancer |
+| Google Cloud | Private Service Connect | endpoint | service attachment |
+
+The mechanism has four parts.
 
 ### 1. A network interface in the consumer's subnet
-Creating the endpoint places one or more network interfaces, each with a private IP from the
-consumer's subnet, into the consumer's network. Packets sent to that IP are carried over the cloud
-provider's internal network to the service. Because the consumer only ever sees an IP in its own
-range, the two sides' address spaces never have to be compatible: overlapping CIDRs are fine,
-which is the main reason this beats peering for a SaaS that has thousands of customers who all use
-10.0.0.0/8. You place one interface per availability zone because the interface lives in a zone; a
-single-zone endpoint is a single point of failure and pushes cross-zone traffic.
+- **What is created.** One or more network interfaces, each with a private IP from the consumer's
+  subnet; packets to that IP travel over the provider's internal network to the service.
+- **Overlapping CIDRs are fine.** The consumer only ever sees an IP in its own range, so address spaces
+  never have to be compatible. This is the main reason it beats peering for a SaaS whose thousands of
+  customers all use 10.0.0.0/8.
+- **One interface per availability zone**, because the interface lives in a zone; a single-zone endpoint
+  is a single point of failure and pushes cross-zone traffic.
 
 ### 2. A service published on the provider side
-For first-party services (model APIs, storage, key management) the cloud publishes the service for
-you. For your own SaaS you publish it yourself: on AWS, an endpoint service fronted by a Network Load
-Balancer; on Azure, a Private Link service behind a Standard Load Balancer; on Google Cloud, a service
-attachment. You then decide who may connect, by allowlisting customer accounts or requiring manual
-acceptance of each connection request, because otherwise anyone who learns the service name could
-attach to it.
+- **First-party services** (model APIs, storage, key management): the cloud publishes them for you.
+- **Your own SaaS:** you publish it yourself (see the table above).
+- **Decide who may connect** by allowlisting customer accounts or requiring manual acceptance of each
+  connection request, because otherwise anyone who learns the service name could attach to it.
 
 ### 3. DNS that points the normal hostname at the private IP
-Applications and SDKs use the service's ordinary hostname. If that name still resolves to a public IP,
-the endpoint is never used. So the endpoint comes with a private DNS zone that overrides the public
-record inside the consumer network: the same hostname now resolves to the interface's private IP.
-Keeping the hostname unchanged is a deliberate design choice, because it means TLS certificates still
-validate and no SDK needs reconfiguring. For callers outside the VPC (on-prem over a VPN, or another
-network) you must forward their DNS queries into the cloud resolver, otherwise they resolve publicly.
+- **Why DNS matters.** Applications and SDKs use the service's ordinary hostname; if it still resolves to
+  a public IP, the endpoint is never used.
+- **The override.** The endpoint comes with a private DNS zone that overrides the public record inside
+  the consumer network, so the same hostname resolves to the interface's private IP.
+- **Hostname unchanged on purpose**, because TLS certificates still validate and no SDK needs
+  reconfiguring.
+- **Callers outside the VPC** (on-prem over a VPN, or another network) need their DNS queries forwarded
+  into the cloud resolver, otherwise they resolve publicly.
 
 ### 4. Policy on both ends
-Connectivity is not authorization. Calls still need IAM credentials or API keys. On top, you can attach
-an endpoint policy (which principals and actions may use this endpoint) and, on the service, a
-resource policy or network rule saying "only accept requests arriving via endpoint X". The combination
-is what makes stolen credentials useless off-network.
+- **Connectivity is not authorization.** Calls still need IAM credentials or API keys.
+- **Endpoint policy:** which principals and actions may use this endpoint.
+- **Service-side rule:** a resource policy or network rule saying "only accept requests arriving via
+  endpoint X". The combination is what makes stolen credentials useless off-network.
 
 ### Following one request
 Put the four parts together for a call from a pod to a model API:
-1. The SDK asks the VPC resolver for `bedrock-runtime.<region>.amazonaws.com`; the private zone
-   answers with the endpoint interfaces' private IPs (say 10.20.1.15 and 10.20.2.15, one per zone).
-2. The pod opens TCP 443 to 10.20.1.15. The **security group on the endpoint interface** must allow
-   443 from the pod's subnet; it is a separate control from the pod's own egress rules, and forgetting
-   it is the classic "DNS is right but it still times out" failure.
-3. The provider network carries the flow to the service's load balancer. The service never sees a
-   route into your VPC; it sees a connection tagged with the endpoint it came through, which is what
-   resource policies such as "only via endpoint X" match on. (For your own SaaS on AWS, enabling
-   Proxy Protocol v2 on the NLB is how your application learns which customer endpoint a connection
-   came from, *because* the source IP alone is not a reliable customer identifier.)
-4. TLS is negotiated against the ordinary hostname, so the provider's public certificate validates,
-   then the API key or IAM signature is checked as usual.
+1. **Resolve.** The SDK asks the VPC resolver for `bedrock-runtime.<region>.amazonaws.com`; the private
+   zone answers with the endpoint interfaces' private IPs (say 10.20.1.15 and 10.20.2.15, one per zone).
+2. **Connect.** The pod opens TCP 443 to 10.20.1.15. The **security group on the endpoint interface**
+   must allow 443 from the pod's subnet. It is a separate control from the pod's own egress rules, and
+   forgetting it is the classic "DNS is right but it still times out" failure.
+3. **Carry.** The provider network takes the flow to the service's load balancer. The service never sees
+   a route into your VPC; it sees a connection tagged with the endpoint it came through, which is what
+   resource policies such as "only via endpoint X" match on.
+4. **Authenticate.** TLS is negotiated against the ordinary hostname, so the provider's public
+   certificate validates; then the API key or IAM signature is checked as usual.
 
-Note the direction: connections are initiated by the consumer toward the service. The provider cannot
-open connections back into the consumer network through the endpoint, which is why security teams
-find it easier to approve than a VPN or peering link.
+- **Customer identity for your own SaaS.** On AWS, enabling Proxy Protocol v2 on the NLB is how your
+  application learns which customer endpoint a connection came from, *because* the source IP alone is
+  not a reliable customer identifier.
+- **One-way by design.** Connections are initiated by the consumer toward the service; the provider
+  cannot open connections back into the consumer network through the endpoint, which is why security
+  teams approve it more easily than a VPN or peering link.
 
-On AWS, gateway endpoints are a different, older mechanism available only for S3 and DynamoDB: they
-add a route-table entry (a prefix list) instead of an interface, cost nothing extra, but only work from
-inside that VPC and not from on-prem or peered networks. Azure and Google Cloud have no direct equivalent;
-their closest analogues are service endpoints and Private Google Access respectively.
+### Gateway endpoints (AWS only)
+- **Older, different mechanism** available only for S3 and DynamoDB: a route-table entry (a prefix list)
+  instead of an interface.
+- **Cost and reach.** Cost nothing extra, but only work from inside that VPC, not from on-prem or peered
+  networks.
+- **Elsewhere.** Azure and Google Cloud have no direct equivalent; their closest analogues are service
+  endpoints and Private Google Access respectively.
 
-## Example
-A team runs a RAG service in a private subnet with no NAT. They created an interface endpoint for the
-model runtime API and one for object storage, then want a deploy-time check that the SDK's hostnames
-really resolve privately. A failed check is the earliest signal that private DNS is off, which otherwise
-shows up only as timeouts (no egress) or, worse, silent internet traffic (if egress exists).
+## Diagram
+One call from a pod to a model API: the private DNS answer and the endpoint's security group are the
+two steps that most often break.
+
+```mermaid
+sequenceDiagram
+    participant P as Pod in private subnet
+    participant R as VPC resolver
+    participant E as Endpoint interface
+    participant L as Provider load balancer
+    participant S as Model API
+    P->>R: resolve the ordinary API hostname
+    R-->>P: private IPs, one per zone
+    P->>E: TCP 443 to private IP
+    Note over E: security group must admit 443
+    E->>L: carried on provider network, tagged with endpoint id
+    L->>S: forward request
+    Note over S: TLS on normal hostname, then IAM or API key, then only-via-endpoint policy
+    S-->>P: response on the same path
+```
+
+## Examples
+### Deploy-time check that SDK hostnames resolve privately
+- **Setting.** A team runs a RAG service in a private subnet with no NAT. They created an interface
+  endpoint for the model runtime API and one for object storage.
+- **Why check.** A failed check is the earliest signal that private DNS is off, which otherwise shows up
+  only as timeouts (no egress) or, worse, silent internet traffic (if egress exists).
 
 ```python
 import ipaddress, socket, sys
@@ -143,44 +169,103 @@ if failures:
     print("\n".join("FAIL " + f for f in failures)); sys.exit(1)
 ```
 
-Run it from inside the workload (a pod, a task), not from a laptop, because resolution depends on which
-resolver the caller uses. Storage services may answer with a gateway route rather than a private IP;
-check the route table for those.
+- **Run it from inside the workload** (a pod, a task), not a laptop, because resolution depends on which
+  resolver the caller uses.
+- **Storage may use a gateway route** rather than a private IP; check the route table for those.
+
+### The endpoint in Terraform, with the security group that usually gets forgotten
+One interface per zone, private DNS on, and an ingress rule for 443 from the workload subnets.
+
+```hcl
+resource "aws_vpc_endpoint" "bedrock_runtime" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.eu-west-1.bedrock-runtime"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.app_a.id, aws_subnet.app_b.id]   # one per AZ
+  security_group_ids  = [aws_security_group.endpoint.id]
+  private_dns_enabled = true                                          # the DNS half
+}
+
+resource "aws_security_group" "endpoint" {
+  vpc_id = aws_vpc.main.id
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [aws_subnet.app_a.cidr_block, aws_subnet.app_b.cidr_block]
+  }
+}
+```
+
+### Worked scenario: three symptoms, three different causes
+| Symptom seen | What the lookup from the pod shows | Cause | Fix |
+|---|---|---|---|
+| Flow logs show bytes via NAT to the API | public IP | private DNS off or zone not linked to this VPC | enable private DNS, link the zone |
+| Timeouts, hostname resolves to 10.20.1.15 | private IP | endpoint security group blocks 443 | admit 443 from the workload subnet |
+| Works in cluster, fails from data centre | public IP on-prem only | no DNS forwarding from on-prem | forward the domain to the cloud resolver |
+
+The second row is the one teams misdiagnose as a provider outage, because DNS already looks correct.
+
+## Production patterns
+- **Fail closed at the network layer.** Remove the NAT route from subnets that only need endpointed
+  services, so a call that resolves publicly fails loudly instead of leaking. Monitor VPC flow logs for
+  any bytes to the service via NAT; the target is zero.
+- **Restrict the service to the endpoint.** For S3, a bucket policy that denies requests unless the
+  `aws:SourceVpce` condition key matches your endpoint id; for Azure services, set public network access
+  to disabled. Monitor denied requests: a spike means a caller is still on the public path.
+- **Shared endpoint hub.** With dozens of services across many VPCs, host endpoints once in a central VPC
+  and share the private zones, because per-endpoint, per-zone charges add up. Monitor endpoint count and
+  cost per VPC.
+- **Hybrid DNS forwarding.** Give on-prem resolvers a conditional forward for the service domains to a
+  cloud inbound resolver (Route 53 Resolver inbound endpoints on AWS, Azure DNS Private Resolver on Azure).
+  Monitor the DNS check above run from an on-prem host.
+- **Manual acceptance for your SaaS endpoint service.** Set `acceptance_required = true` and an explicit
+  principal allowlist on the Terraform `aws_vpc_endpoint_service`, so unknown accounts never attach.
+  Review the connection list on a schedule.
+- **DNS check as a deploy gate.** Run the resolution script as a pre-start job in each environment and
+  block rollout on failure; alert if it ever flips from private to public.
 
 ## Trade-offs
-- You gain a narrow, one-directional path to exactly one service, but pay per-endpoint, per-zone hourly
-  and per-GB charges; with dozens of services across many VPCs, a central shared-endpoint VPC becomes cheaper.
-- Disabling public access on the service blocks leaked credentials from the internet, but also blocks your
-  own engineers' laptops and CI runners unless they reach it over VPN or a private runner.
-- Endpoints avoid CIDR coordination that peering or VPNs need, but they only carry traffic to the
-  published service; if workloads need many services or bidirectional flows, peering or a transit network is simpler.
-- Private networking reassures a security team about the path, but it does not change who processes
-  the data or where; if the concern is residency or training use, you need contractual and regional controls instead.
+- **Narrow path vs cost.** You gain a narrow, one-directional path to exactly one service, but pay
+  per-endpoint, per-zone hourly and per-GB charges. With dozens of services across many VPCs, a central
+  shared-endpoint VPC becomes cheaper.
+- **No public access vs convenience.** Disabling public access blocks leaked credentials from the
+  internet, but also blocks your own engineers' laptops and CI runners unless they reach it over VPN or a
+  private runner.
+- **No CIDR coordination vs flexibility.** Endpoints avoid the CIDR coordination peering or VPNs need,
+  but only carry traffic to the published service. If workloads need many services or bidirectional
+  flows, peering or a transit network is simpler.
+- **Path assurance vs data assurance.** Private networking reassures a security team about the path, but
+  does not change who processes the data or where. If the concern is residency or training use, you
+  need contractual and regional controls instead.
 
 ## Pitfalls
-- Creating the endpoint but not enabling or linking the private DNS zone; the symptom is the SDK timing
-  out in a no-egress subnet, or flow logs showing traffic still leaving through the NAT gateway.
-- Forgetting on-prem and peered-VPC callers need DNS forwarding to the cloud resolver; the symptom is
-  "works from the cluster, fails from the data center" with the hostname resolving to a public IP there.
-- Leaving the endpoint interface's security group at a default that does not admit 443 from the
-  workload subnet; the symptom is that the hostname correctly resolves to a private IP but every
-  connection times out, which teams misdiagnose as a DNS or provider outage.
-- Endpointing the main API but not its dependencies, such as the identity provider, token service or a
-  separate file-upload host; the symptom is authentication or uploads hanging while plain calls succeed.
-- Deploying the interface in one availability zone; the symptom is a full outage of model calls during a
-  zone incident and unexpected cross-zone data charges in normal operation.
-- Publishing your SaaS endpoint service with auto-accept for any principal; the symptom is unknown
-  accounts appearing in the connection list, which an audit will flag immediately.
+- **Endpoint without private DNS.** Creating the endpoint but not enabling or linking the private DNS
+  zone. Symptom: the SDK times out in a no-egress subnet, or flow logs show traffic still leaving
+  through the NAT gateway.
+- **Forgetting hybrid callers.** On-prem and peered-VPC callers need DNS forwarding to the cloud
+  resolver. Symptom: "works from the cluster, fails from the data center", with the hostname resolving to
+  a public IP there.
+- **Default security group on the interface.** It does not admit 443 from the workload subnet. Symptom:
+  the hostname correctly resolves to a private IP but every connection times out, which teams misdiagnose
+  as a DNS or provider outage.
+- **Endpointing the API but not its dependencies.** Such as the identity provider, token service or a
+  separate file-upload host. Symptom: authentication or uploads hang while plain calls succeed.
+- **Single-zone interface.** Symptom: a full outage of model calls during a zone incident and unexpected
+  cross-zone data charges in normal operation.
+- **Auto-accept for any principal on your SaaS endpoint service.** Symptom: unknown accounts appear in
+  the connection list, which an audit will flag immediately.
 
 ## When to use
-Reach for private endpoints whenever a customer's workload in a cloud network must call a managed
-service and their policy says "no internet egress" or "no public endpoints for data services". That
-covers most regulated buyers calling hosted model APIs, storage and key management in their own
-account, and it is the standard way to offer your SaaS to enterprise customers without a VPN. Prefer
-it over VPN or peering when the flow is one-directional to a single service. Do not use it as a
-substitute for authorization, encryption or data-processing terms. Measure success by flow logs (zero
-bytes to the service via NAT) and by the service rejecting non-endpoint traffic. In interviews,
-explaining the DNS override and the one-way property is what separates real experience from slideware.
+- **Use when** a customer's workload in a cloud network must call a managed service and policy says "no
+  internet egress" or "no public endpoints for data services". That covers most regulated buyers calling
+  hosted model APIs, storage and key management in their own account.
+- **Offer your SaaS this way**: it is the standard way to serve enterprise customers without a VPN.
+- **Prefer it over VPN or peering** when the flow is one-directional to a single service.
+- **Do not use it** as a substitute for authorization, encryption or data-processing terms.
+- **Measure:** flow logs (zero bytes to the service via NAT) and the service rejecting non-endpoint traffic.
+- **Interviews:** explaining the DNS override and the one-way property is what separates real experience
+  from slideware.
 
 ## Role lens
 - **Engineer:** Writes the endpoint, security group and private DNS resources in Terraform, and adds a
@@ -201,6 +286,44 @@ verify with a lookup from inside the pod, then make it fail closed: remove the N
 subnet so a call that resolves publicly fails loudly, set the service's resource policy to accept only requests via
 this endpoint, and turn off public network access where the service supports it. Finally add the DNS
 check to deployment so a regression is caught before traffic flows.
+
+## Interview questions
+### What is a private endpoint, and why is it preferred over a NAT gateway or IP allowlist?
+- **Definition:** a network interface with a private IP in the consumer's subnet, plus a private DNS
+  override, that carries traffic to one managed service over the provider's network.
+- **Versus NAT:** NAT opens the whole internet to the subnet; the endpoint reaches exactly one service.
+- **Versus allowlists:** provider IP pools are shared and change, so allowlists end up admitting a large
+  slice of the cloud.
+
+### DNS resolves to a private IP but every call times out. Walk me through the debugging.
+- **Confirm the path:** from inside the pod, check the resolved IP is the endpoint interface and try a
+  TCP connect to 443.
+- **Check the endpoint's security group first:** it must admit 443 from the workload subnet, and it is
+  separate from the pod's egress rules.
+- **Then check** pod egress policy, network ACLs on the subnet, and that the endpoint has an interface in
+  the zone the pod is calling.
+
+### When would you choose a VPN or peering instead of private endpoints?
+- **Many services or both directions:** endpoints carry traffic only to one published service, so broad
+  or bidirectional flows are simpler over peering or a transit network.
+- **Non-cloud sources needing routes into the VPC:** a VPN joins networks, which endpoints deliberately
+  do not.
+- **Cost:** endpoints bill per endpoint, per zone and per GB, so dozens of services across many VPCs
+  favour a shared hub or a different topology.
+
+### How do you make a stolen API key useless from outside the customer network?
+- **The endpoint alone does not:** it adds a private path but leaves the public one open.
+- **Restrict at the service:** disable public network access, or use a resource policy that only accepts
+  requests via this endpoint (for S3, the `aws:SourceVpce` condition).
+- **Prove it:** call from outside with a valid key and expect a denial; alert on denied-request spikes.
+
+### You are offering your SaaS over PrivateLink to 300 enterprise customers. What do you design for?
+- **Publishing:** an endpoint service behind a Network Load Balancer, with manual acceptance or an
+  account allowlist so only contracted customers attach.
+- **Tenant identity:** Proxy Protocol v2 tells your app which endpoint a connection came from, because
+  source IPs overlap across customers using the same private ranges.
+- **Operations:** availability in every zone customers use, and a runbook for their DNS and security-group
+  setup, since most onboarding failures are on their side.
 
 ## Quiz
 ### Q: Why can a SaaS vendor offer private endpoints to hundreds of customers who all use overlapping 10.0.0.0/16 ranges?

@@ -5,7 +5,7 @@ name: Approval & authorization boundaries
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - agents/human-in-the-loop
   - agents/approval-gates-for-consequential-actions
@@ -22,102 +22,127 @@ sources:
 ---
 
 ## TL;DR
-Authorization answers "may this principal perform this action at all"; approval answers "does a human need
-to confirm this particular instance". Both must be decided by the runtime at the tool-dispatch boundary,
-outside the model's influence, because model output is untrusted input: a prompt-injected or hallucinated
-tool call carries exactly as much authority as a legitimate one. The agent acts with the *intersection* of
-the user's rights and its own delegated scope, and an approval is bound to the exact arguments it approved.
+Authorization asks "may this principal do this at all"; approval asks "must a human confirm this instance".
+The runtime decides both at tool dispatch, outside the model's influence, using user-and-agent intersected
+authority and approvals bound to exact arguments.
 
 ## Why it exists
-An agent that can call tools is a program that performs actions chosen by a model. Whoever influences the
-model, whether the user, a web page the agent read, or a document in the retrieval index, influences those
-actions. That makes two questions unavoidable for every tool call: is the principal behind this run allowed
-to do this, and, even if so, is this specific action consequential enough that a person should look first?
-
-The naive answer is to put the rules in the system prompt: "never delete data, ask before sending email".
-This fails for three reasons. Instructions are advisory, not enforced; a sufficiently persuasive injection
-overrides them, and models comply with injected instructions at a rate that no security review will accept.
-The model cannot verify permissions it cannot see; it does not know which records this user may read. And
-nothing is recorded; when something goes wrong there is no decision to audit, only a transcript.
-
-A second naive answer is to give the agent a powerful service account "so it can do what users need". This
-creates the classic confused deputy: a user who may not read a record asks the agent, the agent reads it
-with its own broad credential, and the access control of the underlying system is bypassed by a layer of
-indirection. Agents that are more privileged than the people driving them are the central finding behind
-the "excessive agency" class of LLM vulnerabilities.
-
-So the boundary has to live in the runtime, be evaluated deterministically with the real principal's
-identity, and treat the human approval as a durable, argument-bound record rather than a conversational
-"are you sure?".
+- **Whoever influences the model influences the actions.** The user, a web page the agent read or a document
+  in the retrieval index can all steer tool calls. A prompt-injected or hallucinated call carries exactly as
+  much authority as a legitimate one, because model output is untrusted input.
+- **Two questions are unavoidable per tool call.** Is the principal behind this run allowed to do this? And
+  even if so, is this specific action consequential enough that a person should look first?
+- **Rules in the system prompt fail three ways.** Instructions are advisory: a persuasive injection overrides
+  them, at a rate no security review accepts. The model cannot verify permissions it cannot see, such as
+  which records this user may read. And nothing is recorded, so there is no decision to audit, only a
+  transcript.
+- **A powerful service account creates the confused deputy.** A user who may not read a record asks the
+  agent, which reads it with its own broad credential, bypassing the underlying system's access control.
+  Agents more privileged than their drivers are the core of the "excessive agency" vulnerability class.
+- **So the boundary lives in the runtime.** It is evaluated deterministically with the real principal's
+  identity, and a human approval is a durable, argument-bound record, not a conversational "are you sure?".
 
 ## How it works
 ### Three principals, one effective authority
-Every run has at least three identities in play: the **end user** on whose behalf it acts, the **agent**
-itself (a workload identity with its own allowed tool set), and the **tool owner** whose service will be
-called. The effective authority of a tool call is the intersection: the action must be within the user's
-permissions *and* within the agent's delegated scope. Intersecting rather than unioning is the design
-choice that prevents the confused deputy, because the agent can never reach more than the user could.
+| Principal | What it is |
+|---|---|
+| **End user** | the person on whose behalf the run acts |
+| **Agent** | a workload identity with its own allowed tool set |
+| **Tool owner** | the service that will be called |
 
-In practice this is implemented by delegation: the runtime holds a user token or scopes obtained at
-sign-in and, when dispatching a tool, exchanges it for a short-lived, down-scoped token for that tool
-(OAuth token exchange / on-behalf-of flows, or cloud role assumption with a session policy). The tool
-service then enforces its own authorization against the delegated identity, which gives defence in depth:
-even if the runtime's check is bypassed, the tool sees a token that cannot do more than the user could.
+- **Effective authority is the intersection.** The action must be within the user's permissions *and*
+  within the agent's delegated scope.
+- **Intersect, never union,** because then the agent can never reach more than the user could. That is the
+  design choice that prevents the confused deputy.
+- **Implemented by delegation.** The runtime holds a user token or scopes from sign-in. At dispatch it
+  exchanges them for a short-lived, down-scoped token for that tool: OAuth token exchange / on-behalf-of
+  flows, or cloud role assumption with a session policy.
+- **The tool enforces again (defence in depth).** The tool service checks its own authorization against the
+  delegated identity, so even if the runtime's check is bypassed, the token cannot do more than the user
+  could.
 
 ### Classifying actions
-Authorization is binary per (principal, action, resource). Approval needs a richer classification because
+Authorization is binary per (principal, action, resource). Approval needs a richer classification, because
 "allowed" and "safe to do unattended" differ. A workable tiering:
 
-- **auto** — read-only, idempotent, inside the tenant (search, fetch a record).
-- **log** — writes that are reversible or low blast radius (create a draft, add a comment).
-- **approve** — irreversible, external, financial or above a threshold (send email, refund, delete,
-  merge, call anything that costs money beyond a cap).
-- **deny** — never from an agent, regardless of user (drop tables, change IAM, disable logging).
+| Tier | Meaning | Examples |
+|---|---|---|
+| **auto** | read-only, idempotent, inside the tenant | search, fetch a record |
+| **log** | writes that are reversible or low blast radius | create a draft, add a comment |
+| **approve** | irreversible, external, financial or above a threshold | send email, refund, delete, merge, anything costing money beyond a cap |
+| **deny** | never from an agent, regardless of user | drop tables, change IAM, disable logging |
 
-Tiers are assigned per tool and refined per argument (a refund under a threshold may be `log`, above it
-`approve`). Keeping this table in configuration owned by security, not in the agent's code or prompt, is
-what makes it reviewable and changeable without redeploying agents.
+- **Assign per tool, refine per argument.** A refund under a threshold may be `log`, above it `approve`.
+- **Keep the table in configuration owned by security,** not in agent code or the prompt, because that makes
+  it reviewable and changeable without redeploying agents.
 
 ### Approval as a durable, argument-bound state
-When the gate returns `approve`, the runtime does not block; it writes an **approval request** containing
-the run id, the tool name, the full arguments, and a fingerprint (hash of the canonicalised call), parks the
-run in `waiting_for_approval`, and notifies an approver through whatever channel the organisation uses.
-The approver sees the exact action, not the model's description of it, because descriptions can be
-misleading while arguments are what will execute.
+When the gate returns `approve`, the runtime does not block. Instead:
+1. **Write an approval request** with the run id, tool name, full arguments and a fingerprint (hash of the
+   canonicalised call).
+2. **Park the run** in `waiting_for_approval`.
+3. **Notify an approver** through whatever channel the organisation uses. The approver sees the exact
+   action, not the model's description of it, because descriptions can mislead while arguments are what
+   will execute.
 
-When the approval event arrives, the runtime resumes and re-checks three things before executing: the
-fingerprint of the call it is about to dispatch equals the approved fingerprint (so the model cannot
-"adjust" the arguments after approval), the approval has not expired (a TTL bounds how stale the human's
-context can be), and authorization still holds (permissions may have been revoked while parked). Only then
-does it dispatch, and it marks the approval **consumed** in the same write that records the dispatch.
-Single use matters because a fingerprint covers arguments, not occurrences: without consumption, one
-approval of `refund(order=812, amount=400)` would also authorise an identical second refund later in the
-same run, which is exactly what a looping or injected agent produces. The approval record, the approver's
-identity and the final decision are appended to the run's log, which turns the audit question "who
-authorised this?" into a lookup.
+When the approval event arrives, the runtime resumes and re-checks before executing:
+1. **Fingerprint matches.** The call about to dispatch hashes to the approved fingerprint, so the model
+   cannot "adjust" arguments after approval.
+2. **Not expired.** A TTL bounds how stale the human's context can be.
+3. **Authorization still holds.** Permissions may have been revoked while the run was parked.
+4. **Dispatch and consume in one write.** The approval is marked **consumed** in the same write that records
+   the dispatch.
+
+- **Why single use matters:** a fingerprint covers arguments, not occurrences. Without consumption, one
+  approval of `refund(order=812, amount=400)` would also authorise an identical second refund later in the
+  same run, which is exactly what a looping or injected agent produces.
+- **Audit becomes a lookup.** The approval record, approver identity and final decision are appended to the
+  run's log, so "who authorised this?" has a direct answer.
 
 ### Who approves, and through what channel
-Two different controls hide under the word "approval". **User confirmation** (the person driving the run
-confirms the action) defeats prompt injection, because the user sees the real arguments and the injected
-instruction did not come from them; it does nothing against a user who wants the harmful action.
-**Independent approval** (a manager, a finance reviewer) adds separation of duties, and the runtime must
-then enforce that the approver is not the requester. Pick per tier: confirmation for "is this what you
-meant", independent approval where the organisation would require it for a human doing the same thing.
-Either way the approval prompt is rendered by the runtime from the stored arguments and delivered through
-a channel the model cannot write to; if the model's chat output is the approval UI, an injection can
-simply print a fake "approved" or a misleading summary.
+| Control | Who | Defeats | Does not defeat |
+|---|---|---|---|
+| **User confirmation** | the person driving the run | prompt injection: the user sees the real arguments and did not issue the injected instruction | a user who wants the harmful action |
+| **Independent approval** | a manager, a finance reviewer | a single bad actor (separation of duties) | nothing extra on injection; the runtime must enforce approver ≠ requester |
+
+- **Pick per tier.** Confirmation for "is this what you meant"; independent approval where the organisation
+  would require it for a human doing the same thing.
+- **The runtime renders the prompt.** It is built from the stored arguments and delivered through a channel
+  the model cannot write to. If the model's chat output is the approval UI, an injection can print a fake
+  "approved" or a misleading summary.
 
 ### Avoiding approval fatigue
-A gate that asks too often trains approvers to click yes, which is worse than no gate. Mitigations that
-preserve the control: approve a *plan* up front (a bounded set of actions and arguments) rather than each
-step; batch low-risk approvals; allow a scoped, time-boxed "always allow this tool with these constraints
-for this session"; and track the approval rate and median time-to-approve so you notice when the gate has
-become a rubber stamp.
+A gate that asks too often trains approvers to click yes, which is worse than no gate. Mitigations that keep
+the control:
+- **Approve a plan up front:** a bounded set of actions and arguments, rather than each step.
+- **Batch low-risk approvals.**
+- **Scoped, time-boxed allowances:** "always allow this tool with these constraints for this session".
+- **Track approval rate and median time-to-approve,** so you notice when the gate has become a rubber stamp.
 
-## Example
-A dispatch-time gate that computes effective authority as an intersection, tiers the action, and treats
-approvals as fingerprint-bound records with a TTL. The policy table would normally be loaded from
-configuration; it is inlined here to keep the mechanics visible.
+## Diagram
+Every call passes the intersection check first; only approve-tier calls park, and a resumed call executes
+only if its fingerprint, TTL and authorization all still hold.
+
+```mermaid
+flowchart TD
+    C["Tool call from model"] --> AZ{"Scope in user AND agent?"}
+    AZ -->|"no"| D["Deny"]
+    AZ -->|"yes"| T{"Tier for tool and args"}
+    T -->|"deny"| D
+    T -->|"auto or log"| X["Execute with delegated token"]
+    T -->|"approve"| R["Store request with fingerprint and TTL"]
+    R --> P["Park run, notify approver"]
+    P -->|"approved"| V{"Same fingerprint, live, still authorized?"}
+    V -->|"yes"| K["Consume approval and execute"]
+    V -->|"no"| R
+    P -->|"rejected"| D
+```
+
+## Examples
+### Dispatch-time gate with fingerprint-bound approvals
+It computes effective authority as an intersection, tiers the action, and treats approvals as
+fingerprint-bound records with a TTL. The policy table would normally be loaded from configuration; it is
+inlined here to keep the mechanics visible.
 
 ```python
 import hashlib, json, time
@@ -160,53 +185,112 @@ def gate(run, call, approvals):
 # above is also the re-authorization; a cached copy from run start would let a revoked user's run finish.
 ```
 
-Trace three calls from one support agent run. `refund_payment(order=812, amount=30)` passes the scope
-check, tiers to `log`, and executes. `refund_payment(order=812, amount=400)` tiers to `approve`; no record
-exists, so a request with a 4-hour TTL is created and the run parks. The approver sees amount 400 and order
-812, approves; on resume the same canonical call hashes to the same `fp`, the record is live and approved,
-it is consumed and the refund executes. If the model then emits the identical call again, `get` finds no
-unconsumed record and a new approval is required. Had the model swapped in `amount=4000` after approval,
-the hash would differ and the run would simply park again.
+### Worked trace: three refunds in one support run
+| Call | Gate result | Why |
+|---|---|---|
+| `refund_payment(order=812, amount=30)` | allow (`log`) | passes the scope check; at or under the threshold, so it executes |
+| `refund_payment(order=812, amount=400)` | wait | tiers to `approve`; no record exists, so a request with a 4-hour TTL is created and the run parks |
+| same call, after approval | allow | the approver saw amount 400 and order 812; the same canonical call hashes to the same `fp`, the record is live and approved, so it is consumed and the refund executes |
+| identical call again | wait | `get` finds no unconsumed record, so a new approval is required |
+| `amount=4000` swapped in after approval | wait | the hash differs, so the run simply parks again |
+
+### Runnable harness for the gate
+Paste below the gate above and run it: an in-memory approvals table reproduces the trace, including the
+consumed approval and the user who lacks `tickets:write`.
+
+```python
+from types import SimpleNamespace
+
+class Approvals:                             # in-memory stand-in for the approvals table
+    def __init__(self): self.rows = []
+    def create(self, run_id, fp, call, ttl_s):
+        self.rows.append({"run": run_id, "fp": fp, "call": call, "decision": "pending",
+                          "approver": None, "expires_at": time.time() + ttl_s, "consumed": False})
+    def get(self, run_id, fp):
+        live = [r for r in self.rows if r["run"] == run_id and r["fp"] == fp and not r["consumed"]]
+        return live[-1] if live else None
+    def consume(self, rec): rec["consumed"] = True
+    def decide(self, run_id, fp, decision, approver):     # what the approvals inbox calls
+        rec = self.get(run_id, fp); rec["decision"], rec["approver"] = decision, approver
+
+run = SimpleNamespace(id="run_7", user_scopes={"payments:refund", "docs:read"},
+                      agent_scopes={"payments:refund", "docs:read", "tickets:write"})
+ap = Approvals()
+small = {"name": "refund_payment", "args": {"order": 812, "amount": 30}}
+big = {"name": "refund_payment", "args": {"order": 812, "amount": 400}}
+print(gate(run, small, ap))                              # ('allow', 'log')
+effect, fp = gate(run, big, ap); print(effect)           # wait
+ap.decide("run_7", fp, "approved", "maya")
+print(gate(run, big, ap))                                # ('allow', 'approved by maya')
+print(gate(run, big, ap)[0])                             # wait: approval was consumed
+swapped = {"name": "refund_payment", "args": {"order": 812, "amount": 4000}}
+print(gate(run, swapped, ap)[1] == fp)                   # False: different fingerprint
+print(gate(run, {"name": "create_ticket", "args": {}}, ap))  # deny: user lacks tickets:write
+```
+
+## Production patterns
+- **Down-scoped token per tool call** — when a user is present. Exchange the user's token at dispatch using
+  OAuth 2.0 Token Exchange (RFC 8693, `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` with the
+  tool as audience) or an on-behalf-of flow; on AWS, assume a role with a session policy. Monitor token
+  lifetimes and calls made without a user subject.
+- **Tier table as reviewed configuration** — when more than one team ships tools. Keep tiers and thresholds
+  in a policy file or policy engine owned by security, require their review on changes (for example via a
+  CODEOWNERS entry), and fail closed on unknown tools. Monitor tools with no tier assigned.
+- **Atomic single-use consumption** — whenever approvals gate money or external sends. Consume with a
+  conditional write such as `UPDATE approvals SET consumed_at = now() WHERE id = $1 AND consumed_at IS
+  NULL` and dispatch only if one row changed. Monitor duplicate-consume attempts.
+- **Runtime-rendered approval cards** — when approvals happen in chat tools. Render the card in a Slack or
+  Teams message from the stored arguments with approve and reject buttons, never from model text, and
+  verify the clicker is not the requester for independent approvals. Monitor approver-equals-requester
+  rejections.
+- **Fatigue dashboard** — once the gate is live. Chart approval rate, reject rate and median time-to-approve
+  per tool; a reject rate near zero means re-tier the tool, and time-to-approve sets the TTL. Monitor
+  expired approvals as a share of requests.
 
 ## Trade-offs
-- Intersecting user and agent scopes gives least privilege and clean audit attribution, but requires
-  per-user delegated tokens; for background agents with no user present you fall back to a tightly scoped
-  workload identity and tier more actions as `approve`.
-- Binding approvals to exact argument fingerprints defeats argument-swapping after approval, but any
-  benign retry with different arguments needs a fresh approval; loosen to a constrained intent (recipient
+- **Intersected scopes vs simple service identity.** You gain least privilege and clean audit attribution,
+  but need per-user delegated tokens. For background agents with no user present, fall back to a tightly
+  scoped workload identity and tier more actions as `approve`.
+- **Exact-fingerprint approvals vs flexibility.** They defeat argument-swapping after approval, but any
+  benign retry with different arguments needs a fresh approval. Loosen to a constrained intent (recipient
   fixed, body free) only where you can express the constraint in policy.
-- Enforcing at the runtime alone is simpler than also enforcing at each tool service, but a single
-  bypass is then total; defence in depth costs token plumbing and buys survival of your own bugs.
-- Plan-level approval cuts prompts dramatically and keeps humans engaged, but the agent may legitimately
-  need to deviate, and every deviation outside the approved set must re-trigger the gate.
-- Short approval TTLs keep the human's context fresh, yet in asynchronous organisations they expire
-  before anyone looks; pick the TTL from your observed time-to-approve, not from a security wish.
+- **Runtime-only vs defence in depth.** Enforcing only at the runtime is simpler than also enforcing at each
+  tool service, but a single bypass is then total. Defence in depth costs token plumbing and buys survival
+  of your own bugs.
+- **Plan-level vs per-step approval.** Plan-level cuts prompts dramatically and keeps humans engaged, but the
+  agent may legitimately need to deviate, and every deviation outside the approved set must re-trigger the
+  gate.
+- **Short vs long approval TTLs.** Short TTLs keep the human's context fresh, yet in asynchronous
+  organisations they expire before anyone looks. Pick the TTL from observed time-to-approve, not from a
+  security wish.
 
 ## Pitfalls
-- Delegating the approval question to the model ("ask the user before sending"); the symptom is a red-team
-  injection that gets the action executed with a polite confirmation message the user never saw.
-- Approving by description rather than by arguments; the symptom is an audit log where the executed call
-  differs from what the approver believed they approved.
-- Running the agent under a broad service account; the symptom is users retrieving through the agent
-  records they cannot open directly, discovered during a security review or worse.
-- Approvals without a TTL or run binding; the symptom is an approval granted on Monday executing a
-  different run's call on Friday after the business context changed.
-- Resuming after approval without re-authorizing; the symptom is a revoked user whose parked runs still
-  complete their actions hours after offboarding.
-- Approvals that are not consumed on use; the symptom is one approved refund appearing two or three times
-  in the payment ledger when the agent retried or looped with identical arguments.
-- Unknown tools defaulting to `allow`; the symptom is a newly added tool executing consequential actions
-  before anyone classified it.
+- **Delegating the approval question to the model** ("ask the user before sending"). Symptom: a red-team
+  injection gets the action executed with a polite confirmation message the user never saw. Fix: the gate
+  decides, and the runtime renders the confirmation.
+- **Approving by description rather than by arguments.** Symptom: an audit log where the executed call
+  differs from what the approver believed they approved. Fix: show stored arguments and bind a fingerprint.
+- **Running the agent under a broad service account.** Symptom: users retrieve through the agent records
+  they cannot open directly, found during a security review or worse. Fix: delegated, intersected tokens.
+- **Approvals without a TTL or run binding.** Symptom: an approval granted on Monday executes a different
+  run's call on Friday after the business context changed. Fix: key by run and fingerprint, with expiry.
+- **Resuming after approval without re-authorizing.** Symptom: a revoked user's parked runs still complete
+  their actions hours after offboarding. Fix: re-read scopes from the identity provider on resume.
+- **Approvals that are not consumed on use.** Symptom: one approved refund appears two or three times in the
+  payment ledger when the agent retried or looped with identical arguments. Fix: consume atomically.
+- **Unknown tools defaulting to `allow`.** Symptom: a newly added tool executes consequential actions before
+  anyone classified it. Fix: default unknown tools to `approve` or deny.
 
 ## When to use
-Every agent that can perform a write needs the authorization half from day one; the approval half becomes
-necessary the moment an action is irreversible, external, financial or outside the tenant. Resist the
-instinct to gate everything: measure the approval rate per tool, the reject rate (near zero means the gate
-is theatre or the tier is wrong) and time-to-approve, and move tools between tiers on evidence. Day to day
-this shows up as a tier table in configuration, delegated tokens in tool adapters and an approvals inbox
-in the product. In interviews, expect to be asked where the check lives and why not in the prompt, how you
-prevent the confused deputy, and what exactly an approver is approving; the strong answer names the
-fingerprint, the TTL and the re-authorization on resume.
+- **Use authorization from day one** for every agent that can perform a write.
+- **Add approval** the moment an action is irreversible, external, financial or outside the tenant.
+- **Avoid gating everything.** Measure the approval rate per tool, the reject rate (near zero means the gate
+  is theatre or the tier is wrong) and time-to-approve, and move tools between tiers on evidence.
+- **Day to day** this is a tier table in configuration, delegated tokens in tool adapters and an approvals
+  inbox in the product.
+- **Interviews:** expect "where does the check live and why not in the prompt", "how do you prevent the
+  confused deputy" and "what exactly is the approver approving". The strong answer names the fingerprint,
+  the TTL and re-authorization on resume.
 
 ## Role lens
 - **Engineer:** Implements the gate in the dispatcher, canonicalises and hashes calls, and writes tests
@@ -228,6 +312,38 @@ the run with a fingerprint of the exact arguments, a human sees amount and recip
 runtime verifies the fingerprint, the TTL and that authorization still holds. Third, defence in depth: the
 payments service enforces the per-user limit itself on the delegated token, so a bug in the gate cannot
 exceed it. Finally, I would monitor approval and reject rates to keep the threshold honest.
+
+## Interview questions
+### What is the difference between authorization and approval for an agent's tool call?
+- **Authorization** is a deterministic yes or no per principal, action and resource: may this user, through
+  this agent, do this at all.
+- **Approval** is a per-instance human check on an already-authorized action that is irreversible,
+  external or financial, bound to the exact arguments.
+- **Both live at dispatch** in the runtime, because model output is untrusted and prompts are advisory.
+
+### Users are reading records through the agent that they cannot open directly. How do you debug and fix it?
+- **Diagnosis:** the agent is a confused deputy, calling the records service with its own broad service
+  account, so the service's access control sees the agent rather than the user.
+- **Fix:** compute effective authority as user intersected with agent scopes, and exchange the user's token
+  for a short-lived, down-scoped token per tool call so the records service enforces per-user rules itself.
+
+### Why bind an approval to an argument fingerprint, and when would you loosen that?
+- **Bind** because descriptions can mislead and the model could change the recipient or amount after the
+  human said yes; a hash of the canonicalised call makes any change park the run again.
+- **Loosen** to a constrained intent (recipient fixed, body free) only where policy can express the
+  constraint, accepting that benign retries otherwise need a fresh approval.
+
+### Approvers now approve 99 percent of requests within seconds. Is the gate working?
+- **Probably not:** a near-zero reject rate with instant approvals signals fatigue, meaning the gate has
+  become a rubber stamp that trains approvers to click yes.
+- **Response:** re-tier low-risk tools to `log`, approve plans instead of steps, batch low-risk items, and
+  keep human attention for the calls that are actually consequential.
+
+### Who should approve: the user driving the run or an independent reviewer?
+- **User confirmation** defeats prompt injection, because the user sees the real arguments and never issued
+  the injected instruction, but it does nothing against a user who wants the harmful action.
+- **Independent approval** adds separation of duties for actions the organisation would require a second
+  person for, and the runtime must enforce that approver and requester differ.
 
 ## Quiz
 ### Q: Why should an agent's effective authority be the intersection of the user's permissions and the agent's scopes, rather than the agent's scopes alone?

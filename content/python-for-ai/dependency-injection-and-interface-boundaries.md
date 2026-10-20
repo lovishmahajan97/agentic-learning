@@ -37,7 +37,8 @@ providers, for the price of one thin layer of indirection.
   a script that only wanted a helper crash or talk to the wrong environment.
 - **The naive fixes fail.** `unittest.mock.patch("app.summarize.client")` breaks when a refactor moves the
   module, because it couples to an internal path, not a contract. `if os.getenv("FAKE_LLM")` puts test
-  branches in production. A global registry (`get_llm_client()`) hides the dependency one hop away.
+  branches in production. A global registry (`get_llm_client()`) hides the dependency one hop away:
+  nothing in the function signature says it needs a model.
 - **DI flips the direction.** The code that needs a completer is given one; the boundary names the need
   in types your code owns; one composition root wires it. The cost is explicitness; the payoff is a
   visible, testable dependency graph changeable in one place.
@@ -126,19 +127,20 @@ providers, for the price of one thin layer of indirection.
 - **Keep fakes dumb:** a fake that re-implements vendor logic will pass tests the real thing fails.
 
 ## Diagram
-The composition root is the only place that reads settings and builds real clients; the dependency arrows
-point inward toward the port your domain code owns, and tests plug a fake into the same port.
+The composition root (`main()`, an app factory or a FastAPI lifespan) is the only place that reads settings
+and builds real clients; every adapter's arrow points toward the port your domain code owns, and tests plug
+a fake into the same port.
 
 ```mermaid
-flowchart LR
-    S["Settings and env vars"] --> R["Composition root: main, app factory, lifespan"]
+flowchart TD
+    S["Settings and env vars"] --> R["Composition root"]
     R -->|"builds"| A1["OpenAICompleter adapter"]
     R -->|"builds"| A2["vLLM or Anthropic adapter"]
-    A1 -->|"implements"| P["Completer Protocol: your types"]
+    R -->|"injects via constructor"| D["Summarizer domain service"]
+    D -->|"calls complete, gets Completion"| P["Completer Protocol"]
+    A1 -->|"implements"| P
     A2 -->|"implements"| P
     F["FakeCompleter in tests"] -->|"implements"| P
-    R -->|"injects via constructor"| D["Summarizer domain service"]
-    D -->|"calls complete, gets Completion"| P
     A1 -.->|"only file importing the SDK"| V["Vendor SDK and network"]
 ```
 
@@ -283,7 +285,7 @@ A team must add a self-hosted vLLM endpoint for one feature.
 - **Clever fakes** that parse the prompt and generate plausible answers. Symptom: green tests for
   behaviour the real provider does not exhibit. Fix: scripted answers only.
 - **A sync port in an async service** (or an adapter wrapping an async SDK in `asyncio.run`). Symptom:
-  latency that grows with concurrency, or
+  request latency that grows with concurrency because each LLM call blocks the event loop, or
   `RuntimeError: asyncio.run() cannot be called from a running event loop`. Fix: an `AsyncCompleter` port.
 - **Threading config values** (`api_key`, `model`, `temperature`) through five layers. Symptom:
   signatures change whenever a setting is added. Fix: inject the configured adapter instead.

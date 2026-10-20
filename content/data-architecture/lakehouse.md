@@ -5,7 +5,7 @@ name: Lakehouse
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - data-architecture/etl-elt-for-rag
   - data-architecture/training-data-pipelines
@@ -23,115 +23,134 @@ sources:
 ---
 
 ## TL;DR
-A lakehouse is a transactional table layer (Delta Lake, Apache Iceberg, Apache Hudi) over open columnar
-files (Parquet) in object storage. It keeps the cheap, engine-agnostic storage of a data lake and adds
-what a lake lacks: atomic commits, snapshot isolation, schema enforcement and evolution, time travel and
-real deletes. For AI systems it is the natural home for raw documents, chunk and embedding tables, training
-datasets and trace logs, because many different engines need the same data and none of them should own it.
+A lakehouse is a transactional table layer (Delta Lake, Apache Iceberg, Apache Hudi) over open Parquet
+files in object storage. It adds atomic commits, snapshot isolation, schema enforcement, time travel and
+real deletes: the shared home for AI documents, chunks, embeddings, training sets and traces.
 
 ## Why it exists
-Before lakehouses, teams ran two tiers. A data lake (files in S3 or similar) held raw and semi-structured
-data cheaply and let Spark or Python read it, but a directory of Parquet files is not a table: a writer
-that dies halfway leaves readers seeing a partial dataset, two concurrent writers corrupt each other, there
-is no schema to enforce, and deleting one user's rows means rewriting files by hand with no record of what
-changed. This is the "data swamp". A data warehouse held curated tables with ACID guarantees and SQL
-performance, but in a proprietary format, at a higher cost, and poorly suited to images, PDFs, embeddings
-or the Python-first tooling ML teams use. So data was copied from the lake to the warehouse, the copies
-drifted, and governance had to be enforced twice.
-
-AI workloads make the swamp problem worse. A RAG pipeline wants to append millions of chunk rows while a
-retrieval evaluation reads a consistent snapshot; a training job must be reproducible against exactly the
-data it saw; a GDPR request requires deleting one person's documents and proving the deletion also reached
-the derived tables. Each of these needs transactions and versioning on top of cheap storage. The
-lakehouse idea, stated plainly, is: keep the files open and the storage cheap, and add a metadata layer
-that turns a set of files into a versioned, transactional table that any engine can read.
+- **The lake was cheap but was not a table.** Files in S3 or similar held raw and semi-structured data that
+  Spark or Python could read. But a writer dying halfway leaves readers seeing a partial dataset, two
+  concurrent writers corrupt each other, no schema is enforced, and deleting one user's rows means
+  rewriting files by hand with no record. This is the "data swamp".
+- **The warehouse was safe but closed.** Curated tables with ACID and SQL performance, but a proprietary
+  format, higher cost, and a poor fit for images, PDFs, embeddings or Python-first ML tooling.
+- **So data was copied between the two,** the copies drifted, and governance had to be enforced twice.
+- **AI workloads make the swamp worse.** A RAG pipeline appends millions of chunk rows while a retrieval
+  eval reads a consistent snapshot; a training job must reproduce against exactly the data it saw; a GDPR
+  request must delete one person's documents and prove it reached the derived tables. All need
+  transactions and versioning on cheap storage.
+- **The idea, plainly:** keep the files open and the storage cheap, and add a metadata layer that turns a
+  set of files into a versioned, transactional table any engine can read, because many engines need the
+  same data and none should own it.
 
 ## How it works
 ### Layer 1: open columnar files in object storage
-Data lives as Parquet files on S3, GCS or ADLS. Parquet is columnar and compressed, split into row groups
-with per-column statistics (min, max, null count), so an engine scanning for `tenant_id = 'acme'` can skip
-whole row groups whose statistics exclude the value. Object storage gives durability and essentially
-unlimited capacity at a low price per GB, but with high per-request latency and no in-place updates: a
-file is written whole or not at all. Every other design choice follows from that constraint.
+- **Parquet on S3, GCS or ADLS.** Columnar and compressed, split into row groups with per-column statistics
+  (min, max, null count).
+- **Statistics enable skipping.** A scan for `tenant_id = 'acme'` skips whole row groups whose statistics
+  exclude the value.
+- **Object storage's constraint drives everything.** Durable, essentially unlimited capacity at a low price
+  per GB, but high per-request latency and no in-place updates: a file is written whole or not at all.
 
 ### Layer 2: the table format
-A table format is a metadata log that says which files make up the table at each version. Delta Lake
-writes a `_delta_log` of JSON commit entries with periodic Parquet checkpoints; Iceberg writes a tree of
-metadata files, manifest lists and manifests pointing at data files; Hudi keeps a timeline of commits. In
-all three, a write is: add new data files, then atomically publish a new log entry or metadata pointer
-that references them. Because publishing is a single atomic operation, readers either see the old version
-or the new one, never a mix, and concurrent writers use optimistic concurrency: each validates that no
-conflicting commit landed since it started, and retries if one did. This is how ACID is achieved without a
-database server sitting in front of the files. The atomic publish still needs one primitive from somewhere:
-a put-if-absent write in the object store (which S3 lacked until it added conditional writes, so Delta on S3
-long relied on a single writer or an external lock table), or an atomic pointer swap in the catalog, which
-is how Iceberg commits.
+A table format is a metadata log saying which files make up the table at each version.
 
-Here is one commit with a conflict. The table is at version 41. Writer A appends chunks for new
-documents. Writer B runs a GDPR delete that rewrites three files. Both read version 41, write their new
-Parquet files (which no reader can see yet, because no log entry references them), and try to publish
-version 42. A's put-if-absent of entry 42 succeeds. B's fails, so B reads entry 42 and checks whether
-A's changes conflict with what B read and rewrote. A only added files, and if those files cannot hold
-rows matching B's delete predicate (judged by partition values or file statistics, so the check can be
-conservative), there is no conflict and B publishes the same change as version 43. If A had instead
-rewritten one of the files B removed, B would have to abort and re-run against the new state. This is
-optimistic concurrency. It is cheap when writers touch disjoint data and degrades into retry storms when
-many writers rewrite the same partitions, and that is the condition under which you serialize writers
-through one job instead.
+| Format | Metadata structure |
+|---|---|
+| Delta Lake | a `_delta_log` of JSON commit entries with periodic Parquet checkpoints |
+| Iceberg | a tree of metadata files, manifest lists and manifests pointing at data files |
+| Hudi | a timeline of commits |
 
-The same log gives you:
+**A write, in all three:**
+1. Add new data files (invisible to readers, because nothing references them yet).
+2. Atomically publish a new log entry or metadata pointer that references them.
+3. Readers see the old version or the new one, never a mix.
+4. Concurrent writers use optimistic concurrency: each validates that no conflicting commit landed since it
+   started, and retries if one did. That is ACID without a database server in front of the files.
 
-- **Snapshot isolation and time travel.** A reader pins a version; a training job can record the
-  snapshot id it read, and reading it again later returns identical rows, as long as that snapshot has not
-  been expired and its files vacuumed. Default retention windows are days to weeks (Delta's default vacuum
-  threshold is 7 days), so a snapshot needed for a year must be explicitly retained (an Iceberg tag, a
-  longer retention setting on that table) or materialized as its own dataset.
+**The atomic publish still needs one primitive from somewhere:**
+- **A put-if-absent write in the object store.** S3 lacked this until it added conditional writes, so Delta
+  on S3 long relied on a single writer or an external lock table.
+- **Or an atomic pointer swap in the catalog,** which is how Iceberg commits.
+
+### What the log gives you
+- **Snapshot isolation and time travel.** A reader pins a version; a training job records the snapshot id
+  and re-reading it returns identical rows, as long as the snapshot has not been expired and its files
+  vacuumed. Default retention is days to weeks (Delta's default vacuum threshold is 7 days), so a
+  snapshot needed for a year must be explicitly retained (an Iceberg tag, a longer retention setting) or
+  materialized as its own dataset.
 - **Schema enforcement and evolution.** The current schema is in the metadata; writes with a mismatched
   schema are rejected, and adding a column is a metadata change rather than a rewrite.
-- **Deletes and updates.** Copy-on-write rewrites the affected files and commits the replacement;
-  merge-on-read records deletes in small side files (Iceberg delete files, Delta deletion vectors) that
-  readers apply at scan time, deferring the rewrite to a later compaction. Copy-on-write favours readers,
+- **Deletes and updates.** Copy-on-write rewrites the affected files and commits the replacement.
+  Merge-on-read records deletes in small side files (Iceberg delete files, Delta deletion vectors) that
+  readers apply at scan time, deferring the rewrite to compaction. Copy-on-write favours readers;
   merge-on-read favours frequent small writes.
 - **Partitioning and clustering.** Rows are laid out by a partition value (date, tenant) and optionally
-  clustered within partitions so that statistics-based skipping works. Iceberg's hidden partitioning
-  derives the partition from a column transform so queries need not know the layout.
+  clustered within partitions so statistics-based skipping works. Iceberg's hidden partitioning derives the
+  partition from a column transform, so queries need not know the layout.
 
 ### Delta, Iceberg and Hudi: what actually differs
-All three implement the same idea, and they differ mainly in where they came from. Delta Lake came out of
-Databricks and Spark: a linear log of JSON commits with Parquet checkpoints, most mature inside that
-ecosystem. Iceberg came out of Netflix as an engine-neutral specification: snapshots point to manifest
-lists, which point to manifests, which point to data files, so planning a query reads a small
-metadata tree instead of listing directories. It also offers hidden partitioning and partition
-evolution, meaning the layout can change without rewriting old data or changing queries. Hudi came out
-of Uber for upsert-heavy, CDC-fed tables. It offers explicit copy-on-write and merge-on-read table types
-and record-level indexes that locate the file holding a key, which makes frequent upserts cheaper.
-Interoperability layers such as Delta UniForm and Apache XTable write one format's metadata for another
-format's data, which is why the choice is less permanent than it used to be.
+All three implement the same idea and differ mainly in origin.
+
+| Format | Origin | Distinctive traits |
+|---|---|---|
+| Delta Lake | Databricks and Spark | linear log of JSON commits with Parquet checkpoints; most mature inside that ecosystem |
+| Iceberg | Netflix, as an engine-neutral spec | snapshots point to manifest lists, then manifests, then data files, so planning reads a small metadata tree instead of listing directories; hidden partitioning and partition evolution (change layout without rewriting old data or queries) |
+| Hudi | Uber, for upsert-heavy CDC-fed tables | explicit copy-on-write and merge-on-read table types; record-level indexes that locate the file holding a key, making frequent upserts cheaper |
+
+- **The choice is less permanent than it was.** Interoperability layers such as Delta UniForm and Apache
+  XTable write one format's metadata for another format's data.
 
 ### Layer 3: the catalog
-A catalog maps table names to the current metadata location and is where access control, discovery and
-lineage attach: Hive Metastore, AWS Glue, Unity Catalog, Nessie, or an Iceberg REST catalog. It is the
-component that makes "the same table" mean the same thing to Spark, Trino, DuckDB, Flink, Ray and a
-pandas script, which is the whole point: no copies, one access policy.
+- **What it does.** Maps table names to the current metadata location; access control, discovery and
+  lineage attach here.
+- **Examples.** Hive Metastore, AWS Glue, Unity Catalog, Nessie, or an Iceberg REST catalog.
+- **Why it matters.** It makes "the same table" mean the same thing to Spark, Trino, DuckDB, Flink, Ray and a
+  pandas script, which is the whole point: no copies, one access policy.
 
 ### Maintenance the format does not do for you
-Streaming appends create many small files, and object listing plus per-file overhead then dominates query
-time; periodic compaction rewrites them into large files. Old snapshots and the files only they reference
-accumulate until expired and vacuumed, which is also the moment a "deleted" row is physically gone, so
-retention policy and deletion guarantees depend on running this job.
+- **Compaction.** Streaming appends create many small files; object listing plus per-file overhead then
+  dominates query time. Periodic compaction rewrites them into large files.
+- **Snapshot expiry and vacuum.** Old snapshots and the files only they reference accumulate until expired
+  and vacuumed. That is also the moment a "deleted" row is physically gone, so retention policy and
+  deletion guarantees depend on running this job.
 
 ### Where AI data sits in it
-A common layering is bronze (raw ingested bytes and metadata), silver (parsed, cleaned, conformed) and gold
-(serving-ready tables). For an AI platform the concrete tables are: documents (raw pointer, hash, ACL),
-parsed text, chunks, embeddings (an array column alongside `model_id`), training datasets as pinned
-snapshots, and evaluation and trace logs. The vector index and any feature-serving store are derived from
-these tables, rebuilt from them, and never the only copy. The lakehouse is an analytical and batch store:
-point lookups and sub-100 ms serving belong to Postgres, a key-value store or the vector database.
+- **Medallion layering.** Bronze (raw ingested bytes and metadata), silver (parsed, cleaned, conformed),
+  gold (serving-ready tables).
+- **Concrete AI tables.** Documents (raw pointer, hash, ACL), parsed text, chunks, embeddings (an array
+  column alongside `model_id`), training datasets as pinned snapshots, and evaluation and trace logs.
+- **Serving stores are derived.** The vector index and any feature-serving store are rebuilt from these
+  tables and are never the only copy.
+- **Not a serving database.** The lakehouse is an analytical and batch store; point lookups and sub-100 ms
+  serving belong to Postgres, a key-value store or the vector database.
 
-## Example
-A chunk table in Delta Lake using the `deltalake` Python package: append new chunks, upsert changed ones by
-`chunk_id`, read an older snapshot for a reproducible evaluation, and compact small files. The same table
-can be read by Spark, DuckDB or Trino through a catalog.
+## Diagram
+A commit writes invisible data files, then races to publish the next log entry; the loser checks for a
+conflict and either republishes as the next version or re-runs.
+
+```mermaid
+sequenceDiagram
+    participant A as Writer A append
+    participant B as Writer B GDPR delete
+    participant S as Object store
+    participant L as Commit log
+    A->>S: write new Parquet files
+    B->>S: write rewritten files
+    A->>L: put-if-absent entry 42
+    L-->>A: ok, table now v42
+    B->>L: put-if-absent entry 42
+    L-->>B: already exists
+    Note over B: read entry 42, A only added files
+    B->>L: put-if-absent entry 43
+    L-->>B: ok, table now v43
+```
+
+## Examples
+### A chunk table in Delta Lake
+Using the `deltalake` Python package: append new chunks, upsert changed ones by `chunk_id`, read an older
+snapshot for a reproducible evaluation, and compact small files. Spark, DuckDB or Trino can read the same
+table through a catalog.
 
 ```python
 import pyarrow as pa
@@ -166,58 +185,127 @@ dt.optimize.compact()
 dt.vacuum(retention_hours=168, dry_run=False)
 ```
 
-What the log looks like afterwards shows the mechanism. Version 0 is the append: one `add` action per
-new Parquet file. Version 1 is the merge. Because these rows already exist, it rewrites the matched file:
-a `remove` for the old file and an `add` for its replacement, both in one atomic entry. Version 2 is the
-compaction: `remove` actions for the small files and an `add` for the large one, with no change to the
-rows. (On this two-row toy table compaction may find nothing to merge and commit nothing; on a real table
-fed by streaming appends it is a large commit.) A reader pinned to version 0 still resolves the original file, because `remove` only drops a file
-from later versions and does not delete it from storage. Vacuum is the step that deletes files no
-retained version references.
+**What the log looks like afterwards:**
 
-Every training or evaluation run that reads this table records `eval_version`; a later audit re-reads the
-same rows even after the table has moved on, provided the retention policy keeps that version. Note that
-`vacuum(retention_hours=168)` deletes files that only versions older than seven days still reference, so
-time travel to those versions stops working: retention and reproducibility are one decision, not two.
+| Version | Operation | Log actions |
+|---|---|---|
+| 0 | append | one `add` per new Parquet file |
+| 1 | merge (rows exist, so the matched file is rewritten) | a `remove` for the old file and an `add` for its replacement, in one atomic entry |
+| 2 | compaction | `remove` for the small files and an `add` for the large one, no change to rows |
+
+- **Toy caveat.** On this two-row table compaction may find nothing to merge and commit nothing; on a real
+  table fed by streaming appends it is a large commit.
+- **`remove` is logical.** A reader pinned to version 0 still resolves the original file, because `remove`
+  only drops a file from later versions. Vacuum is the step that deletes files no retained version
+  references.
+- **Retention and reproducibility are one decision.** Every run records `eval_version`, and an audit can
+  re-read the same rows provided retention keeps that version. `vacuum(retention_hours=168)` deletes files
+  that only versions older than seven days reference, so time travel to them stops working.
+
+### Optimistic concurrency, simulated
+Runnable as-is. The table is at version 41. Writer A appends chunks for new documents; writer B runs a
+GDPR delete that rewrites three files (one in the simulation); both read version 41 and race for 42.
+
+```python
+class Log:
+    """A table's commit log: version -> actions. put_if_absent is the one atomic primitive."""
+    def __init__(self, upto):
+        self.entries = {v: {"add": [f"f{v}.parquet"], "remove": []} for v in range(upto + 1)}
+    def put_if_absent(self, version, entry):
+        if version in self.entries:
+            return False
+        self.entries[version] = entry
+        return True
+
+def commit(log, read_version, adds, removes, retries=3):
+    v = read_version + 1
+    for _ in range(retries):
+        if log.put_if_absent(v, {"add": adds, "remove": removes}):
+            return v
+        winner = log.entries[v]
+        # Simplified check: real formats also ask whether the winner's added files could hold
+        # rows matching our predicate (via partition values or file statistics).
+        if set(winner["remove"]) & set(removes):
+            raise RuntimeError(f"conflict at v{v}: re-run against the new state")
+        v += 1                                        # disjoint change: publish as the next version
+    raise RuntimeError("too many retries")
+
+log = Log(upto=41)                                    # table is at version 41
+print("A:", commit(log, 41, adds=["chunks-new.parquet"], removes=[]))            # A: 42
+print("B:", commit(log, 41, adds=["f7b.parquet"], removes=["f7.parquet"]))       # B: 43
+try:
+    commit(log, 41, adds=["f7c.parquet"], removes=["f7.parquet"])                # C rewrote f7 too
+except RuntimeError as e:
+    print("C:", e)                                                               # C: conflict at v43
+```
+
+| Step | What happens |
+|---|---|
+| A and B both read version 41 | each writes new Parquet files no reader can see yet |
+| A publishes entry 42 | put-if-absent succeeds |
+| B tries entry 42 | fails; B reads entry 42 and checks for conflict with what it read and rewrote |
+| A only added files that cannot hold rows matching B's predicate | judged by partition values or file statistics, so the check can be conservative; no conflict, B publishes as version 43 |
+| Had A rewritten a file B removed | B aborts and re-runs against the new state (writer C above) |
+
+- **Cheap when writers touch disjoint data;** it degrades into retry storms when many writers rewrite the
+  same partitions, and that is when you serialize writers through one job instead.
+
+## Production patterns
+- **Scheduled compaction per table.** For tables fed by streaming appends, run `OPTIMIZE` (Delta) or the
+  `rewrite_data_files` procedure (Iceberg on Spark) on a schedule, after ingestion windows. Monitor file
+  count and average file size per table; a falling average file size is the early warning.
+- **Retention as an explicit policy.** Set snapshot expiry (`VACUUM` with a retention period in Delta, the
+  `expire_snapshots` procedure in Iceberg) to match the deletion SLA, and tag or materialize any snapshot a
+  training run must keep longer. Monitor time from deletion request to physical removal.
+- **Pin snapshots in run configs.** Record the table version or snapshot id each training and evaluation
+  run read, next to the code commit. Alert when a pinned version is about to fall outside retention.
+- **One writer per hot partition.** When several jobs rewrite the same partitions (re-chunking, GDPR deletes,
+  CDC merges), route them through one job or queue. Monitor commit retries and conflict aborts per table.
+- **Merge-on-read for CDC tables.** For continuously upserted tables, enable deletion vectors (Delta) or
+  merge-on-read deletes (Iceberg, Hudi) and compact regularly so read-time merge cost stays bounded. Monitor
+  scan time and the number of delete files per data file.
 
 ## Trade-offs
-- Open files and a shared catalog let any engine read the data without copies, but you now operate
-  compaction, snapshot expiry and vacuuming yourself unless a managed platform does it for you.
-- Object storage makes capacity nearly free, but per-request latency makes the lakehouse wrong for point
-  lookups or request-path serving; the moment a query needs sub-100 ms, the data needs a derived store.
-- Copy-on-write keeps reads simple and fast, while merge-on-read makes frequent small updates and deletes
-  cheap; the choice flips toward merge-on-read when CDC-style streams feed the table continuously.
-- Time travel gives reproducibility and audit cheaply, but every retained snapshot pins files on disk,
-  and a deletion is not a deletion until snapshot expiry runs; long-lived reproducibility and prompt
-  physical deletion pull in opposite directions, so training snapshots that must outlive retention are
-  usually materialized separately with deletion handled explicitly.
-- Choosing Delta, Iceberg or Hudi is mostly an ecosystem decision (Databricks, Spark and Trino, or a
+- **Open files vs operations work.** Any engine can read the data without copies, but you now operate
+  compaction, snapshot expiry and vacuuming yourself unless a managed platform does it.
+- **Cheap capacity vs latency.** Object storage makes capacity nearly free, but per-request latency makes the
+  lakehouse wrong for point lookups or request-path serving; once a query needs sub-100 ms, the data needs a
+  derived store.
+- **Copy-on-write vs merge-on-read.** Copy-on-write keeps reads simple and fast; merge-on-read makes frequent
+  small updates and deletes cheap. The choice flips toward merge-on-read when CDC-style streams feed the
+  table continuously.
+- **Time travel vs prompt deletion.** Reproducibility and audit come cheaply, but every retained snapshot
+  pins files, and a deletion is not a deletion until expiry runs. Training snapshots that must outlive
+  retention are usually materialized separately with deletion handled explicitly.
+- **Delta vs Iceberg vs Hudi.** Mostly an ecosystem decision (Databricks, Spark and Trino, or a
   streaming-first stack); the formats converge on features, so engine support and catalog integration
   should decide.
 
 ## Pitfalls
-- Streaming small appends without compaction; the symptom is queries whose time is dominated by listing
-  and opening thousands of tiny files, visible as low bytes-scanned but long wall-clock.
-- Partitioning on a high-cardinality column such as `doc_id`; the symptom is millions of directories, slow
+- **Streaming small appends without compaction.** Symptom: query time dominated by listing and opening
+  thousands of tiny files, visible as low bytes-scanned but long wall-clock.
+- **Partitioning on a high-cardinality column such as `doc_id`.** Symptom: millions of directories, slow
   metadata operations and no skipping benefit.
-- Treating the lakehouse as the serving database for retrieval or features; the symptom is p99 latency in
-  seconds and a request path that depends on object-store availability.
-- Storing embeddings without a `model_id` column; the symptom is an index rebuilt from mixed vectors after
-  a model upgrade, with retrieval quality that silently degrades.
-- Never expiring snapshots or vacuuming; the symptom is storage growing without bound and a GDPR deletion
-  that an auditor can still find in an old version.
-- Letting every writer evolve the schema freely; the symptom is downstream jobs failing on a renamed
-  column, which the data-contracts lesson addresses.
+- **Using the lakehouse as the serving database** for retrieval or features. Symptom: p99 latency in seconds
+  and a request path that depends on object-store availability.
+- **Embeddings without a `model_id` column.** Symptom: an index rebuilt from mixed vectors after a model
+  upgrade, with retrieval quality that silently degrades.
+- **Never expiring snapshots or vacuuming.** Symptom: storage growing without bound and a GDPR deletion that
+  an auditor can still find in an old version.
+- **Every writer evolving the schema freely.** Symptom: downstream jobs failing on a renamed column, which
+  the data-contracts lesson addresses.
 
 ## When to use
-Use a lakehouse when more than one engine or team needs the same large tables, when reproducibility and
-audit matter (training sets, evaluation snapshots, deletion proof), or when raw documents and derived
-chunk and embedding tables must coexist with analytics. For a single service with a few gigabytes, a
-Postgres schema is simpler and should win. Measure file count and average file size per table, query bytes
-scanned versus rows returned (skipping effectiveness), snapshot retention versus storage growth, and time
-from a deletion request to physical removal. In day-to-day work the lakehouse is where the RAG pipeline's
-stage tables and the training manifest live; in interviews, be ready to explain how an atomic commit over
-immutable files yields ACID, and why the vector index is derived from a table rather than being the source.
+- **Use when** more than one engine or team needs the same large tables, when reproducibility and audit
+  matter (training sets, evaluation snapshots, deletion proof), or when raw documents and derived chunk and
+  embedding tables must coexist with analytics.
+- **Avoid when** it is a single service with a few gigabytes; a Postgres schema is simpler and should win.
+- **Measure** file count and average file size per table, bytes scanned versus rows returned (skipping
+  effectiveness), snapshot retention versus storage growth, and time from deletion request to physical
+  removal.
+- **Day to day,** the lakehouse is where the RAG pipeline's stage tables and the training manifest live.
+- **Interviews:** explain how an atomic commit over immutable files yields ACID, and why the vector index is
+  derived from a table rather than being the source.
 
 ## Role lens
 - **Engineer:** Writes stage outputs as Delta or Iceberg tables with partition keys and `model_id` columns,
@@ -242,6 +330,42 @@ log records what changed. What stays with the team: the deleted rows persist in 
 expiry and vacuum run, so a retention job and a check against derived stores such as the vector index are
 still needed; compaction of the nightly job's small files; and a catalog so Trino, Spark and Python all
 resolve the same table and access policy.
+
+## Interview questions
+### What is a lakehouse, and why not just use a data lake plus a warehouse?
+- **Definition:** a transactional metadata layer (Delta, Iceberg, Hudi) over open Parquet files in object
+  storage, giving atomic commits, snapshots, schema enforcement and real deletes.
+- **Why not two tiers:** copying lake data into a warehouse creates drifting copies and doubles governance,
+  and warehouses fit embeddings, PDFs and Python tooling poorly.
+- **The payoff for AI:** one copy of chunks, embeddings and training sets that Spark, Trino, DuckDB and
+  pandas all read through one catalog and one access policy.
+
+### Commits on a busy table keep failing with conflicts. How do you debug it?
+- **Look at who rewrites what:** conflicts come from concurrent writers rewriting the same files or
+  partitions, such as a re-chunk job and a GDPR delete job.
+- **Check the partitioning:** a coarse partition (all chunks in one) makes every rewrite overlap; partition by
+  date or tenant so writers touch disjoint data.
+- **Then serialize** the remaining hot writers through one job, and track retries per table.
+
+### When would you not put data in a lakehouse?
+- **Request-path serving:** sub-100 ms lookups belong in Postgres, a key-value store or the vector database,
+  because object storage has high per-request latency.
+- **Small single-service data:** a few gigabytes owned by one service is simpler in Postgres.
+- **Keep the lakehouse as the source** those serving stores are rebuilt from.
+
+### A customer asks you to prove a user's data is deleted. What do you check?
+- **The delete commit:** a `DELETE` or `MERGE` produced a new version without the rows.
+- **Old snapshots:** the rows still exist in prior versions until snapshot expiry and vacuum run, so check
+  retention (Delta's default vacuum threshold is 7 days) and that the job ran.
+- **Derived stores:** the vector index, caches and any materialized training snapshots must also be purged.
+
+### Why do training runs record a snapshot id, and what can break it?
+- **Reproducibility:** re-reading a pinned version returns identical rows, so a regression can be traced to a
+  data change.
+- **What breaks it:** vacuum deletes files only old versions reference; with `retention_hours=168`, versions
+  older than seven days stop resolving.
+- **Fix:** tag the snapshot (Iceberg), extend retention for that table, or materialize the training set as
+  its own dataset with deletion handled explicitly.
 
 ## Quiz
 ### Q: How does a lakehouse table format provide atomic commits on object storage that has no in-place updates?

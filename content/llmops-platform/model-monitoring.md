@@ -5,7 +5,7 @@ name: Model monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - llmops-platform/drift
   - llmops-platform/observability-stack
@@ -22,94 +22,132 @@ sources:
 ---
 
 ## TL;DR
-A deployed model can be up, fast and returning 200s while giving steadily worse answers, because
-correctness is not a status code. Model monitoring layers three kinds of signal over live traffic:
-operational (latency, errors, tokens, cost), behavioural proxies computable on every request without
-labels (refusals, schema failures, output length, tool-call mix), and quality signals that arrive late
-and sparse (judge scores on a sample, user feedback, business outcomes). Sliced by version and tenant,
-they turn silent regressions into alerts with examples attached.
+A model can return fast 200s while answers get worse. Model monitoring layers operational signals,
+label-free behavioural proxies and late, sparse quality signals over live traffic, sliced by version and
+tenant, so silent regressions become alerts with examples attached.
 
 ## Why it exists
-Service monitoring assumes failures are visible: a request errors, times out or is slow. An LLM
-application fails differently. The model answers confidently with the wrong refund policy; the
-retriever returns last year's price list; the agent stops calling the search tool because the vendor
-quietly updated the model and it now prefers to answer from memory. All of these are HTTP 200, p95
-within budget, dashboards green.
-
-Ground truth is also late or absent. A classifier in a bank gets labels when the loan defaults, months
-later; a support assistant never learns whether the customer's problem was solved unless you build the
-loop. So you cannot monitor "accuracy" directly the way you monitor error rate.
-
-The naive alternatives each cover one corner. "We have evals in CI" measures a fixed set at release
-time; production is a different distribution and it changes after release, while the model itself can
-change underneath a provider alias. "We watch user complaints" is sparse, biased toward the angriest
-users and days late. "We log everything" produces terabytes nobody reads. Monitoring exists to make
-the question "is the system behaving as it did when we validated it?" answerable continuously, cheaply
-and per segment, with a path from any alert to the concrete requests behind it.
+- **Correctness is not a status code.** The model confidently cites the wrong refund policy; the retriever
+  returns last year's price list; the agent stops calling the search tool because the vendor quietly
+  updated the model and it now answers from memory. All HTTP 200, p95 within budget, dashboards green.
+- **Ground truth is late or absent.** A bank's classifier gets labels when the loan defaults, months
+  later; a support assistant never learns whether the problem was solved unless you build the loop. So
+  you cannot monitor "accuracy" the way you monitor error rate.
+- **Each naive alternative covers one corner.**
+  - "We have evals in CI" measures a fixed set at release time; production is a different, changing
+    distribution, and the model can change underneath a provider alias.
+  - "We watch user complaints" is sparse, biased toward the angriest users and days late.
+  - "We log everything" produces terabytes nobody reads.
+- **What monitoring buys:** a continuous, cheap, per-segment answer to "is the system behaving as it did
+  when we validated it?", with a path from any alert to the concrete requests behind it.
 
 ## How it works
+### The three layers at a glance
+| Layer | Examples | Coverage | Label latency |
+|---|---|---|---|
+| 1. Operational | latency, errors, tokens, cost | 100% | seconds |
+| 2. Behavioural proxies | refusals, schema failures, length, tool-call mix | 100% | seconds |
+| 3. Quality and outcomes | judge scores, feedback, business metrics | sampled or sparse | minutes to days |
+
 ### Layer 1: operational signals
-The ordinary SRE set, tagged with AI-specific dimensions: request rate, error rate by class (provider
-429s, 5xxs, timeouts, guardrail blocks), latency as time-to-first-token and total, input and output
-tokens, cost per request, tool-call failures and retries. Standard plumbing, but every series must
-carry model id, prompt version, bundle id and tenant as labels, *because* the first question after any
-anomaly is "which version, which customer".
+- **The ordinary SRE set:** request rate; error rate by class (provider 429s, 5xxs, timeouts, guardrail
+  blocks); latency as time-to-first-token and total; input and output tokens; cost per request; tool-call
+  failures and retries.
+- **AI-specific labels on every series:** model id, prompt version, bundle id and tenant, *because* the
+  first question after any anomaly is "which version, which customer".
 
 ### Layer 2: behavioural proxies (no labels needed)
-Cheap functions of the output computed on 100% of traffic: refusal rate (a small classifier or pattern
-match), schema-validation failure rate for structured outputs, output length distribution, empty or
-truncated responses (finish reason), repetition, language mismatch between input and output, tool-call
-rate and which tools, citation presence in RAG answers, retrieval score distribution, "I don't know"
-rate. None of these is quality. Each is a proxy whose *shift* is informative: if the refusal rate
-doubles after a model update, something changed, and you know within minutes rather than after the
-weekly feedback review. Proxies are chosen *because* they are deterministic, free, and move early.
+Cheap functions of the output, computed on 100% of traffic:
+- **Refusal rate** (a small classifier or pattern match) and "I don't know" rate.
+- **Schema-validation failure rate** for structured outputs.
+- **Output length distribution**, plus empty or truncated responses (finish reason) and repetition.
+- **Language mismatch** between input and output.
+- **Tool-call rate and which tools.**
+- **RAG signals:** citation presence and retrieval score distribution.
+
+- **None of these is quality; their *shift* is informative.** If refusal rate doubles after a model
+  update, something changed, and you know within minutes, not after the weekly feedback review.
+- **Chosen *because* they are deterministic, free, and move early.**
 
 ### Layer 3: quality and outcome signals
-- Online judge: an LLM scores a sample of live responses against a rubric (groundedness, completeness,
-  policy adherence). Sampled *because* a judge call is another LLM inference over the full prompt and
-  response, often comparable to or more than the cost of the request it scores; 1–5% is a common order
-  of magnitude (illustrative), stratified so small tenants are still covered.
-- Human review queues: low-judge-score or flagged traces routed to reviewers; the labels feed both the
-  monitor's calibration and the golden set.
-- Explicit feedback: thumbs, ratings, "report". Sparse and selection-biased, so track the rate of
-  negative feedback per hundred responses rather than its raw count.
-- Implicit feedback: regenerate, copy, abandon, escalate to human, task completion. Higher volume, less
-  precise; correlate once with human labels to learn what each means.
-- Business outcomes: resolution rate, conversion, handle time. The slowest signal and the one leaders
+- **Online judge.** An LLM scores a sample of live responses against a rubric (groundedness, completeness,
+  policy adherence). Sampled *because* a judge call is another inference over the full prompt and
+  response, often comparable to or more than the request it scores. 1–5% is a common order of magnitude
+  (illustrative), stratified so small tenants are still covered.
+- **Human review queues.** Low-judge-score or flagged traces go to reviewers; the labels calibrate the
+  monitor and grow the golden set.
+- **Explicit feedback.** Thumbs, ratings, "report". Sparse and selection-biased, so track negative
+  feedback per hundred responses, not raw count.
+- **Implicit feedback.** Regenerate, copy, abandon, escalate to human, task completion. Higher volume,
+  less precise; correlate once with human labels to learn what each means.
+- **Business outcomes.** Resolution rate, conversion, handle time: the slowest signal and the one leaders
   believe.
 
-Each signal has a label latency: implicit feedback in seconds, explicit in minutes, judge in minutes to
-hours, business metrics in days. Monitoring design is largely about using fast proxies to decide where
-to spend slow, expensive labels.
+| Signal | Label latency |
+|---|---|
+| Implicit feedback | seconds |
+| Explicit feedback | minutes |
+| Online judge | minutes to hours |
+| Business metrics | days |
+
+- **Design principle:** use fast proxies to decide where to spend slow, expensive labels.
 
 ### Slicing, baselines and alerting
-Aggregates hide regressions. A 2% drop in overall judge score can be a 40% drop for one tenant or one
-intent. Slice every metric by version, tenant, intent class, language and input length bucket. Compare
-against a baseline that controls for time: the same hour last week, or the incumbent version in a
-concurrent canary. Alert on sudden shifts and on slow trends separately, and require a minimum sample
-per window *because* judged metrics on thirty requests are noise. Route operational breaches to the
-pager and quality shifts to a ticket with the top disagreeing examples attached.
+1. **Slice everything** by version, tenant, intent class, language and input-length bucket, because
+   aggregates hide regressions: a 2% drop in overall judge score can be a 40% drop for one tenant or
+   intent.
+2. **Compare against a time-controlled baseline:** the same hour last week, or the incumbent in a
+   concurrent canary.
+3. **Alert on sudden shifts and slow trends separately.**
+4. **Require a minimum sample per window**, *because* judged metrics on thirty requests are noise.
+5. **Route by type:** operational breaches page; quality shifts open a ticket with the top disagreeing
+   examples attached.
 
-Slicing has a statistical cost that is easy to miss: every slice is another hypothesis test. With 200
-slices each checked hourly at a threshold that fires falsely 5% of the time, you should expect about ten
-false alerts per run from noise alone. Two standard defences: make the threshold depend on the slice's
-own standard error (a drop must exceed roughly two standard errors of the difference, so small slices
-need bigger drops), and require the breach to persist across consecutive windows before alerting.
+**The multiple-testing cost of slicing.** Every slice is another hypothesis test. With 200 slices checked
+hourly at a threshold that fires falsely 5% of the time, expect about ten false alerts per run from noise
+alone. Two defences:
+- **Scale the threshold to the slice's standard error:** a drop must exceed roughly two standard errors
+  of the difference, so small slices need bigger drops.
+- **Require persistence** across consecutive windows before alerting.
 
 ### From proxies to SLOs
-The proxies that matter most can be written as service-level objectives in the SRE sense: "99% of
-extraction responses pass schema validation over 28 days" or "refusal rate on the billing intent stays
-below 3%". That gives each one an error budget, and you alert on how fast the budget is burning rather
-than on single bad windows: a fast burn (a large fraction of the month's budget gone in an hour) pages,
-a slow burn opens a ticket. This is the same machinery used for availability, applied to behaviour,
-and it is what stops quality alerting from becoming either silent or noisy.
+- **Write key proxies as SLOs:** "99% of extraction responses pass schema validation over 28 days", or
+  "refusal rate on the billing intent stays below 3%".
+- **Each gets an error budget;** alert on how fast it burns, not on single bad windows.
+- **Fast burn pages** (a large fraction of the month's budget gone in an hour); **slow burn opens a
+  ticket.**
+- **Why it works:** it is the same machinery used for availability, applied to behaviour, and it stops
+  quality alerting from being either silent or noisy.
 
 ### Close the loop
-Every metric should be derivable from traces so an alert can drill into the requests behind it, and
-every reviewed failure should become a golden-set case. Monitoring that does not feed the eval suite
-finds the same regression twice.
+- **Derive every metric from traces**, so an alert drills into the requests behind it.
+- **Turn every reviewed failure into a golden-set case.** Monitoring that does not feed the eval suite
+  finds the same regression twice.
 
-## Example
+## Diagram
+Every request produces a version-tagged trace; cheap layers cover all of it, the judge covers a stratified
+sample, and only slice-aware, sample-guarded shifts become pages or tickets.
+
+```mermaid
+flowchart TD
+    R["Live request"] --> T[("Trace with bundle, model, tenant tags")]
+    T --> O["Layer 1: ops metrics, 100%"]
+    T --> P["Layer 2: proxies, 100%"]
+    T --> S["Stratified sampler"]
+    S --> J["Layer 3: online judge, 1-5%"]
+    J --> HR["Human review queue"]
+    O --> C["Slice and compare vs baseline"]
+    P --> C
+    J --> C
+    C --> G{"Min sample and persistent?"}
+    G -->|"ops breach"| PG["Page"]
+    G -->|"quality shift"| TK["Ticket with examples"]
+    HR --> GS[("Golden set")]
+    TK --> GS
+```
+
+## Examples
+### Windowed monitor per bundle and tenant
 A windowed monitor over logged events: proxies on all requests, judge scores on the sampled subset,
 compared per version against a baseline window with a minimum-sample guard.
 
@@ -158,44 +196,97 @@ def alerts(current, baseline):
 # floor of 50 judged requests is what bounds the smallest regression this slice can see.
 ```
 
+### Burn-rate SLO and slice false alarms, in numbers
+Pure Python for the SLO "99% of extraction responses pass schema validation over 28 days".
+
+```python
+SLO = 0.99
+WINDOW_H = 28 * 24                    # 672 hours in the SLO window
+budget = 1 - SLO                      # 1% of requests may fail
+
+def burn_rate(failed: int, total: int) -> float:
+    return (failed / total) / budget  # 1.0 means the budget lasts exactly the window
+
+for label, failed, total in [("normal hour", 9, 1200), ("bad release", 200, 1200)]:
+    r = burn_rate(failed, total)
+    print(f"{label}: burn {r:.2f}x, budget gone in {WINDOW_H / r:.0f} h")
+
+slices, false_rate = 200, 0.05
+print(f"false alerts per run, one window: {slices * false_rate:.1f}")
+print(f"same, two consecutive windows: {slices * false_rate ** 2:.1f}")   # if windows independent
+# normal hour: burn 0.75x, budget gone in 896 h
+# bad release: burn 16.67x, budget gone in 40 h
+# false alerts per run, one window: 10.0
+# same, two consecutive windows: 0.5
+```
+
+| Situation | Number | Action |
+|---|---|---|
+| Normal hour, 9 of 1,200 fail | burn 0.75x | nothing |
+| Bad release, 200 of 1,200 fail | burn 16.67x, budget gone in 40 h | page (fast burn) |
+| 200 slices, single-window threshold | ~10 false alerts per run | too noisy to page on |
+| Same, persistence over 2 windows | ~0.5 per run (independence assumed) | ticket-worthy |
+
+## Production patterns
+- **Version and model tags from the OpenTelemetry GenAI conventions.** Record `gen_ai.request.model` and
+  `gen_ai.response.model` on each LLM span, plus token usage attributes; the response model shows the
+  resolved snapshot behind an alias, which is how an overnight vendor update becomes visible. Monitor
+  distinct response-model values per bundle.
+- **Bounded-cardinality metric labels.** Put bundle and model ids on Prometheus series, but keep high-
+  cardinality dimensions (per-tenant for thousands of tenants, request ids) in traces or a columnar store
+  and aggregate there. Monitor active series count per metric.
+- **Stratified judge sampling with a per-slice floor.** Sample a fixed percentage overall but guarantee a
+  minimum number of judged requests per tenant and intent per day, so small tenants clear the 50-judged
+  floor. Monitor judged count per slice against the floor.
+- **Multiwindow burn-rate alerts.** The Google SRE Workbook's approach pages when a short and a long
+  window both show a high burn rate (its example pages at about 2% of a 30-day budget in one hour, a burn
+  rate of 14.4) and tickets on slow burns. Apply it to schema-pass and refusal SLOs. Monitor alert
+  precision after each incident review.
+- **Pinned, calibrated judge.** Pin the judge model snapshot and re-measure its agreement with human
+  labels on a fixed set on a schedule and whenever the judge changes. Monitor judge-human agreement;
+  a step change in every quality series on one day usually means the judge moved.
+- **Alert-to-eval loop.** Every confirmed quality ticket exports its traces as new golden-set cases
+  before closing. Monitor the share of incidents that produced at least one new eval case.
+
 ## Trade-offs
-- Judge sampling at 1% is cheap but a small tenant may get five scored requests a day; stratified
-  sampling fixes coverage at the cost of a more complex sampler.
-- Proxy metrics are free and fast but indirect; a refusal-rate drop can mean a better model or a
-  jailbroken one, so proxies trigger investigation, not conclusions.
-- Fine slicing catches per-tenant regressions but multiplies alert series and shrinks samples per
-  slice; past a point the right move is anomaly detection on the slice set rather than fixed thresholds.
-- Online judges give continuous quality signal but inherit judge bias and drift when the judge model
-  itself is updated; pin the judge and re-calibrate it against human labels periodically.
-- Capturing full prompts and outputs makes every alert debuggable but creates a sensitive data store
-  with retention and access obligations; hashing or redaction trades debuggability for safety.
+- **1% judge sampling: cheap vs coverage.** A small tenant may get five scored requests a day;
+  stratified sampling fixes coverage at the cost of a more complex sampler.
+- **Proxies: free and fast vs indirect.** A refusal-rate drop can mean a better model or a jailbroken one,
+  so proxies trigger investigation, not conclusions.
+- **Fine slicing: catches per-tenant regressions vs alert volume.** It multiplies series and shrinks
+  samples per slice; past a point, anomaly detection on the slice set beats fixed thresholds.
+- **Online judges: continuous signal vs judge bias and drift.** The judge drifts when its model updates;
+  pin it and re-calibrate against human labels periodically.
+- **Full prompt and output capture: debuggable vs sensitive.** It creates a data store with retention and
+  access obligations; hashing or redaction trades debuggability for safety.
 
 ## Pitfalls
-- Monitoring only HTTP health; the symptom is a week of green dashboards followed by a customer
-  escalation about answers that have been wrong since the last model update.
-- Alerting on raw judge scores without a sample floor; the symptom is 3 a.m. pages caused by twelve
-  unlucky requests, followed by the alert being muted.
-- Events not tagged with bundle, prompt and model version; the symptom is a regression you can see but
-  cannot attribute to a release, so rollback becomes guesswork.
-- Treating thumbs-down counts as representative; the symptom is optimising for the loudest segment
-  while the silent majority's task completion falls.
-- Dashboards without drill-down; the symptom is an alert that says "quality down 8%" and a two-hour
-  hunt for a single example.
-- Letting the judge model auto-update; the symptom is a step change in every quality series on the
-  day the vendor shipped, with no change in your system.
-- Fixed thresholds across hundreds of slices; the symptom is a daily stream of one-window alerts on
-  small tenants that never reproduce, until the whole channel is muted.
+- **Monitoring only HTTP health.** Symptom: a week of green dashboards, then a customer escalation about
+  answers wrong since the last model update. Fix: add proxies and sampled judging.
+- **Alerting on raw judge scores without a sample floor.** Symptom: 3 a.m. pages caused by twelve unlucky
+  requests, then the alert gets muted. Fix: minimum sample and standard-error thresholds.
+- **Events not tagged with bundle, prompt and model version.** Symptom: a regression you can see but not
+  attribute to a release, so rollback becomes guesswork. Fix: tags on every event.
+- **Treating thumbs-down counts as representative.** Symptom: optimising for the loudest segment while the
+  silent majority's task completion falls. Fix: rates plus implicit and outcome signals.
+- **Dashboards without drill-down.** Symptom: "quality down 8%" and a two-hour hunt for one example. Fix:
+  derive metrics from traces and attach examples.
+- **Letting the judge model auto-update.** Symptom: a step change in every quality series on the day the
+  vendor shipped, with no change in your system. Fix: pin the judge.
+- **Fixed thresholds across hundreds of slices.** Symptom: a daily stream of one-window alerts on small
+  tenants that never reproduce, until the channel is muted. Fix: per-slice standard errors and persistence.
 
 ## When to use
-From the first production deployment: operational metrics and the cheapest proxies (schema failures,
-refusals, length, finish reason) sliced by version cost almost nothing and catch the loud failures.
-Add sampled judging once you have a rubric that correlates with human labels, and add feedback
-capture as soon as the product surface allows it. Invest in slicing when you have more than a handful
-of tenants or intents. What to measure is determined by what the system is for: a RAG assistant
-needs groundedness and citation rate; an agent needs tool-failure and step-count distributions; a
-structured extractor needs schema validity and field-level agreement on a sample. In interviews, the
-expected answer distinguishes proxies from quality, explains label latency, and shows how an alert
-leads to examples and then to a new eval case.
+- **From the first production deployment:** operational metrics and the cheapest proxies (schema
+  failures, refusals, length, finish reason) sliced by version cost almost nothing and catch loud failures.
+- **Add sampled judging** once you have a rubric that correlates with human labels; add feedback capture
+  as soon as the product surface allows.
+- **Invest in slicing** once you have more than a handful of tenants or intents.
+- **Measure what the system is for:** a RAG assistant needs groundedness and citation rate; an agent needs
+  tool-failure and step-count distributions; a structured extractor needs schema validity and field-level
+  agreement on a sample.
+- **Interviews:** distinguish proxies from quality, explain label latency, and show how an alert leads to
+  examples and then to a new eval case.
 
 ## Role lens
 - **Engineer:** Emits version-tagged events, implements the proxy checks and the sampler, and builds the
@@ -217,6 +308,40 @@ sample accrues, with the lowest-scoring traces attached for review. Explicit fee
 day. Where the provider returns the resolved model snapshot in response metadata, logging it would show
 that value changing at the same timestamp, which is the root cause; the fix is to pin snapshots and
 treat any model change, alias update included, as a release that goes through shadow or canary.
+
+## Interview questions
+### What is the difference between a behavioural proxy and a quality metric, and why monitor both?
+- **A proxy** is a cheap, deterministic function of the output (refusal rate, schema failures, length,
+  tool-call mix) computed on 100% of traffic; its shift says something changed, not whether it got worse.
+- **A quality metric** (judge score, human label, outcome) measures goodness but is sampled, slow or sparse.
+- **Together:** proxies detect early and point to where to spend expensive judge and human labels.
+
+### Overall judge score is flat but one enterprise tenant says answers got worse. How do you investigate?
+- **Slice by tenant and intent**, because an aggregate can hide a 40% drop in one segment behind a 2%
+  overall move.
+- **Check the slice's sample:** if that tenant has few judged requests, raise its stratified floor before
+  concluding anything.
+- **Pull the lowest-scoring traces** for the tenant, compare with the same hour last week, and check
+  whether its documents, language or intents differ from the golden set.
+
+### You have 200 tenant-by-intent slices and a 5% false-positive threshold. What goes wrong and how do you fix it?
+- **About ten false alerts every run** from noise alone, so the channel gets muted.
+- **Fixes:** thresholds scaled to each slice's standard error, persistence across consecutive windows,
+  and paging only on SLO burn rates; slice anomalies open tickets.
+
+### Why sample the online judge instead of scoring every response?
+- **Cost:** a judge call is another inference over the full prompt and response, often comparable to or
+  more than the request it scores, so 100% judging roughly doubles inference spend.
+- **Enough signal:** 1–5% (illustrative), stratified so small tenants still reach a minimum count, detects
+  meaningful shifts at a fraction of the cost.
+- **Cost of under-sampling:** with sd ≈ 0.8 and 50 judged per side, only drops above about 0.32 are
+  detectable.
+
+### How would you turn "schema validity" into an alert that neither stays silent nor floods?
+- **Define an SLO:** for example 99% of extraction responses pass schema validation over 28 days, giving
+  a 1% error budget.
+- **Alert on burn rate:** page on a fast burn in a short and long window, ticket on a slow burn.
+- **Attach examples:** every alert links to the failing traces, and fixed failures become eval cases.
 
 ## Quiz
 ### Q: Why are behavioural proxies such as refusal rate and schema-failure rate monitored on every request while judge scores are sampled?

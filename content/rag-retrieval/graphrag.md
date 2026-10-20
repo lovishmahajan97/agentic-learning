@@ -5,7 +5,7 @@ name: GraphRAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/knowledge-graphs
   - rag-retrieval/multi-hop-retrieval
@@ -101,8 +101,8 @@ query time when they do not.
   answers should still cite original text where possible.
 
 ## Diagram
-The top row is the expensive index-time pipeline; the bottom shows how the two query modes reuse it,
-global search over community reports and local search through entities back to source chunks.
+The upper chain is the expensive index-time pipeline; the lower part shows how the two query modes reuse
+it: global search reads community reports, local search reads entities and edges back to source chunks.
 
 ```mermaid
 flowchart TD
@@ -115,8 +115,8 @@ flowchart TD
     Q["Query"] --> RT{"Route by question type"}
     RT -->|"corpus-wide theme"| GS["Global: map over reports, reduce top partial answers"]
     RT -->|"specific entities"| LS["Local: match entities, follow edges, pull source chunks"]
-    GS --> R
-    LS --> G
+    GS -.->|"reads"| R
+    LS -.->|"reads"| G
 ```
 
 ## Examples
@@ -154,7 +154,7 @@ real length and your models' prices.
 
 ```python
 def estimate(corpus_tokens, chunk=1_200, prompt=1_500, output=500, gleanings=1,
-             llm_to_embed_price=30, reports=40, queries_per_month=2_000):
+             llm_to_embed_price=30, reports=40, global_queries_per_month=2_000):
     chunks = corpus_tokens // chunk
     calls = chunks * (1 + gleanings)
     llm_tokens = calls * (chunk + prompt + output)        # extraction only; merging/reports add more
@@ -163,7 +163,7 @@ def estimate(corpus_tokens, chunk=1_200, prompt=1_500, output=500, gleanings=1,
             "index_cost_x_embedding": round(index_cost_vs_embed),
             "global_query_calls": reports + 1,             # map over reports + one reduce
             "naive_mapreduce_calls": chunks,               # read every chunk per question instead
-            "calls_saved_per_month": (chunks - reports - 1) * queries_per_month}
+            "calls_saved_per_month": (chunks - reports - 1) * global_queries_per_month}  # global only
 
 print(estimate(4_000_000))
 # {'chunks': 3333, 'extraction_calls': 6666, 'llm_tokens_M': 21.3, 'index_cost_x_embedding': 160,

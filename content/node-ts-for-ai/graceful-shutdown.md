@@ -5,7 +5,7 @@ name: Graceful shutdown
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
   - deployment/health-checks
@@ -22,100 +22,136 @@ sources:
 ---
 
 ## TL;DR
-Processes are killed constantly: deploys, autoscaling, node drains, out-of-memory kills. Graceful
-shutdown is the sequence a Node service runs on SIGTERM so nothing in flight is lost: stop advertising
-readiness, stop accepting new requests and jobs, let in-flight work finish within a deadline shorter
-than the orchestrator's grace period, close queues and pools, flush telemetry, then exit. Without it, every deploy
-truncates streamed LLM responses, re-runs queue jobs and leaks half-done writes.
+On SIGTERM a Node service must fail readiness, stop intake, finish in-flight work within a deadline
+shorter than the grace period, close queues and pools, flush telemetry and exit. Otherwise every deploy
+truncates LLM streams, re-runs jobs and leaks half-done writes.
 
 ## Why it exists
-Kubernetes replaces a pod by sending SIGTERM and, after `terminationGracePeriodSeconds` (30 s by
-default), SIGKILL. `docker stop` does the same with a 10 s default. In a Node process with no handler,
-SIGTERM either terminates it immediately or, when Node is PID 1 in the container, is ignored outright
-(the kernel drops signals that PID 1 has no handler for), so the pod sits until SIGKILL. Either way
-nothing drains: an SSE stream halfway through a 2,000-token answer closes without a
-final event, a BullMQ worker mid-way through a 500-chunk embedding loses its place and the job stalls
-and re-runs, a Postgres transaction is rolled back by the server when the socket drops, and the last
-batch of OpenTelemetry spans, which are precisely the ones covering the deploy, is never exported.
-
-The naive fix, `process.on('SIGTERM', () => server.close(() => process.exit(0)))`, is better and still
-wrong in three ways. First, Kubernetes removes the pod from the Service's endpoints asynchronously with
-sending SIGTERM, so for a short window new requests still arrive at a server that has stopped accepting;
-you see connection errors at the load balancer on every deploy. Second, `server.close()` waits for every
-open connection, and on older Node versions that includes idle keep-alive connections from the load
-balancer, so the process can hang until SIGKILL. Third, closing the HTTP server says nothing about the
-worker, the pool, the Redis client or the telemetry exporter, each of which has its own flush and close
-semantics and must be closed in the right order. Graceful shutdown is the explicit choreography of all
-of that against a deadline.
+- **Processes are killed constantly:** deploys, autoscaling, node drains, out-of-memory kills.
+  Kubernetes sends SIGTERM and, after `terminationGracePeriodSeconds` (30 s by default), SIGKILL;
+  `docker stop` does the same with a 10 s default.
+- **Node without a handler does not drain.** SIGTERM either terminates it immediately or, when Node is
+  PID 1 in the container, is ignored outright (the kernel drops signals PID 1 has no handler for), so
+  the pod sits until SIGKILL.
+- **Every in-flight thing breaks.** An SSE stream halfway through a 2,000-token answer closes without a
+  final event; a BullMQ worker mid-way through a 500-chunk embedding loses its place and the job stalls
+  and re-runs; the server rolls back a Postgres transaction when the socket drops; the last batch of
+  OpenTelemetry spans, covering the deploy itself, is never exported.
+- **The naive fix is still wrong three ways.**
+  `process.on('SIGTERM', () => server.close(() => process.exit(0)))` refuses requests that still
+  arrive during endpoint propagation, can hang on idle keep-alive connections on older Node, and ignores
+  the worker, pool, Redis client and telemetry exporter.
+- **Graceful shutdown is choreography against a deadline:** each resource has its own flush and close
+  semantics and must close in the right order.
 
 ## How it works
 ### What the orchestrator does
-1. The pod is marked terminating and is taken out of the Service's ready endpoints straight away,
-   whatever its readiness probe says; that removal then propagates to kube-proxy rules and ingress
-   controllers with a delay of typically a few seconds, during which they still route to the pod.
-2. The container's `preStop` hook runs, if any; a common one is `sleep 5` to let endpoint removal
-   propagate before the signal arrives (the exec form needs a `sleep` binary in the image; recent
-   Kubernetes versions also offer a built-in `sleep` preStop action). The hook's time counts against
-   the grace period.
-3. SIGTERM is sent to PID 1 of the container.
-4. After the grace period, SIGKILL.
+1. **Pod marked terminating** and removed from the Service's ready endpoints straight away, whatever its
+   readiness probe says. That removal propagates to kube-proxy rules and ingress controllers with a
+   delay of typically a few seconds, during which they still route to the pod.
+2. **`preStop` hook runs,** if any. A common one is `sleep 5` to let endpoint removal propagate before
+   the signal arrives. The exec form needs a `sleep` binary in the image; recent Kubernetes versions
+   also offer a built-in `sleep` preStop action. The hook's time counts against the grace period.
+3. **SIGTERM** goes to PID 1 of the container.
+4. **SIGKILL** after the grace period.
 
-Two consequences: the process must actually receive the signal (use the exec form
-`CMD ["node", "dist/server.js"]`; the shell form `CMD npm start` leaves a shell as PID 1 that does not
-forward signals, and `docker run --init` or `tini` is the safe default), and the application's own
-deadline must be shorter than the grace period minus the `preStop` sleep, *because* otherwise SIGKILL
-wins and the work is lost anyway.
+- **The process must receive the signal.** Use the exec form `CMD ["node", "dist/server.js"]`; the shell
+  form `CMD npm start` leaves a shell as PID 1 that does not forward signals. `docker run --init` or
+  `tini` is the safe default.
+- **The app's deadline must be shorter than the grace period minus the `preStop` sleep,** *because*
+  otherwise SIGKILL wins and the work is lost anyway.
 
 ### The sequence inside Node
-1. **Flip readiness, then keep serving briefly.** Make `/ready` return 503 immediately so any balancer
-   that health-checks the pod directly stops routing; keep `/live` healthy, *because* a failing liveness
-   probe during shutdown would make the orchestrator restart the container mid-drain. In Kubernetes the
-   readiness flip is not what removes the pod from rotation (termination already did); what closes the
-   502 window is continuing to accept requests for a few seconds while the endpoint removal propagates.
-   Do that with a `preStop` sleep, or, if you cannot change the manifest, an in-app delay before
-   `server.close()`, but not both, since each costs grace period.
-2. **Stop intake.** `server.close()` stops accepting connections. Since Node 19, `close()` also closes
-   idle keep-alive connections; on older versions call `server.closeIdleConnections()` yourself. Keep
-   `keepAliveTimeout` short so balancers reconnect elsewhere. `close()` still waits for *active*
-   connections, and an SSE stream is never idle, so a server with open streams will not finish closing
-   until every stream ends; track open streams so the drain step can end them deliberately, and use
-   `server.closeAllConnections()` as the last resort when the deadline is near. For BullMQ, `await worker.close()` stops
-   taking new jobs and waits for active ones; `worker.pause()` is the softer form. Cancel scheduled
-   timers and polling loops.
-3. **Drain in flight.** Requests complete naturally. Streaming responses need a product decision:
-   finish them if they will end within the deadline, otherwise send a final event that tells the client
-   to resume or retry, and abort the upstream model call with an `AbortController` so you stop paying
-   for tokens nobody will receive.
-4. **Close resources in reverse dependency order.** Queue and Redis clients (`queue.close()`,
-   `redis.quit()`, which waits for pending replies, unlike `disconnect()`), then `pool.end()`, which
-   must come after every worker and request that might still query. Telemetry goes last
-   (`sdk.shutdown()` flushes the batch span processor): the exporter depends on none of the other
-   resources, and flushing last also exports the spans and errors of the close steps themselves. Give
-   the flush its own short timeout.
-5. **Exit explicitly.** Once a SIGTERM listener is registered, Node no longer exits on the signal by
-   default, so call `process.exit(0)` at the end (or set `process.exitCode` and let the loop drain).
-   Wrap the sequence in a deadline timer (`setTimeout(..., 20_000).unref()` for a 30 s grace period with a 5 s `preStop`) that exits non-zero if
-   draining hangs, *because* a hung shutdown wastes the whole grace period and still ends in SIGKILL.
-6. **Second signal means force.** A second SIGTERM or SIGINT during draining should exit immediately;
+1. **Flip readiness, then keep serving briefly.** `/ready` returns 503 immediately so any balancer that
+   health-checks the pod directly stops routing. Keep `/live` healthy, *because* a failing liveness
+   probe during shutdown makes the orchestrator restart the container mid-drain.
+2. **Stop intake.** `server.close()` stops accepting connections; for BullMQ, `await worker.close()`
+   stops taking new jobs and waits for active ones (`worker.pause()` is the softer form). Cancel
+   scheduled timers and polling loops.
+3. **Drain in flight.** Requests complete naturally. Streaming responses need a product decision (see
+   below).
+4. **Close resources in reverse dependency order.** Queue and Redis clients first, then `pool.end()`,
+   then telemetry last.
+5. **Exit explicitly,** under a deadline timer.
+6. **Second signal means force.** A second SIGTERM or SIGINT during draining exits immediately;
    operators expect it.
 
+### Closing the 502 window
+- **Readiness is not what removes the pod** in Kubernetes; termination already did.
+- **What closes the window** is continuing to accept requests for a few seconds while endpoint removal
+  propagates.
+- **Do it once:** a `preStop` sleep, or, if you cannot change the manifest, an in-app delay before
+  `server.close()`, but not both, since each costs grace period.
+
+### HTTP connections
+| Situation | Behaviour | Action |
+|---|---|---|
+| Node 19 and later | `close()` also closes idle keep-alive connections | nothing extra |
+| Older Node | idle keep-alive sockets keep `close()` waiting | call `server.closeIdleConnections()` |
+| Balancer keep-alive | long-lived idle sockets | keep `keepAliveTimeout` short so balancers reconnect elsewhere |
+| Open SSE streams | never idle, so `close()` waits for each to end | track open streams and end them deliberately |
+| Deadline near | something still open | `server.closeAllConnections()` as the last resort |
+
+### Streams and model calls
+- **Finish them** if they will end within the deadline.
+- **Otherwise send a final event** that tells the client to resume or retry.
+- **Abort the upstream model call** with an `AbortController`, so you stop paying for tokens nobody will
+  receive.
+
+### Close order and exit
+- **Redis:** `queue.close()` and `redis.quit()`, which waits for pending replies, unlike `disconnect()`.
+- **Postgres:** `pool.end()` must come after every worker and request that might still query.
+- **Telemetry last:** `sdk.shutdown()` flushes the batch span processor. The exporter depends on none of
+  the other resources, and flushing last also exports the spans and errors of the close steps. Give the
+  flush its own short timeout.
+- **Exit is your job.** Once a SIGTERM listener is registered, Node no longer exits on the signal by
+  default, so call `process.exit(0)` at the end (or set `process.exitCode` and let the loop drain).
+- **Deadline timer.** `setTimeout(..., 20_000).unref()` for a 30 s grace period with a 5 s `preStop`
+  exits non-zero if draining hangs, *because* a hung shutdown wastes the whole grace period and still
+  ends in SIGKILL.
+
 ### Crashes
-`uncaughtException` and `unhandledRejection` leave the process in an unknown state. Log, then either
-flush telemetry and exit non-zero within a second or two, or run the normal drain under a short
-deadline (as the example does); either way stop accepting work and exit non-zero, never keep serving. The orchestrator
-starts a fresh instance, and the queue's stall detection re-runs the job, which is why jobs must be
-idempotent in the first place.
+- **`uncaughtException` and `unhandledRejection` leave the process in an unknown state.**
+- **Two acceptable responses:** log, then flush telemetry and exit non-zero within a second or two; or
+  run the normal drain under a short deadline (as the example does).
+- **Either way** stop accepting work and exit non-zero; never keep serving.
+- **Recovery is external.** The orchestrator starts a fresh instance and the queue's stall detection
+  re-runs the job, which is why jobs must be idempotent in the first place.
 
 ### What "done" looks like
 Deploys produce zero 5xx at the load balancer, zero stalled jobs, no truncated streams in client logs,
 and the last trace before shutdown is present in the backend.
 
-## Example
-A shutdown orchestrator for an API process that also runs a BullMQ worker. Readiness fails first, HTTP
-intake and the worker close in parallel, then Redis and Postgres close, and telemetry is flushed last
-under its own 3-second cap. The 20-second deadline leaves margin under a 30-second grace period minus a
-5-second `preStop` sleep; the timer is `unref()`'d so it cannot keep an otherwise-finished process
-alive, and a second signal forces exit.
+## Diagram
+The SIGTERM-to-SIGKILL timeline: the `preStop` sleep covers endpoint propagation, and everything inside
+Node must finish before the grace period ends.
+
+```mermaid
+sequenceDiagram
+    participant K as Kubernetes
+    participant P as Proxies and ingress
+    participant N as Node process
+    participant D as Redis, Postgres, OTel
+    K->>P: remove pod from endpoints, propagates over seconds
+    K->>N: preStop sleep 5
+    Note over N: still serving requests routed during propagation
+    K->>N: SIGTERM
+    Note over N: readiness 503, liveness stays 200
+    N->>N: server.close and worker.close, drain in flight
+    N->>D: redis.quit, then pool.end
+    N->>D: sdk.shutdown flushes spans, capped
+    N->>K: process.exit before the deadline
+    K-->>N: SIGKILL only if the grace period expires
+```
+
+## Examples
+### Shutdown orchestrator for an API plus BullMQ worker
+Readiness fails first, HTTP intake and the worker close in parallel, then Redis and Postgres close, and
+telemetry is flushed last under its own 3-second cap.
+
+The 20-second deadline leaves margin under a 30-second grace period minus a 5-second `preStop` sleep;
+the timer is `unref()`'d so it cannot keep an otherwise-finished process alive, and a second signal
+forces exit.
 
 ```ts
 import http from "node:http";
@@ -162,30 +198,112 @@ process.on("SIGINT",  () => void shutdown("SIGINT"));
 process.on("unhandledRejection", (e) => { console.error(e); void shutdown("unhandledRejection", 1); });
 ```
 
+### Production snippet: the container and manifest side
+The code above only works if the signal reaches Node and the timings line up. Exec-form `CMD` behind
+`tini` makes Node receive SIGTERM; the manifest sets the grace period, the `preStop` sleep and separate
+probes.
+
+```dockerfile
+FROM node:22-slim
+RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "dist/server.js"]
+```
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 30
+  containers:
+    - name: agent-api
+      image: registry.example.com/agent-api:1.4.2
+      lifecycle:
+        preStop:
+          exec:
+            command: ["sleep", "5"]      # covers endpoint propagation; set DRAIN_DELAY_MS to 0
+      readinessProbe:
+        httpGet: { path: /ready, port: 8080 }
+        periodSeconds: 2
+      livenessProbe:
+        httpGet: { path: /live, port: 8080 }
+        periodSeconds: 10
+```
+
+### Worked scenario: budgeting a 30-second grace period
+How the numbers in the example fit together, measured from the moment the pod is marked terminating.
+
+| Time | Event | Budget used |
+|---|---|---|
+| 0 s | endpoints removal starts propagating; `preStop` sleep begins | 0 of 30 s |
+| 5 s | SIGTERM; readiness 503; deadline timer set for 20 s | 5 s |
+| 5-22 s | `server.close()` and `worker.close()` drain; a 4-job worker finishes its active jobs | up to 22 s |
+| 22-25 s | `redis.quit()`, `pool.end()`, `sdk.shutdown()` capped at 3 s | up to 25 s |
+| 25 s | latest point the deadline timer forces `process.exit(1)` | 25 s |
+| 30 s | SIGKILL, never reached if the above held | 30 s |
+
+If a worker's jobs routinely take longer than about 15 seconds, raise `terminationGracePeriodSeconds`
+for the worker deployment and the deadline with it, or add per-chunk checkpoints so a cut-off job
+resumes cheaply.
+
+## Production patterns
+- **Zero-error rollouts as a test.** Run a steady load against a staging deployment while triggering a
+  rollout restart, and fail the check if the load balancer logs any 5xx or connection resets. Monitor
+  5xx and stalled-job counts per rollout in production too.
+- **Grace period per workload.** Keep API pods near the default 30 s, and give worker deployments a
+  `terminationGracePeriodSeconds` sized to the longest acceptable job plus margin, with the in-app
+  deadline derived from it. Monitor stalled jobs and drain-timeout exits after deploys.
+- **Stream handoff on shutdown.** When draining, send a final SSE event telling the client to reconnect
+  (with a resume token or the run id) and abort the upstream model call with its `AbortController`.
+  Monitor aborted streams and client reconnect success.
+- **One structured log line per shutdown step.** Log each step with its duration and alert on
+  `drain timeout` or non-zero exit codes, so a slow close (often the telemetry flush or a pool still in
+  use) is visible. Monitor the distribution of total shutdown time.
+- **PodDisruptionBudget for voluntary evictions.** For node drains and cluster upgrades, a
+  PodDisruptionBudget (`minAvailable` or `maxUnavailable`) limits how many replicas drain at once, so
+  graceful shutdown never takes out the whole fleet. Monitor evictions blocked by the budget during
+  upgrades.
+
 ## Trade-offs
-- Draining in-flight work avoids lost requests and duplicate jobs, but every second of drain delays the rollout; with long LLM streams the deadline has to be a product decision (finish, or cut with a resume token), not just a timeout value.
-- Keeping the listener open for a few seconds after SIGTERM (a `preStop` sleep or an in-app delay) removes the propagation-window 502s, but those seconds come out of the grace period and slow every rollout; size the delay from how long your ingress or proxy actually takes to drop an endpoint, and drop it where the balancer deregisters targets before the signal arrives.
-- A hard internal deadline guarantees the process exits before SIGKILL and reports a non-zero code, but it cuts whatever is still running; keep it comfortably below the grace period and raise the grace period for worker pods rather than removing the deadline.
-- Closing BullMQ workers gracefully prevents stalls on every deploy, but with `concurrency: 10` and ten-minute jobs no sensible grace period suffices; the fix is per-chunk checkpoints so a re-run resumes, not a longer wait.
-- Flushing telemetry on shutdown preserves the most interesting spans, but a slow or unreachable collector can eat the whole deadline; give the flush its own short timeout.
+- **No lost work vs rollout speed.** Draining in-flight work avoids lost requests and duplicate jobs, but
+  every second of drain delays the rollout; with long LLM streams the deadline is a product decision
+  (finish, or cut with a resume token), not just a timeout value.
+- **No 502s vs grace period.** Keeping the listener open for a few seconds after SIGTERM (a `preStop`
+  sleep or an in-app delay) removes propagation-window 502s, but those seconds come out of the grace
+  period and slow every rollout. Size the delay from how long your ingress actually takes to drop an
+  endpoint, and drop it where the balancer deregisters targets before the signal arrives.
+- **Guaranteed exit vs cut work.** A hard internal deadline guarantees exit before SIGKILL with a
+  non-zero code, but cuts whatever is still running; keep it below the grace period and raise the grace
+  period for worker pods rather than removing the deadline.
+- **Graceful workers vs long jobs.** Closing BullMQ workers gracefully prevents stalls on every deploy,
+  but with `concurrency: 10` and ten-minute jobs no sensible grace period suffices; the fix is per-chunk
+  checkpoints so a re-run resumes, not a longer wait.
+- **Telemetry completeness vs deadline.** Flushing on shutdown preserves the most interesting spans, but
+  a slow or unreachable collector can eat the whole deadline; give the flush its own short timeout.
 
 ## Pitfalls
-- Shell-form `CMD npm start` or a wrapper script as PID 1: the symptom is containers that always take the full grace period and die by SIGKILL, with no shutdown log line ever appearing.
-- Registering a SIGTERM handler that forgets to call `process.exit`: the symptom is the process lingering after draining because an open handle (a timer, a Redis socket) keeps the event loop alive.
-- `server.close()` on Node 18 or older without `closeIdleConnections()`: the symptom is shutdown hanging until SIGKILL while the balancer holds idle keep-alive sockets.
-- Liveness probe wired to the same flag as readiness: the symptom is the container being restarted by the orchestrator in the middle of its own drain.
-- Closing the Postgres pool before the worker finishes: the symptom is "Cannot use a pool after calling end on the pool" errors in the last jobs of every deploy.
-- Deadline timer not `unref()`'d: the symptom is a process that finished draining but waits the full timeout before exiting.
+- **Shell-form `CMD npm start` or a wrapper script as PID 1.** Symptom: containers always take the full
+  grace period and die by SIGKILL, with no shutdown log line ever appearing.
+- **A SIGTERM handler that never calls `process.exit`.** Symptom: the process lingers after draining
+  because an open handle (a timer, a Redis socket) keeps the event loop alive.
+- **`server.close()` on Node 18 or older without `closeIdleConnections()`.** Symptom: shutdown hangs
+  until SIGKILL while the balancer holds idle keep-alive sockets.
+- **Liveness probe wired to the same flag as readiness.** Symptom: the orchestrator restarts the
+  container in the middle of its own drain.
+- **Closing the Postgres pool before the worker finishes.** Symptom: "Cannot use a pool after calling
+  end on the pool" errors in the last jobs of every deploy.
+- **Deadline timer not `unref()`'d.** Symptom: a process that finished draining but waits the full
+  timeout before exiting.
 
 ## When to use
-Every long-running Node process needs this: API servers, BullMQ workers, MCP servers, schedulers. Do it
-on day one of containerising the service, because the symptoms (5xx spikes, duplicate jobs, truncated
-streams, missing traces) are easy to blame on everything else. Set the internal deadline from the
-orchestrator's grace period and the longest acceptable in-flight unit; raise
-`terminationGracePeriodSeconds` for worker deployments with long jobs, and shorten jobs with checkpoints
-where that is not enough. Measure 5xx and connection errors during rollouts, stalled job counts, and
-whether shutdown logs show the sequence completing. In interviews, walk through the SIGTERM-to-SIGKILL
-timeline and the ordering of readiness, intake, drain, flush, close, exit.
+- **Use in every long-running Node process:** API servers, BullMQ workers, MCP servers, schedulers.
+- **Do it on day one of containerising,** because the symptoms (5xx spikes, duplicate jobs, truncated
+  streams, missing traces) are easy to blame on everything else.
+- **Set the deadline** from the orchestrator's grace period and the longest acceptable in-flight unit;
+  raise `terminationGracePeriodSeconds` for worker deployments with long jobs, and add checkpoints
+  where that is not enough.
+- **Measure:** 5xx and connection errors during rollouts, stalled job counts, and whether shutdown logs
+  show the sequence completing.
+- **Interviews:** walk through the SIGTERM-to-SIGKILL timeline and the order of readiness, intake,
+  drain, flush, close, exit.
 
 ## Role lens
 - **Engineer:** Implements the shutdown orchestrator, wires readiness to it, closes the worker, telemetry, Redis and pool in order, and tests it by sending SIGTERM to a loaded local process.
@@ -208,6 +326,43 @@ with `await worker.close()`, `redis.quit()`, `pool.end()`, flush OpenTelemetry, 
 all under a deadline below the grace period, with a non-zero exit if the deadline fires. Verify the
 signal reaches Node at all: exec-form `CMD` so Node (or a forwarding init such as `tini`) is PID 1,
 not a shell.
+
+## Interview questions
+### What happens between Kubernetes deciding to stop a pod and the process disappearing?
+- **The pod is marked terminating** and removed from endpoints at once, but proxies learn about it over
+  a few seconds.
+- **The `preStop` hook runs,** then SIGTERM reaches PID 1, and SIGKILL follows after
+  `terminationGracePeriodSeconds` (30 s by default).
+- **So the app must** keep serving through propagation, drain, close and exit before the grace period
+  ends.
+
+### Your containers always take exactly 30 seconds to stop and never log a shutdown line. What is wrong?
+- **The signal never reaches Node:** a shell-form `CMD npm start` or wrapper script is PID 1 and does not
+  forward SIGTERM, or Node is PID 1 with no handler and the kernel ignores the signal.
+- **Fix:** exec-form `CMD ["node", "dist/server.js"]` behind `tini` or `docker run --init`, plus an
+  explicit SIGTERM handler.
+- **Verify** by sending SIGTERM locally and checking the log line and exit code.
+
+### Why must the Postgres pool close after the HTTP server and worker, and telemetry after everything?
+- **The pool must outlive every request and job** that may still query; ending it first produces "pool
+  after end" errors in the last jobs.
+- **Telemetry goes last** because the exporter depends on nothing else, and flushing last also exports
+  the spans and errors of the close steps.
+- **Each step still needs a cap** so one slow close cannot consume the whole deadline.
+
+### When is a longer grace period the wrong fix for jobs that get cut off during deploys?
+- **When jobs are long by nature:** with `concurrency: 10` and ten-minute jobs, no sensible grace
+  period lets every active job finish.
+- **Better:** per-chunk checkpoints and idempotent writes, so a job re-run after a stall resumes where it
+  left off.
+- **Keep the grace period** sized to a reasonable unit of work, and treat re-runs as normal.
+
+### How do you size the in-app deadline for a 30-second grace period with a 5-second `preStop` sleep?
+- **Subtract the hook:** only about 25 seconds remain after SIGTERM, and you want margin before SIGKILL.
+- **So pick about 20 seconds** for the whole drain, with sub-caps such as 3 seconds for the telemetry
+  flush, and exit non-zero when it fires.
+- **Then verify** with shutdown logs: if drains routinely approach the deadline, raise the grace period
+  or shorten units of work.
 
 ## Quiz
 ### Q: A Kubernetes pod calls `server.close()` the instant it receives SIGTERM and the load balancer logs a burst of 502s on every deploy. What removes the burst?

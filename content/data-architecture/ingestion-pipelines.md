@@ -5,7 +5,7 @@ name: Ingestion pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - data-architecture/etl-elt-for-rag
   - data-architecture/document-processing-pipelines
@@ -22,122 +22,137 @@ sources:
 ---
 
 ## TL;DR
-An ingestion pipeline is the path from source systems (databases, SaaS tools, file shares, event streams)
-into a durable, replayable landing store that your AI system can transform from. The design that survives
-production is incremental change capture (including deletes), an immutable raw copy keyed by source
-identity and content hash, and idempotent stages with a committed watermark, because sources change
-continuously and every downstream choice (parser, chunker, embedding model) will be redone more than once.
+An ingestion pipeline moves data from source systems into a durable, replayable landing store. What
+survives production: incremental change capture including deletes, an immutable raw copy keyed by source
+identity and content hash, and idempotent stages with a committed watermark.
 
 ## Why it exists
-The first version of every RAG system is a script: list everything in Confluence or an S3 bucket, embed
-it, upsert it, run it nightly. It works at 2,000 documents and fails in four predictable ways at 200,000.
-
-First, cost scales with the corpus rather than with change. A nightly full re-crawl re-fetches, re-parses
-and re-embeds documents that have not moved, and the embedding bill and API rate limits become the
-bottleneck long before the vector store does. Second, deletes are invisible. A listing-based crawl only
-ever sees what exists now; a document deleted at the source stays in the index forever and keeps being
-retrieved, which for HR policies or revoked contracts is a correctness and compliance bug. Third, a crash
-halfway through leaves the index half new and half old with no record of which is which, and the only
-recovery is another full run. Fourth, when the team changes the chunker or the embedding model, there is
-no raw copy to re-transform from, so "re-index" means "re-crawl", colliding again with rate limits and
-with the source team's goodwill.
-
-The naive fix, "make the script faster", does not address any of these. What is needed is a separation
-between *getting bytes out of sources* (which should be incremental, polite and durable) and *turning bytes
-into retrieval units* (which should be cheap to re-run). This lesson covers the first half; the ETL/ELT
-lesson in this module covers the second.
+- **The first version is always a script.** List everything in Confluence or an S3 bucket, embed it,
+  upsert it, run it nightly. It works at 2,000 documents and fails in four predictable ways at 200,000.
+- **Cost scales with the corpus, not with change.** A nightly full re-crawl re-fetches, re-parses and
+  re-embeds documents that have not moved. The embedding bill and API rate limits become the bottleneck
+  long before the vector store does.
+- **Deletes are invisible, and crashes leave a mess.** A listing-based crawl only sees what exists now, so a
+  deleted document stays in the index and keeps being retrieved: a compliance bug for HR policies or
+  revoked contracts. A crash halfway leaves the index half new and half old, and the only recovery is
+  another full run.
+- **No raw copy means re-index equals re-crawl.** When the team changes the chunker or the embedding model,
+  there is nothing to re-transform from, so the work collides again with rate limits and with the source
+  team's goodwill.
+- **"Make the script faster" fixes none of this.** The fix is to separate *getting bytes out of sources*
+  (incremental, polite, durable) from *turning bytes into retrieval units* (cheap to re-run). This lesson
+  covers the first half; the ETL/ELT lesson in this module covers the second.
 
 ## How it works
 ### Classify each source by how it exposes change
-Every connector design starts with one question: how does this source tell me what changed? There are
-four answers, in rising order of fidelity and cost.
+Every connector design starts with one question: how does this source tell me what changed? Four answers,
+in rising order of fidelity and cost:
 
-1. **Snapshot diff.** List everything, hash each item, compare with the last snapshot. Catches creates,
-   updates and deletes. Cost is O(corpus) per run for the listing (not for the content, if the source gives
-   a cheap version or ETag), so it is fine for a few hundred thousand items and wrong for a billion rows.
-2. **Cursor / watermark.** Query `WHERE updated_at > :last_seen` or use a provider's change token
-   (Microsoft Graph delta queries, Google Drive's changes feed). Cheap and incremental. Provider change
-   tokens usually do report deletions (Graph delta marks removed items, for example), but a plain
-   timestamp cursor misses hard deletes and can miss rows written with a timestamp earlier than the
-   watermark by clock skew or long transactions. The fix is to read with `>=` and a small overlap window
-   and dedupe by id, and to pair it with a periodic snapshot diff that reconciles deletes.
-3. **Change data capture (CDC).** Tail the database's transaction log (Postgres logical decoding, MySQL
-   binlog) with a tool such as Debezium and receive every insert, update and delete as an ordered event.
-   Highest fidelity, including deletes, at the cost of operating a streaming system and needing DBA
-   cooperation.
-4. **Push: webhooks and event streams.** The source calls you. Lowest latency, but webhooks are
-   at-least-once at best and often lossy, so they are a trigger to fetch, not the source of truth.
+| Mode | How | Catches deletes? | Cost and caveats |
+|---|---|---|---|
+| 1. Snapshot diff | List everything, hash each item, compare with the last snapshot | Yes | O(corpus) per run for the listing (not the content, if the source gives a cheap version or ETag); fine for a few hundred thousand items, wrong for a billion rows |
+| 2. Cursor / watermark | `WHERE updated_at > :last_seen`, or a provider change token (Microsoft Graph delta queries, Google Drive's changes feed) | Change tokens usually yes (Graph delta marks removed items); a timestamp cursor no | Cheap and incremental, but a plain cursor misses hard deletes and rows written with an earlier timestamp due to clock skew or long transactions |
+| 3. Change data capture (CDC) | Tail the transaction log (Postgres logical decoding, MySQL binlog) with a tool such as Debezium | Yes, every insert, update and delete as an ordered event | Highest fidelity; you operate a streaming system and need DBA cooperation |
+| 4. Push: webhooks, event streams | The source calls you | Only if it sends them | Lowest latency, but webhooks are at-least-once at best and often lossy, so treat them as a trigger to fetch, not the source of truth |
 
-The design choice follows from freshness requirements and from what the source offers, not from taste.
-A support knowledge base that changes a few hundred times a day is fine on a 15-minute cursor poll with a
-nightly snapshot reconcile; an orders table that drives agent decisions wants CDC.
+- **Fix the cursor's blind spots.** Read with `>=` and a small overlap window, dedupe by id, and pair it with
+  a periodic snapshot diff that reconciles deletes.
+- **Choose from freshness needs and what the source offers, not taste.** A support knowledge base that
+  changes a few hundred times a day is fine on a 15-minute cursor poll with a nightly snapshot reconcile.
+  An orders table that drives agent decisions wants CDC.
 
 ### Land raw bytes immutably
-Each fetched item is written to a landing store (object storage or a lakehouse table) as the raw bytes
-plus a metadata record: `source`, `source_id`, `source_version` (ETag, revision number or content hash),
-`fetched_at`, `acl` (who may read it at the source), and the raw `uri`. The record is immutable; a new
-version is a new row, not an overwrite. This is the single most important choice in the pattern, because
-everything downstream (parsing, chunking, embedding) is a deterministic function of the raw bytes and can
-be replayed from them without touching the source again.
+- **What is written.** Raw bytes in object storage or a lakehouse table, plus a metadata record: `source`,
+  `source_id`, `source_version` (ETag, revision number or content hash), `fetched_at`, `acl` (who may read
+  it at the source) and the raw `uri`.
+- **Immutable.** A new version is a new row, not an overwrite.
+- **Why this is the most important choice.** Parsing, chunking and embedding are deterministic functions of
+  the raw bytes, so they can be replayed without touching the source again.
 
 ### Make every stage idempotent
-The natural key of an item is `(source, source_id)`. Content hashing on top of it lets the pipeline skip
-items whose bytes have not changed even when the source claims an update (many SaaS APIs bump
-`updated_at` on permission changes or views). Skipping re-parsing and re-embedding is right in that case,
-but the ACL must still be compared and propagated, because a permission change with identical bytes is
-exactly the update retrieval filtering depends on. Downstream writes are upserts keyed by that identity, and
-deletes are written as tombstone rows carrying the same key, so a replay of any window produces the same
-end state. The watermark is committed *after* the batch's writes are durable; committing it first is the
-classic bug that turns a crash into a silent gap.
+1. **Key by natural identity.** The key is `(source, source_id)`.
+2. **Skip unchanged bytes by content hash,** even when the source claims an update, because many SaaS APIs
+   bump `updated_at` on permission changes or views.
+3. **Still compare and propagate the ACL** when bytes are identical, because a permission change with
+   identical bytes is exactly the update retrieval filtering depends on.
+4. **Write upserts keyed by identity; write deletes as tombstone rows** with the same key, so replaying any
+   window produces the same end state.
+5. **Commit the watermark *after* the batch's writes are durable.** Committing it first is the classic bug
+   that turns a crash into a silent gap.
 
-The delivery guarantee this buys is worth stating precisely. No stage is exactly-once: the overlap window,
-retries and redelivered webhooks all mean the same change can arrive twice. The pipeline is
-*at-least-once with idempotent effects*. Re-applying a change keyed by `(source, source_id, version)`
-leaves the store unchanged, so a duplicate does no harm and a gap is the only failure you must prevent.
-That is why the commit order matters more than deduplication: duplicates are absorbed downstream, gaps
-are not.
+**The delivery guarantee, stated precisely:**
+- **No stage is exactly-once.** The overlap window, retries and redelivered webhooks mean the same change
+  can arrive twice.
+- **The pipeline is *at-least-once with idempotent effects*.** Re-applying a change keyed by
+  `(source, source_id, version)` leaves the store unchanged, so a duplicate does no harm.
+- **Commit order matters more than deduplication.** Duplicates are absorbed downstream; gaps are not, and a
+  gap is the only failure you must prevent.
 
 ### Initial load, backfills and the handoff to incremental
-Every connector has two modes: the first full load and steady-state increments. The dangerous moment is
-the switch from one to the other. If you snapshot the source and then start polling "from now", changes
-made during the snapshot, which can take hours for a large source, fall between the two. The fix is to
-record the change position *before* the snapshot starts: the cursor value, the provider's delta token,
-or the log position for CDC. Then the incremental reader starts from that recorded position, and the
-idempotent upserts absorb the overlap. Debezium works this way: it takes a consistent initial snapshot,
-then streams from the log offset it recorded at snapshot time. Run backfills, such as re-ingesting a
-source after a connector bug, in a separate lane with their own rate-limit budget. Otherwise a
-multi-day backfill uses up the API quota and the incremental sync goes stale while it runs.
+- **Two modes per connector:** the first full load and steady-state increments. The switch between them is
+  the dangerous moment.
+- **The gap.** Snapshot the source, then poll "from now", and changes made during the snapshot (which can
+  take hours for a large source) fall between the two.
+- **The fix.** Record the change position *before* the snapshot starts (cursor value, provider delta token,
+  or CDC log position). Start the incremental reader there; idempotent upserts absorb the overlap.
+- **Debezium works this way.** It takes a consistent initial snapshot, then streams from the log offset it
+  recorded at snapshot time.
+- **Run backfills in a separate lane** with their own rate-limit budget, such as re-ingesting a source after
+  a connector bug. Otherwise a multi-day backfill uses up the API quota and the incremental sync goes stale.
 
 ### Treat source schemas as a contract that will break
-SaaS APIs add fields, rename them and change pagination without notice, and a database team will
-eventually drop a column the connector reads. Validate each fetched record against an expected schema
-at the landing boundary. Store unknown fields in the raw record instead of dropping them, and send
-records that fail validation to quarantine rather than letting them flow on with nulls. A connector
-that quietly writes `title = null` for a whole source is worse than one that stops, because the index
-fills with untitled chunks and nothing alarms. The data-contracts lesson covers making this explicit
-with the source owner.
+- **Sources drift.** SaaS APIs add fields, rename them and change pagination without notice; a database
+  team will eventually drop a column the connector reads.
+- **Validate at the landing boundary.** Check each fetched record against an expected schema; store unknown
+  fields in the raw record instead of dropping them.
+- **Quarantine failures** rather than letting them flow on with nulls. A connector that quietly writes
+  `title = null` for a whole source is worse than one that stops, because the index fills with untitled
+  chunks and nothing alarms. The data-contracts lesson covers making this explicit with the source owner.
 
 ### Decouple fetch rate from processing rate
-Sources impose rate limits; parsers and embedders have their own throughput. A queue between the connector
-and the transformation stages absorbs the mismatch, gives retries with backoff a place to live, and lets a
-poison document (a 2 GB PDF that crashes the parser) be parked in a dead-letter queue instead of stalling
-the run. Batch orchestration (Airflow, Dagster, Prefect) suits snapshot and cursor sources; a streaming
-consumer suits CDC and webhooks. Micro-batches every few minutes are the common middle ground.
+- **A queue between connector and transforms** absorbs the mismatch between source rate limits and
+  parser/embedder throughput, and gives retries with backoff a place to live.
+- **A dead-letter queue** parks a poison document (a 2 GB PDF that crashes the parser) instead of stalling
+  the run.
+- **Match orchestration to the source.** Batch orchestration (Airflow, Dagster, Prefect) suits snapshot and
+  cursor sources; a streaming consumer suits CDC and webhooks. Micro-batches every few minutes are the
+  common middle ground.
 
 ### Carry ACLs and lineage as data
-Permissions from the source travel with the document as a first-class field, because retrieval must filter
-on them later and a pipeline that drops them cannot be fixed at query time. Lineage, which raw version a
-chunk came from and which pipeline version produced it, is what makes a selective re-run possible.
+- **ACLs are a first-class field** travelling with the document, because retrieval must filter on them
+  later and a pipeline that drops them cannot be fixed at query time.
+- **Lineage** (which raw version a chunk came from, which pipeline version produced it) is what makes a
+  selective re-run possible.
 
 ### Observe the pipeline as a pipeline
-Per stage, count items in, items out and items failed; track lag as `now − last_committed_watermark`;
-alarm on a change ratio that is zero (connector silently broken) or near 100 % (source migrated and every
-id changed). These three numbers answer "is the index fresh?" without reading the index.
+- **Per stage:** items in, items out, items failed.
+- **Lag:** `now − last_committed_watermark`.
+- **Change ratio alarms:** zero means the connector is silently broken; near 100 % means the source migrated
+  and every id changed.
+- These three numbers answer "is the index fresh?" without reading the index.
 
-## Example
-An incremental connector loop for a cursor-based source. It reads with an overlap window, dedupes by id,
-skips re-embedding unchanged content by hash while still propagating ACL changes, writes tombstones for
-deletes reported by the source, and commits the watermark only after the batch is durable.
+## Diagram
+Changes flow from the source into an immutable landing store; the watermark advances only after writes are
+durable, and a nightly snapshot diff catches deletes the cursor misses.
+
+```mermaid
+flowchart TD
+    S["Source system"] -->|"cursor read with overlap"| C["Connector"]
+    S -.->|"nightly full listing"| R["Snapshot diff reconcile"]
+    C --> H{"Content hash changed?"}
+    H -->|"no"| A["Compare and propagate ACL"]
+    H -->|"yes"| L[("Immutable raw landing")]
+    R -->|"tombstones for vanished ids"| L
+    L --> Q["Queue to parse, chunk, embed"]
+    Q -.->|"poison file"| D["Dead-letter queue"]
+    L -->|"flush durable"| W["Commit watermark"]
+```
+
+## Examples
+### Incremental connector loop for a cursor-based source
+It reads with an overlap window, dedupes by id, skips re-embedding unchanged content by hash while still
+propagating ACL changes, writes tombstones for deletes reported by the source, and commits the watermark
+only after the batch is durable.
 
 ```python
 import hashlib, datetime as dt
@@ -176,46 +191,111 @@ def sync_once(source, landing, state):
 A nightly snapshot-diff job runs alongside this loop to catch deletes the source never reported, which is
 the standard pairing for sources that only expose `updated_at`.
 
+### The nightly snapshot diff that catches deletes
+Runnable as-is. It compares tonight's `{id: content_hash}` listing with last night's and reports the change
+ratio you would alarm on.
+
+```python
+import hashlib
+
+def snapshot_diff(previous, current):
+    """previous/current: {source_id: content_hash}. Returns (created, updated, deleted)."""
+    prev_ids, cur_ids = set(previous), set(current)
+    created = sorted(cur_ids - prev_ids)
+    deleted = sorted(prev_ids - cur_ids)                       # the only way a listing reveals deletes
+    updated = sorted(i for i in cur_ids & prev_ids if previous[i] != current[i])
+    return created, updated, deleted
+
+def h(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+unchanged  = {f"page-{i}": h(f"doc {i}") for i in range(5, 15)}          # 10 pages nobody touched
+last_night = {**unchanged, "page-1": h("Leave policy v1"), "page-2": h("Expenses"), "page-3": h("Old VPN guide")}
+tonight    = {**unchanged, "page-1": h("Leave policy v2"), "page-2": h("Expenses"), "page-4": h("New VPN guide")}
+
+created, updated, deleted = snapshot_diff(last_night, tonight)
+print("created:", created)    # ['page-4']
+print("updated:", updated)    # ['page-1']
+print("deleted:", deleted)    # ['page-3'] -> write a tombstone for it
+ratio = (len(created) + len(updated) + len(deleted)) / max(len(last_night), 1)
+print(f"change ratio: {ratio:.0%}")   # 23%; alarm if 0% for days or near 100%
+```
+
+### Worked scenario: full re-crawl vs incremental at 200,000 documents
+Illustrative orders of magnitude, not a benchmark: assume 200,000 documents averaging 2,000 tokens, and
+1% of documents changing per day.
+
+| Design | Documents re-embedded per day | Tokens embedded per day | Source API calls per day |
+|---|---|---|---|
+| Nightly full re-crawl | 200,000 | 400 million | every document fetched |
+| Cursor + content hash | about 2,000 | about 4 million | changed items plus a cheap listing |
+| Ratio | 100x fewer | 100x fewer | the full fetch disappears |
+
+- **The bill tracks the change rate, not the corpus.** At a 1% daily change rate the incremental design does
+  about 1% of the embedding work.
+- **Deletes still need the listing.** The nightly snapshot diff touches only ids and versions, not content.
+
+## Production patterns
+- **Snapshot-then-stream for CDC sources.** When a database table drives decisions, run Debezium with an
+  initial snapshot (its `snapshot.mode` setting, `initial` by default) so it records the log offset before
+  streaming. Monitor replication-slot lag in `pg_replication_slots`, because a stalled consumer makes
+  Postgres retain WAL and fill the disk.
+- **Cursor poll plus nightly reconcile for SaaS.** For wikis and ticketing tools, poll every 15 minutes with
+  a 5-minute overlap and a content hash, and run a snapshot diff nightly for deletes. Monitor freshness lag
+  and the tombstones emitted per reconcile; a reconcile that keeps finding deletes means the cursor is
+  missing them.
+- **Dead-letter queue with a retry cap.** Put a queue between fetch and parse, retry with exponential
+  backoff, and move a message to a DLQ after a fixed number of receives (for SQS, the redrive policy's
+  `maxReceiveCount`). Alert on DLQ depth above zero for more than one run.
+- **Separate backfill lane.** Run backfills as their own job with a lower share of the source's rate limit,
+  and with `max_active_runs=1` on an Airflow DAG so runs do not pile up. Monitor incremental lag while the
+  backfill runs; it must stay inside the freshness SLA.
+- **Pipeline health dashboard.** Per connector, chart items in/out/failed per stage, `now − watermark`, and
+  change ratio per run, with alarms at zero change for N runs and near 100 % change.
+
 ## Trade-offs
-- Snapshot diff is the simplest way to catch deletes and needs no source cooperation, but its listing cost
-  grows with the corpus, so it flips to cursor-plus-reconcile once a full listing takes longer than the
+- **Snapshot diff: simplicity vs listing cost.** It catches deletes with no source cooperation, but listing
+  cost grows with the corpus. It flips to cursor-plus-reconcile once a full listing takes longer than the
   freshness window.
-- CDC gives exact, ordered, delete-inclusive change streams, but it requires log access, DBA buy-in and a
-  streaming platform; for a source changing a few hundred times a day, polling is cheaper to run.
-- Storing every raw version makes replays and audits trivial at the cost of storage; when documents are
-  large binaries that change often, keep only the last N versions and rely on lineage for the rest.
-- Streaming ingestion cuts freshness lag to seconds but spreads work evenly, which is worse for embedding
-  APIs that are cheaper and faster in large batches; micro-batching usually wins unless the use case is
-  truly real-time.
+- **CDC: exactness vs operating cost.** It gives exact, ordered, delete-inclusive change streams, but needs
+  log access, DBA buy-in and a streaming platform. For a source changing a few hundred times a day, polling
+  is cheaper to run.
+- **Every raw version: easy replays vs storage.** Storing all versions makes replays and audits trivial at
+  the cost of storage. When documents are large binaries that change often, keep only the last N versions
+  and rely on lineage for the rest.
+- **Streaming vs micro-batch.** Streaming cuts freshness lag to seconds but spreads work evenly, which is
+  worse for embedding APIs that are cheaper and faster in large batches. Micro-batching usually wins unless
+  the use case is truly real-time.
 
 ## Pitfalls
-- Advancing the watermark before the batch's writes are durable; the symptom is documents that are
-  missing from the index after a crash with no error in any log.
-- Using a timestamp cursor without an overlap window; the symptom is sporadic missed updates traced to
-  rows committed late or from a clock-skewed replica.
-- Never handling deletes; the symptom is a retrieved answer citing a document that no longer exists at
-  the source, often discovered by a customer rather than a dashboard.
-- Dropping source ACLs during ingestion "to simplify"; the symptom is a user retrieving a document they
-  could not open in the source system, which is a security incident, not a bug.
-- Re-fetching on every `updated_at` bump without a content hash; the symptom is a large embedding bill
-  for a corpus that barely changes, because the SaaS source bumps timestamps on permission edits. The
-  opposite error, skipping hash-identical items entirely, silently drops those permission edits.
-- Starting the incremental cursor at the time the initial snapshot *finished* rather than when it
-  started; the symptom is documents edited during the first load that stay at their old version until
-  someone edits them again.
-- No dead-letter path; the symptom is a whole nightly run that fails repeatedly on the same oversized or
-  malformed file while thousands of healthy documents go stale.
+- **Advancing the watermark before writes are durable.** Symptom: documents missing from the index after a
+  crash, with no error in any log. Fix: flush, then commit the cursor.
+- **A timestamp cursor without an overlap window.** Symptom: sporadic missed updates traced to rows committed
+  late or from a clock-skewed replica. Fix: read with `>=` and an overlap, dedupe by id.
+- **Never handling deletes.** Symptom: an answer citing a document that no longer exists at the source,
+  often discovered by a customer rather than a dashboard. Fix: tombstones plus a snapshot reconcile.
+- **Dropping source ACLs "to simplify".** Symptom: a user retrieves a document they could not open in the
+  source system, which is a security incident, not a bug. Fix: carry ACLs as a first-class field.
+- **Re-fetching on every `updated_at` bump without a content hash.** Symptom: a large embedding bill for a
+  corpus that barely changes, because the SaaS source bumps timestamps on permission edits. The opposite
+  error, skipping hash-identical items entirely, silently drops those permission edits.
+- **Starting the incremental cursor when the initial snapshot *finished*.** Symptom: documents edited during
+  the first load stay at their old version until someone edits them again. Fix: record the position when
+  the snapshot started.
+- **No dead-letter path.** Symptom: a nightly run fails repeatedly on the same oversized or malformed file
+  while thousands of healthy documents go stale. Fix: a DLQ with a retry cap.
 
 ## When to use
-Reach for this pattern the moment a corpus has more than one source, changes while the system is live, or
-must respect deletions and permissions, which is to say for anything beyond a demo. Measure freshness lag,
-change ratio per run, per-stage failure counts and the embedding spend per run; those four numbers expose
-nearly every ingestion defect. Do not build CDC for a wiki that changes twice a day, and do not accept a
-"full re-crawl nightly" design for a corpus whose embedding cost per full pass exceeds the monthly vector
-store bill. In day-to-day work this is the code that pages you at 3 a.m. when a source's API changes; in
-interviews it is the "design ingestion for SharePoint plus Jira plus a Postgres orders table, with
-deletes and permissions" question, and the expected answer walks through change detection per source,
-immutable raw landing, idempotent upserts and tombstones, and the watermark commit order.
+- **Use when** a corpus has more than one source, changes while the system is live, or must respect
+  deletions and permissions, which is to say anything beyond a demo.
+- **Avoid** CDC for a wiki that changes twice a day, and reject a "full re-crawl nightly" design for a corpus
+  whose embedding cost per full pass exceeds the monthly vector store bill.
+- **Measure** freshness lag, change ratio per run, per-stage failure counts and embedding spend per run;
+  those four numbers expose nearly every ingestion defect.
+- **Day to day,** this is the code that pages you at 3 a.m. when a source's API changes.
+- **Interviews:** "design ingestion for SharePoint plus Jira plus a Postgres orders table, with deletes and
+  permissions". Walk through change detection per source, immutable raw landing, idempotent upserts and
+  tombstones, and the watermark commit order.
 
 ## Role lens
 - **Engineer:** Writes connectors with cursors, overlap windows, content hashing and tombstones, and
@@ -239,6 +319,45 @@ versions, compare with the stored snapshot, and emit tombstones for ids that dis
 changed hashes. Add an overlap window to the cursor read and dedupe by id, commit the watermark only
 after writes are durable, and store the raw page bytes so chunker changes can be replayed without
 re-crawling the wiki.
+
+## Interview questions
+### What does "at-least-once with idempotent effects" mean for an ingestion pipeline, and why aim for it?
+- **Definition:** a change may be delivered more than once (overlap windows, retries, redelivered
+  webhooks), but applying it twice leaves the store unchanged because writes are keyed by
+  `(source, source_id, version)`.
+- **Why:** exactly-once across a SaaS API, a queue and a vector store is not achievable in practice, while
+  idempotent upserts make duplicates harmless.
+- **The consequence:** the only failure left to prevent is a gap, which is why the watermark commit order
+  matters more than deduplication.
+
+### Design ingestion for SharePoint, Jira and a Postgres orders table, with deletes and permissions.
+- **Per-source change detection:** Graph delta queries for SharePoint, an `updated` cursor with overlap plus a
+  nightly snapshot diff for Jira, Debezium CDC for the orders table.
+- **One landing schema:** immutable raw bytes plus `source`, `source_id`, `source_version`, `fetched_at`,
+  `acl` and `uri`; deletes become tombstones.
+- **Shared plumbing:** a queue with a DLQ before parsing, watermark committed after flush, and per-source lag
+  and change-ratio alarms.
+
+### Users say an edited policy page still shows the old text in answers. How do you debug it?
+- **Check the landing store first:** is there a new version for that `source_id`? If not, the fault is in
+  the connector (cursor gap, clock skew, watermark committed too early).
+- **If the version landed,** follow lineage downstream: was a `document.changed` event emitted, did parsing
+  fail into the DLQ, or did the index upsert miss?
+- **Then fix the class of bug:** add an overlap window, reorder the commit, or alarm on DLQ depth.
+
+### When would you not use CDC?
+- **When the source changes slowly:** a wiki changing a few hundred times a day is well served by a cursor
+  poll plus a nightly reconcile.
+- **When you lack log access or DBA buy-in,** because CDC needs logical decoding or binlog access and a
+  streaming platform to run.
+- **Use it** when the table drives agent decisions and needs ordered, delete-inclusive changes in seconds.
+
+### Your embedding bill doubled but the corpus barely changed. What do you look at?
+- **Change ratio per run:** a jump suggests re-embedding on `updated_at` bumps without a content-hash check,
+  often caused by permission edits or view counts.
+- **Id churn:** a change ratio near 100 % means the source migrated and every id changed, so everything looks
+  new.
+- **Backfills:** an unplanned re-ingest in the main lane re-embeds everything; move it to its own budget.
 
 ## Quiz
 ### Q: Why should the ingestion watermark be committed only after the batch's writes are durable?

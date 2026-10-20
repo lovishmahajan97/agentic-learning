@@ -5,7 +5,7 @@ name: Input / output guardrails
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - safety-security/prompt-injection
   - safety-security/output-validation
@@ -22,31 +22,28 @@ sources:
 ---
 
 ## TL;DR
-A language model is a probabilistic component whose behaviour you cannot fully specify in a prompt, so
-the system around it needs deterministic checkpoints. Input guardrails inspect what reaches the model
-(injection patterns, scope, PII, size); output guardrails inspect what leaves it (structure, policy,
-leakage, tool calls) and decide to allow, block, rewrite, retry or escalate. They exist because a
-system prompt is an instruction, not an enforcement boundary, and the cost of a wrong output is paid
-outside the model.
+Guardrails are deterministic checkpoints around a probabilistic model: input rails inspect what reaches
+it, output rails inspect what leaves it and allow, block, rewrite, retry or escalate, because a system
+prompt is an instruction, not an enforcement boundary.
 
 ## Why it exists
-Every serious application validates at its trust boundaries: web forms, API payloads, file uploads. An
-LLM feature adds a new kind of boundary, natural language in and natural language (or actions) out, and
-the component in the middle does not behave like a parser. It weighs the developer's instructions
-against everything else in its context and samples an answer. The same prompt produces different
-outputs at non-zero temperature, a paraphrased request can flip a refusal into compliance, and text
-arriving in a document or tool result is read with the same attention as the system prompt.
-
-The obvious fixes do not hold. "Put the rule in the system prompt" fails because the model does not
-distinguish instructions from data and follows rules probabilistically; red teams bypass prompt-only
-rules with a role-play prefix in minutes. "Use a better model" lowers the failure rate but does not
-bound it, and leaves you with no log of what was attempted and nothing to tune. "Have a human review
-everything" does not scale past a pilot.
-
-Guardrails give you what the prompt cannot: a place to put deterministic rules, a measurable block
-rate with false positives you can count, an audit trail per decision, and a fail-closed default when a
-component is down. Regulated and contractual settings (financial advice, medical content, data-handling
-agreements) usually make this layer mandatory rather than optional.
+- **LLM features add a new trust boundary.** Apps already validate web forms, API payloads and file
+  uploads. An LLM feature takes natural language in and emits natural language (or actions) out, and the
+  component in the middle does not behave like a parser: it weighs the developer's instructions against
+  everything else in its context and samples an answer.
+- **The model is not consistent.** The same prompt produces different outputs at non-zero temperature, a
+  paraphrased request can flip a refusal into compliance, and text arriving in a document or tool result
+  is read with the same attention as the system prompt.
+- **The obvious fixes do not hold.** "Put the rule in the system prompt" fails because the model does not
+  distinguish instructions from data and follows rules probabilistically; red teams bypass prompt-only
+  rules with a role-play prefix in minutes. "Use a better model" lowers the failure rate but does not
+  bound it and leaves no log or tuning knob. "Have a human review everything" does not scale past a pilot.
+- **Guardrails give what the prompt cannot.** A place for deterministic rules, a measurable block rate
+  with false positives you can count, an audit trail per decision, and a fail-closed default when a
+  component is down.
+- **Often mandatory.** Regulated and contractual settings (financial advice, medical content,
+  data-handling agreements) usually make this layer required, not optional, because the cost of a wrong
+  output is paid outside the model.
 
 ## How it works
 ### Where the checks sit
@@ -54,8 +51,8 @@ agreements) usually make this layer mandatory rather than optional.
 user input ──▶ input rails ──▶ model (+ tools) ──▶ output rails ──▶ user / action
                  │ block/rewrite              retry with feedback ◀─┘
 ```
-Both rail sets are ordinary code that runs before and after the model call, with the model treated as
-an untrusted function in the middle.
+- Both rail sets are ordinary code that runs before and after the model call.
+- The model is treated as an untrusted function in the middle.
 
 ### Input rails
 - **Size, encoding, normalisation.** Token limits, control-character stripping, Unicode normalisation
@@ -65,68 +62,101 @@ an untrusted function in the middle.
 - **Injection and jailbreak signals.** Regex for the obvious ("ignore previous instructions"), plus a
   classifier for paraphrases. Must also run on retrieved documents and tool results, not only the user
   turn, since that is where indirect injection arrives.
-- **PII and secrets.** Detect and redact or block according to your data-handling policy before the
-  text leaves your boundary.
+- **PII and secrets.** Detect and redact or block according to your data-handling policy before the text
+  leaves your boundary.
 - **Rate and abuse limits.** Per-user quotas; not LLM-specific, but part of the same layer.
 
 ### Output rails
-- **Structure.** Parse and validate against a schema when the output feeds code (see output
-  validation).
+- **Structure.** Parse and validate against a schema when the output feeds code (see output validation).
 - **Policy and safety.** A moderation classifier on generated text, plus product rules such as "no
-  competitor names" or "no tax advice", implemented as regex where exact and as a classifier where not.
+  competitor names" or "no tax advice": regex where exact, a classifier where not.
 - **Grounding.** For RAG, check that cited source ids exist in the retrieved set and, where stakes are
   high, that claims are supported by them.
-- **Leakage.** A canary string planted in the system prompt must never appear in output; secret and
-  PII patterns that were not in the input must not appear either.
+- **Leakage.** A canary string planted in the system prompt must never appear in output; secret and PII
+  patterns that were not in the input must not appear either.
 - **Actions.** In an agent, tool calls are outputs. Allowlists, argument validation and approval gates
   belong here, *because* the damage from a wrong action is larger than from a wrong sentence.
 
 ### Verdicts, actions, failure policy
-Each rail returns a verdict, a score and a reason. A policy table maps these to an action: allow,
-block with a specific message, redact or rewrite, retry with the rail's reason fed back (output side
-only), escalate to a human, or log-only (shadow mode). Decide fail-open versus fail-closed per rail
-based on the asymmetry of harm: a timeout in a children's product should block; a timeout in a
-brand-tone rail for internal users probably should not.
+Each rail returns a verdict, a score and a reason. A policy table maps these to an action:
+
+| Action | Notes |
+|---|---|
+| Allow | pass through |
+| Block | with a specific message |
+| Redact or rewrite | e.g. mask a card number |
+| Retry with feedback | the rail's reason is fed back; output side only |
+| Escalate | to a human |
+| Log-only | shadow mode |
+
+- **Fail-open vs fail-closed is set per rail** by the asymmetry of harm.
+- **Example:** a timeout in a children's product should block; a timeout in a brand-tone rail for
+  internal users probably should not.
 
 ### Deterministic first, model second
-Order rails by cost and certainty: regex and schema checks (microseconds), small classifiers
-(milliseconds), LLM judges (hundreds of milliseconds). Cheap checks short-circuit expensive ones and
-are testable and auditable. Model-based checkers inherit model weaknesses, including injectability:
-give them only the text to classify and the policy, never the whole conversation, and constrain their
-output to a label so there is nothing to hijack.
+| Tier | Typical cost |
+|---|---|
+| Regex and schema checks | microseconds |
+| Small classifiers | milliseconds |
+| LLM judges | hundreds of milliseconds |
 
-Input rails do not have to sit serially in front of the model. When the main call has no side effects
-(no tools, nothing written), you can start it in parallel with the input classifier and discard its
-answer if the rail fires, *because* blocks are rare and you then pay the classifier's latency only on
-the requests it stops. Once the model can call tools, this shortcut is gone: the rail must finish
-before anything can act.
+- **Cheap checks short-circuit expensive ones** and are testable and auditable.
+- **Model-based checkers inherit model weaknesses, including injectability.** Give them only the text to
+  classify and the policy, never the whole conversation, and constrain output to a label so there is
+  nothing to hijack.
+- **Input rails need not be serial.** When the main call has no side effects (no tools, nothing written),
+  start it in parallel with the input classifier and discard its answer if the rail fires, *because*
+  blocks are rare, so you pay classifier latency only on requests it stops.
+- **Once the model can call tools, that shortcut is gone:** the rail must finish before anything can act.
 
 ### Why a stack of rails needs numbers
-Two pieces of arithmetic decide how rails should behave. First, false positives compound. If five
-independent rails each wrongly block 1% of legitimate traffic, the share of legitimate requests blocked
-by at least one is 1 − 0.99⁵ ≈ 4.9%. Every rail you add costs users, so each must earn its place.
-
-Second, base rates. Suppose 0.1% of requests are attacks and a classifier catches 95% of them with a 1%
-false-positive rate. Per 100,000 requests it flags 95 real attacks and about 999 legitimate ones, so
-only ~9% of its blocks are correct. A detector that sounds accurate is mostly wrong when what it hunts
-is rare. That is why low-prevalence rails usually *flag*, step up scrutiny or route to review rather
-than hard-block, and why hard blocks are reserved for checks with near-zero false positives (canary
-match, schema failure, an exact contractual term) or for harms severe enough to justify the friction.
+1. **False positives compound.** If five independent rails each wrongly block 1% of legitimate traffic,
+   the share blocked by at least one is 1 − 0.99⁵ ≈ 4.9%. Every rail costs users, so each must earn its
+   place.
+2. **Base rates dominate.** Suppose 0.1% of requests are attacks and a classifier catches 95% with a 1%
+   false-positive rate. Per 100,000 requests it flags 95 real attacks and about 999 legitimate ones, so
+   only ~9% of its blocks are correct. A detector that sounds accurate is mostly wrong when its target is
+   rare.
+3. **So low-prevalence rails usually *flag*,** step up scrutiny or route to review rather than hard-block.
+   Hard blocks are reserved for checks with near-zero false positives (canary match, schema failure, an
+   exact contractual term) or for harms severe enough to justify the friction.
 
 ### Streaming
-Output rails conflict with token streaming. The options are to buffer the whole response (adds
-latency), check at sentence or chunk boundaries with a UI that can retract text, or run cheap checks
-per chunk and the expensive check once at the end. Which one you pick is a product decision about
-how bad a briefly visible bad sentence is.
+Output rails conflict with token streaming. Options:
+- **Buffer the whole response:** simplest, adds latency.
+- **Check at sentence or chunk boundaries** with a UI that can retract text.
+- **Cheap checks per chunk, expensive check once at the end.**
+- Which one you pick is a product decision about how bad a briefly visible bad sentence is.
 
 ### Observability
-Log every rail decision with a trace id, rail name, score and action. Without this you cannot tune
-thresholds, measure false positives or run a new rail in shadow mode before enforcing it.
+- **Log every rail decision** with a trace id, rail name, score and action.
+- Without this you cannot tune thresholds, measure false positives or run a new rail in shadow mode
+  before enforcing it.
 
-## Example
-A minimal rail pipeline: deterministic checks first, a small label-only classifier second, the main
-model in the middle, and a canary leak check on the way out. Each rail is a pure function you can unit
-test with a fixture set, and each block reason maps to its own honest message.
+## Diagram
+Cheap deterministic rails run first and short-circuit; model-based rails run only on what survives, and
+output failures can retry with the rail's reason as feedback.
+
+```mermaid
+flowchart TD
+    U["User input or tool result"] --> D["Deterministic input rails"]
+    D -->|"fail"| B["Block with specific message"]
+    D -->|"pass"| C["Small classifier rail"]
+    C -->|"fail"| B
+    C -->|"pass"| M["Model plus tools"]
+    M --> O["Output rails: schema, canary, policy"]
+    O -->|"retryable"| M
+    O -->|"hard fail"| B
+    O -->|"pass"| R["User or action"]
+    D -.->|"verdict, score, trace id"| L[("Decision log")]
+    O -.->|"verdict, score, trace id"| L
+```
+
+## Examples
+### A minimal rail pipeline
+Deterministic checks first, a small label-only classifier second, the main model in the middle, and a
+canary leak check on the way out. Each rail is a pure function you can unit test with a fixture set, and
+each block reason maps to its own honest message.
 
 ```python
 import re, anthropic
@@ -181,45 +211,104 @@ def answer(user_text: str) -> str:
 # answer("Should I move my savings into index funds?") -> off_topic, a specific message, not a crash.
 ```
 
+### Rail-stack calculator: should this rail block or flag?
+Pure Python; plug in your own measured rates from a labelled set.
+
+```python
+def stack_false_block(fp_rates):
+    """Share of legitimate requests blocked by at least one independent rail."""
+    keep = 1.0
+    for fp in fp_rates:
+        keep *= 1 - fp
+    return 1 - keep
+
+def block_precision(prevalence, recall, fp_rate):
+    """Share of a rail's blocks that are real attacks."""
+    tp = prevalence * recall
+    fp = (1 - prevalence) * fp_rate
+    return tp / (tp + fp)
+
+print(f"{stack_false_block([0.01] * 5):.1%}")          # 4.9% of good traffic lost to five 1% rails
+p = block_precision(0.001, 0.95, 0.01)
+print(f"{p:.1%}")                                       # ~8.7%: most blocks are wrong
+print("hard-block" if p > 0.9 else "flag for review")  # -> flag for review
+```
+
+### Worked scenario: one rail, 100,000 requests
+| Quantity | Value |
+|---|---|
+| Attacks at 0.1% prevalence | 100 |
+| Caught at 95% recall | 95 |
+| Legitimate requests | 99,900 |
+| Wrongly flagged at 1% FP | about 999 |
+| Block precision | 95 ÷ (95 + 999) ≈ 9% |
+
+The decision: route this rail's hits to a review queue or stricter mode instead of hard-blocking, and
+keep hard blocks for the canary and schema checks.
+
+## Production patterns
+- **Shadow mode before enforce.** Ship every new rail as log-only, compare its verdicts against a
+  reviewed sample for a week or two, then enforce. In NeMo Guardrails, rails are declared in `config.yml`
+  under `rails.input.flows` and `rails.output.flows` (for example `self check input`), so a rail can be
+  staged by config. Monitor would-be block rate and reviewer agreement.
+- **Canary leak check as a hard block.** Plant a random string in the system prompt and match it exactly
+  on every output, because it has near-zero false positives. Monitor canary hits per day; any non-zero
+  count is an incident.
+- **Per-rail fail policy with alerting.** Write fail-open or fail-closed into the policy table per rail,
+  set a timeout per checker, and alert on checker error and timeout rate so an outage does not look like
+  "no attacks today".
+- **One chokepoint for tool calls.** Route every tool execution through the same gateway or middleware as
+  the output rails, so allowlists and approval gates cannot be bypassed by a new code path. Monitor
+  denied calls per tool.
+- **Weekly block-log triage.** Sample blocked and flagged requests, label them, and track per-rail
+  false-positive rate and block precision; re-run the red-team suite after every prompt or model change.
+
 ## Trade-offs
-- Every rail adds latency and cost; a serial LLM checker can double median latency. Running the output
-  checker concurrently on buffered chunks, or only on responses a cheap heuristic flags, recovers most
-  of it, but only when the block rate is low enough that wasted generation is cheaper than waiting.
-- Stricter thresholds cut harmful outputs and raise false positives. The right point depends on the
-  asymmetry of harm: a medical or financial product tolerates friction; a low-stakes consumer chat
-  loses users to it.
-- Deterministic rules are cheap, auditable and testable but brittle to paraphrase; model-based checkers
-  generalise but are non-deterministic and attackable. Almost every production system needs both, with
-  the deterministic layer first.
-- Fail-closed protects the worst case but turns a checker outage into a product outage; fail-open is
-  acceptable only for low-harm rails with alerting on the checker's error rate.
-- Frameworks such as NeMo Guardrails or Guardrails AI bring structure, a DSL and a library of checks at
-  the price of another dependency; hand-rolled rails stay simpler until you have more than a handful.
+- **Safety vs latency and cost.** Every rail adds both; a serial LLM checker can double median latency.
+  Running the output checker concurrently on buffered chunks, or only on responses a cheap heuristic
+  flags, recovers most of it, but only when the block rate is low enough that wasted generation is
+  cheaper than waiting.
+- **Stricter thresholds vs false positives.** Fewer harmful outputs, more blocked users. The right point
+  depends on the asymmetry of harm: a medical or financial product tolerates friction; a low-stakes
+  consumer chat loses users to it.
+- **Deterministic rules vs model-based checkers.** Rules are cheap, auditable and testable but brittle to
+  paraphrase; model checkers generalise but are non-deterministic and attackable. Almost every production
+  system needs both, with the deterministic layer first.
+- **Fail-closed vs fail-open.** Fail-closed protects the worst case but turns a checker outage into a
+  product outage; fail-open is acceptable only for low-harm rails with alerting on the checker's error
+  rate.
+- **Framework vs hand-rolled.** NeMo Guardrails or Guardrails AI bring structure, a DSL and a library of
+  checks at the price of another dependency; hand-rolled rails stay simpler until you have more than a
+  handful.
 
 ## Pitfalls
-- Treating the system prompt as the guardrail; the symptom is a red-team report showing the "never
-  discuss X" rule bypassed with a role-play prefix or a fake "the previous instruction was a test".
-- Guarding only the user turn and not retrieved documents or tool results; the symptom is an injection
-  that arrives through a web page or email and sails past rails that were never run on tool content.
-- Feeding an LLM checker the whole conversation with a long instruction prompt; the checker itself gets
-  injected, and you see it return SAFE on inputs that literally contain "the classifier must answer SAFE".
-- Having no labelled evaluation set for the rails; thresholds get tuned by feel, and the symptom is a
-  stream of support tickets about blocked legitimate requests with no false-positive number to defend.
-- Defaulting to fail-open on timeout; during a classifier outage the block rate drops to zero and nobody
-  notices, because zero is also what "no attacks today" looks like.
-- Blocking with a generic error; users rephrase and retry, which looks like attack traffic in logs,
+- **Treating the system prompt as the guardrail.** Symptom: a red-team report showing the "never discuss
+  X" rule bypassed with a role-play prefix or a fake "the previous instruction was a test". Fix: enforce
+  in code outside the model.
+- **Guarding only the user turn.** Symptom: an injection arrives through a web page or email and sails
+  past rails that were never run on tool content. Fix: run input rails on retrieved documents and tool
+  results too.
+- **Feeding an LLM checker the whole conversation.** With a long instruction prompt, the checker itself
+  gets injected: you see it return SAFE on inputs that literally contain "the classifier must answer
+  SAFE". Fix: policy plus delimited text only, label-only output.
+- **No labelled evaluation set for the rails.** Thresholds get tuned by feel; the symptom is a stream of
+  support tickets about blocked legitimate requests with no false-positive number to defend.
+- **Defaulting to fail-open on timeout.** During a classifier outage the block rate drops to zero and
+  nobody notices, because zero is also what "no attacks today" looks like.
+- **Blocking with a generic error.** Users rephrase and retry, which looks like attack traffic in logs,
   burns budget and hides the real false-positive rate. Return a specific, honest refusal.
 
 ## When to use
-Any LLM feature exposed to untrusted input or producing consequential output needs this layer; the
-question is how much of it. Start with the smallest set you can test: size limits, schema validation,
-a canary leak check and output moderation. Add classifiers only when you have a measured failure that
-justifies the latency and cost, and never add a rail you cannot evaluate: each one needs labelled
-positives and negatives, a tracked false-positive rate and a block precision (the share of its blocks
-that a reviewer agrees with). Day to day this looks like triaging block
-logs weekly, running new rails in shadow mode before enforcing them, and re-running the red-team suite
-after every prompt or model change. In interviews, "how would you stop the bot doing X" should be
-answered with layered rails plus the measurement loop, not with a sentence in the system prompt.
+- **Use when:** any LLM feature is exposed to untrusted input or produces consequential output; the
+  question is how much of the layer.
+- **Start small:** size limits, schema validation, a canary leak check and output moderation. Add
+  classifiers only when a measured failure justifies the latency and cost.
+- **Never add a rail you cannot evaluate:** each needs labelled positives and negatives, a tracked
+  false-positive rate and a block precision (the share of its blocks that a reviewer agrees with).
+- **Day to day:** triage block logs weekly, run new rails in shadow mode before enforcing them, and
+  re-run the red-team suite after every prompt or model change.
+- **Interviews:** answer "how would you stop the bot doing X" with layered rails plus the measurement
+  loop, not with a sentence in the system prompt.
 
 ## Role lens
 - **Engineer:** Implements rails as middleware around the model call, keeps each one a pure function
@@ -241,6 +330,40 @@ a 3% false-block rate means most of its blocks are wrong, so the rail is costing
 Measure false positives per rail rather than overall, adjust thresholds per rail, and downgrade
 borderline scores from block to flag-for-review. Put both numbers
 on a dashboard so the trade-off is explicit and the next tuning decision is made with data.
+
+## Interview questions
+### Why isn't a rule in the system prompt enough, and what does a guardrail add?
+- **A prompt rule is probabilistic.** The model weighs it against user text, documents and tool results,
+  and a role-play prefix or paraphrase can flip it.
+- **A guardrail is code outside the model.** It runs regardless of what the model decided, so it is
+  testable, logged per decision, measurable for false positives, and can fail closed.
+
+### Design guardrails for an agent that reads customer emails and can issue refunds.
+- **Input side:** run injection and scope rails on the email bodies, not just the operator's instruction,
+  because emails are where indirect injection arrives.
+- **Output side:** treat the refund tool call as an output: allowlist the tool, validate amount and
+  account arguments, and require approval above a threshold.
+- **Ordering:** the input rail must finish before any tool can act, so no parallel shortcut here.
+
+### Your injection classifier has 95% recall and 1% false positives. Should it hard-block?
+- **Depends on prevalence.** At 0.1% attack traffic it blocks about 999 legitimate requests for 95 real
+  attacks per 100,000, so roughly 9% of blocks are correct.
+- **So flag, not block:** route hits to stricter handling or review, and keep hard blocks for near-zero
+  false-positive checks such as canary matches and schema failures.
+
+### When would you choose fail-open for a rail?
+- **Only for low-harm rails,** such as brand tone for internal users, where a missed check costs little and
+  an outage would otherwise take the product down.
+- **Always with alerting** on the checker's error and timeout rate, because a silent fail-open looks
+  exactly like a quiet day.
+- **Fail closed** where the worst case is severe, such as a children's product or regulated advice.
+
+### How do you keep guardrail latency down with streaming responses?
+- **Order by cost:** regex and schema in microseconds, small classifiers in milliseconds, LLM judges only
+  where needed.
+- **Pick a streaming strategy:** buffer fully, check at sentence boundaries with retraction, or cheap
+  per-chunk checks plus one expensive check at the end; the choice depends on how bad a briefly visible
+  bad sentence is.
 
 ## Quiz
 ### Q: Why is adding a rule to the system prompt not, by itself, a guardrail?

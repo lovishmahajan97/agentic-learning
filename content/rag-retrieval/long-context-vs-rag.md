@@ -5,7 +5,7 @@ name: Long-context vs RAG
 kind: decision
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - model-internals/context-window
   - rag-retrieval/lost-in-the-middle
@@ -20,9 +20,9 @@ sources:
 ---
 
 ## TL;DR
-Huge windows let you skip retrieval and prompt with the whole corpus. That wins for small, static,
-reused corpora or whole-document reasoning; RAG wins for large, changing, permissioned or high-volume
-ones: tokens cost money, prefill is slow, long-context recall is unreliable.
+Huge windows sometimes let you skip retrieval: best for small, static, reused corpora or whole-document
+reasoning. RAG wins for large, changing, permissioned or high-volume ones: tokens cost money, prefill
+grows with length, and models use long contexts less reliably than advertised.
 
 ## Why it exists
 - **RAG began as a necessity.** Early context windows held a few thousand tokens, so you had to select.
@@ -105,7 +105,7 @@ flowchart TD
     F -->|"no"| RAG["RAG with per-user filters"]
     F -->|"yes"| P{"One permission scope and rare edits?"}
     P -->|"no"| RAG
-    P -->|"yes"| V{"Volume times corpus size within budget, cache hit rate measured?"}
+    P -->|"yes"| V{"Cost within budget at measured hit rate?"}
     V -->|"yes"| LC["Long-context with cached prefix"]
     V -->|"no"| H["Document-level retrieval into a large window"]
     LC -.->|"triggers: growth, permissions, edits"| RAG
@@ -154,7 +154,7 @@ C, R = 150_000, 6_000                        # 300-page manual; retrieved budget
 
 print(f"long, no cache : ${cost_long(C, 20_000, p, d=0.10, h=0.0):,.0f}/day")    # $9,000
 print(f"long, cached   : ${cost_long(C, 20_000, p, d=0.10, h=1.0):,.0f}/day")    # $900
-print(f"rag            : ${cost_rag(R, 20_000, p):,.0f}/day")                    # $360
+print(f"rag            : ${cost_rag(R, 20_000, p):,.0f}/day")                    # $360 (question tokens ignored)
 
 # Low volume: 50 questions/day, gaps often exceed the cache TTL (illustrative h=0.3, 25% write premium)
 per_q = cost_long(C, 50, p, d=0.10, h=0.3, write_premium=0.25) / 50

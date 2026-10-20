@@ -5,7 +5,7 @@ name: Dependency & risk management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - scoping/statement-of-work
   - scoping/data-access-and-permissions-discovery
@@ -20,44 +20,44 @@ sources:
 ---
 
 ## TL;DR
-AI projects are rarely late because of code. They are late because of things the team does not
-control: data exports, access, security reviews, SME time, provider quotas. Dependency management maps
-those inputs with owners, lead times and need-by dates. Risk management lists what could go wrong,
-sizes each risk in days or money, and attacks the biggest ones first with cheap spikes, so the worst
-surprises arrive in week one rather than week nine.
+AI projects slip on things the team does not control: data, access, security reviews, SME time, quotas.
+Map dependencies with owners and need-by dates, size risks in days, and retire the biggest with cheap
+spikes, so surprises arrive in week one.
 
 ## Why it exists
-A typical enterprise AI pilot plan says "weeks 1–2: data ingestion". In practice, week 1 is spent
-learning that the document system's export needs a ticket to a team with a three-week queue. Week 3
-reveals that a third of the documents are scanned images. Week 5 brings the security review's verdict
-that customer data cannot go to an external API in that region. None of these is an engineering
-failure, yet each one moves the delivery date, and the team takes the blame because nobody wrote the
-dependency down with an owner and a date.
-
-The naive approaches fail predictably. A risk list written once for the kickoff deck and never
-reopened gives no protection: it records risks and drives no action. Rating everything "medium" makes
-it impossible to prioritise. Treating risks as things to watch rather than things to retire leaves the
-biggest unknowns, such as data quality, security approval and feasibility on real inputs, unresolved
-until late, when there is no slack left to absorb them. AI work also carries risks ordinary software
-projects do not have. The data may not support the task. The eval set may not represent production.
-Model behaviour can change when a provider updates or retires a version. Quotas and regional
-availability can block a deployment design that worked in a demo.
+- **The plan says "weeks 1–2: data ingestion"; reality differs.** Week 1 is spent learning the document
+  system's export needs a ticket to a team with a three-week queue. Week 3 reveals a third of the documents
+  are scanned images. Week 5 brings the security verdict that customer data cannot go to an external API in
+  that region.
+- **None of these is an engineering failure,** yet each moves the delivery date, and the team takes the
+  blame because nobody wrote the dependency down with an owner and a date.
+- **A kickoff-deck risk list gives no protection.** Written once and never reopened, it records risks and
+  drives no action. Rating everything "medium" makes it impossible to prioritise.
+- **Watching risks instead of retiring them** leaves the biggest unknowns (data quality, security approval,
+  feasibility on real inputs) unresolved until late, when there is no slack left to absorb them.
+- **AI adds its own risks:** the data may not support the task, the eval set may not represent production,
+  model behaviour can change when a provider updates or retires a version, and quotas or regional
+  availability can block a deployment design that worked in a demo.
 
 ## How it works
 ### Keep a RAID log
-Keep one living log of **R**isks (things that might happen), **A**ssumptions (things you are treating
-as true but have not verified), **I**ssues (risks that have already happened) and **D**ependencies
-(inputs owned by someone else). The categories matter *because* each one triggers a different action.
-An assumption gets verified. A risk gets a response. An issue gets resolved now. A dependency gets
-chased by its owner.
+One living log, because each category triggers a different action:
+
+| Category | Meaning | Action |
+|---|---|---|
+| **R**isks | things that might happen | get a response |
+| **A**ssumptions | treated as true but not verified | get verified |
+| **I**ssues | risks that have already happened | get resolved now |
+| **D**ependencies | inputs owned by someone else | get chased by their owner |
 
 ### Map dependencies
-For each dependency, record what is needed (in a specific format), who owns it (a named person, not
-"IT"), the realistic lead time, the need-by date derived from the plan, and the status. Then find the
-**critical path**: the chain of dependent tasks with zero slack, such as data export → eval set →
-PoC → pilot sign-off. Anything on that chain slips the end date day for day. Anything off it has slack
-you can spend. Start the longest-lead items first. Security reviews, legal agreements and procurement
-often take longer than the engineering, so they should start in week zero, before anything is built.
+1. **Record each one:** what is needed (in a specific format), who owns it (a named person, not "IT"), the
+   realistic lead time, the need-by date derived from the plan, and the status.
+2. **Find the critical path:** the chain of dependent tasks with zero slack, such as data export → eval set
+   → PoC → pilot sign-off. Anything on that chain slips the end date day for day; anything off it has slack
+   you can spend.
+3. **Start the longest-lead items first.** Security reviews, legal agreements and procurement often take
+   longer than the engineering, so they should start in week zero, before anything is built.
 
 ### Identify risks by category
 Walk a checklist so you do not rely on memory:
@@ -67,36 +67,63 @@ Walk a checklist so you do not rely on memory:
   deprecation of a model version.
 - **People and adoption:** SME availability, sponsor turnover, user resistance.
 - **Commercial and vendor:** pricing changes, contract terms, lock-in.
-- **Regulatory and harm:** whether outputs could harm users or breach rules. This overlaps with
-  AI-system risk management (frameworks such as the NIST AI RMF), which is covered in its own lesson.
+- **Regulatory and harm:** whether outputs could harm users or breach rules. This overlaps with AI-system
+  risk management (frameworks such as the NIST AI RMF), which is covered in its own lesson.
 
 ### Assess in units people can act on
-Score each risk by likelihood and impact. Where possible, express impact in schedule days or money,
-not "high". The expected delay, probability × impact, can be compared directly with the slack on the
-affected path. A 50% chance of a 15-day slip on the critical path is 7.5 expected days, which outranks
-a 90% chance of a 2-day slip on a path with 10 days of slack.
+- **Score likelihood and impact,** with impact in schedule days or money where possible, not "high".
+- **Expected delay = probability × impact,** which compares directly with the slack on the affected path.
 
-Expected delay ranks risks, but it is not the whole story. A 10% chance of a 60-day slip has the same
-6 expected days as a near-certain 6-day slip, yet only the first can end the engagement. For risks
-whose impact would be fatal, such as the pilot being unable to run at all or a budget window closing,
-plan by impact rather than by expected value: buy them down early or prepare a contingency whatever
-their expected days say.
+| Risk | Probability | Impact | Expected | Path slack | Effect on end date |
+|---|---|---|---|---|---|
+| A | 50% | 15 days | 7.5 days | 0 (critical path) | lands directly |
+| B | 90% | 2 days | 1.8 days | 10 days | absorbed |
+
+- **Expected delay ranks risks but is not the whole story.** A 10% chance of a 60-day slip has the same 6
+  expected days as a near-certain 6-day slip, yet only the first can end the engagement.
+- **Plan fatal risks by impact, not expected value.** If the pilot could be unable to run at all, or a
+  budget window could close, buy the risk down early or prepare a contingency whatever its expected days
+  say.
 
 ### Choose a response and a trigger
-For each significant risk, choose one of four responses. **Avoid** it by changing the plan. **Reduce**
-it with a spike, a fallback or an earlier start. **Transfer** it to the party best placed to own it,
-for example by making a data date a customer obligation in the SOW. Or **accept** it with a
-contingency plan. Give each risk an early-warning trigger, such as "export not received by day 10".
-That way, switching to the contingency is a pre-agreed step rather than a debate held in a crisis.
+| Response | How |
+|---|---|
+| **Avoid** | change the plan |
+| **Reduce** | a spike, a fallback or an earlier start |
+| **Transfer** | to the party best placed to own it, for example a data date as a customer obligation in the SOW |
+| **Accept** | with a contingency plan |
+
+- **Give each risk an early-warning trigger,** such as "export not received by day 10", so switching to the
+  contingency is a pre-agreed step rather than a debate held in a crisis.
 
 ### Retire the biggest unknowns first
-Order early work by the uncertainty it removes, not by the order the architecture suggests. A two-day
-spike on 50 real documents removes more risk than two weeks of polished pipeline code over synthetic
-ones. Review the log weekly at the steering meeting, with escalation thresholds agreed in the SOW.
+- **Order early work by the uncertainty it removes,** not by the order the architecture suggests. A two-day
+  spike on 50 real documents removes more risk than two weeks of polished pipeline code over synthetic ones.
+- **Review the log weekly** at the steering meeting, with escalation thresholds agreed in the SOW.
 
-## Example
-A 10-week pilot of a contract-review assistant for a legal department. All figures are illustrative.
-At kickoff the RAID log holds these top items:
+## Diagram
+The weekly risk loop: every item gets sized against slack, a response and a trigger, and a fired trigger
+switches to a pre-agreed contingency.
+
+```mermaid
+flowchart TD
+    I["Identify: checklist by category"] --> L[("RAID log with named owners")]
+    L --> S["Size: probability x days vs slack"]
+    S --> F{"Fatal impact or on critical path?"}
+    F -->|"yes"| R["Retire first: spike, early start, fallback"]
+    F -->|"no"| A["Accept or transfer with trigger"]
+    R --> W["Weekly steering review"]
+    A --> W
+    W --> T{"Trigger fired?"}
+    T -->|"yes"| C["Switch to contingency"]
+    T -->|"no"| L
+    C --> L
+```
+
+## Examples
+### Worked scenario: 10-week contract-review pilot
+A 10-week pilot of a contract-review assistant for a legal department. All figures are illustrative. At
+kickoff the RAID log holds these top items:
 
 | ID | Item | Owner | Prob | Impact | Exp. days | Response and trigger |
 |----|------|-------|------|--------|-----------|----------------------|
@@ -106,50 +133,105 @@ At kickoff the RAID log holds these top items:
 | R3 | SME lawyers miss labelling sessions | Customer GC | 0.6 | 5 days | 3 | Book sessions now; trigger if <75% attended in week 3 |
 | R4 | Provider quota too low for batch backfill | Engineer | 0.2 | 3 days | 0.6 | Request increase week 1; accept |
 
-D1, then R1 and R2, sit on the critical path, because the eval set needs the export and the pilot
-needs security approval. Plan slack is 5 days. The expected delays from R1 and R2 alone (11 days)
-exceed it, so the plan as drawn is not credible. The team acts accordingly. It submits the security
-questionnaire on day 0, not when the pilot is ready. It runs the OCR spike in week 1. The spike finds
-that 30% of files are scans and that OCR is acceptable on 80% of them, so R2 drops to a 3-day impact.
-It also writes D1's need-by date into the SOW, so that a late export moves the schedule. In week 4 the
-security review asks for an in-region deployment. Because R1 had a contingency, the switch takes 4 days
-instead of the 20 it would have cost unplanned.
+- **The plan as drawn is not credible.** D1, then R1 and R2, sit on the critical path, because the eval set
+  needs the export and the pilot needs security approval. Plan slack is 5 days, and the expected delays
+  from R1 and R2 alone (11 days) exceed it.
+- **What the team did:**
+  1. Submitted the security questionnaire on day 0, not when the pilot was ready.
+  2. Ran the OCR spike in week 1. It found 30% of files are scans and OCR is acceptable on 80% of them, so
+     R2 dropped to a 3-day impact.
+  3. Wrote D1's need-by date into the SOW, so a late export moves the schedule.
+- **Outcome:** in week 4 the security review asked for an in-region deployment. Because R1 had a
+  contingency, the switch took 4 days instead of the 20 it would have cost unplanned.
+
+### Exposure calculator for the weekly review
+Ranks risks by expected days, flags fatal-impact ones, and compares critical-path exposure with slack.
+Re-run it after each spike; the numbers reproduce the scenario above.
+
+```python
+RISKS = [  # id, probability, impact in schedule days, on critical path?
+    ("R1", 0.3, 20, True),    # security review rejects external LLM API
+    ("R2", 0.5, 10, True),    # scans with poor OCR
+    ("R3", 0.6, 5, False),    # SMEs miss labelling sessions
+    ("R4", 0.2, 3, False),    # provider quota too low for backfill
+]
+SLACK_DAYS = 5
+FATAL_DAYS = 30               # illustrative: a slip this large would end the engagement
+
+def report(risks, slack=SLACK_DAYS):
+    for rid, p, days, critical in sorted(risks, key=lambda r: r[1] * r[2], reverse=True):
+        flag = "  FATAL-IMPACT: plan by impact" if days >= FATAL_DAYS else ""
+        print(f"{rid} expected {p * days:4.1f} days  critical={critical}{flag}")
+    exposure = sum(p * d for _, p, d, c in risks if c)
+    print(f"critical-path exposure {exposure:.1f} days vs slack {slack}: "
+          f"plan {'not credible' if exposure > slack else 'holds'}")
+
+def with_impact(risks, rid, days):
+    return [(i, p, days if i == rid else d, c) for i, p, d, c in risks]
+
+report(RISKS)                                    # 11.0 vs 5: not credible
+after_spike = with_impact(RISKS, "R2", 3)        # OCR spike: R2 impact 10 -> 3 days
+report(after_spike)                              # 7.5 vs 5: still not credible
+report(with_impact(after_spike, "R1", 4))        # adapter contingency: R1 20 -> 4 days, 2.7 vs 5 holds
+```
+
+- **Exposure should fall week by week** as spikes and contingencies retire unknowns; here it goes 11.0, then
+  7.5, then 2.7 days.
+
+## Production patterns
+- **RAID log as a shared, owned document.** Keep it where both delivery team and customer edit it, with a
+  named person per row and a need-by date per dependency. Monitor the count of dependencies past their
+  need-by date at every weekly steering meeting.
+- **Week-zero approvals.** Submit the security questionnaire, data processing agreement and procurement
+  requests on day 0, in parallel with building. Track each approval's age against its expected lead time.
+- **Provider seam for contingencies.** Put model calls behind an adapter interface so a switch to an
+  in-region or alternative hosted model is a configuration change. Monitor provider quota usage, regional
+  availability and announced model deprecation dates.
+- **Spike-first backlog.** Schedule one- to two-day spikes on real data for every risk on the critical path
+  before building pipeline code. Track total critical-path exposure week by week; a flat or rising curve
+  means the work is not attacking the risks.
+- **Triggers wired to the calendar.** Turn each trigger (for example "export not received by day 10") into
+  a dated check owned by a person, with the contingency pre-agreed in steering notes. Monitor fired
+  triggers and time from trigger to switch.
 
 ## Trade-offs
-- A detailed RAID log catches more surprises but costs steering time every week. Keep the top ten
-  items active and archive the rest, unless the engagement is regulated or multi-vendor.
-- Front-loading spikes removes uncertainty early but delays visible demo progress. That trade is worth
-  making whenever a feasibility or data risk sits on the critical path.
-- Transferring risk to the customer through dated obligations protects the schedule but can strain
-  the relationship. Frame it as shared planning, and only for items they genuinely control.
-- Building contingency architecture, such as a provider adapter or in-region fallback, costs effort
-  upfront. It pays off when security or provider approval is uncertain, and is waste when approval is
-  already confirmed.
-- Quantified scoring (probability × days) gives real prioritisation but implies false precision. Treat
-  the numbers as ranking tools, not forecasts, when the estimates are rough.
+- **Coverage vs steering time.** A detailed RAID log catches more surprises but costs steering time every
+  week. Keep the top ten items active and archive the rest, unless the engagement is regulated or
+  multi-vendor.
+- **Early certainty vs visible progress.** Front-loading spikes removes uncertainty early but delays visible
+  demo progress. That trade is worth making whenever a feasibility or data risk sits on the critical path.
+- **Schedule protection vs relationship.** Transferring risk to the customer through dated obligations
+  protects the schedule but can strain the relationship. Frame it as shared planning, and only for items
+  they genuinely control.
+- **Cheap contingency vs upfront effort.** Building contingency architecture, such as a provider adapter or
+  in-region fallback, costs effort upfront. It pays off when security or provider approval is uncertain,
+  and is waste when approval is already confirmed.
+- **Real prioritisation vs false precision.** Quantified scoring (probability × days) gives real
+  prioritisation but implies false precision. Treat the numbers as ranking tools, not forecasts, when the
+  estimates are rough.
 
 ## Pitfalls
-- Writing the risk list once at kickoff. The symptom is a deck slide that still lists "data quality"
-  as medium in week 8, after it has already caused a slip.
-- Naming teams instead of people as owners. The symptom is a dependency marked "with IT" for three
-  weeks with nobody able to say who is working on it.
-- Starting security and legal reviews only when the system is ready. The symptom is a finished pilot
-  that waits a month for approval to touch production data.
-- Accepting risks without triggers or contingencies. The symptom is a crisis meeting debating options
-  that could have been decided calmly in week one.
-- Ignoring model and provider risks. The symptom is a deployment design that fails on quota, regional
+- **Writing the risk list once at kickoff.** Symptom: a deck slide that still lists "data quality" as medium
+  in week 8, after it has already caused a slip.
+- **Naming teams instead of people as owners.** Symptom: a dependency marked "with IT" for three weeks with
+  nobody able to say who is working on it.
+- **Starting security and legal reviews only when the system is ready.** Symptom: a finished pilot that
+  waits a month for approval to touch production data.
+- **Accepting risks without triggers or contingencies.** Symptom: a crisis meeting debating options that
+  could have been decided calmly in week one.
+- **Ignoring model and provider risks.** Symptom: a deployment design that fails on quota, regional
   availability or a deprecated model version in the final week.
 
 ## When to use
-Start the dependency map and RAID log during scoping, before the SOW is signed, because dated customer
-dependencies and known risks belong in the SOW itself. Then review the log weekly for the life of the
-engagement. Even a two-week internal PoC benefits from a ten-line version naming the data, access and
-people it depends on. Measure how the log is working: count dependencies past their need-by date, compare the expected
-delay with slack on the critical path, and track total exposure (the sum of expected days on the
-critical path) week by week. Exposure should fall as spikes retire unknowns. A flat or rising curve
-means the work is not attacking the risks. In interviews and on site, expect "what could
-stop this project?" The strong answer names specific, owned dependencies and the spike that would
-retire the biggest unknown first.
+- **Use when:** scoping, before the SOW is signed, because dated customer dependencies and known risks
+  belong in the SOW itself. Then review the log weekly for the life of the engagement.
+- **Lighter version:** even a two-week internal PoC benefits from a ten-line version naming the data, access
+  and people it depends on.
+- **Measure:** count dependencies past their need-by date, compare expected delay with slack on the critical
+  path, and track total exposure (the sum of expected days on the critical path) week by week. Exposure
+  should fall as spikes retire unknowns; a flat or rising curve means the work is not attacking the risks.
+- **Interviews:** expect "what could stop this project?" The strong answer names specific, owned
+  dependencies and the spike that would retire the biggest unknown first.
 
 ## Role lens
 - **Engineer:** Runs the early spikes that retire technical and data risks, and builds the adapters
@@ -169,6 +251,37 @@ rejected. The late export is a dependency on the critical path, so I would name 
 agree a new date, and invoke the SOW clause that moves milestones day for day. The missed SME session
 is a risk to watch: rebook it and set an attendance trigger. Then I would re-estimate expected delay
 against remaining slack and tell the sponsor now whether the end date still holds.
+
+## Interview questions
+### What is a RAID log, and why keep four categories instead of one risk list?
+- **Definition:** a living log of risks, assumptions, issues and dependencies, each row with a named owner.
+- **Why four:** each category triggers a different action. Assumptions get verified, risks get a response
+  and trigger, issues get resolved now, and dependencies get chased by their owner.
+
+### What are the biggest risks specific to an AI pilot that an ordinary software plan misses?
+- **Data:** the data may not support the task, and scans or poor OCR can surface weeks in.
+- **Evaluation:** the eval set may not represent production inputs.
+- **Provider:** behaviour changes when a model version is updated or retired, and quotas or regional
+  availability can block a design that worked in a demo.
+- **Approval:** security review of external model APIs and data residency, often the longest lead time.
+
+### When would you plan by impact rather than by expected delay?
+- **When the impact would be fatal,** such as the pilot being unable to run at all or a budget window
+  closing.
+- **Example:** a 10% chance of a 60-day slip and a near-certain 6-day slip both carry 6 expected days, but
+  only the first can end the engagement, so buy it down early or prepare a contingency.
+
+### Your critical-path exposure is 11 expected days against 5 days of slack in week 1. What do you do?
+- **Say now that the plan is not credible,** rather than at the deadline.
+- **Attack the biggest items:** submit the security review on day 0, build an adapter for an in-region
+  fallback, run a spike on 50 real files, and write the export need-by date into the SOW.
+- **Re-run the numbers** after each action and report the exposure trend to the sponsor weekly.
+
+### How do you make customer dependencies enforceable without damaging the relationship?
+- **Make them dated SOW obligations** with a day-for-day schedule consequence, only for items the customer
+  genuinely controls.
+- **Frame it as shared planning:** named owners, need-by dates visible in the shared log, and early-warning
+  triggers agreed together, so a slip is a known step rather than blame.
 
 ## Quiz
 ### Q: Why should a security review or data-processing agreement usually start in week zero?

@@ -5,7 +5,7 @@ name: CI/CD
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/kubernetes
@@ -22,113 +22,123 @@ sources:
 ---
 
 ## TL;DR
-Continuous integration means every change is merged to the main line often and verified by an
-automated build and test run on a clean machine; continuous delivery means every verified build
-becomes one immutable artifact that can reach production through a repeatable, automated path, and
-continuous deployment removes the final button. The pipeline replaces trust in laptops with evidence
-and makes releases small and routine enough that failure is cheap to detect and reverse. For AI
-systems it must gate prompts and models too, whose tests are evaluations.
+CI merges and verifies every change on a clean machine; CD turns each verified build into one immutable
+artifact with an automated path to production. Small, routine releases make failure cheap to reverse. For
+AI systems it also gates prompts and models with evaluations.
 
 ## Why it exists
-Without a pipeline, integration happens late: weeks of divergent branches meet at release time and the
-merge is where the bugs live. Tests run on developer machines with whatever happens to be installed,
-so "passes locally" carries no information about production. Deployment is a runbook followed by a
-person, usually under time pressure, and the second execution differs from the first in some detail
-nobody wrote down. Nobody can say which commit is in production, and rollback means "redeploy the old
-one", which cannot be rebuilt because the dependency resolution has moved on.
-
-Each of these is a feedback-delay problem. The cost of a defect grows with the distance between the
-change that introduced it and the moment it is detected, because context is lost and other changes
-pile on top. Continuous integration shrinks that distance by integrating at least daily against a
-build that must stay green. Continuous delivery extends the idea through to production with a
-deployment pipeline whose stages give fast, cheap feedback first and slow, expensive feedback later.
-The DORA research reported in *Accelerate* found that teams deploying more often with shorter lead
-times also had *lower* change failure rates: small, frequent changes are safer than large, rare ones,
-which is the opposite of the intuition behind "test everything manually before the big release".
-
-AI systems raise the stakes. A prompt edit is a behaviour change with no type checker; a model version
-bump can silently regress a task the team never wrote a test for; a retrieval index rebuild changes
-answers without touching code. Without a pipeline that treats these as changes to be verified,
-quality drift ships unnoticed and is discovered by users.
+- **Late integration is where bugs live.** Weeks of divergent branches meet at release time, and the merge
+  is the defect.
+- **"Passes locally" carries no information.** Tests run on developer machines with whatever happens to be
+  installed.
+- **Manual deploys are not repeatable.** A runbook followed by a person under time pressure differs the
+  second time in some detail nobody wrote down. Nobody can say which commit is in production, and rollback
+  ("redeploy the old one") fails because dependency resolution has moved on.
+- **Each is a feedback-delay problem.** A defect's cost grows with the distance between the change and its
+  detection, *because* context is lost and other changes pile on top. CI shrinks that distance by integrating
+  at least daily against a build that must stay green; CD extends it to production with stages that give
+  fast, cheap feedback first and slow, expensive feedback later.
+- **Small and frequent is safer.** The DORA research in *Accelerate* found teams deploying more often with
+  shorter lead times also had *lower* change failure rates, the opposite of "test everything manually before
+  the big release".
+- **AI raises the stakes.** A prompt edit is a behaviour change with no type checker; a model version bump can
+  silently regress an untested task; an index rebuild changes answers without touching code. Unverified,
+  quality drift ships and users find it.
 
 ## How it works
 ### The stages of a deployment pipeline
-1. **Commit stage, minutes.** Check out on a clean runner, install from the lockfile, lint, type-check,
-   run unit tests with the model client mocked or recorded, scan for secrets. It runs on every push,
-   so it must be cheap and deterministic; it exists to fail fast on the majority of mistakes.
-2. **Build.** Build the container image once, tag it with the git SHA, push it to a registry. The image
-   digest is now the artifact. "Build once, promote many" is a rule *because* rebuilding per
-   environment can resolve different dependencies or base layers, so production would run something
-   that was never tested.
-3. **Acceptance.** Start the real dependencies (Postgres, Redis) as service containers, run API tests
-   against the built image, run contract tests against provider APIs, and run a small, fixed
-   evaluation set against the prompts and model with pass thresholds.
-4. **Supply chain.** Audit dependencies, scan the image, produce a software bill of materials, sign the
-   image so later stages can verify they are deploying what this stage produced.
-5. **Staging.** Deploy automatically, run smoke tests against a production-shaped environment.
-6. **Production.** Promote the same digest, gated by an approval (delivery) or automatically
-   (deployment), progressively: a canary takes a slice of traffic while error rate, latency and online
-   quality metrics are compared against the baseline, then full rollout or automatic rollback.
+1. **Commit stage, minutes.** Clean runner, install from the lockfile, lint, type-check, unit tests with the
+   model client mocked or recorded, secret scan. It runs on every push, so it must be cheap and
+   deterministic; it exists to fail fast on the majority of mistakes.
+2. **Build.** Build the container image once, tag it with the git SHA, push it to a registry. The image digest
+   is now the artifact. "Build once, promote many" is a rule *because* rebuilding per environment can resolve
+   different dependencies or base layers, so production would run something never tested.
+3. **Acceptance.** Start real dependencies (Postgres, Redis) as service containers, run API tests against the
+   built image, contract tests against provider APIs, and a small, fixed evaluation set against the prompts
+   and model with pass thresholds.
+4. **Supply chain.** Audit dependencies, scan the image, produce a software bill of materials, and sign the
+   image so later stages can verify they deploy what this stage produced.
+5. **Staging.** Deploy automatically; run smoke tests against a production-shaped environment.
+6. **Production.** Promote the same digest, gated by an approval (delivery) or automatically (deployment),
+   progressively: a canary takes a slice of traffic while error rate, latency and online quality metrics are
+   compared with the baseline, then full rollout or automatic rollback.
 
-The three common production strategies differ in what they cost and what they can detect. A **rolling**
-update replaces replicas a few at a time: no extra capacity beyond the surge, but old and new versions
-serve side by side and a bad version reaches every user before anyone compares metrics. **Blue-green**
-stands up a full second environment and switches traffic at once: rollback is an instant switch back,
-paid for with double capacity during the release, and it detects nothing that only shows under real
-load until all users are on it. A **canary** sends a small share of traffic to the new version and
-promotes only if its metrics hold: the only strategy that limits the blast radius of a bad release, but
-it needs enough traffic for the comparison to be statistically meaningful and metrics that actually
-reflect quality, which for LLM features means online evaluation signals, not just HTTP 5xx.
+### Production rollout strategies
+| Strategy | How | Cost | What it detects |
+|---|---|---|---|
+| **Rolling** | Replace replicas a few at a time | No extra capacity beyond the surge | Little: old and new serve side by side and a bad version reaches every user before anyone compares metrics |
+| **Blue-green** | Full second environment, switch traffic at once | Double capacity during the release | Nothing that only shows under real load until all users are on it; rollback is an instant switch back |
+| **Canary** | Small share of traffic to the new version; promote only if metrics hold | Needs enough traffic for a statistically meaningful comparison | The only one that limits the blast radius of a bad release |
 
-With GitOps, the pipeline's last step is a commit of the new digest to a configuration repository, and
-a controller (Argo CD, Flux) reconciles the cluster to it. The config repo becomes the audit log of
-what ran when, and rollback is `git revert`.
+- **Canary metrics must reflect quality:** for LLM features that means online evaluation signals, not just
+  HTTP 5xx.
+- **GitOps.** The pipeline's last step commits the new digest to a configuration repository, and a controller
+  (Argo CD, Flux) reconciles the cluster to it. The config repo becomes the audit log of what ran when, and
+  rollback is `git revert`.
 
 ### Principles that make the stages work
-- **Trunk-based development with feature flags.** Small pull requests into a main branch that is
-  always deployable; flags separate *deploying* code from *releasing* behaviour.
-- **Pipeline as code**, versioned next to the application, so a pipeline change is reviewed like any
-  other change.
-- **Reproducibility.** Lockfiles for dependencies, base images pinned by digest, third-party pipeline
-  actions pinned to a commit SHA rather than a mutable tag.
-- **Fast feedback.** Cache dependencies keyed on the lockfile hash, parallelise test shards, and move
-  slow suites to a nightly or on-demand lane rather than letting the commit stage grow to thirty
-  minutes, because a slow pipeline makes developers batch changes, which is exactly the large, risky
-  merge the pipeline exists to prevent.
-- **Secrets through identity.** The CI job presents an OIDC token the cloud exchanges for a short-lived
-  role credential, instead of a stored long-lived key; secrets are masked in logs and never exposed to
-  jobs triggered by untrusted pull requests.
+- **Trunk-based development with feature flags.** Small pull requests into an always-deployable main branch;
+  flags separate *deploying* code from *releasing* behaviour.
+- **Pipeline as code,** versioned next to the application, so a pipeline change is reviewed like any other.
+- **Reproducibility.** Lockfiles for dependencies, base images pinned by digest, third-party pipeline actions
+  pinned to a commit SHA rather than a mutable tag.
+- **Fast feedback.** Cache dependencies keyed on the lockfile hash, parallelise test shards, and move slow
+  suites to a nightly or on-demand lane rather than letting the commit stage grow to thirty minutes,
+  *because* a slow pipeline makes developers batch changes, the large, risky merge the pipeline exists to
+  prevent.
+- **Secrets through identity.** The CI job presents an OIDC token the cloud exchanges for a short-lived role
+  credential instead of a stored long-lived key; secrets are masked in logs and never exposed to jobs
+  triggered by untrusted pull requests.
 - **Environment protection.** Production deploys require a reviewer, a branch rule, or both.
-- **Backward-compatible changes across a deploy.** During any rolling or canary release, old and new
-  versions run at once against the same database, queue and caches, and a rollback puts the old version
-  back on data the new one wrote. Schema changes therefore follow expand-contract: add the new column or
-  table first (old code ignores it), deploy code that writes both and reads the new one, backfill, and
-  only in a later release drop the old shape. Message and API formats follow the same rule.
+- **Backward-compatible changes across a deploy.** During any rolling or canary release, old and new versions
+  run at once against the same database, queue and caches, and a rollback puts the old version back on data
+  the new one wrote. Message and API formats follow the same rule.
+
+### Expand-contract for schema changes
+1. **Expand:** add the new column or table first; old code ignores it.
+2. **Migrate code:** deploy code that writes both and reads the new one.
+3. **Backfill** existing rows.
+4. **Contract:** only in a later release, drop the old shape.
 
 ### What changes for AI systems
-- **Non-determinism.** Model outputs vary between runs, so unit tests mock or record the client and
-  assert on structure and control flow, while quality is measured in an evaluation stage with
-  thresholds over many cases, never with exact-match asserts on generated text.
-- **Cost and quota.** Real-model tests spend money and rate limit. Run a small smoke evaluation on
-  every pull request, the full set on main or nightly, under a CI-only key with a spend limit.
-- **Artifacts beyond code.** Model weights and indexes live in a registry or object store, referenced
-  by version; a change to a prompt template, a model version or a retrieval index must trigger the
-  evaluation gate exactly as a code change triggers tests.
-- **GPU work.** Tests that need a GPU run on self-hosted runners or as cluster Jobs, never on the
-  default runner.
-- **Rollback scope.** The deployable unit pins code, prompt and model version together, so a rollback
-  reverts all three.
+| Concern | Practice |
+|---|---|
+| **Non-determinism** | Unit tests mock or record the client and assert on structure and control flow; quality is measured in an evaluation stage with thresholds over many cases, never with exact-match asserts on generated text |
+| **Cost and quota** | Real-model tests spend money and hit rate limits: a small smoke evaluation on every pull request, the full set on main or nightly, under a CI-only key with a spend limit |
+| **Artifacts beyond code** | Weights and indexes live in a registry or object store by version; a change to a prompt template, model version or retrieval index triggers the evaluation gate exactly as code triggers tests |
+| **GPU work** | Self-hosted runners or cluster Jobs, never the default runner |
+| **Rollback scope** | The deployable unit pins code, prompt and model version together, so a rollback reverts all three |
 
 ### How you know it is working
-The four DORA metrics: deployment frequency, lead time for changes, change failure rate, and time to
-restore service. Add pipeline duration and flake rate; a pipeline nobody trusts is one nobody waits for.
+- **The four DORA metrics:** deployment frequency, lead time for changes, change failure rate, and time to
+  restore service.
+- **Plus pipeline duration and flake rate;** a pipeline nobody trusts is one nobody waits for.
 
-## Example
-A GitHub Actions workflow with two jobs. Every pull request runs lint, types and mocked unit tests,
-plus a small smoke evaluation that only runs when the secret is available (pushes and same-repository
-pull requests). On `main`, the image is built once, pushed with the commit SHA as its tag, and the
-exact digest is rolled out to the cluster using short-lived credentials obtained through OIDC rather
-than a stored cloud key. The `production` environment carries required-reviewer protection.
+## Diagram
+Fast, cheap checks run first and every later stage reuses the one digest built in stage two, so what reaches
+production is exactly what was tested.
+
+```mermaid
+flowchart TD
+    PR["Push or pull request"] --> CS["Commit stage: lint, types, mocked unit tests"]
+    CS --> B["Build image once, tag git SHA"]
+    B --> AC["Acceptance: API tests, smoke eval gate"]
+    AC --> SC["Scan, SBOM, sign digest"]
+    SC --> ST["Staging deploy and smoke tests"]
+    ST --> AP{"Approval or auto?"}
+    AP --> CN["Canary: compare to baseline"]
+    CN -->|"metrics hold"| FULL["Full rollout"]
+    CN -->|"regression"| RB["Automatic rollback"]
+    CS -.->|"fail fast"| PR
+```
+
+## Examples
+### GitHub Actions: test on every PR, build once and deploy the digest on main
+- **Every pull request** runs lint, types and mocked unit tests, plus a small smoke evaluation that only runs
+  when the secret is available (pushes and same-repository pull requests).
+- **On `main`,** the image is built once and pushed with the commit SHA as its tag, and the exact digest is
+  rolled out using short-lived credentials obtained through OIDC rather than a stored cloud key.
+- **The `production` environment** carries required-reviewer protection.
 
 ```yaml
 name: ci
@@ -169,53 +179,110 @@ jobs:
           kubectl rollout status deployment/llm-api --timeout=10m
 ```
 
+### An evaluation gate as a CI step
+Runnable with the standard library. It compares this pull request's eval scores with the baseline from main
+and exits non-zero on a regression beyond tolerance, which fails the job. The scores are illustrative; in a
+real pipeline they come from the eval run's output file.
+
+```python
+import sys
+
+BASELINE  = {"groundedness": 0.91, "format_ok": 0.99, "refusal_rate": 0.04}   # from the last main run
+CANDIDATE = {"groundedness": 0.88, "format_ok": 0.99, "refusal_rate": 0.05}   # this pull request
+HIGHER_IS_BETTER = {"groundedness": True, "format_ok": True, "refusal_rate": False}
+TOLERANCE = {"groundedness": 0.02, "format_ok": 0.01, "refusal_rate": 0.02}   # allowed regression
+
+def regressions(base, cand):
+    out = []
+    for m, b in base.items():
+        delta = cand[m] - b if HIGHER_IS_BETTER[m] else b - cand[m]   # negative = worse
+        if delta < -TOLERANCE[m]:
+            out.append(f"{m}: {b:.2f} -> {cand[m]:.2f} (tolerance {TOLERANCE[m]:.2f})")
+    return out
+
+bad = regressions(BASELINE, CANDIDATE)
+for line in bad:
+    print("REGRESSION", line)
+print("eval gate:", "FAIL" if bad else "PASS")
+sys.exit(1 if bad else 0)    # a non-zero exit fails the CI job
+# Prints: REGRESSION groundedness: 0.91 -> 0.88 (tolerance 0.02) / eval gate: FAIL
+```
+
+### Worked scenario: renaming a column without breaking a rollout
+A team wants to rename `user_name` to `display_name` on a service that deploys by rolling update.
+
+| Release | Change | Why it is safe |
+|---|---|---|
+| Wrong: one release | Rename the column and ship code that reads `display_name` | Old replicas still running mid-rollout query `user_name` and error; rollback fails because old code cannot read the new schema |
+| 1 (expand) | Add `display_name`; old code ignores it | Both versions work |
+| 2 | Code writes both columns, reads `display_name` | Rollback to release 1 still finds `user_name` populated |
+| 3 | Backfill `display_name` for old rows | No code change |
+| 4 (contract) | Drop `user_name` once nothing reads it | No running version depends on it |
+
+## Production patterns
+- **Path-filtered evaluation gate.** Trigger the full eval job only when prompts, model config or retrieval
+  settings change, using `on: pull_request: paths:` with entries such as `prompts/**`, and run the smoke set
+  on everything else. Track eval-gate pass rate and the cost per run.
+- **Pinned actions with automated updates.** Reference third-party actions by full commit SHA and let
+  Dependabot's `github-actions` ecosystem open pull requests to bump them. Review those bumps like code;
+  monitor how many workflows still use mutable tags.
+- **One deploy at a time per environment.** Add a workflow `concurrency` group (for example `group:
+  deploy-production` with `cancel-in-progress: false`) so two merges cannot roll out over each other. Watch
+  queued deploy time as merge frequency grows.
+- **Flaky-test quarantine.** Mark a flaky test with a pytest marker that moves it to a non-blocking lane the
+  day it flakes, with an owner and a deadline. Monitor flake rate per suite and the size of the quarantine.
+- **GitOps promotion by digest.** The pipeline commits the new digest to the config repository and Argo CD or
+  Flux syncs it, so `git log` answers "what ran when" and `git revert` is the rollback. Alert on applications
+  that stay out of sync.
+
 ## Trade-offs
-- Running evaluations on every pull request catches prompt regressions early, but costs money, time and
-  attention when the eval is noisy; the balance flips to a small smoke set per pull request plus a full
-  nightly run once the per-pull-request eval bill or wait time starts pushing people to batch prompt
-  changes or skip the gate.
-- Continuous deployment maximises flow by removing the human gate, but for regulated customers or
-  high-blast-radius changes continuous delivery with an approval and a canary is the right stopping
-  point.
-- Build-once-promote-many guarantees production runs what was tested, but forces every environment
-  difference into runtime configuration rather than a rebuild, which demands discipline about config
-  injection.
-- GitOps gives an auditable, declarative rollback path, but adds a reconciliation delay and another
-  controller to operate; direct `kubectl` from the pipeline is simpler for a single team and few
-  services.
-- Aggressive caching keeps pipelines fast, but a stale cache produces "green in CI, broken in prod";
-  key caches on lockfile hashes and expire them on base-image changes.
+- **Eval on every PR vs cost and noise.** It catches prompt regressions early but costs money, time and
+  attention when the eval is noisy. The balance flips to a small smoke set per pull request plus a full
+  nightly run once the per-pull-request eval bill or wait time pushes people to batch prompt changes or skip
+  the gate.
+- **Continuous deployment vs approval gates.** Removing the human gate maximises flow, but for regulated
+  customers or high-blast-radius changes continuous delivery with an approval and a canary is the right
+  stopping point.
+- **Build-once-promote-many vs config discipline.** It guarantees production runs what was tested, but forces
+  every environment difference into runtime configuration rather than a rebuild, which demands discipline
+  about config injection.
+- **GitOps vs simplicity.** An auditable, declarative rollback path, but a reconciliation delay and another
+  controller to operate; direct `kubectl` from the pipeline is simpler for a single team and few services.
+- **Aggressive caching vs staleness.** Pipelines stay fast, but a stale cache produces "green in CI, broken in
+  prod"; key caches on lockfile hashes and expire them on base-image changes.
 
 ## Pitfalls
-- Tolerating flaky tests; the symptom is a "just re-run it" culture in which a real failure is merged
-  because red no longer means anything. Quarantine flaky tests immediately and fix or delete them.
-- Unit tests that call the real model and assert exact strings; the symptom is intermittent failures
-  that start the day the provider updates the model.
-- Rebuilding the image at deploy time; the symptom is production behaving differently from staging
-  with the "same" commit because dependency resolution drifted between builds.
-- Long-lived cloud keys stored as CI secrets; the symptom is a leaked runner log or compromised action
-  yielding permanent credentials. Use OIDC federation.
-- Third-party actions referenced by a mutable tag or branch; the symptom is a supply-chain compromise
-  of that action silently running in your pipeline. Pin to a commit SHA.
-- Only code is versioned and rolled back; the symptom is a bad prompt requiring a hotfix pull request
-  under pressure instead of a one-click revert.
-- `pull_request_target` workflows, which run with secrets in the base repository's context, that check
-  out and execute the fork's code; the symptom is a malicious pull request exfiltrating secrets through
-  a build script or log line.
-- A commit stage that grows past half an hour; the symptom is rising pull-request size and lead time,
-  because developers batch changes to avoid waiting.
-- Shipping a destructive migration (rename or drop a column) in the same release as the code that needs
-  it; the symptom is errors from the still-running old replicas during rollout, and a rollback that
-  fails because the old code cannot read the new schema.
+- **Tolerating flaky tests.** Symptom: a "just re-run it" culture in which a real failure is merged because
+  red no longer means anything. Fix: quarantine flaky tests immediately and fix or delete them.
+- **Unit tests that call the real model and assert exact strings.** Symptom: intermittent failures that start
+  the day the provider updates the model.
+- **Rebuilding the image at deploy time.** Symptom: production behaves differently from staging with the
+  "same" commit because dependency resolution drifted between builds.
+- **Long-lived cloud keys stored as CI secrets.** Symptom: a leaked runner log or compromised action yields
+  permanent credentials. Fix: OIDC federation.
+- **Third-party actions referenced by a mutable tag or branch.** Symptom: a supply-chain compromise of that
+  action silently runs in your pipeline. Fix: pin to a commit SHA.
+- **Only code is versioned and rolled back.** Symptom: a bad prompt needs a hotfix pull request under
+  pressure instead of a one-click revert.
+- **`pull_request_target` workflows that check out and execute the fork's code.** They run with secrets in
+  the base repository's context. Symptom: a malicious pull request exfiltrates secrets through a build script
+  or log line.
+- **A commit stage that grows past half an hour.** Symptom: rising pull-request size and lead time, because
+  developers batch changes to avoid waiting.
+- **Shipping a destructive migration (rename or drop a column) in the same release as the code that needs
+  it.** Symptom: errors from still-running old replicas during rollout, and a rollback that fails because the
+  old code cannot read the new schema.
 
 ## When to use
-Set up a pipeline on day one for any codebase with more than one contributor or more than one deploy;
-a five-minute lint-and-test workflow is enough to start. Add stages as risk grows: image build and scan
-once you deploy containers, an evaluation gate once prompt or model changes affect users, canaries once
-traffic is large enough for a comparison to mean something. Use path filters so documentation changes
-skip the heavy stages. Track the four DORA metrics plus pipeline duration, flake rate and eval-gate pass
-rate. In interviews, explain build-once-promote-many, why small frequent deploys are safer, how you test
-non-deterministic model code, and how a CI job authenticates to the cloud without a stored key.
+- **Use from day one** for any codebase with more than one contributor or more than one deploy; a five-minute
+  lint-and-test workflow is enough to start.
+- **Add stages as risk grows:** image build and scan once you deploy containers, an evaluation gate once
+  prompt or model changes affect users, canaries once traffic is large enough for a comparison to mean
+  something.
+- **Use path filters** so documentation changes skip the heavy stages.
+- **Measure:** the four DORA metrics plus pipeline duration, flake rate and eval-gate pass rate.
+- **Interviews:** explain build-once-promote-many, why small frequent deploys are safer, how you test
+  non-deterministic model code, and how a CI job authenticates to the cloud without a stored key.
 
 ## Role lens
 - **Engineer:** Writes the workflow, mocks the model client in unit tests, maintains the smoke
@@ -239,6 +306,43 @@ full set only when those paths change or a label is applied, under a CI-only key
 Then build the image once, deploy to staging, smoke-test, and canary a small share of production
 traffic while watching the same metrics online, with the prompt and model version pinned in the same
 artifact so a rollback reverts both.
+
+## Interview questions
+### What is the difference between continuous integration, delivery and deployment?
+- **Integration:** every change merges to main often and is verified by an automated build and tests on a
+  clean machine, so integration bugs surface within hours, not at release time.
+- **Delivery:** every green build becomes one immutable artifact with an automated path to production, but a
+  human presses the final button.
+- **Deployment:** the button is removed; every green build ships, usually through a canary.
+
+### Production behaves differently from staging for the same commit. How do you investigate?
+- **Check the artifact:** compare the deployed image digests; if they differ, something rebuilt per
+  environment and dependency resolution drifted.
+- **Check configuration:** with identical digests the difference is runtime config, secrets, model version or
+  data, so diff those next.
+- **Fix the process:** build once, promote the digest, and pin prompt and model versions in the artifact.
+
+### Rolling, blue-green or canary for an LLM chat feature: which would you choose?
+- **Canary,** because it is the only strategy that limits the blast radius of a bad release, and LLM
+  regressions are often quality changes that only real traffic reveals.
+- **It needs** enough traffic for a meaningful comparison and online quality signals, not just 5xx.
+- **Blue-green** fits when you need instant switch-back and can afford double capacity; rolling is the cheap
+  default with the least protection.
+
+### How do you test code that calls an LLM without making CI flaky or expensive?
+- **Unit tests mock or record the client** and assert structure and control flow, so they are deterministic,
+  free and fast.
+- **Quality is an evaluation stage** with thresholds over many cases: a roughly 20-case smoke set per pull
+  request, the full set nightly or when prompt and model paths change.
+- **Use a CI-only key with a spend limit,** and never assert exact generated strings.
+
+### How does a GitHub Actions job deploy to AWS without a stored access key?
+- **The job requests an OIDC token** (`id-token: write`), signed by GitHub, carrying claims such as repository,
+  branch and environment.
+- **An IAM role trusts that issuer** only for matching claims, and the cloud exchanges the token for
+  short-lived credentials.
+- **So nothing long-lived exists to leak;** keep the trust conditions narrow, for example main branch of one
+  repository.
 
 ## Quiz
 ### Q: Why build the image once and promote the same digest through environments rather than rebuilding per environment?

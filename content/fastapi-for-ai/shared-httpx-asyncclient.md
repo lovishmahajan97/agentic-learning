@@ -114,7 +114,7 @@ connection, and a connection goes back to the pool only when its body is read or
 
 ```mermaid
 flowchart TD
-    LS["Lifespan startup: build one AsyncClient with Limits and Timeout"] --> P[("Connection pool per worker")]
+    LS["Lifespan builds one AsyncClient"] --> P[("Connection pool per worker")]
     RQ["Request handler via Depends"] --> Q{"Idle connection to this origin?"}
     P --> Q
     Q -->|"yes"| SEND["Send on warm socket, no DNS, TCP or TLS"]
@@ -124,7 +124,7 @@ flowchart TD
     NEW --> SEND
     SEND --> RD["Body read or response aclose"]
     RD -->|"return connection"| P
-    P -.->|"after yield"| CL["Lifespan shutdown: await client.aclose"]
+    P -.->|"after yield"| CL["Shutdown: await client.aclose"]
 ```
 
 ## Examples
@@ -195,8 +195,14 @@ async def stream(body: dict, http: httpx.AsyncClient = Depends(get_http)):
     return StreamingResponse(relay(), media_type=r.headers.get("content-type", "text/event-stream"))
 ```
 
+- **One gap remains:** a generator's `finally` runs only once the generator has started. If the client
+  disconnects before the first chunk is pulled, `relay()` never starts and `r` stays open, so add a
+  close-once guard that cleanup outside the generator can also call (see cancellation on client
+  disconnect), and alert on connections that stay checked out.
+
 ### Worked numbers: setup tax in an agent loop
-Illustrative 40 ms round trip, TLS 1.3, uncached DNS, ten sequential calls per user request.
+Illustrative 40 ms round trip, TLS 1.3, ten sequential calls per user request; the range covers DNS
+cached (0 ms) or not (one round trip).
 
 | Step | Per call | Ten calls |
 |---|---|---|
@@ -251,6 +257,7 @@ Illustrative 40 ms round trip, TLS 1.3, uncached DNS, ten sequential calls per u
   a library call that looks cheap. Fix: construct once in the lifespan.
 - **Streaming with `send(..., stream=True)` and not closing on every path.** Symptom: `PoolTimeout` after
   a burst of cancelled or failed streams, with idle CPU and a healthy upstream, clearing only on restart.
+  Fix: `async with client.stream(...)`, or `aclose()` in a `finally` and on every early error path.
 
 ## When to use
 - **Always,** in any FastAPI service that makes outbound HTTP calls: one client (or one SDK client) per
@@ -297,13 +304,13 @@ example in Redis) if replicas scale dynamically.
 - **Fix:** use `async with client.stream(...)`, or close in a `finally` inside the generator and on every
   early error path before raising.
 
-### How do you choose max_connections for a fleet calling a provider with a concurrency limit?
-- **The pool is per worker process,** so fleet connections are `workers × max_connections`, multiplied again
-  by replicas.
-- **Size from the provider budget:** roughly provider limit ÷ (workers × replicas), so the fleet stays under
-  it instead of turning extra connections into 429s.
-- **If replicas autoscale,** a static per-worker number drifts, so add a shared limiter (for example in
-  Redis) and keep retries with backoff for 429s.
+### After quiet periods, the first call to the provider sometimes fails with a connection reset. Why?
+- **A pooled idle socket was dropped silently.** A NAT, proxy or load balancer on the path closed it after
+  its own idle timeout, but the pool still held it, so the first reuse hit a dead connection.
+- **Fix the timing:** set `keepalive_expiry` below the shortest idle timeout on the path, so the pool retires
+  sockets before the network does.
+- **Then make reuse failures safe:** retry idempotent calls once on a connect or reset error, and watch
+  connection-reset counts on first reuse to confirm the fix.
 
 ### When would you not use the default httpx timeouts, and how would you set them for streaming?
 - **The default is five seconds for each of `connect`, `read`, `write` and `pool`,** which is too short for a

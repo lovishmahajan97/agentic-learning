@@ -5,7 +5,7 @@ name: Supervised fine-tuning (SFT)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/instruction-tuning
   - training-adaptation/post-training
@@ -175,7 +175,8 @@ print(f"trained on {(labels != -100).sum().item()} of {ids.numel()} tokens, loss
   sequence.
 - **Count equals full length:** masking is off.
 - **Count is zero:** the prompt length came from a different template and every label is −100, which
-  trains nothing while the loop runs without error.
+  trains nothing useful while the loop runs without error. In plain PyTorch the mean over zero targets
+  is NaN, so a `nan` loss is the tell; do not let that step update the weights.
 - **One-minute test for both:** decode `ids[0][labels[0] != -100]` back to text and eyeball it.
 
 ### Worked numbers: loss averaging and memory
@@ -208,13 +209,15 @@ print(full_ft_gb(7e9))                                # 112.0 GB before activati
 - **Assert the mask on every run.** At data-load time, decode the supervised span of a few examples and
   log the supervised-token count per batch. Fail the job if any batch has zero supervised tokens or a
   count equal to its full length, and check that the end-of-turn token is inside the span.
-- **Let the trainer do assistant-only loss and packing.** Use TRL's `SFTTrainer` with its
-  completion-only or assistant-only loss option and packing enabled, rather than hand-rolled masking.
-  Monitor the same supervised-token count, because a template change can silently break the trainer's
-  span detection.
+- **Let the trainer do assistant-only loss and packing.** In recent TRL versions, set
+  `SFTConfig(assistant_only_loss=True, packing=True)` for conversational data rather than hand-rolling
+  masks. Assistant-only loss needs a chat template that marks assistant spans with generation tags, so
+  confirm yours does. Monitor the same supervised-token count, because a template change can silently
+  break span detection.
 - **Keep the best checkpoint by validation loss.** Evaluate every epoch (or every few hundred steps) on
   held-out prompts and use `load_best_model_at_end=True` with `metric_for_best_model="eval_loss"` in
-  Hugging Face `TrainingArguments`. Monitor validation loss for the upturn that signals memorisation.
+  Hugging Face `TrainingArguments`, with matching eval and save strategies. Monitor validation loss for
+  the upturn that signals memorisation.
 - **Replay general instruction data.** Mix a slice of broad instruction data into every epoch alongside
   domain examples. Monitor a general capability benchmark before and after each round; a drop means the
   replay slice is too small.
@@ -290,12 +293,13 @@ consistent with both problems, which is why a held-out task metric, not loss, sh
 - **So pick SFT** when you want a format, persona or procedure, and continued pre-training when the
   domain vocabulary itself is unfamiliar.
 
-### After fine-tuning, the model answers correctly and then keeps generating a fake user turn. Debug it.
-- **Suspect the end-of-turn token.** If it was masked with the prompt, nothing taught the model to stop.
-- **Check the template next:** training with one chat template and serving with another produces the same
-  symptom.
-- **Verify by decoding** the supervised span of a few examples and confirming it ends with the end-of-turn
-  or EOS token, then assert that check in the data loader.
+### Offline evals looked great, but in production the fine-tuned model ignores the system prompt. What do you check?
+- **Template parity first.** If the serving stack renders a different chat template from training (or a
+  client builds raw strings), the model does not recognise where the system turn is.
+- **Compare token ids, not text:** render one training example with the saved tokenizer's
+  `apply_chat_template` and diff it against a logged production request.
+- **Then check the data:** if every demonstration used the same fixed system prompt, the model never
+  learned that changing it should change behaviour; vary system prompts in the training set.
 
 ### When would you choose LoRA over full fine-tuning, and when not?
 - **LoRA when** budget is one GPU or you need many swappable variants on one base.

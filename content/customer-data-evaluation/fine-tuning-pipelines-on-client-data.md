@@ -5,7 +5,7 @@ name: Fine-tuning pipelines on client data
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - training-adaptation/fine-tune-vs-rag-vs-prompt-decision
   - training-adaptation/supervised-fine-tuning
@@ -18,103 +18,124 @@ related:
 ---
 
 ## TL;DR
-A fine-tuning pipeline on client data is a repeatable, audited path from a customer's records to a
-deployed model: permission check, extraction, redaction, cleaning, leakage-safe splits, training
-(usually a per-customer adapter), evaluation against the prompted baseline, and registration with full
-lineage. It must be a pipeline, not a notebook, because you will have to rerun it: after a base-model
-deprecation, a data-deletion request or a new batch of labels.
+A repeatable, audited path from a customer's records to a deployed model, usually a per-customer
+adapter, with permission, redaction, leakage-safe splits, baseline evals and lineage. It must be a
+pipeline, not a notebook, because deprecations, deletion requests and new labels force reruns.
 
 ## Why it exists
-Fine-tuning on a customer's data is sometimes the right call: a classification scheme with hundreds of
-house-specific labels, a rigid output format, a house writing style, or distilling a large prompted
-model into a smaller, cheaper one for their volume. The technical part, running supervised fine-tuning
-or LoRA, is the easy part. What makes it hard is that the data belongs to someone else.
-
-Consider what the one-off notebook approach leaves behind. Nobody can say exactly which records trained
-the model, so when the customer's legal team asks you to delete a former employee's data, you cannot
-tell whether the weights are affected. The train/test split was random by row, so near-duplicate tickets
-sit on both sides and the eval looks better than reality. Personal data was not redacted, and the model
-can now reproduce a customer's phone number when prompted with the right prefix. The base model gets
-deprecated by its provider a year later and nobody can reproduce the training run. And if two customers'
-data were combined "because more data helps", one customer's information can surface in the other's
-outputs.
-
-Each of these is a reason the work must be an automated pipeline with explicit gates: the same inputs and
-config reproduce an equivalent model (bit-identical weights are rare on GPUs because of non-deterministic
-kernels, but eval results should match within noise), every artifact has lineage, and data governance is enforced in code rather than
-remembered.
+- **Sometimes fine-tuning is right.** Hundreds of house-specific labels, a rigid output format, a house
+  writing style, or distilling a large prompted model into a smaller, cheaper one for their volume.
+  Running supervised fine-tuning or LoRA is the easy part; the hard part is that the data belongs to
+  someone else.
+- **The one-off notebook leaves no lineage.** Nobody can say which records trained the model, so when
+  legal asks to delete a former employee's data you cannot tell whether the weights are affected.
+- **It leaks and memorises.** A random row split puts near-duplicate tickets on both sides, so the eval
+  looks better than reality. Unredacted personal data means the model can reproduce a customer's phone
+  number given the right prefix. Combining two customers' data "because more data helps" lets one's
+  information surface in the other's outputs.
+- **It cannot be reproduced.** The provider deprecates the base model a year later and nobody can rerun
+  the training.
+- **So it must be an automated pipeline with explicit gates.** Same inputs and config reproduce an
+  equivalent model (bit-identical weights are rare on GPUs because of non-deterministic kernels, but eval
+  results should match within noise), every artifact has lineage, and governance is enforced in code
+  rather than remembered.
 
 ## How it works
 ### 0. Decide it is worth it
-Fine-tune only after a strong prompted baseline (with retrieval where knowledge is the issue) has been
-measured on the customer's golden set and has plateaued. Fine-tuning is good at *behaviour*: format,
-style, label space, and cost/latency via distillation. It is bad at *facts that change*, because facts
-baked into weights go stale and cannot be cited; those stay in retrieval.
+- **Prerequisite:** a strong prompted baseline (with retrieval where knowledge is the issue), measured on
+  the customer's golden set, that has plateaued.
+- **Fine-tuning is good at *behaviour*:** format, style, label space, and cost/latency via distillation.
+- **It is bad at *facts that change*,** because facts baked into weights go stale and cannot be cited;
+  those stay in retrieval.
 
 ### 1. Permission gate
-Check the contract and data processing agreement: is training permitted, on which data, who owns the
-resulting weights or adapter, and where may training run (region, cloud, on-prem)? Record the basis in
-the run manifest. If it is not written down, the pipeline should refuse to start.
+- **Check the contract and data processing agreement:** is training permitted, on which data, who owns
+  the resulting weights or adapter, and where may training run (region, cloud, on-prem)?
+- **Record the basis in the run manifest.** If it is not written down, the pipeline refuses to start.
 
 ### 2. Extract and minimise
-Pull only the fields the task needs, from a snapshot with a recorded identifier and time, so the run is
-reproducible and deletion requests can be checked against it.
+- **Pull only the fields the task needs**, from a snapshot with a recorded identifier and time, so the run
+  is reproducible and deletion requests can be checked against it.
 
 ### 3. Redact and filter
-Detect and mask PII and secrets that the task does not need (names, account numbers, credentials),
-because a model trained on them can memorise and regurgitate them. Then deduplicate (exact and near-
-duplicate), drop low-quality or mislabelled examples, and balance classes. On customer data, cleaning
-often removes a large share of the raw records, which is normal.
+1. **Mask PII and secrets the task does not need** (names, account numbers, credentials), because a model
+   trained on them can memorise and regurgitate them.
+2. **Deduplicate**, exact and near-duplicate.
+3. **Drop low-quality or mislabelled examples**, and balance classes.
+- **Expect heavy losses.** On customer data, cleaning often removes a large share of the raw records,
+  which is normal.
 
 ### 4. Split without leakage
-Split by **group** (customer account, case, document, or time period), not by row. Tickets from one
-case share wording; if they land on both sides, the test set measures memorisation. A time-based split
-also matches the deployment reality: train on the past, predict the future. Grouping does not catch
-everything (the same template email can open many unrelated cases), so after splitting run a
-near-duplicate check *across* the boundary (MinHash or embedding similarity above a high threshold) and
-move or drop test items that have a near-twin in train. Report how many you removed; a large number
-means the dataset is more repetitive than it looked.
+- **Split by group** (customer account, case, document or time period), not by row. Tickets from one case
+  share wording; on both sides, the test set measures memorisation.
+- **Time-based splits match deployment:** train on the past, predict the future.
+- **Then check across the boundary.** Grouping misses some leaks (one template email can open many
+  unrelated cases), so run a near-duplicate check (MinHash or embedding similarity above a high
+  threshold) and move or drop test items with a near-twin in train.
+- **Report how many you removed.** A large number means the dataset is more repetitive than it looked.
 
 ### 5. Format and train
-Render examples in the base model's exact chat template, with the same system prompt the production
-system will use. Prefer a **per-customer adapter** (LoRA or another PEFT method) over full fine-tuning:
-adapters are small, cheap to retrain, isolate each customer's data in its own artifact, and can be
-deleted when the contract ends. Never pool customers' data unless every customer has agreed.
+- **Template-exact formatting.** Render examples in the base model's exact chat template, with the same
+  system prompt production will use.
+- **Prefer a per-customer adapter** (LoRA or another PEFT method) over full fine-tuning: small, cheap to
+  retrain, isolates each customer's data in its own artifact, deletable when the contract ends.
+- **Never pool customers' data** unless every customer has agreed.
 
-Where training runs is a separate decision with its own consequences. A provider's hosted fine-tuning
-API is the least engineering, but the customer's data goes to that provider (which their data agreement
-must allow), the tuned model typically lives only on that provider and cannot be exported, and when the
-provider retires the base model you retrain on whatever replaces it. Self-hosted training on an open
-model keeps data in the customer's boundary and gives you a portable adapter, at the cost of owning GPUs,
-the training stack and serving. If the training targets are outputs of a large prompted model
-(distillation), check that model's terms as well: some providers restrict using outputs to train other
-models.
+Where training runs is a separate decision:
+
+| Option | Gain | Cost |
+|---|---|---|
+| **Provider's hosted fine-tuning API** | Least engineering | Data goes to that provider (the data agreement must allow it); the tuned model typically lives only there and cannot be exported; when the provider retires the base model you retrain on whatever replaces it |
+| **Self-hosted on an open model** | Data stays in the customer's boundary; portable adapter | You own GPUs, the training stack and serving |
+
+- **Distillation has its own terms.** If training targets are outputs of a large prompted model, check
+  that model's terms too: some providers restrict using outputs to train other models.
 
 ### 6. Evaluate against the baseline
-Compare the tuned model with the prompted baseline on the customer's held-out golden set and regression
-suite, and run general capability and safety checks to catch catastrophic forgetting or loosened refusal
-behaviour. Add **memorisation probes**: prompt with prefixes of training records and check whether
-redacted-class strings (or planted canary strings) come back.
-
-Also train on nested subsets (say 25%, 50% and 100% of the training groups) and plot the golden-set score
-against size. If the curve is still climbing at 100%, more labelled data is the cheapest next gain; if it
-flattened at 50%, more data will not help and the ceiling is in the labels, the task definition or the
-base model. This one plot answers the customer's most common question, "should we label more?", with
-evidence instead of opinion.
+- **Compare with the prompted baseline** on the customer's held-out golden set and regression suite.
+- **Run general capability and safety checks** to catch catastrophic forgetting or loosened refusals.
+- **Add memorisation probes:** prompt with prefixes of training records and check whether redacted-class
+  strings (or planted canary strings) come back.
+- **Plot a learning curve.** Train on nested subsets (say 25%, 50% and 100% of the training groups) and
+  plot golden-set score against size:
+  - still climbing at 100%: more labelled data is the cheapest next gain;
+  - flattened at 50%: more data will not help; the ceiling is in the labels, task definition or base
+    model.
+- **This one plot answers "should we label more?"** with evidence instead of opinion.
 
 ### 7. Register with lineage
-Register the artifact with the dataset snapshot hash, the record-id manifest, code version, base model
-id and version, hyperparameters, eval results and the permission record. That manifest is what lets you
-answer "was record X used?" and rerun the pipeline when needed.
+- **Register** the dataset snapshot hash, the record-id manifest, code version, base model id and version,
+  hyperparameters, eval results and the permission record.
+- **The manifest answers "was record X used?"** and lets you rerun the pipeline when needed.
 
 ### Deletion is retraining
-Removing a record's influence from trained weights is not reliably possible today (machine unlearning is
-an active research area, not a guarantee). The practical answer to a deletion request is to drop the
-record and retrain, which is only cheap if the pipeline is automated and adapters are small. Deletion
-also has to reach everything derived from the snapshot: cached tokenised datasets, the golden set if the
-record was in it, eval logs that quote it, and old adapter versions still in the registry.
+- **Unlearning is not a guarantee.** Removing a record's influence from trained weights is not reliably
+  possible today; machine unlearning is an active research area.
+- **The practical answer: drop the record and retrain**, which is only cheap if the pipeline is automated
+  and adapters are small.
+- **Deletion reaches everything derived from the snapshot:** cached tokenised datasets, the golden set if
+  the record was in it, eval logs that quote it, and old adapter versions still in the registry.
 
-## Example
+## Diagram
+Every run passes the permission gate and ends in the registry with a manifest; a deletion request loops
+back to the snapshot and reruns the whole path.
+
+```mermaid
+flowchart TD
+    G{"Training permitted in DPA?"} -->|"no"| X["Refuse to run"]
+    G -->|"yes"| S[("Versioned snapshot")]
+    S --> R["Minimise, redact, dedupe, filter"]
+    R --> SP["Group split + cross-boundary near-dup check"]
+    SP --> T["Train per-customer adapter"]
+    T --> E{"Beats or matches prompted baseline?"}
+    E -->|"no"| B["Keep prompted baseline"]
+    E -->|"yes"| REG[("Registry: manifest + lineage")]
+    REG --> SH["Shadow mode"]
+    D["Deletion request"] -->|"drop records, rerun"| S
+```
+
+## Examples
+### Leakage-safe split and run manifest
 The leakage-safe split and the manifest step, the two parts most often done wrong. Records are grouped by
 case, split by a stable hash of the group key, and the manifest records exactly which ids went where.
 
@@ -143,56 +164,110 @@ def split_and_manifest(records, tenant, snapshot_id, permission_ref, test_frac=0
     return train, test, manifest
 ```
 
-Illustrative scenario (numbers chosen for the walkthrough, not a benchmark): 40,000 raw support tickets
-become 26,000 after deduplication and quality filters. They belong to 9,000 cases, so the 15% bucket puts
-roughly 1,350 cases (around 3,900 tickets, since cases vary in size) in test. The cross-boundary
-near-duplicate check then finds 210 test tickets with a near-twin in train, mostly auto-generated
-"password reset" requests, and drops them. A LoRA adapter on a mid-size open model is compared with the
-prompted large-model baseline on the customer's golden set:
+### Worked scenario: support-ticket classifier adapter
+Illustrative numbers chosen for the walkthrough, not a benchmark.
 
-- Baseline: 86% label accuracy. Adapter at 25%, 50%, 100% of training cases: 81%, 85%, 87%. The curve is
-  still rising, so more labels would likely help.
-- The adapter is within noise of the baseline at a fraction of the per-request cost, general capability
-  and refusal checks are unchanged, and no canary string comes back in 500 prefix probes.
+| Stage | Count |
+|---|---|
+| Raw support tickets | 40,000 |
+| After deduplication and quality filters | 26,000, belonging to 9,000 cases |
+| Test bucket at 15% | roughly 1,350 cases, around 3,900 tickets (cases vary in size) |
+| Cross-boundary near-duplicates dropped | 210 test tickets, mostly auto-generated "password reset" requests |
 
-That combination, not the accuracy number alone, is what moves it to shadow mode. Had the row-split
-version been run instead, the same adapter would have scored higher offline, because near-identical
-tickets from the same case would sit on both sides, and the gap would have surfaced only in production.
+A LoRA adapter on a mid-size open model is compared with the prompted large-model baseline on the
+customer's golden set:
+
+| Model | Label accuracy |
+|---|---|
+| Prompted large-model baseline | 86% |
+| Adapter on 25% / 50% / 100% of training cases | 81% / 85% / 87% |
+
+- **The curve is still rising**, so more labels would likely help.
+- **It is within noise of the baseline** at a fraction of the per-request cost; general capability and
+  refusal checks are unchanged; no canary string comes back in 500 prefix probes.
+- **That combination, not the accuracy alone, moves it to shadow mode.**
+- **The row-split counterfactual.** The same adapter would have scored higher offline, because
+  near-identical tickets from one case would sit on both sides, and the gap would surface only in
+  production.
+
+### Canary memorisation probe
+Plant random canary strings in a few training records before training, then prompt the tuned model with
+record prefixes and look for them (and for redacted-class patterns) in the output. `generate` is any
+function that calls your tuned model.
+
+```python
+import re, secrets
+
+def make_canaries(n=5):
+    return [f"canary-{secrets.token_hex(8)}" for _ in range(n)]   # random, so never in real data
+
+PHONE = re.compile(r"\+?\d[\d\s-]{8,}\d")      # example redacted-class pattern
+
+def probe(generate, records, canaries, prefix_chars=200, limit=500):
+    hits = []
+    for r in records[:limit]:
+        out = generate(r["text"][:prefix_chars])
+        leaked = [c for c in canaries if c in out] + PHONE.findall(out)
+        if leaked:
+            hits.append({"id": r["id"], "leaked": leaked})
+    return hits          # gate: any canary hit blocks registration
+```
+
+## Production patterns
+- **Manifest-first runs** — every training run. Write snapshot id, record-id manifest hash, code commit,
+  base model id and version, hyperparameters and permission reference into the model registry entry (for
+  example as MLflow run params, tags and artifacts). Monitor runs registered without a permission
+  reference: the target is zero.
+- **Near-duplicate check across the split** — after grouping. Use MinHash LSH (for example the
+  `datasketch` library) or embedding cosine similarity above a high threshold between test and train, and
+  drop test items with a twin. Monitor the removed count per run; a jump means new templated traffic.
+- **Per-tenant adapters on shared serving** — when many customers each have a small adapter. Serve one
+  base model with multiple LoRA adapters selected per request, for example vLLM with `--enable-lora`.
+  Monitor per-adapter latency and that tenant routing selects the adapter from the authenticated tenant.
+- **Learning curve as a standard stage** — on every new dataset. Train 25%, 50% and 100% nested subsets in
+  the same pipeline run and attach the plot to the eval report. Monitor the slope between the last two
+  points to decide whether to fund more labelling.
+- **Deletion runbook wired to the manifest** — for data-subject and contract-end requests. Look up record
+  ids in manifests, rerun affected pipelines, then purge cached datasets, eval logs and old adapter
+  versions. Monitor time from request to completed purge.
 
 ## Trade-offs
-- Per-customer adapters isolate data and make deletion and retraining cheap, but cap how much the model
-  can learn compared with full fine-tuning; full tuning is worth it only with large data and ownership terms
-  that allow it.
-- Aggressive redaction lowers memorisation risk but can remove signal the task needs (names in entity
-  extraction); keep a field only when the task cannot work without it, and probe for leakage.
-- A fine-tuned small model is cheaper and faster than a prompted large one at high volume, but every base-
-  model change means retraining; at low volume the prompted model's flexibility usually wins.
-- Group or time splits give honest numbers that look worse than random splits; accept the lower number,
-  because it is the one production will show.
+- **Per-customer adapters vs full fine-tuning.** Adapters isolate data and make deletion and retraining
+  cheap, but cap how much the model can learn; full tuning is worth it only with large data and ownership
+  terms that allow it.
+- **Aggressive redaction vs task signal.** It lowers memorisation risk but can remove signal the task
+  needs (names in entity extraction); keep a field only when the task cannot work without it, and probe
+  for leakage.
+- **Small tuned model vs prompted large model.** Cheaper and faster at high volume, but every base-model
+  change means retraining; at low volume the prompted model's flexibility usually wins.
+- **Group or time splits vs flattering numbers.** Honest splits look worse than random ones; accept the
+  lower number, because it is the one production will show.
 
 ## Pitfalls
-- Changing the split salt or re-extracting a live table between runs; the symptom is a "rerun" whose
-  test ids differ from the original manifest, so before-and-after scores are not comparable.
-- Splitting by row; the symptom is an excellent offline score followed by a much worse production result
-  on new cases.
-- Training without a recorded permission basis; the symptom is a legal review that orders the model
-  deleted, with no way to prove what it contained.
-- Formatting training data in a different template or system prompt from production; the symptom is a
-  tuned model that does well in the training harness and inconsistently in the product.
-- Skipping memorisation probes; the symptom is a red-team or user finding real customer identifiers in
+- **Changing the split salt or re-extracting a live table between runs.** Symptom: a "rerun" whose test
+  ids differ from the original manifest, so before-and-after scores are not comparable.
+- **Splitting by row.** Symptom: an excellent offline score followed by a much worse production result on
+  new cases.
+- **Training without a recorded permission basis.** Symptom: a legal review orders the model deleted, with
+  no way to prove what it contained.
+- **A different template or system prompt from production.** Symptom: a tuned model that does well in the
+  training harness and inconsistently in the product.
+- **Skipping memorisation probes.** Symptom: a red-team or user finds real customer identifiers in
   generated text.
-- Mixing customers' data into one model "for more signal"; the symptom is one customer's terminology or
-  records appearing in another's outputs, which is a cross-tenant leak.
-- Treating the run as one-off; the symptom is a deprecation notice for the base model and nobody able to
+- **Mixing customers' data "for more signal".** Symptom: one customer's terminology or records appear in
+  another's outputs, which is a cross-tenant leak.
+- **Treating the run as one-off.** Symptom: a deprecation notice for the base model and nobody able to
   reproduce the dataset or hyperparameters.
 
 ## When to use
-Build the pipeline when a prompted baseline has plateaued on a behaviour fine-tuning is good at, the
-customer permits training, and volume or latency makes a smaller tuned model pay off. Do not fine-tune to
-add knowledge that changes, to fix retrieval failures, or before a golden set exists to prove the gain.
-Measure the tuned model against the prompted baseline on held-out groups, plus cost per request,
-forgetting and memorisation checks. In interviews, emphasise permission, group splits, adapters for
-isolation and the fact that deletion means retraining.
+- **Use when** a prompted baseline has plateaued on a behaviour fine-tuning is good at, the customer
+  permits training, and volume or latency makes a smaller tuned model pay off.
+- **Avoid** to add knowledge that changes, to fix retrieval failures, or before a golden set exists to
+  prove the gain.
+- **Measure** the tuned model against the prompted baseline on held-out groups, plus cost per request,
+  forgetting and memorisation checks.
+- **Interviews:** emphasise permission, group splits, adapters for isolation and the fact that deletion
+  means retraining.
 
 ## Role lens
 - **Engineer:** Implements extraction, redaction, deduplication, group splits, template-exact formatting,
@@ -211,6 +286,39 @@ record's influence from weights is not dependable; I would drop the records from
 pipeline, re-evaluate against the same golden set and replace the adapter, then delete the old one. That is
 easy only if the pipeline is automated, inputs are versioned snapshots with id manifests, and the model is
 a small per-customer adapter rather than a shared multi-customer model.
+
+## Interview questions
+### When is fine-tuning on a customer's data the right call, and when is it not?
+- **Right for behaviour:** a large house-specific label space, rigid output format, house style, or
+  distilling a prompted model for cost and latency at volume.
+- **Wrong for changing facts**, because weights go stale and cannot cite; those belong in retrieval.
+- **Only after** a strong prompted baseline has plateaued on the customer's golden set, and training is
+  permitted in writing.
+
+### Your fine-tuned model scored 8 points above baseline offline but is worse in production. What happened?
+- **Most likely leakage.** A row split put tickets from the same case, or templated near-duplicates, on
+  both sides, so the test measured memorisation.
+- **Fix:** split by case, account or time, then run a cross-boundary near-duplicate check.
+- **Also check** that training used production's exact chat template and system prompt.
+
+### Hosted fine-tuning API or self-hosted training on an open model?
+- **Hosted:** least engineering, but data goes to the provider, the tuned model usually cannot be exported,
+  and a base-model retirement forces retraining on its replacement.
+- **Self-hosted:** data stays in the customer's boundary and the adapter is portable, at the cost of GPUs,
+  a training stack and serving.
+- **The data agreement often decides** before engineering preference does.
+
+### How do you show a customer whether labelling more data is worth it?
+- **Learning curve:** train on nested 25%, 50% and 100% subsets of training groups and plot golden-set
+  score.
+- **Still climbing at 100%:** more labels are the cheapest next gain. **Flat after 50%:** the ceiling is
+  labels, task definition or base model, not volume.
+
+### What does your registry need to hold for a client fine-tune?
+- **Lineage:** snapshot hash, record-id manifest, code version, base model id and version,
+  hyperparameters, eval results and the permission record.
+- **Why:** it answers "was record X used?", lets you rerun after a deprecation or deletion, and proves to
+  auditors what the model contained.
 
 ## Quiz
 ### Q: Why should a fine-tuning dataset of support tickets be split by case rather than by individual ticket?

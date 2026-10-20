@@ -5,7 +5,7 @@ name: OpenTelemetry instrumentation
 kind: practice
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -22,131 +22,180 @@ sources:
 ---
 
 ## TL;DR
-OpenTelemetry (OTel) is the vendor-neutral standard for traces, metrics and logs. In a Node AI service
-you install the SDK once at process start, let auto-instrumentation wrap HTTP, `fetch`, Postgres, Redis
-and your web framework, and add your own spans around agent steps carrying tenant, run id and prompt
-version. Context follows `await` through `AsyncLocalStorage` and crosses services in the W3C
-`traceparent` header, so one request's path from API to queue to LLM to database becomes a single
-queryable tree.
+OpenTelemetry (OTel) is the vendor-neutral standard for traces, metrics and logs. In Node you load the
+SDK first, let auto-instrumentation wrap HTTP, databases and Redis, and add spans for agent steps;
+context follows `await` and crosses services in `traceparent`.
 
 ## Why it exists
-An agent request in Node fans out: an HTTP handler calls a planner model, which calls three tools, two
-of which hit Postgres and one of which enqueues a BullMQ job that calls an embedding API on another
-replica. When that request takes 40 s or costs 60,000 tokens, logs from six processes tell you *that*
-it happened but not *why*, because nothing ties the lines together and nothing records durations as a
-tree. Hand-rolled solutions, a `requestId` threaded through every function and `console.time` pairs,
-break at the first `await` you forgot, do not cross the queue, and produce data no tool can draw as a
-waterfall.
-
-Node makes the problem sharper than threaded runtimes do: there is no thread to hang context on, so
-"which request is this log line from" must travel along the async continuation chain. OTel's Node SDK
-solves that with `AsyncLocalStorage`, propagates context across processes with standard headers, and
-emits the result in a format every backend (Jaeger, Tempo, Honeycomb, Datadog, Langfuse and others via
-OTLP) accepts. The vendor-neutral part matters *because* the backend you pick in year one is rarely the
-one you have in year three, and because enterprise customers want your spans in *their* collector. The
-observability module covers the concepts; this lesson is the Node mechanics.
+- **Agent requests fan out across processes.** An HTTP handler calls a planner model, which calls three
+  tools; two hit Postgres and one enqueues a BullMQ job that calls an embedding API on another replica.
+- **Logs say *that*, not *why*.** When that request takes 40 s or costs 60,000 tokens, logs from six
+  processes show it happened, but nothing ties the lines together or records durations as a tree.
+- **Hand-rolled tracing breaks.** A `requestId` threaded through every function and `console.time` pairs
+  break at the first `await` you forgot, do not cross the queue, and produce data no tool can draw as a
+  waterfall.
+- **Node has no thread to hang context on.** "Which request is this log line from" must travel along the
+  async continuation chain; OTel's Node SDK does that with `AsyncLocalStorage` and propagates context
+  across processes with standard headers.
+- **Vendor neutrality pays off.** Every backend (Jaeger, Tempo, Honeycomb, Datadog, Langfuse and others
+  via OTLP) accepts the format, which matters *because* the backend you pick in year one is rarely the
+  one you have in year three, and enterprise customers want your spans in *their* collector. The
+  observability module covers concepts; this lesson is the Node mechanics.
 
 ## How it works
 ### API, SDK and the split between them
-Your code calls the API (`@opentelemetry/api`): `trace.getTracer(name).startActiveSpan(...)`,
-`metrics.getMeter(...)`. The SDK (`@opentelemetry/sdk-node`, or `NodeTracerProvider` directly) is
-configured once and decides what happens: sampling, batching, exporting. Libraries depend only on the
-API *because* then a library can be instrumented without forcing an SDK or an exporter on its users;
-with no SDK registered the API calls are no-ops.
+- **Your code calls the API** (`@opentelemetry/api`): `trace.getTracer(name).startActiveSpan(...)`,
+  `metrics.getMeter(...)`.
+- **The SDK decides what happens** (`@opentelemetry/sdk-node`, or `NodeTracerProvider` directly):
+  sampling, batching, exporting. It is configured once.
+- **Libraries depend only on the API** *because* then they can be instrumented without forcing an SDK or
+  exporter on their users; with no SDK registered, API calls are no-ops.
 
 ### Startup order and auto-instrumentation
-Auto-instrumentation works by patching modules (`http`, `undici`/`fetch`, `pg`, `ioredis`, `express`,
-`fastify`, `pino` and others) when they are loaded. It must therefore be installed *before* those
-modules are imported, which is why the SDK lives in its own `instrumentation.ts` loaded with
-`node --require` (CommonJS) or `node --import` (ESM), or via `NODE_OPTIONS`. ESM needs one more piece:
-`import` statements bypass the CommonJS `require` hook, so the file must also register OTel's ESM
-loader hook (`module.register("@opentelemetry/instrumentation/hook.mjs", ...)`), which the zero-code
-entry point `@opentelemetry/auto-instrumentations-node/register` does for you. Importing it from
-`app.ts` after your framework is a classic silent failure: no error, no spans.
+1. **Instrumentation patches modules as they load:** `http`, `undici`/`fetch`, `pg`, `ioredis`,
+   `express`, `fastify`, `pino` and others.
+2. **So it must be installed before they are imported.** The SDK lives in its own `instrumentation.ts`,
+   loaded with `node --require` (CommonJS) or `node --import` (ESM), or via `NODE_OPTIONS`.
+3. **ESM needs a loader hook.** `import` statements bypass the CommonJS `require` hook, so the file must
+   register OTel's ESM hook (`module.register("@opentelemetry/instrumentation/hook.mjs", ...)`). The
+   zero-code entry point `@opentelemetry/auto-instrumentations-node/register` does this for you.
+4. **The classic silent failure:** importing it from `app.ts` after your framework. No error, no spans.
 
 ### Spans, kinds and the tree
-A span is a named, timed operation with a trace id (shared by the whole request), its own span id, a
-parent span id, attributes, events (timestamped points such as "first token") and a status. The tree
-is reconstructed by the backend from parent ids alone, which is why a missing parent link produces an
-orphan root rather than an error. Each span has a kind: `SERVER` for handling an inbound request,
-`CLIENT` for an outbound call, `PRODUCER` and `CONSUMER` for the two ends of a queue, `INTERNAL` for
-in-process work such as an agent step. Kinds matter *because* backends derive service maps and
-latency breakdowns from them: a `CLIENT` span with no matching `SERVER` child is time spent waiting on
-something you do not instrument, such as a model provider.
+- **A span** is a named, timed operation with a trace id (shared by the whole request), its own span id,
+  a parent span id, attributes, events (timestamped points such as "first token") and a status.
+- **The backend rebuilds the tree from parent ids alone,** so a missing parent link produces an orphan
+  root rather than an error.
 
-### Context propagation
-Within a process the SDK installs an `AsyncLocalStorage`-based context manager so the active span
-follows `await`, promises, timers and callbacks. `AsyncLocalStorage` works by capturing the current
-store whenever Node creates an async resource (a promise, a timer, a socket callback) and restoring it
-when that resource's continuation runs, so "the active span" is whatever was active when the
-continuation was *scheduled*. That rule explains where context gets lost: a library that collects
-callbacks in its own queue and invokes them later from a different continuation (a hand-rolled
-connection pool, a batching client) runs them in the wrong context, and an `EventEmitter` listener runs
-in the context of whoever called `emit()`, not whoever registered it. The fix is to bind explicitly with
-`context.bind(context.active(), fn)` (or `AsyncResource.bind`) at the point the callback is handed
-over. Across HTTP it injects and extracts `traceparent` and
-`tracestate` (W3C Trace Context); the `http` and `fetch` instrumentations do this for every outbound
-and inbound request. Across a queue nothing is automatic unless the library supports it (BullMQ 5 has an opt-in `telemetry`
-option, provided by the `bullmq-otel` package, that does this): otherwise serialise the
-context into job data on the producer (`propagation.inject(context.active(), carrier)`) and restore it
-in the worker (`propagation.extract(...)`) so the job's spans link to the originating request.
+| Kind | Used for |
+|---|---|
+| `SERVER` | handling an inbound request |
+| `CLIENT` | an outbound call |
+| `PRODUCER` / `CONSUMER` | the two ends of a queue |
+| `INTERNAL` | in-process work such as an agent step |
+
+- **Kinds matter** *because* backends derive service maps and latency breakdowns from them: a `CLIENT`
+  span with no matching `SERVER` child is time spent waiting on something you do not instrument, such as
+  a model provider.
+
+### Context propagation in a process
+- **The SDK installs an `AsyncLocalStorage` context manager,** so the active span follows `await`,
+  promises, timers and callbacks.
+- **The rule:** `AsyncLocalStorage` captures the current store whenever Node creates an async resource (a
+  promise, a timer, a socket callback) and restores it when that continuation runs. "The active span" is
+  whatever was active when the continuation was *scheduled*.
+- **Where context gets lost.** A library that queues callbacks and invokes them later from a different
+  continuation (a hand-rolled connection pool, a batching client) runs them in the wrong context. An
+  `EventEmitter` listener runs in the context of whoever called `emit()`, not whoever registered it.
+- **The fix:** bind explicitly with `context.bind(context.active(), fn)` (or `AsyncResource.bind`) where
+  the callback is handed over.
+
+### Context propagation across processes
+- **HTTP is automatic.** The `http` and `fetch` instrumentations inject and extract `traceparent` and
+  `tracestate` (W3C Trace Context) on every outbound and inbound request.
+- **Queues are not, unless the library supports it.** BullMQ 5 has an opt-in `telemetry` option,
+  provided by the `bullmq-otel` package.
+- **Otherwise do it by hand:** serialise context into job data on the producer
+  (`propagation.inject(context.active(), carrier)`) and restore it in the worker
+  (`propagation.extract(...)`) so the job's spans link to the originating request.
 
 ### Spans for model calls
-The Anthropic TypeScript SDK emits its own span per request, `anthropic.messages.create` (kind
-`CLIENT`), through whatever tracer provider the application registered, carrying
-`gen_ai.provider.name`, `gen_ai.usage.input_tokens` (cache reads and writes included),
-`gen_ai.usage.output_tokens`, the cache read and write counts, and `anthropic.request.id`; its tool
-runner adds a parent span plus one span per tool it runs. The feature is in beta, so pin the SDK
-version. Two rules follow. Wrap the call in a span of your own (`agent.plan`, `tool.search_docs`) with
-app-level attributes (tenant, run id, prompt version) and the SDK span nests under it; the SDK then
-sends its own span's `traceparent` to the API, so server-side spans (if API tracing is configured) join
-the same trace. And if a third-party instrumentation already patches the SDK,
-turn one of the two off (`openTelemetry: false` or `ANTHROPIC_OPEN_TELEMETRY=false`) or every request
-appears twice. For providers whose SDK emits nothing, set the GenAI semantic-convention attributes
-yourself (`gen_ai.provider.name`, the request model, `gen_ai.usage.*`); the conventions are still
-marked experimental, so expect renames.
+- **The Anthropic TypeScript SDK emits its own span** per request, `anthropic.messages.create` (kind
+  `CLIENT`), through whatever tracer provider the application registered.
+- **Its attributes:** `gen_ai.provider.name`, `gen_ai.usage.input_tokens` (cache reads and writes
+  included), `gen_ai.usage.output_tokens`, the cache read and write counts, and `anthropic.request.id`.
+  Its tool runner adds a parent span plus one span per tool. The feature is in beta, so pin the SDK
+  version.
+- **Rule 1: wrap the call in your own span** (`agent.plan`, `tool.search_docs`) with app attributes
+  (tenant, run id, prompt version); the SDK span nests under it. The SDK sends its span's `traceparent`
+  to the API, so server-side spans (if API tracing is configured) join the same trace.
+- **Rule 2: one instrumentation per SDK.** If a third-party instrumentation already patches the SDK, turn
+  one off (`openTelemetry: false` or `ANTHROPIC_OPEN_TELEMETRY=false`) or every request appears twice.
+- **Other providers:** if the SDK emits nothing, set the GenAI semantic-convention attributes yourself
+  (`gen_ai.provider.name`, the request model, `gen_ai.usage.*`). The conventions are still experimental,
+  so expect renames.
 
-Prompt and completion text stay out of spans by default: the SDK's content mode is `metadata_only`, and
-`content` mode exists *because* reading conversations from traces is useful but makes your tracing
-backend a store of customer data under its own retention rules, with a per-span size limit (0.75 MB by
-default) beyond which content is truncated. Treat that as an explicit opt-in, or send content to an
-LLM-specific tool (Langfuse, Phoenix) built for it.
+### Prompt content in spans
+- **Off by default.** The SDK's content mode is `metadata_only`.
+- **`content` mode is an explicit opt-in** *because* reading conversations from traces is useful but
+  makes your tracing backend a store of customer data under its own retention rules.
+- **Size limit:** content beyond a per-span limit (0.75 MB by default) is truncated.
+- **Alternative:** send content to an LLM-specific tool (Langfuse, Phoenix) built for it.
 
 ### Streaming
-A streaming call's span ends when the stream is fully read or closed, so close a stream you abandon or
-its span never ends. Spans you start while reading chunks are siblings of the SDK span, not children;
-start one span of your own around both the call and the read loop, and add an event at the first token
-so time-to-first-token is queryable.
+- **A streaming call's span ends when the stream is fully read or closed,** so close a stream you abandon
+  or its span never ends.
+- **Spans started while reading chunks are siblings** of the SDK span, not children. Start one span of
+  your own around both the call and the read loop, and add an event at the first token so
+  time-to-first-token is queryable.
 
 ### Metrics and logs
-Use a histogram for model latency and a counter for tokens by model and tenant; these aggregate cheaply
-where traces are sampled. Pino or Winston with the OTel log instrumentation gets `trace_id` and
-`span_id` on every line, which is what lets you jump from a log to the trace.
+- **Metrics:** a histogram for model latency and a counter for tokens by model and tenant; these
+  aggregate cheaply where traces are sampled.
+- **Logs:** Pino or Winston with the OTel log instrumentation puts `trace_id` and `span_id` on every
+  line, which lets you jump from a log to the trace.
 
-### Export, sampling, cost
-Spans go through a `BatchSpanProcessor` to an OTLP exporter (HTTP or gRPC), usually to an OpenTelemetry
-Collector sidecar or gateway that fans out to backends, redacts, and does tail sampling. The batch
-processor exists *because* exporting each span synchronously would put a network call on every
-operation: ended spans go into an in-memory queue (2,048 spans by default) and are exported in batches
-of up to 512 every 5 seconds or when a batch fills. When the exporter cannot keep up, the queue fills
-and new spans are dropped, not blocked, which protects request latency at the cost of silently missing
-data; tune `OTEL_BSP_MAX_QUEUE_SIZE` and watch the dropped count. Use the `SimpleSpanProcessor`
-(export on end) only in tests. Head sampling
-in the SDK (`parentbased_traceidratio` at, say, 10%) cuts cost; the `parentbased` part means a service
-follows the sampled flag in the incoming `traceparent` and only applies its own ratio at the root,
-*because* independent coin flips per service would produce traces with random holes. Head sampling
-decides before anything has gone wrong, so it throws away 90% of the rare slow or failed traces along with the boring ones; tail
-sampling in the collector keeps errors and slow traces *because* it decides after seeing the whole
-trace. Configuration is environment-driven: `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
-`OTEL_TRACES_SAMPLER`, `OTEL_RESOURCE_ATTRIBUTES`. On shutdown call `sdk.shutdown()` so the batch
-processor flushes; otherwise the last spans of every deploy vanish.
+### Export and batching
+- **Pipeline:** spans go through a `BatchSpanProcessor` to an OTLP exporter (HTTP or gRPC), usually to an
+  OpenTelemetry Collector sidecar or gateway that fans out to backends, redacts and tail-samples.
+- **Why batch:** exporting each span synchronously would put a network call on every operation.
 
-## Example
+| Setting | Default | Behaviour |
+|---|---|---|
+| In-memory queue | 2,048 spans | when full, new spans are dropped, not blocked |
+| Batch size | up to 512 spans | exported when a batch fills |
+| Schedule | every 5 seconds | exports whatever is queued |
+
+- **Dropping protects latency** at the cost of silently missing data; tune `OTEL_BSP_MAX_QUEUE_SIZE` and
+  watch the dropped count.
+- **`SimpleSpanProcessor`** (export on end) is for tests only.
+- **Flush on exit.** On shutdown call `sdk.shutdown()` so the batch processor flushes; otherwise the last
+  spans of every deploy vanish.
+
+### Sampling and configuration
+- **Head sampling** in the SDK (`parentbased_traceidratio` at, say, 10%) cuts cost.
+- **`parentbased` follows the caller:** a service obeys the sampled flag in the incoming `traceparent` and
+  applies its own ratio only at the root, *because* independent coin flips per service would produce
+  traces with random holes.
+- **Head sampling decides before anything has gone wrong,** so it throws away 90% of the rare slow or
+  failed traces along with the boring ones.
+- **Tail sampling in the collector** keeps errors and slow traces *because* it decides after seeing the
+  whole trace.
+- **Config is environment-driven:** `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+  `OTEL_TRACES_SAMPLER`, `OTEL_RESOURCE_ATTRIBUTES`.
+
+## Diagram
+One trace across an API, a model call and a queue hop. HTTP propagation is automatic; the queue hop
+only joins the trace because the producer injects context into the job and the worker extracts it.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API server
+    participant L as Model provider
+    participant Q as BullMQ
+    participant W as Worker
+    participant X as OTel Collector
+    C->>A: POST /runs with traceparent
+    Note over A: SERVER span, agent.plan span via AsyncLocalStorage
+    A->>L: messages.create, CLIENT span, traceparent header
+    L-->>A: response with token usage
+    A->>Q: queue.add with injected carrier
+    Q->>W: job data carries traceparent
+    Note over W: extract carrier, CONSUMER span joins the trace
+    A-->>X: batched OTLP export
+    W-->>X: batched OTLP export
+```
+
+## Examples
+### SDK setup and an application span around a model call
 `instrumentation.ts` configures the SDK and is loaded before the app with
 `node --import ./instrumentation.js app.js` (for a CommonJS build, use `--require` and drop the two
-`register` lines, which only an ES module can run). The second block shows an
-application span around a model call; the Anthropic SDK's own `anthropic.messages.create` span, with
-token usage, nests under it automatically because the SDK uses the registered provider.
+`register` lines, which only an ES module can run).
+
+The second block shows an application span around a model call; the Anthropic SDK's own
+`anthropic.messages.create` span, with token usage, nests under it automatically because the SDK uses
+the registered provider.
 
 ```ts
 // instrumentation.ts — loaded first, never imported by application code except for shutdown
@@ -188,31 +237,109 @@ export async function plan(tenant: string, runId: string, prompt: string) {
 }
 ```
 
+### Carrying trace context through a BullMQ job by hand
+Without the opt-in `telemetry` option, the producer writes `traceparent` into the job data and the
+worker restores it, so the worker's `CONSUMER` span becomes a child of the API request.
+
+```ts
+import { context, propagation, trace, SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { Queue, Worker } from "bullmq";
+const tracer = trace.getTracer("agent-worker");
+
+// producer (API process)
+export async function enqueueRun(queue: Queue, runId: string) {
+  const carrier: Record<string, string> = {};
+  propagation.inject(context.active(), carrier);          // writes traceparent (and tracestate if set)
+  await queue.add("run", { runId, otel: carrier }, { jobId: `run-${runId}` });
+}
+
+// consumer (worker process)
+export const worker = new Worker("runs", async (job) => {
+  const parent = propagation.extract(context.active(), job.data.otel ?? {});
+  return context.with(parent, () =>
+    tracer.startActiveSpan("run.process", { kind: SpanKind.CONSUMER, attributes: { "app.run_id": job.data.runId } },
+      async (span) => {
+        try { return await processRun(job.data.runId); }
+        catch (e: any) { span.recordException(e); span.setStatus({ code: SpanStatusCode.ERROR }); throw e; }
+        finally { span.end(); }
+      }));
+}, { connection });
+```
+
+### Worked scenario: what head sampling keeps
+Illustrative traffic: 200 requests per second, about 40 spans per request, 1% of requests fail.
+
+| Policy | Spans per second | Spans per day | Failed traces kept per second |
+|---|---|---|---|
+| No sampling | 8,000 | ~691 million | all 2 |
+| Head sampling at 10% | 800 | ~69 million | ~0.2: 90% of failures discarded |
+| 10% head plus collector tail sampling that keeps every error | ~800 plus error traces | ~69 million plus errors | all 2 |
+
+The tail-sampling row needs the SDK to export every span to the collector (sample at 100% in the SDK)
+so the collector can decide per trace; the cost moves from the backend bill to collector capacity.
+
+## Production patterns
+- **Collector gateway with tail sampling.** When errors and slow traces matter more than volume, run the
+  Collector's `tail_sampling` processor with policies for error status and high latency, and route all
+  spans of a trace to the same collector instance (a trace-id-aware load-balancing exporter). Monitor
+  collector memory, refused spans and the decision-wait backlog.
+- **Redact in the pipeline, not in every service.** Use a Collector `attributes` processor to delete or
+  hash sensitive keys (user emails, raw prompts if a team enabled content mode) before export. Monitor
+  by sampling exported spans for forbidden keys in a scheduled check.
+- **Flush on shutdown.** On `SIGTERM` close the HTTP server, drain workers, then `await sdk.shutdown()`
+  before exit, within the orchestrator's grace period. Monitor span counts around deploy times for gaps.
+- **Cost and latency as metrics, not trace queries.** Record token counts and model latency as
+  histograms with model and tenant attributes (the GenAI conventions name
+  `gen_ai.client.token.usage` and `gen_ai.client.operation.duration`), so dashboards stay correct under
+  sampling. Watch attribute cardinality: tenant ids are fine, run ids are not.
+- **Correlate logs automatically.** Enable the Pino instrumentation (`@opentelemetry/instrumentation-pino`)
+  so every line carries `trace_id` and `span_id`. Monitor the share of error logs that have a trace id.
+
 ## Trade-offs
-- Auto-instrumentation gives HTTP, DB and Redis spans with zero code changes, but it patches modules and must load first; it also instruments noisy things (`fs`, DNS) that you will want to disable to control volume.
-- Head sampling at the SDK is cheap and predictable, but drops rare slow or failed traces; tail sampling in a collector keeps them at the cost of running and sizing the collector.
-- Rich span attributes (tenant, model, tokens, prompt version) make traces queryable for cost and quality questions, but attributes are billed per byte by most vendors, and prompt content in spans is a data-protection liability that needs an explicit decision.
-- Linking queue jobs to their originating request through injected context gives end-to-end traces, but requires every producer and consumer to carry the carrier; one unlinked hop breaks the tree into orphans.
-- LLM-specific observability tools (Langfuse, Phoenix, LangSmith) understand prompts, evals and sessions in ways generic tracing does not, while OTel is the common wire; sending OTel spans to such a tool via OTLP avoids instrumenting twice.
+- **Zero-code coverage vs control.** Auto-instrumentation gives HTTP, DB and Redis spans with no code
+  changes, but patches modules and must load first; it also instruments noisy things (`fs`, DNS) you
+  will want to disable to control volume.
+- **Head vs tail sampling.** Head sampling at the SDK is cheap and predictable but drops rare slow or
+  failed traces; tail sampling in a collector keeps them at the cost of running and sizing the
+  collector.
+- **Rich attributes vs bill and liability.** Tenant, model, tokens and prompt version make traces
+  queryable for cost and quality, but most vendors bill attributes per byte, and prompt content in spans
+  is a data-protection liability that needs an explicit decision.
+- **End-to-end traces vs discipline.** Linking queue jobs through injected context gives full traces,
+  but every producer and consumer must carry the carrier; one unlinked hop breaks the tree into orphans.
+- **LLM tools vs generic tracing.** Langfuse, Phoenix and LangSmith understand prompts, evals and
+  sessions in ways generic tracing does not, while OTel is the common wire; sending OTel spans to such a
+  tool via OTLP avoids instrumenting twice.
 
 ## Pitfalls
-- SDK initialised after the framework or `pg` is imported: the symptom is a trace with only your manual spans, no HTTP or DB children, and no error anywhere.
-- ESM app started with `--require`: the symptom is auto-instrumentation silently doing nothing because ESM modules bypass the CommonJS hook; use `--import` with the register entry.
-- Spans never ended on an error path (missing `finally`), or a streaming response abandoned without closing it: the symptom is traces that look incomplete or never export, and memory growing with open spans.
-- No `sdk.shutdown()` on SIGTERM: the symptom is the last few seconds of spans missing before every deploy, which is exactly when errors happen.
-- Both the vendor SDK's built-in tracing and a third-party instrumentation of that SDK active: the symptom is every model call appearing twice in the trace with identical timing.
-- Context lost across a callback queue or an `EventEmitter`: the symptom is DB or tool spans that attach to the wrong request's trace, or start new root traces, only under concurrency, because the callback ran in whichever context was active when it was invoked.
-- Trace context not propagated into BullMQ jobs: the symptom is worker spans that form their own root traces, unlinked from the API request that caused them.
+- **SDK initialised after the framework or `pg` is imported.** Symptom: a trace with only your manual
+  spans, no HTTP or DB children, and no error anywhere.
+- **ESM app started with `--require`.** Symptom: auto-instrumentation silently does nothing because ESM
+  modules bypass the CommonJS hook. Fix: `--import` with the register entry.
+- **Spans never ended on an error path** (missing `finally`), or an abandoned stream never closed.
+  Symptom: traces that look incomplete or never export, and memory growing with open spans.
+- **No `sdk.shutdown()` on SIGTERM.** Symptom: the last few seconds of spans missing before every deploy,
+  which is exactly when errors happen.
+- **Vendor SDK tracing and a third-party instrumentation of that SDK both active.** Symptom: every model
+  call appears twice in the trace with identical timing.
+- **Context lost across a callback queue or an `EventEmitter`.** Symptom: DB or tool spans attach to the
+  wrong request's trace, or start new roots, only under concurrency, because the callback ran in
+  whichever context was active when it was invoked.
+- **Trace context not propagated into BullMQ jobs.** Symptom: worker spans form their own root traces,
+  unlinked from the API request that caused them.
 
 ## When to use
-Instrument every service that calls a model, from the first deployment; retrofitting traces during an
-incident is the worst time. Use auto-instrumentation for transport and storage, the vendor SDK's spans
-for model calls, manual spans for anything semantically meaningful (agent step, tool call, retrieval),
-metrics for cost and latency aggregates, and logs with trace ids for detail. Reach for an LLM-specific
-tool when you need prompt versioning, evals and human review, and feed it through OTLP. Measure spans
-per request, export errors, dropped spans from the batch processor, and whether every error trace is
-kept. Interviewers ask how context crosses `await` in Node, why auto-instrumentation must load first,
-and what you would put on a model-call span.
+- **Use from the first deployment** in every service that calls a model; retrofitting traces during an
+  incident is the worst time.
+- **Split the work:** auto-instrumentation for transport and storage, the vendor SDK's spans for model
+  calls, manual spans for semantically meaningful work (agent step, tool call, retrieval), metrics for
+  cost and latency aggregates, logs with trace ids for detail.
+- **Add an LLM-specific tool** when you need prompt versioning, evals and human review, and feed it
+  through OTLP.
+- **Measure:** spans per request, export errors, dropped spans from the batch processor, and whether
+  every error trace is kept.
+- **Interviews:** how context crosses `await` in Node, why auto-instrumentation must load first, and what
+  you would put on a model-call span.
 
 ## Role lens
 - **Engineer:** Owns `instrumentation.ts`, wraps agent steps and tool calls in spans with tenant and run attributes, propagates context into jobs, and ensures spans end and flush on every path.
@@ -231,6 +358,43 @@ own: on the producer, call `propagation.inject(context.active(), carrier)` and s
 job data; in the worker, `propagation.extract` it and start the processing span inside that context so
 it becomes a child (or a linked span) of the API request. Verify with one request and confirm a single
 trace spans API, database, Redis and worker.
+
+## Interview questions
+### What is the difference between the OpenTelemetry API and SDK, and why does a library only depend on the API?
+- **The API** is what code calls to create spans and metrics; without a registered SDK every call is a
+  cheap no-op.
+- **The SDK** decides sampling, batching and export, and is configured once by the application.
+- **Libraries use only the API** so they can ship instrumentation without forcing an exporter or backend
+  on their users.
+
+### Some DB spans attach to the wrong request's trace, but only under load. What is happening?
+- **Context follows scheduling, not registration:** `AsyncLocalStorage` restores the context active when
+  a continuation was scheduled, so a pool or batching client that runs queued callbacks later runs them
+  in someone else's context.
+- **`EventEmitter` listeners** run in the context of the `emit()` caller.
+- **Fix:** bind callbacks with `context.bind(context.active(), fn)` or `AsyncResource.bind` where they are
+  handed over, then verify with a concurrent load test.
+
+### What would you put on a span for an LLM call, and what would you keep off it?
+- **On it:** model, provider, input and output tokens including cache reads, stop reason, tenant, run id
+  and prompt version, plus a first-token event for streaming.
+- **Off it by default:** prompt and completion text, because it turns the tracing backend into a store
+  of customer data with its own retention, and attributes are billed per byte.
+- **If content is needed,** opt in deliberately or send it to an LLM observability tool.
+
+### Head sampling at 10% means you rarely find traces for failed requests. How do you fix that without tracing everything at full cost?
+- **Move the decision to the collector:** export every span from the SDK to a collector running tail
+  sampling that keeps all error and slow traces plus a small share of the rest.
+- **Keep `parentbased` sampling** in services so a trace is never half-sampled.
+- **Cost moves** from backend storage to collector capacity, which must buffer whole traces before
+  deciding.
+
+### Spans from the last seconds before each deploy are missing. Why, and how do you fix it?
+- **The `BatchSpanProcessor` holds spans in memory** (up to 2,048 by default) and exports every 5 seconds
+  or when a batch of 512 fills; a killed process loses what is queued.
+- **Fix:** on `SIGTERM`, stop accepting work, finish in-flight requests, then `await sdk.shutdown()` to
+  flush before exit.
+- **Also watch the dropped-span count,** since a full queue drops spans silently.
 
 ## Quiz
 ### Q: Why must the OpenTelemetry SDK be loaded before importing your web framework and database client?

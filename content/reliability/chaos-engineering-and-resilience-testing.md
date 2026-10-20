@@ -5,7 +5,7 @@ name: Chaos engineering & resilience testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - reliability/fmea
   - reliability/circuit-breakers
@@ -21,106 +21,117 @@ sources:
 ---
 
 ## TL;DR
-Resilience mechanisms (fallbacks, breakers, retries, failover) run rarely and rot silently, so you do
-not know whether they work until they are needed. Resilience testing exercises them deliberately in
-pre-production: fault injection, load, stress and soak tests, failover drills, game days. Chaos
-engineering extends this to controlled experiments on real systems: state a steady-state hypothesis,
-inject a realistic fault with a bounded blast radius, measure whether it held. For AI systems the faults
-include provider 429s and latency, tool failures, stale retrieval and malformed model output.
+Resilience mechanisms (fallbacks, breakers, retries, failover) run rarely and rot silently. Resilience
+testing exercises them deliberately; chaos engineering runs controlled experiments on real systems:
+hypothesis, bounded fault, measurement. For AI, faults include 429s, latency, stale retrieval and bad output.
 
 ## Why it exists
-Fallback code is the least-tested code in any system. A team ships multi-provider failover and feels
-safer. Six months later the primary provider degrades, the fallback fires for the first time in
-production, and fails: the secondary's API key expired, its model does not accept the same tool-call
-format, or its rate limit is a tenth of the primary's. Every layer of resilience you add is another
-untested path, and the testing you already do does not reach it. Unit tests mock the dependency. End-to-
-end tests run the happy path. Staging has neither production traffic patterns nor production data
-volumes nor the real vendor quotas.
-
-The naive alternative is to let real incidents validate the design. That works, in the sense that you
-learn, but the lesson arrives at three in the morning, at full scale, uncontrolled, with customers
-watching. Chaos engineering's founding observation is that the failure is going to happen anyway; the
-only choice is whether it happens while you are watching, at one percent of traffic, with a kill switch,
-or later.
-
-Two further problems push beyond "test the fallback". Distributed systems have emergent failure modes
-that no component test predicts: retry storms, thundering herds on recovery, cache stampedes, cost
-amplification when traffic falls to a pricier fallback model. Only exercising the whole system under
-fault reveals them. And systems drift: a fallback verified in March is unverified by June after three
-model upgrades and a vendor's quota change. Verification has to be repeated, which means it has to be
-cheap and automated.
+- **Fallback code is the least-tested code in any system.** A team ships multi-provider failover. Six
+  months later the primary degrades, the fallback fires for the first time in production, and fails: the
+  secondary's API key expired, its model does not accept the same tool-call format, or its rate limit is a
+  tenth of the primary's.
+- **Existing tests do not reach it.** Every layer of resilience is another untested path. Unit tests mock
+  the dependency. End-to-end tests run the happy path. Staging has neither production traffic patterns nor
+  production data volumes nor the real vendor quotas.
+- **Letting incidents validate the design is the naive alternative.** You learn, but the lesson arrives at
+  three in the morning, at full scale, uncontrolled, with customers watching. Chaos engineering's founding
+  observation: the failure will happen anyway; the only choice is whether it happens while you are
+  watching, at one percent of traffic, with a kill switch, or later.
+- **Emergent failures need whole-system tests.** Retry storms, thundering herds on recovery, cache
+  stampedes, and cost amplification when traffic falls to a pricier fallback model are predicted by no
+  component test; only exercising the whole system under fault reveals them.
+- **Systems drift.** A fallback verified in March is unverified by June after three model upgrades and a
+  vendor's quota change. Verification has to be repeated, which means it has to be cheap and automated.
 
 ## How it works
 ### Resilience testing: proving the mechanisms you built
-This is the pre-production family, and it comes first because there is no point running experiments
-against mechanisms that do not exist yet.
+This pre-production family comes first, because there is no point running experiments against mechanisms
+that do not exist yet. In pre-production it covers fault injection, load, stress and soak tests, failover
+drills and game days.
 
-- **Fault injection** at the dependency boundary: make the provider client return 429s, 5xxs, 8-second
-  latencies or truncated completions for a configurable fraction of calls, and confirm that timeouts,
-  breakers, backoff and fallbacks behave as designed.
-- **Load, stress and soak tests**: load at expected peak to confirm SLOs hold; stress beyond peak to find
-  the knee where latency explodes and to see whether shedding engages; soak for hours at steady load to
-  catch leaks, including agent-specific ones such as conversation state that never expires or token
-  budgets that creep upward per session.
-- **Failover and recovery drills**: kill the primary database, region or model deployment on a schedule
-  and measure actual recovery time and data loss against the disaster-recovery targets.
-- **Continuous canaries for every fallback path**: a synthetic request through the secondary provider
-  every few minutes. This is the single cheapest control against fallback rot, because it catches
-  expired credentials, renamed models and quota changes before a real failover does.
-- **Game days**: scheduled, cross-team scenario exercises that include the humans: paging, runbooks,
-  communication, decision-making. A perfect failover with a confused on-call is still an outage.
+| Test | What you do | What it proves |
+|---|---|---|
+| Fault injection | at the dependency boundary, make the provider client return 429s, 5xxs, 8-second latencies or truncated completions for a configurable fraction of calls | timeouts, breakers, backoff and fallbacks behave as designed |
+| Load | expected peak | SLOs hold |
+| Stress | beyond peak | where the knee is (latency explodes) and whether shedding engages |
+| Soak | hours at steady load | leaks, including agent-specific ones: conversation state that never expires, token budgets that creep upward per session |
+| Failover and recovery drills | kill the primary database, region or model deployment on a schedule | actual recovery time and data loss against disaster-recovery targets |
+| Continuous fallback canaries | a synthetic request through the secondary provider every few minutes | expired credentials, renamed models and quota changes are caught before a real failover |
+| Game days | scheduled, cross-team scenario exercises including paging, runbooks, communication, decision-making | the humans work too |
+
+- **Canaries are the single cheapest control against fallback rot.**
+- **Game days matter because** a perfect failover with a confused on-call is still an outage.
 
 ### Chaos engineering: discovering what you did not build for
 The discipline is defined by its method, not by breaking things.
 
 1. **Define steady state as user-facing output.** Success rate, p95 latency, task completion rate, cost
    per task: the SLIs. Not CPU or queue depth, because the hypothesis is about whether users notice.
-2. **State a falsifiable hypothesis.** "If the primary provider returns 429 on 30 percent of calls,
-   success rate stays at or above 99 percent and p95 rises by less than 20 percent." A hypothesis makes
-   the result a finding either way; "we killed a pod and nothing happened" teaches nothing. Only
-   hypothesize resilience you believe you have: if you already expect the system to fall over, the
+2. **State a falsifiable hypothesis.** "If the primary provider returns 429 on 30 percent of calls, success
+   rate stays at or above 99 percent and p95 rises by less than 20 percent." A hypothesis makes the result
+   a finding either way; "we killed a pod and nothing happened" teaches nothing.
+3. **Only hypothesize resilience you believe you have.** If you already expect the system to fall over, the
    experiment has nothing to discover and the right move is to fix it first.
-3. **Inject realistic events.** Latency, errors, instance loss, network partition, dependency
+4. **Inject realistic events.** Latency, errors, instance loss, network partition, dependency
    unavailability, resource exhaustion, zone loss, clock skew. Prefer the events your FMEA ranked highest;
    that table is the experiment backlog.
-4. **Minimize blast radius.** Start in staging, then one percent of production, an internal tenant, one
+5. **Minimize blast radius.** Start in staging, then one percent of production, an internal tenant, one
    availability zone. Define an abort condition and a kill switch before starting. Run during business
-   hours with on-call informed, because an experiment that is indistinguishable from an incident is one.
-5. **Compare experiment and control.** Route a slice of traffic through the fault and an equal slice
+   hours with on-call informed, because an experiment indistinguishable from an incident is one.
+6. **Compare experiment and control.** Route a slice of traffic through the fault and an equal slice
    without, and compare the SLIs, as in an A/B test. This separates the fault's effect from background
-   noise, but only with enough traffic in each arm. Telling a 99 percent success rate from 98 percent
-   needs on the order of a thousand requests per arm (the standard error of a 99 percent rate over
-   1,000 requests is about 0.3 points), so a one-percent slice of a low-traffic service may need hours
-   to reach a verdict. Size the slice and the duration together.
-6. **Fix, then widen, then automate.** Each refuted hypothesis becomes a fix and a regression test. Verified
+   noise, but only with enough traffic in each arm (see the sizing note below).
+7. **Fix, then widen, then automate.** Each refuted hypothesis becomes a fix and a regression test. Verified
    hypotheses graduate to larger blast radius and eventually to continuous automated runs, because the
    system will drift away from the verified state.
 
+### Sizing the experiment
+- **Telling 99 percent success from 98 percent** needs on the order of a thousand requests per arm: the
+  standard error of a 99 percent rate over 1,000 requests is about 0.3 points.
+- **So a one-percent slice of a low-traffic service may need hours to reach a verdict.** Size the slice and
+  the duration together.
+
 ### Injection mechanisms
-Application-level hooks in your own provider and tool clients are the most useful for AI systems: you
-cannot make a vendor's API go down, but you can make your client behave as if it had. Network-level
-tools add latency, bandwidth caps and connection resets through a proxy (Toxiproxy is a common choice)
-or a service mesh's fault-injection rules. Infrastructure-level tools kill instances and pods, fill disks
-and hog CPU; this is the Chaos Monkey lineage, continued by Kubernetes-native projects such as
-LitmusChaos and Chaos Mesh, commercial platforms, and the cloud providers' own fault-injection services.
-Data-level injection is specific to AI and usually hand-built: serve a stale index snapshot, drop a
-fraction of retrieved chunks, revoke a tool's credentials, or return refusals, truncated text and
-malformed JSON from a model stub.
+| Level | Tools and techniques | Best for |
+|---|---|---|
+| Application | hooks in your own provider and tool clients | AI systems: you cannot make a vendor's API go down, but your client can behave as if it had |
+| Network | a proxy (Toxiproxy is a common choice) or a service mesh's fault-injection rules: latency, bandwidth caps, connection resets | internal dependencies |
+| Infrastructure | kill instances and pods, fill disks, hog CPU: the Chaos Monkey lineage, continued by Kubernetes-native LitmusChaos and Chaos Mesh, commercial platforms, and cloud providers' fault-injection services | instance and zone loss |
+| Data (AI-specific, usually hand-built) | serve a stale index snapshot, drop a fraction of retrieved chunks, revoke a tool's credentials, or return refusals, truncated text and malformed JSON from a model stub | guards against wrong answers |
 
 ### What is different about LLM and agent systems
-Faults are semantic as well as operational. A model returns plausible nonsense; retrieval returns the
-wrong tenant's documents; a tool reports success with wrong data. Infrastructure chaos never produces
-these, so the experiment must inject them and the hypothesis must be about whether guards (schema
-validation, groundedness checks, confirmation steps) catch them. Amplification is the second difference:
-injecting 429s should reveal whether backoff, jitter and step budgets hold, or whether an agent loops
-fifty times and a retry storm forms. The third is cost: a fault that pushes traffic to a fallback model
-has a dollar blast radius as well as a latency one, so experiments need a spending cap and the cost SLI
-belongs in the hypothesis.
+- **Faults are semantic as well as operational.** A model returns plausible nonsense; retrieval returns the
+  wrong tenant's documents; a tool reports success with wrong data. Infrastructure chaos never produces
+  these, so the experiment must inject them and the hypothesis must be about whether guards (schema
+  validation, groundedness checks, confirmation steps) catch them.
+- **Amplification.** Injecting 429s should reveal whether backoff, jitter and step budgets hold, or whether
+  an agent loops fifty times and a retry storm forms.
+- **Cost.** A fault that pushes traffic to a fallback model has a dollar blast radius as well as a latency
+  one, so experiments need a spending cap and the cost SLI belongs in the hypothesis.
 
-## Example
-A fault-injecting wrapper around the real model client, controlled by environment variables so it is
-inert by default, plus a minimal experiment runner with an abort condition. The experiment is run once
-as a control and once with a fault, and the two results are compared against the hypothesis.
+## Diagram
+The experiment loop: the hypothesis and abort condition come before any fault, and both outcomes (held or
+refuted) produce work.
+
+```mermaid
+flowchart TD
+    S["Steady state: user-facing SLIs"] --> H["Falsifiable hypothesis"]
+    H --> F["Pick fault from FMEA backlog"]
+    F --> B["Blast radius, abort rule, kill switch"]
+    B --> X["Run fault slice and control slice"]
+    X --> A{"Abort condition hit?"}
+    A -->|"yes"| K["Kill switch: stop, investigate"]
+    A -->|"no"| C{"Hypothesis held?"}
+    C -->|"no"| R["Fix plus regression test"]
+    C -->|"yes"| W["Widen blast radius, then automate"]
+    R -.->|"re-run"| X
+```
+
+## Examples
+### Fault-injecting client wrapper and experiment runner
+A wrapper around the real model client, controlled by environment variables so it is inert by default,
+plus a minimal runner with an abort condition. Run once as a control and once with a fault, and compare
+the two results against the hypothesis.
 
 ```python
 import asyncio, os, random, time
@@ -164,52 +175,105 @@ async def experiment(handler, requests, min_success=0.95):
 # Hypothesis: success_rate >= 0.99 and p95_s < 1.2 x the control's. Anything else is a finding.
 ```
 
-In practice the same wrapper sits in the deployed service behind a per-tenant or per-request flag, so
-the fault can be applied to one percent of real traffic; the runner's abort check becomes an alert on
-the experiment slice's SLIs that flips the flag off.
+- **In production the same wrapper sits in the deployed service** behind a per-tenant or per-request flag,
+  so the fault can be applied to one percent of real traffic.
+- **The runner's abort check becomes an alert** on the experiment slice's SLIs that flips the flag off.
+
+### How long must the experiment run? A runnable sizing check
+A standard two-proportion power calculation (two-sided 5 percent, 80 percent power) for telling a 99
+percent control from a 98 percent fault arm, and what that means in hours per arm.
+
+```python
+from math import ceil, sqrt
+
+def se(p, n):
+    return sqrt(p * (1 - p) / n)          # standard error of a success rate
+
+def n_per_arm(p_control, p_fault, z_alpha=1.96, z_power=0.84):
+    """Requests per arm to tell two success rates apart (two-sided 5%, 80% power)."""
+    var = p_control * (1 - p_control) + p_fault * (1 - p_fault)
+    return ceil((z_alpha + z_power) ** 2 * var / (p_control - p_fault) ** 2)
+
+print(f"SE of 99% over 1,000 requests: {100 * se(0.99, 1000):.2f} points")   # 0.31
+n = n_per_arm(0.99, 0.98)
+print("requests per arm, 99% vs 98%:", n)                                     # 2313
+for rps, slice_ in [(10, 0.01), (10, 0.10), (200, 0.01)]:
+    hours = n / (rps * slice_) / 3600
+    print(f"{rps} rps service, {slice_:.0%} slice: {hours:.1f} h per arm")
+# 10 rps at 1%: 6.4 h | 10 rps at 10%: 0.6 h | 200 rps at 1%: 0.3 h
+```
+
+| Service | Slice | Time per arm |
+|---|---|---|
+| 10 requests per second | 1% | ~6.4 hours |
+| 10 requests per second | 10% | ~0.6 hours |
+| 200 requests per second | 1% | ~0.3 hours |
+
+The formal answer (~2,300 per arm) matches the "order of a thousand" rule of thumb; widen the slice once the
+abort condition has proven it fires, rather than running a tiny slice for so long that drift muddies it.
+
+## Production patterns
+- **Fallback canary on a schedule.** Send one synthetic request through every fallback provider and model
+  every few minutes from a scheduler, tagged so it is excluded from user SLIs. Alert on any failure;
+  monitor canary latency and the secondary's response schema.
+- **Flag-gated client faults.** Ship the `ChaosLLM`-style wrapper in production behind a feature flag scoped
+  to an internal tenant or a request header, with rate and mode as flag values. Monitor the experiment
+  slice's SLIs separately and auto-disable the flag when the abort threshold is crossed.
+- **Proxy faults for internal tools.** Put Toxiproxy between the agent and a tool API in staging and add a
+  latency toxic (for example `toxiproxy-cli toxic add -t latency -a latency=8000 <proxy>`), or use a
+  service mesh's fault-injection rules (Istio's VirtualService `fault` with `delay` or `abort` and a
+  percentage). Monitor breaker transitions and bulkhead rejections.
+- **Quarterly game day with the humans.** Script a scenario (primary provider down, SSO connector cut),
+  page the real on-call, and time detection, decision and recovery against the runbook. Track action items
+  to closure like postmortem actions.
+- **Spending cap on every experiment.** Before any drill that routes traffic to a pricier fallback, set a
+  budget for the experiment slice and put cost per task in the hypothesis. Monitor spend per slice in near
+  real time.
 
 ## Trade-offs
-- Production experiments give true signal, with real traffic, data and vendor limits, at real risk;
-  staging is safe but misses emergent behavior. Start in staging and graduate to production only once
-  abort conditions, observability per slice and a kill switch exist.
-- A small blast radius limits harm but also limits evidence: the smaller the slice, the longer the
-  experiment must run to separate the fault's effect from noise. Widen the slice once the abort
-  condition has proven it fires, rather than running a tiny slice for so long that drift muddies the
-  comparison.
-- Every experiment costs engineering time and sometimes vendor dollars, because faults push traffic to
-  fallbacks and retries; prioritize by FMEA risk rather than by what is easy to inject.
-- Continuous automated chaos catches drift but demands a mature on-call and can be mistaken for a real
-  incident; scheduled game days are cheaper and clearer but only test what someone remembered to
-  schedule.
-- Semantic fault injection tests the guards that matter for AI but needs trustworthy evals to judge
-  success; infrastructure fault injection is easy to measure but blind to wrong-answer failures. Do
-  both, in that order of importance for an LLM product.
+- **Production signal vs risk.** Production experiments give true signal, with real traffic, data and vendor
+  limits, at real risk; staging is safe but misses emergent behavior. Start in staging and graduate to
+  production only once abort conditions, per-slice observability and a kill switch exist.
+- **Small blast radius vs evidence.** A small slice limits harm but also limits evidence: the smaller the
+  slice, the longer the experiment must run to separate the fault's effect from noise. Widen the slice once
+  the abort condition has proven it fires, rather than running a tiny slice for so long that drift muddies
+  the comparison.
+- **Coverage vs cost.** Every experiment costs engineering time and sometimes vendor dollars, because faults
+  push traffic to fallbacks and retries; prioritize by FMEA risk rather than by what is easy to inject.
+- **Continuous vs scheduled.** Continuous automated chaos catches drift but demands a mature on-call and can
+  be mistaken for a real incident; scheduled game days are cheaper and clearer but only test what someone
+  remembered to schedule.
+- **Semantic vs infrastructure faults.** Semantic fault injection tests the guards that matter for AI but
+  needs trustworthy evals to judge success; infrastructure fault injection is easy to measure but blind to
+  wrong-answer failures. Do both, in that order of importance for an LLM product.
 
 ## Pitfalls
-- Running without a steady-state hypothesis. The symptom: a log of experiments none of which produced a
-  fix, and nobody able to say what was verified.
-- No abort condition or kill switch. The symptom: a postmortem whose root cause is the chaos experiment
+- **Running without a steady-state hypothesis.** Symptom: a log of experiments none of which produced a fix,
+  and nobody able to say what was verified.
+- **No abort condition or kill switch.** Symptom: a postmortem whose root cause is the chaos experiment
   itself.
-- Injecting only infrastructure faults into an AI system. The symptom: pods survive every drill, then
-  the first real 429 storm triggers agent loops and a cost spike nobody tested for.
-- Never canarying the fallback. The symptom: the first real failover fails for a configuration reason,
-  an expired key, a renamed model, a lower quota, that a five-minute synthetic check would have caught.
-- Experimenting without per-slice observability. The symptom: the hypothesis cannot be evaluated because
-  the experiment's traffic is indistinguishable from everything else in the dashboards.
-- Applying faults to shared customer traffic without regard to contracts. The symptom: a customer's SLA
+- **Injecting only infrastructure faults into an AI system.** Symptom: pods survive every drill, then the
+  first real 429 storm triggers agent loops and a cost spike nobody tested for.
+- **Never canarying the fallback.** Symptom: the first real failover fails for a configuration reason, an
+  expired key, a renamed model, a lower quota, that a five-minute synthetic check would have caught.
+- **Experimenting without per-slice observability.** Symptom: the hypothesis cannot be evaluated because the
+  experiment's traffic is indistinguishable from everything else in the dashboards.
+- **Applying faults to shared customer traffic without regard to contracts.** Symptom: a customer's SLA
   breached by your own experiment, and a difficult conversation about who caused the outage.
-- Ignoring the cost blast radius. The symptom: a full-traffic primary-failure drill that routes an hour
-  of traffic to the expensive fallback model, visible on the next invoice.
+- **Ignoring the cost blast radius.** Symptom: a full-traffic primary-failure drill that routes an hour of
+  traffic to the expensive fallback model, visible on the next invoice.
 
 ## When to use
-Begin once the basic mechanisms exist and observability can show SLIs for an experiment slice; before
-that, build the mechanisms. A sensible progression: dependency fault injection in staging for the top
-three FMEA rows, synthetic canaries through every fallback path, one game day per quarter for failover
-and disaster recovery, then production chaos at one percent for the most critical mechanisms, growing
-toward automation. Do not bother for a prototype or a service with no SLO, because there is no steady
-state to defend. Measure hypotheses verified and refuted, weaknesses found per experiment, time to
-detect and time to abort. In interviews, describe one experiment end to end: steady state, hypothesis,
-fault, blast radius, abort condition, result, and the fix it produced.
+- **Begin once** the basic mechanisms exist and observability can show SLIs for an experiment slice; before
+  that, build the mechanisms.
+- **Progression:** dependency fault injection in staging for the top three FMEA rows, synthetic canaries
+  through every fallback path, one game day per quarter for failover and disaster recovery, then production
+  chaos at one percent for the most critical mechanisms, growing toward automation.
+- **Avoid** for a prototype or a service with no SLO, because there is no steady state to defend.
+- **Measure** hypotheses verified and refuted, weaknesses found per experiment, time to detect and time to
+  abort.
+- **Interviews:** describe one experiment end to end: steady state, hypothesis, fault, blast radius, abort
+  condition, result, and the fix it produced.
 
 ## Role lens
 - **Engineer:** Builds the fault-injection hooks into provider and tool clients, writes the experiment and
@@ -234,6 +298,40 @@ watch retry amplification (provider calls per user request), fallback rate, brea
 and spend, and sample the fallback outputs through your quality evals because the secondary model may be
 measurably worse. Finally test recovery: when the primary returns, traffic should move back through the
 breaker's half-open probes without a thundering herd.
+
+## Interview questions
+### Why run chaos experiments in production at all, when staging is safer?
+- **Staging lacks the real conditions:** production traffic patterns, data volumes and vendor quotas, which
+  is where emergent failures like retry storms and herds on recovery live.
+- **The failure will happen anyway;** the choice is whether it happens at one percent of traffic, during
+  business hours, with a kill switch, or at full scale at night.
+- **But graduate there:** staging first, and production only with abort conditions, per-slice observability
+  and a kill switch.
+
+### Design a chaos experiment for an agent whose provider starts returning 429s.
+- **Steady state:** success rate, p95, task completion and cost per task on the experiment slice.
+- **Hypothesis:** with 30 percent injected 429s, success stays at or above 99 percent and p95 rises less than
+  20 percent; also provider calls per user request stay bounded (no loop).
+- **Blast radius and abort:** an internal tenant at one percent, abort below 98 percent success, a spending
+  cap; compare against a control slice.
+
+### How long would you run an experiment on a 1 percent slice of a 10-request-per-second service?
+- **Size from the effect you want to see:** 99 versus 98 percent success needs roughly 2,300 requests per arm
+  at 5 percent significance and 80 percent power.
+- **A 1 percent slice of 10 requests per second is 0.1 per second,** so about 6.4 hours per arm.
+- **Options:** widen the slice once the abort rule has proven it fires, or accept a larger detectable effect.
+
+### What faults would you inject that infrastructure chaos tools never produce?
+- **Semantic faults:** plausible-but-wrong output, refusals, truncated text, malformed JSON from a model
+  stub, stale index snapshots, dropped chunks, cross-tenant retrieval, revoked tool credentials.
+- **Why:** an LLM product's worst failures are silent wrong answers, so the hypothesis is whether schema
+  validation, groundedness checks and confirmation steps catch them, judged by trustworthy evals.
+
+### When would you not invest in chaos engineering yet?
+- **No SLO, no steady state:** for a prototype there is nothing to defend.
+- **Mechanisms missing:** if you already expect the system to fall over, fix it first; the experiment has
+  nothing to discover.
+- **No per-slice observability:** the hypothesis could not be evaluated, so build that before the first run.
 
 ## Quiz
 ### Q: What distinguishes chaos engineering from ordinary fault-injection testing?

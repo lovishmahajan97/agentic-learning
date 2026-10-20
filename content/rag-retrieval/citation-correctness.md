@@ -5,7 +5,7 @@ name: Citation correctness
 kind: metric
 difficulty: advanced
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/citations-grounding
   - evals/faithfulness-groundedness
@@ -235,8 +235,9 @@ print(f"citation recall {point:.3f}, 95% CI [{lo:.3f}, {hi:.3f}]")
 ## Pitfalls
 - **Reporting citation rate as citation quality.** Symptom: a dashboard near 100% while user feedback
   reports "the link doesn't say that".
-- **Showing the judge the whole answer and all sources.** Rather than one claim and its cited passages;
-  the judge is persuaded by fluency and scores support far higher than humans do.
+- **Showing the judge the whole answer and all sources** rather than one claim and its cited passages.
+  Symptom: the judge is persuaded by fluency and scores support far higher than humans do. Fix: one
+  claim plus its cited passages per call.
 - **Never measuring judge agreement with human labels.** Judge scores drift with prompt or model changes,
   and a regression in citation quality goes unnoticed.
 - **Ignoring version skew** between the chunk the model saw and the document fetched at eval time. Correct
@@ -299,8 +300,9 @@ accuracy.
 - **Re-check** agreement whenever the judge prompt or model changes.
 
 ### Citation recall moved from 0.80 to 0.82 on 300 questions. Do you ship the change?
-- **Not on that evidence alone.** Claims within one answer are correlated, so bootstrap over questions;
-  at this size the 95% interval is about plus or minus 3 points, so two points is within noise.
+- **Not on that evidence alone.** Claims within one answer are correlated, so bootstrap over questions,
+  not claims. On a few hundred questions the 95% interval is typically a few points wide (about plus or
+  minus 3 in the synthetic example above), so a two-point move is within noise.
 - **Look at the contradiction rate** and the partial-support share separately, since those carry the
   real harm and can move while the average stays flat.
 

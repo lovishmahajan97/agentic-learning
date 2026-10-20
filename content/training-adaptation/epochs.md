@@ -5,7 +5,7 @@ name: Epochs
 kind: concept
 difficulty: intro
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/learning-rate
   - training-adaptation/overfitting
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 An epoch is one full pass of the optimiser over the training set, the natural unit for reshuffling,
-evaluating and stopping. Fine-tuning needs a few epochs on small sets; pretraining counts tokens and
-rarely completes one pass.
+evaluating and stopping. More epochs help a small fine-tuning set until the model starts memorising;
+pretraining counts tokens and rarely completes one pass.
 
 ## Why it exists
 - **Minibatches consume data piecewise.** Gradient descent updates on minibatches of *B* examples, so
@@ -123,13 +123,15 @@ flowchart TD
     R --> B["Micro-batches: ceil(N / B) per epoch"]
     B -->|"every A micro-batches"| O["Optimizer step, scheduler step"]
     O --> E{"Eval point reached?"}
-    E -->|"no"| B
+    E -->|"no"| D{"Epoch finished?"}
     E -->|"yes"| V["Validation loss and task metric"]
     V --> I{"Improved on best?"}
     I -->|"yes"| C[("Save best checkpoint")]
     I -->|"no, patience used up"| X["Stop, load best checkpoint"]
-    I -->|"no, patience left"| N{"Epoch cap reached?"}
-    C --> N
+    I -->|"no, patience left"| D
+    C --> D
+    D -->|"no"| B
+    D -->|"yes"| N{"Epoch cap reached?"}
     N -->|"no"| S
     N -->|"yes"| X
 ```
@@ -253,17 +255,20 @@ trainer.train()
 - **Copying a fixed epoch count from a tutorial.** Symptom: held-out loss rising through the second half
   of the run while training loss keeps falling. Fix: early stopping on the validation curve.
 - **Changing epochs without noticing the LR schedule changed.** Symptom: runs that are "longer" but
-  incomparable, with different LR at the same step.
+  incomparable, with different LR at the same step. Fix: log the LR per step and re-derive warmup and
+  decay for the new step count.
 - **Accumulation that does not divide the epoch.** Symptom: an optimizer step count that does not match
-  the expected arithmetic, and gradients leaking across epoch boundaries.
+  the expected arithmetic, and gradients leaking across epoch boundaries. Fix: size the schedule with
+  `ceil` and flush pending gradients at the end.
 - **Comparing runs by epoch when dataset sizes differ.** Symptom: a "two-epoch" run on ten times the data
-  credited to the data rather than to ten times the updates.
+  credited to the data rather than to ten times the updates. Fix: compare on optimizer steps or tokens.
 - **Resuming without the sampler position.** Symptom: some examples seen twice and others never in that
-  epoch, and a resumed run that no longer matches an uninterrupted one.
+  epoch, and a resumed run that no longer matches an uninterrupted one. Fix: checkpoint the epoch and
+  batches consumed.
 - **Reading the staircase as "learning more".** The symptom that shows it is memorisation is validation
-  loss flat or rising across the same epoch boundaries.
+  loss flat or rising across the same epoch boundaries. Fix: stop early and keep the best checkpoint.
 - **Evaluating only at epoch boundaries on a large dataset.** Symptom: the best checkpoint sits between
-  two evaluations and is never saved.
+  two evaluations and is never saved. Fix: step-based evaluation and saving.
 
 ## When to use
 - **Think in epochs when:** the dataset is fixed and small enough to be seen several times: supervised
@@ -306,8 +311,8 @@ loss after many passes often comes with memorised phrasing and brittleness on pa
   schedules, warmup and evaluation are defined in tokens or steps.
 
 ### Your training loss drops sharply at each epoch boundary. What is happening and what do you do?
-- **That staircase is memorisation.** The model now sees examples it has already seen and predicts them
-  better than the unseen remainder of the first pass.
+- **The staircase signals memorisation starting.** The model now sees examples it has already seen and
+  predicts them better than the unseen remainder of the first pass.
 - **Confirm with validation:** if validation loss is flat or rising across the same boundaries, further
   epochs buy memorisation, not skill.
 - **Act:** keep the best checkpoint, stop with patience, or reduce epochs or learning rate for the next run.

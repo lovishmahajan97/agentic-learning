@@ -5,7 +5,7 @@ name: Change management
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - adoption/user-training
   - adoption/stakeholder-management
@@ -21,153 +21,247 @@ sources:
 ---
 
 ## TL;DR
-Change management is the deliberate work of moving people from the old way of doing a task to the new
-one, so that a deployed AI system is actually used and produces value. It exists because the common
-failure of enterprise AI is not a broken model but an unchanged workflow: people ignore, work around or
-over-trust a tool whose output is probabilistic and whose arrival can feel like a threat to their role.
+Change management deliberately moves people from the old way of doing a task to the new one, so a
+deployed AI system is actually used. Enterprise AI usually fails through an unchanged workflow, not a
+broken model.
 
 ## Why it exists
-Shipping is not adoption. A typical pattern after an internal AI launch is a burst of curious usage in
-the first week, then a slow decay back to the old process, while the dashboard still shows the system
-"live". Nothing in the code is wrong; the people around it never changed what they do.
-
-AI systems make this harder than ordinary software for three reasons. First, the output is probabilistic,
-so users have to learn *when* to trust it. Users who under-trust redo the work by hand and now spend more
-time than before, because they read the draft *and* do the task. Users who over-trust let errors through
-(automation bias), and the first public mistake poisons the tool for everyone. Second, AI arrives with an
-implied question about jobs. If nobody answers it, people answer it themselves, and quiet resistance is a
-rational response. Third, the value usually requires redesigning the work around the tool: if agents are
-still measured on the old metric, still follow the old checklist and still route through the old
-approval step, the AI step is pure overhead.
-
-The naive alternatives fail in predictable ways. "Announce it, record a training video, it's intuitive"
-creates awareness but not desire, and leaves incentives untouched. "Mandate it" produces compliance
-theatre: people open the tool so the login count looks good and then ignore the output. Change management
-replaces both with a plan that names the behavior change, finds what blocks it for each group, and
-removes those blocks one by one.
+- **Shipping is not adoption.** A typical internal AI launch shows a burst of curious usage in the first
+  week, then a slow decay back to the old process, while the dashboard still shows the system "live".
+  Nothing in the code is wrong; the people around it never changed what they do.
+- **Probabilistic output forces users to learn *when* to trust it.** Under-trusters redo the work by hand
+  and now spend more time than before, because they read the draft *and* do the task. Over-trusters let
+  errors through (automation bias), and the first public mistake poisons the tool for everyone.
+- **AI arrives with an implied question about jobs.** If nobody answers it, people answer it themselves,
+  and quiet resistance is a rational response.
+- **The value needs the work redesigned around the tool.** If agents are still measured on the old metric,
+  still follow the old checklist and still route through the old approval step, the AI step is pure
+  overhead.
+- **The naive alternatives fail predictably.** "Announce it, record a training video, it's intuitive"
+  creates awareness but not desire and leaves incentives untouched. "Mandate it" produces compliance
+  theatre: people open the tool so the login count looks good, then ignore the output. Change management
+  instead names the behavior change, finds what blocks it per group, and removes those blocks one by one.
 
 ## How it works
 ### Use frameworks as diagnostic checklists
-Two well-known models cover different levels. **ADKAR** (Prosci) describes the individual: *Awareness* of
-why the change is happening, *Desire* to take part, *Knowledge* of how, *Ability* to do it in real work,
-and *Reinforcement* that makes it stick. Its value is diagnostic: find the first stage that is blocked
-for a group and work there, *because* training (Knowledge) cannot fix a Desire problem, and enthusiasm
-(Desire) cannot fix a missing integration (Ability). **Kotter's eight steps** describe the organization:
-create urgency, build a guiding coalition, form a vision, communicate it, remove obstacles, generate
-short-term wins, consolidate gains, and anchor the new way in culture. The older
-unfreeze-change-refreeze framing, traditionally attributed to Kurt Lewin (historians note the tidy
-three-step version was largely popularized by later writers), makes the same point compactly: the old
-habit has to be loosened before the new one can form, and then deliberately locked in. None of these is
-an algorithm; use them to ask "what is missing for this group?", not as a sequence of ceremonies.
+| Model | Level | Stages |
+|---|---|---|
+| **ADKAR** (Prosci) | The individual | *Awareness* of why, *Desire* to take part, *Knowledge* of how, *Ability* to do it in real work, *Reinforcement* that makes it stick |
+| **Kotter's eight steps** | The organization | Create urgency, build a guiding coalition, form a vision, communicate it, remove obstacles, generate short-term wins, consolidate gains, anchor the new way in culture |
+| **Unfreeze-change-refreeze** | Compact framing | Loosen the old habit, form the new one, then deliberately lock it in |
+
+- **ADKAR is diagnostic.** Find the first stage that is blocked for a group and work there, *because*
+  training (Knowledge) cannot fix a Desire problem, and enthusiasm (Desire) cannot fix a missing
+  integration (Ability).
+- **Lewin attribution caveat.** Unfreeze-change-refreeze is traditionally attributed to Kurt Lewin;
+  historians note the tidy three-step version was largely popularized by later writers.
+- **None of these is an algorithm.** Use them to ask "what is missing for this group?", not as a sequence
+  of ceremonies.
 
 ### 1. Define the change as behavior
-"Adopt the AI assistant" cannot be managed or measured. "Claims adjusters start every file over 30 pages
-from the AI summary and verify its cited sections, instead of reading the file front to back" can. Write
-one such sentence per affected role, *because* every later step (training, metrics, incentives) hangs off
-it.
+- **Unmanageable:** "Adopt the AI assistant" cannot be managed or measured.
+- **Manageable:** "Claims adjusters start every file over 30 pages from the AI summary and verify its cited
+  sections, instead of reading the file front to back."
+- **Write one such sentence per affected role**, *because* every later step (training, metrics,
+  incentives) hangs off it.
 
 ### 2. Assess impact per group
-For each group, list what changes: tasks, skills, metrics, tools, approvals, and any effect on headcount
-or roles. Be explicit about job impact, *because* silence is filled with rumor. Groups differ: the end
-users, their team leads, QA reviewers, IT support and compliance each experience a different change.
+- **List what changes for each group:** tasks, skills, metrics, tools, approvals, and any effect on
+  headcount or roles.
+- **Be explicit about job impact**, *because* silence is filled with rumor.
+- **Groups differ.** End users, their team leads, QA reviewers, IT support and compliance each experience
+  a different change.
 
-Treat resistance as data about which stage is blocked, not as an attitude problem. "It's slower" is an
-Ability or incentive problem; "it got the prior-injury note wrong" is a trust problem; "why would I train
-my replacement?" is a Desire problem rooted in job security; a senior expert's "I don't need it" is often
-about losing the status of being the person who knows. Each needs a different fix, which is why the
-diagnosis has to be per group.
+Treat resistance as data about which stage is blocked, not as an attitude problem. Each needs a different
+fix, which is why the diagnosis has to be per group:
+
+| What you hear | What is blocked |
+|---|---|
+| "It's slower" | Ability or incentive problem |
+| "It got the prior-injury note wrong" | Trust problem |
+| "Why would I train my replacement?" | Desire, rooted in job security |
+| A senior expert's "I don't need it" | Often loss of status as the person who knows |
 
 The incentive question can usually be made arithmetic. A user adopts the new path when, on the metric
 they are judged by, it beats the old one *including* the cost of verifying the output:
-`t_ai = t_review_output + t_verify + t_fix_errors` versus `t_manual`. If verification is slow or the
-task is short, `t_ai > t_manual` and non-adoption is the rational choice, not a training gap.
+
+- **The comparison:** `t_ai = t_review_output + t_verify + t_fix_errors` versus `t_manual`.
+- **The rational outcome:** if verification is slow or the task is short, `t_ai > t_manual` and
+  non-adoption is the rational choice, not a training gap.
 
 ### 3. Build sponsorship and a change network
-An executive sponsor who visibly uses the tool and explains the why creates legitimacy. Champions inside
-each team, usually the early adopters in Rogers' diffusion model, create proof, *because* people copy
-respected peers more readily than memos. Team leads matter most: if a lead says "don't trust that thing",
-no amount of central communication wins.
+- **Executive sponsor creates legitimacy** by visibly using the tool and explaining the why.
+- **Champions create proof.** These are usually the early adopters in Rogers' diffusion model, inside each
+  team, *because* people copy respected peers more readily than memos.
+- **Team leads matter most.** If a lead says "don't trust that thing", no amount of central communication
+  wins.
 
 ### 4. Change the system around the tool
-Update the SOPs, QA checklists and KPIs so the new way is the measured way. Decide when the old path is
-retired and what the fallback is when the AI is down or wrong. *Because* people follow incentives, an
-unchanged scorecard quietly pulls them back to the old process.
+- **Update SOPs, QA checklists and KPIs** so the new way is the measured way.
+- **Decide when the old path is retired** and what the fallback is when the AI is down or wrong.
+- **Why:** people follow incentives, so an unchanged scorecard quietly pulls them back to the old process.
 
 ### 5. Roll out in phases, and plan for the dip
-Start with a pilot cohort, fix what they hit, then expand. Expect performance to *fall* before it rises
-(often called the J-curve): people are learning a new habit, running old and new paths side by side, and
-hitting first-version bugs. Tell the sponsor in advance, temporarily protect the pilot cohort's
-productivity targets, and judge the change on the trend after the learning period rather than on week
-two, *because* a dip that nobody predicted reads as failure and gets the project cancelled at its
-lowest point.
-
-Close the feedback loop. Publish a "you said, we did" list, *because*
-visible responsiveness is the cheapest way to build desire. Show the measured error rate honestly and
-teach how to verify (citations, confidence cues), which calibrates trust instead of inflating it.
+1. **Pilot cohort first**, fix what they hit, then expand.
+2. **Expect performance to *fall* before it rises** (often called the J-curve): people are learning a new
+   habit, running old and new paths side by side, and hitting first-version bugs.
+3. **Tell the sponsor in advance** and temporarily protect the pilot cohort's productivity targets.
+4. **Judge the trend after the learning period**, not week two, *because* a dip that nobody predicted
+   reads as failure and gets the project cancelled at its lowest point.
+5. **Close the feedback loop.** Publish a "you said, we did" list, *because* visible responsiveness is the
+   cheapest way to build desire.
+6. **Calibrate trust honestly.** Show the measured error rate and teach how to verify (citations,
+   confidence cues), which calibrates trust instead of inflating it.
 
 ### 6. Reinforce and measure
-Track leading indicators (weekly active users in the target group, share of eligible tasks started with
-the AI, override and edit rates) and lagging outcomes (cycle time, quality, cost per case). Usage without
-outcome improvement usually means people are using it but the workflow around it has not changed (or the
-tool is not adding value); outcome improvement without usage means something other than the tool is
-driving the outcome, so crediting the AI would be wrong.
+| Indicator type | Examples |
+|---|---|
+| Leading | Weekly active users in the target group, share of eligible tasks started with the AI, override and edit rates |
+| Lagging | Cycle time, quality, cost per case |
 
-## Example
+- **Usage without outcome improvement** usually means people use it but the workflow around it has not
+  changed (or the tool is not adding value).
+- **Outcome improvement without usage** means something other than the tool is driving the outcome, so
+  crediting the AI would be wrong.
+
+## Diagram
+Walk ADKAR in order for one group and stop at the first stage that fails; the fix sits next to it, not
+further down the list.
+
+```mermaid
+flowchart TD
+    S["Adoption decaying for a group"] --> A{"Aware of why?"}
+    A -->|"no"| A1["Sponsor explains the why"]
+    A -->|"yes"| D{"Want to use it?"}
+    D -->|"no"| D1["Fix incentives, KPIs, job clarity"]
+    D -->|"yes"| K{"Know how?"}
+    K -->|"no"| K1["Training and verification drills"]
+    K -->|"yes"| B{"Able in real work?"}
+    B -->|"no"| B1["Fix integration and verify cost"]
+    B -->|"yes"| R["Reinforce: metrics, SOPs, champions"]
+```
+
+## Examples
+### Break-even calculator: when is the AI path rational?
+Plug in timings from user interviews (these are the illustrative figures from the scenario below) to see
+where the AI path starts beating the manual one on the user's own metric.
+
+```python
+def t_manual(pages, per_page=0.6):
+    return per_page * pages
+
+def t_ai(pages, fixed=10, per_page=0.25):
+    # fixed: read the summary, open and check each cited section
+    # per_page: the spot reading that remains
+    return fixed + per_page * pages
+
+break_even = 10 / (0.6 - 0.25)          # 0.6p = 10 + 0.25p
+print(f"break-even ~ {break_even:.0f} pages")   # ~29 pages
+
+for p in (12, 30, 80):
+    ai, man = t_ai(p), t_manual(p)
+    print(f"{p:3} pages: AI {ai:4.0f} min, manual {man:4.0f} min ->",
+          "use AI" if ai < man else "manual wins")
+# 12 pages: AI 13 vs manual 7  -> manual wins
+# 80 pages: AI 30 vs manual 48 -> use AI
+# Cutting `fixed` (e.g. inline citations) lowers the break-even further.
+```
+
+### Worked scenario: an insurer's claims summarizer
 A hypothetical insurer rolls out an AI claims-file summarizer to 120 adjusters. Usage starts at about 70%
-of adjusters in week one and decays to about 25% by week six. The model's offline eval looks fine, so the
-team interviews ten adjusters and checks the logs instead of retraining.
+of adjusters in week one and decays to about 25% by week six. The model's offline eval looks fine, so
+the team interviews ten adjusters and checks the logs instead of retraining.
 
-The ADKAR diagnosis differs by group. Adjusters know how to use the tool (Knowledge is fine), but Desire is
-low: they are scored on claims closed per day, and on short files reading the summary plus checking it
-takes longer than reading the file. Two team leads tell their teams not to rely on it after a story spread
-about a summary that missed a prior-injury note. Ability is also weak: the summary opens in a separate tab,
-so verification means switching windows.
+**Diagnosis by ADKAR stage:**
 
-The incentive problem is worth doing as arithmetic (illustrative figures from the interviews): reading a
-file by hand takes about 0.6 minutes per page; the AI path costs about 10 minutes of fixed overhead
-(read the summary, open and check each cited section) plus about 0.25 minutes per page for the spot
-reading that remains. Break-even is where 0.6p = 10 + 0.25p, so p ≈ 29 pages. On a 12-page file the AI
-path costs 13 minutes against 7 by hand; on an 80-page file it costs 30 against 48. Adjusters who
-abandoned the tool were, on average, handling shorter files: they were right.
+| Stage | Finding |
+|---|---|
+| Knowledge | Fine: adjusters know how to use the tool |
+| Desire | Low: scored on claims closed per day, and on short files reading the summary plus checking it takes longer than reading the file |
+| Trust (via leads) | Two team leads tell their teams not to rely on it after a story spread about a summary that missed a prior-injury note |
+| Ability | Weak: the summary opens in a separate tab, so verification means switching windows |
 
-Interventions follow the diagnosis. The tool is enabled only for files over 30 pages, where it saves time.
-The missed-note bug is reproduced, fixed and announced, and the team publishes its golden-set result
-(say, a material omission in 1 of 25 long files) alongside the instruction to check cited sections for
-medical history. The two skeptical leads join the pilot review and become champions. The QA checklist is
-updated to accept "summary verified" as a valid review step. Citations are moved inline, which cuts the fixed verification overhead and lowers the break-even
-further. Usage on eligible files recovers and stays, and cycle time on long files becomes the metric
+**The arithmetic** (illustrative figures from the interviews):
+- **Manual:** about 0.6 minutes per page.
+- **AI path:** about 10 minutes fixed overhead plus about 0.25 minutes per page of remaining spot reading.
+- **Break-even:** 0.6p = 10 + 0.25p, so p ≈ 29 pages.
+- **Short file:** on a 12-page file the AI path costs 13 minutes against 7 by hand.
+- **Long file:** on an 80-page file it costs 30 against 48.
+- **Verdict:** adjusters who abandoned the tool were, on average, handling shorter files: they were right.
+
+**Interventions follow the diagnosis:**
+1. **Eligibility:** the tool is enabled only for files over 30 pages, where it saves time.
+2. **Trust:** the missed-note bug is reproduced, fixed and announced; the team publishes its golden-set
+   result (say, a material omission in 1 of 25 long files) alongside the instruction to check cited
+   sections for medical history.
+3. **Leads:** the two skeptical leads join the pilot review and become champions.
+4. **System:** the QA checklist accepts "summary verified" as a valid review step.
+5. **Ability:** citations move inline, which cuts the fixed verification overhead and lowers the
+   break-even further.
+
+**Outcome:** usage on eligible files recovers and stays. Cycle time on long files becomes the metric
 reported to the sponsor, rather than the share of all adjusters using the tool, which would have
 pressured people to use it on short files where it costs time.
 
+## Production patterns
+- **Eligibility gating** — when the tool only beats the manual path on some tasks, enable it by a rule
+  (for example a feature flag on document length over the break-even page count) instead of for
+  everything. Monitor share of *eligible* tasks done the new way and time per task on each path.
+- **Segmented adoption dashboard** — from launch, log usage, overrides and edits with team and task type
+  attached, and chart them per team rather than as one company-wide line. Monitor team-by-team variance
+  with no technical cause, which points at leads or local incentives.
+- **Pre-agreed J-curve review date** — before rollout, agree in writing with the sponsor the learning
+  period, the protected targets for the pilot cohort, and the date of the first go/kill review. Monitor
+  the trend over that window, not single weeks.
+- **"You said, we did" changelog** — publish a short, regular list mapping user-reported problems to the
+  fix shipped, in the channel users already read. Monitor feedback volume and override rate after each
+  fix lands.
+- **Scorecard update as a launch gate** — do not expand beyond the pilot until SOPs, QA checklists and
+  KPIs name the new path. Monitor reversion to the manual path during busy periods as the early warning.
+
 ## Trade-offs
-- A phased pilot surfaces workflow problems cheaply, but it delays org-wide value; skip it only when the change is small and reversible.
-- Retiring the old path forces adoption and ends dual running, but removes the fallback; keep it while the AI's error rate is still being established.
-- Heavy executive sponsorship speeds legitimacy, but a sponsor seen as imposing cuts can turn the change into a headcount fight; it flips back to an asset once the sponsor has stated plainly what happens to roles.
-- Mandating usage gets the numbers up quickly, but produces compliance theatre unless incentives and workflow change first.
-- Investing in a champion network costs people's time, which pays off at scale and is overkill for a ten-person team.
+- **Phased pilot vs speed.** A pilot surfaces workflow problems cheaply but delays org-wide value; skip
+  it only when the change is small and reversible.
+- **Retiring the old path vs keeping a fallback.** Retiring forces adoption and ends dual running, but
+  removes the fallback; keep it while the AI's error rate is still being established.
+- **Heavy executive sponsorship vs headcount fear.** It speeds legitimacy, but a sponsor seen as imposing
+  cuts can turn the change into a headcount fight; it flips back to an asset once the sponsor has stated
+  plainly what happens to roles.
+- **Mandating usage vs real adoption.** It gets the numbers up quickly, but produces compliance theatre
+  unless incentives and workflow change first.
+- **Champion network vs people's time.** It costs time, which pays off at scale and is overkill for a
+  ten-person team.
 
 ## Pitfalls
-- Treating training as the whole change plan; the symptom is high course completion with usage decaying after launch week.
-- Measuring logins instead of the target behavior; dashboards look healthy while cycle time and quality do not move.
-- Leaving old KPIs in place, which shows up as users reverting to the manual path whenever they are busy.
-- Ignoring team leads and middle managers; usage varies sharply team by team with no technical explanation.
-- Overselling accuracy at launch, so the first visible error triggers a trust collapse and a spike in overrides.
-- Setting an adoption target of "everyone uses it for everything"; the symptom is usage on tasks where the tool is slower, flat or worse outcomes, and resentment.
-- Reviewing results during the learning dip, which shows up as a sponsor wanting to cancel in week three when the trend was about to turn.
-- Staying silent on job impact, revealed by rumors, union or works-council questions, and slow passive resistance.
+- **Treating training as the whole change plan.** Symptom: high course completion with usage decaying
+  after launch week.
+- **Measuring logins instead of the target behavior.** Dashboards look healthy while cycle time and
+  quality do not move.
+- **Leaving old KPIs in place.** Shows up as users reverting to the manual path whenever they are busy.
+- **Ignoring team leads and middle managers.** Usage varies sharply team by team with no technical
+  explanation.
+- **Overselling accuracy at launch.** The first visible error triggers a trust collapse and a spike in
+  overrides.
+- **Targeting "everyone uses it for everything".** Symptom: usage on tasks where the tool is slower, flat
+  or worse outcomes, and resentment.
+- **Reviewing results during the learning dip.** Shows up as a sponsor wanting to cancel in week three
+  when the trend was about to turn.
+- **Staying silent on job impact.** Revealed by rumors, union or works-council questions, and slow passive
+  resistance.
 
 ## When to use
-Plan change management whenever an AI system changes how a group of people does its daily work, which is
-almost every enterprise deployment beyond a developer tool. The size of the effort scales with the number
-of people affected, how much their metrics and roles change, and how costly mistakes are. Start it during
-scoping, not after launch: the behavior statement and impact assessment belong next to the success
-metrics. Measure the target behavior and the business outcome, not logins: share of *eligible* tasks done
-the new way, override and edit rates, time per task on the new path versus the old, and usage segmented
-by team (team-by-team variance with no technical cause points at leads or local incentives). If you
-cannot write the behavior sentence or show the new path beats the old on the user's own metric, fix that
-before planning communications. In interviews, the signal is
-whether you treat low adoption as a diagnosis problem (which ADKAR stage is blocked, for whom) rather than
-as a call for more training or a better model.
+- **Use when** an AI system changes how a group of people does its daily work, which is almost every
+  enterprise deployment beyond a developer tool. Effort scales with the number of people affected, how
+  much their metrics and roles change, and how costly mistakes are.
+- **Start during scoping, not after launch.** The behavior statement and impact assessment belong next to
+  the success metrics.
+- **Measure** the target behavior and business outcome, not logins: share of *eligible* tasks done the new
+  way, override and edit rates, time per task on the new path versus the old, and usage segmented by team
+  (team-by-team variance with no technical cause points at leads or local incentives).
+- **Fix first** if you cannot write the behavior sentence or show the new path beats the old on the user's
+  own metric; do that before planning communications.
+- **Interviews:** the signal is whether you treat low adoption as a diagnosis problem (which ADKAR stage is
+  blocked, for whom) rather than as a call for more training or a better model.
 
 ## Role lens
 - **Engineer:** Instruments the product so the target behavior is measurable, and builds the trust affordances (citations, confidence cues, easy override) users need.
@@ -177,6 +271,42 @@ as a call for more training or a better model.
 ## Check yourself
 **Q:** Six weeks after launch, usage of your AI drafting tool has halved, but offline evals are unchanged. The sponsor wants to fund a model upgrade. What do you do first?
 **A:** I would not assume the model is the cause, because evals are flat and decay after a launch spike is the classic adoption pattern. I would segment usage by team and task type, interview a handful of users and team leads, and map what I find onto ADKAR to find the first blocked stage. Typical causes are incentives (old KPIs), workflow friction (verification is slow), a trust event (one bad output went viral) or a lead discouraging use. Each has a cheaper fix than a model upgrade. I would come back to the sponsor with the diagnosis, the targeted fixes and the metric that will show whether they worked.
+
+## Interview questions
+### What is ADKAR, and why is it more useful as a diagnostic than as a plan?
+- **Definition:** five individual-level stages: Awareness, Desire, Knowledge, Ability, Reinforcement.
+- **Why diagnostic:** you work on the first blocked stage for a given group, because each stage needs a
+  different fix; training (Knowledge) cannot repair Desire, and enthusiasm cannot repair a missing
+  integration (Ability).
+- **So** running every stage as a ceremony for every group wastes effort on stages that are already fine.
+
+### One team uses the tool heavily and an identical team barely touches it. How do you debug that?
+- **Rule out technical causes first:** same version, same data, same integrations, similar task mix.
+- **Then look at people:** what the team lead says about the tool, how that team's KPIs are set, and
+  whether a trust event happened there.
+- **Fix locally:** bring the lead into the pilot review, protect targets during learning, and recheck
+  team-level usage and outcome a few weeks later.
+
+### When would you not mandate use of an AI tool?
+- **When the new path loses on the user's own metric.** If `t_ai > t_manual` for a task, a mandate forces
+  slower work and breeds compliance theatre.
+- **When the error rate is not yet established**, because removing the manual fallback leaves no safe
+  path when the AI is wrong.
+- **Mandate later**, once incentives, SOPs and workflow already favor the new path and the old one is
+  being retired deliberately.
+
+### Which numbers would you put on the adoption dashboard, and which would you leave off?
+- **Leading:** share of eligible tasks started with the AI in the target group, override and edit rates,
+  weekly active users in that group.
+- **Lagging:** cycle time, quality and cost per case, against the pre-launch baseline.
+- **Leave off or demote:** company-wide logins and training completion, because they measure exposure,
+  not behavior, and pressure people to use the tool where it costs time.
+
+### How do you keep a sponsor from cancelling during the J-curve dip?
+- **Predict it in writing before launch:** expected dip, learning period length, and the review date.
+- **Protect the pilot cohort's targets** for that period so the dip does not punish early adopters.
+- **Report the trend** and the fixes shipped ("you said, we did"), so the sponsor judges direction rather
+  than a single bad week.
 
 ## Quiz
 ### Q: In ADKAR terms, what is the main risk of responding to low adoption with more training sessions?

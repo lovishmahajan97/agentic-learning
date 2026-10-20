@@ -68,7 +68,8 @@ send {"type": "http.response.body", "body": b"", "more_body": False}     # end o
 
 - **No `Content-Length` up front**, so over HTTP/1.1 uvicorn uses `Transfer-Encoding: chunked`.
 - **Behind a proxy that terminates HTTP/2**, the chunks become DATA frames.
-- **Do not set `Content-Length` yourself** unless you really know it.
+- **Do not set `Content-Length` yourself** unless you really know it, because the chunked framing above
+  depends on its absence and a wrong length truncates or hangs the client.
 
 ### Sync versus async iterators
 | Content | How Starlette drives it | Cost |

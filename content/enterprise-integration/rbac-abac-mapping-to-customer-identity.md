@@ -5,7 +5,7 @@ name: RBAC / ABAC mapping to customer identity
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - enterprise-integration/sso-iam-integration
   - enterprise-integration/scim-provisioning
@@ -22,83 +22,101 @@ sources:
 ---
 
 ## TL;DR
-Your product has its own permission model; each customer's identity provider has its own groups and
-attributes. Mapping is the per-tenant translation layer between them: customer group IDs become your roles
-(RBAC), and customer attributes such as department, region or clearance become inputs to policies (ABAC).
-It must be explicit, stored as configuration, keyed by immutable IDs and evaluated on every request,
-because the AI layer (retrieval filters, agent tools) is where a wrong mapping turns into a data leak.
+Mapping is the per-tenant layer that turns customer IdP group IDs into your roles (RBAC) and customer
+attributes into policy inputs (ABAC). Keep it as config keyed by immutable IDs, evaluated per request,
+because retrieval and agents are where wrong mappings leak.
 
 ## Why it exists
-A customer arrives with an Entra or Okta directory full of groups like `GRP-FIN-EMEA-RO`, `All Staff` and
-`Contractors-2023`, and attributes like `department=Legal` and `country=DE`. Your product has roles such as
-`viewer`, `editor` and `admin`, and documents synced from their systems with their own ACLs. Nobody
-designed these to fit.
-
-The naive approaches fail in predictable ways. Hard-coding group names in code ("if 'Admins' in groups")
-works for one customer and is wrong for the next, and breaks on rename. Granting everyone in the tenant the
-same access ignores the fact that their source systems already restrict HR, M&A and legal content.
-Re-implementing their whole permission model inside your product creates a second source of truth that
-drifts. Pure RBAC also struggles with rules like "regional managers see deals in their region": with six
-functions, five regions and three seniority levels, encoding each combination as a role gives 90 roles,
-and adding one region adds 18 more, each of which a customer admin must bind and review. ABAC states the
-rule once, `subject.region == resource.region`, and adding a region adds no policy. And AI adds a new principal: an agent acting for a user
-must not exceed that user's rights, nor be granted broader rights because it runs as a service. A mapping
-layer gives each customer a reviewable, testable statement of who can do what.
+- **Nobody designed the two sides to fit.** A customer's Entra or Okta directory has groups like
+  `GRP-FIN-EMEA-RO`, `All Staff` and `Contractors-2023`, and attributes like `department=Legal` and
+  `country=DE`. Your product has roles such as `viewer`, `editor` and `admin`, plus documents synced with
+  their own ACLs.
+- **The naive approaches fail predictably.**
+  - Hard-coding group names ("if 'Admins' in groups") works for one customer, is wrong for the next, and
+    breaks on rename.
+  - Granting everyone in the tenant the same access ignores that source systems already restrict HR, M&A
+    and legal content.
+  - Re-implementing their whole permission model creates a second source of truth that drifts.
+- **Pure RBAC explodes on contextual rules.** "Regional managers see deals in their region" with six
+  functions, five regions and three seniority levels is 90 roles; adding one region adds 18 more, each bound
+  and reviewed by a customer admin. ABAC states the rule once, `subject.region == resource.region`, and
+  adding a region adds no policy.
+- **AI adds a new principal.** An agent acting for a user must not exceed that user's rights, nor be granted
+  broader rights because it runs as a service. A mapping layer gives each customer a reviewable, testable
+  statement of who can do what.
 
 ## How it works
 ### Three kinds of permission inputs
-1. **Product permissions**: what actions exist in your app (configure workspace, run agent X, export).
-   These are your roles; RBAC fits *because* the action set is small and stable.
-2. **Data permissions**: who may see each document or record. For synced content these come from the
-   source system's ACLs (users and groups), so you carry them rather than invent them.
-3. **Contextual rules**: attribute conditions such as region, department, data classification, device or
-   time. ABAC fits *because* these are combinations that would otherwise multiply roles.
+| Input | Examples | Model | Why that model |
+|---|---|---|---|
+| 1. **Product permissions** | configure workspace, run agent X, export | RBAC (your roles) | *Because* the action set is small and stable |
+| 2. **Data permissions** | who may see each document or record | Carried source ACLs (users and groups) | You carry them rather than invent them |
+| 3. **Contextual rules** | region, department, data classification, device, time | ABAC | *Because* these combinations would otherwise multiply roles |
 
 ### The mapping record (per tenant)
-- `role_bindings`: IdP group *object ID* to product role, e.g. Entra group `3f2a…` to `workspace_admin`.
-  IDs, *because* display names are neither unique nor stable.
-- `attribute_map`: IdP claim name to your attribute, e.g. `extension_region` to `region`, with allowed values.
-- `policies`: ABAC rules over subject, resource and action attributes, e.g. `resource.classification ==
-  "confidential" requires subject.clearance >= 2`.
-- `default`: what an authenticated user with no matching binding gets, usually nothing beyond basic access.
+- **`role_bindings`:** IdP group *object ID* to product role, e.g. Entra group `3f2a…` to
+  `workspace_admin`. IDs, *because* display names are neither unique nor stable.
+- **`attribute_map`:** IdP claim name to your attribute, e.g. `extension_region` to `region`, with allowed values.
+- **`policies`:** ABAC rules over subject, resource and action attributes, e.g.
+  `resource.classification == "confidential" requires subject.clearance >= 2`.
+- **`default`:** what an authenticated user with no matching binding gets, usually nothing beyond basic access.
 
 ### Translating source ACLs into the customer's identities
 Carried ACLs name principals in each source's vocabulary (SharePoint site groups, Confluence groups, Slack
-channels, Salesforce public groups), not the IdP groups your role bindings use. There are two ways to join
-them, and the choice is a real design decision:
-- **Expand at index time.** Resolve each document's ACL to user IDs and store those. Queries are a simple
-  membership test, but one person joining a 10,000-member group rewrites the ACL of every document that group
-  can see, so membership churn becomes index churn.
-- **Resolve at query time.** Store source principal IDs on documents, and compute for each user the set of
-  source principals they hold (from a crosswalk of source identities to IdP IDs plus synced source-group
-  membership). Documents change only when their own ACL changes; the cost moves to keeping the per-user
-  principal set current and fast to look up. It is the more common choice once groups are large.
-Either way, a source principal the crosswalk cannot resolve grants nothing, *because* guessing (by display
-name, say) is how one person's access lands on another.
+channels, Salesforce public groups), not the IdP groups your role bindings use. Two ways to join them:
+
+| | Expand at index time | Resolve at query time |
+|---|---|---|
+| Stored on documents | ACL resolved to user IDs | Source principal IDs |
+| Query cost | Simple membership test | Look up the user's set of held source principals |
+| What membership churn costs | One person joining a 10,000-member group rewrites the ACL of every document that group can see | Documents change only when their own ACL changes |
+| Where effort goes | Index churn | Keeping the per-user principal set current and fast (crosswalk of source identities to IdP IDs plus synced source-group membership) |
+| Typical choice | Small groups | More common once groups are large |
+
+- **Either way, an unresolvable source principal grants nothing**, *because* guessing (by display name, say)
+  is how one person's access lands on another.
 
 ### Resolving a principal
-At login (OIDC/SAML) and on SCIM updates, build the principal: stable user key, group IDs (including nested
-groups resolved by the IdP or Graph), mapped roles and attributes. Cache with a short TTL and invalidate on
-SCIM events.
+1. **At login (OIDC/SAML) and on SCIM updates**, build the principal: stable user key, group IDs (including
+   nested groups resolved by the IdP or Graph), mapped roles and attributes.
+2. **Cache with a short TTL** and invalidate on SCIM events.
 
 ### Enforcing
-Evaluate in one policy decision point, *because* scattered `if` statements cannot be audited. Fix the
-combining rules explicitly: deny by default, an explicit deny overrides any allow, and a policy whose
-attribute is missing evaluates to deny (fail closed), with the missing-attribute rate monitored so that
-fail-closed shows up as a data-quality alert rather than as silent lockouts. Options range
-from a small in-process function to a policy engine (OPA/Rego, Cedar) or a relationship-based system
-(Zanzibar-style, e.g. OpenFGA or SpiceDB) when permissions follow object graphs like folders and shares.
+- **One policy decision point**, *because* scattered `if` statements cannot be audited.
+- **Explicit combining rules:** deny by default; an explicit deny overrides any allow; a policy whose
+  attribute is missing evaluates to deny (fail closed).
+- **Monitor the missing-attribute rate**, so fail-closed shows up as a data-quality alert rather than as
+  silent lockouts.
+- **Engine options:** a small in-process function; a policy engine (OPA/Rego, Cedar); or a
+  relationship-based system (Zanzibar-style, e.g. OpenFGA or SpiceDB) when permissions follow object graphs
+  like folders and shares.
 
 ### AI-specific enforcement
-- **Retrieval**: filter candidate chunks by the principal's source groups and attributes *before* ranking
+- **Retrieval:** filter candidate chunks by the principal's source groups and attributes *before* ranking
   and generation, never by asking the model to withhold.
-- **Agents**: effective permission = user permission ∩ agent's granted scope. The agent never gains
-  rights the user lacks, and a broadly entitled user does not make a narrow agent broad.
-- **Audit**: log the decision inputs (principal, rule matched) so a customer can ask "why could Ana see this?"
+- **Agents:** effective permission = user permission ∩ agent's granted scope. The agent never gains rights
+  the user lacks, and a broadly entitled user does not make a narrow agent broad.
+- **Audit:** log the decision inputs (principal, rule matched) so a customer can ask "why could Ana see this?"
 
-## Example
-An in-process evaluator showing the three layers. Tenant config is data, not code; agent scope intersects
-with user rights.
+## Diagram
+Identity claims become a principal once; every product action, retrieval and agent call asks the same
+decision point.
+
+```mermaid
+flowchart TD
+    C["IdP claims and SCIM data"] --> P["Resolve principal"]
+    M[("Tenant mapping config")] --> P
+    P --> PDP{"Policy decision point"}
+    PDP -->|"role allows action"| A["Product action"]
+    PDP -->|"ACL and attribute match"| R["Retrieval filter before ranking"]
+    PDP -->|"user rights and agent scope"| G["Agent tool call"]
+    PDP -.->|"principal and rule matched"| L[("Decision audit log")]
+    PDP -->|"no match or missing attribute"| D["Deny"]
+```
+
+## Examples
+### In-process evaluator with the three layers
+Tenant config is data, not code; agent scope intersects with user rights.
 
 ```python
 TENANT_CFG = {
@@ -137,40 +155,94 @@ print(can_act(ana, "query"), can_act(ana, "export"), can_read(ana, deal))   # Tr
 print(can_act(ana, "query", agent_scope={"export"}))                       # False
 ```
 
-Ana is an analyst in the EMEA sales group. She can query but not export; she is in a group on the deal's
-ACL, yet the regional attribute rule denies the AMER deal; and an agent scoped only to `export` cannot query
-on her behalf.
+- **Ana is an analyst in the EMEA sales group.** She can query but not export.
+- **The ACL matches but ABAC denies.** She is in a group on the deal's ACL, yet the regional attribute rule
+  denies the AMER deal.
+- **The agent cannot amplify her.** An agent scoped only to `export` cannot query on her behalf.
+
+### Query-time resolution of source principals
+Pure Python, runnable. Documents keep source principal IDs; each user gets a cached set of principals they
+hold, built from the crosswalk and synced source-group membership.
+
+```python
+# Synced from each source: source group -> member source identities (nested groups pre-expanded)
+SOURCE_GROUP_MEMBERS = {
+    "confluence:group:legal": {"atl:5b10"},                 # Atlassian account IDs
+    "sharepoint:sitegroup:hr-owners": {"entra:9a1f"},       # SharePoint uses Entra object IDs
+    "slack:channel:C-deals": {"slack:U02ABC", "slack:U07XYZ"},
+}
+# Crosswalk: source identity -> IdP object ID, joined on IdP ID or verified email
+CROSSWALK = {"atl:5b10": "entra:9a1f", "slack:U02ABC": "entra:9a1f", "entra:9a1f": "entra:9a1f"}
+
+def principal_set(idp_user: str) -> set:
+    """Every source principal this IdP user holds; computed per user, cached, invalidated on change."""
+    mine = {src for src, idp in CROSSWALK.items() if idp == idp_user}
+    return mine | {g for g, members in SOURCE_GROUP_MEMBERS.items() if members & mine}
+
+def visible(doc_acl: set, held: set) -> bool:
+    return bool(doc_acl & held)          # unresolved principals never match anyone: fail closed
+
+held = principal_set("entra:9a1f")
+print(visible({"confluence:group:legal"}, held))          # True: via crosswalked Atlassian ID
+print(visible({"slack:channel:C-board"}, held))           # False: not a member
+print(visible({"confluence:user:unknown-guest"}, held))   # False: unresolved grants nothing
+```
+
+### Worked numbers: roles vs attributes, index vs query time
+| Change | RBAC-only or index-time cost | ABAC or query-time cost |
+|---|---|---|
+| Regional rule, 6 functions × 5 regions × 3 levels | 90 roles to bind and review | 1 rule |
+| Add a sixth region | 18 more roles | 0 new rules; tag deals with the new region |
+| One person joins a 10,000-member group that can see 200,000 documents (illustrative) | 200,000 document ACL rewrites | 1 user's principal set recomputed |
+
+## Production patterns
+- **Mapping as versioned, reviewed config.** Store each tenant's `role_bindings`, `attribute_map` and
+  policies as data with change history, edited through an admin UI or reviewed change, never in code.
+  Monitor unmapped-user counts per tenant after each change.
+- **Fail closed with a data-quality alarm.** Deny when a required attribute is missing, and alert when the
+  missing rate for `region` or `department` exceeds a threshold you agree with the customer. Monitor
+  denied-request reasons.
+- **Externalised policies when rules grow.** Move rules to an engine such as Cedar, where the regional rule is
+  `permit (principal, action == Action::"read", resource) when { principal.region == resource.region };`,
+  or to OpenFGA/SpiceDB for folder-and-share graphs. Monitor decision latency on the request path.
+- **Decision logs that answer "why".** Log principal, resource, action and the rule that matched for every
+  retrieval and agent decision. Monitor by sampling: a customer admin reviews a set of decisions each quarter.
+- **Canary users per sensitive group.** Keep test users in HR, legal and each region, and run scheduled
+  retrieval queries as them that must and must not return known documents. Alert on any wrong answer.
 
 ## Trade-offs
-- RBAC role bindings are easy for customer admins to review, but encoding contextual rules as roles explodes
-  their number; switch to ABAC when roles start encoding region × function × level.
-- ABAC expresses fine-grained rules compactly, but decisions depend on attribute quality in the customer's
-  directory; if `department` is blank for a third of users, policies silently deny or over-grant.
-- Carrying source-system ACLs keeps your app consistent with the customer's existing permissions, but
-  inherits their mistakes and lags by a sync cycle; live checks against the source are exact but slow.
-- A central policy engine gives auditability and consistent decisions, but adds a dependency on the request
-  path; an in-process library is faster and is enough while rules stay simple.
+- **RBAC reviewability vs role explosion.** Role bindings are easy for customer admins to review, but
+  encoding contextual rules as roles explodes their number. Switch to ABAC when roles start encoding region
+  × function × level.
+- **ABAC compactness vs attribute quality.** Decisions depend on the customer's directory; if `department` is
+  blank for a third of users, policies silently deny or over-grant.
+- **Carried ACLs vs live checks.** Carrying source ACLs keeps you consistent with existing permissions, but
+  inherits their mistakes and lags by a sync cycle. Live checks against the source are exact but slow.
+- **Central engine vs in-process library.** A central policy engine gives auditability and consistent
+  decisions but adds a dependency on the request path. An in-process library is faster and enough while
+  rules stay simple.
 
 ## Pitfalls
-- Binding roles to group display names; the symptom is a customer renaming a group and all its members
-  losing or gaining access overnight.
-- A permissive default for unmapped users; the symptom is a newly onboarded department seeing the whole
+- **Binding roles to group display names.** Symptom: a customer renames a group and all its members lose or
+  gain access overnight.
+- **A permissive default for unmapped users.** Symptom: a newly onboarded department sees the whole
   workspace because no binding matched.
-- Filtering retrieval after generation or relying on the prompt to withhold; the symptom is restricted facts
-  appearing in answers, paraphrased.
-- Running agents with a service identity broader than the user; the symptom is an agent completing an action
-  the user could not perform directly in the UI.
-- Expanding document ACLs to individual users at index time for large groups; the symptom is index write
-  volume and permission lag that spike whenever HR moves people between big groups.
-- Ignoring nested groups; the symptom is users whose access comes through a parent group seeing nothing.
+- **Filtering after generation, or relying on the prompt to withhold.** Symptom: restricted facts appear in
+  answers, paraphrased.
+- **Agents with a service identity broader than the user.** Symptom: an agent completes an action the user
+  could not perform directly in the UI.
+- **Index-time expansion for large groups.** Symptom: index write volume and permission lag spike whenever
+  HR moves people between big groups.
+- **Ignoring nested groups.** Symptom: users whose access comes through a parent group see nothing.
 
 ## When to use
-Introduce an explicit mapping layer as soon as a second customer brings its own directory, and before any AI
-feature indexes customer content. Start with role bindings by group ID plus carried source ACLs; add ABAC
-rules when customers ask for regional, classification or clearance restrictions. Measure unmapped-user
-counts per tenant, denied-request reasons, and results from periodic access reviews where a customer admin
-checks a sample of decisions. In interviews, explain how user rights, agent scope and document ACLs combine,
-and where the decision is enforced.
+- **Use when** a second customer brings its own directory, and before any AI feature indexes customer content.
+- **Start with** role bindings by group ID plus carried source ACLs.
+- **Add ABAC** when customers ask for regional, classification or clearance restrictions.
+- **Measure:** unmapped-user counts per tenant, denied-request reasons, and periodic access reviews where a
+  customer admin checks a sample of decisions.
+- **Interviews:** explain how user rights, agent scope and document ACLs combine, and where the decision is
+  enforced.
 
 ## Role lens
 - **Engineer:** Implements principal resolution, the policy decision function or engine integration, and
@@ -189,6 +261,38 @@ ABAC: map the IdP region attribute and tag each deal with its region, then allow
 the user is in the global-deals group ID. Enforce in one policy function used by the retrieval filter and by
 agent tools, and verify attribute coverage first, because users with no region would otherwise be denied
 everything.
+
+## Interview questions
+### What is the difference between RBAC and ABAC, and why do enterprise AI products usually need both?
+- **RBAC** grants actions through roles; it fits product permissions because the action set is small and
+  stable and admins can review bindings.
+- **ABAC** evaluates rules over subject, resource and action attributes; it fits region, classification and
+  clearance rules that would otherwise multiply roles.
+- **Both, plus carried source ACLs**, because data visibility is already defined in the customer's systems.
+
+### A user who changed teams still gets answers from the old team's documents. Where do you look?
+- **Principal cache:** was it invalidated on the SCIM group-removal event, or is it waiting out its TTL?
+- **Source-group sync:** has the source system's own group membership been resynced, since carried ACLs lag
+  by a sync cycle?
+- **Index-time expansion:** if ACLs were expanded to users, the rewrite for that group may be queued or failed.
+
+### Would you expand document ACLs to users at index time or resolve them at query time?
+- **Index time** for small, stable groups: queries are a cheap membership test.
+- **Query time** once groups are large: one join to a 10,000-member group otherwise rewrites every document
+  that group can see.
+- **Either way**, unresolved principals grant nothing.
+
+### How do agent permissions combine with user permissions, and why not a union?
+- **Effective permission is the intersection** of the user's rights and the agent's granted scope.
+- **A union lets either side amplify the other:** a narrow agent becomes broad for an admin, or a service
+  identity gives a junior user admin actions.
+
+### A third of the customer's users have a blank `department`. What happens to your ABAC rules?
+- **With fail-closed evaluation**, those users are denied anything that depends on department, which looks
+  like an outage to them.
+- **With careless defaults**, they may be over-granted, which is worse.
+- **Fix it upstream:** alert on missing-attribute rate, agree a cleanup or fallback attribute with the IAM
+  admin, and test before rollout.
 
 ## Quiz
 ### Q: Why should role bindings reference IdP group object IDs rather than names?

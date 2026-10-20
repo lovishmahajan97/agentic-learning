@@ -5,7 +5,7 @@ name: Terraform (infrastructure as code)
 kind: tool
 difficulty: core
 est_minutes: 19
-status: reviewed
+status: crisp
 related:
   - deployment/customer-vpc-on-prem-air-gapped
   - deployment/private-endpoints
@@ -22,101 +22,132 @@ sources:
 ---
 
 ## TL;DR
-Infrastructure as code (IaC) describes networks, clusters, GPU node pools, buckets and permissions in
-versioned files that a tool reconciles against reality, instead of clicking through consoles. Terraform
-is the most widely used multi-cloud IaC tool: you declare desired state in HCL, it diffs that against a recorded
-state file and the provider APIs, shows a plan, and applies only the difference. That makes environments
-reproducible, reviewable and repeatable in every customer account you deploy to.
+Terraform describes networks, GPU node pools, buckets and permissions as versioned HCL, diffs that
+against a state file and the cloud APIs, shows a plan and applies only the difference, so every
+environment and customer account is reproducible and reviewable.
 
 ## Why it exists
-An AI platform is a lot of infrastructure: a VPC with private subnets, private endpoints to the model
-API and storage, a Kubernetes cluster with a GPU node pool, a vector database, KMS keys, IAM roles,
-log sinks. Built by hand in a console, it works once. Then you need a staging copy, then the customer
-wants it in their own account in another region, then an auditor asks who opened port 443 to the world
-and when.
-
-Console work fails because it leaves no reviewable record, cannot be reproduced exactly, and drifts:
-the third environment is never quite like the first. Imperative scripts (a shell file of CLI calls) are
-better but still brittle, because they encode steps rather than outcomes, so running them twice either
-fails ("already exists") or duplicates resources, and they cannot tell you what would change before
-they change it.
-
-Declarative IaC fixes this by making the files the source of truth. You state what should exist; the
-tool works out the create, update and delete calls, and can show them to a reviewer first. Changes go
-through pull requests like application code, so a security reviewer can approve the diff rather than
-trust a screenshot. For forward-deployed work this is decisive: the same reviewed module can be run by
-the customer's own platform team, in their account, under their change control.
+- **An AI platform is a lot of infrastructure.** A VPC with private subnets, private endpoints to the
+  model API and storage, a Kubernetes cluster with a GPU node pool, a vector database, KMS keys, IAM
+  roles, log sinks.
+- **Console work works once.** Then you need a staging copy, the customer wants it in their own account
+  in another region, and an auditor asks who opened port 443 to the world and when. Console changes
+  leave no reviewable record, cannot be reproduced exactly, and drift: the third environment is never
+  quite like the first.
+- **Imperative scripts are brittle.** A shell file of CLI calls encodes steps rather than outcomes, so
+  running it twice fails ("already exists") or duplicates resources, and it cannot say what would change
+  before changing it.
+- **Declarative IaC makes the files the source of truth.** You state what should exist; the tool works
+  out the create, update and delete calls and shows them to a reviewer first. Changes go through pull
+  requests, so a security reviewer approves the diff rather than trusting a screenshot.
+- **Decisive for forward-deployed work.** The same reviewed module can be run by the customer's own
+  platform team, in their account, under their change control.
 
 ## How it works
 ### Configuration, providers and the resource graph
-You write `.tf` files in HCL declaring resources (`aws_vpc_endpoint`, `google_container_node_pool`,
-`azurerm_private_endpoint`) with arguments. Providers are plugins that translate each resource type into
-API calls for a cloud or service; that plugin model is why one tool covers AWS, Azure, Google Cloud,
-Kubernetes, DNS providers and many SaaS products. Terraform parses references between resources
-(a security group ID used by an endpoint) into a dependency graph, then creates independent resources in
-parallel and dependent ones in order. That is why you rarely write ordering by hand.
+- **Resources in HCL.** You write `.tf` files declaring resources (`aws_vpc_endpoint`,
+  `google_container_node_pool`, `azurerm_private_endpoint`) with arguments.
+- **Providers are plugins** translating each resource type into API calls for a cloud or service; that
+  plugin model is why one tool covers AWS, Azure, Google Cloud, Kubernetes, DNS providers and many SaaS
+  products.
+- **A dependency graph.** References between resources (a security group ID used by an endpoint) become
+  a graph; independent resources are created in parallel and dependent ones in order, which is why you
+  rarely write ordering by hand.
 
 ### State
-Terraform records what it created, and the real IDs, in a state file. State exists because the tool
-must map `aws_s3_bucket.documents` in your code to one specific bucket in the account, and must know
-which resources it owns so it can delete one you removed from the code. Teams store state remotely
-(object storage, Terraform Cloud/HCP, or similar) with locking so two applies cannot run at once and
-corrupt it. State contains every attribute the provider returns, including generated passwords and
-keys, in plain text, so it must be encrypted and access-controlled like a secret.
+- **What it records.** What Terraform created, and the real IDs, in a state file.
+- **Why it exists.** The tool must map `aws_s3_bucket.documents` in your code to one specific bucket in
+  the account, and know which resources it owns so it can delete one you removed from the code.
+- **Remote with locking.** Teams store state remotely (object storage, Terraform Cloud/HCP, or similar)
+  with locking so two applies cannot run at once and corrupt it.
+- **It is a secret.** State holds every attribute the provider returns, including generated passwords and
+  keys, in plain text, so encrypt and access-control it like a secret.
 
 ### Plan and apply
-`terraform plan` refreshes state from the real APIs, compares with your configuration and prints the
-create/update/replace/destroy actions. "Replace" is the line to read carefully, because some argument
-changes cannot be updated in place and force destroy-then-create, which for a database or bucket means
-data loss. `terraform apply` executes a plan; in CI you save the plan file and apply exactly that plan
-after approval, so what was reviewed is what runs.
-
-### Modules and variables
-Modules package resources behind input variables and outputs, like functions. A "customer deployment"
-module might take a VPC ID, subnet IDs, region and KMS key, and output the service URL. Each environment
-or customer is then a small root configuration calling that module with different inputs.
+1. **Plan.** `terraform plan` refreshes state from the real APIs, compares with your configuration and
+   prints the create/update/replace/destroy actions.
+2. **Read "replace" carefully.** Some argument changes cannot be updated in place and force
+   destroy-then-create, which for a database or bucket means data loss.
+3. **Apply exactly what was reviewed.** `terraform apply` executes a plan; in CI you save the plan file
+   and apply exactly that plan after approval, so what was reviewed is what runs.
 
 ### How the diff decides update versus replace
-For each resource the plan compares three things: the configuration, the last-recorded state, and what
-the refresh read from the API. If an argument differs, the provider's schema says whether the API can
-change it in place (a tag, an instance count) or whether it is immutable once created (a bucket name,
-a cluster's subnet), in which case the action becomes replace. Replacement defaults to
-destroy-then-create *because* many names must be unique; `lifecycle { create_before_destroy = true }`
-reverses the order for stateless things like launch templates or certificates, so there is no gap.
+- **Three inputs per resource:** the configuration, the last-recorded state, and what the refresh read
+  from the API.
+- **The provider schema decides.** If an argument differs, the schema says whether the API can change it
+  in place (a tag, an instance count) or whether it is immutable once created (a bucket name, a
+  cluster's subnet), in which case the action becomes replace.
+- **Order of replacement.** Defaults to destroy-then-create *because* many names must be unique;
+  `lifecycle { create_before_destroy = true }` reverses the order for stateless things like launch
+  templates or certificates, so there is no gap.
+
+| Plan symbol | Action | Risk |
+|---|---|---|
+| `+` | create | low |
+| `~` | update in place | usually low; read the changed arguments |
+| `-/+` | destroy then create (replace) | data loss for stateful resources |
+| `+/-` | create then destroy (`create_before_destroy`) | brief duplicate; names must allow it |
+| `-` | destroy | check it was intended |
 
 ### Resource addresses are identity
-State keys each object by its address in code (`module.rag.aws_s3_bucket.documents`), not by its
-cloud ID. Renaming a block, moving it into a module or switching `count` to `for_each` therefore looks
-to Terraform like "delete the old address, create a new one", even though nothing real changed. A
-`moved { from = ..., to = ... }` block (or `terraform state mv`) tells it the object merely changed
-address, and the plan becomes a no-op. This is the mechanism behind most "harmless refactor recreated
-the database" stories.
+- **State keys objects by code address** (`module.rag.aws_s3_bucket.documents`), not by cloud ID.
+- **So refactors look like replacement.** Renaming a block, moving it into a module or switching `count`
+  to `for_each` reads as "delete the old address, create a new one", even though nothing real changed.
+- **The fix.** A `moved { from = ..., to = ... }` block (or `terraform state mv`) says the object merely
+  changed address, and the plan becomes a no-op. This is the mechanism behind most "harmless refactor
+  recreated the database" stories.
 
-### Drift and import
-If someone changes a resource in the console, the next plan shows drift and proposes reverting it.
-Existing hand-built resources can be adopted with an `import` block or `terraform import` so they come
-under management without being recreated.
+### Modules, environments and drift
+- **Modules are functions.** They package resources behind input variables and outputs. A "customer
+  deployment" module might take a VPC ID, subnet IDs, region and KMS key, and output the service URL;
+  each environment or customer is a small root configuration calling it with different inputs.
+- **Drift.** If someone changes a resource in the console, the next plan shows drift and proposes
+  reverting it.
+- **Import.** Existing hand-built resources are adopted with an `import` block or `terraform import`, so
+  they come under management without being recreated.
 
 ### One state per environment
 Each environment or customer gets its own state, so a plan for staging cannot touch production.
-Two layouts are common: separate root directories per environment (explicit, each with its own
-backend key and credentials) or CLI workspaces sharing one configuration (less duplication, but the
-same credentials and an easy-to-forget `terraform workspace select`). For customer accounts with
-separate change boards, separate roots with separate backends is the usual choice *because* the
-isolation boundary should match the approval boundary.
+
+| Layout | Pros | Cons |
+|---|---|---|
+| Separate root directories per environment | explicit; each has its own backend key and credentials | some duplication |
+| CLI workspaces sharing one configuration | less duplication | same credentials; an easy-to-forget `terraform workspace select` |
+
+For customer accounts with separate change boards, separate roots with separate backends is the usual
+choice *because* the isolation boundary should match the approval boundary.
 
 ### Alternatives
-CloudFormation (AWS) and Bicep/ARM (Azure) are native single-cloud equivalents with no state file to
-manage, since the provider tracks it. Pulumi and AWS CDK let you write infrastructure in general-purpose
-languages, which helps loops and abstraction but makes reviews depend on reading code rather than a
-declarative file. OpenTofu is a community fork of Terraform created after HashiCorp moved Terraform to
-the Business Source License in 2023; it keeps HCL and the provider ecosystem and is open source.
+| Tool | Shape | Note |
+|---|---|---|
+| CloudFormation (AWS), Bicep/ARM (Azure) | native, single-cloud | no state file to manage, since the provider tracks it |
+| Pulumi, AWS CDK | general-purpose languages | helps loops and abstraction; reviews depend on reading code rather than a declarative file |
+| OpenTofu | community fork of Terraform | created after HashiCorp moved Terraform to the Business Source License in 2023; keeps HCL and the provider ecosystem; open source |
 
-## Example
-A minimal module for the private model-access slice of a customer deployment: a locked remote state, a
-security group that only admits the app subnet, an interface endpoint for the model runtime with private
-DNS, and a document bucket protected from accidental destruction. Argument names follow the AWS provider;
-check them against the provider version you pin.
+## Diagram
+The reviewed plan, not the code, is what gets applied; state is the bridge between code addresses and
+real objects.
+
+```mermaid
+flowchart TD
+    C["HCL code in a pull request"] --> P["terraform plan"]
+    S[("Remote state with lock")] --> P
+    API["Cloud provider APIs"] -->|"refresh"| P
+    P --> F["Saved plan file"]
+    F --> R{"Reviewer: any replace or destroy?"}
+    R -->|"yes, unexpected"| C
+    R -->|"approved"| A["terraform apply saved plan"]
+    A --> API
+    A -->|"new IDs and attributes"| S
+```
+
+## Examples
+### Module for private model access
+- **What it contains.** A locked remote state, a security group that only admits the app subnet, an
+  interface endpoint for the model runtime with private DNS, and a document bucket protected from
+  accidental destruction.
+- **Check the names.** Argument names follow the AWS provider; check them against the provider version
+  you pin.
 
 ```hcl
 terraform {
@@ -162,43 +193,121 @@ resource "aws_s3_bucket" "documents" {
 }
 ```
 
-`terraform plan` on a fresh account shows three resources to add; changing `bucket` later would show a
-replace, and `prevent_destroy` turns that into an error rather than a deleted archive. The guard lives in
-the resource block, so it does not protect against someone deleting the block itself; pair it with
-bucket versioning or a deletion-protection setting on the cloud side.
+- **Fresh account:** `terraform plan` shows three resources to add.
+- **Changing `bucket` later** would show a replace, and `prevent_destroy` turns that into an error
+  rather than a deleted archive.
+- **Limit of the guard.** It lives in the resource block, so it does not protect against someone
+  deleting the block itself; pair it with bucket versioning or a deletion-protection setting on the
+  cloud side.
+
+### Refactor and adopt without recreating anything
+Moving the bucket into a module, and adopting a hand-built KMS key, both as plan-visible code.
+
+```hcl
+moved {
+  from = aws_s3_bucket.documents
+  to   = module.rag.aws_s3_bucket.documents
+}
+
+import {
+  to = aws_kms_key.rag
+  id = "1234abcd-12ab-34cd-56ef-1234567890ab"   # the existing key's ID
+}
+```
+
+Expected plan: zero destroys, one import, and no change for the moved bucket. Anything else means the
+refactor is not what you think.
+
+### CI guard that blocks replacing data resources
+Reads the JSON form of a saved plan (`terraform show -json tfplan`) and fails the pipeline if a protected
+resource type would be destroyed or replaced.
+
+```python
+"""Fail CI if a Terraform plan deletes or replaces protected resources.
+Usage: terraform show -json tfplan > plan.json && python plan_guard.py plan.json"""
+import json, sys
+
+PROTECTED = {"aws_s3_bucket", "aws_db_instance", "aws_opensearch_domain", "aws_kms_key"}
+
+def risky_changes(plan):
+    for rc in plan.get("resource_changes", []):
+        actions = rc["change"]["actions"]          # e.g. ["update"], ["delete", "create"]
+        if "delete" in actions:
+            kind = "REPLACE" if "create" in actions else "DESTROY"
+            yield kind, rc["address"], rc["type"]
+
+def main(path):
+    plan = json.load(open(path))
+    blocked = 0
+    for kind, address, rtype in risky_changes(plan):
+        flag = "BLOCK" if rtype in PROTECTED else "review"
+        blocked += flag == "BLOCK"
+        print(f"{flag:6} {kind:7} {address}")
+    sys.exit(1 if blocked else 0)
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+# BLOCK  REPLACE module.rag.aws_s3_bucket.documents
+# review REPLACE aws_launch_template.gpu
+```
+
+## Production patterns
+- **Saved plan, exact apply.** In CI run `terraform plan -out=tfplan` on every pull request, attach the
+  rendered plan to the review or change ticket, and apply with `terraform apply tfplan` after approval.
+  Monitor applies that ran without a matching reviewed plan; the target is none.
+- **Scheduled drift detection.** Run `terraform plan -detailed-exitcode` nightly against main; exit code
+  2 means changes are pending. Alert on non-empty plans and trace each to a console change or a missing
+  back-port.
+- **Pin providers and commit the lock file.** Use version constraints like `~> 5.0` and commit
+  `.terraform.lock.hcl`; upgrade deliberately with `terraform init -upgrade` in its own pull request.
+  Watch for plans that change resources nobody touched.
+- **Provider mirror for isolated accounts.** Build it with `terraform providers mirror <dir>`, ship it in
+  the release bundle, and point the customer's CLI configuration at it with a `filesystem_mirror` block,
+  so `terraform init` never reaches the public registry.
+- **Split state by layer.** Separate network, cluster and application states so a routine app change
+  cannot plan against the VPC. Pass values between them with outputs and data sources, and track plan
+  duration per state.
+- **Guard data resources twice.** `prevent_destroy` in code plus versioning or deletion protection in the
+  cloud, and the plan-guard script above in CI for anything stateful.
 
 ## Trade-offs
-- Declarative plans make every change reviewable before it happens, but the state file becomes critical
-  shared infrastructure; losing or corrupting it is worse than losing the code.
-- One tool across clouds and SaaS providers helps teams deploying into varied customer accounts, but a
-  single-cloud team may find native CloudFormation or Bicep simpler since there is no state to operate.
-- HCL's restricted language keeps configurations readable for security reviewers, but complex logic
-  (dynamic topologies, heavy loops) is awkward; general-purpose IaC tools win when logic dominates.
-- Large single state files give one view of everything but make plans slow and blast radius big;
-  splitting by layer (network, cluster, app) limits damage at the cost of cross-state references.
+- **Reviewable plans vs critical state.** Declarative plans make every change reviewable before it
+  happens, but the state file becomes critical shared infrastructure; losing or corrupting it is worse
+  than losing the code.
+- **Multi-cloud breadth vs native simplicity.** One tool across clouds and SaaS providers helps teams
+  deploying into varied customer accounts, but a single-cloud team may find native CloudFormation or
+  Bicep simpler since there is no state to operate.
+- **Restricted HCL vs expressive code.** HCL keeps configurations readable for security reviewers, but
+  complex logic (dynamic topologies, heavy loops) is awkward; general-purpose IaC tools win when logic
+  dominates.
+- **One big state vs split states.** Large single state files give one view of everything but make plans
+  slow and blast radius big. Splitting by layer (network, cluster, app) limits damage at the cost of
+  cross-state references.
 
 ## Pitfalls
-- Committing state or secrets to git, or storing state unencrypted; the symptom is a secret scanner
-  alert, or an auditor finding database passwords readable by everyone with repository access.
-- Approving a plan without reading "must be replaced" lines; the symptom is a vector database or
-  bucket recreated empty after an apparently harmless argument change.
-- Refactoring resource names or module structure without `moved` blocks; the symptom is a plan that
-  shows an equal number of destroys and creates for a pull request that "only renamed things".
-- Unpinned provider versions or an uncommitted `.terraform.lock.hcl`; the symptom is a plan that
-  suddenly proposes changes nobody made, after a new provider release changed a default.
-- Making emergency fixes in the console and never back-porting them; the symptom is the next routine
-  apply silently reverting the fix and re-causing the incident.
-- Assuming the customer's air-gapped environment can download providers; the symptom is
-  `terraform init` failing, fixed only by shipping a provider mirror with the release bundle.
+- **Committing state or secrets to git, or storing state unencrypted.** Symptom: a secret scanner alert,
+  or an auditor finding database passwords readable by everyone with repository access.
+- **Approving a plan without reading "must be replaced" lines.** Symptom: a vector database or bucket
+  recreated empty after an apparently harmless argument change.
+- **Refactoring names or module structure without `moved` blocks.** Symptom: a plan showing an equal
+  number of destroys and creates for a pull request that "only renamed things".
+- **Unpinned provider versions or an uncommitted `.terraform.lock.hcl`.** Symptom: a plan that suddenly
+  proposes changes nobody made, after a new provider release changed a default.
+- **Emergency console fixes never back-ported.** Symptom: the next routine apply silently reverts the
+  fix and re-causes the incident.
+- **Assuming an air-gapped environment can download providers.** Symptom: `terraform init` fails, fixed
+  only by shipping a provider mirror with the release bundle.
 
 ## When to use
-Use IaC for anything that must exist in more than one environment or survive an audit: which is to say
-every production AI deployment, and every customer-VPC deployment. Terraform or OpenTofu is the default
-when you deploy across clouds or into many customer accounts, or when the customer's platform team
-already uses it. Use native templates when an organization is single-cloud and mandates them. Keep
-application rollout (container versions, model weights) in a deploy tool such as Helm or Argo rather than
-Terraform, since those change far more often. Measure drift (plans that are not empty on main) and
-time to stand up a new environment. Interviewers probe state, plan review and the replace hazard.
+- **Use IaC for** anything that must exist in more than one environment or survive an audit: every
+  production AI deployment, and every customer-VPC deployment.
+- **Terraform or OpenTofu by default** when you deploy across clouds or into many customer accounts, or
+  when the customer's platform team already uses it.
+- **Native templates** when an organization is single-cloud and mandates them.
+- **Not for application rollout.** Keep container versions and model weights in a deploy tool such as
+  Helm or Argo rather than Terraform, since those change far more often.
+- **Measure:** drift (plans that are not empty on main) and time to stand up a new environment.
+- **Interviews:** expect probes on state, plan review and the replace hazard.
 
 ## Role lens
 - **Engineer:** Writes modules for GPU node pools, endpoints and buckets, runs plan in CI on every pull
@@ -220,6 +329,43 @@ plan. Protect data resources with `prevent_destroy`, document every replace-trig
 publish an IAM policy listing the permissions the apply role needs. For upgrades, release a new module
 version with a changelog and an expected-plan summary so they can compare. If the account is isolated,
 include a provider mirror.
+
+## Interview questions
+### What is declarative IaC, and why is it better than a script of CLI calls?
+- **Declarative:** you describe the desired end state and the tool computes create, update and delete
+  calls by diffing code, state and the real APIs.
+- **Why better:** it is idempotent (running twice changes nothing), it can show a plan before acting, and
+  changes go through code review instead of screenshots.
+- **Scripts encode steps**, so re-runs fail with "already exists" or duplicate resources.
+
+### A pull request that only renamed modules shows 14 destroys and 14 creates. What happened and what do you do?
+- **Cause:** state keys objects by address, so new addresses look like new resources and old ones look
+  removed.
+- **Fix:** add `moved` blocks from each old address to the new one (or `terraform state mv`) and re-plan
+  until it is a no-op.
+- **Guard:** a CI check that fails on destroys of stateful types would have stopped the apply.
+
+### When would you choose CloudFormation, Bicep or Pulumi over Terraform?
+- **Single-cloud and mandated:** native templates remove the state file and locking you would otherwise
+  operate.
+- **Logic-heavy topologies:** Pulumi or CDK let you use loops and abstraction in a real language, at the
+  cost of reviewers reading code rather than declarative files.
+- **Terraform or OpenTofu wins** when you deploy across clouds and many customer accounts, or the
+  customer's team already runs it.
+
+### How do you keep Terraform state safe in production?
+- **Remote backend with locking** so two applies cannot corrupt it; the S3 backend supports a native
+  lock file (`use_lockfile`).
+- **Encrypt and restrict it** because it stores generated passwords and keys in plain text.
+- **One state per environment or customer**, matching the approval boundary, plus versioning on the
+  state bucket so a bad write can be rolled back.
+
+### How do you deliver Terraform into an air-gapped customer account?
+- **Ship providers with the release:** build a mirror with `terraform providers mirror`, and configure a
+  filesystem mirror so `terraform init` never contacts the registry.
+- **Pin versions and include the lock file** so the mirror and the plan agree.
+- **Ship modules as files** with an expected-plan summary, since the customer cannot pull them from a
+  registry either.
 
 ## Quiz
 ### Q: Why does Terraform need a state file at all, when it could just query the cloud APIs?

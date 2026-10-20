@@ -5,7 +5,7 @@ name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/model-evaluation
   - evals/task-specific-acceptance-criteria
@@ -35,8 +35,11 @@ perfect or large.
   handled, and the same engineer then tunes the prompt until those twenty pass: overfitting with extra
   steps.
 - **What a golden set buys.** Subject-matter experts sign off on expected outputs, so "is this answer
-  right" is argued once, during labeling, not in every review. Versioning makes a score reproducible.
-  Every production failure becomes an item, so the set grows toward failures that actually occur.
+  right" is argued once, during labeling, not in every review. Versioning makes a score reproducible,
+  so two prompts, two models or two weeks can be compared. Every production failure becomes an item, so
+  the set grows toward failures that actually occur rather than ones imagined up front.
+- **Quality beats size.** A few hundred well-chosen, well-labeled items beat ten thousand scraped ones,
+  provided they are stratified across the cases that matter and kept out of prompts and training data.
 
 ## How it works
 ### What a record contains
@@ -135,7 +138,8 @@ flowchart TD
     AG -->|"yes"| V[("golden_vN.jsonl, reviewed and tagged")]
     V -->|"hash of id"| DV["Dev split: iterate prompts"]
     V -->|"hash of id"| HO["Held-out split: ship decisions only"]
-    HO -.->|"production failures, stale items, saturation"| E
+    HO --> P["Shipped system in production"]
+    P -.->|"new failures become items"| E
 ```
 
 ## Examples
@@ -291,13 +295,15 @@ version the result. A few hundred such items will say more than two thousand syn
   and privacy constraints keep them out of CI.
 - **Logs are still the best source of inputs,** sampled with per-slice quotas and then labeled by SMEs.
 
-### Design a golden dataset for a new customer-support assistant.
-- **Define slices first:** intent, language, customer segment, difficulty, and set a quota per slice so
-  each one is measurable on its own.
-- **Fill from four sources:** stratified traffic, failures from error analysis, SME edge cases, and
-  synthetic items for gaps, labeled by humans and tagged as synthetic.
-- **Store each record** with complete input, expected output or reference plus a grader spec, slice
-  tags, provenance and version, in JSONL under review, with a hash-based dev and held-out split.
+### How do you label an open-ended task where several answers are correct, and what if experts disagree?
+- **Store a reference plus a grading spec,** not one string: a rubric, must-contain facts and acceptable
+  alternatives, because a single reference fails correct paraphrases and pushes the team to make the
+  prompt mimic its wording.
+- **Write guidelines first and double-label a subset** to measure agreement; the guidelines become the
+  task definition.
+- **Resolve each disagreement:** an ambiguous item gets a fixed guideline or is dropped, a multi-answer
+  item stores every acceptable answer, and persistently low agreement means the task definition needs
+  work, since no grader can be more reliable than its labels.
 
 ### How many items do you need to detect a 5-point improvement at an 80% pass rate?
 - **Independent runs:** n ≈ (1.96 + 0.84)² · 2p(1−p) / δ², about 1,000 items per version at 80% power

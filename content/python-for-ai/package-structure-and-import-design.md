@@ -22,15 +22,13 @@ sources:
 ---
 
 ## TL;DR
-In Python the import graph is your architecture. Use a `src/` layout, point imports one way
-(domain ← services ← adapters ← entrypoints), keep side effects out of import time, and import heavy SDKs
-and model libraries lazily or only at the edges.
+In Python the import graph is your architecture: it decides what can be tested alone and what runs at
+startup. Use a `src/` layout so tests exercise the installed package, point imports one way
+(domain ← services ← adapters ← entrypoints), and keep heavy SDKs and import-time side effects at the edges.
 
 ## Why it exists
 - **Notebooks grow into tangles.** One notebook becomes a `utils.py`, then forty modules where everything
-  imports everything. Three failures follow. First, **circular imports**. Second, **slow, fragile
-  startup**: importing your package pulls in everything at once. Third, **tests that pass for the wrong
-  reason**.
+  imports everything. Three failures follow, one per bullet below.
 - **Circular imports.** `agent.py` imports `tools.py`, which imports `agent.py` for a type, until Python
   raises `ImportError: cannot import name 'Agent' from partially initialized module`.
 - **Slow, fragile startup.** Importing the package pulls in `torch`, `transformers` and three vendor SDKs,
@@ -42,7 +40,8 @@ and model libraries lazily or only at the edges.
 - **Naive fixes hide the cause.** `sys.path.insert(0, "..")` or `PYTHONPATH=.` makes imports depend on
   where the process started, so they differ in CI, Docker and a teammate's laptop. `try/except ImportError`
   hides a cycle until another import order triggers it. "Just be careful" does not scale because nothing
-  enforces it: design the structure, give it a direction, check it with a tool.
+  enforces it: design the structure, give it a direction and check it with a tool, the same way you would
+  design service boundaries.
 
 ## How it works
 ### What an import actually does
@@ -61,7 +60,7 @@ Two consequences drive every rule below:
 | Form | Binds | Consequence |
 |---|---|---|
 | `import a` | the module object | a cycle survives if `a.X` is only looked up later, at call time |
-| `from a import X` | a copy of `a.X`'s current value, *now* | fails mid-cycle |
+| `from a import X` | a new name `X` in the importer, bound to whatever `a.X` is *now* | fails mid-cycle |
 
 - **Patch where the name is used.** `mock.patch("a.X")` does not affect a module `b` that already did
   `from a import X`, because `b` holds its own reference; patch `b.X`.
@@ -233,11 +232,13 @@ with mock.patch("rag.call", return_value="fake"):
 
 ### Layer contract as a CI check
 An `import-linter` contract in `pyproject.toml`; `lint-imports` fails the build when a lower layer imports a
-higher one. Layers are listed from highest to lowest.
+higher one. Layers are listed from highest to lowest; forbidding third-party packages such as `openai`
+also needs `include_external_packages = true`, because import-linter ignores external imports by default.
 
 ```toml
 [tool.importlinter]
 root_package = "myapp"
+include_external_packages = true   # required for the forbidden contract on openai, anthropic, torch
 
 [[tool.importlinter.contracts]]
 name = "Layered architecture"
@@ -250,7 +251,7 @@ layers = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "Domain never touches vendor SDKs"
+name = "Domain and services never import vendor SDKs"
 type = "forbidden"
 source_modules = ["myapp.domain", "myapp.services"]
 forbidden_modules = ["openai", "anthropic", "torch"]

@@ -5,7 +5,7 @@ name: Model & dataset provenance
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - data-architecture/data-lineage
   - data-architecture/training-data-pipelines
@@ -22,126 +22,144 @@ sources:
 ---
 
 ## TL;DR
-Provenance is the verifiable record of where a model or dataset came from: the exact bytes it was built
-from, the code and parameters that built it, who built it, under which licence, and the evaluations that
-were run on it. It exists because a model file is opaque: nothing in a checkpoint tells you what data it
-saw, whether that data was licensed or contained your eval set, or whether the file is even the one you
-think it is. Provenance turns "trust me" into hashes, manifests and signatures.
+Provenance is the verifiable record of a model's or dataset's origin: exact input bytes, code,
+parameters, builder, licence and evaluations. A checkpoint is opaque about what it saw, so provenance
+replaces "trust me" with hashes, manifests and signatures.
 
 ## Why it exists
-A fine-tuned model lands in the registry as `router-v4.safetensors`. Six months later the questions
-start. Legal asks whether any training data came from a source with a non-commercial licence. A customer
-asks whether their data was used. The eval team notices suspiciously high scores and wants to know whether
-the benchmark leaked into training. Security asks whether the base model was downloaded from the official
-repository or a lookalike. An engineer wants to reproduce the run to fix a regression. Every one of these
-is answerable only if, at build time, someone recorded the inputs precisely and made the record
-tamper-evident.
-
-The naive alternative is the model card written after the fact and the README in the dataset folder.
-They fail because they are prose written from memory: they describe what the author believes the inputs
-were, not what the job actually read. A dataset folder that was "the cleaned support tickets" when the
-README was written has since had rows added and removed. A base model pulled by name resolves to a
-different revision today. Prose cannot be diffed, verified or traced.
-
-The second naive alternative is "git is enough": commit the training script and call it reproducible.
-Code is one of six inputs. The data snapshot, the base model revision, the environment (library and
-CUDA versions), the hyperparameters and the random seed all change outputs, and none of them lives in
-the training script. Provenance is the discipline of capturing all of them, as identifiers that can be
-checked, at the moment the artifact is created.
+- **The questions arrive months later.** A fine-tune lands in the registry as `router-v4.safetensors`.
+  Six months on: Legal asks about non-commercial data sources; a customer asks whether their data was used;
+  the eval team suspects the benchmark leaked; Security asks whether the base model came from the official
+  repository or a lookalike; an engineer wants to reproduce the run to fix a regression.
+- **Only build-time records answer them,** and only if someone recorded the inputs precisely and made the
+  record tamper-evident.
+- **After-the-fact model cards and READMEs fail,** because they are prose written from memory: what the
+  author believes the inputs were, not what the job read. "The cleaned support tickets" folder has since had
+  rows added and removed; a base model pulled by name resolves to a different revision today. Prose cannot
+  be diffed, verified or traced.
+- **"Git is enough" fails,** because code is one of six inputs. The data snapshot, base model revision,
+  environment (library and CUDA versions), hyperparameters and random seed all change outputs, and none
+  lives in the training script.
+- **What provenance is:** the discipline of capturing all of them as checkable identifiers at the moment
+  the artifact is created.
 
 ## How it works
 ### Content addressing: identity by hash
-The foundation is that every input and output is identified by a cryptographic hash of its bytes, not by
-a name or path. A dataset snapshot is the sorted list of its files with their SHA-256 digests, hashed
-again into one dataset digest (a Merkle-style root). A model artifact is its file digests. This is chosen
-*because* a hash is the only identifier that is stable across copies, cannot drift when someone edits the
-folder, and lets a reader verify they hold the same bytes. Hugging Face model repositories are git
-repositories, so a commit hash identifies a revision exactly; always pin `revision` rather than relying
-on the default branch, which moves.
+- **Identify by bytes, not by name or path.** A dataset snapshot is the sorted list of its files with their
+  SHA-256 digests, hashed again into one dataset digest (a Merkle-style root). A model artifact is its file
+  digests.
+- **Why:** a hash is the only identifier stable across copies, it cannot drift when someone edits the
+  folder, and it lets a reader verify they hold the same bytes.
+- **Pin hub revisions.** Hugging Face model repositories are git repositories, so a commit hash identifies a
+  revision exactly. Always pin `revision` rather than relying on the default branch, which moves.
 
 ### The build manifest
-Every training or fine-tuning run writes a manifest beside its output, containing:
-- base model: repository id and revision hash, plus file digests;
-- datasets: each snapshot digest, row counts, and the filter or sampling parameters used;
-- code: commit hash and container or environment digest, with library versions;
-- parameters: the full hyperparameter set and the seed;
-- outputs: checkpoint digests and the eval results with the eval set's own digest;
-- actor and time: who or what launched the run, when.
+Every training or fine-tuning run writes a manifest beside its output:
 
-Merged, distilled and adapter models list every parent artifact as an input (each with its own manifest
-digest), *because* a merge has several ancestors and the licence and contamination questions must be
-answered for all of them. The format of the record matters less than its completeness; supply-chain
-attestation formats from software (in-toto and SLSA-style provenance) and bill-of-materials formats with
-ML profiles (CycloneDX and SPDX both have them) are being adopted so registries and scanners can read
-manifests without bespoke parsers.
+| Section | Contents |
+|---|---|
+| Base model | repository id and revision hash, plus file digests |
+| Datasets | each snapshot digest, row counts, filter or sampling parameters used |
+| Code | commit hash, container or environment digest, library versions |
+| Parameters | the full hyperparameter set and the seed |
+| Outputs | checkpoint digests, eval results with the eval set's own digest |
+| Actor and time | who or what launched the run, and when |
 
-The manifest is written by the job, not by a person, *because* that is the only way it describes what
-ran. It is stored in the model registry as the artifact's metadata and should also be committed where
-the lineage system can link it to dataset versions.
+- **Merged, distilled and adapter models list every parent** as an input, each with its own manifest
+  digest, *because* a merge has several ancestors and the licence and contamination questions must be
+  answered for all of them.
+- **Completeness beats format.** Software supply-chain attestation formats (in-toto and SLSA-style
+  provenance) and bill-of-materials formats with ML profiles (CycloneDX and SPDX both have them) are being
+  adopted so registries and scanners can read manifests without bespoke parsers.
+- **The job writes it, not a person,** *because* that is the only way it describes what ran. Store it in
+  the model registry as the artifact's metadata, and commit it where the lineage system can link it to
+  dataset versions.
 
 ### Dataset documentation
-Datasheets (Gebru et al.) formalize the questions a dataset should answer: motivation, composition,
-collection process, preprocessing, intended uses, distribution and maintenance. For an AI team the
-operationally important subset is: source systems and their terms, consent or licence basis, PII handling
-applied, the filtering recipe and its parameters, known gaps, and the eval sets that must never overlap
-with it. Attach this as a structured file next to the snapshot digest, so documentation and bytes are
-versioned together.
+- **Datasheets (Gebru et al.)** formalize what a dataset should answer: motivation, composition, collection
+  process, preprocessing, intended uses, distribution and maintenance.
+- **The operational subset for an AI team:** source systems and their terms, consent or licence basis, PII
+  handling applied, the filtering recipe and its parameters, known gaps, and the eval sets that must never
+  overlap with it.
+- **Store it next to the snapshot digest** as a structured file, so documentation and bytes are versioned
+  together.
 
 ### Model documentation
-Model cards (Mitchell et al.) do the same for models: intended use, out-of-scope use, training data
-summary, evaluation results broken down by relevant slices, limitations and ethical considerations. The
-provenance manifest is the machine-readable backbone; the model card is the human-readable layer that
-references it. Regulation increasingly expects both: the EU AI Act, for example, requires technical
-documentation covering data and evaluation for high-risk systems, and for general-purpose model providers
-technical documentation plus a public summary of training content. Templates, codes of practice and
-application dates are still being phased in, so check current obligations rather than relying on a
-summary.
+- **Model cards (Mitchell et al.)** cover intended use, out-of-scope use, training data summary, evaluation
+  results by relevant slices, limitations and ethical considerations.
+- **Two layers:** the provenance manifest is the machine-readable backbone; the model card is the
+  human-readable layer that references it.
+- **Regulation increasingly expects both.** The EU AI Act, for example, requires technical documentation
+  covering data and evaluation for high-risk systems, and for general-purpose model providers technical
+  documentation plus a public summary of training content. Templates, codes of practice and application
+  dates are still being phased in, so check current obligations rather than relying on a summary.
 
 ### Synthetic and model-generated data
-A growing share of fine-tuning data is generated by another model: distilled answers, synthetic
-instructions, LLM-written labels. Such a dataset's inputs are not just its seed data but also the
-generator model and revision, the prompt template version, the sampling parameters and the filter that
-kept or discarded outputs. Record all of them, *because* the generator's behaviour is now part of your
-model (its errors and biases propagate), a change of generator explains a change of downstream quality,
-and the generator's usage terms travel with its outputs: some providers' terms restrict using outputs to
-train competing models, which is a question for counsel that the manifest must make answerable.
+- **A generated dataset has more inputs than its seed data:** the generator model and revision, the prompt
+  template version, the sampling parameters and the filter that kept or discarded outputs. Record all of
+  them.
+- **Why each matters:** the generator's errors and biases propagate into your model; a change of generator
+  explains a change of downstream quality; and the generator's usage terms travel with its outputs.
+- **Terms are a counsel question:** some providers' terms restrict using outputs to train competing models,
+  and the manifest must make that answerable.
 
 ### Licence and terms tracking
-Each dataset and base model carries its licence identifier in the manifest. The safe engineering policy
-is that a derived artifact carries the combined obligations of all its inputs, computed by walking the
-lineage graph, *because* publishing a fine-tune under a permissive licence does not release it from the
-base model's terms (many model licences explicitly bind derivatives). Licences are not a simple
-restrictiveness ranking: two inputs can impose different, even incompatible, obligations, and whether a
-given dataset licence reaches the trained weights is a legal question, so the graph's job is to surface
-every applicable term for counsel, not to decide it.
-This is also where "the customer's data may not be used to train shared models" is enforced: the
-manifest of any shared model must show no customer-restricted dataset digests among its inputs.
+- **Each dataset and base model carries its licence identifier** in the manifest.
+- **Derived artifacts inherit combined obligations,** computed by walking the lineage graph, *because*
+  publishing a fine-tune under a permissive licence does not release it from the base model's terms (many
+  model licences explicitly bind derivatives).
+- **Licences are not a simple ranking.** Two inputs can impose different, even incompatible, obligations,
+  and whether a dataset licence reaches the trained weights is a legal question. The graph surfaces every
+  applicable term for counsel; it does not decide.
+- **Customer isolation is enforced here:** the manifest of any shared model must show no
+  customer-restricted dataset digests among its inputs.
 
 ### Integrity and supply chain
-A hash tells you what you have; a signature tells you who produced it. Signing model artifacts and
-manifests (Sigstore-style keyless signing is one approach being adopted for ML artifacts) lets a deployer
-verify that a checkpoint came from the registry's build pipeline, not from a laptop or a tampered
-download. Prefer `safetensors` over pickle-based formats, because loading a pickle executes arbitrary
-code embedded in the file; a signed safetensors file is both authentic and inert. Record dependency
-digests too, since a training run is only as trustworthy as the libraries that ran it.
+- **A hash says what you have; a signature says who produced it.** Signing artifacts and manifests
+  (Sigstore-style keyless signing is one approach being adopted for ML artifacts) lets a deployer verify a
+  checkpoint came from the registry's build pipeline, not a laptop or a tampered download.
+- **Prefer `safetensors` over pickle-based formats,** because loading a pickle executes arbitrary code
+  embedded in the file. A signed safetensors file is both authentic and inert.
+- **Record dependency digests too,** since a training run is only as trustworthy as the libraries that ran
+  it.
 
 ### Using provenance
-- **Contamination check:** hash the eval set's examples and the training snapshot's examples; exact
-  overlap is found by digest comparison without re-reading the pipeline. Hashes only catch exact copies,
-  so normalize text before hashing and add n-gram or embedding-similarity checks for reformatted or
-  paraphrased leaks.
-- **Data subject requests:** the dataset snapshot digests in a model's manifest, joined with lineage,
-  answer whether a person's records contributed to a model.
-- **Reproduction:** the manifest is the command line: same base revision, same snapshot, same commit,
-  same parameters and seed. Bitwise identity is not guaranteed on GPUs, but the result should land within
-  the known run-to-run variance.
-- **Incident response:** when a model misbehaves, compare its manifest with the last good one; the diff
-  is the list of suspects.
+- **Contamination check:** hash the eval set's examples and the training snapshot's examples; exact overlap
+  is found by digest comparison without re-reading the pipeline. Hashes only catch exact copies, so
+  normalize text before hashing and add n-gram or embedding-similarity checks for reformatted or paraphrased
+  leaks.
+- **Data subject requests:** the dataset snapshot digests in a model's manifest, joined with lineage, answer
+  whether a person's records contributed to a model.
+- **Reproduction:** the manifest is the command line: same base revision, snapshot, commit, parameters and
+  seed. Bitwise identity is not guaranteed on GPUs, but the result should land within the known run-to-run
+  variance.
+- **Incident response:** when a model misbehaves, compare its manifest with the last good one; the diff is
+  the list of suspects.
 
-## Example
-A manifest writer for a fine-tuning run. It hashes the dataset snapshot and base model files, captures
-code and environment identifiers, and writes a JSON manifest beside the checkpoint. The training call is a
-stub; everything around it is what provenance requires.
+## Diagram
+Every input is reduced to a digest before training; gates run on the digests, and only a signed manifest
+lets the checkpoint into the registry.
+
+```mermaid
+flowchart TD
+    B["Base model at pinned revision"] --> H["Hash every input"]
+    D["Dataset snapshot"] --> H
+    G["Code commit and container digest"] --> H
+    H --> C{"Eval overlap or licence conflict?"}
+    C -->|"yes"| X["Block the run"]
+    C -->|"no"| T["Train with params and seed"]
+    T --> K["Checkpoint safetensors"]
+    K --> M["Job writes manifest with all digests"]
+    M --> S["Sign manifest and checkpoint"]
+    S --> R[("Model registry")]
+    R -->|"deploy verifies signature and digest"| P["Serving"]
+```
+
+## Examples
+### A manifest writer for a fine-tuning run
+It hashes the dataset snapshot and base model files, captures code and environment identifiers, and writes
+a JSON manifest beside the checkpoint. The training call is a stub; everything around it is what
+provenance requires.
 
 ```python
 import hashlib, json, subprocess, sys, platform, time
@@ -193,43 +211,116 @@ The overlap check is deliberately crude (whole-file hashes); a real contaminatio
 examples or n-grams. The licence field on the dataset is what later blocks this checkpoint from being
 promoted to a shared, multi-customer deployment.
 
+### Example-level contamination check: exact digests plus n-grams
+The step the crude file check above defers. Normalizing before hashing catches reformatted copies; shared
+n-grams catch light paraphrases. The 8-token n-gram size is an illustrative choice; tune it on your data.
+
+```python
+import hashlib, re
+
+def normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", text.lower())).strip()
+
+def digest(text: str) -> str:
+    return hashlib.sha256(normalize(text).encode()).hexdigest()
+
+def ngrams(text: str, n: int = 8) -> set[tuple[str, ...]]:
+    toks = normalize(text).split()
+    return {tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)}
+
+def contamination(train: list[str], evalset: list[str], n: int = 8, min_shared: int = 1):
+    train_digests = {digest(t) for t in train}
+    train_grams = set().union(*(ngrams(t, n) for t in train))
+    exact = [e for e in evalset if digest(e) in train_digests]
+    near = [e for e in evalset if e not in exact and len(ngrams(e, n) & train_grams) >= min_shared]
+    return exact, near
+
+train = ["How do I reset my password? Go to Settings, then Security, then Reset.",
+         "Refunds are issued to the original card within five business days of approval."]
+evalset = ["how do I reset my password?  go to settings, then security, then reset",   # reformatted copy
+           "Refunds are issued to the original card within five business days, per policy.",
+           "What is the API rate limit for the free tier?"]
+exact, near = contamination(train, evalset)
+print(len(exact), "exact;", len(near), "near-duplicate;", len(evalset) - len(exact) - len(near), "clean")
+# 1 exact; 1 near-duplicate; 1 clean
+```
+
+### Worked scenario: diffing manifests after a regression
+`router-v4` routes worse than `router-v3` in production. Diff the two manifests (illustrative values):
+
+| Field | router-v3 | router-v4 | Suspect? |
+|---|---|---|---|
+| Base model revision | commit e1f… | commit e1f… | no |
+| Training snapshot digest | 9ab… (120k rows) | c42… (131k rows) | yes: 11k new rows |
+| Synthetic subset generator | model A, prompt v2 | model B, prompt v2 | yes: generator changed |
+| Code commit | 5d0… | 5d0… | no |
+| Seed and params | identical | identical | no |
+| Eval set digest | 77c… | 77c… | no, scores are comparable |
+
+- **Two suspects, both in data:** retrain v4's recipe with the old generator's subset to isolate the
+  effect. Without the generator recorded, "the same" synthetic dataset would look unchanged.
+
+## Production patterns
+- **Pin every hub download to a commit.** Use for all base models and hub datasets. Pass
+  `revision="<commit sha>"` to `from_pretrained` or `huggingface_hub.snapshot_download`, and record that
+  sha in the manifest. Monitor any training config that resolves a branch name instead of a commit.
+- **Manifest required for registry promotion.** Use for every artifact that reaches a registry. Attach the
+  job-written manifest to the registered model (in MLflow, for example, `mlflow.log_dict(manifest,
+  "manifest.json")` on the run), and have the promotion step reject artifacts without one. Monitor coverage:
+  fraction of registry artifacts with complete manifests.
+- **Safetensors-only loading.** Use for any third-party or shared checkpoint. In Transformers pass
+  `use_safetensors=True` so a pickle file is refused rather than executed. Monitor registry artifacts still
+  stored as pickle-based formats.
+- **Sign at build, verify at deploy.** Use for artifacts that cross trust boundaries. Sign the manifest and
+  checkpoint in the build pipeline (Sigstore's `cosign sign-blob` is one option), and verify signature and
+  digest before the serving process loads weights. Monitor verification failures; each is a blocked
+  tampered or out-of-band artifact.
+- **Licence and isolation gate in CI.** Use before promoting shared models. Walk the manifest closure and
+  fail if any input carries a customer-restricted tag or an unreviewed licence. Monitor gate failures and
+  time to counsel review.
+- **Contamination gate before training.** Use whenever eval sets exist. Run the digest and n-gram overlap
+  check between the training snapshot and every registered eval set, and record the result in the manifest.
+  Monitor overlap counts per run.
+
 ## Trade-offs
-- Content-addressed snapshots make inputs exact but require immutable copies or a lakehouse with
-  snapshot isolation; hashing a mutable table "as of now" is cheap and nearly useless.
-- Full per-file digests for large corpora cost a scan per run; for multi-terabyte datasets, hash
-  partition manifests the lakehouse already maintains rather than every byte again.
-- Signing artifacts gives tamper evidence but adds key management and a verification step at load time;
+- **Exact inputs vs immutable storage.** Content-addressed snapshots make inputs exact but require immutable
+  copies or a lakehouse with snapshot isolation; hashing a mutable table "as of now" is cheap and nearly
+  useless.
+- **Full digests vs scan cost.** Per-file digests for large corpora cost a scan per run. For multi-terabyte
+  datasets, hash partition manifests the lakehouse already maintains rather than every byte again.
+- **Tamper evidence vs key management.** Signing adds key management and a verification step at load time;
   skip it only for throwaway experiments that never reach a registry.
-- Rich datasheets improve downstream decisions but are written by people and go stale; keep the
-  machine-written manifest authoritative and the prose as commentary on it.
-- Pinning base model revisions protects reproducibility but means security patches to a model repo are
-  not picked up automatically; make upgrading the revision an explicit, evaluated change.
+- **Rich datasheets vs staleness.** Datasheets improve downstream decisions but are written by people and go
+  stale. Keep the machine-written manifest authoritative and the prose as commentary on it.
+- **Reproducibility vs automatic patches.** Pinning base model revisions means security patches to a model
+  repo are not picked up automatically; make upgrading the revision an explicit, evaluated change.
 
 ## Pitfalls
-- Referencing the base model by name without a revision; the symptom is a reproduction attempt that
-  silently uses a newer upstream commit and lands outside the expected variance.
-- Writing the model card from memory after the run; the symptom is documented training data that does
-  not match the snapshot the job actually read.
-- Hashing a dataset directory that was later edited in place; the symptom is a manifest digest that
-  matches nothing on disk when an audit asks for the bytes.
-- Loading pickle-format checkpoints from an unverified source; the symptom is arbitrary code execution
-  at load time, usually discovered by a security review rather than by the model misbehaving.
-- Forgetting licence propagation through fine-tunes and merges; the symptom is a commercial deployment of
-  a model whose ancestor forbids it.
-- Treating eval results as part of the model card but not recording the eval set digest; the symptom is
-  scores that cannot be compared across runs because the set quietly changed.
-- Recording a synthetic dataset's digest but not the generator model and prompt version that produced it;
-  the symptom is a quality shift after regenerating "the same" dataset that nobody can explain.
+- **Referencing the base model by name without a revision.** Symptom: a reproduction attempt silently uses a
+  newer upstream commit and lands outside the expected variance. Fix: pin the commit.
+- **Writing the model card from memory after the run.** Symptom: documented training data does not match the
+  snapshot the job actually read. Fix: generate the card from the manifest.
+- **Hashing a dataset directory that was later edited in place.** Symptom: a manifest digest that matches
+  nothing on disk when an audit asks for the bytes. Fix: immutable snapshots.
+- **Loading pickle-format checkpoints from an unverified source.** Symptom: arbitrary code execution at load
+  time, usually discovered by a security review rather than by the model misbehaving.
+- **Forgetting licence propagation through fine-tunes and merges.** Symptom: a commercial deployment of a
+  model whose ancestor forbids it. Fix: compute obligations over the full closure.
+- **Recording eval results but not the eval set digest.** Symptom: scores that cannot be compared across
+  runs because the set quietly changed.
+- **Recording a synthetic dataset's digest but not the generator model and prompt version.** Symptom: a
+  quality shift after regenerating "the same" dataset that nobody can explain.
 
 ## When to use
-Record provenance for every artifact that reaches a registry: every fine-tune, every merged model, every
-dataset snapshot used for training or evaluation, and every eval set. Experiments that never leave a
-notebook can skip signing but should still capture the manifest, since the one that works will be
-promoted. Measure coverage (fraction of registry artifacts with complete manifests), reproduction success
-rate on a sampled run, and time to answer "what was this trained on". In day-to-day work provenance shows
-up as the manifest you read before deploying someone else's checkpoint. In interviews, "how would you
-prove your model was not trained on the benchmark" is answered with dataset and eval digests and an
-overlap check, not with "we were careful".
+- **Record provenance for every artifact that reaches a registry:** every fine-tune, merged model, dataset
+  snapshot used for training or evaluation, and eval set.
+- **Notebook experiments** can skip signing but should still capture the manifest, since the one that works
+  will be promoted.
+- **Measure:** coverage (fraction of registry artifacts with complete manifests), reproduction success rate
+  on a sampled run, and time to answer "what was this trained on".
+- **Day to day:** the manifest is what you read before deploying someone else's checkpoint.
+- **Interviews:** "how would you prove your model was not trained on the benchmark" is answered with dataset
+  and eval digests and an overlap check, not with "we were careful".
 
 ## Role lens
 - **Engineer:** Makes the training job write the manifest, pins base model revisions and dependency
@@ -252,6 +343,37 @@ other models share that ancestor. For this to be credible, the manifests must ha
 jobs at build time with content hashes, signed so they cannot be edited afterwards, and stored with the
 artifact so the deployed digest can be matched to its manifest. Without that, the honest answer is "we
 believe not", which does not survive a dispute.
+
+## Interview questions
+### What is the difference between a model card and a provenance manifest?
+- **Manifest:** machine-written at build time, with digests of the base model, data snapshots, code,
+  environment, params, seed and outputs; it can be verified and diffed.
+- **Model card:** human-readable intended use, limitations and sliced eval results that reference the
+  manifest; written alone from memory it drifts from what actually ran.
+
+### Your benchmark scores jumped 9 points after a data refresh. How do you check for contamination?
+- **Exact overlap:** normalize and hash every eval example and every training example, then intersect the
+  digests.
+- **Near overlap:** n-gram or embedding-similarity checks catch reformatted and paraphrased leaks that
+  hashes miss.
+- **Then diff manifests:** the new snapshot digest and any changed synthetic-data generator are the
+  suspects.
+
+### A merged model has three parents. How do you decide whether it can be deployed commercially?
+- **Walk the closure:** every parent's manifest, recursively, down to base models and datasets with their
+  licence identifiers.
+- **Surface, do not rank:** obligations can be different or incompatible, so the tooling lists every
+  applicable term and counsel decides; a permissive licence on the merge does not override a parent's terms.
+
+### When is signing artifacts not worth the cost?
+- **Throwaway experiments** that never reach a registry can skip it; they should still write the manifest.
+- **Anything deployed or shared across trust boundaries should be signed,** because a hash alone cannot say
+  who produced the file.
+
+### Can you reproduce a fine-tune bit for bit from its manifest?
+- **Usually not on GPUs:** non-deterministic kernels mean bitwise identity is not guaranteed.
+- **But you can land within known run-to-run variance** using the same base revision, snapshot, commit,
+  params and seed; a result outside that variance points at an unpinned input.
 
 ## Quiz
 ### Q: Why is a dataset identified by a content hash rather than by its path or name?

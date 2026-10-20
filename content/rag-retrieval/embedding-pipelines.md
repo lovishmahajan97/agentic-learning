@@ -5,7 +5,7 @@ name: Embedding pipelines
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/embedding-models
@@ -68,11 +68,14 @@ chunk_id = hash(model_version, doc_id, chunk_index, chunk_text)
 | Re-run on unchanged document | every id already present; nothing embedded |
 | Edit changes one or two chunks, same count before them | only those get new ids and embeddings; old ids deleted as stale |
 | Edit inserts or removes a chunk | every later `chunk_index` shifts, so all later chunks re-embed |
-| Model upgrade | complete new id set, so migration is a normal run, not a special case |
+| Model upgrade | complete new id set, so migration is a normal run, not a special case, provided the document-level change check also keys on model version |
 
 - **If inserts are common:** keep an embedding cache keyed by `hash(model_version, chunk_text)` so
   moved-but-unchanged text is not re-sent, or drop the index from the id and store it as a field (then
   disambiguate identical chunks within one document, such as repeated boilerplate).
+- **Watch the early exit:** a document whose content hash is unchanged is skipped before ids are
+  computed, so on a model upgrade either include the model version in that check or run against a fresh
+  record namespace for the new collection; otherwise the upgrade run skips every document.
 - **Frameworks do the same:** LangChain's indexing API and LlamaIndex's ingestion pipeline map document
   ids to content hashes via a record manager or docstore.
 
@@ -117,7 +120,7 @@ embedded, and stale ids are deleted only after their replacements are live.
 
 ```mermaid
 flowchart TD
-    S["Source change event or nightly scan"] --> H{"Content hash changed?"}
+    S["Source change event or nightly scan"] --> H{"Content hash or model version changed?"}
     H -->|"no"| SKIP["Skip, nothing embedded"]
     H -->|"yes"| P["Parse and normalize, deterministic"]
     P --> C["Chunk and enrich with metadata"]
@@ -209,7 +212,7 @@ Illustrative quota and latency; plug in your own.
 | Tokens per request (batch of 64) | 64 × 300 = 19,200 |
 | Requests per minute the quota allows | 1,000,000 ÷ 19,200 ≈ 52 |
 | Worker doing one 2-second request at a time | 30 requests per minute |
-| Useful workers | about 2; a third worker only adds 429s and backoff |
+| Useful workers | 52 ÷ 30 ≈ 1.7: run 2 behind a shared limiter capped near 52 requests per minute; a third worker only adds 429s and backoff |
 
 Run blue/green: the old collection keeps serving for the five hours, so the overnight window, not the
 bill, is the decision.

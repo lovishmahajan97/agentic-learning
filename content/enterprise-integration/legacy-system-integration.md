@@ -5,7 +5,7 @@ name: Legacy system integration
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - enterprise-integration/enterprise-connectors
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -21,82 +21,109 @@ sources:
 ---
 
 ## TL;DR
-Legacy systems (mainframes, AS/400s, old ERPs, in-house databases) hold the data and transactions an AI
-feature needs, but they offer no modern API, run on batch windows and fixed record formats, and cannot be
-changed or overloaded. You integrate by wrapping them behind an anti-corruption layer that picks the least
-invasive access path (file drop, replica, message queue, existing service, or screen automation) and
-translates their model into yours, so the legacy quirks stop at one boundary.
+Legacy systems hold the data AI features need but offer no modern API and cannot be changed or
+overloaded. Wrap them in an anti-corruption layer that uses the least invasive access path and
+translates their model into yours, so quirks stop at one boundary.
 
 ## Why it exists
-In most large enterprises the system of record for policies, accounts, claims or inventory is decades old.
-It works, it is audited, and nobody will rewrite it for your assistant. Yet "what is the status of claim
-4471?" or "raise a return for this order" can only be answered by that system.
-
-The naive approaches each break something. Querying the production database directly with ad-hoc SQL
-competes with the batch jobs and online transactions it was sized for, and on a mainframe, CPU consumption
-can translate directly into the customer's software bill. Writing to its tables bypasses the business rules
-that live in application code, corrupting state in ways nobody notices until month-end. Copying its data
-model straight into your service (cryptic eight-character field names, status code `07`, dates as
-`YYDDD`) spreads legacy semantics everywhere, so every later change touches every consumer. And treating it
-like a cloud API (retry instantly, call it per user request, expect sub-second latency) collides with
-nightly batch windows, single-threaded transaction monitors and maintenance freezes. Legacy integration is
-the discipline of extracting value without destabilizing the thing that runs the business.
+- **The system of record is old and staying.** In most large enterprises policies, accounts, claims or
+  inventory live in mainframes, AS/400s, old ERPs or in-house databases. They work, they are audited, and
+  nobody will rewrite them for your assistant.
+- **Only they can answer.** "What is the status of claim 4471?" or "raise a return for this order" can only
+  be answered by that system.
+- **Ad-hoc SQL on production competes for capacity.** It fights the batch jobs and online transactions the
+  system was sized for, and on a mainframe CPU consumption can translate directly into the customer's
+  software bill.
+- **Writing to its tables corrupts state.** It bypasses business rules that live in application code, in
+  ways nobody notices until month-end.
+- **Copying its model spreads legacy semantics.** Cryptic eight-character field names, status code `07` and
+  dates as `YYDDD` leak everywhere, so every later change touches every consumer. Treating it like a cloud
+  API (retry instantly, call per user request, expect sub-second latency) collides with nightly batch
+  windows, single-threaded transaction monitors and maintenance freezes.
 
 ## How it works
 ### 1. Choose the access path, least invasive first
 Ordered roughly from safest to riskiest, *because* each step down couples you more tightly to internals:
-- **Existing interface.** A SOAP service, an MQ queue (IBM MQ is common on mainframes), a published batch
-  extract, or an ESB/iPaaS flow someone already maintains. Reusing it inherits its rules and its support.
-- **Batch file exchange.** Fixed-width or delimited files over SFTP on a schedule. Crude but decoupled: the
-  legacy side controls load, and files are replayable.
-- **Read replica or CDC.** Read from a replica, or capture changes from the database log, so reads never touch
-  the primary. Writes still go through the application.
-- **Transaction wrappers.** Expose an existing transaction program (for example a CICS transaction) through a
-  gateway, so business rules still run on writes.
-- **Screen automation (RPA).** Drive the green-screen or desktop UI. It is the last resort *because* any UI
-  change breaks it, but sometimes it is the only path that runs the full validation logic.
+
+| Path | What it is | Why choose or avoid |
+|---|---|---|
+| **Existing interface** | A SOAP service, an MQ queue (IBM MQ is common on mainframes), a published batch extract, or an ESB/iPaaS flow someone maintains | Reusing it inherits its rules and its support |
+| **Batch file exchange** | Fixed-width or delimited files over SFTP on a schedule | Crude but decoupled: the legacy side controls load, and files are replayable |
+| **Read replica or CDC** | Read a replica, or capture changes from the database log | Reads never touch the primary; writes still go through the application |
+| **Transaction wrappers** | Expose an existing transaction program (for example a CICS transaction) through a gateway | Business rules still run on writes |
+| **Screen automation (RPA)** | Drive the green-screen or desktop UI | Last resort *because* any UI change breaks it, but sometimes the only path that runs full validation |
 
 ### 2. Build an anti-corruption layer
-A translation service owned by your side converts legacy records into your canonical model and back. It
-decodes encodings (EBCDIC, COBOL `COMP-3` packed decimal, implied decimal points), maps status codes to
-named states, normalizes dates and time zones, and hides access-path details behind domain operations such
-as `get_claim(id)`. Consumers, including LLM tools, see only that interface, *because* when the legacy
-system is eventually replaced, only this layer changes.
+A translation service owned by your side converts legacy records into your canonical model and back:
+- **Decodes encodings:** EBCDIC, COBOL `COMP-3` packed decimal, implied decimal points.
+- **Maps codes to named states**, and normalizes dates and time zones.
+- **Exposes domain operations** such as `get_claim(id)`, hiding access-path details.
+- **Is the only interface consumers see, including LLM tools**, *because* when the legacy system is
+  eventually replaced, only this layer changes.
 
-Two encoding traps account for most "the numbers are wrong" incidents. Signed numeric fields stored as
-display digits (`PIC S9(5)V99` without `COMP-3`) carry the sign in the zone half of the last byte, so the
-final character looks like a letter or brace after conversion rather than a digit. And mixed records,
-text fields beside packed binary fields, must be transferred as binary and decoded field by field from
-the copybook, *because* a file-transfer step that converts the whole file from EBCDIC to ASCII rewrites the
-packed bytes as if they were characters and destroys them without any error.
+Two encoding traps cause most "the numbers are wrong" incidents:
+1. **Zoned signs.** Signed numeric fields stored as display digits (`PIC S9(5)V99` without `COMP-3`) carry
+   the sign in the zone half of the last byte. After conversion the final character looks like a letter or
+   brace rather than a digit.
+2. **Mixed records converted as text.** Text fields beside packed binary fields must be transferred as
+   binary and decoded field by field from the copybook, *because* a transfer step that converts the whole
+   file from EBCDIC to ASCII rewrites the packed bytes as characters and destroys them without any error.
 
 ### 3. Protect the legacy system
-Put a cache or replica in front of reads, a queue in front of writes, and explicit concurrency limits
-everywhere. Size the limit with Little's law: concurrent calls = arrival rate × call latency. If an agent
-feature generates an illustrative 20 lookups per second and each legacy transaction takes 1.5 seconds,
-about 30 calls are in flight at once; if the operations team will allow 10 concurrent sessions, you must
-cache, batch, or shed load, *because* the gateway will otherwise queue requests until user-facing
-timeouts fire and retries make it worse. Respect batch windows: schedule bulk extracts when the system says, and make agent tools return
-"system unavailable, try after 06:00" rather than hammering it.
+- **Cache or replica in front of reads, a queue in front of writes**, and explicit concurrency limits
+  everywhere.
+- **Size the limit with Little's law:** concurrent calls = arrival rate × call latency.
+- **Worked number:** an illustrative 20 lookups per second at 1.5 seconds per legacy transaction means
+  about 30 calls in flight. If operations allows 10 concurrent sessions, you must cache, batch, or shed load,
+  *because* the gateway will otherwise queue requests until user-facing timeouts fire and retries make it worse.
+- **Respect batch windows.** Schedule bulk extracts when the system says, and make agent tools return
+  "system unavailable, try after 06:00" rather than hammering it.
 
 ### 4. Make writes safe
-Legacy transactions are rarely idempotent, and a timeout has three possible meanings: the request never
-arrived, it ran and the reply was lost, or it is still running. Retrying blindly is only safe in the first
-case. So attach a client reference to every write, record it in your own store before sending, and put it
-in a field the legacy system persists and can be queried by (a customer reference or batch reference
-field, agreed with the system's owners). After a timeout, look the reference up before retrying; if it
-exists, the write happened. If the system offers no queryable field, route writes through a single queue
-consumer and confirm them against the next extract, *because* only reconciliation can then tell you which
-in-doubt writes landed.
+A timeout on a legacy transaction has three possible meanings, and legacy transactions are rarely idempotent:
+
+| Meaning | Is a blind retry safe? |
+|---|---|
+| The request never arrived | Yes |
+| It ran and the reply was lost | No: duplicate write |
+| It is still running | No: duplicate write |
+
+So:
+1. **Attach a client reference** to every write and record it in your own store before sending.
+2. **Put it in a field the legacy system persists and can be queried by** (a customer reference or batch
+   reference field, agreed with the system's owners).
+3. **After a timeout, look the reference up before retrying**; if it exists, the write happened.
+4. **No queryable field?** Route writes through a single queue consumer and confirm them against the next
+   extract, *because* only reconciliation can then tell you which in-doubt writes landed.
 
 ### 5. Migrate incrementally if replacing
-The strangler fig pattern routes one capability at a time from the legacy system to the new one behind a
-facade, *because* big-bang rewrites of systems with decades of undocumented rules routinely fail.
+- **Strangler fig:** route one capability at a time from the legacy system to the new one behind a facade,
+  *because* big-bang rewrites of systems with decades of undocumented rules routinely fail.
 
-## Example
+## Diagram
+Consumers only ever see domain operations; protection and translation sit between them and the legacy system.
+
+```mermaid
+flowchart TD
+    A["Agent tool or service"] --> ACL["Anti-corruption layer"]
+    ACL -->|"get_claim(id)"| C[("Read cache or replica")]
+    ACL -->|"writes with client ref"| Q["Write queue"]
+    C -->|"miss"| L["Concurrency limiter"]
+    Q --> L
+    L --> P{"Access path"}
+    P --> I["Existing MQ or SOAP"]
+    P --> F["Batch file over SFTP"]
+    P --> T["CICS transaction gateway"]
+    I --> M[("Legacy system of record")]
+    F --> M
+    T --> M
+```
+
+## Examples
+### Decoding a fixed-width EBCDIC extract
 A nightly SFTP extract contains fixed-width 30-byte records in EBCDIC: customer id `PIC X(10)`, name
-`PIC X(16)`, balance `PIC S9(5)V99 COMP-3` (seven digits plus a sign nibble = 4 bytes, two implied decimals).
-The anti-corruption layer decodes it into a typed record.
+`PIC X(16)`, balance `PIC S9(5)V99 COMP-3` (seven digits plus a sign nibble = 4 bytes, two implied
+decimals). The anti-corruption layer decodes it into a typed record.
 
 ```python
 from decimal import Decimal
@@ -134,43 +161,117 @@ assert unpack_comp3(bytes.fromhex("1234567C"), 2) == Decimal("12345.67")
 assert unpack_comp3(bytes.fromhex("0000150D"), 2) == Decimal("-1.50")
 ```
 
-Reading the file as UTF-8 would raise decode errors or produce garbage names and, worse, treating the packed
-bytes as text (or decoding them with `cp037`, which maps every byte to some character) would
-silently produce plausible-looking wrong balances, which is why the layout (the COBOL copybook) is the first
-artifact to request from the customer.
+- **Wrong decoding fails silently.** Reading the file as UTF-8 raises decode errors or produces garbage
+  names. Worse, treating the packed bytes as text (or decoding them with `cp037`, which maps every byte to
+  some character) silently produces plausible-looking wrong balances.
+- **So the layout comes first.** The COBOL copybook is the first artifact to request from the customer.
+
+### Idempotent write wrapper for an in-doubt timeout
+The reference is recorded before sending and looked up after a timeout, so a lost reply never becomes a
+second write. The fake gateway applies the write and then loses the reply once.
+
+```python
+import uuid
+
+class LegacyTimeout(Exception):
+    pass
+
+def update_contact(pending: dict, gateway, claim_id: str, address: str) -> str:
+    ref = uuid.uuid4().hex[:12].upper()            # client reference, agreed field width
+    pending[ref] = (claim_id, address)             # 1. record BEFORE sending
+    for _ in range(3):
+        try:
+            gateway.send(claim_id, address, ref)   # 2. ref goes in a field the system persists
+            break
+        except LegacyTimeout:
+            # 3. wait out the transaction's max run time (not shown), then look before retrying
+            if gateway.find_by_reference(ref):
+                break                              # it ran; only the reply was lost
+    else:
+        return f"in-doubt {ref}: confirm against next extract"
+    del pending[ref]
+    return f"applied {ref}"
+
+class FakeGateway:                                 # applies the write, then loses the reply once
+    def __init__(self):
+        self.rows, self.lose_reply = {}, True
+    def send(self, claim_id, address, ref):
+        self.rows[ref] = (claim_id, address)
+        if self.lose_reply:
+            self.lose_reply = False
+            raise LegacyTimeout()
+    def find_by_reference(self, ref):
+        return ref in self.rows
+
+gw, pending = FakeGateway(), {}
+print(update_contact(pending, gw, "CLM4471", "1 New St"))
+print(len(gw.rows), pending)                       # 1 {}: applied once, nothing in doubt
+```
+
+### Worked capacity check with Little's law
+Agent lookups against a claims mainframe that allows 10 concurrent sessions (illustrative figures).
+
+| Scenario | Arrival rate to legacy | Latency | In flight | Fits 10? |
+|---|---|---|---|---|
+| Every lookup hits the mainframe | 20/s | 1.5 s | 30 | No |
+| Read cache absorbs 70% of lookups | 6/s | 1.5 s | 9 | Yes, barely |
+| Cache plus batching 2 lookups per call | 3 calls/s | 1.5 s | 4.5 | Yes, with headroom |
+
+The cache is the lever, because latency is fixed by the legacy system and arrival rate is the only thing
+you control.
+
+## Production patterns
+- **Bulkhead the legacy calls.** Wrap every call in a limiter sized to the session count operations agrees
+  (for example `asyncio.Semaphore(10)` per gateway in Python), and fail fast with a clear message when it is
+  full. Monitor in-flight calls, queue wait time and rejections.
+- **Maintenance-aware tools.** Keep the batch and maintenance calendar in config and check it before calling,
+  so agent tools answer "system unavailable, try after 06:00" during the window. Monitor calls attempted
+  inside windows (should be zero).
+- **Binary transfer plus copybook-driven parsing.** Move mixed files without code-page conversion (FTP in
+  binary mode, or SFTP, which does not convert), then decode per field from the copybook. Quarantine records
+  that fail validation and alert on parse rejects per extract.
+- **Reference-tagged writes with daily reconciliation.** Every write carries a client reference; a daily job
+  matches pending references against the next extract and pages on any still in doubt. Monitor in-doubt
+  writes and how they resolved.
+- **Status-code translation table, owned and versioned.** Keep the mapping from codes like `07` to named
+  states in one reviewed table in the anti-corruption layer, and fail on unknown codes rather than passing
+  them through. Monitor unknown-code counts.
 
 ## Trade-offs
-- Batch file exchange is decoupled and replayable, but data is as stale as the last extract; it flips to
-  CDC or a queue when users need answers about changes made in the last hour.
-- Reading a replica protects the primary, but replication lag means a just-submitted transaction may be
+- **Batch files: decoupled vs stale.** Files are decoupled and replayable, but data is as stale as the last
+  extract. It flips to CDC or a queue when users need answers about changes made in the last hour.
+- **Replica: protects the primary vs lag.** Replication lag means a just-submitted transaction may be
   invisible; read-your-writes flows must query the primary or wait.
-- Screen automation reaches logic no API exposes, but breaks on any UI change and is slow; it is acceptable
-  only when volumes are low and a proper interface is on the roadmap.
-- An anti-corruption layer costs a service to build and run, but without it every consumer learns legacy
+- **Screen automation: reach vs fragility.** It reaches logic no API exposes, but breaks on any UI change and
+  is slow. Acceptable only when volumes are low and a proper interface is on the roadmap.
+- **Anti-corruption layer: a service to run vs leaked semantics.** Without it every consumer learns legacy
   codes; it stops paying off only for a single throwaway consumer.
 
 ## Pitfalls
-- Querying the production database during the batch window; the symptom is the nightly job overrunning
-  and the operations team asking who is running unplanned queries.
-- Decoding with the wrong code page or ignoring packed decimals; the symptom is mojibake in names or
-  balances off by orders of magnitude.
-- Retrying non-idempotent legacy writes on timeout; the symptom is duplicate orders or payments
-  discovered at reconciliation.
-- Exposing raw legacy codes to the LLM as tool output; the symptom is the model guessing what status
-  `07` means and confidently telling a customer the wrong thing.
-- Transferring mixed text-and-packed files in text mode, or letting a gateway convert code pages for the
-  whole record; the symptom is names that look fine while numeric fields are garbage or fail validation.
-- Assuming 24/7 availability; the symptom is agent tools failing every night during maintenance with
-  unhelpful error messages.
+- **Querying production during the batch window.** Symptom: the nightly job overruns and operations asks
+  who is running unplanned queries.
+- **Wrong code page or ignored packed decimals.** Symptom: mojibake in names or balances off by orders of
+  magnitude.
+- **Retrying non-idempotent writes on timeout.** Symptom: duplicate orders or payments discovered at
+  reconciliation.
+- **Raw legacy codes as tool output.** Symptom: the model guesses what status `07` means and confidently
+  tells a customer the wrong thing.
+- **Text-mode transfer of mixed text-and-packed files**, or a gateway converting code pages for the whole
+  record. Symptom: names look fine while numeric fields are garbage or fail validation.
+- **Assuming 24/7 availability.** Symptom: agent tools fail every night during maintenance with unhelpful
+  error messages.
 
 ## When to use
-Use these patterns whenever an AI feature must read from or write to a system you cannot change. Start by
-asking for the existing interfaces, the batch schedule, the record layouts and the capacity constraints,
-before writing code. Prefer read-only integration for a first release; add writes only through a path that
-runs the system's own business rules, with idempotency references. Measure data freshness against the batch schedule, load placed on the legacy system (calls, concurrency,
-CPU where the owners can report it), in-doubt writes and how they resolved, parse rejects per extract, and
-reconciliation mismatches. In interviews, explaining why you would not point an agent
-at the mainframe database directly, and what you would do instead, is the core signal.
+- **Use when** an AI feature must read from or write to a system you cannot change.
+- **Ask first, code second:** existing interfaces, the batch schedule, the record layouts and the capacity
+  constraints.
+- **Release order:** read-only first; add writes only through a path that runs the system's own business
+  rules, with idempotency references.
+- **Measure:** data freshness against the batch schedule, load on the legacy system (calls, concurrency, CPU
+  where the owners can report it), in-doubt writes and how they resolved, parse rejects per extract, and
+  reconciliation mismatches.
+- **Interviews:** explain why you would not point an agent at the mainframe database directly, and what you
+  would do instead; that is the core signal.
 
 ## Role lens
 - **Engineer:** Writes the anti-corruption layer: copybook-driven parsers, code-to-state mappings,
@@ -191,6 +292,39 @@ address, ref)`, record the reference before sending and, after a timeout, look i
 retrying, so an in-doubt write is never applied twice, and queue requests so the
 agent never overloads the system or calls during batch. If only a nightly file exists, make the agent say
 the change is scheduled, not done.
+
+## Interview questions
+### What is an anti-corruption layer and why put one in front of a legacy system?
+- **Definition:** a translation service you own that decodes legacy formats, maps codes to named states and
+  exposes domain operations like `get_claim(id)`.
+- **Why:** legacy semantics stop at one boundary, so consumers (including LLM tools) never learn status
+  codes or copybook layouts, and replacing the legacy system later changes only this layer.
+
+### Balances from a new mainframe extract are wildly wrong but names look fine. How do you debug it?
+- **Suspect the transfer first:** a text-mode transfer or gateway converting the whole record from EBCDIC
+  to ASCII rewrites packed `COMP-3` bytes without any error.
+- **Check against the copybook:** confirm field offsets, `COMP-3` versus zoned display digits, and implied
+  decimals.
+- **Fix:** transfer as binary, decode field by field, and validate nibbles so corruption raises instead of
+  producing plausible numbers.
+
+### An agent tool needs 20 lookups per second but the mainframe allows 10 sessions at 1.5 s each. What do you do?
+- **Little's law:** 20 × 1.5 = 30 calls in flight, three times the limit.
+- **Levers:** a read cache or replica, batching lookups, nightly extracts for data that tolerates staleness,
+  and load shedding with a clear message.
+- **Never** just raise timeouts and retry, because that grows the queue and the retries make it worse.
+
+### When would you accept screen automation, and when would you refuse it?
+- **Accept** when volumes are low, it is the only path that runs full validation, and a proper interface is
+  on the roadmap.
+- **Refuse** for high-volume or latency-sensitive paths, because any UI change breaks it and it runs at
+  human interaction speed.
+
+### How do you make a write to a non-idempotent legacy transaction safe to retry?
+- **Client reference recorded before sending**, carried in a field the system persists and can be queried by.
+- **After a timeout, look it up before retrying**, because the request may have run with the reply lost, or
+  still be running.
+- **No queryable field:** single queue consumer plus reconciliation against the next extract.
 
 ## Quiz
 ### Q: Why is screen automation usually the last-resort integration path?

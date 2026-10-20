@@ -5,7 +5,7 @@ name: Training data pipelines
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - training-adaptation/data-curation
   - training-adaptation/synthetic-data-generation
@@ -24,102 +24,139 @@ sources:
 
 ## TL;DR
 A training data pipeline turns raw sources into versioned, deduplicated, decontaminated, token-ready
-shards with full provenance. Its architecture matters because what you *remove* (duplicates, eval
-leakage, junk, PII) shapes the model at least as much as what you add, because every run must be
-reproducible from a dataset hash, and because tokenizing, packing and globally shuffling raw text at
-training time can starve the GPUs. This lesson covers the pipeline; the curation, labeling and synthetic-data lessons in Training &
-adaptation cover what makes an individual example good.
+shards with provenance. What you remove shapes the model as much as what you add, runs must reproduce
+from a dataset hash, and offline packing keeps GPUs fed.
 
 ## Why it exists
-The naive pipeline is "export a JSONL file and point the trainer at it". It fails in ways that are
-invisible in the loss curve and expensive to discover afterwards.
-
-Duplicates are the first problem. Web and enterprise corpora contain the same page, template or ticket
-thousands of times. A model trained on them sees those sequences many more times than the rest of the
-data, memorizes them, and spends capacity on boilerplate; Lee et al. found that near-duplicate removal
-made models emit memorized training text roughly ten times less often and reach the same or better
-accuracy in fewer training steps.
-Contamination is the second: if the eval set's questions leaked into training through a scraped forum or
-an internal doc, the benchmark score is a measure of memorization, and the regression you see at
-deployment has no explanation in your dashboards. Third, formatting noise: SFT examples assembled by hand
-with inconsistent chat templates, stray system prompts or missing end-of-turn tokens teach the model the
-noise, and the symptom is a fine-tuned model that stops at the wrong place or emits template fragments.
-Fourth, reproducibility: without a dataset version and a deterministic shuffle, a loss divergence cannot
-be reproduced, a resumed run does not match the original, and a regression cannot be attributed to a data
-change. Fifth, throughput: tokenizing, packing and globally shuffling raw text inside the dataloader is
-CPU- and I/O-bound work that can leave the accelerators idle in a sawtooth pattern, most visibly for
-smaller models whose per-GPU token consumption is high.
-
-The pipeline exists to make these properties structural rather than hoped for: filter, deduplicate,
-decontaminate, format, tokenize, pack and shard offline, and record what came from where.
+- **"Export a JSONL file and point the trainer at it" fails invisibly.** The failures do not show in the
+  loss curve and are expensive to discover afterwards.
+- **Duplicates.** Web and enterprise corpora contain the same page, template or ticket thousands of times.
+  The model memorizes them and spends capacity on boilerplate; Lee et al. found near-duplicate removal made
+  models emit memorized training text roughly ten times less often, with the same or better accuracy in
+  fewer training steps.
+- **Contamination and formatting noise.** If eval questions leaked into training (a scraped forum, an
+  internal doc), the benchmark measures memorization and the deployment regression has no explanation.
+  Hand-assembled SFT examples with inconsistent chat templates, stray system prompts or missing end-of-turn
+  tokens teach the noise: the model stops at the wrong place or emits template fragments.
+- **Reproducibility and throughput.** Without a dataset version and a deterministic shuffle, a loss
+  divergence cannot be reproduced, a resumed run does not match, and a regression cannot be attributed to a
+  data change. Tokenizing, packing and globally shuffling raw text in the dataloader is CPU- and I/O-bound
+  and can leave accelerators idle in a sawtooth, most visibly for smaller models with high per-GPU token
+  consumption.
+- **The pipeline makes these properties structural, not hoped for.** Filter, deduplicate, decontaminate,
+  format, tokenize, pack and shard offline, and record what came from where. This lesson covers the
+  pipeline; the curation, labeling and synthetic-data lessons in Training & adaptation cover what makes an
+  individual example good.
 
 ## How it works
 ### Stage order, and why
-The stages run in an order chosen so that cheap operations shrink the data before expensive ones run.
+Cheap operations shrink the data before expensive ones run.
 
 1. **Sourcing and provenance.** Every source gets a manifest: origin, license or contractual basis,
    snapshot date, raw hash. This is the only point where that information is cheap to capture.
-2. **Heuristic filtering.** Language identification, length bounds, symbol-to-word ratio, fraction of
-   lines ending in terminal punctuation, repeated-line ratio, blocklisted domains. These are the C4 and
-   Gopher-style rules: cheap per document, remove a large fraction of junk, and run first because
-   everything after is costlier per byte.
-3. **Deduplication.** Exact dedup by document hash catches byte-identical copies only. Near-duplicate
-   detection uses MinHash: shingle each document into overlapping n-grams, hash each shingle with *k*
-   hash functions and keep the minimum per function to form a signature, then band the signature with
-   locality-sensitive hashing so documents sharing a band become candidate pairs, and cluster candidates
-   with union-find, keeping one per cluster. It exists because exact hashing misses the same article with
-   a different footer, and pairwise comparison of a billion documents is impossible.
-   The reason it works: for one random hash function, the chance that two documents have the same
-   minimum shingle hash equals their Jaccard similarity *s*. So a signature of *k* minima estimates
-   *s*. Split the signature into *b* bands of *r* rows (with *k = b·r*). Two documents become a candidate
-   pair if all *r* values in at least one band match, which happens with probability
-   `P(s) = 1 − (1 − s^r)^b`. That is an S-curve with its steep part near `(1/b)^(1/r)`. With *k* = 100
-   split as *b* = 20, *r* = 5, the threshold is about 0.55. Pairs with *s* = 0.8 become candidates with
-   probability about 0.9996, pairs at 0.5 about 0.47, and pairs at 0.3 about 0.05. More rows per band
-   moves the threshold up and makes the curve steeper. Candidates are usually checked against a real
-   similarity before they are merged, because LSH controls recall, not precision.
-4. **Decontamination.** Compare training text against every evaluation set the model will be judged on,
-   using n-gram overlap (the GPT-3 report used 13-gram overlap; the right *n* is a judgement between
-   missing paraphrases and deleting common phrases), and remove or flag overlapping training documents.
-   This must be redone whenever an eval set is added. Your own validation split needs the same care.
-   Split *after* near-duplicate clustering and by group (customer, thread, product), so a cluster never
-   has members on both sides. A random row-level split of support tickets puts near-identical tickets in
-   train and validation, and the validation loss then reports memorization.
+2. **Heuristic filtering.** Language ID, length bounds, symbol-to-word ratio, fraction of lines ending in
+   terminal punctuation, repeated-line ratio, blocklisted domains. These C4 and Gopher-style rules are cheap
+   per document, remove a large fraction of junk, and run first because everything after costs more per
+   byte.
+3. **Deduplication.** Exact dedup by document hash catches byte-identical copies only; near-duplicates need
+   MinHash (next subsection). It exists because exact hashing misses the same article with a different
+   footer, and pairwise comparison of a billion documents is impossible.
+4. **Decontamination.** Compare training text against every eval set the model will be judged on with
+   n-gram overlap and remove or flag overlapping documents (details below). Redo it whenever an eval set is
+   added.
 5. **Model-based quality filtering.** A small classifier or a perplexity threshold from a reference model
-   ranks remaining documents for "educational" or domain quality. It runs late because it is the most
-   expensive per document and operates on the smallest set. The FineWeb work is a good public reference
-   for how much each of these stages removes on web data.
-6. **Safety and PII scrubbing.** Regex and NER passes for emails, keys, phone numbers, plus toxicity
+   ranks documents for "educational" or domain quality. It runs late because it is the most expensive per
+   document and operates on the smallest set. FineWeb is a good public reference for how much each stage
+   removes on web data.
+6. **Safety and PII scrubbing.** Regex and NER passes for emails, keys and phone numbers, plus toxicity
    filters, with the policy decided by legal rather than by the pipeline author.
-7. **Formatting.** For pretraining, documents are concatenated with an end-of-sequence token between
-   them. For SFT, each example is rendered through the exact chat template the model will serve with,
-   and the loss mask is computed so that only assistant tokens contribute to the loss; the prompt tokens
-   get the ignore index. Doing this offline, deterministically, removes a whole class of template bugs.
-8. **Tokenization and packing.** Tokenize offline and store token ids. Pack multiple short examples into
-   fixed-length sequences to avoid padding waste (a batch of 4,096-token slots filled with 300-token
-   examples is over 90 % padding otherwise). Packing requires either resetting position ids and masking
-   attention across document boundaries or accepting a small amount of cross-document attention; which
-   you choose depends on the trainer's support.
-9. **Sharding and mixture.** Write fixed-size shards (Parquet, Arrow, WebDataset tar, or a streaming
-   format such as MDS) with a shard index, so the loader can shuffle at shard level and within a buffer,
-   resume from a global sample offset, and sample sources according to a mixture weight (for example
-   up-weighting the customer's domain data relative to general text). A mixture weight implies a
-   repetition count: `epochs_of_source = weight × total_training_tokens / source_tokens`. Giving a
-   50M-token domain source 20 % of a 1B-token run means 200M tokens drawn from it, which is four passes
-   over it. Write that number down per source, because a small source with a high weight is repeated
-   many times, and repetition is where memorization and overfitting come from.
+7. **Formatting.** Pretraining: concatenate documents with an end-of-sequence token between them. SFT:
+   render each example through the exact chat template the model will serve with, and mask the loss so only
+   assistant tokens contribute; prompt tokens get the ignore index. Doing this offline, deterministically,
+   removes a whole class of template bugs.
+8. **Tokenization and packing.** Tokenize offline, store token ids, and pack short examples into
+   fixed-length sequences (see the packing subsection).
+9. **Sharding and mixture.** Write fixed-size shards with a shard index and sample sources by mixture
+   weight (see below).
 10. **Versioning.** A dataset version is the ordered list of shard hashes plus the pipeline config. The
     training run records that version; lineage goes from any training sample back to its source manifest.
 
-### The dataloader contract
-The loader's job at training time is reduced to reading shards, buffered shuffling with a seeded RNG, and
-collation. Its throughput must exceed the model's consumption in tokens per second with headroom, which
-is why the expensive work was moved offline. Prefetching and multiple workers handle the rest.
+### Near-duplicate detection with MinHash and LSH
+1. **Shingle** each document into overlapping n-grams.
+2. **Hash** each shingle with *k* hash functions and keep the minimum per function: the signature.
+3. **Band** the signature with locality-sensitive hashing; documents sharing a band become candidate pairs.
+4. **Cluster** candidates with union-find and keep one per cluster.
 
-## Example
-Offline SFT formatting and packing: render the chat template, mask prompt tokens with the ignore index,
-pack examples into fixed-length sequences separated by EOS, and emit shards with a content hash for the
-dataset manifest. The tokenizer is any Hugging Face tokenizer with a chat template.
+**Why it works:**
+- For one random hash function, the chance two documents share the minimum shingle hash equals their Jaccard
+  similarity *s*, so a signature of *k* minima estimates *s*.
+- Split the signature into *b* bands of *r* rows (*k = b·r*). A pair is a candidate if all *r* values in at
+  least one band match: `P(s) = 1 − (1 − s^r)^b`.
+- That is an S-curve with its steep part near `(1/b)^(1/r)`. More rows per band moves the threshold up and
+  makes the curve steeper.
+
+| *k* = 100 as *b* = 20, *r* = 5 (threshold about 0.55) | Candidate probability |
+|---|---|
+| *s* = 0.8 | about 0.9996 |
+| *s* = 0.5 | about 0.47 |
+| *s* = 0.3 | about 0.05 |
+
+- **Verify candidates** against a real similarity before merging, because LSH controls recall, not
+  precision.
+
+### Decontamination and the validation split
+- **N-gram overlap against eval sets.** The GPT-3 report used 13-gram overlap. The right *n* is a judgement
+  between missing paraphrases and deleting common phrases.
+- **Your own validation split needs the same care.** Split *after* near-duplicate clustering and by group
+  (customer, thread, product), so a cluster never has members on both sides.
+- **Why:** a random row-level split of support tickets puts near-identical tickets in train and validation,
+  and validation loss then reports memorization.
+
+### Packing
+- **Padding waste without it.** A batch of 4,096-token slots filled with 300-token examples is over 90 %
+  padding.
+- **Cross-document attention.** Packing requires either resetting position ids and masking attention across
+  document boundaries, or accepting a small amount of cross-document attention; the choice depends on the
+  trainer's support.
+
+### Sharding and mixture weights
+- **Formats.** Parquet, Arrow, WebDataset tar, or a streaming format such as MDS, with a shard index.
+- **What the index buys.** The loader can shuffle at shard level and within a buffer, resume from a global
+  sample offset, and sample sources by mixture weight (for example up-weighting the customer's domain data
+  relative to general text).
+- **A weight implies a repetition count:** `epochs_of_source = weight × total_training_tokens / source_tokens`.
+  Giving a 50M-token domain source 20 % of a 1B-token run draws 200M tokens from it: four passes.
+- **Write that number down per source,** because a small source with a high weight is repeated many times,
+  and repetition is where memorization and overfitting come from.
+
+### The dataloader contract
+- **The loader only reads shards,** does buffered shuffling with a seeded RNG, and collates.
+- **Its throughput must exceed the model's consumption** in tokens per second with headroom, which is why
+  the expensive work moved offline. Prefetching and multiple workers handle the rest.
+
+## Diagram
+Cheap filters shrink the data before expensive stages run; the output is a hashed set of shards the
+training run references.
+
+```mermaid
+flowchart TD
+    S["Sources + provenance manifest"] --> F["Heuristic filters"]
+    F --> D["Exact + MinHash dedup"]
+    D --> C["Decontaminate vs eval sets"]
+    C --> Q["Model-based quality filter"]
+    Q --> P["PII and safety scrub"]
+    P --> T["Template render + loss mask"]
+    T --> K["Tokenize + pack"]
+    K --> SH[("Shards + manifest hash")]
+    SH --> L["Seeded loader feeds trainer"]
+    D -.->|"split by group after clustering"| V["Validation split"]
+```
+
+## Examples
+### Offline SFT formatting and packing
+Render the chat template, mask prompt tokens with the ignore index, pack examples into fixed-length
+sequences separated by EOS, and emit shards with a content hash for the dataset manifest. The tokenizer is
+any Hugging Face tokenizer with a chat template.
 
 ```python
 import hashlib, json
@@ -162,47 +199,98 @@ def write_shards(packed, path):
         json.dump(manifest, f)                                  # the dataset version is this file's hash
 ```
 
-The `doc_ids` column lets a trainer that supports it block attention across packed documents; the manifest
-of shard hashes is what the training config references so the run is reproducible.
+- **`doc_ids`** lets a trainer that supports it block attention across packed documents.
+- **The manifest of shard hashes** is what the training config references, so the run is reproducible.
+
+### Tuning the LSH threshold and checking mixture repetition
+Runnable as-is. It prints the candidate probability for three band layouts of the same 100 hash functions,
+then the repetition and padding arithmetic from above.
+
+```python
+def p_candidate(s, b, r):
+    """Probability two docs with Jaccard s share at least one fully matching band."""
+    return 1 - (1 - s**r) ** b
+
+for b, r in [(20, 5), (10, 10), (50, 2)]:                  # each uses k = b*r = 100 hash functions
+    thr = (1 / b) ** (1 / r)
+    row = "  ".join(f"s={s}: {p_candidate(s, b, r):.4f}" for s in (0.3, 0.5, 0.8))
+    print(f"b={b:>2} r={r:>2} threshold~{thr:.2f}  {row}")
+
+def epochs(weight, total_tokens, source_tokens):
+    return weight * total_tokens / source_tokens
+
+print(epochs(0.20, 1e9, 50e6))       # 4.0 passes over a 50M-token source at 20% of a 1B run
+print(1 - 300 / 4096)                # padding fraction of 300-token examples in 4,096 slots, unpacked
+```
+
+| Layout | Threshold | P at s = 0.3 | P at s = 0.5 | P at s = 0.8 |
+|---|---|---|---|---|
+| b = 20, r = 5 | ~0.55 | 0.0475 | 0.4701 | 0.9996 |
+| b = 10, r = 10 | ~0.79 | 0.0001 | 0.0097 | 0.6789 |
+| b = 50, r = 2 | ~0.14 | 0.9910 | 1.0000 | 1.0000 |
+
+- **Read it as a recall dial.** b = 10, r = 10 misses a third of pairs at s = 0.8; b = 50, r = 2 flags almost
+  everything and floods the verification step.
+
+## Production patterns
+- **Use a dedup library built for scale.** For corpora beyond one machine, run MinHash dedup with an
+  existing tool (Hugging Face `datatrove` was used for FineWeb; `datasketch` offers `MinHashLSH` with a
+  `threshold` and `num_perm` for smaller jobs). Monitor the fraction removed and the cluster-size
+  distribution; one giant cluster usually means a template or boilerplate problem.
+- **Decontamination as a blocking gate.** Before any training run, compute n-gram overlap between the new
+  shards and every registered eval set and fail the pipeline above a set overlap rate. Re-run the gate when
+  an eval set is added, and log overlap per eval set in the run record.
+- **Eyeball the loss mask.** For every new template or tokenizer, decode a few rendered examples with
+  labels shown and confirm only assistant tokens and the end-of-turn token carry loss. Monitor the share of
+  examples dropped as too long, because silent drops skew the data mix.
+- **Pin the dataset version in the run config.** Reference the manifest hash, the pipeline config and the
+  loader seed in the training config, and refuse to launch without them. This makes resume and divergence
+  debugging possible.
+- **Benchmark the loader before the run.** Measure loader tokens per second against the model's
+  consumption on the target hardware, and watch GPU utilization for a sawtooth during the first minutes.
 
 ## Trade-offs
-- Aggressive heuristic filtering removes junk cheaply but also removes legitimate code, tables and
-  non-English text; the thresholds flip when the target domain is exactly the content the rules distrust.
-- Near-duplicate removal improves generalization and reduces memorization, but a low similarity threshold
-  deletes templated-but-distinct documents such as product pages, which can matter for a domain model.
-- Packing eliminates padding waste and raises tokens per second, but without cross-document attention
-  masking it lets examples attend to unrelated neighbours; for short SFT examples the masking is worth it.
-- Offline tokenization maximizes training throughput and reproducibility, yet it binds the dataset to one
-  tokenizer, so a tokenizer or model-family change means re-tokenizing from the text tables.
-- Strict n-gram decontamination protects eval validity but at small *n* removes documents that merely
-  share common phrases with the eval set, shrinking the training set for no gain.
+- **Aggressive heuristic filtering vs coverage.** It removes junk cheaply but also legitimate code, tables
+  and non-English text; the thresholds flip when the target domain is exactly the content the rules
+  distrust.
+- **Near-duplicate removal vs templated content.** It improves generalization and reduces memorization, but
+  a low similarity threshold deletes templated-but-distinct documents such as product pages, which can
+  matter for a domain model.
+- **Packing vs isolation.** It eliminates padding waste and raises tokens per second, but without
+  cross-document masking examples attend to unrelated neighbours; for short SFT examples masking is worth
+  it.
+- **Offline tokenization vs flexibility.** It maximizes throughput and reproducibility, yet binds the dataset
+  to one tokenizer, so a tokenizer or model-family change means re-tokenizing from the text tables.
+- **Strict decontamination vs data volume.** It protects eval validity, but at small *n* removes documents
+  that merely share common phrases with the eval set, shrinking the training set for no gain.
 
 ## Pitfalls
-- Decontaminating with exact match only; the symptom is a benchmark score that collapses on a freshly
-  written eval set of the same difficulty.
-- Rendering SFT examples with a template that differs from serving; the symptom is the fine-tuned model
-  emitting role tags or failing to stop at the end of its turn.
-- Tokenizing, packing or globally shuffling raw text inside the dataloader at scale; the symptom is GPU
-  utilization oscillating between near zero and full while CPUs are saturated.
-- Non-deterministic shuffling without a seeded, offset-addressable order; the symptom is a resumed run
-  whose loss curve does not continue the original, and a divergence nobody can reproduce.
-- Running near-dup detection before cheap filters; the symptom is MinHash jobs that take days on data
-  most of which is then discarded by a one-line length rule.
-- Splitting train and validation at random rows instead of by group after dedup; the symptom is a
-  validation loss that keeps falling while quality on genuinely new customers or threads stays flat.
-- Dropping provenance at the first join; the symptom is a takedown or license question that can only be
+- **Decontaminating with exact match only.** Symptom: a benchmark score that collapses on a freshly written
+  eval set of the same difficulty. Fix: n-gram overlap.
+- **A training template that differs from serving.** Symptom: the fine-tuned model emits role tags or fails
+  to stop at the end of its turn. Fix: render with the exact serving template.
+- **Tokenizing, packing or globally shuffling inside the dataloader at scale.** Symptom: GPU utilization
+  oscillates between near zero and full while CPUs are saturated. Fix: do it offline.
+- **Non-deterministic shuffling without a seeded, offset-addressable order.** Symptom: a resumed run whose
+  loss curve does not continue the original, and a divergence nobody can reproduce.
+- **Near-dup detection before cheap filters.** Symptom: MinHash jobs that take days on data most of which a
+  one-line length rule then discards.
+- **Random-row train/validation splits instead of group splits after dedup.** Symptom: validation loss keeps
+  falling while quality on genuinely new customers or threads stays flat.
+- **Dropping provenance at the first join.** Symptom: a takedown or license question that can only be
   answered by retraining without the disputed source.
 
 ## When to use
-Build this pipeline, at whatever scale, the moment training data is assembled from more than one source
-or will be used more than once. For a fine-tune on a few thousand customer examples the stages are small
-scripts, but the properties still matter: template-exact rendering, loss masking, dedup against the eval
-set, and a manifest hash in the training config. Measure the fraction removed at each stage, the
-near-duplicate cluster size distribution, overlap rate with each eval set, padding ratio after packing,
-and loader tokens per second against model consumption. In interviews, "how would you prepare data to
-fine-tune on a customer's support tickets" is answered by walking these stages, and the differentiating
-points are decontamination against the eval set, prompt-token loss masking and a reproducible dataset
-version.
+- **Use** this pipeline, at whatever scale, the moment training data comes from more than one source or
+  will be used more than once.
+- **Small fine-tunes still need the properties.** For a few thousand customer examples the stages are small
+  scripts, but keep template-exact rendering, loss masking, dedup against the eval set, and a manifest hash
+  in the training config.
+- **Measure** fraction removed per stage, near-duplicate cluster sizes, overlap rate with each eval set,
+  padding ratio after packing, and loader tokens per second against model consumption.
+- **Interviews:** "how would you prepare data to fine-tune on a customer's support tickets?" Walk these
+  stages; the differentiators are decontamination against the eval set, prompt-token loss masking and a
+  reproducible dataset version.
 
 ## Role lens
 - **Engineer:** Writes the filtering, MinHash dedup, template rendering and packing jobs, verifies the
@@ -225,6 +313,39 @@ loss mask included prompt tokens so the model learned to reproduce template stru
 rendered examples token by token, confirm the ignore index covers the prompt and that the end-of-turn
 token terminates the labels. Near-duplicate inflation in the training set would compound both, so look at
 the dedup cluster sizes as well.
+
+## Interview questions
+### Why does stage order matter in a training data pipeline?
+- **Cost per byte rises along the pipeline:** heuristic filters are nearly free, MinHash is moderate, and
+  model-based quality scoring is the most expensive per document.
+- **So cheap filters run first** and shrink the set before costly stages run; running MinHash first means
+  days of compute on data a length rule would have discarded.
+- **Provenance is captured first** because it is only cheap at the source.
+
+### Validation loss keeps falling but the model is no better on new customers. What happened?
+- **Likely a leaky split:** rows were split at random, so near-duplicate tickets from one customer or thread
+  sit on both sides and validation measures memorization.
+- **Check** dedup clusters that span train and validation, and overlap with the eval set.
+- **Fix:** split by group after near-duplicate clustering, and rebuild the eval from data dated after the
+  training export.
+
+### How do you choose the MinHash band layout?
+- **The threshold sits near `(1/b)^(1/r)`:** with 100 hash functions, 20 bands of 5 rows puts it near
+  0.55, while 10 bands of 10 rows moves it near 0.79 and makes the curve steeper.
+- **Trade recall for verification cost:** a lower threshold finds more near-duplicates but sends more
+  candidate pairs to the exact-similarity check.
+- **Domain matters:** a low threshold deletes templated-but-distinct documents such as product pages.
+
+### A 50M-token domain dataset gets 20 % of a 1B-token run. Is that a problem?
+- **Compute repetitions:** 0.2 × 1B / 50M = four passes over the domain data.
+- **Four passes is a risk to watch, not automatically wrong;** repetition is where memorization and
+  overfitting come from, so track held-out loss on that domain.
+- **Levers:** lower the weight, add more domain data, or deduplicate it harder first.
+
+### When would you not pack SFT examples?
+- **When the trainer cannot reset position ids or mask attention across documents** and examples are
+  short and unrelated, cross-document attention may hurt more than padding costs.
+- **Otherwise pack:** 300-token examples in 4,096-token slots waste over 90 % of each sequence on padding.
 
 ## Quiz
 ### Q: Why do near-duplicate removal with MinHash rather than relying on exact document hashing?

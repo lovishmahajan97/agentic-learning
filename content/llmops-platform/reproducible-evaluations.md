@@ -5,7 +5,7 @@ name: Reproducible evaluations
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - llmops-platform/experiment-tracking
   - llmops-platform/evaluation-frameworks
@@ -22,96 +22,108 @@ sources:
 ---
 
 ## TL;DR
-A reproducible evaluation is one anyone can re-run from a recorded manifest and reach the same
-conclusion: same dataset version, same bundle (model snapshot, prompt version, decoding parameters,
-index), same scorer versions (judge model and rubric), same code and environment, with raw outputs stored
-and residual sampling noise measured rather than assumed away. It exists because an LLM eval has many
-silently drifting parts, so an unpinned comparison across weeks compares two different systems and blames
-the wrong cause.
+A reproducible eval can be re-run from a recorded manifest (dataset, bundle, scorers, code, environment)
+to the same conclusion, with raw outputs stored and leftover noise measured, because unpinned comparisons
+across weeks compare two different systems.
 
 ## Why it exists
-"Did the prompt change help?" is only answerable if everything else held still, and in an LLM system
-almost nothing does by default. The provider updates the model behind an alias such as `-latest`, and
-published studies have documented large behaviour shifts between dated versions of the same hosted model.
-Sampling at temperature above zero produces different outputs on every run, and even at temperature zero
-outputs are generally not bit-identical across calls, because batching and floating-point reduction order
-on GPUs are not deterministic. The judge used to score free text is itself a model and drifts for the same
-reasons. The dataset gets edited in place. The retrieval index is re-embedded. The prompt contains today's
-date or a live tool result. A dependency bump changes a tokenizer or an SDK default. A warm cache serves
-last month's outputs for a model that has since changed.
-
-The naive answers each cover one source. "Set temperature to 0 and a seed" addresses sampling only, and
-many APIs treat the seed as best-effort. "Compare with last week's number" compares two systems. "Run it
-twice and see" is the right instinct without the bookkeeping to act on it. The cost of getting this wrong
-is not academic: a team ships a prompt that "improved three points" when the provider changed the model
-underneath, or rolls back a genuine improvement because the judge was upgraded the same day. Regulated
-customers add a second reason: they ask for the evidence behind a release, and "we ran it and it looked
-fine" is not evidence. Reproducibility is the discipline of pinning what can be pinned, measuring the
-noise in what cannot, and recording both.
+- **Almost nothing holds still by default.** "Did the prompt change help?" needs everything else fixed. The
+  provider updates the model behind an alias such as `-latest`, and published studies have documented large
+  behaviour shifts between dated versions of the same hosted model.
+- **Sampling is noisy even at temperature zero.** Above zero, every run differs. At zero, outputs are
+  generally still not bit-identical across calls, because batching and floating-point reduction order on
+  GPUs are not deterministic. The judge is a model and drifts for the same reasons.
+- **Everything else moves too.** The dataset is edited in place, the index re-embedded, the prompt contains
+  today's date or a live tool result, a dependency bump changes a tokenizer or SDK default, and a warm cache
+  serves last month's outputs for a model that has since changed.
+- **Naive fixes cover one source each.** "Temperature 0 and a seed" addresses sampling only, and many APIs
+  treat the seed as best-effort. "Compare with last week" compares two systems. "Run it twice and see" is the
+  right instinct without the bookkeeping to act on it.
+- **The cost is real.** Teams ship a prompt that "improved three points" when the provider changed the model,
+  or roll back a real improvement because the judge was upgraded the same day. Regulated customers want
+  evidence, and "we ran it and it looked fine" is not evidence. So pin what can be pinned, measure the noise
+  in what cannot, and record both.
 
 ## How it works
 ### Three levels, and which one you actually need
-*Bit-exact* reproduction (identical outputs) is achievable with locally served open-weight models at
-temperature zero with fixed batching and deterministic kernels (at some throughput cost), and rarely
-through a hosted API. *Statistical* reproduction (the
-same score distribution within a measured noise band) is the practical target for every decision eval.
-*Re-derivable* (anyone can reconstruct the run from its manifest, even if the provider has since changed)
-is the minimum bar for any eval that is cited in a release.
+| Level | Means | Achievable when | Required for |
+|---|---|---|---|
+| **Bit-exact** | identical outputs | locally served open-weight models at temperature zero with fixed batching and deterministic kernels (at some throughput cost); rarely through a hosted API | debugging, special cases |
+| **Statistical** | same score distribution within a measured noise band | always, with repeats | every decision eval |
+| **Re-derivable** | anyone can reconstruct the run from its manifest, even if the provider has since changed | always, with a manifest | the minimum bar for any eval cited in a release |
 
 ### The eval lockfile
-Every run records a manifest, and each field is there *because* a specific drift has burned someone:
-- **Dataset**: the content hash of the items, not a file name, because files get edited in place.
-- **Bundle**: model snapshot id (or weights digest), prompt versions, decoding parameters, seed where
-  supported, tool and retrieval index snapshots. A dated snapshot rather than an alias, because the alias
-  is the single most common cause of unexplained score changes.
-- **Scorers**: judge model snapshot, judge prompt and rubric version, scorer code version; the judge is
-  pinned because it is a model.
-- **Environment**: git SHA, dependency lockfile hash, container image digest; because tokenizers, SDK
-  defaults and retry behaviour live in dependencies.
-- **Runtime inputs**: anything the application reads at request time that is not in the bundle, such as
-  the current date, a live tool or API result, or a feature-flag value. These are frozen by injecting a
-  fixed clock and replaying recorded tool responses (an agent eval that calls a live search API is not
-  reproducible next week whatever else you pin), and the recording's hash goes into the manifest.
-- **Run policy**: concurrency, timeout and retry settings, cache mode; because timeouts recorded as zero
-  scores make a provider incident look like a regression, and a cache that ignores a pin hides a change.
-The run id is a hash of the manifest, so two runs with identical pins are recognisably the same
-experiment, and the manifest is stored next to the raw outputs in the experiment-tracking or evaluation
-store.
+Every run records a manifest; each field is there *because* a specific drift has burned someone.
+
+| Field | Contents | Because |
+|---|---|---|
+| **Dataset** | the content hash of the items, not a file name | files get edited in place |
+| **Bundle** | model snapshot id (or weights digest), prompt versions, decoding parameters, seed where supported, tool and retrieval index snapshots | a dated snapshot, not an alias: the alias is the single most common cause of unexplained score changes |
+| **Scorers** | judge model snapshot, judge prompt and rubric version, scorer code version | the judge is a model |
+| **Environment** | git SHA, dependency lockfile hash, container image digest | tokenizers, SDK defaults and retry behaviour live in dependencies |
+| **Runtime inputs** | anything read at request time outside the bundle: the current date, a live tool or API result, a feature-flag value | frozen by injecting a fixed clock and replaying recorded tool responses; the recording's hash goes in the manifest |
+| **Run policy** | concurrency, timeout and retry settings, cache mode | timeouts recorded as zero scores make a provider incident look like a regression; a cache that ignores a pin hides a change |
+
+- **Live tools break reproducibility:** an agent eval that calls a live search API is not reproducible next
+  week whatever else you pin.
+- **The run id is a hash of the manifest,** so two runs with identical pins are recognisably the same
+  experiment.
+- **Store the manifest next to the raw outputs** in the experiment-tracking or evaluation store.
 
 ### Measure the noise you cannot pin
-Run the *same* bundle several times (three to five repeats is a common illustrative choice) and compute
-the spread of the aggregate; that spread is the noise floor, and no delta smaller than it may be believed.
-Report every metric as a mean with a confidence interval, compare candidate against champion on
-identical items so item difficulty cancels, and evaluate at the temperature production uses rather than
-forcing zero, *because* an eval at temperature zero of a system that ships at 0.7 measures a different
-system; repeats, not determinism, are how you tame the variance. Deterministic scorers on structured
-outputs from a locally pinned model can show a noise floor near zero, at which point one run suffices;
-measure it before assuming it.
+1. **Run the *same* bundle several times** (three to five repeats is a common illustrative choice) and compute
+   the spread of the aggregate. That spread is the noise floor; no delta smaller than it may be believed.
+2. **Report every metric as a mean with a confidence interval.**
+3. **Compare candidate and champion on identical items** so item difficulty cancels.
+4. **Evaluate at the temperature production uses,** not forced zero, *because* an eval at temperature zero of
+   a system that ships at 0.7 measures a different system. Repeats, not determinism, tame the variance.
+
+- **When one run suffices:** deterministic scorers on structured outputs from a locally pinned model can show
+  a noise floor near zero. Measure it before assuming it.
 
 ### Two kinds of noise, two different tools
-A score on a golden set is uncertain for two separate reasons, and they need different remedies.
-*Generation noise* is the run-to-run variation on the same items, from sampling, non-deterministic
-serving and a model-graded scorer; repeats measure it, and averaging each item's score over its repeats
-shrinks it. *Item-sampling noise* is the uncertainty from having evaluated these few hundred items rather
-than the whole population of requests; repeats do nothing for it, only more items do, and the confidence
-interval computed over items (bootstrap over per-item scores) is what quantifies it. A delta must clear
-both: a perfectly deterministic run on 100 items still has an item-level interval of several points. The
-practical recipe is to average repeats per item first, then compute the paired interval over items.
+| Noise | Source | Remedy | Measured by |
+|---|---|---|---|
+| **Generation noise** | run-to-run variation on the same items: sampling, non-deterministic serving, a model-graded scorer | repeats; averaging each item's score over its repeats shrinks it | spread across repeats |
+| **Item-sampling noise** | having evaluated these few hundred items rather than the whole population of requests | only more items; repeats do nothing | confidence interval over items (bootstrap over per-item scores) |
+
+- **A delta must clear both.** A perfectly deterministic run on 100 items still has an item-level interval
+  of several points.
+- **Practical recipe:** average repeats per item first, then compute the paired interval over items.
 
 ### Detect drift you cannot pin
-Even a dated snapshot is a promise you cannot verify from outside. A *sentinel run* re-executes a frozen
-reference bundle on a fixed subset on a schedule; if its score moves beyond the noise floor while
-nothing in the manifest changed, something outside the manifest did (the provider, the network, the
-environment), and the alert fires before a candidate is blamed. The same sentinel catches a silently
-updated judge.
+- **A dated snapshot is a promise you cannot verify from outside.**
+- **A sentinel run** re-executes a frozen reference bundle on a fixed subset on a schedule.
+- **If its score moves beyond the noise floor** while nothing in the manifest changed, something outside the
+  manifest did (the provider, the network, the environment), and the alert fires before a candidate is
+  blamed.
+- **The same sentinel catches a silently updated judge.**
 
 ### Comparability as a rule, not a hope
-Two runs are comparable only if their dataset version and scorer versions match; the tooling should refuse
-to diff them otherwise, or label the comparison as cross-version. Re-scoring is cheap when raw outputs are
-stored: a new judge version re-scores champion and candidate from stored outputs without re-calling the
-target, which is how you re-baseline after a judge upgrade.
+- **Two runs are comparable only if their dataset version and scorer versions match.** The tooling should
+  refuse to diff them otherwise, or label the comparison as cross-version.
+- **Re-scoring is cheap when raw outputs are stored:** a new judge version re-scores champion and candidate
+  from stored outputs without re-calling the target, which is how you re-baseline after a judge upgrade.
 
-## Example
+## Diagram
+Every run is identified by its manifest; comparisons are refused across yardsticks, and a cache-free
+sentinel watches for drift the manifest cannot pin.
+
+```mermaid
+flowchart TD
+    M["Manifest: dataset, bundle, scorers, env, runtime inputs, policy"] --> ID["Run id = hash of manifest"]
+    ID --> RUN["Run k repeats, cache off for floor"]
+    RUN --> RO[("Raw outputs + manifest stored")]
+    RO --> SC["Score with pinned scorers"]
+    SC --> CMP{"Same dataset and scorer versions?"}
+    CMP -->|"no"| REF["Refuse or label cross-version"]
+    CMP -->|"yes"| PI["Paired interval over items vs noise floor"]
+    SN["Scheduled sentinel: frozen bundle"] --> DR{"Moved beyond floor?"}
+    DR -->|"yes, manifest unchanged"| AL["Alert: drift outside manifest"]
+```
+
+## Examples
+### Manifest, noise floor and comparability check
 A manifest builder, a noise-floor measurement, and a comparability check. The run id is derived from the
 manifest, so re-running with the same pins produces the same id; a changed pin produces a new one. The
 noise floor is measured on the champion before any candidate is judged against it.
@@ -150,41 +162,107 @@ def comparable(a: dict, b: dict) -> tuple[bool, dict]:
 #                                                               # over items (gate lesson) must also exclude it
 ```
 
+### Repeats per item, then a paired interval over items
+Pure Python, runnable, with synthetic scores. The candidate is truly 3 points better on every item, with
+three repeats each on 100 identical items. Repeats shrink generation noise, but the interval over items
+still includes zero: only more items can resolve a gain this small.
+
+```python
+import random, statistics
+
+def paired_interval(champ, cand, n_boot=2000, seed=0):
+    """champ, cand: {item_id: [score per repeat]} on IDENTICAL items.
+    Average repeats per item first (shrinks generation noise), then bootstrap over items
+    (quantifies item-sampling noise, which repeats cannot touch)."""
+    ids = sorted(champ)
+    diffs = [statistics.mean(cand[i]) - statistics.mean(champ[i]) for i in ids]
+    rng = random.Random(seed)
+    boots = sorted(statistics.mean(rng.choices(diffs, k=len(diffs))) for _ in range(n_boot))
+    return statistics.mean(diffs), boots[int(0.025 * n_boot)], boots[int(0.975 * n_boot)]
+
+rng = random.Random(42)                       # synthetic pass/fail scores, 3 repeats per item
+p_champ = {f"i{k}": rng.random() for k in range(100)}           # each item's true pass probability
+p_cand = {k: min(1.0, p + 0.03) for k, p in p_champ.items()}    # candidate truly +3 points per item
+draw = lambda p: [float(rng.random() < p) for _ in range(3)]
+champ = {k: draw(p) for k, p in p_champ.items()}
+cand = {k: draw(p) for k, p in p_cand.items()}
+
+delta, lo, hi = paired_interval(champ, cand)
+print(f"delta={delta:+.3f}  95% CI [{lo:+.3f}, {hi:+.3f}]")   # an interval several points wide around +0.03
+print("result" if lo > 0 or hi < 0 else "not yet a result: interval includes zero")
+```
+
+### Worked scenario: Friday's "three-point win"
+A prompt change scores three points above a baseline measured three weeks earlier. Comparing the two
+manifests field by field explains it before anyone re-runs anything.
+
+| Manifest field | Baseline (3 weeks ago) | Friday's run | Comparable? |
+|---|---|---|---|
+| Dataset hash | golden-v8 | golden-v9 (20 items added) | no: different yardstick |
+| Model | alias `-latest` | alias `-latest` | unknown: the alias may have moved |
+| Judge | rubric v3 | rubric v3, judge snapshot updated | no: the judge is a model |
+| Prompt | v11 | v12 | the change under test |
+
+- **Verdict:** three uncontrolled changes besides the prompt, so the three points belong to nobody yet.
+- **Fix:** pin a dated model snapshot, re-run champion and candidate now with identical manifests except the
+  prompt, cache off, repeats per item, paired interval over items.
+
+## Production patterns
+- **Harness refuses incomplete manifests** — for any eval that gates or is cited. Fail the run at start if a
+  dataset hash, model snapshot, judge snapshot, lockfile hash or image digest is missing, or if any model id
+  matches an alias pattern such as `-latest`. Monitor the fraction of runs with a complete manifest.
+- **Scheduled sentinel with the cache off** — when you depend on hosted models. Run a frozen champion bundle
+  on a fixed subset daily or weekly, cache disabled, and alert when its score leaves the measured noise band.
+  Monitor sentinel drift events per quarter.
+- **Recorded tool responses for agent evals** — when the application calls live tools. Record tool responses
+  once, replay them by request hash during evals, inject a fixed clock, and put the recording's hash in the
+  manifest. Monitor replay misses, which mean the agent asked something new.
+- **Noise floor stored per metric** — before any gate trusts a delta. Re-measure the floor with repeats on
+  the champion whenever the model, judge or dataset version changes, and store it with the baseline. Monitor
+  floor width over time; a widening floor often means a provider-side change.
+- **Retained evidence with the promoted bundle** — for regulated or customer-facing commitments. Store
+  manifest, raw outputs, scores and approvals together and keep them for the retention period your policy
+  sets. Monitor that every promoted bundle has a retrievable evidence record.
+
 ## Trade-offs
-- Pinning dated snapshots gives stable comparisons, but every deprecation forces a re-baseline; when the
-  provider deprecates faster than you re-baseline, a scheduled model-upgrade job with a full eval is the
-  only sustainable answer.
-- Repeated runs quantify noise at a multiple of the cost; once a deterministic scorer on a locally pinned
-  model shows a near-zero floor, a single run is enough, but only after the floor has been measured.
-- Evaluating at production temperature measures what ships but is noisier; evaluating at zero is cleaner
-  and may measure a system you do not ship, so the choice follows what production actually does.
-- Content-addressed caching makes re-runs nearly free, yet a key that omits any pin hides a change; the
-  sentinel run must bypass the cache, which is exactly the run you cannot make cheap.
+- **Stable comparisons vs re-baselining.** Pinning dated snapshots gives stable comparisons, but every
+  deprecation forces a re-baseline. When the provider deprecates faster than you re-baseline, a scheduled
+  model-upgrade job with a full eval is the only sustainable answer.
+- **Quantified noise vs cost.** Repeated runs quantify noise at a multiple of the cost. Once a deterministic
+  scorer on a locally pinned model shows a near-zero floor, a single run is enough, but only after the floor
+  has been measured.
+- **Production temperature vs cleanliness.** Evaluating at production temperature measures what ships but is
+  noisier; evaluating at zero is cleaner and may measure a system you do not ship. The choice follows what
+  production actually does.
+- **Cheap cached re-runs vs hidden changes.** Content-addressed caching makes re-runs nearly free, yet a key
+  that omits any pin hides a change. The sentinel run must bypass the cache, which is exactly the run you
+  cannot make cheap.
 
 ## Pitfalls
-- A model alias instead of a dated snapshot in the manifest; the symptom is scores jumping on a day when
-  nobody deployed anything.
-- A silently upgraded judge; the symptom is champion and candidate shifting together, which preserves the
-  delta but breaks every absolute floor in the gate.
-- Datasets referenced by file name; the symptom is two runs "on golden.jsonl" disagreeing on the item count.
-- Treating "three identical repeats" as proof the result is solid; the symptom is a deterministic eval
-  on 80 items whose two-point win vanishes on the next dataset version, because repeats never measured
-  item-sampling noise.
-- Timeouts counted as zero scores; the symptom is eval scores that correlate with the provider's status page.
-- Assuming temperature zero means deterministic; the symptom is a bug report that some outputs differ
-  between identical runs (how many depends on the provider, output length and load), filed as a regression.
-- Comparing runs scored by different judge versions; the symptom is a "regression" that vanishes when both
-  runs are re-scored from stored outputs with the same judge.
+- **A model alias instead of a dated snapshot in the manifest.** Symptom: scores jumping on a day when nobody
+  deployed anything.
+- **A silently upgraded judge.** Symptom: champion and candidate shifting together, which preserves the delta
+  but breaks every absolute floor in the gate.
+- **Datasets referenced by file name.** Symptom: two runs "on golden.jsonl" disagreeing on the item count.
+- **Treating "three identical repeats" as proof.** Symptom: a deterministic eval on 80 items whose two-point
+  win vanishes on the next dataset version, because repeats never measured item-sampling noise.
+- **Timeouts counted as zero scores.** Symptom: eval scores that correlate with the provider's status page.
+- **Assuming temperature zero means deterministic.** Symptom: a bug report that some outputs differ between
+  identical runs (how many depends on the provider, output length and load), filed as a regression.
+- **Comparing runs scored by different judge versions.** Symptom: a "regression" that vanishes when both runs
+  are re-scored from stored outputs with the same judge.
 
 ## When to use
-Every eval that informs a decision gets a manifest; the rigour scales with the stakes. In the development
-loop, re-derivable is enough and the framework captures the manifest automatically. At a release gate,
-statistical reproduction is required: repeats to establish the noise floor, identical dataset and scorer
-versions, paired comparison. For regulated or customer-facing commitments, store the full evidence
-(manifest, raw outputs, scores, approvals) with the promoted bundle. Measure the practice itself: the
-fraction of runs with a complete manifest, the noise floor per metric, sentinel drift events per quarter,
-and how often the comparability check refuses a diff. In interviews, the question is usually "how would
-you know the model changed underneath you?"; the sentinel run is the answer.
+- **Always:** every eval that informs a decision gets a manifest; the rigour scales with the stakes.
+- **Development loop:** re-derivable is enough, and the framework captures the manifest automatically.
+- **Release gate:** statistical reproduction is required: repeats to establish the noise floor, identical
+  dataset and scorer versions, paired comparison.
+- **Regulated or customer-facing commitments:** store the full evidence (manifest, raw outputs, scores,
+  approvals) with the promoted bundle.
+- **Measure** the fraction of runs with a complete manifest, the noise floor per metric, sentinel drift events
+  per quarter, and how often the comparability check refuses a diff.
+- **Interviews:** the usual question is "how would you know the model changed underneath you?"; the sentinel
+  run is the answer.
 
 ## Role lens
 - **Engineer:** Makes the harness refuse to start without a complete manifest, pins judge and model
@@ -205,6 +283,41 @@ manifests identical except for the prompt version, cache disabled, three repeats
 items, and report the mean difference with a confidence interval. If the interval excludes zero and the
 delta exceeds the measured floor, treat the improvement as real (and confirm it on the slices that matter);
 otherwise it is not yet a result.
+
+## Interview questions
+### What does "reproducible" mean for an LLM eval if outputs are not deterministic?
+- **Statistical, not bit-exact:** re-running the same manifest gives the same score distribution within a
+  measured noise band, and the same conclusion.
+- **Re-derivable as the floor:** anyone can reconstruct the run from its manifest even after the provider
+  has changed.
+- **Bit-exact** is realistic only for locally served models with deterministic kernels and fixed batching.
+
+### How would you know the model changed underneath you?
+- **A scheduled sentinel run:** a frozen reference bundle on a fixed subset, cache off, compared against its
+  own noise floor.
+- **If it moves while its manifest did not,** something outside the manifest changed: the provider, the
+  environment or a silently updated judge.
+- **The alert fires before** a candidate prompt gets blamed for the shift.
+
+### Three repeats agree perfectly, yet the win vanished on the next dataset version. Why?
+- **Repeats measure generation noise only.** They say nothing about item-sampling noise from having
+  evaluated these items and not others.
+- **On 80 or 100 items** the interval over items is several points wide even for a deterministic run.
+- **Fix:** average repeats per item, then compute a paired bootstrap interval over items, and grow the set
+  if the interval is too wide.
+
+### Should you evaluate at temperature zero to make results stable?
+- **Only if production runs at zero.** An eval at zero of a system that ships at 0.7 measures a different
+  system.
+- **Zero is not deterministic anyway** on hosted infrastructure, because batching and floating-point order
+  vary.
+- **Use repeats** at the production temperature and measure the noise floor instead.
+
+### What goes in an eval manifest, and which field causes the most unexplained score changes?
+- **Fields:** dataset hash, bundle (model snapshot, prompt versions, decoding params, seed, index), scorers
+  (judge snapshot, rubric), environment (git SHA, lockfile, image digest), runtime inputs and run policy.
+- **Most common culprit:** a model alias instead of a dated snapshot.
+- **The run id is the manifest's hash,** so identical pins are recognisably the same experiment.
 
 ## Quiz
 ### Q: Why must the judge model's snapshot be part of the eval manifest?

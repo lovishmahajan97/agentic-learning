@@ -5,7 +5,7 @@ name: Requirements traceability
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - scoping/statement-of-work
   - scoping/success-metrics-kpis
@@ -20,82 +20,107 @@ sources:
 ---
 
 ## TL;DR
-Requirements traceability is the maintained link from each business objective to the requirements
-that serve it, to the components and prompts that implement them, to the eval cases that verify them,
-and to the latest evidence. You need it because "is this requirement met?" and "what does this change
-break?" both need those links. With AI systems, a prompt or model change can silently affect
-requirements nobody re-tested.
+Requirements traceability is the maintained link from objective to requirement, to the components and
+prompts implementing it, to eval cases and evidence. It answers "is this met?" and "what does this change
+break?", because a prompt or model change can silently break untested requirements.
 
 ## Why it exists
-Halfway through an AI project, the requirements live in three places: the SOW, a few Slack threads,
-and the heads of two SMEs. The eval suite has 800 cases, but nobody can say which requirement each
-case checks. When the customer asks "does it meet requirement 7, never discussing individual claims?",
-the honest answer is "probably". When someone switches to a cheaper model, the eval average moves
-from 91% to 90%, everyone shrugs, and nobody notices that every refusal case for requirement 7 now
-fails. Those were eight cases, about 1% of the suite, so their collapse moved the average by a single
-point.
-
-The naive approach treats the eval suite as one undifferentiated score, plus a requirements document
-that is never updated. That breaks in both directions. Going forward, from requirements to tests,
-there are requirements with no test at all, especially non-functional ones like "never reveal another
-employee's data". Going backward, from tests and features to requirements, there are cases and
-features that trace to nothing. Those are gold-plating, stale behaviour, or scope creep nobody approved.
-Aggregate scores hide both. Regulated buyers make this concrete: in safety-critical software domains,
-traceability from requirement to verification evidence is an expected part of certification. AI
-governance reviews increasingly ask the same question of model-based systems.
+- **Requirements scatter by mid-project.** They live in the SOW, a few Slack threads, and the heads of two
+  SMEs. The eval suite has 800 cases, but nobody can say which requirement each case checks.
+- **"Probably" is the honest answer without links.** When the customer asks "does it meet requirement 7,
+  never discussing individual claims?", nobody can show evidence.
+- **Averages hide collapses.** After a switch to a cheaper model the eval average moves from 91% to 90%,
+  everyone shrugs, and nobody notices every refusal case for requirement 7 now fails. Those were eight
+  cases, about 1% of the suite, so their collapse moved the average by a single point.
+- **One score plus a stale document breaks both ways.** Forward (requirements to tests): requirements with
+  no test, especially non-functional ones like "never reveal another employee's data". Backward (tests and
+  features to requirements): cases and features tracing to nothing, meaning gold-plating, stale behaviour,
+  or unapproved scope creep.
+- **Regulated buyers expect it.** In safety-critical software domains, traceability from requirement to
+  verification evidence is an expected part of certification, and AI governance reviews increasingly ask
+  the same of model-based systems.
 
 ## How it works
 ### The chain
 Give every element a stable ID and record links between adjacent levels:
 
 1. **Objective** (from the metric tree), for example O1: reduce benefits-desk contacts.
-2. **Requirement**: a testable statement with a priority and an acceptance threshold. Include
-   functional requirements (answer from the current policy), behavioural ones (escalate medical-claim
-   questions), and non-functional ones (p95 latency, data isolation, retention).
-3. **Implementation elements**: the components, prompt templates, tools, retrieval filters and
-   guardrails that realise each requirement, recorded with their version.
-4. **Verification**: eval cases tagged with the requirement IDs they check, plus deterministic tests,
-   load tests and security tests for the non-functional requirements.
-5. **Evidence**: the run ID, the model and prompt versions, the date, and the per-requirement result.
+2. **Requirement:** a testable statement with a priority and an acceptance threshold. Include functional
+   requirements (answer from the current policy), behavioural ones (escalate medical-claim questions), and
+   non-functional ones (p95 latency, data isolation, retention).
+3. **Implementation elements:** the components, prompt templates, tools, retrieval filters and guardrails
+   that realise each requirement, recorded with their version.
+4. **Verification:** eval cases tagged with the requirement IDs they check, plus deterministic tests, load
+   tests and security tests for the non-functional requirements.
+5. **Evidence:** the run ID, the model and prompt versions, the date, and the per-requirement result.
 
 ### Why per-requirement thresholds
-Each requirement gets its own acceptance threshold on its own slice of cases. The slice score, not
-the global average, decides the result *because* requirements differ in criticality and in volume. A
-100% requirement such as "never reveal another employee's data" can be outvoted by hundreds of
-routine cases in an average. Slicing also gives each requirement a sample size, so you can tell
-whether a slice has enough cases for its result to mean anything.
+- **The slice score decides, not the global average,** because requirements differ in criticality and in
+  volume. A 100% requirement such as "never reveal another employee's data" can be outvoted by hundreds of
+  routine cases in an average.
+- **Slicing gives each requirement a sample size,** so you can tell whether a slice has enough cases for its
+  result to mean anything.
 
-Sample size matters most for zero-tolerance requirements. If a slice of n cases has no failures, the
-95% upper bound on the true failure rate is about 3/n (the "rule of three"). Thirty clean cases show
-only that the rate is below roughly 10%; three hundred show below roughly 1%. A 100% threshold on a
-small slice is therefore evidence of "not frequent", not of "never". A requirement that truly must
-never fail should also trace to a deterministic control, such as a permission filter or a hard
-validator with its own unit tests, with the eval slice as a second line of evidence.
+### Zero-tolerance slices and the rule of three
+If a slice of n cases has no failures, the 95% upper bound on the true failure rate is about 3/n:
+
+| Clean cases in slice | Failure rate shown to be below |
+|---|---|
+| 30 | roughly 10% |
+| 300 | roughly 1% |
+
+- **A 100% threshold on a small slice** is evidence of "not frequent", not of "never".
+- **A requirement that truly must never fail** should also trace to a deterministic control, such as a
+  permission filter or a hard validator with its own unit tests, with the eval slice as a second line of
+  evidence.
 
 ### The two queries that matter
-- **Coverage (forward):** which requirements have no verification, or too few cases to judge? Fill
-  these gaps before acceptance, not after an incident.
-- **Orphans (backward):** which tests, prompts or features trace to no requirement? Either a
-  requirement is missing from the document, and should be added and approved, or the element is
-  unneeded and should be removed.
+- **Coverage (forward):** which requirements have no verification, or too few cases to judge? Fill these
+  gaps before acceptance, not after an incident.
+- **Orphans (backward):** which tests, prompts or features trace to no requirement? Either a requirement is
+  missing from the document, and should be added and approved, or the element is unneeded and should be
+  removed.
 
 ### Change impact analysis
-When something changes, the links say what to re-verify. A new model version touches every
-requirement, so re-run everything and compare per-requirement results. A change to the retrieval
-filter touches the requirements linked to that component. A requirement change touches its linked
-cases, which may need relabelling. This is the payoff that justifies the bookkeeping: the cost of
-change becomes proportional to what changed, rather than "re-test everything and hope".
+When something changes, the links say what to re-verify:
+
+| Change | Re-verify |
+|---|---|
+| New model version | every requirement; re-run everything and compare per-requirement results |
+| Retrieval filter change | requirements linked to that component |
+| Requirement change | its linked cases, which may need relabelling |
+
+- **This is the payoff that justifies the bookkeeping:** the cost of change becomes proportional to what
+  changed, rather than "re-test everything and hope".
 
 ### Keep it lightweight
-The matrix does not need a requirements-management tool. Tags on eval cases (a `reqs` field in the
-JSONL), a requirements file in the repo with IDs and thresholds, and a CI step that prints the
-per-requirement report cover most AI projects. A traceability matrix that is not generated from the
-artefacts themselves goes stale within weeks.
+- **No requirements-management tool needed.** Tags on eval cases (a `reqs` field in the JSONL), a
+  requirements file in the repo with IDs and thresholds, and a CI step that prints the per-requirement
+  report cover most AI projects.
+- **Generate the matrix from the artefacts,** because a traceability matrix that is not generated from them
+  goes stale within weeks.
 
-## Example
-An HR benefits assistant. Eval cases carry requirement tags, and CI prints a per-requirement report
-that catches untested requirements and orphan cases. A real suite would have tens to hundreds of cases
-per requirement. This one is cut down to show the mechanics.
+## Diagram
+Forward links answer "is every requirement verified?"; walking them backward from a changed element answers
+"what must be re-tested?".
+
+```mermaid
+flowchart TD
+    O["Objective O1"] --> R["Requirement with threshold"]
+    R --> I["Implementation: prompt, filter, tool, version"]
+    R --> V["Verification: tagged eval cases, tests"]
+    V --> E[("Evidence: run ID, versions, slice result")]
+    C["Change: model, prompt or filter"] -->|"follow links"| I
+    I -->|"linked requirements"| R
+    R -->|"re-run slices"| V
+    V -.->|"no requirement tag"| OR["Orphan: add requirement or remove"]
+```
+
+## Examples
+### Per-requirement CI report with coverage and orphans
+An HR benefits assistant. Eval cases carry requirement tags, and CI prints a per-requirement report that
+catches untested requirements and orphan cases. A real suite would have tens to hundreds of cases per
+requirement; this one is cut down to show the mechanics.
 
 ```python
 from collections import defaultdict
@@ -136,44 +161,93 @@ for rid, (text, threshold) in REQS.items():
 print("orphans:", orphans)   # -> ['c005', 'c006']
 ```
 
-The output shows R4, the data-isolation requirement, as UNTESTED. That would never show up in an
-aggregate pass rate, and it is exactly the requirement a security reviewer will ask about. R2 fails
-outright, and its 100% threshold means a single failure blocks acceptance. Both orphans need a
-decision: is c005's "R9" a typo, or a requirement nobody wrote down? And when R4 does get cases, a
-30-case slice passing at 100% only bounds the leak rate below about 10%. That is why R4 should also
-trace to the retrieval layer's per-employee access filter and its deterministic tests, not to the
-eval slice alone.
+Reading the output:
+- **R4 (data isolation) is UNTESTED.** That would never show up in an aggregate pass rate, and it is exactly
+  the requirement a security reviewer will ask about.
+- **R2 fails outright,** and its 100% threshold means a single failure blocks acceptance.
+- **Both orphans need a decision:** is c005's "R9" a typo, or a requirement nobody wrote down?
+- **When R4 gets cases,** a 30-case slice passing at 100% only bounds the leak rate below about 10%. So R4
+  should also trace to the retrieval layer's per-employee access filter and its deterministic tests, not to
+  the eval slice alone.
+
+### Change impact: what to re-verify for a given change
+The same links, walked from implementation elements to requirements. A CI job can call this with the
+files changed in a pull request (element names here are illustrative).
+
+```python
+LINKS = {   # implementation element -> requirement IDs it realises (from the matrix)
+    "model":                   ["*"],              # the model touches every requirement
+    "prompt/answer_v3":        ["R1", "R3"],
+    "prompt/escalation_v2":    ["R2"],
+    "retrieval/policy_filter": ["R1"],
+    "retrieval/employee_acl":  ["R4"],
+}
+REQ_IDS = ["R1", "R2", "R3", "R4"]
+
+def to_reverify(changed):
+    hit = set()
+    for element in changed:
+        reqs = LINKS.get(element)
+        if reqs is None:
+            raise KeyError(f"{element} traces to no requirement: orphan or missing link")
+        hit |= set(REQ_IDS) if "*" in reqs else set(reqs)
+    return sorted(hit)
+
+print(to_reverify(["prompt/answer_v3"]))          # ['R1', 'R3']
+print(to_reverify(["retrieval/employee_acl"]))    # ['R4']
+print(to_reverify(["model"]))                     # ['R1', 'R2', 'R3', 'R4']
+```
+
+- **An unknown element raises,** which turns a missing link into a CI failure instead of an untested change.
+
+## Production patterns
+- **Requirements file in the repo.** Keep requirement IDs, statements, priorities and thresholds in a
+  version-controlled file reviewed like code, with changes approved by the requirement owner. Monitor for
+  requirements with no linked cases after each change.
+- **Tagged eval data.** Add a `reqs` list to every eval case in the JSONL and fail CI when a case has no
+  known tag. Monitor the orphan count and the per-requirement case count against a minimum such as 30.
+- **Per-requirement gate in CI.** Print the per-requirement report on every prompt or model change, and
+  block merge when a critical slice falls below its threshold. Monitor per-requirement diffs between the
+  current and candidate configuration, not the global average.
+- **Evidence records with versions.** Store each run's ID, model version, prompt versions, date and
+  per-requirement results as an immutable artefact. Monitor that every production configuration maps to a
+  stored passing run.
+- **Deterministic controls for never-fail requirements.** Trace data-isolation and similar requirements to
+  a permission filter or validator with its own unit tests, and keep the eval slice as a second line of
+  evidence.
 
 ## Trade-offs
-- Fine-grained tagging gives precise impact analysis but costs time on every new case. Tag at the
-  requirement level, not the sub-clause level, unless the domain is regulated.
-- A dedicated requirements tool gives audit trails and approval workflows but drifts away from the
-  code. Prefer IDs in repo files and eval data unless the customer's compliance process mandates a tool.
-- Per-requirement thresholds are stricter than a global average and can block releases over small
-  slices. Pair them with minimum case counts so noise does not decide acceptance.
-- Tracing every prompt template to requirements makes refactoring slower. It earns its cost once the
-  system has more than a handful of prompts or more than one team editing them.
+- **Precision vs tagging time.** Fine-grained tagging gives precise impact analysis but costs time on every
+  new case. Tag at the requirement level, not the sub-clause level, unless the domain is regulated.
+- **Audit workflow vs drift.** A dedicated requirements tool gives audit trails and approval workflows but
+  drifts away from the code. Prefer IDs in repo files and eval data unless the customer's compliance process
+  mandates a tool.
+- **Strictness vs blocked releases.** Per-requirement thresholds are stricter than a global average and can
+  block releases over small slices. Pair them with minimum case counts so noise does not decide acceptance.
+- **Traceable prompts vs refactoring speed.** Tracing every prompt template to requirements makes
+  refactoring slower. It earns its cost once the system has more than a handful of prompts or more than one
+  team editing them.
 
 ## Pitfalls
-- Reporting a single aggregate eval score as proof of acceptance. The symptom is a release that
-  passes on average while a small, critical requirement fails every case.
-- Non-functional requirements left out of the matrix. The symptom is a security review finding that
-  data isolation or retention was never tested at all.
-- A hand-maintained traceability spreadsheet. The symptom is a matrix that lists cases which no longer
-  exist and misses the ones added last sprint.
-- Not recording model and prompt versions with the evidence. The symptom is nobody being able to say
-  which configuration actually passed acceptance once something regresses in production.
-- Treating orphan cases as harmless. The symptom is behaviour customers rely on that is undocumented,
+- **Reporting a single aggregate eval score as proof of acceptance.** Symptom: a release that passes on
+  average while a small, critical requirement fails every case.
+- **Non-functional requirements left out of the matrix.** Symptom: a security review finds that data
+  isolation or retention was never tested at all.
+- **A hand-maintained traceability spreadsheet.** Symptom: a matrix that lists cases which no longer exist
+  and misses the ones added last sprint.
+- **Not recording model and prompt versions with the evidence.** Symptom: nobody can say which
+  configuration actually passed acceptance once something regresses in production.
+- **Treating orphan cases as harmless.** Symptom: behaviour customers rely on that is undocumented,
   untested against a threshold, and removed by the next refactor.
 
 ## When to use
-Set up traceability as soon as there is an SOW with numbered requirements and more than a few dozen
-eval cases. In practice that means at the start of the pilot build, because that is when tagging is
-cheapest. It is essential when acceptance is contractual, when several teams change prompts or models,
-or when the buyer is regulated and will audit. For a throwaway PoC, a short list of requirements
-mapped to test names is enough. Day to day, it shows up as a per-requirement CI report and as the
-first thing you check when a model upgrade is proposed. In interviews, it answers "how do you know a
-model swap didn't break anything?"
+- **Use when:** there is an SOW with numbered requirements and more than a few dozen eval cases. In practice
+  that means the start of the pilot build, because that is when tagging is cheapest.
+- **Essential when:** acceptance is contractual, several teams change prompts or models, or the buyer is
+  regulated and will audit.
+- **Lighter version:** for a throwaway PoC, a short list of requirements mapped to test names is enough.
+- **Day to day:** a per-requirement CI report, and the first thing you check when a model upgrade is proposed.
+- **Interviews:** it answers "how do you know a model swap didn't break anything?"
 
 ## Role lens
 - **Engineer:** Tags eval cases with requirement IDs, writes the per-requirement CI report, and records
@@ -193,6 +267,37 @@ That means checking each requirement's slice against its own threshold, flagging
 cases to judge, and diffing per-requirement results between the two models. A model change touches
 every requirement, so all of them need to be re-verified. I would approve only if every critical
 requirement still meets its threshold, and record the new model version with the evidence.
+
+## Interview questions
+### What is requirements traceability, and why does an AI system need it more than ordinary software?
+- **Definition:** maintained links from objectives to requirements, implementation elements, verification
+  cases and evidence, each with a stable ID.
+- **Why AI needs it more:** a prompt or model change can shift behaviour everywhere at once, and an
+  aggregate eval score hides a small critical slice collapsing.
+
+### A security reviewer asks you to prove the assistant never shows one employee another's data. What do you show?
+- **The trace:** requirement R4 linked to the per-employee access filter in retrieval, its deterministic
+  unit tests, and a tagged eval slice.
+- **The evidence:** the run ID, model and prompt versions and the slice result for the configuration in
+  production.
+- **The honest bound:** a clean slice of n cases shows the rate is below about 3/n, so the filter, not the
+  eval, carries the "never".
+
+### When would you not set up a full traceability matrix?
+- **For a throwaway PoC,** where a short list of requirements mapped to test names is enough.
+- **When there are only a handful of prompts and one team,** fine-grained tracing of every template slows
+  refactoring more than it helps; tag eval cases at the requirement level instead.
+
+### Your eval suite has 800 cases and three teams editing prompts. How do you keep the matrix from going stale?
+- **Generate it from the artefacts:** a `reqs` tag on every case, a requirements file in the repo, and a CI
+  step that builds the report.
+- **Fail CI on orphans and untested critical requirements,** and enforce minimum case counts per slice.
+- **Record versions with every run,** so evidence always maps to a configuration.
+
+### What does a backward trace find that a forward trace misses, and what do you do with it?
+- **Backward finds orphans:** cases, prompts or features that serve no agreed requirement.
+- **Decide each one:** either a missing requirement to write down and approve, or gold-plating and
+  unapproved scope to remove before a refactor silently deletes behaviour customers rely on.
 
 ## Quiz
 ### Q: What does a backward trace (from tests and features to requirements) mainly reveal?

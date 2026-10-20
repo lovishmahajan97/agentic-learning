@@ -5,7 +5,7 @@ name: BullMQ & durable jobs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/redis
   - node-ts-for-ai/graceful-shutdown
@@ -21,104 +21,147 @@ sources:
 ---
 
 ## TL;DR
-BullMQ is a Redis-backed job queue for Node: producers add jobs, workers process them with concurrency,
-retries with backoff, rate limits, delays, priorities and parent/child flows, and job state survives
-process restarts because it lives in Redis, not in a promise. An HTTP request is the wrong unit of work
-for a minutes-long agent run or a 10,000-document embedding batch. Delivery is at-least-once, so
-handlers must be idempotent, and the queue is only as durable as the Redis behind it.
+BullMQ is a Redis-backed Node job queue with concurrency, retries, backoff, rate limits, delays and
+flows; job state survives restarts because it lives in Redis. Delivery is at-least-once, so handlers
+must be idempotent, and durability equals Redis's.
 
 ## Why it exists
-An agent run takes two minutes, calls the model eight times and calls three tools. Doing that inside an
-HTTP handler means the client holds a connection for two minutes, a load balancer idle timeout (60 s is a
-common default) can kill it first, a deploy that restarts the process loses the run with no record, and a burst of 200
-runs starts 200 concurrent model calls that hit the provider's rate limit together. The same shape
-appears for batch embedding, nightly evals, document ingestion, webhook fan-out and scheduled
-re-indexing.
-
-The in-process alternative, `setImmediate(() => runAgent(...))` with a `Map` of in-flight runs, fails
-on every axis: it dies with the process, cannot be shared across replicas, has no retry policy and no
-visibility. Postgres-as-queue (`SELECT ... FOR UPDATE SKIP LOCKED`) is a legitimate design and keeps
-everything in one transactional store, but you then write the polling, locking, retry, backoff, delay
-and dead-letter machinery yourself.
-
-BullMQ packages that machinery on top of Redis. Redis fits *because* the queue's hot path (claim a job,
-renew its lock, move it between states) is a handful of atomic operations on lists, sorted sets and
-hashes, which Redis executes in microseconds and which BullMQ implements as Lua scripts so a claim can
-never be half-done. The trade is that the queue inherits Redis's durability settings: snapshot-only
-persistence or an LRU eviction policy means lost jobs.
+- **A request is the wrong unit for long work.** An agent run takes two minutes, calls the model eight
+  times and calls three tools. Inside an HTTP handler, the client holds a connection for two minutes and
+  a load balancer idle timeout (60 s is a common default) can kill it first.
+- **Restarts and bursts hurt.** A deploy that restarts the process loses the run with no record, and a
+  burst of 200 runs starts 200 concurrent model calls that hit the provider's rate limit together. The
+  same shape appears for a 10,000-document embedding batch, nightly evals, document ingestion, webhook
+  fan-out and scheduled re-indexing.
+- **In-process queues fail on every axis.** `setImmediate(() => runAgent(...))` with a `Map` of
+  in-flight runs dies with the process, cannot be shared across replicas, and has no retry policy and no
+  visibility.
+- **Postgres-as-queue is legitimate but DIY.** `SELECT ... FOR UPDATE SKIP LOCKED` keeps everything in
+  one transactional store, but you write the polling, locking, retry, backoff, delay and dead-letter
+  machinery yourself.
+- **BullMQ packages that machinery on Redis.** Redis fits *because* the hot path (claim a job, renew its
+  lock, move it between states) is a handful of atomic operations on lists, sorted sets and hashes,
+  done in microseconds as Lua scripts so a claim is never half-done. The trade: snapshot-only
+  persistence or an LRU eviction policy means lost jobs.
 
 ## How it works
 ### Objects
-- **Queue**: the producer handle. `queue.add(name, data, opts)` writes a job hash and pushes its id onto
-  the waiting list (or a delayed or prioritised sorted set).
-- **Worker**: the consumer. It takes a processor `(job) => Promise<result>` and a `concurrency`; each
-  slot atomically moves a job from waiting to active and runs the processor. Many Worker processes on
-  many replicas share one queue, which is how you scale.
-- **Job**: `id`, `name`, `data` (JSON), `opts`, `attemptsMade`, `progress`, `returnvalue` and
-  timestamps. A custom `jobId` deduplicates: adding a job whose id already exists in the queue is a
-  no-op while the earlier job is still stored, which is the simplest exactly-once-enqueue tool you have.
-  Custom ids must not be plain integers or contain `:` (BullMQ uses it as its key separator and throws
-  on `add`), so use `embed-<docId>`, not `embed:<docId>`. The dedup window is exactly the job's
-  lifetime in Redis: once `removeOnComplete` deletes the job, the same id can be added again, and while
-  a completed job is still retained, a deliberate re-run with that id is silently ignored. BullMQ 5
-  also offers a `deduplication` option with its own id and TTL when you want that window explicit.
-- **QueueEvents**: a Redis-streams-based listener for `completed`, `failed` and `progress`, so an API
-  replica can stream progress to a client without being the worker.
-- **FlowProducer**: adds a parent job with children; the parent runs only after all children complete,
-  which models "embed 500 chunks, then write the document summary".
+| Object | Role | Key detail |
+|---|---|---|
+| Queue | producer handle | `queue.add(name, data, opts)` writes a job hash and pushes its id onto the waiting list (or a delayed or prioritised sorted set) |
+| Worker | consumer | takes a processor `(job) => Promise<result>` and a `concurrency`; each slot atomically moves a job from waiting to active. Many Workers on many replicas share one queue, which is how you scale |
+| Job | the unit | `id`, `name`, `data` (JSON), `opts`, `attemptsMade`, `progress`, `returnvalue`, timestamps |
+| QueueEvents | listener | Redis-streams based `completed`, `failed`, `progress`, so an API replica can stream progress without being the worker |
+| FlowProducer | parent and children | the parent runs only after all children complete: "embed 500 chunks, then write the document summary" |
+
+### Custom job ids and dedup
+- **A custom `jobId` deduplicates.** Adding a job whose id already exists is a no-op while the earlier
+  job is still stored: the simplest exactly-once-enqueue tool you have.
+- **Format rules.** Custom ids must not be plain integers or contain `:` (BullMQ uses it as its key
+  separator and throws on `add`), so use `embed-<docId>`, not `embed:<docId>`.
+- **The dedup window is the job's lifetime in Redis.** Once `removeOnComplete` deletes the job, the same
+  id can be added again; while a completed job is retained, a deliberate re-run with that id is silently
+  ignored.
+- **Explicit windows.** BullMQ 5 also offers a `deduplication` option with its own id and TTL.
 
 ### Job lifecycle
-A job is always in exactly one state, and each state is a Redis structure: `waiting` (a list),
-`prioritized` and `delayed` (sorted sets ordered by priority or due time), `active` (a list plus a
-per-job lock key), `waiting-children` (a parent blocked on its flow), and the terminal `completed` and
-`failed` sets. Every transition (claim, complete, fail and reschedule, promote a delayed job) is one Lua
-script *because* it touches several keys at once, and a crash between "remove from waiting" and "add to
-active" would otherwise lose or duplicate the job. Reading the queue's health is therefore reading the
-sizes of these sets: a growing `waiting` means too few workers or a limiter that is too tight; a growing
-`failed` means a bug or a dependency that is down; a non-empty `active` with nobody working means stalls.
+Each state is a Redis structure, and a job is in exactly one:
+
+| State | Structure | Meaning when it grows |
+|---|---|---|
+| `waiting` | list | too few workers or a limiter that is too tight |
+| `prioritized`, `delayed` | sorted sets by priority or due time | scheduled work piling up |
+| `active` | list plus a per-job lock key | non-empty with nobody working means stalls |
+| `waiting-children` | parent blocked on its flow | children are slow or failing |
+| `completed`, `failed` | terminal sets | a growing `failed` means a bug or a dependency that is down |
+
+- **Every transition is one Lua script** (claim, complete, fail and reschedule, promote a delayed job)
+  *because* it touches several keys, and a crash between "remove from waiting" and "add to active"
+  would otherwise lose or duplicate the job.
 
 ### Retries, backoff, delays
-`opts.attempts` with `opts.backoff: { type: 'exponential', delay: 1000 }` re-schedules a failed job
-after 1 s, 2 s, 4 s and so on until `attempts` is exhausted, then leaves it in the failed set for
-inspection or manual retry. Delayed jobs sit in a sorted set keyed by timestamp and are promoted when
-due *because* polling a list for "is it time yet" would waste Redis round trips. `priority` orders
-waiting jobs; `removeOnComplete` and `removeOnFail` with a count or an age keep Redis from filling with
-history. Recurring work (nightly evals, hourly re-index) uses a job scheduler
-(`queue.upsertJobScheduler(id, { pattern: cron } or { every: ms }, template)` in recent BullMQ 5
-releases, which supersedes the older repeatable-job API): the scheduler keeps one upcoming delayed job
-per schedule, so running several producer replicas does not multiply the runs.
+- **Exponential backoff.** `opts.attempts` with `opts.backoff: { type: 'exponential', delay: 1000 }`
+  re-schedules a failed job after 1 s, 2 s, 4 s and so on until `attempts` is exhausted, then leaves it
+  in the failed set for inspection or manual retry.
+- **Delayed jobs** sit in a sorted set keyed by timestamp and are promoted when due, *because* polling a
+  list for "is it time yet" would waste Redis round trips.
+- **`priority`** orders waiting jobs.
+- **Retention.** `removeOnComplete` and `removeOnFail` with a count or an age keep Redis from filling
+  with history.
+- **Recurring work** (nightly evals, hourly re-index) uses a job scheduler:
+  `queue.upsertJobScheduler(id, { pattern: cron } or { every: ms }, template)` in recent BullMQ 5
+  releases, which supersedes the older repeatable-job API. It keeps one upcoming delayed job per
+  schedule, so several producer replicas do not multiply the runs.
 
 ### Locks and stalled jobs
-When a worker claims a job it sets a lock with `lockDuration` and renews it on an interval while the
-processor runs. If the process dies, or the event loop is blocked long enough that renewal stops, the
-lock expires, a stall checker notices an active job with no lock and moves it back to waiting, up to
-`maxStalledCount` times before marking it failed. This is the mechanism that gives durability across
-crashes, and it is also why a CPU-bound processor that blocks the event loop can get a job processed
-twice: the renewal timer never fires. BullMQ's sandboxed processors (pass a file path instead of a
-function; the job runs in a child process or a worker thread) exist *because* of that failure mode.
+1. **Claim:** the worker sets a lock with `lockDuration` and renews it on an interval while the processor
+   runs.
+2. **Failure:** the process dies, or the event loop is blocked long enough that renewal stops; the lock
+   expires.
+3. **Recovery:** a stall checker sees an active job with no lock and moves it back to waiting, up to
+   `maxStalledCount` times before marking it failed.
+
+- **This is the durability mechanism,** and also why a CPU-bound processor that blocks the event loop can
+  get a job processed twice: the renewal timer never fires.
+- **Sandboxed processors exist for that failure mode.** Pass a file path instead of a function; the job
+  runs in a child process or a worker thread.
 
 ### Rate limiting for LLM providers
-`Worker` takes `limiter: { max, duration }` to cap jobs started per window across all workers of a
-queue. For provider 429s, a processor can call `await queue.rateLimit(ms)` (in BullMQ 5 this replaces
-the deprecated `worker.rateLimit`) and throw `Worker.RateLimitError()` so the job returns to the queue
-without consuming an attempt while the queue pauses for that window. Per-group limits (one quota per tenant) are a BullMQ Pro feature; the
-open-source approach is a queue per tenant tier, or a Redis token bucket checked inside the processor.
+- **Fleet-wide cap.** `Worker` takes `limiter: { max, duration }` to cap jobs started per window across
+  all workers of a queue.
+- **Reacting to 429s.** A processor calls `await queue.rateLimit(ms)` (in BullMQ 5 this replaces the
+  deprecated `worker.rateLimit`) and throws `Worker.RateLimitError()`; the job returns to the queue
+  without consuming an attempt while the queue pauses for that window.
+- **Per-tenant limits.** Per-group limits are a BullMQ Pro feature; the open-source approach is a queue
+  per tenant tier, or a Redis token bucket checked inside the processor.
 
 ### Delivery semantics, and what BullMQ is not
-Every path above is at-least-once: a job can run twice after a stall, after a crash between finishing
-the work and moving the job to completed, or after a manual retry. Processors must therefore be
-idempotent, usually by keying side effects on `job.id` (a Postgres unique constraint, an idempotency key
-on a downstream API). BullMQ is also not a workflow engine: it does not checkpoint the middle of a
-processor. A ten-step agent run should either be split into one job per step with state in Postgres, or
-run under a durable-execution engine (Temporal, Inngest, Restate and similar) when you need replayable
-history, long timers and human-in-the-loop waits.
+- **At-least-once everywhere.** A job can run twice after a stall, after a crash between finishing the
+  work and moving the job to completed, or after a manual retry.
+- **So processors must be idempotent,** usually by keying side effects on `job.id` (a Postgres unique
+  constraint, an idempotency key on a downstream API).
+- **Not a workflow engine.** It does not checkpoint the middle of a processor. Split a ten-step agent run
+  into one job per step with state in Postgres, or use a durable-execution engine (Temporal, Inngest,
+  Restate and similar) for replayable history, long timers and human-in-the-loop waits.
 
-## Example
-An embedding pipeline: the API enqueues one job per document with a deterministic id (a double-submit is
-harmless), a worker with bounded concurrency and a provider rate limit processes it, and the processor
-is idempotent because the vector write keys on document id and chunk index. Each BullMQ object gets its
-own ioredis connection from a factory here; BullMQ also duplicates a Worker's connection internally for
-its blocking commands, and refuses a Worker connection whose `maxRetriesPerRequest` is not `null`.
+## Diagram
+The job lifecycle: every arrow is one atomic Lua script, and the stall arrow from active back to
+waiting is what makes a crashed worker's job run again.
+
+```mermaid
+stateDiagram-v2
+    state "waiting" as W
+    state "delayed" as D
+    state "prioritized" as PR
+    state "active, locked" as A
+    state "waiting-children" as WC
+    state "completed" as C
+    state "failed" as F
+    [*] --> W : queue.add
+    [*] --> D : add with delay
+    [*] --> PR : add with priority
+    [*] --> WC : flow parent
+    WC --> W : all children done
+    D --> W : due time reached
+    W --> A : claim and lock
+    PR --> A : claim and lock
+    A --> C : processor resolves
+    A --> D : throws, attempts left, backoff
+    A --> W : lock expired, stall checker
+    A --> F : attempts or stalls exhausted
+    C --> [*] : removeOnComplete
+    F --> [*] : removeOnFail
+```
+
+## Examples
+### Embedding pipeline with dedup, limiter and checkpoints
+The API enqueues one job per document with a deterministic id (a double-submit is harmless), a worker
+with bounded concurrency and a provider rate limit processes it, and the processor is idempotent
+because the vector write keys on document id and chunk index.
+
+Each BullMQ object gets its own ioredis connection from a factory here; BullMQ also duplicates a
+Worker's connection internally for its blocking commands, and refuses a Worker connection whose
+`maxRetriesPerRequest` is not `null`.
 
 ```ts
 import IORedis from "ioredis";
@@ -158,31 +201,101 @@ const events = new QueueEvents("embed", { connection: conn() });
 events.on("progress", ({ jobId, data }) => notifyClient(jobId, data));
 ```
 
+### Worked scenario: what the settings above mean in time
+Using the queue defaults above (`attempts: 5`, exponential backoff with a 2-second base delay) and the
+worker limiter of 50 jobs per 60 seconds.
+
+| Question | Arithmetic | Result |
+|---|---|---|
+| Waits between the 5 attempts | 2 s, 4 s, 8 s, 16 s | 4 retries, ~30 s of backoff before the job lands in `failed` |
+| Time to start 10,000 document jobs | 10,000 ÷ 50 per minute | ~200 minutes, however many workers you add |
+| Jobs in flight per replica | `concurrency: 4` | 4 documents at once; 3 replicas give 12 |
+| A 429 at chunk 300 of a 500-chunk document | `rateLimit(30_000)` then retry | queue pauses 30 s, job resumes at chunk 300 thanks to `embeddingExists` |
+
+### Production snippet: nightly evals and clean shutdown
+A scheduler registered by every producer replica still yields one run per night, and the worker drains
+in-flight jobs on `SIGTERM` instead of leaving them to the stall checker.
+
+```ts
+import { Queue, Worker } from "bullmq";
+
+const evalQueue = new Queue("evals", { connection: conn() });
+await evalQueue.upsertJobScheduler("nightly-regression",
+  { pattern: "0 2 * * *" },                                         // 02:00 every day
+  { name: "run-suite", data: { suite: "regression" }, opts: { attempts: 2 } });
+
+const evalWorker = new Worker("evals", runSuite, { connection: conn(), concurrency: 1 });
+
+process.on("SIGTERM", async () => {
+  await evalWorker.close();                                         // stop claiming, wait for active jobs
+  process.exit(0);
+});
+```
+
+## Production patterns
+- **Drain workers on deploy.** Handle `SIGTERM` with `await worker.close()` and set the orchestrator's
+  grace period above your typical job duration, or make jobs resumable so a cut-off job restarts
+  cheaply. Monitor `stalled` events and duplicate side effects right after deploys.
+- **Alert on depth and age, not just failures.** Poll `queue.getJobCounts('waiting', 'active', 'delayed', 'failed')`
+  into metrics, and record start delay as `job.processedOn - job.timestamp`. A rising start delay with
+  idle workers points at the limiter; with busy workers, at capacity.
+- **Enqueue through an outbox.** Write the job request into a Postgres outbox row in the business
+  transaction; a relay calls `queue.add` with the outbox row id as `jobId`, so relay retries dedupe.
+  Monitor the age of the oldest unrelayed outbox row.
+- **Sandbox CPU-heavy processors.** Pass a processor file path to `Worker`, optionally with
+  `useWorkerThreads: true`, for parsing, chunking or vector math, so the main event loop keeps renewing
+  locks. Monitor event-loop lag and stalled counts per queue.
+- **Run a dead-letter review loop.** Keep failures with `removeOnFail: { age: ... }`, inspect them in a
+  dashboard such as Bull Board, and re-run fixed ones with `job.retry()`. Monitor failed counts grouped
+  by error message and attempt.
+
 ## Trade-offs
-- Redis makes claim, renew and move operations microsecond-fast and lets any number of replicas share a queue, but durability equals Redis's: AOF and `noeviction` are mandatory for work you cannot re-enqueue, while a cache-style instance is fine for best-effort jobs.
-- Retries with exponential backoff absorb transient provider failures without code, but each retry re-runs the whole processor; a 500-chunk job failing at chunk 499 restarts at chunk 0 unless the processor checkpoints per chunk.
-- A worker-level `limiter` keeps a whole fleet under a provider's quota with one setting, but it is per queue, not per tenant or per model; fairness across tenants needs separate queues, BullMQ Pro groups, or an in-processor token bucket.
-- At-least-once delivery is simple and robust and forces idempotent processors; exactly-once is not on offer from the queue, and chasing it with locks inside the processor usually costs more than a unique constraint.
-- BullMQ is far lighter than a workflow engine and needs only Redis, but it has no durable mid-job state; once runs need long waits, signals or replay, Temporal-style engines earn their operational cost.
+- **Speed and sharing vs durability.** Redis makes claim, renew and move microsecond-fast and lets any
+  number of replicas share a queue, but durability equals Redis's: AOF and `noeviction` are mandatory
+  for work you cannot re-enqueue; a cache-style instance is fine for best-effort jobs.
+- **Free retries vs repeated work.** Exponential backoff absorbs transient provider failures without
+  code, but each retry re-runs the whole processor; a 500-chunk job failing at chunk 499 restarts at
+  chunk 0 unless the processor checkpoints per chunk.
+- **One limiter vs fairness.** A worker-level `limiter` keeps a fleet under a provider's quota with one
+  setting, but it is per queue, not per tenant or model; fairness needs separate queues, BullMQ Pro
+  groups, or an in-processor token bucket.
+- **At-least-once vs exactly-once.** At-least-once is simple and robust and forces idempotent
+  processors; the queue does not offer exactly-once, and chasing it with locks inside the processor
+  usually costs more than a unique constraint.
+- **Lightweight vs workflow engine.** BullMQ needs only Redis, but has no durable mid-job state; once runs
+  need long waits, signals or replay, Temporal-style engines earn their operational cost.
 
 ## Pitfalls
-- A processor that blocks the event loop (large synchronous JSON parse, vector math): the symptom is `stalled` events and jobs processed twice because the lock renewal timer could not fire. Move CPU work to a sandboxed processor or a worker thread.
-- Non-idempotent side effects (send email, charge budget, append message) keyed on nothing: the symptom is duplicates after a deploy or a stall, with every attempt logging success.
-- An ioredis connection with `maxRetriesPerRequest` left at its default (20): the symptom is a Worker throwing at construction when handed that instance (BullMQ only warns and overrides it when given plain options), or blocking waits erroring out during a Redis reconnect.
-- Relying on `jobId` for dedup while also using `removeOnComplete`: the symptom is the "duplicate" document being embedded again a few minutes after the first job finished, because the completed job (and its id) had already been deleted.
-- `removeOnComplete` left off in a high-volume queue: the symptom is Redis memory growing until eviction or out-of-memory, weeks after launch.
-- Treating `queue.add` as part of a database transaction: the symptom is jobs for rows that rolled back, or committed rows with no job; use an outbox table and a relay worker.
-- Exiting with `process.exit()` instead of `await worker.close()`: the symptom is active jobs re-run after every deploy once the stall checker catches them.
+- **A processor that blocks the event loop** (large synchronous JSON parse, vector math). Symptom:
+  `stalled` events and jobs processed twice because the lock renewal timer could not fire. Fix: a
+  sandboxed processor or a worker thread.
+- **Non-idempotent side effects keyed on nothing** (send email, charge budget, append message). Symptom:
+  duplicates after a deploy or a stall, with every attempt logging success.
+- **An ioredis connection with `maxRetriesPerRequest` at its default (20).** Symptom: a Worker throwing at
+  construction when handed that instance (BullMQ only warns and overrides it when given plain options),
+  or blocking waits erroring out during a Redis reconnect.
+- **Relying on `jobId` for dedup while also using `removeOnComplete`.** Symptom: the "duplicate" document
+  is embedded again a few minutes after the first job finished, because the completed job (and its id)
+  was already deleted.
+- **`removeOnComplete` left off in a high-volume queue.** Symptom: Redis memory grows until eviction or
+  out-of-memory, weeks after launch.
+- **Treating `queue.add` as part of a database transaction.** Symptom: jobs for rows that rolled back, or
+  committed rows with no job. Fix: an outbox table and a relay worker.
+- **Exiting with `process.exit()` instead of `await worker.close()`.** Symptom: active jobs re-run after
+  every deploy once the stall checker catches them.
 
 ## When to use
-Use BullMQ when work outlives a request, must survive restarts, needs retries with backoff, or must be
-throttled against an external quota: agent runs, ingestion, embedding, evaluation batches, webhook
-delivery, scheduled refreshes. Keep synchronous sub-second work in the request. If the team already has
-Postgres and low volume, `SKIP LOCKED` polling can be enough; if runs need durable multi-step state,
-timers of hours or days, or human approval steps, reach for a durable-execution engine and keep BullMQ
-for simple, idempotent units. Measure waiting-queue depth, job age at start, failure rate by attempt,
-stalled count and worker concurrency utilisation. Interviewers ask what happens when a worker dies
-mid-job and how you keep the job from doing its side effect twice.
+- **Use when:** work outlives a request, must survive restarts, needs retries with backoff, or must be
+  throttled against an external quota: agent runs, ingestion, embedding, evaluation batches, webhook
+  delivery, scheduled refreshes.
+- **Avoid when:** work is synchronous and sub-second; keep it in the request.
+- **Alternatives:** with Postgres already there and low volume, `SKIP LOCKED` polling can be enough; for
+  durable multi-step state, timers of hours or days, or human approval steps, use a durable-execution
+  engine and keep BullMQ for simple, idempotent units.
+- **Measure:** waiting-queue depth, job age at start, failure rate by attempt, stalled count and worker
+  concurrency utilisation.
+- **Interviews:** expect "what happens when a worker dies mid-job" and "how do you keep the side effect
+  from happening twice".
 
 ## Role lens
 - **Engineer:** Designs job payloads and ids, writes idempotent processors with per-chunk checkpoints, configures attempts, backoff, concurrency and limiter, and closes workers gracefully on SIGTERM.
@@ -201,6 +314,44 @@ process is alive; after `maxStalledCount` stalls BullMQ marks it failed. Changes
 idempotent with a unique key, check for existing chunks at the start of each iteration so a retry
 resumes instead of restarting, move CPU-heavy work to a sandboxed processor, and close workers with
 `await worker.close()` on SIGTERM so in-flight jobs finish before the pod is killed.
+
+## Interview questions
+### Why use a job queue for an agent run instead of doing the work in the HTTP handler?
+- **Lifetime:** a two-minute run outlives load-balancer idle timeouts and dies with the process on a
+  deploy, leaving no record.
+- **Control:** a queue adds retries with backoff, a fleet-wide rate limit against the provider, and
+  visibility into waiting, active and failed work.
+- **The API then returns a run id** and streams progress via `QueueEvents` or polling.
+
+### Jobs are being processed twice even though no worker crashed. How do you debug it?
+- **Suspect stalls:** a processor blocking the event loop stops lock renewal, so the stall checker
+  hands the job to another worker while the first is still running.
+- **Confirm** with `stalled` events, event-loop lag metrics and overlapping start times for one job id.
+- **Fix** by moving CPU work to a sandboxed processor, and make side effects idempotent on `job.id`
+  regardless, because at-least-once delivery will duplicate eventually.
+
+### When would you not use BullMQ?
+- **Low volume with Postgres already present:** `SKIP LOCKED` polling keeps jobs transactional with your
+  data and removes a Redis dependency.
+- **Long multi-step workflows:** runs needing durable mid-run state, timers of days or human approval
+  belong in a durable-execution engine such as Temporal.
+- **Redis you cannot make durable:** if the only instance is `allkeys-lru` with snapshots, important
+  jobs will be lost.
+
+### How do you keep a fleet of embedding workers under a provider quota of 50 requests per minute?
+- **Use the Worker `limiter`,** `{ max: 50, duration: 60_000 }`, which is shared across all workers of
+  the queue; adding replicas then adds no extra load on the provider.
+- **On a 429 anyway,** call `queue.rateLimit(ms)` and throw `Worker.RateLimitError()` so the job waits
+  without burning an attempt.
+- **Caveat:** the limiter counts jobs, not provider calls; if one job makes many calls, size jobs or add
+  a token bucket inside the processor.
+
+### What does a deterministic `jobId` buy you, and where does it stop protecting you?
+- **It makes enqueue idempotent:** a double-submit of `embed-<docId>` is a no-op while the first job is
+  still stored.
+- **It stops at retention:** once `removeOnComplete` deletes the job the id can be reused, so a late
+  duplicate runs again; while it is retained, an intended re-run is silently ignored.
+- **So** keep processor-side idempotency, or use BullMQ 5's `deduplication` option with an explicit TTL.
 
 ## Quiz
 ### Q: What makes a job survive a worker process crash in BullMQ?

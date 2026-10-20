@@ -5,7 +5,7 @@ name: Webhooks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - enterprise-integration/incremental-synchronization-and-cdc
   - enterprise-integration/retry-deduplication-reconciliation
@@ -21,74 +21,97 @@ sources:
 ---
 
 ## TL;DR
-A webhook is an HTTP POST a source system sends to your endpoint when something changes, so you learn about
-changes in seconds without polling. Delivery is at-least-once, unordered and from the public internet, so a
-correct receiver verifies the signature, acknowledges fast, queues the event, processes it idempotently,
-treats the payload as a hint to re-fetch current state, and runs periodic reconciliation for the events that
-never arrive.
+A webhook is an HTTP POST a source sends when something changes, so you learn in seconds without
+polling. Delivery is at-least-once, unordered and public, so verify, ack fast, queue, process
+idempotently, re-fetch current state, and reconcile for events that never arrive.
 
 ## Why it exists
-An AI assistant indexed over Jira, Slack or SharePoint is only as fresh as its last sync. Polling every few
-minutes for every tenant and every container multiplies API calls by tenants × containers × polls, most of
-which return "nothing changed", and still leaves minutes of staleness. Illustratively, 200 tenants with 50
-watched containers each, polled every 5 minutes, is 200 × 50 × 288 ≈ 2.9 million calls a day, and the
-average staleness is still about half the interval. Halving staleness doubles the calls. For agent workflows ("when a ticket
-is assigned to the AI queue, draft a reply") polling also adds latency the user feels.
-
-Webhooks invert the direction: the source tells you when something happens. The naive receiver, though,
-does the work inside the HTTP handler, trusts the body, and assumes each event arrives exactly once and in
-order. All three assumptions are false. The handler times out while calling an LLM, so the sender retries and
-you process the event twice. Anyone who discovers the URL can post fake events, for example injecting a
-forged "document updated" event with attacker text into your index. Events for the same object arrive out
-of order, so an older "updated" overwrites a newer state. And senders drop events during outages on either
-side, or disable subscriptions that fail too often. The webhook pattern is the set of habits that make an
-unreliable push channel safe to build on.
+- **Freshness is the product.** An AI assistant indexed over Jira, Slack or SharePoint is only as fresh as
+  its last sync.
+- **Polling scales badly.** Calls multiply by tenants × containers × polls, most return "nothing changed",
+  and minutes of staleness remain. Illustratively, 200 tenants with 50 watched containers each, polled every
+  5 minutes, is 200 × 50 × 288 ≈ 2.9 million calls a day, and average staleness is still about half the
+  interval. Halving staleness doubles the calls.
+- **Agents feel the latency.** "When a ticket is assigned to the AI queue, draft a reply" waits on the poll.
+- **Webhooks invert the direction**: the source tells you when something happens.
+- **The naive receiver's three assumptions are false.** It works inside the handler, trusts the body, and
+  expects exactly-once, in-order delivery:
+  - the handler times out calling an LLM, the sender retries, and you process the event twice;
+  - anyone who discovers the URL can post fake events, e.g. a forged "document updated" injecting attacker
+    text into your index;
+  - events for one object arrive out of order, so an older "updated" overwrites newer state;
+  - senders drop events during outages on either side, or disable subscriptions that fail too often.
 
 ## How it works
 ### 1. Subscribe
-Register your URL with the source, per tenant, for specific event types. Some sources confirm ownership
-first: Slack sends a `url_verification` challenge you must echo; Microsoft Graph sends a `validationToken`
-that you return as plain text, and Graph subscriptions expire, so you must renew them on a schedule.
-Store subscription IDs and expiry, *because* an expired subscription fails silently: nothing arrives.
-Graph also sends lifecycle notifications (for example that a subscription needs reauthorization, or that
-notifications were missed); handle them, *because* "missed" is the sender telling you to run a catch-up sync.
+- **Register your URL per tenant for specific event types.**
+- **Prove ownership where required.** Slack sends a `url_verification` challenge you must echo; Microsoft
+  Graph sends a `validationToken` you return as plain text.
+- **Renew expiring subscriptions.** Graph subscriptions expire, so renew them on a schedule. Store
+  subscription IDs and expiry, *because* an expired subscription fails silently: nothing arrives.
+- **Handle lifecycle notifications.** Graph sends them (for example a subscription needs reauthorization, or
+  notifications were missed); *because* "missed" is the sender telling you to run a catch-up sync.
 
 ### 2. Verify
-Reject anything not provably from the sender. Most use an HMAC of the raw body (often with a timestamp)
-under a shared secret; some use a client-state token you chose at subscription time, or mutual TLS.
-Compare in constant time and reject old timestamps to limit replay. The details belong to the
-signature-verification lesson; the integration rule is: verify the **raw bytes** before parsing. In a
-multi-tenant receiver, derive the tenant from which secret verified the request (or from the subscription ID
-you stored), never from a tenant field in the body, *because* the body is exactly what an attacker controls.
+- **Reject anything not provably from the sender.** Most use an HMAC of the raw body (often with a
+  timestamp) under a shared secret; some use a client-state token you chose at subscription time, or mutual TLS.
+- **Compare in constant time and reject old timestamps** to limit replay. Details are in the
+  signature-verification lesson.
+- **Verify the raw bytes before parsing.** That is the integration rule.
+- **Derive the tenant from which secret verified the request** (or from the subscription ID you stored),
+  never from a tenant field in the body, *because* the body is exactly what an attacker controls.
 
 ### 3. Acknowledge fast, process later
-Return 2xx within the sender's timeout (Slack, for example, expects a response within three seconds)
-after verifying and durably enqueueing, *because* any slow work in the handler causes timeouts, retries and
-duplicates. Senders differ in what happens next: most retry with backoff a bounded number of times (Slack
-marks retries with `X-Slack-Retry-Num` and `X-Slack-Retry-Reason` headers), and some disable a subscription
-whose endpoint keeps failing. Either way, your failure window becomes lost events.
+- **Return 2xx within the sender's timeout** after verifying and durably enqueueing (Slack, for example,
+  expects a response within three seconds), *because* slow work in the handler causes timeouts, retries and
+  duplicates.
+- **Know what the sender does next.** Most retry with backoff a bounded number of times (Slack marks retries
+  with `X-Slack-Retry-Num` and `X-Slack-Retry-Reason` headers); some disable a subscription whose endpoint
+  keeps failing. Either way, your failure window becomes lost events.
 
 ### 4. Process idempotently
-Use the sender's event ID (or a hash of the payload) as a deduplication key in the consumer. Senders retry
-on non-2xx and sometimes even after success, so duplicates are normal. A dedup table is an optimisation,
-not the guarantee: two workers can pick up the same event concurrently and both see "not seen yet". The
-real guarantee is that processing is itself idempotent (re-fetch current state, upsert by key), so a
-duplicate that slips through does no harm. For side effects that are not naturally idempotent, such as
-posting a reply, claim the event with an atomic insert-if-absent before acting.
+- **Deduplicate by the sender's event ID** (or a hash of the payload) in the consumer. Senders retry on
+  non-2xx and sometimes even after success, so duplicates are normal.
+- **A dedup table is an optimisation, not the guarantee.** Two workers can pick up the same event
+  concurrently and both see "not seen yet".
+- **The guarantee is idempotent processing:** re-fetch current state, upsert by key, so a duplicate that
+  slips through does no harm.
+- **Claim non-idempotent side effects** (posting a reply) with an atomic insert-if-absent before acting.
 
 ### 5. Treat payloads as hints
-Many events are "thin" (an ID and a type). Even fat payloads may be stale by the time you process them.
-Re-fetch the current object from the API and apply it, or compare a version or modified timestamp and
-discard older ones, *because* ordering is not guaranteed.
+- **Many events are thin** (an ID and a type); even fat payloads may be stale by processing time.
+- **Re-fetch the current object** and apply it, or compare a version or modified timestamp and discard older
+  ones, *because* ordering is not guaranteed.
 
 ### 6. Reconcile
-Run a periodic incremental sync (delta query, `updated since` watermark) that catches whatever the
-webhooks missed. Webhooks give latency; reconciliation gives correctness. Alert when reconciliation finds
-many changes webhooks did not deliver, since that usually means a broken subscription.
+- **Run a periodic incremental sync** (delta query, `updated since` watermark) that catches whatever the
+  webhooks missed. Webhooks give latency; reconciliation gives correctness.
+- **Alert when reconciliation finds many undelivered changes**, since that usually means a broken subscription.
 
-## Example
-A FastAPI receiver for Slack Events API requests: verify the signature over the raw body, answer the URL
-challenge, enqueue and return immediately.
+## Diagram
+The handler only verifies and enqueues; all real work happens in a worker that re-fetches state, and a
+reconciler covers what never arrives.
+
+```mermaid
+sequenceDiagram
+    participant S as Source system
+    participant H as Webhook handler
+    participant Q as Durable queue
+    participant W as Worker
+    participant X as Index
+    S->>H: POST event (signed raw body)
+    Note over H: Verify HMAC on raw bytes, tenant from secret
+    H->>Q: Enqueue by event ID
+    H->>S: 200 within timeout
+    Q->>W: Deliver (maybe twice)
+    W->>S: Re-fetch current object
+    W->>X: Upsert by key, then mark event done
+    Note over W,X: Periodic reconciliation catches missed events
+```
+
+## Examples
+### Slack Events API receiver in FastAPI
+Verify the signature over the raw body, answer the URL challenge, enqueue and return immediately.
 
 ```python
 import hashlib, hmac, json, os, time
@@ -128,44 +151,104 @@ async def consume(msg):                                      # runs in a worker,
     await dedup.mark(msg.key)                                # mark only after success, so a crash retries
 ```
 
-The consumer re-fetches the whole thread rather than trusting the single message in the event, which also
-handles edits and out-of-order delivery for that thread. Edit and delete events (`message_changed`,
-`message_deleted` subtypes) carry the affected message nested inside the event, and the event's own `ts`
-is not a message, which is why the root timestamp is read from the nested message. A deleted thread root
-makes the re-fetch return not-found, which the indexer must treat as a delete. The dedup key is marked only
-after processing succeeds: marking it first would turn a worker crash into a silently dropped event.
+- **Whole-thread re-fetch.** The consumer re-fetches the thread rather than trusting the single message,
+  which also handles edits and out-of-order delivery for that thread.
+- **Nested messages on edits and deletes.** `message_changed` and `message_deleted` subtypes carry the
+  affected message nested inside the event, and the event's own `ts` is not a message, so the root timestamp
+  is read from the nested message.
+- **Deleted roots.** A deleted thread root makes the re-fetch return not-found, which the indexer must treat
+  as a delete.
+- **Mark after success.** Marking the dedup key first would turn a worker crash into a silently dropped event.
+
+### Atomic claim and version-guarded upsert
+Pure Python with `sqlite3`, runnable. The same SQL shape works in Postgres with
+`INSERT ... ON CONFLICT (event_id) DO NOTHING`.
+
+```python
+import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE claims (event_id TEXT PRIMARY KEY)")
+db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT, version INTEGER)")
+
+def claim(event_id: str) -> bool:
+    """Atomic insert-if-absent: exactly one worker wins, however many race on a retried event."""
+    cur = db.execute("INSERT OR IGNORE INTO claims VALUES (?)", (event_id,))
+    db.commit()
+    return cur.rowcount == 1
+
+def apply_if_newer(doc_id: str, body: str, version: int) -> bool:
+    """Version-guarded upsert: an older event arriving late cannot overwrite newer state."""
+    db.execute("INSERT OR IGNORE INTO docs VALUES (?, ?, -1)", (doc_id, body))
+    cur = db.execute("UPDATE docs SET body = ?, version = ? WHERE id = ? AND version < ?",
+                     (body, version, doc_id, version))
+    db.commit()
+    return cur.rowcount == 1
+
+print(claim("Ev123"), claim("Ev123"))          # True False: second delivery does not post twice
+print(apply_if_newer("PROJ-7", "v2 text", 2))  # True
+print(apply_if_newer("PROJ-7", "v1 text", 1))  # False: late, older event discarded
+```
+
+### Worked numbers: polling vs webhooks plus reconciliation
+200 tenants × 50 containers, illustrative 20,000 real changes a day.
+
+| Design | API calls per day | Typical staleness |
+|---|---|---|
+| Poll every 5 minutes | 200 × 50 × 288 ≈ 2.9 million | about 2.5 minutes on average |
+| Poll every minute | ≈ 14.4 million | about 30 seconds |
+| Webhooks + one re-fetch per change | ≈ 20,000 | seconds |
+| Plus hourly reconciliation per container | + 200 × 50 × 24 = 240,000 | missed events bounded to 1 hour |
+
+## Production patterns
+- **Durable enqueue before the 2xx.** Write the verified event to a durable queue or an outbox table and only
+  then acknowledge; with Kafka, a producer configured with `acks=all` is the usual choice. Monitor enqueue
+  latency against the sender's timeout and receiver error rate.
+- **Subscription renewal with a horizon alert.** A scheduled job renews expiring subscriptions (Graph, for
+  example) well before expiry and re-creates any that were removed. Monitor each tenant's subscription
+  expiry horizon and alert when it falls below one renewal interval.
+- **Lifecycle notifications trigger catch-up.** Set a lifecycle notification URL on Graph subscriptions and
+  treat "missed" or "reauthorization required" as a signal to reauthorize and run reconciliation now. Monitor
+  lifecycle events per tenant.
+- **Dead-letter queue with replay.** After a bounded number of worker attempts, move the event to a DLQ with
+  the error, and give operators a replay command. Monitor DLQ depth and age of the oldest message.
+- **Dual secrets during rotation.** Accept signatures from the current and previous signing secret for a
+  short overlap, then retire the old one. Monitor signature failures by tenant, which spike when a rotation
+  goes wrong.
 
 ## Trade-offs
-- Webhooks cut freshness lag to seconds and save API calls, but add a public endpoint, subscription
-  lifecycle and secret management; polling wins when changes are rare or the source has no webhooks.
-- Fat payloads avoid an API call per event, but can be stale or out of order; thin payloads plus re-fetch
-  cost a call each but always apply current state.
-- Acknowledging before processing keeps the sender happy, but makes your queue the durability boundary; if
-  the enqueue is not durable, an acknowledged event can be lost for good.
-- Per-tenant subscriptions isolate failures and secrets, but multiply renewal jobs; one shared app-level
-  subscription is simpler when the source supports routing by tenant ID.
+- **Freshness vs operational surface.** Webhooks cut lag to seconds and save API calls, but add a public
+  endpoint, subscription lifecycle and secret management. Polling wins when changes are rare or the source
+  has no webhooks.
+- **Fat vs thin payloads.** Fat payloads avoid an API call per event but can be stale or out of order; thin
+  payloads plus re-fetch cost a call each but always apply current state.
+- **Ack-before-process vs durability.** Acknowledging first keeps the sender happy but makes your queue the
+  durability boundary; if the enqueue is not durable, an acknowledged event can be lost for good.
+- **Per-tenant vs shared subscriptions.** Per-tenant subscriptions isolate failures and secrets but multiply
+  renewal jobs; one shared app-level subscription is simpler when the source supports routing by tenant ID.
 
 ## Pitfalls
-- Calling an LLM or indexer inside the handler; the symptom is sender timeouts, retries and the same
-  document embedded or the same reply drafted twice.
-- Verifying the signature over re-serialized JSON instead of raw bytes; the symptom is every request failing
-  verification, after which someone disables the check.
-- No reconciliation job; the symptom is a few documents permanently stale after an outage, found only when
-  a user complains.
-- Letting subscriptions expire or get disabled after repeated failures; the symptom is a tenant's freshness
-  quietly dropping to the reconciliation interval.
-- Processing non-idempotent side effects with only a check-then-mark dedup; the symptom is occasional
-  double replies or double tickets under load, when two workers race on the same retried event.
-- Trusting payload content as instructions or index text without fetching from the source; the symptom is
-  forged events injecting attacker-controlled text into retrieval.
+- **Calling an LLM or indexer inside the handler.** Symptom: sender timeouts, retries, and the same document
+  embedded or the same reply drafted twice.
+- **Verifying over re-serialized JSON instead of raw bytes.** Symptom: every request fails verification,
+  after which someone disables the check.
+- **No reconciliation job.** Symptom: a few documents permanently stale after an outage, found only when a
+  user complains.
+- **Letting subscriptions expire or get disabled after repeated failures.** Symptom: a tenant's freshness
+  quietly drops to the reconciliation interval.
+- **Check-then-mark dedup for non-idempotent side effects.** Symptom: occasional double replies or double
+  tickets under load, when two workers race on the same retried event.
+- **Trusting payload content as instructions or index text** without fetching from the source. Symptom:
+  forged events inject attacker-controlled text into retrieval.
 
 ## When to use
-Use webhooks when users or agents need changes within seconds and the source supports them; keep a
-reconciliation sync regardless. Prefer polling or delta sync alone for low-change sources, sources without
-webhooks, or customers who will not allow inbound internet traffic (then consider a relay or a pull-based
-event API). Measure end-to-end lag from source change to index, duplicate rate, signature failures, queue
-depth, subscription expiry horizon, and how many changes reconciliation catches that webhooks missed.
-In interviews, the expected answer names at-least-once delivery, idempotency, fast ack and reconciliation.
+- **Use when** users or agents need changes within seconds and the source supports webhooks; keep a
+  reconciliation sync regardless.
+- **Prefer polling or delta sync alone** for low-change sources, sources without webhooks, or customers who
+  will not allow inbound internet traffic (then consider a relay or a pull-based event API).
+- **Measure:** end-to-end lag from source change to index, duplicate rate, signature failures, queue depth,
+  subscription expiry horizon, and how many changes reconciliation catches that webhooks missed.
+- **Interviews:** name at-least-once delivery, idempotency, fast ack and reconciliation.
 
 ## Role lens
 - **Engineer:** Writes verified, fast-ack receivers, idempotent consumers keyed by event ID, re-fetch logic
@@ -184,6 +267,37 @@ changes, so they stay stale until the item changes again. Prevention is a reconc
 query for items updated since the last confirmed watermark, run periodically and after any incident, which
 re-fetches and upserts them. Also alert on receiver error rate and queue health so outages trigger an
 immediate catch-up sync.
+
+## Interview questions
+### What delivery guarantees do webhooks give, and how does that shape the receiver?
+- **At-least-once, unordered, best-effort:** retries create duplicates, events can arrive out of order, and
+  some are lost for good.
+- **So the receiver** verifies, acks fast after a durable enqueue, processes idempotently, re-fetches current
+  state and relies on reconciliation for completeness.
+
+### The assistant drafted the same Slack reply twice for one message. How do you debug and fix it?
+- **Check for retries:** `X-Slack-Retry-Num` on the second delivery usually means the handler was slow and
+  missed the timeout.
+- **Check the dedup:** a check-then-mark table lets two workers race on the same retried event.
+- **Fix:** ack after enqueue only, and claim the side effect with an atomic insert-if-absent on the event ID
+  before posting.
+
+### When would you not use webhooks?
+- **Low-change sources**, where polling or delta sync is cheap and simpler.
+- **Sources without webhooks**, or customers who will not allow inbound internet traffic; use a relay or a
+  pull-based event API instead.
+- **Never as the only mechanism**, because a missed event stays wrong until the item changes again.
+
+### How do you size the reconciliation interval?
+- **It is your worst-case staleness** for a missed event, so pick it from the freshness the customer needs.
+- **Cost:** tenants × containers × runs per day of incremental queries; 200 × 50 hourly is 240,000 calls a
+  day, far below 5-minute polling.
+- **Watch the catch rate:** many changes found by reconciliation means a subscription is broken, not that
+  the interval is wrong.
+
+### How does a multi-tenant receiver know which tenant an event belongs to?
+- **From the credential:** the secret that verified the signature, or the stored subscription ID.
+- **Never from the body**, because a tenant field in the payload is exactly what a forger controls.
 
 ## Quiz
 ### Q: Why should a webhook handler return 2xx quickly and process the event asynchronously?

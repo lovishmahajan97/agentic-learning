@@ -5,7 +5,7 @@ name: Data ingestion from client systems
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - data-architecture/ingestion-pipelines
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -21,92 +21,111 @@ sources:
 ---
 
 ## TL;DR
-Ingesting from a client's systems means pulling data you do not own, through interfaces the client
-chooses, across a network boundary they control, from systems their business runs on. The durable
-design picks the least invasive channel the client can offer (API, replica, file drop, events or CDC),
-lands an immutable raw copy, advances a checkpoint only after a successful write, throttles to protect
-the source, and reconciles because some changes, especially deletes, are invisible to the channel.
+Client ingestion pulls data you do not own through channels the client approves. Pick the least invasive
+channel, land an immutable raw copy, advance the checkpoint only after a durable write, throttle to
+protect the source, and reconcile for deletes the channel cannot see.
 
 ## Why it exists
-Inside your own company, ingestion is an engineering problem. At a client it is also a negotiation: the
-data sits in their CRM, ERP, ticketing system or file shares; their security team decides which network
-paths exist; their platform team decides whether you may touch a database at all; and their operations
-team will notice if your job slows the system their staff use all day. You rarely get the interface you
-would design. You get what they can approve, often a REST API with rate limits, a nightly CSV on SFTP, a
-read replica, or an on-premises system reachable only from an agent inside their network.
-
-The naive approach is a script that calls the API, paginates through everything, and writes straight
-into the index, run on a schedule. It breaks in a characteristic order. Rate limits return 429s and the
-script dies halfway, so the next run starts over. A full re-pull each night takes longer than the night
-as volume grows. Records updated during the run are skipped or duplicated because pagination shifted
-under it. Deleted records stay in the index forever because a full pull of "what exists" says nothing
-about what stopped existing unless you diff it. And because raw responses were never kept, a parser
-bug found a month later means re-pulling everything from a source that took weeks to get access to.
-
-The pattern below exists to make ingestion resumable, incremental, gentle on the source, and replayable
-without going back to the client.
+- **Ingestion at a client is a negotiation.** The data sits in their CRM, ERP, ticketing system or file
+  shares; their security team decides which network paths exist; their platform team decides whether you
+  may touch a database; their operations team notices if your job slows the system staff use all day.
+- **You get what they can approve,** rarely the interface you would design: often a REST API with rate
+  limits, a nightly CSV on SFTP, a read replica, or an on-premises system reachable only from an agent
+  inside their network.
+- **The naive script breaks in a characteristic order.** Call the API, paginate through everything, write
+  straight into the index on a schedule:
+  1. Rate limits return 429s and the script dies halfway, so the next run starts over.
+  2. A full nightly re-pull takes longer than the night as volume grows.
+  3. Records updated during the run are skipped or duplicated because pagination shifted under it.
+  4. Deleted records stay in the index forever, because a pull of "what exists" says nothing about what
+     stopped existing unless you diff it.
+  5. Raw responses were never kept, so a parser bug found a month later means re-pulling everything from
+     a source that took weeks to get access to.
+- **What the pattern buys:** ingestion that is resumable, incremental, gentle on the source, and
+  replayable without going back to the client.
 
 ## How it works
-For the generic landing-zone and pipeline design, see the data-architecture ingestion lesson; this
-lesson covers what changes when the source belongs to a client.
+For the generic landing-zone and pipeline design, see the data-architecture ingestion lesson; this lesson
+covers what changes when the source belongs to a client.
 
 ### 1. Choose the channel from what the client can offer
-- **Vendor API pull** (Salesforce, ServiceNow, Zendesk, Graph for SharePoint): the usual default because
-  it respects the vendor's permission model and is supported. Costs: rate limits, pagination quirks,
-  and per-object API shapes.
-- **Database read replica or read-only views:** fastest for bulk data and allows SQL filtering, but
-  couples you to an internal schema that can change without notice; ask for views as a stable contract.
-- **File drop** (SFTP, a shared object-storage bucket): common for legacy systems and for teams that
-  cannot grant live access; simple and auditable, but batch-only and prone to format drift.
-- **Events or webhooks:** low latency, but delivery is at-least-once and can be lost, so it needs a
-  periodic pull or reconciliation behind it.
-- **CDC from the database log:** captures inserts, updates and deletes in order with low source load, but
-  needs DBA cooperation and connector infrastructure, so it is usually a phase-two upgrade.
+| Channel | Strength | Cost |
+|---|---|---|
+| **Vendor API pull** (Salesforce, ServiceNow, Zendesk, Graph for SharePoint) | the usual default: respects the vendor's permission model and is supported | rate limits, pagination quirks, per-object API shapes |
+| **Database read replica or read-only views** | fastest for bulk data, allows SQL filtering | couples you to an internal schema that can change without notice; ask for views as a stable contract |
+| **File drop** (SFTP, shared object-storage bucket) | common for legacy systems and teams that cannot grant live access; simple and auditable | batch-only, prone to format drift |
+| **Events or webhooks** | low latency | at-least-once and can be lost, so needs a periodic pull or reconciliation behind it |
+| **CDC from the database log** | inserts, updates and deletes in order, low source load | needs DBA cooperation and connector infrastructure, so usually a phase-two upgrade |
 
 ### 2. Decide where the connector runs
-If the source is only reachable inside the client network, run a small agent there that pushes outbound
-to you, *because* outbound connections usually pass security review far more easily than inbound ones;
-otherwise use private connectivity (private endpoints, VPN). Credentials are a dedicated service
-account or OAuth client with read-only scope, stored in a secrets manager and rotated.
+- **Inside the client network when needed.** If the source is only reachable there, run a small agent that
+  pushes outbound to you, *because* outbound connections usually pass security review far more easily
+  than inbound ones.
+- **Otherwise private connectivity** (private endpoints, VPN).
+- **Credentials:** a dedicated service account or OAuth client with read-only scope, stored in a secrets
+  manager and rotated.
 
 ### 3. Backfill, then incremental
-A historical backfill runs once, in bounded batches, off-peak, resumable per batch. Incremental runs
-then fetch only what changed since a **watermark**, typically a `modified_at` timestamp or a sequence
-number from the source.
+- **Backfill once:** in bounded batches, off-peak, resumable per batch.
+- **Then incremental:** fetch only what changed since a **watermark**, typically a `modified_at` timestamp
+  or a sequence number from the source.
 
 ### 4. Make the watermark safe
-Timestamps lie at the boundaries: several records can share the watermark's exact timestamp, clocks
-skew, and long transactions commit with earlier timestamps. So query from `watermark - overlap`, accept
-that some records arrive twice, and deduplicate by `(source_id, version or content_hash)`. Advance the
-watermark only *after* the batch is durably written, so a crash re-reads rather than skips. This is the
-whole reason ingestion can be at-least-once without being wrong.
+Timestamps lie at the boundaries: several records can share the watermark's exact timestamp, clocks skew,
+and long transactions commit with earlier timestamps. So:
+1. **Query from `watermark - overlap`** and accept that some records arrive twice.
+2. **Deduplicate by `(source_id, version or content_hash)`.**
+3. **Advance the watermark only *after* the batch is durably written,** so a crash re-reads rather than
+   skips. This is the whole reason ingestion can be at-least-once without being wrong.
 
 ### 5. Land raw, immutably
-Write each source record as received to a raw store, keyed by source system, object type, ID and content
-hash, before any parsing or mapping. Everything downstream (mapping, parsing, chunking, embedding) can
-be re-run from raw without re-contacting the client, which matters because access is slow to get and
-downstream logic will change. Two details decide whether this works. First, hash only the fields that
-carry content: many APIs return volatile fields (a computed "last viewed", a signed download URL that
-expires, a request timestamp), and hashing those makes every re-read look like a new version. Second,
-land the record's **permissions** with its content (ACLs, sharing, owning group), because retrieval
-must enforce them at query time and a raw zone without them cannot be replayed into a permission-aware
-index.
+- **Write each record as received** to a raw store, keyed by source system, object type, ID and content
+  hash, before any parsing or mapping.
+- **Why:** everything downstream (mapping, parsing, chunking, embedding) can be re-run from raw without
+  re-contacting the client, which matters because access is slow to get and downstream logic will change.
+- **Hash only content-bearing fields.** Many APIs return volatile fields (a computed "last viewed", a
+  signed download URL that expires, a request timestamp), and hashing those makes every re-read look like
+  a new version.
+- **Land permissions with content** (ACLs, sharing, owning group), because retrieval must enforce them at
+  query time and a raw zone without them cannot be replayed into a permission-aware index.
 
 ### 6. Protect the source
-Honour rate limits and `Retry-After`, cap concurrency, schedule heavy work outside business hours,
-prefer replicas over primaries, and expose a client-side switch to pause ingestion. Being a good
-neighbour is what keeps your access approved.
+- **Honour rate limits and `Retry-After`,** and cap concurrency.
+- **Schedule heavy work outside business hours** and prefer replicas over primaries.
+- **Expose a client-side switch to pause ingestion.** Being a good neighbour is what keeps your access
+  approved.
 
 ### 7. Catch what the channel misses
-Polling by `modified_at` does not see hard deletes and some permission changes, and it only sees what
-bumps the field you poll on: Salesforce, for example, updates `SystemModstamp` on system and automated
-changes that leave `LastModifiedDate` untouched, so a sync keyed on the latter misses them. Use the source's
-deleted-items endpoint or tombstones where it has one, CDC where available, and otherwise a periodic ID
-reconciliation comparing source and target key sets.
+- **Polling by `modified_at` misses hard deletes** and some permission changes.
+- **It only sees what bumps the polled field.** Salesforce, for example, updates `SystemModstamp` on
+  system and automated changes that leave `LastModifiedDate` untouched, so a sync keyed on the latter
+  misses them.
+- **Fill the gap** with the source's deleted-items endpoint or tombstones where it has one, CDC where
+  available, and otherwise a periodic ID reconciliation comparing source and target key sets.
 
-## Example
-An incremental pull from a paginated REST API with a safe watermark, backoff on rate limits, raw
-landing and deduplication. `api`, `raw_store` and `state` stand in for your HTTP client, object store and
+## Diagram
+An incremental run reads from the watermark minus an overlap, lands raw records keyed by content hash,
+and moves the watermark only after every write succeeds; reconciliation covers deletes separately.
+
+```mermaid
+flowchart TD
+    W[("Checkpoint: watermark")] --> Q["Query updated_since = watermark - overlap"]
+    Q --> A["Client API page"]
+    A -->|"429 or 5xx"| B["Back off, honour Retry-After"]
+    B --> A
+    A --> H{"Content hash already landed?"}
+    H -->|"yes"| N["Skip: overlap re-read"]
+    H -->|"no"| R[("Immutable raw store")]
+    R --> D["Downstream: map, parse, chunk, embed"]
+    A -->|"last page written"| W2["Advance watermark to max updated_at seen"]
+    W2 --> W
+    C["ID reconciliation job"] -->|"tombstone deletes"| D
+```
+
+## Examples
+### Incremental pull with a safe watermark
+An incremental pull from a paginated REST API with a safe watermark, backoff on rate limits, raw landing
+and deduplication. `api`, `raw_store` and `state` stand in for your HTTP client, object store and
 checkpoint table.
 
 ```python
@@ -144,52 +163,108 @@ def sync_tickets(api, raw_store, state, tenant):
     state.set(tenant, "tickets_wm", newest.isoformat())  # advance only after all writes succeeded
 ```
 
-The overlap re-reads ten minutes of records each run; the content-hash key makes those re-reads no-ops,
-and an unchanged record never produces a second raw object. The new watermark is the largest
-`updated_at` *seen in the data*, never your own clock at the end of the run, because the two clocks
-disagree and a watermark from your clock can jump past records the source stamped slightly earlier.
-The overlap should exceed the worst clock skew plus the longest transaction you expect at the source;
-ten minutes is a starting value, not a derived one. A crash mid-run leaves the watermark where
-it was, so the next run resumes. Note what this cannot see: a ticket hard-deleted in the source never
-appears in `updated_since`, which is why a separate reconciliation job compares ID sets.
+- **Overlap re-reads are no-ops.** The run re-reads ten minutes of records each time; the content-hash key
+  makes those re-reads no-ops, and an unchanged record never produces a second raw object.
+- **The watermark comes from the data.** It is the largest `updated_at` *seen in the data*, never your own
+  clock at the end of the run, because the two clocks disagree and a watermark from your clock can jump
+  past records the source stamped slightly earlier.
+- **Sizing the overlap.** It should exceed the worst clock skew plus the longest transaction you expect at
+  the source; ten minutes is a starting value, not a derived one.
+- **Crashes resume.** A crash mid-run leaves the watermark where it was, so the next run resumes.
+- **What it cannot see.** A ticket hard-deleted in the source never appears in `updated_since`, which is
+  why a separate reconciliation job compares ID sets.
+
+### Why a strict `>` with no overlap loses records
+A runnable simulation: a long transaction commits after the previous run, but with an earlier
+timestamp than the watermark.
+
+```python
+source = [  # (id, updated_at as minutes since midnight)
+    ("T1", 100), ("T2", 105), ("T3", 105),
+]
+watermark = 105                        # run 1 saw T1, T2, T3 and stopped at 105
+source.append(("T4", 104))             # long transaction commits late, stamped 104
+source.append(("T5", 110))             # ordinary later edit
+
+strict = [i for i, ts in source if ts > watermark]
+overlap = [i for i, ts in source if ts >= watermark - 10]
+already = {"T1", "T2", "T3"}
+
+print(strict)                               # ['T5']        T4 is lost forever
+print([i for i in overlap if i not in already])  # ['T4', 'T5'] overlap catches it
+```
+
+The overlap also re-reads T1 to T3; in the real pipeline the content-hash key turns those into no-ops.
+
+### Worked scenario: choosing channels for one client
+A client with three sources and different constraints (illustrative).
+
+| Source | What the client could approve | Channel chosen | Delete handling |
+|---|---|---|---|
+| ServiceNow tickets | API service account, shared quota | API pull with watermark overlap | nightly ID reconciliation |
+| On-premises ERP | no inbound connections | agent inside their network, outbound push | CDC requested for phase two |
+| Policy PDFs | nightly export only | SFTP file drop, validated per file | full listing diff per drop |
+
+## Production patterns
+- **Overlap watermark with content-hash dedupe.** Use for every polling sync. Query from the watermark
+  minus an overlap larger than skew plus the longest transaction, key raw objects by ID and content hash,
+  advance after writes. Monitor duplicate-skip counts; if they equal the whole overlap window every run,
+  volatile fields are leaking into the hash.
+- **Outbound-only agent for on-premises sources.** Use when security forbids inbound connections. A small
+  connector inside the client network pushes over a monitored outbound channel with read-only
+  credentials. Monitor agent heartbeat, version and push lag, since you cannot log in freely.
+- **Source-protection controls.** Use against any production system. Cap concurrency, honour
+  `Retry-After`, schedule backfills off-peak, and give the client a pause switch. Monitor 429 rate per
+  tenant and the source's latency during your runs.
+- **Validate file drops before loading.** Use for SFTP or bucket exports. Check expected columns and order,
+  row counts against the previous drop and an end-of-file marker or manifest, and quarantine failures.
+  Monitor missed nights and rejected files.
+- **ID-set reconciliation for deletes.** Use whenever the channel cannot report deletes. Periodically list
+  source IDs, diff with target IDs and tombstone the difference through to the index. Monitor tombstones
+  per run and raw-versus-target counts.
 
 ## Trade-offs
-- API pull respects the vendor's permission model and is supported, but rate limits make large backfills
-  slow; a read replica flips the balance for bulk history when the client's DBAs will provide one.
-- Polling by watermark is simple and works with almost any API, but adds latency of up to one polling
-  interval and misses deletes; events or CDC win once freshness or delete propagation becomes a requirement.
-- An agent inside the client network reaches on-premises systems and passes security review more
-  easily, but you now operate software in an environment you cannot log into freely, so upgrades,
-  monitoring and support get harder.
-- Keeping an immutable raw copy makes every downstream fix replayable, but stores sensitive client data
-  a second time; retention, encryption and deletion propagation must cover the raw zone too.
-- File drops are the easiest channel to get approved, but you inherit the export job's failures, such as
-  partial files, changed column orders and missed nights, so validate each file before loading it.
+- **API pull vs replica.** API pull respects the vendor's permission model and is supported, but rate
+  limits make large backfills slow; a read replica flips the balance for bulk history when the client's
+  DBAs will provide one.
+- **Polling vs events or CDC.** Watermark polling is simple and works with almost any API, but adds
+  latency of up to one polling interval and misses deletes; events or CDC win once freshness or delete
+  propagation becomes a requirement.
+- **In-network agent vs operability.** An agent inside the client network reaches on-premises systems and
+  passes security review more easily, but you now operate software in an environment you cannot log into
+  freely, so upgrades, monitoring and support get harder.
+- **Immutable raw copy vs a second copy of sensitive data.** It makes every downstream fix replayable, but
+  stores client data twice; retention, encryption and deletion propagation must cover the raw zone too.
+- **File drops vs inherited failures.** They are the easiest channel to get approved, but you inherit the
+  export job's failures, such as partial files, changed column orders and missed nights, so validate each
+  file before loading it.
 
 ## Pitfalls
-- Advancing the watermark before writes are durable; the symptom is a small, permanent gap of records
-  that were fetched during a crash and never re-fetched.
-- Using a strict `>` comparison on a timestamp watermark with no overlap; the symptom is occasional
-  missing records that share a timestamp with the previous run's last record.
-- Offset pagination over a set that changes during the run; the symptom is records skipped or seen twice
-  when inserts shift page boundaries, fixed by cursor or keyset pagination ordered on a stable key.
-- Ignoring `Retry-After` and retrying immediately; the symptom is the client's API gateway throttling or
-  blocking your service account, sometimes for the whole tenant's integrations.
-- Hashing the whole API response, volatile fields included, for the dedupe key; the symptom is a raw zone
+- **Advancing the watermark before writes are durable.** Symptom: a small, permanent gap of records that
+  were fetched during a crash and never re-fetched.
+- **A strict `>` comparison on a timestamp watermark with no overlap.** Symptom: occasional missing
+  records that share a timestamp with the previous run's last record.
+- **Offset pagination over a set that changes during the run.** Symptom: records skipped or seen twice
+  when inserts shift page boundaries. Fix: cursor or keyset pagination ordered on a stable key.
+- **Ignoring `Retry-After` and retrying immediately.** Symptom: the client's API gateway throttles or
+  blocks your service account, sometimes for the whole tenant's integrations.
+- **Hashing the whole API response, volatile fields included, for the dedupe key.** Symptom: a raw zone
   that grows by roughly the full overlap window on every run and "changed" counts that never fall,
   although nobody edited those records.
-- Writing straight to the index with no raw copy; the symptom is that a parser or mapping fix requires a
-  full re-pull, which can take days against a rate-limited API.
-- Assuming polling sees deletes; the symptom is answers citing documents or records the customer deleted
+- **Writing straight to the index with no raw copy.** Symptom: a parser or mapping fix requires a full
+  re-pull, which can take days against a rate-limited API.
+- **Assuming polling sees deletes.** Symptom: answers citing documents or records the customer deleted
   weeks ago, often found by the customer.
 
 ## When to use
-Use this pattern for any recurring pull from a system you do not own. Start by asking the client what
-they can approve, not by proposing your ideal: an API with a service account is usually fastest to get,
-a file drop is the fallback for legacy systems, and CDC is worth requesting once freshness or deletes
-matter. Measure lag (source change to landed), records per run, retry and 429 rates, raw-versus-target
-counts from reconciliation, and run duration against the window you have. In interviews, the tell of
-experience is mentioning the watermark overlap, advancing the checkpoint after the write, and deletes.
+- **Use for** any recurring pull from a system you do not own.
+- **Ask what the client can approve first,** not your ideal: an API with a service account is usually
+  fastest to get, a file drop is the fallback for legacy systems, and CDC is worth requesting once
+  freshness or deletes matter.
+- **Measure:** lag (source change to landed), records per run, retry and 429 rates, raw-versus-target
+  counts from reconciliation, and run duration against the window you have.
+- **Interviews:** the tell of experience is mentioning the watermark overlap, advancing the checkpoint
+  after the write, and deletes.
 
 ## Role lens
 - **Engineer:** Writes connectors with cursor pagination, backoff that honours `Retry-After`, overlap
@@ -209,6 +284,38 @@ advancing the watermark only after writes succeed. Deleted tickets persist becau
 query cannot return records that no longer exist. Fix with the API's deleted-records endpoint if it has
 one, CDC if the client can provide it, or a scheduled reconciliation that diffs source and target ID sets
 and tombstones the difference through to the index.
+
+## Interview questions
+### Why land an immutable raw copy before parsing or mapping?
+- **Replay without the client.** Every downstream fix (mapping, parsing, chunking, embedding) can be re-run
+  from raw, which matters because access took weeks to get and downstream logic will change.
+- **The cost** is storing sensitive client data a second time, so retention, encryption and deletion
+  propagation must cover the raw zone.
+
+### Your raw zone grows by thousands of objects every run though nobody edits records. What is wrong?
+- **The content hash includes volatile fields,** such as a signed download URL or a request timestamp, so
+  every overlap re-read looks like a new version.
+- **Fix:** hash only content-bearing fields and keep permissions alongside; expect duplicate skips to
+  roughly match the overlap window once fixed.
+
+### The client offers either API access or a read replica. How do you choose?
+- **API pull** respects the vendor's permission model and is supported, but rate limits make large
+  backfills slow.
+- **A replica** is fastest for bulk history and allows SQL filtering, but couples you to an internal
+  schema; ask for read-only views as a stable contract.
+- **Often both:** a replica or views for the backfill and the API for incremental sync and permissions.
+
+### Security will not open any inbound port to the on-premises system. What do you propose?
+- **An outbound-only agent** inside their network, on a host they control, pushing to you over a channel
+  their security team can monitor.
+- **The trade-off** is operating software you cannot log into freely, so build heartbeat, version reporting
+  and remote diagnostics in from the start.
+
+### How large should the watermark overlap be?
+- **Larger than the worst clock skew plus the longest source transaction,** because late-committing
+  transactions are stamped with earlier times.
+- **Ten minutes is a starting value, not a derived one;** content-hash dedupe makes a generous overlap
+  cheap, so err on the large side.
 
 ## Quiz
 ### Q: Why should the watermark be advanced only after the batch has been durably written?

@@ -5,7 +5,7 @@ name: AI risk management
 kind: practice
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
   - security-governance-compliance/threat-modeling
@@ -22,85 +22,106 @@ sources:
 ---
 
 ## TL;DR
-AI risk management is the continuous loop of identifying what can go wrong with an AI system, estimating
-how likely and how harmful each risk is, choosing controls, and tracking what risk remains, with named
-owners and an explicit appetite for what is acceptable. It exists because AI risks are probabilistic,
-shift after launch, and span security, safety, legal and business harms, so a one-time security review
-cannot cover them.
+AI risk management is a continuous loop: identify what can go wrong, rate likelihood and harm, choose
+controls, track what remains, with owners and an explicit appetite. AI risks are probabilistic and shift
+after launch, so a one-time review cannot cover them.
 
 ## Why it exists
-Traditional software risk reviews assume behaviour is specified and stable: test against the spec, fix
-deviations, ship. AI systems break those assumptions. Their behaviour is statistical (an error rate, not a
-bug), depends on data that drifts, can change when a provider updates a model you did not touch, and
-produces harms that are not outages: a confident wrong answer, a biased outcome, leaked training data, an
-agent taking an action nobody intended. Many of these harms fall on people outside the organization who
-never see the system.
-
-The naive approach is a launch checklist: security sign-off, privacy sign-off, done. It fails because it
-is binary and one-off. It cannot express "this hallucinates on roughly one answer in fifty for long
-documents and that is acceptable only with a citation check", and it says nothing about what happens six
-months later when the corpus, the users or the model have changed. It also fragments ownership: security
-looks at prompt injection, legal at copyright, product at accuracy, and nobody sees the combined picture or
-decides which risk to fund first.
-
-Frameworks such as the NIST AI RMF and ISO/IEC 23894 exist to give that picture a shared structure: a
-common vocabulary, a lifecycle, and the expectation that risk decisions are recorded and revisited. They
-are voluntary guidance, but regulators, auditors and enterprise customers increasingly expect to see them.
+- **Traditional reviews assume specified, stable behaviour:** test against the spec, fix deviations, ship.
+  AI breaks that. Behaviour is statistical (an error rate, not a bug), depends on data that drifts, and can
+  change when a provider updates a model you did not touch.
+- **AI harms are not outages.** A confident wrong answer, a biased outcome, leaked training data, an agent
+  taking an action nobody intended. Many fall on people outside the organization who never see the system.
+- **A launch checklist is binary and one-off.** It cannot express "this hallucinates on roughly one answer
+  in fifty for long documents and that is acceptable only with a citation check", and says nothing about
+  six months later, when the corpus, users or model have changed.
+- **Ownership fragments.** Security looks at prompt injection, legal at copyright, product at accuracy, and
+  nobody sees the combined picture or decides which risk to fund first.
+- **Frameworks give a shared structure.** The NIST AI RMF and ISO/IEC 23894 provide a common vocabulary, a
+  lifecycle, and recorded, revisited risk decisions. They are voluntary guidance, but regulators, auditors
+  and enterprise customers increasingly expect to see them.
 
 ## How it works
 ### The NIST AI RMF functions
-The AI RMF organizes the work into four functions:
-- **Govern**: policies, roles, risk appetite, accountability and culture. It is cross-cutting *because*
-  without an owner and an agreed appetite, the other three produce reports nobody acts on.
-- **Map**: establish context for a specific system: purpose, users, affected people, legal setting,
-  dependencies, and the risks that context creates. Mapping comes first *because* the same model carries
-  different risks in different uses.
-- **Measure**: quantify or qualitatively assess the mapped risks with evaluations, red teaming,
-  monitoring and expert review, including measuring what you cannot measure well and saying so.
-- **Manage**: prioritize, treat (mitigate, transfer, avoid or accept), monitor, and respond to incidents.
+| Function | What it covers | Because |
+|---|---|---|
+| **Govern** | Policies, roles, risk appetite, accountability, culture; cross-cutting | Without an owner and an agreed appetite, the other three produce reports nobody acts on |
+| **Map** | Context for one system: purpose, users, affected people, legal setting, dependencies, and the risks that context creates | Comes first, because the same model carries different risks in different uses |
+| **Measure** | Evaluations, red teaming, monitoring, expert review, including saying what you cannot measure well | Turns mapped risks into evidence |
+| **Manage** | Prioritize, treat (mitigate, transfer, avoid or accept), monitor, respond to incidents | Where decisions and money go |
 
-NIST's Generative AI Profile extends this with risks specific to generative systems, such as
-confabulation, harmful content, information integrity and data privacy. ISO/IEC 23894 takes the other
-route: it adapts the generic ISO 31000 process (establish context, identify, analyse, evaluate, treat,
-monitor and review, communicate) to AI. The two map onto each other closely, and either gives an auditor a
-recognizable structure; the EU AI Act's risk management system for high-risk systems asks for the same
-loop, run across the system's whole lifecycle.
+- **NIST's Generative AI Profile** adds generative-specific risks such as confabulation, harmful content,
+  information integrity and data privacy.
+- **ISO/IEC 23894 takes the other route:** it adapts the generic ISO 31000 process (establish context,
+  identify, analyse, evaluate, treat, monitor and review, communicate) to AI.
+- **They map onto each other closely,** and either gives an auditor a recognizable structure. The EU AI
+  Act's risk management system for high-risk systems asks for the same loop, run across the system's
+  whole lifecycle.
 
 ### The risk register
-The working artifact is a register per system (rolled up across the portfolio). Each entry has:
+The working artifact is a register per system, rolled up across the portfolio. Each entry has:
 1. **Risk statement** in cause-event-consequence form: "Because retrieved documents may be outdated, the
    assistant may state a superseded policy, leading a customer to act on wrong terms."
-2. **Category**: security, privacy, fairness, safety, reliability, legal or IP, third-party, operational.
-3. **Inherent rating**: likelihood × impact before controls, on a defined scale *because* "high" means
+2. **Category:** security, privacy, fairness, safety, reliability, legal or IP, third-party, operational.
+3. **Inherent rating:** likelihood × impact before controls, on a defined scale, *because* "high" means
    nothing without anchors (for example, impact 5 = regulatory breach or harm to many people).
 4. **Controls** mapped to the risk, each with an owner and evidence that it works.
 5. **Residual rating** after controls, compared with the risk appetite. Above appetite means treat
    further, avoid the use, or record formal acceptance by someone with authority.
-6. **Key risk indicators**: live metrics that warn the risk is materializing (groundedness rate, override
-   rate, injection detections, complaint volume).
-7. **Review trigger and date**.
+6. **Key risk indicators (KRIs):** live metrics that warn the risk is materializing (groundedness rate,
+   override rate, injection detections, complaint volume).
+7. **Review trigger and date.**
 
 ### Why likelihood × impact needs a guard rail
-The product of two ordinal 1–5 scales is convenient but lossy. A near-certain nuisance (5 × 1) and a rare
-catastrophe (1 × 5) both score 5, yet no one would treat them alike, and the gaps between ratings are not
-real distances. So most mature registers add rules on top of the score: any risk with maximum impact
-(serious harm to people, regulatory breach) needs a named owner's sign-off regardless of its product, and
-likelihood is anchored to observable frequencies ("more than once a month in comparable systems")
-rather than adjectives. Appetite is also usually stated per category, because an organization may accept
-moderate reliability risk while accepting almost no privacy or safety risk.
+- **The product of two ordinal 1–5 scales is lossy.** A near-certain nuisance (5 × 1) and a rare
+  catastrophe (1 × 5) both score 5, yet no one would treat them alike, and the gaps between ratings are not
+  real distances.
+- **Add an impact floor.** Any risk with maximum impact (serious harm to people, regulatory breach) needs a
+  named owner's sign-off regardless of its product.
+- **Anchor likelihood to observable frequencies** ("more than once a month in comparable systems") rather
+  than adjectives.
+- **State appetite per category,** because an organization may accept moderate reliability risk while
+  accepting almost no privacy or safety risk.
 
 ### Treatment options
-Mitigate (guardrails, human review, evaluation gates), transfer (contract terms, insurance, vendor
-indemnities), avoid (narrow scope, do not automate the decision), or accept with sign-off. Avoidance is
-underused: removing autonomy or a data source often removes a risk more cheaply than any control.
+| Option | Examples |
+|---|---|
+| **Mitigate** | Guardrails, human review, evaluation gates |
+| **Transfer** | Contract terms, insurance, vendor indemnities |
+| **Avoid** | Narrow scope, do not automate the decision |
+| **Accept** | With sign-off by someone with authority |
 
-### Integration
-Risk management is only real when wired into delivery: high residual risks block releases, KRIs feed
-monitoring alerts, incidents update likelihood estimates, and the register is reviewed when the model,
-data, purpose or regulation changes. The three-lines model is common in regulated firms: builders own
-risks, a risk or compliance function challenges them, internal audit checks the process.
+- **Avoidance is underused:** removing autonomy or a data source often removes a risk more cheaply than
+  any control.
 
-## Example
+### Integration with delivery
+Risk management is only real when wired into delivery:
+- **High residual risks block releases.**
+- **KRIs feed monitoring alerts.**
+- **Incidents update likelihood estimates.**
+- **The register is reviewed** when the model, data, purpose or regulation changes.
+- **Three lines model,** common in regulated firms: builders own risks, a risk or compliance function
+  challenges them, internal audit checks the process.
+
+## Diagram
+Govern sets owners and appetite; each system then cycles through Map, Measure and Manage, and live KRIs
+and incidents push it back round the loop.
+
+```mermaid
+flowchart TD
+    G["Govern: owners, appetite per category"] --> M["Map: purpose, users, setting"]
+    M --> R[("Risk register entry")]
+    R --> ME["Measure: evals, red team, review"]
+    ME --> S["Score inherent, then residual"]
+    S --> D{"Above appetite or impact floor?"}
+    D -->|"yes"| T["Treat further, avoid, or formal acceptance"]
+    T --> S
+    D -->|"no"| K["Ship with KRIs in monitoring"]
+    K -->|"KRI breach, incident or change"| M
+```
+
+## Examples
+### A register with an appetite line and an impact floor
 A customer-support assistant with retrieval and a refund tool. Scores use a 1 to 5 scale; numbers are
 illustrative judgements, not measurements.
 
@@ -129,43 +150,81 @@ for risk, (li, ii), controls, (lr, ir), kri in register:
     print(f"{inherent:>2} -> {residual:>2}  {status:<15} {risk}  [KRI: {kri}]")
 ```
 
-The PII risk lands exactly at the appetite line with residual 8, which prompts the useful conversation:
-is redaction measured (the KRI) and good enough, or should the team avoid sending free-text history at all?
-The wrong-customer refund scores only 5, below the stale-policy and PII risks, yet it is the one
-the floor rule escalates: a residual impact of 5 means real money to the wrong person, and a low product
-should not let it slip past an accountable owner. The injection risk shows the value of
-capability-limiting controls: with human approval on refunds, a
-successful injection can at most *propose* a refund, so the likelihood that harm completes drops far more
-than any detector could achieve against an adaptive attacker.
+Output: stale docs 12 → 6 OK; injection 15 → 4 OK; PII 12 → 8 OK; model update 6 → 4 OK; wrong-customer
+refund 10 → 5 OWNER SIGN-OFF.
+
+- **The PII risk lands exactly at the appetite line** with residual 8. That prompts the useful
+  conversation: is redaction measured (the KRI) and good enough, or should the team avoid sending
+  free-text history at all?
+- **The wrong-customer refund scores only 5,** below the stale-policy and PII risks, yet the floor rule
+  escalates it: a residual impact of 5 means real money to the wrong person, and a low product should not
+  let it slip past an accountable owner.
+- **The injection risk shows capability-limiting controls at work.** With human approval on refunds, a
+  successful injection can at most *propose* a refund, so the likelihood that harm completes drops far
+  more than any detector could achieve against an adaptive attacker.
+
+### Worked scenario: a KRI fires and the register moves
+Two months after launch the team migrates the knowledge base to a new CMS. Numbers are illustrative.
+
+| Step | Register effect |
+|---|---|
+| Ungrounded-answer KRI doubles over a week after migration | Stale-docs entry flagged for review |
+| Root cause: expiry metadata not carried over, so superseded pages are retrieved | The "doc expiry metadata" control has no evidence |
+| Residual likelihood re-rated from 2 to 4 | Residual 4 × 3 = 12, above appetite 8 |
+| Treatment: re-map expiry fields, add an eval case per superseded policy | Control evidence restored |
+| KRI back to baseline for two weeks, likelihood re-rated to 2 | Residual 6, back under appetite, review date reset |
+
+- **The register changed because evidence changed,** not because a calendar review came round.
+- **The control list was right; its evidence was not,** which is why each control needs a test or metric.
+
+## Production patterns
+- **Register as code next to the service.** Keep entries in a versioned file with scores, controls and KRI
+  names, and have CI fail when any residual exceeds appetite without an acceptance record (approver, date,
+  expiry). Monitor accepted risks past their expiry date.
+- **KRIs wired to real alerts.** Each register KRI names a dashboard metric and an alert threshold in the
+  monitoring system, such as ungrounded-answer rate from sampled grading or approval rejection rate on a
+  gated tool. Monitor KRIs with no data in the last day, since a silent KRI is a missing control.
+- **Risk library per tier.** Maintain a standard set of risks and controls per use-case tier, and let each
+  system record only its deltas. Monitor how many systems override library controls and why.
+- **Change-triggered re-assessment.** Re-run the assessment on a model version change, a new data source,
+  a new tool or a new geography, detected from deploy config diffs. Track mean time from change to
+  re-scored register.
+- **Second-line challenge before high-tier launch.** A risk or compliance reviewer re-scores the top
+  entries independently; large disagreements go to the owner for a decision. Monitor the score gap
+  between first and second line as a signal of under-scoring.
 
 ## Trade-offs
-- Quantified likelihood-impact scoring makes risks comparable and prioritizable, but scores are judgement
-  dressed as numbers; anchor scales with examples and revisit scores when incident data arrives.
-- A detailed per-system register gives depth, but a portfolio of hundreds becomes unmaintainable;
-  standard risk libraries per use-case tier with system-specific deltas scale better.
-- Strict risk appetite thresholds give clear release decisions, but can push teams to under-score risks;
-  independent challenge from a second line keeps scoring honest.
-- Mitigating with more controls reduces residual risk, but each control has cost, latency and failure
+- **Quantified scoring vs false precision.** Likelihood-impact scoring makes risks comparable and
+  prioritizable, but scores are judgement dressed as numbers; anchor scales with examples and revisit
+  scores when incident data arrives.
+- **Per-system depth vs portfolio scale.** A detailed register gives depth, but a portfolio of hundreds
+  becomes unmaintainable; standard risk libraries per use-case tier with system-specific deltas scale
+  better.
+- **Strict appetite vs honest scoring.** Clear thresholds give clear release decisions, but can push teams
+  to under-score risks; independent challenge from a second line keeps scoring honest.
+- **More controls vs avoidance.** Each control reduces residual risk but brings cost, latency and failure
   modes of its own; avoiding a risky capability can be cheaper and more robust.
 
 ## Pitfalls
-- Writing vague risks such as "bias" or "hallucination"; the symptom is a register where no control can
-  be shown to address any specific entry.
-- Rating only inherent risk and never re-rating after controls; the symptom is a register that never
-  changes no matter what the team builds.
-- Controls without evidence; the symptom is "guardrails in place" in the register while nobody can show a
+- **Writing vague risks such as "bias" or "hallucination".** Symptom: a register where no control can be
+  shown to address any specific entry. Fix: cause-event-consequence statements.
+- **Rating only inherent risk and never re-rating after controls.** Symptom: a register that never changes
+  no matter what the team builds.
+- **Controls without evidence.** Symptom: "guardrails in place" in the register while nobody can show a
   detection rate or a test result.
-- No key risk indicators; the symptom is learning about a materialized risk from a customer complaint.
-- Treating the register as a launch artifact; the symptom is a review date a year in the past on a system
+- **No key risk indicators.** Symptom: learning about a materialized risk from a customer complaint.
+- **Treating the register as a launch artifact.** Symptom: a review date a year in the past on a system
   whose model was swapped twice.
 
 ## When to use
-Every AI system in the inventory gets a risk assessment proportionate to its tier: a short standard
-template for low-tier uses, a full register with KRIs and second-line review for high-tier uses. Run it
-before design is fixed, because the cheapest treatments (scope and autonomy decisions) are only available
-early, then re-run on any material change. It underpins ISO/IEC 42001 certification, EU AI Act risk
-management obligations for high-risk systems, and enterprise customer due diligence. In interviews, show
-the loop: map in context, measure with evidence, manage with explicit residual risk and an owner.
+- **Every inventoried system, proportionate to tier:** a short standard template for low-tier uses; a full
+  register with KRIs and second-line review for high-tier uses.
+- **Run it before design is fixed,** because the cheapest treatments (scope and autonomy decisions) are only
+  available early; re-run on any material change.
+- **It underpins** ISO/IEC 42001 certification, EU AI Act risk management obligations for high-risk
+  systems, and enterprise customer due diligence.
+- **Interviews:** show the loop: map in context, measure with evidence, manage with explicit residual risk
+  and an owner.
 
 ## Role lens
 - **Engineer:** Implements the controls the register names and exposes the metrics that serve as key risk
@@ -185,6 +244,36 @@ templates, require human approval for external sends, separate the agent that re
 from the one that can act, and strip attachments. Each reduces impact or removes the path entirely. Then
 re-score residual risk, compare with appetite, define KRIs such as blocked external sends, and if it is
 still above appetite either drop the capability or obtain formal acceptance from an accountable owner.
+
+## Interview questions
+### Why isn't a pre-launch security and privacy review enough for an AI system?
+- **It is binary and one-off,** while AI risk is statistical and moves after launch as data drifts, users
+  change and providers update models.
+- **It fragments ownership** across security, legal and product, so nobody weighs the combined risks or
+  decides what to fund first. A register with owners, appetite and KRIs fixes both.
+
+### Two risks both score 5 on likelihood × impact. Do you treat them the same?
+- **No.** 5 × 1 is a frequent nuisance and 1 × 5 a rare catastrophe; ordinal products hide that.
+- **Apply an impact floor:** maximum-impact risks need named sign-off whatever the product.
+- **Anchor likelihood** to observed frequencies so scores mean the same across teams.
+
+### How do you show a control in the register actually works?
+- **Attach evidence:** a test result, a detection rate on a labelled set, or a metric that would move if
+  it failed.
+- **Make it a KRI with an alert,** so a broken control shows up as a dashboard change, not a complaint.
+- **Re-rate residual risk** when the evidence changes, as in the CMS migration scenario.
+
+### When would you choose avoidance over adding another guardrail?
+- **When the risk comes from a capability you can remove:** autonomy, external email, a sensitive data source.
+- **Because detectors are probabilistic against adaptive attackers,** while removing the path cuts impact
+  regardless of whether an injection succeeds.
+- **The cost is product scope,** so the owner must agree the narrower feature still meets the need.
+
+### How would you keep risk registers manageable across 300 AI systems?
+- **Use a risk library per tier,** with each system recording only deltas.
+- **Store registers as code** with CI checks on appetite and acceptance expiry.
+- **Trigger re-assessment from change events** such as model version or new data source, instead of
+  calendar reviews alone.
 
 ## Quiz
 ### Q: In the NIST AI RMF, why does the Map function come before Measure?

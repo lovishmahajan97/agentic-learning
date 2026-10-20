@@ -5,7 +5,7 @@ name: Quantization (INT8/INT4, GPTQ, AWQ, GGUF)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/peft
   - training-adaptation/pruning
@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 Quantization stores weights (sometimes activations) in INT8, INT4 or small floats instead of 16 bits.
-Decode is limited by bytes read, so models fit cheaper hardware and run faster. GPTQ and AWQ choose 4-bit
-values; GGUF ships them to CPUs.
+Decode is limited by bytes read, so models fit cheaper hardware and decode faster. GPTQ and AWQ
+calibrate 4-bit values to minimise output error; GGUF ships them to CPUs.
 
 ## Why it exists
 - **Memory.** A 70B-parameter model in bf16 is 140 GB of weights and does not fit one 80 GB GPU; at 4 bits
@@ -92,7 +92,7 @@ s = max|x| / (2^(b−1) − 1)        q = clamp(round(x / s), −2^(b−1), 2^(b
 | Input | trained model + calibration set (a few hundred sequences) | a fine-tuning run |
 | Time | minutes to hours | a training run |
 | Mechanism | fit quantized values to calibration data | simulate quantization in forward, straight-through estimator in backward, so the weights learn to live on the grid |
-| More accurate at | the common 4–8 bit settings, cheaply | extreme bit-widths (2–3 bits) or small models |
+| Best fit | the common 4–8 bit settings, where it is cheap and usually good enough | extreme bit-widths (2–3 bits) or small models, where it is more accurate |
 | Examples | GPTQ, AWQ | QAT fine-tunes |
 
 QLoRA sits in between: a frozen 4-bit base with trainable adapters that learn around its rounding error
@@ -321,7 +321,8 @@ quality drops too far, the honest options are two GPUs with FP8 or a smaller mod
 ## Interview questions
 ### Why does weight-only INT4 speed up decode but not prefill?
 - **Decode is bandwidth-bound:** each token reads every weight once with about one multiply-add per
-  weight at batch 1, so time per token ≈ weight bytes ÷ bandwidth and 4× fewer bytes is close to 4× faster.
+  weight at batch 1, so time per token ≈ weight bytes ÷ bandwidth and about 4× fewer bytes lowers that floor about 4×
+  (real gains are smaller, because KV-cache reads and kernel overhead do not shrink).
 - **Prefill is compute-bound:** W4A16 dequantizes to 16-bit inside the kernel, so FLOPs do not fall and
   time-to-first-token stays the same or gets worse.
 - **To cut compute** you need W8A8 or FP8 on tensor cores that run it at roughly twice fp16 throughput.

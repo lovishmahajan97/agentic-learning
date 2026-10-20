@@ -96,7 +96,7 @@ The same signatures and models that validate requests feed one cached schema, an
 that schema; note that raised errors only reach it if you declare them in `responses`.
 
 ```mermaid
-flowchart LR
+flowchart TD
     R["Route signatures and response_model"] --> G["app.openapi() on first request"]
     P["Pydantic models and Field metadata"] --> G
     X["Declared responses, for example 429 ErrorOut"] --> G
@@ -190,7 +190,8 @@ from fastapi.staticfiles import StaticFiles
 IS_PROD = False            # read from settings in real code
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None if IS_PROD else "/openapi.json")
-app.mount("/static", StaticFiles(directory="static"), name="static")   # swagger-ui-bundle.js, swagger-ui.css
+# ./static must exist (StaticFiles raises at startup otherwise) and hold swagger-ui-bundle.js, swagger-ui.css
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if not IS_PROD:
     @app.get("/docs", include_in_schema=False)

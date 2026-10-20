@@ -297,8 +297,11 @@ double-charge. Keep `BackgroundTasks` for the non-financial trace and metrics wr
   watch thread-pool saturation.
 
 ### When is BackgroundTasks the wrong choice even for small work?
-- **When loss has a cost.** A billing ledger entry or audit record belongs in the request's transaction or
-  an outbox row, because the client already got a success when the task fails.
+- **When it is CPU-bound.** An `async def` task computing local embeddings or hashing a large upload
+  blocks the event loop for every request on the worker; push it to a process pool or a job queue.
+- **When an external call can hang.** Tasks run sequentially, so a hanging webhook delays every task
+  queued behind it and keeps the request open through graceful shutdown; give it a timeout or move it to
+  an outbox row.
 - **When the task needs the request's database session.** Yield-dependency teardown timing has changed
   across FastAPI versions (0.106 changed the default), so create resources inside the task instead.
 

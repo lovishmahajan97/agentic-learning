@@ -5,7 +5,7 @@ name: Train / validation / test split
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/train-test-leakage
   - training-adaptation/data-curation
@@ -115,13 +115,14 @@ is read exactly once.
 flowchart TD
     D[("Raw labeled data")] --> DD["Deduplicate, incl. near-duplicates"]
     DD --> Q1{"Do rows share a source?"}
-    Q1 -->|"yes"| GR["Grouped: hash conversation, user or document id"]
-    Q1 -->|"no"| Q2{"Will the model serve the future?"}
-    GR --> Q2
+    Q1 -->|"yes"| GR["Key: conversation, user or document id"]
+    Q1 -->|"no"| RK["Key: row id"]
+    GR --> Q2{"Will the model serve the future?"}
+    RK --> Q2
     Q2 -->|"yes"| TM["Temporal: past to train, newest to test"]
-    Q2 -->|"no"| ST["Random, stratified if a class is rare"]
+    Q2 -->|"no"| HB["Hash key to buckets, stratify rare classes"]
     TM --> S["Train / Val / Test"]
-    ST --> S
+    HB --> S
     S -->|"gradient steps"| TR["Train"]
     S -->|"every decision, read often"| VA["Validation"]
     S -->|"read once, paired comparison"| TE["Test"]
@@ -229,17 +230,21 @@ print(f"McNemar exact p = {mcnemar_exact(40, 25):.3f}")          # 0.082
 - **Splitting by row when rows share a source.** Symptom: validation accuracy far above production and a
   sharp drop the first time a new customer, document or user arrives. Fix: grouped split.
 - **Fitting preprocessing before splitting** (scalers, tokenizers, vocabularies, filters). Symptom: a
-  small, persistent optimistic bias that vanishes when the pipeline is rebuilt on train only.
+  small, persistent optimistic bias that vanishes when the pipeline is rebuilt on train only. Fix: split
+  first, fit every preprocessing step on train only.
 - **Reusing the test set across iterations.** Symptom: a test score that keeps climbing while production
-  does not move, because the test set has quietly become a validation set.
+  does not move, because the test set has quietly become a validation set. Fix: carve a fresh test set
+  from newly arrived data.
 - **Random splits with a rare class.** Symptom: the minority-class metric jumping between 0% and 100%
   across seeds. Fix: stratify.
 - **Re-splitting with a new seed on every run.** Symptom: incomparable experiments and "improvements"
   that are nothing but split noise. Fix: a fixed, hashed split.
 - **Temporal splits with whole-window features** (aggregates, embeddings fit on all periods). Symptom: a
-  time-split test score that is still too good to be true.
+  time-split test score that is still too good to be true. Fix: compute features only from data before
+  each split's cutoff.
 - **Validation drawn from the same synthetic template as training.** Symptom: near-perfect validation
-  alongside poor human evaluation on real prompts.
+  alongside poor human evaluation on real prompts. Fix: deduplicate templates across splits and hold out
+  real prompts.
 
 ## When to use
 Every supervised project needs the three roles; the decision is how to cut.

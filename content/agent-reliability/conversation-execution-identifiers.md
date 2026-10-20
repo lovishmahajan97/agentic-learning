@@ -5,7 +5,7 @@ name: Conversation / execution identifiers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
   - agent-reliability/idempotent-tool-execution
@@ -20,31 +20,25 @@ sources:
 ---
 
 ## TL;DR
-An agent system needs a hierarchy of identifiers, not one "session id": tenant and user for scope,
-conversation id for the long-lived transcript, turn id for one user request, run id for one execution
-attempt of that turn, step and tool-call ids within it, plus trace ids for cross-service correlation.
-Each id answers a different question (resume what, dedupe what, bill whom, trace which), and
-conflating them is why retries double-act and logs cannot be joined.
+Agents need an id hierarchy, not one "session id": tenant, user, conversation, turn, run, step,
+tool call and trace. Each answers a different question (resume what, dedupe what, bill whom, trace
+which); conflating them makes retries double-act and logs impossible to join.
 
 ## Why it exists
-Imagine debugging "the agent created two tickets" with a single session id. The logs show two create
-calls in session S. Were they two user requests? One request retried by the client? One run resumed
-after a crash? Two parallel tool calls? Without ids that distinguish those cases the logs cannot tell
-you, and neither can your dedup logic, because dedup needs a key that is the same across a retry and
-different across a genuine second request.
-
-Each capability of a reliable runtime relies on a specific identity. Resuming requires knowing which
-execution to load; idempotent tools require a key stable across retries; billing and quotas require
-the tenant; reconnecting clients require a conversation cursor; distributed tracing requires an id
-that crosses service boundaries; evaluation requires addressing "step 7 of run X" repeatably. These
-have different lifetimes: a conversation spans days, a turn spans one request, a run spans one attempt
-at that request (a failed turn retried gets a new run under the same turn), a step spans one model
-call.
-
-The naive design uses the model provider's conversation or thread id, or a random id minted per
-request. Provider ids tie your data model to a vendor and know nothing about retries or runs;
-per-request random ids cannot dedupe because a retry mints a new one. The fix is to decide, per id,
-who mints it, when, and what it is stable across.
+- **One session id cannot explain an incident.** Debug "the agent created two tickets": the logs show two
+  create calls in session S. Two user requests? One request retried by the client? One run resumed after
+  a crash? Two parallel tool calls? The logs cannot tell you, and neither can dedup logic, which needs a
+  key that is the same across a retry and different across a genuine second request.
+- **Each capability relies on a specific identity.** Resuming needs the execution to load; idempotent
+  tools need a key stable across retries; billing and quotas need the tenant; reconnecting clients need a
+  conversation cursor; tracing needs an id that crosses services; evaluation needs to address "step 7 of
+  run X" repeatably.
+- **The lifetimes differ.** A conversation spans days, a turn one request, a run one attempt at that
+  request (a failed turn retried gets a new run under the same turn), a step one model call.
+- **Provider ids are the wrong foundation.** The model provider's conversation or thread id ties your data
+  model to a vendor and knows nothing about retries or runs.
+- **Per-request random ids cannot dedupe,** because a retry mints a new one. The fix is to decide, per id,
+  who mints it, when, and what it is stable across.
 
 ## How it works
 ### The hierarchy
@@ -52,75 +46,100 @@ who mints it, when, and what it is stable across.
 tenant_id — user_id — conversation_id — turn_id — run_id — step — tool_call_id
                         (transcript)   (request)  (attempt)  (model call)  (one call)
 ```
-- **tenant_id / user_id**: the scope for isolation, quotas, billing and deletion. Present on every
-  record and every log line.
-- **conversation_id** (thread id): the unit of memory. Keys the event log and the sequence numbers
-  clients resume from.
-- **turn_id**: one user submission. Minted by the *client* before sending, because then a retried
-  POST carries the same id and the server can recognise it. Stable across network retries.
-- **run_id** (execution id): one attempt to produce the turn's response. Minted by the server when
-  work starts. A crash-resume continues the same run; a user-initiated "regenerate" or an automatic
-  retry after failure starts a new run under the same turn with `attempt = n + 1`. Keys checkpoints
-  and leases.
-- **parent_run_id**: for sub-agents. A child run gets its own run id (its own checkpoints, budget
-  and lease) plus a pointer to the parent run and the parent's tool call that spawned it. Because
-  then a crash-resume of the parent can find the child that already exists instead of spawning a
-  second one, and the trace shows the delegation tree rather than unrelated runs.
-- **step**: the index of the model call within the run; with run_id it addresses a checkpoint.
-- **tool_call_id**: assigned by the model API to each requested call (both the Claude and OpenAI
-  APIs include one) and echoed back on the result so the API can pair them. It is an opaque,
-  vendor-formatted string whose only documented job is pairing within the conversation, and it is
-  stable across a resume only if the response that carried it was persisted; scope it with run_id
-  and step rather than relying on it alone for global uniqueness.
-- **idempotency_key**: derived rather than minted, for example `f"{run_id}:{step}:{call_index}"`
-  hashed, so a resumed step regenerates the same key.
-- **trace_id / span_id**: OpenTelemetry ids propagated across services (gateway, agent, tool
-  services, model proxy) so one trace shows the whole turn. A run usually maps to one trace, with
-  each model call and tool call a span. Store trace_id on the run record so a support ticket leads to
-  the trace.
-- **provider request id**: returned by the model API per call; log it, because it is what the vendor
-  needs when you open a support case.
+
+| Id | What it is | Minted by, when | Stable across |
+|---|---|---|---|
+| **tenant_id / user_id** | Scope for isolation, quotas, billing and deletion; on every record and log line | Auth system | Everything |
+| **conversation_id** (thread id) | The unit of memory; keys the event log and the sequence numbers clients resume from | Server, at conversation start | The conversation's life |
+| **turn_id** | One user submission | The *client*, before sending | Network retries |
+| **run_id** (execution id) | One attempt to produce the turn's response; keys checkpoints and leases | Server, when work starts | Crash-resume (not regenerate) |
+| **step** | Index of the model call in the run; with run_id addresses a checkpoint | Harness counter | Resume of that run |
+| **tool_call_id** | Pairs a requested call with its result | The model API | Resume only if the response was persisted |
+| **idempotency_key** | Dedupes a side effect | *Derived*, not minted | Crash-resume |
+| **trace_id / span_id** | Cross-service correlation (OpenTelemetry) | Tracing SDK | The turn's request path |
+
+- **turn_id from the client** because then a retried POST carries the same id and the server can
+  recognise it.
+- **run_id and attempts.** A crash-resume continues the same run; a user-initiated "regenerate" or an
+  automatic retry after failure starts a new run under the same turn with `attempt = n + 1`.
+- **parent_run_id for sub-agents.** A child gets its own run id (own checkpoints, budget and lease) plus a
+  pointer to the parent run and the parent's tool call that spawned it. A resumed parent then finds the
+  existing child instead of spawning a second, and the trace shows the delegation tree.
+- **tool_call_id caveats.** Both the Claude and OpenAI APIs assign one per requested call and expect it
+  echoed on the result. It is an opaque, vendor-formatted string whose only documented job is pairing
+  within the conversation; scope it with run_id and step rather than relying on it for global uniqueness.
+- **idempotency_key derivation:** for example `f"{run_id}:{step}:{call_index}"` hashed, so a resumed step
+  regenerates the same key.
+- **trace_id placement.** Propagate across gateway, agent, tool services and model proxy so one trace
+  shows the whole turn; a run usually maps to one trace, each model and tool call a span. Store trace_id
+  on the run record so a support ticket leads to the trace.
+- **Provider request id.** Returned by the model API per call; log it, because it is what the vendor needs
+  when you open a support case.
 
 ### Generation
-Random UUIDv4 is fine for uniqueness; time-ordered ids (UUIDv7 as standardised in RFC 9562, or ULID)
-sort by creation time and keep B-tree inserts sequential, which matters for the high-write events
-table. Never use model-generated strings as identifiers: a model will happily invent plausible ids
-and reuse them. Never derive ids from content either; the same question asked twice is two turns.
+- **UUIDv4 is fine for uniqueness.**
+- **Time-ordered ids sort and index better.** UUIDv7 (standardised in RFC 9562) or ULID sort by creation
+  time and keep B-tree inserts sequential, which matters for the high-write events table.
+- **Never model-generated strings:** a model will happily invent plausible ids and reuse them.
+- **Never derived from content:** the same question asked twice is two turns.
 
 ### Propagation
-Carry the id set as a context object (Python `contextvars`, Node `AsyncLocalStorage`) so every log
-line, metric, tool call and outbound request is tagged without threading parameters by hand. Put
-run_id, tool_call_id and the trace headers into outbound tool requests so the tool service's logs join
-back. Put the full id set into every event in the event log.
+- **Carry the id set as a context object** (Python `contextvars`, Node `AsyncLocalStorage`) so every log
+  line, metric, tool call and outbound request is tagged without threading parameters by hand.
+- **Send ids outbound:** run_id, tool_call_id and the trace headers go into tool requests so the tool
+  service's logs join back.
+- **Put the full id set into every event** in the event log.
 
 ### Identifiers are not authorization
-Every id the client sends (conversation id, turn id, run id in a reconnect URL) is a claim, not a
-credential. A server that loads `/conversations/{id}/events` without checking that the conversation
-belongs to the caller's tenant and user has an insecure direct object reference, and unguessable
-UUIDs only make the bug harder to find, not absent: ids leak through logs, shared links and browser
-history. Resolve the caller's identity from the auth token, then look up the object *scoped by*
-that identity (`where tenant_id = $1 and conversation_id = $2`). The same rule applies to tool
-services receiving `X-Run-Id`: it is for correlation, never for deciding what the caller may touch.
+- **Every client-sent id is a claim, not a credential:** conversation id, turn id, run id in a reconnect
+  URL.
+- **The classic bug:** loading `/conversations/{id}/events` without checking that the conversation belongs
+  to the caller's tenant and user is an insecure direct object reference.
+- **Unguessable UUIDs only hide the bug,** because ids leak through logs, shared links and browser history.
+- **The fix:** resolve the caller's identity from the auth token, then look up the object *scoped by* it
+  (`where tenant_id = $1 and conversation_id = $2`).
+- **Same for tool services receiving `X-Run-Id`:** it is for correlation, never for deciding what the
+  caller may touch.
 
 ### What each id lets you do
-- Resume after a crash: run_id plus latest step.
-- Dedupe a retried submission: turn_id.
-- Dedupe a retried side effect: the idempotency key derived from (run_id, step, index).
-- Reconnect and catch up: conversation_id plus sequence number.
-- Bill, enforce quotas, delete: tenant_id.
-- Debug across services: trace_id.
-- Pair a tool result with its request: tool_call_id.
+| Need | Id |
+|---|---|
+| Resume after a crash | run_id plus latest step |
+| Dedupe a retried submission | turn_id |
+| Dedupe a retried side effect | idempotency key derived from (run_id, step, index) |
+| Reconnect and catch up | conversation_id plus sequence number |
+| Bill, enforce quotas, delete | tenant_id |
+| Debug across services | trace_id |
+| Pair a tool result with its request | tool_call_id |
 
 ### Attempt semantics
-Decide what is shared across attempts of a turn: the user's message and prior conversation (yes), the
-previous attempt's side effects (they happened, so the new attempt must be told or must check), and
-the budget (per attempt or per turn; per turn stops a retry storm). Record `attempt` on the run and
-keep failed runs: they are evidence.
+Decide what is shared across attempts of a turn:
+- **The user's message and prior conversation:** yes.
+- **The previous attempt's side effects:** they happened, so the new attempt must be told or must check.
+- **The budget:** per attempt or per turn; per turn stops a retry storm.
+- **Record `attempt` on the run and keep failed runs:** they are evidence.
 
-## Example
-The frozen `Ids` object travels in a context variable; the client-minted turn id survives retries,
-the server mints a run id per attempt, and the idempotency key is derived from run, step and call
-index so a resumed step reproduces it exactly.
+## Diagram
+What stays and what changes across the three kinds of repeat; only the regenerate path produces new
+idempotency keys.
+
+```mermaid
+flowchart TD
+    U["User submits turn t_41"] --> P["POST with client-minted turn id"]
+    P -->|"network timeout, client resends"| D{"Run exists for t_41?"}
+    D -->|"yes"| S["Return existing run stream, nothing minted"]
+    D -->|"no"| R["Server mints run r_a, attempt 1"]
+    R -->|"crash at step 3"| C["Resume r_a from checkpoint"]
+    C --> K1["Same key: r_a, 3, 0"]
+    R -->|"user clicks regenerate"| G["Mint run r_b, attempt 2"]
+    G --> K2["New key: r_b, 3, 0"]
+```
+
+## Examples
+### An immutable id set in a context variable
+The frozen `Ids` object travels in a context variable; the client-minted turn id survives retries, the
+server mints a run id per attempt, and the idempotency key is derived from run, step and call index so a
+resumed step reproduces it exactly.
 
 ```python
 import contextvars, hashlib, logging, uuid
@@ -168,52 +187,87 @@ def call_tool(tool, name, args, call_index):
     return tool(name, args, headers=headers)
 ```
 
-Trace the three cases through this code. A user sends turn `t_41` and the POST times out; the client
-re-sends `t_41`, the server finds a run already exists for it and returns that run's stream, so
-nothing is minted. The run `r_a` crashes at step 3 while calling `create_ticket` as call 0; the
-resume restores `Ids(run_id="r_a", step=3)` from the checkpoint, so `idem_key(0)` hashes
-`"r_a:3:0"` again and the ticket API replays the first ticket. The user then clicks regenerate:
-`start_run` mints `r_b` with `attempt=2`, and step 3's key now hashes `"r_b:3:0"`, a different key,
-so a second ticket is possible by design. Whether that is right depends on whether `r_b` was told
-that `r_a` already created one, which is a product decision the ids make visible rather than hide.
+### Worked trace: retry, resume, regenerate
+| Case | What happens | Key for step 3, call 0 |
+|---|---|---|
+| POST for turn `t_41` times out; client re-sends `t_41` | Server finds a run already exists for it and returns that run's stream; nothing is minted | unchanged |
+| Run `r_a` crashes at step 3 while calling `create_ticket` as call 0 | Resume restores `Ids(run_id="r_a", step=3)` from the checkpoint, so `idem_key(0)` hashes `"r_a:3:0"` again; the ticket API replays the first ticket | same |
+| User clicks regenerate | `start_run` mints `r_b` with `attempt=2`; step 3's key now hashes `"r_b:3:0"` | different, so a second ticket is possible by design |
+
+- **The product decision the ids expose:** whether a second ticket is right depends on whether `r_b` was
+  told that `r_a` already created one. The ids make that visible rather than hide it.
+
+### Runnable check of the three cases
+Paste below the `Ids` class; pure standard library.
+
+```python
+base = Ids("acme", "u_7", "c_9", turn_id="t_41")
+r_a = replace(base, run_id="r_a", step=3)
+resumed = replace(base, run_id="r_a", step=3)        # restored from the checkpoint
+regen = replace(base, run_id="r_b", attempt=2, step=3)
+print(r_a.idem_key(0) == resumed.idem_key(0))         # True: crash-resume dedupes
+print(r_a.idem_key(0) == regen.idem_key(0))           # False: regenerate is new work
+print(r_a.fields())   # tenant, user, conversation, turn, run, attempt=1, step=3
+```
+
+## Production patterns
+- **Bind ids into every log line once.** At the start of a run, bind the id set into the logging context
+  (for example `structlog.contextvars.bind_contextvars(**ids.fields())`, or a logging filter reading the
+  context variable) so no call site forgets them. Monitor the share of log lines carrying the full id set.
+- **OpenTelemetry for the trace, your ids as attributes.** Let the OpenTelemetry propagator inject W3C
+  `traceparent` into outbound calls, and set run_id, turn_id and tenant_id as span attributes so traces
+  are searchable by business id. Monitor the share of turns whose trace spans every service.
+- **Database-enforced turn dedup.** Add a unique constraint on (conversation_id, turn_id) and create the
+  turn with an insert that does nothing on conflict, returning the existing run. Monitor conflict rate,
+  which is your client retry rate.
+- **Time-ordered primary keys for hot tables.** Use UUIDv7 or ULID for event and run ids (Python 3.14's
+  `uuid.uuid7()`, PostgreSQL 18's `uuidv7()`, or a library on older versions) to keep B-tree inserts
+  sequential. Monitor index bloat and insert latency on the events table.
+- **Tenant-scoped lookups everywhere.** Route every load through a repository function that takes the
+  authenticated tenant and user and adds `where tenant_id = ...` to the query; add a test that fetches
+  another tenant's id and expects not-found. Monitor authorization-denied counts per endpoint.
+- **Log the provider request id.** Record the model API's per-call request id (returned in a response
+  header and exposed by the official SDKs) on the step's span. Monitor its presence on failed calls,
+  since support cases need it.
 
 ## Trade-offs
-- Client-minted turn ids make submissions retry-safe, but you must validate them (format, uniqueness
-  per conversation) because a buggy or malicious client can collide them; server-minted ids are safe
-  but cannot dedupe retries.
-- A full id hierarchy costs discipline, since every log line, event and outbound call must carry it
-  and retrofitting is tedious; a context-propagation layer added early makes it nearly free.
-- Deriving idempotency keys from (run, step, index) is stable across crash resumes, but a new attempt
-  gets new keys by design, so a retried turn can repeat effects unless the new attempt checks the
-  previous attempt's results.
-- Time-ordered ids improve index locality and sortability, but reveal creation time and ordering to
-  anyone who sees them; random ids reveal nothing but fragment indexes.
+- **Client-minted turn ids vs trust.** They make submissions retry-safe, but you must validate them
+  (format, uniqueness per conversation) because a buggy or malicious client can collide them;
+  server-minted ids are safe but cannot dedupe retries.
+- **Full hierarchy vs discipline.** Every log line, event and outbound call must carry the ids and
+  retrofitting is tedious; a context-propagation layer added early makes it nearly free.
+- **Derived idempotency keys vs new attempts.** Keys from (run, step, index) are stable across crash
+  resumes, but a new attempt gets new keys by design, so a retried turn can repeat effects unless the new
+  attempt checks the previous attempt's results.
+- **Time-ordered vs random ids.** Time-ordered ids improve index locality and sortability but reveal
+  creation time and ordering to anyone who sees them; random ids reveal nothing but fragment indexes.
 
 ## Pitfalls
-- One "session id" for both conversation and execution; the symptom is a regenerate request
-  overwriting the first run's checkpoints or deduping against it incorrectly.
-- Letting the model produce or echo identifiers in free text; the symptom is tool results attached to
-  the wrong call, or ids that look valid but do not exist.
-- Minting a new run id on crash resume; the symptom is idempotency keys that change, so the dedup
-  layer never matches.
-- Naming ids inconsistently across services (run_id in one, execution_id in another); the symptom is
-  traces that cannot be joined when an incident needs them.
-- Forgetting to echo tool_call_id on the result; the symptom is provider API errors about unmatched
-  tool calls and silently dropped results.
-- Loading objects by a client-supplied id without scoping by the caller's tenant; the symptom shows
-  up in a security review or a bug report, where one customer's conversation renders for another
-  after an id was pasted into a URL.
-- Sub-agents that reuse the parent's run id, or have no link to it; the symptom is children
-  overwriting the parent's checkpoints, or a resumed parent spawning a duplicate child.
+- **One "session id" for both conversation and execution.** The symptom is a regenerate overwriting the
+  first run's checkpoints or deduping against it incorrectly. Fix: separate turn and run ids.
+- **Letting the model produce or echo identifiers in free text.** The symptom is tool results attached to
+  the wrong call, or ids that look valid but do not exist. Fix: the harness mints and attaches ids.
+- **Minting a new run id on crash resume.** The symptom is idempotency keys that change, so the dedup layer
+  never matches. Fix: resume under the same run id.
+- **Inconsistent names across services** (run_id in one, execution_id in another). The symptom is traces
+  that cannot be joined when an incident needs them. Fix: one shared id schema.
+- **Forgetting to echo tool_call_id on the result.** The symptom is provider API errors about unmatched
+  tool calls and silently dropped results. Fix: pair results by id in the harness.
+- **Loading objects by a client-supplied id without tenant scoping.** The symptom shows up in a security
+  review or bug report: one customer's conversation renders for another after an id was pasted into a
+  URL. Fix: scoped lookups.
+- **Sub-agents reusing the parent's run id, or unlinked to it.** The symptom is children overwriting the
+  parent's checkpoints, or a resumed parent spawning a duplicate child. Fix: own run id plus
+  parent_run_id.
 
 ## When to use
-Define the hierarchy on day one of any agent project; it costs nothing then and a migration later.
-It shows up whenever you design the API (turn id in the request), the store (run id keys checkpoints,
-conversation id keys events), the tools (idempotency key and trace headers) and the logs (every line
-tagged). Measure the percentage of log lines carrying the full id set, the share of turns whose trace
-spans all services, and duplicate-effect incidents traced to id confusion. In interviews, being able
-to say what stays stable across a retry versus a resume versus a regenerate, and which id dedupes
-each, is the depth expected of an engineer who has run agents in production.
+- **Day one of any agent project:** define the hierarchy; it costs nothing then and a migration later.
+- **It shows up in:** the API (turn id in the request), the store (run id keys checkpoints, conversation
+  id keys events), the tools (idempotency key and trace headers) and the logs (every line tagged).
+- **Measure:** percentage of log lines carrying the full id set, share of turns whose trace spans all
+  services, and duplicate-effect incidents traced to id confusion.
+- **Interviews:** say what stays stable across a retry versus a resume versus a regenerate, and which id
+  dedupes each; that is the depth expected of an engineer who has run agents in production.
 
 ## Role lens
 - **Engineer:** Implements the Ids context object, mints turn ids in the client SDK, propagates
@@ -234,6 +288,38 @@ keys, because the user wants new work. That last case is why a new attempt must 
 previous attempt's results in its context or check before acting; otherwise it repeats effects that
 are legitimate from the runtime's perspective. The ids encode exactly which repeats are errors and
 which are intended.
+
+## Interview questions
+### Why is a single session id not enough for an agent system?
+- **It cannot separate the cases that matter:** two user requests, one retried request, a resumed run and
+  parallel tool calls all look the same.
+- **Dedup and resume need different keys:** turn id for submissions, run id plus step for checkpoints,
+  and a derived idempotency key for side effects, each with its own lifetime.
+
+### How would you design idempotency keys for tool calls in a durable runtime?
+- **Derive, do not mint:** hash run id, step and call index, so a crash-resume of the step regenerates the
+  same key.
+- **Not random UUIDs** (they change on resume), **not argument hashes** (they collide across legitimate
+  repeats), **not process counters** (they restart on a new worker).
+
+### A support ticket says "the agent did it twice". Which ids do you look up, in what order?
+- **Start from tenant and conversation,** then list turns: two turn ids means two user requests.
+- **One turn, two runs** means a regenerate or automatic retry; check `attempt` and whether the second run
+  was told about the first.
+- **One run, repeated tool calls:** compare idempotency keys and step numbers, then follow trace_id and the
+  provider request id into the tool service's logs.
+
+### Is an unguessable UUID in the URL enough to protect a conversation?
+- **No.** Ids leak through logs, shared links and browser history, so a lookup by id alone is an insecure
+  direct object reference.
+- **Scope every lookup by the authenticated tenant and user,** and treat ids like `X-Run-Id` as correlation
+  only, never as authorization.
+
+### UUIDv4 or UUIDv7 for the events table?
+- **UUIDv7 (or ULID)** sorts by creation time and keeps B-tree inserts sequential, which helps a high-write
+  table.
+- **The cost:** it reveals creation time and ordering to anyone who sees the id; where that matters,
+  expose a separate random public id.
 
 ## Quiz
 ### Q: Who should mint the turn id, and why?

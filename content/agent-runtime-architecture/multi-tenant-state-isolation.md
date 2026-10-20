@@ -5,7 +5,7 @@ name: Multi-tenant state isolation
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - system-design/multi-tenancy
   - system-design/tenant-isolation
@@ -21,96 +21,125 @@ sources:
 ---
 
 ## TL;DR
-An agent runtime scatters tenant data across far more places than a CRUD app does: step logs, long-term
-memory, retrieval indexes, uploaded files, code sandboxes, semantic and tool caches, traces and queues.
-Cross-tenant leakage happens in whichever of those a filter was forgotten. Isolation therefore has to be
-structural: tenant identity derived from authentication and carried in the run context, never from model
-output, and enforced at the storage layer of every surface rather than remembered in application code.
+Agent runtimes spread tenant data across step logs, memory, indexes, files, sandboxes, caches, traces and
+queues, and leaks happen wherever a filter was forgotten. Take tenant identity from authentication, never
+the model, and enforce it at each store's storage layer.
 
 ## Why it exists
-In a conventional SaaS backend, multi-tenancy is mostly a database problem: one `tenant_id` column, one
-place to forget the `WHERE`. An agent runtime multiplies the surfaces. A run's conversation and tool results
-sit in a step store. Long-term memory sits in a vector index where "similar" is computed across everything
-unless you say otherwise. Uploaded documents sit in object storage. Generated code runs in a sandbox with a
-filesystem. A semantic cache maps "questions like this" to "answers like that". Traces carry full prompts
-into an observability tool with its own access model. Each of these is a different technology with a
-different notion of scoping, and the leak will be in the one nobody listed.
-
-The failure modes are also stranger than a wrong row. Vector similarity does not care about tenants: a
-question from tenant B about "our refund policy" is nearest to tenant A's refund policy if A's documents are
-in the same index without a filter. A semantic cache keyed only on the normalised question returns tenant
-A's cached answer to tenant B. A warm sandbox reused for speed still has A's files in `/tmp`. Memory
-written by an agent "for this user" is recalled for a different user if the key omits the user.
-
-The naive alternative, "every query filters by tenant, we'll be careful", fails because care does not scale
-across N stores and M engineers, and because the most dangerous tenant identifier in an agent system is
-the one the model produces. If a tool accepts `tenant_id` as an argument, a prompt-injected or hallucinated
-call can supply someone else's. The design has to make the wrong thing impossible, not merely discouraged.
+- **A CRUD app has one place to forget the `WHERE`.** Multi-tenancy there is mostly one `tenant_id` column.
+  An agent runtime multiplies the surfaces, each a different technology with its own notion of scoping, and
+  the leak will be in the one nobody listed.
+- **The surfaces are everywhere.** Step store for conversation and tool results; a vector index for memory
+  where "similar" spans everything unless told otherwise; object storage for uploads; sandboxes with
+  filesystems; a semantic cache; traces carrying full prompts into an observability tool with its own
+  access model.
+- **The failures are stranger than a wrong row.** Vector similarity ignores tenants, so B's "our refund
+  policy" query is nearest to A's refund policy in a shared, unfiltered index. A semantic cache keyed only on
+  the question returns A's answer to B. A warm sandbox keeps A's files in `/tmp`. Memory keyed without the
+  user is recalled for a different user.
+- **"Every query filters by tenant, we'll be careful" fails.** Care does not scale across N stores and M
+  engineers, and the most dangerous tenant identifier is the one the model produces: a tool that accepts
+  `tenant_id` as an argument lets an injected or hallucinated call supply someone else's.
+- **So the design makes the wrong thing impossible,** not merely discouraged.
 
 ## How it works
 ### Enumerate the surfaces
-Isolation starts with an inventory. For an agent runtime the list is usually: (1) run and step store,
-(2) long-term memory, (3) retrieval indexes, (4) file and object storage, (5) execution sandboxes,
-(6) caches: semantic cache, tool-result cache, embedding cache, (7) logs and traces, (8) queues and event
-streams, (9) evaluation datasets built from production traffic, and (10) in-process state: a framework agent
-object with built-in memory, or a module-level conversation buffer, created once at import and reused by
-every request the process serves. Every surface gets an owner and an
-isolation mechanism, and the list is reviewed whenever a new store is added. This step is unglamorous and
-is where most real incidents would have been prevented.
+Isolation starts with an inventory. For an agent runtime it is usually:
+
+1. Run and step store
+2. Long-term memory
+3. Retrieval indexes
+4. File and object storage
+5. Execution sandboxes
+6. Caches: semantic cache, tool-result cache, embedding cache
+7. Logs and traces
+8. Queues and event streams
+9. Evaluation datasets built from production traffic
+10. In-process state: a framework agent object with built-in memory, or a module-level conversation
+    buffer, created once at import and reused by every request the process serves
+
+- **Every surface gets an owner and an isolation mechanism,** and the list is reviewed whenever a new store
+  is added.
+- **This step is unglamorous** and is where most real incidents would have been prevented.
 
 ### Tenant identity comes from the edge, never from the model
-The tenant (and user) is established once, at authentication, and placed in the run context the runtime
-attaches to every call. Tools never accept tenant or user identifiers as model-supplied arguments; adapters
-read them from the context. This is the single most important rule in the pattern, because it removes the
-model, and therefore prompt injection, from the trust path entirely.
+- **Established once, at authentication.** Tenant and user go into the run context the runtime attaches to
+  every call.
+- **Tools never accept tenant or user identifiers as model-supplied arguments;** adapters read them from the
+  context.
+- **This is the single most important rule in the pattern,** because it removes the model, and therefore
+  prompt injection, from the trust path entirely.
 
 ### Enforce at the storage layer
-Application-level filters are a convention; storage-level enforcement is a guarantee. The mechanisms differ
-per surface:
+Application-level filters are a convention; storage-level enforcement is a guarantee. Per surface:
 
-- **Relational stores**: PostgreSQL row-level security with a policy on `tenant_id` compared to a
-  per-transaction setting (`set_config('app.tenant_id', ..., true)` so the value is transaction-local and
-  cannot leak through a pooled connection). Use `FORCE ROW LEVEL SECURITY` so the table owner is not
-  exempt, and connect as a role without `BYPASSRLS`.
-- **Vector indexes**: a mandatory tenant filter or a tenant partition. Most engines support payload
-  filtering during search (Qdrant filters, pgvector with RLS) or per-tenant namespaces (Pinecone
-  namespaces); the filter must be applied *inside* the search, not after top-k, or small tenants get
-  empty results while large ones dominate the candidates. In-search filtering needs a payload index on the
-  tenant field, and engines handle very selective filters differently (some switch to exact search), so
-  measure recall for your smallest tenants, not your average one.
-- **Object storage**: per-tenant prefixes with identity policies that condition access on the prefix, and
-  credentials scoped per request, not a bucket-wide key held by the runtime.
-- **Sandboxes**: ephemeral per run (or at least per tenant), destroyed afterwards, with no shared volumes;
-  warm pools are acceptable only if a pooled sandbox is never handed to a second tenant.
-- **Caches**: tenant (and, for personal data, user) is part of the key, never inferred from the value.
-  A semantic cache is a retrieval index and gets the same filter rules. Self-hosted inference with prefix
-  caching shares KV blocks between requests whose prompts start identically; that returns no foreign
-  content, but cache hits are faster than misses, which is a potential timing side channel, so deployments
-  with strict isolation requirements partition or salt the prefix cache per tenant.
-- **Logs and traces**: tenant as a first-class attribute, access to prompt content restricted by tenant
-  in the observability tool, or prompt bodies redacted before export.
+| Surface | Mechanism | Detail that matters |
+|---|---|---|
+| **Relational stores** | PostgreSQL row-level security, policy on `tenant_id` vs a per-transaction setting | `set_config('app.tenant_id', ..., true)` is transaction-local and cannot leak through a pooled connection; use `FORCE ROW LEVEL SECURITY` so the owner is not exempt; connect as a role without `BYPASSRLS` |
+| **Vector indexes** | mandatory tenant filter or tenant partition | payload filtering during search (Qdrant filters, pgvector with RLS) or per-tenant namespaces (Pinecone namespaces); filter *inside* the search, not after top-k |
+| **Object storage** | per-tenant prefixes, identity policies conditioned on the prefix | credentials scoped per request, not a bucket-wide key held by the runtime |
+| **Sandboxes** | ephemeral per run (or at least per tenant), destroyed afterwards | no shared volumes; warm pools only if a pooled sandbox is never handed to a second tenant |
+| **Caches** | tenant (and, for personal data, user) in the key | never inferred from the value; a semantic cache is a retrieval index and gets the same filter rules |
+| **Logs and traces** | tenant as a first-class attribute | restrict prompt content by tenant in the observability tool, or redact prompt bodies before export |
+
+- **Why filter inside the vector search:** after top-k, small tenants get empty results while large ones
+  dominate the candidates.
+- **In-search filtering needs a payload index** on the tenant field, and engines handle very selective
+  filters differently (some switch to exact search), so measure recall for your smallest tenants, not your
+  average one.
+- **Prefix caching is a side channel, not a leak.** Self-hosted inference shares KV blocks between requests
+  whose prompts start identically. No foreign content is returned, but hits are faster than misses, a
+  potential timing side channel, so strict-isolation deployments partition or salt the prefix cache per
+  tenant.
 
 ### Choose the isolation model per tier of tenant
-Shared infrastructure with enforced scoping, a schema or namespace per tenant, a database or index per
-tenant, and a fully separate deployment (a "cell") form a ladder of rising cost and rising assurance. Most
-platforms run the shared model by default and offer the dedicated options to regulated tenants or those with
-data-residency requirements. Deciding this per surface is normal: shared Postgres with RLS, but a dedicated
-vector collection per tenant because the index's filtering is weaker than the database's.
+A ladder of rising cost and rising assurance:
+
+| Model | Assurance | Typical use |
+|---|---|---|
+| Shared infrastructure with enforced scoping | lowest cost, policy bug has wide blast radius | default for most tenants |
+| Schema or namespace per tenant | harder boundary | mid-tier |
+| Database or index per tenant | hard boundary | regulated tenants |
+| Separate deployment (a "cell") | full isolation | regulated tenants or data-residency requirements |
+
+- **Decide per surface; that is normal.** For example: shared Postgres with RLS, but a dedicated vector
+  collection per tenant because the index's filtering is weaker than the database's.
 
 ### Deletion and offboarding
-Tenant data must be deletable from every surface in the inventory, including vector entries, cached
-answers, traces and evaluation sets derived from production. A deletion that clears the database and leaves
-the memory index intact is a compliance incident waiting for a subject-access request.
+- **Deletable from every surface in the inventory,** including vector entries, cached answers, traces and
+  evaluation sets derived from production.
+- **Partial deletion is an incident in waiting.** Clearing the database but leaving the memory index intact
+  is a compliance incident waiting for a subject-access request.
 
 ### Prove it continuously
-Isolation is tested, not assumed. Seed a secret marker into tenant A through the normal product path, run
-tenant B's agent against queries designed to retrieve it, and assert the marker never appears in output,
-memory, cache or traces. Run this in CI against every store, and again whenever a new tool or store is added.
+Isolation is tested, not assumed:
+1. Seed a secret marker into tenant A through the normal product path.
+2. Run tenant B's agent against queries designed to retrieve it.
+3. Assert the marker never appears in output, memory, cache or traces.
+4. Run this in CI against every store, and again whenever a new tool or store is added.
 
-## Example
-Three surfaces, one rule: tenant comes from the authenticated context and is enforced where the data lives.
-Row-level security on the step store with a transaction-local setting, a mandatory tenant filter inside the
-vector search, a tenant-prefixed cache key, and the canary test that proves the whole path.
+## Diagram
+Identity enters once, at authentication, and every store enforces it itself; the model never supplies a
+tenant id.
+
+```mermaid
+flowchart TD
+    U["Authenticated request"] --> C["Run context: tenant, user"]
+    M["Model tool call args"] -.->|"no identity fields"| A["Tool adapters"]
+    C --> A
+    A --> PG[("Postgres with RLS")]
+    A --> V[("Vector index, filter in search")]
+    A --> O[("Object store, tenant prefix")]
+    A --> K[("Cache, tenant in key")]
+    A --> S["Ephemeral sandbox per run"]
+    T["Canary test in CI"] -.->|"marker from A never seen by B"| A
+```
+
+## Examples
+### Three surfaces, one rule, plus the canary test
+Tenant comes from the authenticated context and is enforced where the data lives: row-level security on the
+step store with a transaction-local setting, a mandatory tenant filter inside the vector search, a
+tenant-prefixed cache key, and the canary test that proves the whole path.
 
 ```python
 import hashlib
@@ -151,57 +180,109 @@ def test_no_cross_tenant_leak(run_agent, ctx_a, ctx_b, stores):
         assert not store.contains(ctx_b.tenant_id, marker)
 ```
 
-Why the vector filter placement matters, with numbers: a shared memory collection holds 1,000,000 vectors,
-of which tenant B owns 2,000 (0.2%). A post-filter design asks for the top 100 neighbours and then drops
-foreign rows. If B's vectors were spread like everyone else's, about 0.2 of those 100 would be B's, so the
-typical result is empty and B's agent "has no memory". The usual fix is to raise the candidate count, which
-makes every query slower and still fails for the smallest tenants. With the filter inside the search, the
-engine returns B's 8 nearest vectors directly, and no foreign payload is ever returned to application code
-that might log or cache it. The canary test then checks the property end to end, through the same product
-path a real user would take, across every store in the inventory.
+### Worked numbers: why the vector filter placement matters
+A shared memory collection holds 1,000,000 vectors, of which tenant B owns 2,000 (0.2%).
+
+| Design | What happens | Result for B |
+|---|---|---|
+| Post-filter | ask for the top 100 neighbours, then drop foreign rows; if B's vectors are spread like everyone else's, about 0.2 of those 100 are B's | typically empty: B's agent "has no memory" |
+| Post-filter, bigger candidate count | the usual fix | every query slower, still fails for the smallest tenants |
+| Filter inside the search | the engine returns B's 8 nearest vectors directly | correct recall, and no foreign payload ever reaches application code that might log or cache it |
+
+The canary test then checks the property end to end, through the same product path a real user would take,
+across every store in the inventory.
+
+### Runnable: post-filter vs in-search filter
+Pure Python, about a second. A scaled-down collection of 100,000 random vectors where B owns the same 0.2%.
+
+```python
+import heapq, random
+
+random.seed(7)
+N, DIM, K = 100_000, 8, 100            # scaled-down collection; tenant B owns 0.2%
+vecs = [[random.gauss(0, 1) for _ in range(DIM)] for _ in range(N)]
+tenant = ["B" if i % 500 == 0 else "A" for i in range(N)]   # 200 of 100,000 rows are B's
+q = [random.gauss(0, 1) for _ in range(DIM)]
+
+def dist(v):
+    return sum((a - b) ** 2 for a, b in zip(v, q))
+
+# post-filter: ANN over everything, then drop foreign rows
+top = heapq.nsmallest(K, range(N), key=lambda i: dist(vecs[i]))
+post = [i for i in top if tenant[i] == "B"]
+
+# in-search filter: only B's rows are candidates
+inside = heapq.nsmallest(8, (i for i in range(N) if tenant[i] == "B"), key=lambda i: dist(vecs[i]))
+
+print(f"post-filter kept {len(post)} of top {K}")   # typically 0 (expected value 0.2)
+print(f"in-search filter returned {len(inside)}")   # 8
+```
+
+## Production patterns
+- **RLS behind a transaction pooler** — when Postgres sits behind a pooler such as PgBouncer in transaction
+  mode. Open a transaction per request, call `set_config('app.tenant_id', $1, true)` first, enable and force
+  RLS on every tenant table, and connect as a non-owner role. Monitor queries run with the setting unset
+  (they return zero rows).
+- **Tenant payload index in the vector store** — when memory lives in a shared collection. Create a keyword
+  payload index on `tenant_id` (Qdrant can mark it as the tenant field so storage is co-located per tenant)
+  and route every search through one helper that requires the context. Monitor recall for the smallest
+  tenants.
+- **Prefix-scoped object credentials** — for uploads and generated files. Issue short-lived credentials per
+  request whose policy only allows the tenant's prefix, for example AWS STS with a session policy or
+  session tags referenced by policy variables. Monitor access-denied errors by tenant and any bucket-wide
+  keys in use.
+- **Per-run sandboxes with tenant-keyed warm pools** — when code execution latency matters. Destroy the
+  sandbox at run end; if you pre-warm, key the pool by tenant and never return a used sandbox to it. Monitor
+  sandbox reuse count and cold-start time.
+- **Inventory-driven offboarding job** — when a tenant leaves or a deletion request arrives. Drive deletion
+  from the surface inventory (rows, vectors, objects, cache keys by tenant prefix, traces, eval sets), then
+  re-run the canary search to verify. Monitor per-surface deletion completeness in drills.
 
 ## Trade-offs
-- Shared stores with enforced scoping are cheap and operationally simple, but a single policy bug has
-  platform-wide blast radius; dedicated databases or cells per tenant invert that, and become mandatory
-  when regulation or residency says so.
-- Per-run ephemeral sandboxes give the cleanest isolation at the cost of seconds of cold start per run;
-  per-tenant warm pools recover the latency but require strict pool affinity and lifecycle discipline.
-- Tenant-scoped caches lose the hit-rate benefit of shared knowledge (the same public question asked by
-  many tenants is computed many times); a separate, explicitly curated global cache for non-tenant content
-  gets some of it back safely.
-- Namespaces or collections per tenant in a vector store give hard boundaries but hit engine limits and
-  waste resources with thousands of tiny tenants; filtered shared collections scale better and lean on
-  filter correctness.
-- Storage-level enforcement such as RLS adds query overhead and makes some admin and analytics access
-  awkward; the alternative, trusting every code path, has no overhead right up to the breach.
+- **Shared stores vs dedicated ones.** Shared stores with enforced scoping are cheap and operationally simple,
+  but a single policy bug has platform-wide blast radius. Dedicated databases or cells per tenant invert
+  that, and become mandatory when regulation or residency says so.
+- **Per-run ephemeral sandboxes vs warm pools.** Ephemeral gives the cleanest isolation at the cost of
+  seconds of cold start per run. Per-tenant warm pools recover the latency but require strict pool affinity
+  and lifecycle discipline.
+- **Tenant-scoped caches vs hit rate.** They lose the benefit of shared knowledge (the same public question
+  asked by many tenants is computed many times). A separate, explicitly curated global cache for non-tenant
+  content gets some of it back safely.
+- **Namespaces per tenant vs filtered shared collections.** Per-tenant namespaces or collections give hard
+  boundaries but hit engine limits and waste resources with thousands of tiny tenants. Filtered shared
+  collections scale better and lean on filter correctness.
+- **Storage-level enforcement vs trusting code paths.** RLS adds query overhead and makes some admin and
+  analytics access awkward. Trusting every code path has no overhead right up to the breach.
 
 ## Pitfalls
-- A tool whose schema includes `tenant_id` or `user_id` as model-fillable arguments; the symptom is an
-  injection test that reads another tenant's records by simply asking.
-- Using `SET` instead of a transaction-local `set_config` with a connection pool; the symptom is
-  intermittent wrong-tenant rows that disappear when you reproduce on a single connection.
-- Filtering vector results by tenant after retrieving top-k; the symptom is small tenants getting empty
-  or thin recall while the index "works fine" in tests with one tenant.
-- Forgetting non-obvious surfaces: a semantic cache without tenant in the key, traces visible to all
-  support staff, or an eval set exported from production; the symptom is a leak that bypasses every
-  database control you audited.
-- Instantiating an agent or memory object once at module import and serving every request with it; the
-  symptom is a user seeing a fragment of someone else's conversation under concurrent load, never in tests.
-- Reusing a warm sandbox across tenants; the symptom is generated code that lists files it should never
-  have seen.
-- Offboarding that deletes rows but not vectors, objects or cached answers; the symptom is a departed
-  tenant's content surfacing in another tenant's recall months later.
+- **A tool schema with `tenant_id` or `user_id` as model-fillable arguments.** Symptom: an injection test
+  reads another tenant's records by simply asking. Fix: read identity from the run context only.
+- **Using `SET` instead of a transaction-local `set_config` with a connection pool.** Symptom: intermittent
+  wrong-tenant rows that disappear when you reproduce on a single connection. Fix: set it per transaction.
+- **Filtering vector results by tenant after retrieving top-k.** Symptom: small tenants get empty or thin
+  recall while the index "works fine" in tests with one tenant. Fix: filter inside the search.
+- **Forgetting non-obvious surfaces.** A semantic cache without tenant in the key, traces visible to all
+  support staff, or an eval set exported from production. Symptom: a leak that bypasses every database
+  control you audited. Fix: the inventory.
+- **Instantiating an agent or memory object once at module import and serving every request with it.**
+  Symptom: a user sees a fragment of someone else's conversation under concurrent load, never in tests. Fix:
+  construct per request or per run.
+- **Reusing a warm sandbox across tenants.** Symptom: generated code lists files it should never have seen.
+  Fix: per-run or tenant-affine sandboxes.
+- **Offboarding that deletes rows but not vectors, objects or cached answers.** Symptom: a departed tenant's
+  content surfaces in another tenant's recall months later. Fix: delete from every inventoried surface.
 
 ## When to use
-Any runtime serving more than one organisation needs the full pattern; even single-tenant deployments need
-the user-level version of it for memory and files. Start by writing the surface inventory and assigning an
-enforcement mechanism per surface; that document is the design. Measure the canary test pass rate on every
-build, the fraction of stores with storage-level (not application-level) scoping, and deletion completeness
-across surfaces during offboarding drills. In day-to-day work this appears as a context object threaded
-through every adapter, RLS migrations, mandatory filter helpers that will not compile without a tenant, and
-a recurring review when a new store is introduced. Interviewers will ask where tenant identity comes from,
-how you isolate a vector index, and what the leak test looks like; the strong answer lists the surfaces
-nobody remembers.
+- **Use the full pattern** in any runtime serving more than one organisation; even single-tenant deployments
+  need the user-level version for memory and files.
+- **Start with the surface inventory** and an enforcement mechanism per surface; that document is the
+  design.
+- **Measure:** canary test pass rate on every build, the fraction of stores with storage-level (not
+  application-level) scoping, and deletion completeness across surfaces during offboarding drills.
+- **Day to day:** a context object threaded through every adapter, RLS migrations, mandatory filter helpers
+  that will not compile without a tenant, and a recurring review when a new store is introduced.
+- **Interviews:** expect "where does tenant identity come from", "how do you isolate a vector index" and
+  "what does the leak test look like"; the strong answer lists the surfaces nobody remembers.
 
 ## Role lens
 - **Engineer:** Threads the authenticated context through every store adapter, writes the RLS migrations
@@ -223,6 +304,38 @@ helper that requires the authenticated context and builds the filter inside the 
 include the tenant, tool schemas with no identity arguments, and ideally storage-level enforcement (RLS on
 pgvector, or a collection per tenant for memory). Then I would add the canary test to CI so the regression
 is caught before a customer reports it, and run the offboarding deletion drill across every surface.
+
+## Interview questions
+### Why is multi-tenant isolation harder in an agent runtime than in a typical SaaS backend?
+- **More surfaces:** step logs, memory, retrieval indexes, files, sandboxes, several caches, traces, queues,
+  eval sets and in-process state, each with its own scoping model.
+- **Stranger failures:** similarity search and semantic caches ignore tenants unless told, and the model
+  itself can supply a wrong tenant id if a tool accepts one as an argument.
+
+### Users intermittently see another tenant's rows, but you cannot reproduce on one connection. What is going on?
+- **Likely cause:** the tenant is set with a session-level `SET` on pooled connections, so the next request
+  that borrows the connection inherits the previous tenant's value.
+- **Fix:** set it with transaction-local `set_config(..., true)` inside a transaction per request, force RLS
+  so the owner is not exempt, and make an unset setting return zero rows.
+
+### When would you give a tenant a dedicated vector collection or cell instead of a shared filtered one?
+- **Dedicated** when regulation or data residency demands it, or when the vector engine's filtering is
+  weaker than your database's and a policy bug would have platform-wide blast radius.
+- **Shared and filtered** when you have thousands of tiny tenants, because per-tenant collections hit engine
+  limits and waste resources.
+
+### How would you prove to a customer's security team that their data cannot leak to another tenant?
+- **Canary test:** seed a unique marker through tenant A's normal product path, query for it as tenant B,
+  and assert it never appears in output, memory, cache, traces or the step log.
+- **Run it continuously** in CI against every store and whenever a tool or store is added, and run it in the
+  customer's environment before go-live.
+
+### A small tenant says the agent has no memory, while large tenants are fine. What do you check?
+- **Filter placement:** if the tenant filter runs after top-k, a tenant owning 0.2% of a shared collection
+  expects 0.2 of 100 candidates, so results are usually empty.
+- **Fix and verify:** move the filter inside the search with a payload index on the tenant field, then
+  measure recall for the smallest tenants specifically, since engines treat very selective filters
+  differently.
 
 ## Quiz
 ### Q: Why must the tenant identifier used for scoping come from the authenticated run context rather than from a tool argument?

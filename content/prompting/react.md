@@ -5,7 +5,7 @@ name: ReAct (reason + act)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - prompting/chain-of-thought
   - prompting/function-tool-calling
@@ -23,87 +23,116 @@ sources:
 ---
 
 ## TL;DR
-ReAct interleaves reasoning and acting in one loop: the model writes a thought, picks a tool call, the
-harness runs it and appends the observation, and the model reasons again over fresh evidence. It exists
-because chain-of-thought alone cannot look anything up, so its errors compound, while action-only agents
-pick tools without a stated reason and cannot revise a plan. Native tool calling is ReAct with the
-parsing moved into the API; the loop, budget and safety checks remain yours.
+ReAct interleaves reasoning and acting in one loop: thought, tool call, observation, repeat, so each step
+reasons over fresh evidence. Native tool calling is ReAct with the parsing moved into the API; the loop,
+budget and safety checks remain yours.
 
 ## Why it exists
-Chain-of-thought gives a model more computation but no new information. Every fact in the chain comes
-from the weights, so a multi-hop question ("who directed the film that won Best Picture the year this
-person was born?") fails if any hop is misremembered, and the chain carries the error forward with full
-confidence. The opposite design, an agent that only acts (look up, click, call) and feeds each result
-straight into the next action, has the information but not the deliberation: it cannot say why it chose
-a query, cannot notice that a result contradicts its goal and cannot re-plan when a step fails.
-
-ReAct's claim was that the two failure modes are complementary. Reasoning tells the agent what to do next
-and how to use what it just saw; acting grounds the reasoning in retrieved or computed facts.
-Interleaving them, thought then action then observation, repeated, was tested on multi-hop question
-answering (HotpotQA), fact verification (FEVER) and interactive tasks (ALFWorld, WebShop) in the original
-study. It beat action-only prompting throughout and beat chain-of-thought on fact verification, with large
-gains on the interactive tasks. The result was not uniform: on HotpotQA plain ReAct trailed
-chain-of-thought slightly (its error analysis blamed uninformative searches and the agent repeating
-itself in loops), and the best numbers came from combining the two, falling back from one to the
-other when it got stuck. The lesson is complementarity, not that interleaving always wins.
-
-Two naive alternatives still look tempting. Single-shot retrieval followed by CoT (retrieve once, then
-reason) fails on multi-hop questions where the second query depends on the first answer. Planning
-everything up front and then executing fails because observations change the plan: a search returns
-nothing, a tool errors, a page says the opposite of what was assumed. The loop has to be able to think
-between actions.
+- **Chain-of-thought adds computation, not information.** Every fact in the chain comes from the weights,
+  so a multi-hop question ("who directed the film that won Best Picture the year this person was born?")
+  fails if any hop is misremembered, and the chain carries the error forward with full confidence.
+- **Action-only agents lack deliberation.** An agent that only acts (look up, click, call) and feeds each
+  result into the next action cannot say why it chose a query, notice a result contradicting its goal, or
+  re-plan when a step fails.
+- **The failure modes are complementary.** Reasoning says what to do next and how to use what was just
+  seen; acting grounds the reasoning in retrieved or computed facts. The original study tested
+  interleaving on HotpotQA, FEVER, ALFWorld and WebShop (see the results table below).
+- **Retrieve-once-then-reason fails multi-hop.** The second query depends on the first answer.
+- **Plan-everything-up-front fails too.** Observations change the plan: a search returns nothing, a tool
+  errors, a page says the opposite of what was assumed. The loop must think between actions.
 
 ## How it works
 ### The loop
-At step t the model sees the task plus the full trajectory so far: thought₁, action₁, observation₁, …,
-observation_{t-1}. It emits thought_t (what is known, what is missing, what to do next), then action_t (a
-tool name and arguments). The harness executes the tool, appends observation_t and calls the model again.
-It stops when the model emits a final answer instead of an action, or when the harness decides to stop
-it. The trajectory is the agent's working memory, and it grows with every observation, which is why
-context management matters more here than in any single-call prompt.
+1. **The model sees the task plus the full trajectory:** thought₁, action₁, observation₁, …,
+   observation_{t-1}.
+2. **It emits thought_t** (what is known, what is missing, what to do next), **then action_t** (a tool name
+   and arguments).
+3. **The harness executes the tool**, appends observation_t and calls the model again.
+4. **It stops** when the model emits a final answer instead of an action, or when the harness decides to
+   stop it.
+- **The trajectory is working memory.** It grows with every observation, which is why context management
+  matters more here than in any single-call prompt.
+
+### What the original study found
+| Benchmark | Task | Result |
+|---|---|---|
+| HotpotQA | Multi-hop question answering | Plain ReAct trailed chain-of-thought slightly; error analysis blamed uninformative searches and repetitive loops |
+| FEVER | Fact verification | Beat chain-of-thought |
+| ALFWorld, WebShop | Interactive tasks | Large gains |
+| All | | Beat action-only prompting throughout |
+
+- **Best numbers came from combining the two**, falling back from one to the other when it got stuck.
+- **The lesson is complementarity**, not that interleaving always wins.
 
 ### Original form: text and a parser
-The paper used few-shot trajectories and a plain-text protocol: `Thought: …`, then `Action:
-Search[query]`, with a stop sequence at `Observation:` so that the harness, not the model, supplies the
-result. The harness regex-parsed the action line. This works with any model that can complete text, but
-it is brittle: malformed action lines, calls to tools that do not exist and, if the stop sequence is
-missing, the model writing its own imagined `Observation:` and reasoning from fiction.
+- **Protocol.** Few-shot trajectories and plain text: `Thought: …`, then an action line such as
+  `Action: Search[query]`, with a stop sequence at `Observation:` so the harness, not the model, supplies
+  the result.
+- **Parsing.** The harness regex-parsed the action line. It works with any model that can complete text.
+- **Brittle.** Malformed action lines, calls to tools that do not exist and, without the stop sequence, the
+  model writing its own imagined `Observation:` and reasoning from fiction.
 
 ### Modern form: native tool calling
-Tool-use APIs let you declare tools with JSON schemas; the model returns structured tool-call blocks with
-validated arguments, its reasoning appears as text (or as hidden thinking on reasoning models), and the
-harness returns results in a dedicated tool-result message. The pattern is unchanged; what moved is the
-parsing. The loop in the harness must still do what the paper's harness did, and several things it did
-not:
-- Stop conditions and a step budget, because the model can loop forever on a task it cannot finish.
-- Error-as-observation: a tool exception is returned to the model as a result flagged as an error, so it
-  can retry differently, instead of being swallowed.
-- Observation size control: truncate or summarise large outputs before appending them, or the context
-  fills with one search result.
-- Trajectory logging, so a failed run can be replayed and read.
-- A trust boundary: observations are untrusted data. A web page or document can contain text addressed
-  to the agent, so the system prompt should say tool results are never instructions, and actions with
-  consequences need permissions and approval gates outside the model.
+- **Declared tools.** Tool-use APIs take tools with JSON schemas; the model returns structured tool-call
+  blocks with validated arguments.
+- **Reasoning** appears as text (or as hidden thinking on reasoning models); results go back in a dedicated
+  tool-result message.
+- **Only the parsing moved.** The harness must still do what the paper's harness did, and more:
+
+| Harness duty | Because |
+|---|---|
+| **Stop conditions and a step budget** | The model can loop forever on a task it cannot finish |
+| **Error-as-observation** | A tool exception returned as an error-flagged result lets the model retry differently instead of the error being swallowed |
+| **Observation size control** | Truncate or summarise large outputs, or the context fills with one search result |
+| **Trajectory logging** | A failed run can be replayed and read |
+| **A trust boundary** | Observations are untrusted data: a page or document can contain text addressed to the agent |
+
+- **Enforce the trust boundary in two places.** The system prompt says tool results are never
+  instructions, and actions with consequences need permissions and approval gates outside the model.
 
 ### Why interleaving pays
-Grounding: each thought is written after the latest evidence, so a wrong assumption is corrected one step
-later rather than at the end. Dynamic decomposition: the second query can use the first answer. Error
-recovery: a failed action is just another observation. The cost is that every step is a full model call
-over a growing context.
+- **Grounding:** each thought is written after the latest evidence, so a wrong assumption is corrected one
+  step later rather than at the end.
+- **Dynamic decomposition:** the second query can use the first answer.
+- **Error recovery:** a failed action is just another observation.
+- **The cost:** every step is a full model call over a growing context.
 
 ### Relatives
-Reflexion adds a self-critique after a failed episode and retries with the critique in context.
-Plan-and-execute separates a planner call from executor calls. All of them are ReAct loops with extra
-structure, covered in the agents module; ReAct is the one to understand first because every tool-calling
-agent you will read is a variation on it.
+- **Reflexion** adds a self-critique after a failed episode and retries with the critique in context.
+- **Plan-and-execute** separates a planner call from executor calls.
+- **All are ReAct loops with extra structure**, covered in the agents module. ReAct comes first because
+  every tool-calling agent you will read is a variation on it.
 
-## Example
-A minimal ReAct harness over native tool calling with two tools. Notice what the harness owns: the
-assistant turn (thought plus tool calls) is appended verbatim so the trajectory stays in context (on
-reasoning models the thought may be a hidden thinking block, which the API expects back unchanged), every
-tool result goes back in one user message, exceptions become error-flagged observations, an identical
-repeated call is refused as an observation rather than re-run, observations are truncated, and a step
-budget ends the loop gracefully.
+## Diagram
+One ReAct run: the harness, not the model, executes tools, checks budgets and repeats, and decides what
+goes back into the growing trajectory.
+
+```mermaid
+sequenceDiagram
+    participant H as Harness
+    participant M as Model
+    participant T as Tool
+    H->>M: Task plus trajectory so far
+    M-->>H: Thought and tool call
+    Note over H: budget, repeat check, permissions
+    H->>T: Execute call
+    T-->>H: Result or exception
+    Note over H: truncate, flag errors, treat as data
+    H->>M: Trajectory plus observation
+    M-->>H: Final answer, no tool call
+    Note over H: log trajectory, stop
+```
+
+## Examples
+### A minimal ReAct harness over native tool calling
+Two tools; notice what the harness owns:
+- **The assistant turn is appended verbatim** (thought plus tool calls), so the trajectory stays in
+  context. On reasoning models the thought may be a hidden thinking block, which the API expects back
+  unchanged.
+- **Every tool result goes back in one user message.**
+- **Exceptions become error-flagged observations.**
+- **An identical repeated call is refused as an observation** rather than re-run.
+- **Observations are truncated, and a step budget ends the loop gracefully.**
 
 ```python
 import anthropic, json
@@ -151,51 +180,118 @@ def run(question, max_steps=8):
 print(run("A customer returns a $1,200 item after 20 days. What refund do they get?"))
 ```
 
-A typical trajectory has three model calls. Call 1: the thought is "I need the refund policy", the action
-`search_docs("refund policy")`, and the observation is the policy text. Call 2: the thought now uses
-that evidence ("20 days is inside 30; $1,200 is over $500, so a 10% fee applies"), so the action is
-`calculator("1200 * 0.10")` and the observation is `120.0`. Call 3: no action, the answer "$1,080". The
-second action could not have been planned before the first observation, because the fee rule was not
-known until the search returned; that dependency is what plain chain-of-thought cannot satisfy. Each
-call re-sends the whole trajectory, so input tokens grow with every step, which is why observations are
-truncated and why the step budget doubles as a cost ceiling.
+A typical trajectory has three model calls:
+
+| Call | Thought | Action | Observation |
+|---|---|---|---|
+| 1 | "I need the refund policy" | `search_docs("refund policy")` | The policy text |
+| 2 | "20 days is inside 30; $1,200 is over $500, so a 10% fee applies" | `calculator("1200 * 0.10")` | `120.0` |
+| 3 | Evidence is sufficient | None | Answer: "$1,080" |
+
+- **The second action could not have been planned** before the first observation, because the fee rule was
+  not known until the search returned; that dependency is what plain chain-of-thought cannot satisfy.
+- **Each call re-sends the whole trajectory**, so input tokens grow every step. That is why observations
+  are truncated and why the step budget doubles as a cost ceiling.
+
+### The original text protocol, parsed safely
+For models without tool support. Pure Python: the harness calls the model with a stop sequence at
+`Observation:`, then parses the action line and rejects anything malformed.
+
+```python
+import re
+
+ACTION = re.compile(r"^Action:\s*(\w+)\[(.*)\]\s*$", re.M)
+TOOLS = {"Search", "Finish"}
+
+def parse_step(completion: str):
+    """Parse one model completion produced with stop=["Observation:"]."""
+    if "Observation:" in completion:              # stop sequence missing: model invented a result
+        raise ValueError("model wrote its own Observation; check the stop sequence")
+    m = ACTION.search(completion)
+    if not m:
+        raise ValueError("no Action line")        # return this to the model as an error observation
+    tool, arg = m.group(1), m.group(2)
+    if tool not in TOOLS:
+        raise ValueError(f"unknown tool {tool!r}")
+    return tool, arg
+
+print(parse_step("Thought: I need the policy.\nAction: Search[refund policy]\n"))
+for bad in ["Thought: done?\nAction: Lookup[x]\n",
+            "Action: Search[x]\nObservation: refunds are free"]:
+    try:
+        parse_step(bad)
+    except ValueError as e:
+        print("error:", e)
+# ('Search', 'refund policy'), then: unknown tool 'Lookup'; model wrote its own Observation
+```
+
+### Worked scenario: why observations must be truncated
+Illustrative sizes: system prompt plus tool definitions 1,000 tokens, question 50, and each step adds
+about 150 tokens of thought and call plus one observation. Call *n* re-sends everything before it.
+
+| Observation size | Input tokens for call 8 | Total input over 8 calls |
+|---|---|---|
+| Truncated to 1,000 tokens | 1,050 + 7 × 1,150 = 9,100 | 40,600 |
+| Raw, 10,000 tokens | 1,050 + 7 × 10,150 = 72,100 | 292,600 |
+
+- **Total input grows quadratically with steps**, because every call re-reads the whole trajectory.
+- **One untruncated tool turns a cheap run into a 7× more expensive one**, and pushes the original question
+  toward the middle of a long context.
+
+## Production patterns
+- **Hard step and cost budgets.** Cap steps per run (for example `max_steps=8`) and total tokens per run in
+  the harness, and end with a graceful exit that returns a partial answer or escalates. Monitor how runs
+  terminate: answer, budget, or error.
+- **Loop detection on call signatures.** Hash tool name plus sorted arguments and refuse identical repeats
+  as an error observation, as in the harness above. Monitor repeat-refusal counts per tool; spikes point to
+  vague tool descriptions.
+- **Errors and size limits as observations.** Return exceptions with the tool-result error flag, and
+  truncate or summarise outputs to a fixed cap before appending. Monitor tool-call success rate and
+  observation size percentiles.
+- **Approval gates for consequential tools.** Read-only tools run freely; tools that send, pay, delete or
+  write require an allowlist check and, where needed, human approval in code, regardless of what the model
+  says. Log every gated call.
+- **Trajectory logging and replay.** Store every message, tool call, result and stop reason with a run id
+  and prompt version, so failures can be replayed. Review failed trajectories to rewrite tool descriptions
+  and stopping rules.
 
 ## Trade-offs
-- Grounded, adaptive multi-step problem solving against latency and cost that scale with the number of
-  steps, each a full call over a growing context; when the steps are known in advance, a fixed workflow
-  of single calls is cheaper and more predictable.
-- Native tool calling removes most parsing failures against a dependence on the vendor's tool-use format;
-  the text protocol runs on any model and is the fallback for models without tool support.
-- Letting the model choose actions gives flexibility against the need for budgets, permissions and
-  approval gates, because the same freedom lets it call the wrong tool or loop; the more consequential
-  the tools, the more of the loop belongs to code.
-- Keeping full observations in context maximises the evidence available against context growth and
-  degraded attention over long trajectories; truncation and summarisation recover context at the price
-  of detail.
+- **Adaptive vs costly.** Grounded multi-step problem solving comes with latency and cost that scale with
+  the number of steps, each a full call over a growing context; when the steps are known in advance, a
+  fixed workflow of single calls is cheaper and more predictable.
+- **Native tool calling vs portability.** It removes most parsing failures but depends on the vendor's
+  tool-use format; the text protocol runs on any model and is the fallback for models without tool support.
+- **Model-chosen actions vs control.** Flexibility requires budgets, permissions and approval gates,
+  because the same freedom lets the model call the wrong tool or loop; the more consequential the tools,
+  the more of the loop belongs to code.
+- **Full observations vs context growth.** Keeping everything maximises evidence but degrades attention
+  over long trajectories; truncation and summarisation recover context at the price of detail.
 
 ## Pitfalls
-- No step budget or loop detection; the symptom is the same tool call repeated with the same arguments
-  until the context or the bill runs out.
-- Swallowing tool errors instead of returning them as observations; the symptom is the model inventing a
-  result for a call that never succeeded, or retrying identically.
-- Appending raw tool output of unbounded size; the symptom is cost spikes and reasoning quality dropping
-  after the first large observation.
-- Treating observations as instructions; the symptom is an agent that follows directions found inside a
+- **No step budget or loop detection.** Symptom: the same tool call repeated with the same arguments until
+  the context or the bill runs out.
+- **Swallowing tool errors** instead of returning them as observations. Symptom: the model invents a result
+  for a call that never succeeded, or retries identically.
+- **Appending raw tool output of unbounded size.** Symptom: cost spikes and reasoning quality dropping after
+  the first large observation.
+- **Treating observations as instructions.** Symptom: an agent that follows directions found inside a
   retrieved document or web page.
-- Missing the stop sequence in the text protocol; the symptom is `Observation:` lines the harness never
+- **Missing the stop sequence in the text protocol.** Symptom: `Observation:` lines the harness never
   produced, with the model reasoning from them.
-- Vague tool descriptions and loose schemas; the symptom is the wrong tool chosen or arguments in the
-  wrong shape, visible as validation errors in the trajectory log.
-- Not logging trajectories; the symptom is a failure that cannot be reproduced or explained to anyone.
+- **Vague tool descriptions and loose schemas.** Symptom: the wrong tool chosen or arguments in the wrong
+  shape, visible as validation errors in the trajectory log.
+- **Not logging trajectories.** Symptom: a failure that cannot be reproduced or explained to anyone.
 
 ## When to use
-Reach for ReAct when the task needs information or effects outside the model and the sequence of steps
-depends on what each step returns: multi-hop questions, troubleshooting against live systems, data
-gathering across several APIs, tasks with a verify step. Do not use it when the steps are fixed; a
-workflow of ordinary calls is cheaper, faster and easier to test. Measure task completion rate, steps per
-task, tool-call success rate, tokens and cost per completed task, and how runs terminate (answer, budget,
-error). Day to day it is the loop in your agent code, its budget and its logging. In interviews, expect
-to design the loop on a whiteboard and to say what the harness must own that the model cannot.
+- **Use when** the task needs information or effects outside the model and each step depends on what the
+  last returned: multi-hop questions, troubleshooting live systems, gathering data across APIs, tasks with
+  a verify step.
+- **Avoid when** the steps are fixed; a workflow of ordinary calls is cheaper, faster and easier to test.
+- **Measure:** task completion rate, steps per task, tool-call success rate, tokens and cost per completed
+  task, and how runs terminate (answer, budget, error).
+- **Day to day:** it is the loop in your agent code, its budget and its logging.
+- **Interviews:** expect to design the loop on a whiteboard and to say what the harness must own that the
+  model cannot.
 
 ## Role lens
 - **Engineer:** Implements the loop: tool schemas, error-as-observation, step budget, observation
@@ -217,6 +313,36 @@ summarising results. I would then add a hard step budget with a graceful exit th
 partial answer or escalates, and track steps per task and completion rate per prompt version so the fix
 is measured. If production inputs differ from development ones, the tool descriptions may also need
 updating for the queries real users actually ask.
+
+## Interview questions
+### What is ReAct, and why is it better than chain-of-thought alone for multi-hop questions?
+- **Definition:** a loop of thought, tool call and observation, repeated until the model answers.
+- **Why:** chain-of-thought draws every fact from the weights, so one misremembered hop corrupts the
+  chain; ReAct grounds each thought in a fresh observation and lets the next query depend on the last
+  answer.
+
+### Whiteboard the harness for a ReAct agent. What does code own that the model cannot?
+- **Control flow:** step and cost budgets, stop conditions and a graceful exit.
+- **Robustness:** errors returned as flagged observations, identical-call detection, truncated outputs.
+- **Safety:** tool results treated as data, permissions and approval gates for consequential actions.
+- **Observability:** full trajectory logs with run id and prompt version.
+
+### When would you not use a ReAct loop?
+- **When the steps are fixed.** A known sequence (extract, validate, store) is cheaper, faster and easier to
+  test as a workflow of single calls.
+- **When latency or cost per request is tight**, since every step is a full call over a growing context.
+
+### Cost per run doubled after adding a new search tool. How do you find out why?
+- **Read trajectories.** Look for larger observations, more steps per task or repeated calls with trivially
+  different queries.
+- **Do the token math.** Input grows roughly quadratically with steps; raw 10,000-token observations
+  instead of 1,000-token ones take an 8-step run from about 40,600 to 292,600 input tokens.
+- **Fix:** truncate or summarise results, tighten the tool description, and add a stopping instruction.
+
+### How do you defend a ReAct agent against prompt injection through tool results?
+- **Treat observations as untrusted data** and say so in the system prompt, but do not rely on wording.
+- **Limit blast radius in code:** least-privilege tools, allowlists, and human approval for actions that
+  send, pay, delete or write, enforced outside the model.
 
 ## Quiz
 ### Q: What failure of plain chain-of-thought does ReAct address?

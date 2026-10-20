@@ -5,7 +5,7 @@ name: Operational ownership & support boundaries
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - delivery-ownership/incident-severity-and-escalation
   - delivery-ownership/slas
@@ -18,81 +18,110 @@ related:
 ---
 
 ## TL;DR
-Operational ownership means a named team is on the hook for a component in production: it gets paged,
-has the access and authority to change it, and answers for its reliability. Support boundaries write
-down where that ownership stops: which layers you support, which belong to the customer or a vendor, and
-how issues cross the line. AI deployments span many parties, so without explicit boundaries incidents
-bounce between teams while nobody fixes them.
+Operational ownership means a named team is paged for a component, can change it, and answers for it.
+Support boundaries say where that stops and how issues cross. AI deployments span many parties, so
+without them incidents bounce between teams unfixed.
 
 ## Why it exists
-A deployed AI system is a stack of things owned by different people: the model provider's API, your
-platform and serving layer, the application's prompts, retrieval and tools, the customer's identity
-provider, network and data sources, and often a customer-built front end. When an answer is wrong or a
-request fails, the cause can be in any layer, and each owner's first instinct is to show it is not
-theirs. The customer, meanwhile, just sees "your AI is broken."
-
-The naive arrangement is implicit ownership: whoever built it, or whoever is most helpful, fixes it. In
-forward-deployed work this usually means the engineer who did the integration keeps getting called months
-after go-live, for problems in systems they no longer control. It does not scale, it makes that person a
-single point of failure, and it hides the true cost of supporting the deployment. The opposite failure is
-tight "not our problem" boundaries with no path across them, where a ticket about stale answers is closed
-because the stale documents live in the customer's SharePoint.
-
-Explicit ownership and boundaries exist so that every component has someone who will act, every party
-knows what it must do, and issues that span boundaries have a defined route instead of a debate.
+- **A deployed AI system is a stack with many owners:** the model provider's API, your platform and
+  serving layer, the application's prompts, retrieval and tools, the customer's identity provider,
+  network and data sources, and often a customer-built front end.
+- **Every owner's first instinct is "not mine".** When an answer is wrong or a request fails, the cause
+  can be in any layer, and each owner tries to show it is not theirs. The customer just sees "your AI is
+  broken."
+- **Implicit ownership does not scale.** Whoever built it, or whoever is most helpful, fixes it. In
+  forward-deployed work the integration engineer keeps getting called months after go-live, for systems
+  they no longer control. That makes them a single point of failure and hides the true support cost.
+- **Rigid "not our problem" boundaries fail the other way.** With no path across them, a ticket about
+  stale answers is closed because the stale documents live in the customer's SharePoint.
+- **What explicit boundaries buy:** every component has someone who will act, every party knows what it
+  must do, and cross-boundary issues have a defined route instead of a debate.
 
 ## How it works
 ### Owners have pager, access and authority
-A team owns a component only if it carries three things together: it is paged when it fails, it has the
-access needed to diagnose and change it, and it has the authority (and budget) to prioritise fixes.
-Ownership without access produces helpless on-call; access without ownership produces drive-by changes no
-one is accountable for. A service catalog records each component's owner, on-call rotation, runbook,
-dependencies and support hours.
+A team owns a component only if it carries all three together:
+1. **Pager:** it is paged when the component fails.
+2. **Access:** it can diagnose and change it.
+3. **Authority (and budget):** it can prioritise fixes.
+
+- **Missing one breaks it.** Ownership without access produces helpless on-call; access without ownership
+  produces drive-by changes no one is accountable for.
+- **A service catalog records** each component's owner, on-call rotation, runbook, dependencies and
+  support hours.
 
 ### Draw the boundary by layer
-For each layer of the stack, state who is responsible for operating it, who for changing it, and who for
-its inputs. A shared-responsibility table is the usual artefact, sometimes expressed as RACI (Responsible,
-Accountable, Consulted, Informed), *because* "who must act" and "who must be told" are different
-questions and conflating them causes either paralysis or surprise. The rule that makes RACI useful is
-exactly one Accountable per row: several Responsible parties can share the work, but if two parties are
-Accountable, each can wait for the other, and a row with none is unowned by construction.
+- **For each layer, state who operates it, who changes it, and who owns its inputs.**
+- **The usual artefact is a shared-responsibility table**, sometimes as RACI (Responsible, Accountable,
+  Consulted, Informed), *because* "who must act" and "who must be told" are different questions, and
+  conflating them causes either paralysis or surprise.
+- **Exactly one Accountable per row** is the rule that makes RACI useful. Several Responsible parties can
+  share the work, but if two parties are Accountable each can wait for the other, and a row with none is
+  unowned by construction.
 
 ### Supported configurations and coverage
-A boundary is also a statement of *what* you support and *when*. A supported-configuration list names the
-versions, models, connectors and deployment shapes you will diagnose; a customer who swaps in their own
-model or edits the system prompt has moved outside it, and the agreement should say whether support then
-becomes best-effort. Coverage hours matter as much as scope: a 24×7 SEV1 commitment needs a staffed
-rotation (or follow-the-sun across time zones), while business-hours support must say what happens to a
-SEV1 at 02:00 on Saturday. Mismatched hours between vendor and customer are a classic gap, because
-each side's on-call assumes the other's is awake.
+- **Scope: what you support.** A supported-configuration list names the versions, models, connectors and
+  deployment shapes you will diagnose. A customer who swaps in their own model or edits the system prompt
+  has moved outside it; the agreement should say whether support then becomes best-effort.
+- **Coverage: when you support it.** A 24×7 SEV1 commitment needs a staffed rotation (or follow-the-sun
+  across time zones). Business-hours support must say what happens to a SEV1 at 02:00 on Saturday.
+- **Mismatched hours are a classic gap**, because each side's on-call assumes the other's is awake.
 
 ### Define the crossing points
-Most real incidents span a boundary, so the important part is the interface: what evidence the reporting
-party must provide (request IDs, timestamps, tenant), which channel to use, response targets by severity,
-and who leads joint incidents. "Out of scope" should mean "we route it to the right owner with
-evidence", not "we close the ticket."
+Most real incidents span a boundary, so the interface matters most:
+- **Evidence** the reporting party must provide: request IDs, timestamps, tenant.
+- **Channel** to use.
+- **Response targets** by severity.
+- **Who leads** joint incidents.
+- **"Out of scope" means routing**, "we route it to the right owner with evidence", not "we close the
+  ticket."
 
 ### Tiered support
-Support is usually layered: tier 1 takes the report, gathers evidence and resolves known issues from
-runbooks; tier 2 diagnoses using logs and tooling; tier 3 is the engineering team that can change code,
-prompts or models. Each tier needs documentation to resolve what it can, *because* every issue that
-reaches engineering unnecessarily is expensive and slows real fixes. The useful measures are the share
-of tickets resolved at each tier and the share escalated with complete evidence: a tier 3 that keeps
-asking "which request ID?" is doing tier 1's job.
+| Tier | Does | Needs |
+|---|---|---|
+| **Tier 1** | Takes the report, gathers evidence, resolves known issues from runbooks | Runbooks, evidence checklist |
+| **Tier 2** | Diagnoses using logs and tooling | Dashboards, trace access |
+| **Tier 3** | The engineering team that can change code, prompts or models | Clean escalations |
+
+- **Each tier needs documentation to resolve what it can**, *because* every issue that reaches
+  engineering unnecessarily is expensive and slows real fixes.
+- **Measure** the share of tickets resolved at each tier and the share escalated with complete evidence.
+  A tier 3 that keeps asking "which request ID?" is doing tier 1's job.
 
 ### Plan the handover
-Deployments move through phases: build, launch, a period of elevated attention (hypercare) and steady
-state. Ownership should change at defined points with exit criteria, such as a stable error and quality
-baseline, runbooks validated by the receiving team, and alerts routed to their on-call. Without this, the
-build team never actually lets go.
+- **Phases:** build, launch, a period of elevated attention (hypercare) and steady state.
+- **Ownership changes at defined points with exit criteria:** a stable error and quality baseline,
+  runbooks validated by the receiving team, and alerts routed to their on-call.
+- **Without this, the build team never actually lets go.**
 
 ### AI-specific boundaries
-Make explicit the things that are new in AI systems: who owns answer quality (the prompt and eval owner,
-not the platform), who owns source data freshness and access permissions (often the customer), who decides
-when a provider model snapshot changes, and who responds to harmful-output reports. These are the
-questions most likely to be unowned by default.
+Make explicit what is new in AI systems; these are the questions most likely to be unowned by default:
+- **Answer quality:** owned by the prompt and eval owner, not the platform.
+- **Source data freshness and access permissions:** often the customer.
+- **Model snapshot changes:** who decides when a provider snapshot changes.
+- **Harmful-output reports:** who responds.
 
-## Example
+## Diagram
+A ticket crosses the boundary with evidence; each side fixes its own factor, and nobody closes it as
+"not ours".
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant T1 as Customer tier 1
+    participant V3 as Vendor tier 3
+    participant CO as Customer content owner
+    U->>T1: Answers cite last year's policy
+    T1->>T1: Collect request IDs and timestamps
+    T1->>V3: Escalate with evidence
+    V3->>V3: Trace retrieval for each request
+    V3->>CO: Route cause: file outside connector scope
+    CO->>CO: Move file, adopt publishing checklist
+    V3->>V3: Add freshness eval and alert
+    V3->>T1: Resolved, both actions owned
+```
+
+## Examples
+### Worked boundary table: RAG assistant in a bank's private cloud
 A vendor deploys a RAG assistant into a bank's private cloud. The boundary table agreed at handover:
 
 | Layer | Operates | Changes | Notes |
@@ -103,45 +132,105 @@ A vendor deploys a RAG assistant into a bank's private cloud. The boundary table
 | Source document repositories | Bank content owners | Bank | Freshness and permissions are the bank's |
 | Chat front end in the intranet | Bank web team | Bank | Vendor supplies API only |
 
-Week 9 ticket: "answers cite last year's expense policy." Tier 1 at the bank collects three request IDs.
-Vendor tier 3 traces them: retrieval returned the 2025 document because the 2026 one was uploaded to a
-folder not included in the connector scope. The cause is on the bank's side (document placement), the
-detection gap is on the vendor's (no freshness eval). Resolution: the bank's content owner moves the
-file and adopts a publishing checklist; the vendor adds a freshness eval and an alert when a source's
-newest document is older than a set threshold. The ticket is resolved in a day because both sides knew
-who did what, and neither closed it as "not ours".
+**Week 9 ticket:** "answers cite last year's expense policy."
+1. Tier 1 at the bank collects three request IDs.
+2. Vendor tier 3 traces them: retrieval returned the 2025 document because the 2026 one was uploaded to a
+   folder not included in the connector scope.
+3. **Cause** is on the bank's side (document placement); **the detection gap** is on the vendor's (no
+   freshness eval).
+4. **Resolution:** the bank's content owner moves the file and adopts a publishing checklist; the vendor
+   adds a freshness eval and an alert when a source's newest document is older than a set threshold.
+5. **Outcome:** resolved in a day because both sides knew who did what, and neither closed it as "not
+   ours".
+
+### Validating a RACI table (runnable)
+Encode the boundary table and check the one rule that matters: exactly one Accountable, at least one
+Responsible. Pure Python.
+
+```python
+RACI = {  # layer -> {party: role letters}
+    "Model endpoint":             {"Provider": "R", "Vendor": "A"},
+    "App, prompts, retrieval":    {"Vendor": "RA", "Bank platform": "I"},
+    "Cluster, network, SSO":      {"Bank platform": "RA", "Vendor": "C"},
+    "Source documents":           {"Bank content": "RA", "Vendor": "I"},
+    "Answer quality":             {"Vendor": "A", "Bank content": "A"},   # "shared": a trap
+    "Harmful-output reports":     {"Vendor": "R", "Bank platform": "C"},  # nobody accountable
+}
+
+def check(raci):
+    problems = []
+    for layer, parties in raci.items():
+        accountable = [p for p, roles in parties.items() if "A" in roles]
+        responsible = [p for p, roles in parties.items() if "R" in roles]
+        if len(accountable) != 1:
+            problems.append(f"{layer}: {len(accountable)} Accountable {accountable}")
+        if not responsible:
+            problems.append(f"{layer}: nobody Responsible")
+    return problems
+
+for p in check(RACI):
+    print(p)
+# Answer quality: 2 Accountable ['Vendor', 'Bank content']
+# Answer quality: nobody Responsible
+# Harmful-output reports: 0 Accountable []
+```
+
+## Production patterns
+- **Service catalog as source of truth.** When: more than a few components or teams. How: every component
+  has an entry with owning team, on-call rotation, runbook link, dependencies and support hours, and
+  alert routing reads from it. Monitor: entries whose owner or rotation no longer exists.
+- **Boundary table in deployment readiness.** When: any multi-party deployment. How: agree the layer table
+  with the customer before go-live, mirror it in the SLA, runbooks and support tooling, and rehearse it in
+  a tabletop exercise. Monitor: tickets bounced between parties.
+- **Evidence-required escalation form.** When: tickets cross from customer or tier 1 to engineering. How:
+  the escalation template requires request IDs, timestamps, tenant and severity before it can be
+  submitted. Monitor: share of tier 3 tickets escalated with complete evidence.
+- **Hypercare with dated exit criteria.** When: every launch. How: a time-boxed window where builders stay
+  first line, ending when the baseline is stable, runbooks are validated by the receiving team and alerts
+  route to their on-call. Monitor: pages to builders after the exit date (should be near zero).
+- **Read-only, audited vendor access.** When: the vendor operates inside a customer environment. How:
+  grant read access to logs and traces through the customer's audited access path rather than broad
+  admin rights. Monitor: time to diagnose and access-review findings.
 
 ## Trade-offs
-- "You build it, you run it" aligns incentives and shortens feedback, but loads product teams with
-  on-call; it flips toward a dedicated operations or platform team when many small services share infrastructure.
-- Narrow support boundaries keep costs predictable, but frustrate customers when problems straddle them;
-  widen them, or sell an extended tier, for strategic accounts where retention matters more than margin.
-- Keeping FDEs as the first line after launch gives customers expert help, but stops FDEs from moving to
-  new deployments; it only works for a time-boxed hypercare window with a dated handover.
-- Granting the vendor broad access inside a customer environment speeds diagnosis, but raises security
-  and compliance burden; read-only, audited access to logs and traces is usually the workable middle.
+- **"You build it, you run it" vs on-call load.** It aligns incentives and shortens feedback, but loads
+  product teams with on-call. It flips toward a dedicated operations or platform team when many small
+  services share infrastructure.
+- **Narrow boundaries vs customer frustration.** Narrow support boundaries keep costs predictable, but
+  frustrate customers when problems straddle them. Widen them, or sell an extended tier, for strategic
+  accounts where retention matters more than margin.
+- **FDEs as first line vs FDE capacity.** Customers get expert help, but FDEs cannot move to new
+  deployments. It only works for a time-boxed hypercare window with a dated handover.
+- **Broad vendor access vs security burden.** Broad access inside a customer environment speeds diagnosis,
+  but raises security and compliance burden. Read-only, audited access to logs and traces is usually the
+  workable middle.
 
 ## Pitfalls
-- Ownership assigned to a team without access or authority; the symptom is on-call that can only open
-  tickets for someone else and mean time to mitigate measured in days.
-- Orphaned components after a reorganisation or project end; the symptom is alerts routed to a channel
-  nobody reads and a service catalog entry naming someone who has left.
-- No owner for answer quality; the symptom is a slow decline in user satisfaction with every team
-  pointing at another layer and no one running evals.
-- Handover without exit criteria; the symptom is the original builders still being paged months after
-  go-live, often unofficially through direct messages.
-- Boundaries written only in the contract; the symptom is support staff on both sides who have never seen
-  the table and argue scope during an incident.
-- Two parties marked Accountable for the same layer, often "shared" data quality; the symptom is a known
-  problem that stays open for weeks while each side waits for the other to schedule the fix.
+- **Ownership assigned to a team without access or authority.** Symptom: on-call that can only open
+  tickets for someone else, and mean time to mitigate measured in days. Fix: grant pager, access and
+  authority together.
+- **Orphaned components after a reorganisation or project end.** Symptom: alerts routed to a channel
+  nobody reads and a service catalog entry naming someone who has left. Fix: re-assign owners as part of
+  every reorganisation.
+- **No owner for answer quality.** Symptom: a slow decline in user satisfaction with every team pointing at
+  another layer and no one running evals. Fix: name the prompt and eval owner.
+- **Handover without exit criteria.** Symptom: the original builders still being paged months after
+  go-live, often unofficially through direct messages. Fix: dated, verified exit criteria.
+- **Boundaries written only in the contract.** Symptom: support staff on both sides who have never seen
+  the table and argue scope during an incident. Fix: put it in runbooks and tooling.
+- **Two parties marked Accountable for the same layer**, often "shared" data quality. Symptom: a known
+  problem that stays open for weeks while each side waits for the other to schedule the fix. Fix: one
+  Accountable per row.
 
 ## When to use
-Define ownership and boundaries before go-live of any production system, and revisit them at each phase
-change, reorganisation or new integration. For multi-party AI deployments, agree the boundary table with
-the customer as part of deployment readiness, mirror it in the SLA, runbooks and support tooling, and
-test it with a tabletop exercise. Measure tickets bounced between parties, time to route an issue to its
-owner, and the share of tickets reaching engineering that tier 1 or 2 could have resolved. In interviews,
-expect "after launch, who supports this?" and answer with owners, crossing points and a handover plan.
+- **Use when:** before go-live of any production system; revisit at each phase change, reorganisation or
+  new integration.
+- **Multi-party AI deployments:** agree the boundary table with the customer as part of deployment
+  readiness, mirror it in the SLA, runbooks and support tooling, and test it with a tabletop exercise.
+- **Measure:** tickets bounced between parties, time to route an issue to its owner, and the share of
+  tickets reaching engineering that tier 1 or 2 could have resolved.
+- **Interviews:** expect "after launch, who supports this?" and answer with owners, crossing points and a
+  handover plan.
 
 ## Role lens
 - **Engineer:** Builds the runbooks, dashboards and evidence-gathering tools that let other tiers resolve
@@ -160,6 +249,37 @@ of failure and hides the support cost. I would write the boundary table with the
 components in the service catalog with an owning team and rotation, route requests to a support queue
 with tiering, make sure runbooks and dashboards let tier 2 diagnose common issues, and set handover exit
 criteria the receiving team signs off. The FDE then becomes a tier 3 escalation, not the front door.
+
+## Interview questions
+### What makes a team the real owner of a production component?
+- **Three things together:** it is paged when the component fails, it has access to diagnose and change
+  it, and it has authority and budget to prioritise fixes.
+- **Why all three:** ownership without access gives helpless on-call; access without ownership gives
+  drive-by changes nobody answers for.
+
+### A customer says answers are stale and the documents live in their system. How do you handle it?
+- **Route, do not close.** Collect request IDs, trace retrieval, and send the cause to the customer's
+  content owner with evidence.
+- **Own your side too.** Ask why your monitoring did not detect it, and add a freshness eval or alert as
+  your action.
+
+### When would you not use "you build it, you run it"?
+- **When many small services share infrastructure**, a dedicated platform or operations team avoids every
+  product team carrying a thin, tiring rotation.
+- **When the builders are FDEs**, because keeping them first line stops them moving to new deployments;
+  limit it to a dated hypercare window.
+
+### Your SLA promises 24×7 SEV1 response, but the customer's platform team works business hours. What breaks?
+- **Joint incidents stall at night.** If the fault is in their cluster or SSO, your on-call is awake but
+  cannot change it, and the SLA clock still runs.
+- **Fix:** agree a customer-side out-of-hours contact for SEV1, or scope the commitment to layers you
+  operate, and test the route in a tabletop exercise.
+
+### How would you measure whether your support boundaries work?
+- **Tickets bounced between parties** and time to route an issue to its owner.
+- **Share of tickets reaching tier 3** that tier 1 or 2 could have resolved, and share escalated with
+  complete evidence.
+- **Pages to builders after the hypercare exit date**, which should fall to near zero.
 
 ## Quiz
 ### Q: Which combination makes a team a genuine operational owner of a component?

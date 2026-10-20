@@ -5,7 +5,7 @@ name: Feature-request triage
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - customer-data-evaluation/feedback-loops-to-product
   - delivery-ownership/productizing-repeated-customer-solutions
@@ -17,89 +17,122 @@ related:
 ---
 
 ## TL;DR
-Feature-request triage turns the stream of customer asks into routed decisions. Capture the underlying
-problem rather than the proposed solution. Classify what the ask really is: in AI products, many
-"feature requests" are quality failures, training gaps or model limits in disguise. Cluster across
-customers, score with explicit criteria, route each item, and tell the requester the outcome. It exists
-so the roadmap follows evidence instead of whoever asks loudest, and so field teams stop silently forking
-the product.
+Feature-request triage turns customer asks into routed decisions: capture the problem, classify what it
+really is (often a quality failure, training gap or model limit), cluster across customers, score,
+route, and tell the requester.
 
 ## Why it exists
-A deployed AI system attracts asks constantly: in workshops, in Slack, from the sponsor, and from end
-users during training sessions. An FDE hears dozens a week. Two naive responses both fail. Saying yes in
-the field ("we can add that") wins goodwill this week. It also produces promises product never made,
-custom branches that make every upgrade painful, and a roadmap set by one account. Forwarding everything
-to the product team unprocessed buries real signal in noise: twenty differently worded requests for the
-same capability look like twenty small asks instead of one large one.
-
-AI products add a twist. A large share of asks are not features at all. "Make it more accurate on
-foreign-exchange questions" is a quality failure that belongs in the continuous-improvement loop with a
-regression case, not in a backlog for next quarter. "Let it handle bulk uploads" may already exist, and
-the real need is training. "Guarantee it never makes a mistake" is a model capability limit that needs an
-expectation reset and a human-review design, not engineering work. Misrouting these is costly: users keep
-suffering a quality bug while it sits in a product queue, or product time goes to building what already
-exists.
+- **Asks arrive constantly.** In workshops, in Slack, from the sponsor, and from end users during
+  training sessions; an FDE hears dozens a week.
+- **Saying yes in the field fails.** "We can add that" wins goodwill this week, but produces promises
+  product never made, custom branches that make every upgrade painful, and a roadmap set by one account.
+- **Forwarding everything unprocessed fails too.** It buries signal in noise: twenty differently worded
+  requests for the same capability look like twenty small asks instead of one large one.
+- **In AI products many asks are not features.** "Make it more accurate on foreign-exchange questions" is a
+  quality failure for the continuous-improvement loop. "Let it handle bulk uploads" may already exist, so
+  the need is training. "Guarantee it never makes a mistake" is a capability limit needing an expectation
+  reset and human-review design.
+- **Misrouting is costly.** Users keep suffering a quality bug while it sits in a product queue, or product
+  time goes to building what already exists. Triage lets the roadmap follow evidence instead of whoever
+  asks loudest, and stops field teams silently forking the product.
 
 ## How it works
 ### 1. Capture the problem, not the solution
-Record each request in a standard form: who asked (role and account), the job they are trying to get done,
-the current workaround, what happens if nothing changes (blocks a deal, risks renewal, costs time), how
-often it occurs, and a concrete example. Keep asking "what would that let you do?" to get from "add an
-Excel export button" to "finance reconciles AI answers against the ledger monthly". You need the problem
-*because* clustering and solution design both depend on it; the customer's proposed solution is one
-option among several.
+Record each request in a standard form:
+
+| Field | Example question |
+|---|---|
+| Who asked | Role and account |
+| Job to be done | What are you trying to get done? |
+| Current workaround | What do you do today? |
+| Cost of no change | Blocks a deal, risks renewal, costs time |
+| Frequency | How often does this happen? |
+| Concrete example | One real case |
+
+- **Keep asking "what would that let you do?"** to get from "add an Excel export button" to "finance
+  reconciles AI answers against the ledger monthly".
+- **You need the problem *because*** clustering and solution design both depend on it; the customer's
+  proposed solution is one option among several.
 
 ### 2. Classify what the ask really is
-- **Quality failure:** the system already tries to do this and gets it wrong. Route it to failure triage,
-  add a regression case, and fix it through the release gate.
-- **Usage or knowledge gap:** the capability exists. Route it to enablement, and fix the docs or UI if
-  many people miss it.
-- **Configuration:** achievable with existing prompts, knowledge sources, settings or permissions. The field
-  team does it.
-- **Customer-specific extension:** a real need unique to this customer, such as an integration with their
-  ERP. Build it on a supported extension point, never as a fork.
-- **Product gap:** a capability missing for a class of customers. It goes to the product backlog with evidence.
-- **Capability limit:** not reliably achievable with current models. Reset expectations and propose
-  mitigations such as human review, narrower scope or confidence thresholds.
+| Type | What it is | Route |
+|---|---|---|
+| **Quality failure** | The system already tries and gets it wrong | Failure triage, a regression case, a fix through the release gate |
+| **Usage or knowledge gap** | The capability exists | Enablement; fix the docs or UI if many people miss it |
+| **Configuration** | Achievable with existing prompts, knowledge sources, settings or permissions | The field team does it |
+| **Customer-specific extension** | A real need unique to this customer, such as an integration with their ERP | Build on a supported extension point, never as a fork |
+| **Product gap** | A capability missing for a class of customers | Product backlog with evidence |
+| **Capability limit** | Not reliably achievable with current models | Reset expectations; propose human review, narrower scope or confidence thresholds |
 
-Ask the classifying questions in a fixed order, cheapest and most urgent first. Does the system already
-attempt this? Look at the traces for the requester's example: if it tries and fails, it is a quality
-failure, which goes first *because* users are being hurt now. If it succeeds when used correctly, it is a
-usage gap. Can existing configuration do it? Can current models do it reliably? Try it on a couple of
-dozen real examples before calling it a product gap, because "the model can't" and "nobody tried" look
-the same from a ticket. Only then ask whether the need is unique to this customer or plausibly shared
-by others. Split compound asks: "make pricing answers right and never wrong" is one quality failure plus
-one capability limit, and each half has a different route.
+Ask the classifying questions in a fixed order, cheapest and most urgent first:
+1. **Does the system already attempt this?** Look at the traces for the requester's example. If it tries
+   and fails, it is a quality failure, which goes first *because* users are being hurt now. If it succeeds
+   when used correctly, it is a usage gap.
+2. **Can existing configuration do it?**
+3. **Can current models do it reliably?** Try it on a couple of dozen real examples before calling it a
+   product gap, because "the model can't" and "nobody tried" look the same from a ticket.
+4. **Is the need unique to this customer, or plausibly shared?**
+
+- **Split compound asks.** "Make pricing answers right and never wrong" is one quality failure plus one
+  capability limit, and each half has a different route.
 
 ### 3. Deduplicate and cluster across customers
-Group requests by underlying problem, not by wording. One cluster with five accounts and concrete examples
-is far stronger evidence than five separate tickets. A shared tagging taxonomy across all field teams is
-what makes this possible.
+- **Group by underlying problem, not wording.** One cluster with five accounts and concrete examples is far
+  stronger evidence than five separate tickets.
+- **A shared tagging taxonomy across all field teams** is what makes this possible.
 
 ### 4. Score with explicit criteria
-A common framework is RICE, popularised by Intercom: Reach × Impact × Confidence ÷ Effort. Reach is
-originally people or events per period; across customers, distinct accounts with the problem is a
-reasonable proxy. Impact uses a coarse scale (3 massive, 2 high, 1 medium, 0.5 low, 0.25 minimal),
-confidence a percentage that discounts guesses, and effort person-weeks or person-months. The coarse
-scales are deliberate: they stop the team arguing over decimals and make the score a ranking aid, not a
-measurement. Add strategic fit, and risk (safety,
-compliance, maintenance burden). Record commercial weight (ARR, deal-blocking status) as a *separate*
-input, not multiplied into the score, *because* folding revenue into the score lets the biggest account set
-the roadmap without anyone deciding that on purpose.
+A common framework is RICE, popularised by Intercom: Reach × Impact × Confidence ÷ Effort.
+
+| Input | Scale |
+|---|---|
+| **Reach** | Originally people or events per period; across customers, distinct accounts with the problem is a reasonable proxy |
+| **Impact** | Coarse: 3 massive, 2 high, 1 medium, 0.5 low, 0.25 minimal |
+| **Confidence** | A percentage that discounts guesses |
+| **Effort** | Person-weeks or person-months |
+
+- **Coarse scales are deliberate:** they stop the team arguing over decimals and make the score a ranking
+  aid, not a measurement.
+- **Add strategic fit and risk** (safety, compliance, maintenance burden).
+- **Record commercial weight (ARR, deal-blocking status) as a *separate* input,** not multiplied into the
+  score, *because* folding revenue in lets the biggest account set the roadmap without anyone deciding
+  that on purpose.
 
 ### 5. Route and decide
-Field fixes happen now. Product gaps go to the product owner, who decides; the FDE supplies evidence, not
-commitments. Declines get a written reason and, where possible, a workaround. Apply a recurrence rule:
-when the same customer-specific extension has been built for several customers, propose productizing it.
+- **Field fixes happen now.**
+- **Product gaps go to the product owner, who decides;** the FDE supplies evidence, not commitments.
+- **Declines get a written reason** and, where possible, a workaround.
+- **Recurrence rule:** when the same customer-specific extension has been built for several customers,
+  propose productizing it.
 
 ### 6. Close the loop
-Tell every requester what happened and why, including "no". A visible outcome keeps customers reporting
-real problems, instead of escalating the same ask to their executive sponsor.
+- **Tell every requester what happened and why, including "no".**
+- **A visible outcome keeps customers reporting real problems,** instead of escalating the same ask to
+  their executive sponsor.
 
-## Example
-A weekly triage pass over seven captured requests from five accounts. Requests are clustered by underlying
-problem and type, each cluster is routed, and only product gaps get a RICE score. ARR is shown next to the
-score but kept out of it. Impact, confidence and effort are the team's estimates.
+## Diagram
+The classifying questions run in a fixed order, so the cheapest and most urgent routes are tested before
+anything reaches the product backlog.
+
+```mermaid
+flowchart TD
+    A["Captured request: problem plus example"] --> Q1{"Does the system already attempt it?"}
+    Q1 -->|"yes, fails"| QF["Quality failure: triage and regression case"]
+    Q1 -->|"yes, works"| UG["Usage gap: enablement"]
+    Q1 -->|"no"| Q2{"Can configuration do it?"}
+    Q2 -->|"yes"| CF["Field team configures"]
+    Q2 -->|"no"| Q3{"Models reliable on real examples?"}
+    Q3 -->|"no"| CL["Capability limit: reset, mitigate"]
+    Q3 -->|"yes"| Q4{"Unique to this customer?"}
+    Q4 -->|"yes"| EX["Extension point build"]
+    Q4 -->|"no"| PG["Cluster, RICE, product backlog"]
+```
+
+## Examples
+### Weekly triage pass: cluster, route and score
+Seven captured requests from five accounts. Requests are clustered by underlying problem and type, each
+cluster is routed, and only product gaps get a RICE score. ARR is shown next to the score but kept out of
+it. Impact, confidence and effort are the team's estimates.
 
 ```python
 from collections import defaultdict
@@ -137,37 +170,107 @@ for (problem, kind), rows in clusters.items():
     print(line)
 ```
 
-Seven tickets become five decisions. Page-level citations is one cluster spanning three accounts
-(RICE 3 × 2 × 0.8 ÷ 3 = 1.60, ARR $770k), so it goes to product with three concrete examples. The
-approval workflow is classed as a product gap because approval chains are common in the segment, but
-only one account has asked; with identical estimates it scores RICE 0.53 at ARR $2,000k. Had reach been
-weighted by ARR, the order would flip: 2,000 against 770. Neither ordering is automatically right; the
-separate column puts that choice in front of the product owner instead of letting arithmetic make it. The stale FX rates go straight into the quality loop this week.
-The SAP export is built by the field team on the integration API. Bulk upload already exists, so the
-action is a training note and a UI change review.
+Seven tickets become five decisions:
+
+| Cluster | Decision |
+|---|---|
+| Page-level citations | One cluster spanning three accounts (RICE 3 × 2 × 0.8 ÷ 3 = 1.60, ARR $770k); goes to product with three concrete examples |
+| Approval workflow | A product gap because approval chains are common in the segment, but only one account has asked; with identical estimates it scores RICE 0.53 at ARR $2,000k |
+| Stale FX rates | Straight into the quality loop this week |
+| SAP export | Built by the field team on the integration API |
+| Bulk upload | Already exists, so a training note and a UI change review |
+
+- **Had reach been weighted by ARR, the order would flip:** 2,000 against 770.
+- **Neither ordering is automatically right;** the separate column puts that choice in front of the
+  product owner instead of letting arithmetic make it.
+
+### Classifying asks in a fixed order
+The ordered questions from step 2 as a function, applied to asks from this lesson. The booleans are what
+the FDE learns from traces, configuration checks and a small trial.
+
+```python
+def classify(attempts, works_when_used_right, config_can_do, reliable_on_sample, unique):
+    """Ask the questions in a fixed order: cheapest and most urgent first."""
+    if attempts:                                   # traces show it already tries
+        return "usage_gap" if works_when_used_right else "quality_failure"
+    if config_can_do:
+        return "configuration"
+    if not reliable_on_sample:                     # tried on a couple of dozen real examples
+        return "capability_limit"
+    return "customer_specific" if unique else "product_gap"
+
+asks = {
+    "more accurate on FX questions": (True, False, False, True, False),
+    "handle bulk uploads":           (True, True, False, True, False),
+    "answer from the new HR policy": (False, True, True, True, False),
+    "export to our SAP form":        (False, False, False, True, True),
+    "cite the source page":          (False, False, False, True, False),
+    "guarantee it is never wrong":   (False, False, False, False, False),
+}
+for ask, answers in asks.items():
+    print(f"{ask:32} -> {classify(*answers)}")
+# more accurate on FX questions    -> quality_failure
+# handle bulk uploads              -> usage_gap
+# answer from the new HR policy    -> configuration
+# export to our SAP form           -> customer_specific
+# cite the source page             -> product_gap
+# guarantee it is never wrong      -> capability_limit
+```
+
+## Production patterns
+- **Structured intake with required fields** — when several field teams capture asks, use one form whose
+  job, workaround, cost-of-no-change and example fields are mandatory, so tickets carry the problem rather
+  than a proposed button. Monitor the share of requests with a concrete example attached.
+- **Shared tag taxonomy and a weekly clustering pass** — every field team tags by underlying problem from
+  one list; triage merges duplicates weekly before scoring. Monitor how many tickets each cluster absorbs
+  and how often new tags are created.
+- **Auto-route quality failures out of the backlog** — a request classified as a quality failure opens a
+  failure-triage item with its example as a regression case. Monitor time from report to regression case
+  and to a gated fix.
+- **ARR as its own column** — the backlog view shows RICE and commercial weight side by side, so the
+  product owner sees when a large account would reorder the list. Monitor how often a decision overrode
+  the RICE order, with the reason written down.
+- **Recurrence rule for field extensions** — keep a register of customer-specific builds by pattern; when a
+  pattern repeats across several customers, raise a productization proposal. Monitor extensions per
+  pattern and how many were later productized.
+- **Decision and closure log** — every request records a decision, a reason and the date the requester was
+  told. Monitor time from request to decision and the share of requesters notified.
 
 ## Trade-offs
-- Building a customer-specific feature in the field can save a deal now, but every fork taxes later upgrades; it is acceptable only on a supported extension point, with a recurrence rule for productizing it.
-- Weighting by ARR aligns with revenue but lets one large account dominate; keep it a separate, visible input so product leadership makes that trade-off deliberately.
-- Detailed capture and clustering take FDE time each week, but they turn anecdotes into evidence; for a single small pilot with one stakeholder, a lightweight list may be enough.
-- Sharing roadmap intent builds customer trust, but it creates implied commitments; share problem clusters and status, not delivery dates, unless product has committed.
+- **Field build vs upgrade tax.** A customer-specific feature built in the field can save a deal now, but
+  every fork taxes later upgrades; it is acceptable only on a supported extension point, with a
+  recurrence rule for productizing it.
+- **ARR weighting vs fairness.** Weighting by ARR aligns with revenue but lets one large account dominate;
+  keep it a separate, visible input so product leadership makes that trade-off deliberately.
+- **Capture effort vs evidence.** Detailed capture and clustering take FDE time each week, but turn
+  anecdotes into evidence; for a single small pilot with one stakeholder, a lightweight list may be enough.
+- **Roadmap transparency vs implied commitments.** Sharing roadmap intent builds trust but creates implied
+  commitments; share problem clusters and status, not delivery dates, unless product has committed.
 
 ## Pitfalls
-- Logging the proposed solution instead of the problem: the backlog fills with many near-duplicate items, and the cluster that matters never looks big.
-- Routing quality failures to the product backlog: users keep reporting the same wrong answers for weeks while the item waits for roadmap planning.
-- Field promises the product never made: the symptom is an escalation from the customer's executive asking where "the committed feature" is.
-- Letting the largest customer's asks dominate: the roadmap drifts toward one account's workflow, and other customers' adoption stalls.
-- Treating capability limits as features: an engineering effort chases "never wrong" for months instead of designing human review and scope limits.
-- No closure to requesters: the same asks reappear louder through other channels, and feedback from end users dries up.
+- **Logging the proposed solution instead of the problem.** The backlog fills with near-duplicate items,
+  and the cluster that matters never looks big.
+- **Routing quality failures to the product backlog.** Users keep reporting the same wrong answers for
+  weeks while the item waits for roadmap planning.
+- **Field promises the product never made.** Symptom: an escalation from the customer's executive asking
+  where "the committed feature" is.
+- **Letting the largest customer's asks dominate.** The roadmap drifts toward one account's workflow, and
+  other customers' adoption stalls.
+- **Treating capability limits as features.** Engineering chases "never wrong" for months instead of
+  designing human review and scope limits.
+- **No closure to requesters.** The same asks reappear louder through other channels, and feedback from end
+  users dries up.
 
 ## When to use
-Run triage whenever a deployed system has users who can ask for things, which is from the first pilot
-week onward. Use a weekly cadence while volume is high, and hold a cross-customer review with product
-monthly or per planning cycle. The full process matters most for platforms serving several customers.
-There, clustering and the decline-with-reason discipline protect the roadmap. Measure time from request
-to decision, the share of requests reclassified as quality or usage gaps, and how many field extensions
-were later productized. In interviews, the signal is separating problem from solution and routing
-AI-specific asks correctly.
+- **Use when** a deployed system has users who can ask for things, which is from the first pilot week
+  onward.
+- **Cadence:** weekly while volume is high, plus a cross-customer review with product monthly or per
+  planning cycle.
+- **Matters most for platforms serving several customers,** where clustering and the decline-with-reason
+  discipline protect the roadmap.
+- **Measure:** time from request to decision, the share of requests reclassified as quality or usage gaps,
+  and how many field extensions were later productized.
+- **Interviews:** the signal is separating problem from solution and routing AI-specific asks correctly.
 
 ## Role lens
 - **Engineer:** Builds the capture form and tagging, and turns quality-failure requests into regression
@@ -186,6 +289,42 @@ sources, or a prompt that lets the model guess. Those go into failure triage now
 and a fix through the release gate, often within days. If part of the ask is "never be wrong", I explain
 that as a model limit and propose mitigations: citing the pricing source, refusing when no document
 matches, or human review for quotes. Then I tell the VP the plan and timeline.
+
+## Interview questions
+### What makes feature-request triage different for an AI product?
+- **Many asks are not features:** they are quality failures, usage gaps or model capability limits phrased
+  as requests, and each has a different route.
+- **Why it matters:** a quality bug parked in a product queue keeps hurting users for a quarter, and
+  product time spent rebuilding an existing capability is wasted.
+- **So the first step is checking traces** for the requester's example before anything is scored.
+
+### A user asks for "support for scanned PDFs". Walk me through triaging it.
+- **Capture the problem:** which documents, how often, what they do today, and one real file.
+- **Classify in order:** does ingestion already attempt scanned files and fail (quality failure), or work
+  when uploaded correctly (usage gap)? Can a configuration setting enable it? Does a trial on a couple of
+  dozen real scans work reliably?
+- **Then decide reach:** if other accounts have the same need, cluster and score it; if unique, build on an
+  extension point.
+
+### A large customer says they will churn unless you build their feature. How do you handle it?
+- **Do not promise in the field;** capture the problem, classify it and bring evidence to the product owner.
+- **Show ARR next to the score, not inside it,** so leadership decides deliberately whether one account
+  should reorder the roadmap.
+- **Offer what you can own:** a configuration, an extension-point build, or a workaround, with a written
+  reason for anything declined.
+
+### Two clusters: six accounts, impact 1, confidence 0.5, effort 2 weeks; versus two accounts, impact 3, confidence 0.8, effort 4 weeks. Which ranks higher?
+- **RICE:** 6 × 1 × 0.5 ÷ 2 = 1.5 against 2 × 3 × 0.8 ÷ 4 = 1.2, so the broad, lower-impact cluster ranks
+  higher.
+- **Read it as a ranking aid,** because the coarse scales are estimates; a small change in confidence can
+  swap the order.
+- **Then add the non-score inputs:** strategic fit, risk and commercial weight, kept visible.
+
+### When is a field-built, customer-specific feature acceptable?
+- **When the need is genuinely unique** and it can be built on a supported extension point, never as a fork,
+  because forks tax every later upgrade.
+- **Track it in a register,** and apply the recurrence rule: once several customers need the same
+  extension, propose productizing it.
 
 ## Quiz
 ### Q: Why should triage record the requester's underlying problem rather than their proposed solution?

@@ -5,7 +5,7 @@ name: Overfitting
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/train-val-test-split
   - training-adaptation/epochs
@@ -123,6 +123,7 @@ flowchart TD
     B -->|"yes"| O["Overfitting"]
     B -->|"no"| C{"Validation fine, production low?"}
     C -->|"yes"| DS["Distribution shift: fresh data, temporal split"]
+    C -->|"no"| OK["Healthy: keep watching the gap"]
     O --> LC["Learning curve on 25, 50, 100 percent of data"]
     LC -->|"still rising steeply"| MD["More diverse data"]
     LC -->|"flat"| ST["Fewer steps, lower LR, PEFT, regularise"]
@@ -246,13 +247,17 @@ for g in flagged:
 - **A validation set that near-duplicates training rows.** Symptom: validation loss tracking training
   loss downward forever, with overfitting surfacing only in production. Fix: deduplicate across splits.
 - **Stopping on the wrong signal.** Stopping on token loss when the task metric matters, or the reverse.
-  Symptom: a checkpoint one or two epochs away from the best one on the metric customers see.
+  Symptom: a checkpoint one or two epochs away from the best one on the metric customers see. Fix:
+  select on the shipped metric, watch loss as the early warning.
 - **Mistaking distribution shift for overfitting.** Adding regularisation does not help. Symptom:
-  validation numbers stay fine while production keeps degrading.
+  validation numbers stay fine while production keeps degrading. Fix: fresh production data and a
+  temporal validation set.
 - **Tuning dozens of hyperparameters on one validation set.** Symptom: a validation score that improves
   with every experiment and a test score that does not, because you have overfit the validation set.
+  Fix: read the untouched test set once, and refresh it when consumed.
 - **Fine-tuning on personal-data records for many epochs.** Symptom: the model regurgitates names,
-  addresses or account numbers verbatim when prompted with a prefix.
+  addresses or account numbers verbatim when prompted with a prefix. Fix: redact PII before training,
+  fewer epochs, and a verbatim-overlap release gate.
 
 ## When to use
 Overfitting is not something you choose; every sufficiently long run does it, so the decision is how to

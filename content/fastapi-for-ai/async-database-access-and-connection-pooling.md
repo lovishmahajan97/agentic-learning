@@ -22,8 +22,8 @@ sources:
 ---
 
 ## TL;DR
-In `async def` endpoints use an async driver behind SQLAlchemy's `AsyncEngine`, never a blocking one.
-Each process keeps a bounded pool, and `processes × (pool_size + max_overflow)` must fit Postgres's cap.
+In `async def` endpoints use an async driver behind SQLAlchemy's `AsyncEngine`; blocking drivers belong
+in `def` endpoints. Each process keeps a bounded pool, and `processes × (pool_size + max_overflow)` must fit Postgres's cap.
 AI rule: never hold a pooled connection across a model call.
 
 ## Why it exists

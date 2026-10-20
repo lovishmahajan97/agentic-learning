@@ -5,7 +5,7 @@ name: ACL-aware retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/metadata-filtering
   - safety-security/cross-tenant-data-leakage
@@ -356,7 +356,8 @@ Fail closed if the directory lookup fails, and key any answer cache on the princ
 
 ### A user in 600 groups suddenly sees almost no results after an SSO change. What is likely wrong?
 - **The group claim overflowed.** Identity providers cap or omit the token's group claim for users in many
-  groups (Entra ID switches to an overage indicator), so the principal set shrank to the user id.
+  groups (Entra ID switches to an overage indicator), so the principal set shrank to the user's own id,
+  domain and `public`.
 - **Fix:** expand groups server-side from the directory (Microsoft Graph transitive membership for Entra
   ID), cache for minutes, and alert when a principal set is unexpectedly small.
 

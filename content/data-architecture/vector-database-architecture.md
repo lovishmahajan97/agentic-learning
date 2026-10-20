@@ -5,7 +5,7 @@ name: Vector database architecture
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/vector-databases
   - rag-retrieval/ann-indexes
@@ -23,106 +23,131 @@ sources:
 ---
 
 ## TL;DR
-A vector database is three things bolted together: an approximate-nearest-neighbour index, a document
-store for ids and payload, and a query planner that combines similarity with filters. The hard problems
-are not the distance math but mutability (graph indexes hate updates and deletes), filtered search
-(selective filters break "find top-k then filter"), memory residency (graph traversal is random access,
-so the index lives in RAM or on an SSD-aware design) and distribution. Understand those four and the
-vendor comparison in the RAG module becomes a checklist.
+A vector database is an ANN index, a payload store and a query planner bolted together. The hard parts are
+not distance math but mutability, filtered search, memory residency and distribution; understand those
+four and any vendor comparison becomes a checklist.
 
 ## Why it exists
-Exact nearest-neighbour search is a dot product per stored vector. For a million 1,536-dimensional
-float32 vectors that is about 6 GB of reads per query, which at the tens of GB/s of memory bandwidth a
-server offers is on the order of 100 ms or more per query, and it scales linearly with the corpus. Approximate indexes such as HNSW cut that to a few thousand distance
-computations by navigating a graph, which is why ANN indexes exist and the rag-retrieval module explains
-them. But an index alone is a library call, not a database. Production retrieval also needs to add and
-delete vectors while serving queries, attach and filter on metadata (tenant, date, ACL), survive a process
-restart, replicate for availability, and spread across machines when the corpus outgrows one.
-
-Each of those requirements collides with the index. HNSW builds a graph whose quality depends on
-insertion order and whose nodes cannot simply be removed without leaving the graph disconnected; deletes
-become tombstones and rebuilds. A filter applied after the top-k is returned yields fewer than k, or zero,
-results when the filter is selective, and a filter applied before means searching a set the graph was not
-built for. Graph traversal performs random memory access, so an index that spills to disk becomes orders
-of magnitude slower unless it was designed for SSDs. Sharding a similarity search means every shard must
-answer and the results must be merged. A vector database is the engineering that resolves those
-collisions; the choice between a dedicated engine and a vector extension inside Postgres or OpenSearch is
-a choice about which of them you need solved and which you can live with.
+- **Exact search does not scale.** It is a dot product per stored vector. A million 1,536-dimensional float32
+  vectors is about 6 GB of reads per query, which at the tens of GB/s of server memory bandwidth is on the
+  order of 100 ms or more per query, growing linearly with the corpus.
+- **ANN fixes the math, not the system.** HNSW cuts the work to a few thousand distance computations by
+  navigating a graph (the rag-retrieval module explains ANN). But an index alone is a library call; production
+  also needs live adds and deletes, metadata filters (tenant, date, ACL), restart durability, replication and
+  sharding.
+- **Each requirement collides with the index.** HNSW graph quality depends on insertion order and nodes cannot
+  be removed without disconnecting the graph, so deletes become tombstones and rebuilds. A filter after top-k
+  yields fewer than k, or zero, results when selective; a filter before means searching a set the graph was
+  not built for.
+- **Memory and distribution collide too.** Graph traversal is random memory access, so an index that spills
+  to disk becomes orders of magnitude slower unless designed for SSDs. Sharded similarity search means every
+  shard answers and results are merged.
+- **A vector database is the engineering that resolves those collisions.** Choosing a dedicated engine or a
+  vector extension in Postgres or OpenSearch is choosing which collisions you need solved and which you can
+  live with.
 
 ## How it works
 ### Data model
-A collection holds points: an id, one or more named vectors (dense, and in many engines sparse for
-hybrid search), and a payload of key-value metadata. Payload fields that will be filtered on get
-secondary indexes (keyword, numeric range, geo), typically inverted or bitmap indexes, because filter
-evaluation must produce sets of candidate ids quickly.
+- **Points in a collection:** an id, one or more named vectors (dense, and in many engines sparse for hybrid
+  search), and a payload of key-value metadata.
+- **Payload indexes** (keyword, numeric range, geo; typically inverted or bitmap) on every filtered field,
+  because filter evaluation must produce candidate id sets quickly.
 
 ### Index layer and why it is memory-bound
-HNSW keeps a layered proximity graph; a query enters at the top layer, greedily walks to the nearest
-node, descends, and at the base layer explores a beam of `ef` candidates. Each hop reads a node's
-neighbour list and its vector, from unpredictable addresses, so throughput tracks memory latency and the
-index must be RAM-resident. IVF partitions vectors into clusters by k-means and scans a few posting lists,
-which is more sequential and cheaper in memory but needs training and loses recall on skewed data.
-Quantization (scalar int8, product quantization, binary) shrinks the vectors the index touches during
-traversal, trading a small recall loss that is recovered by rescoring the final candidates against
-full-precision vectors kept on disk. DiskANN-style designs push this further: a compressed copy in RAM
-guides the walk, and full vectors plus adjacency live on SSD with one read per visited node, which is how
-billion-scale search fits on one machine.
+- **HNSW** keeps a layered proximity graph. A query enters at the top layer, greedily walks to the nearest
+  node, descends, and at the base layer explores a beam of `ef` candidates.
+- **Each hop reads a neighbour list and a vector from unpredictable addresses,** so throughput tracks memory
+  latency and the index must be RAM-resident.
+- **IVF** partitions vectors into k-means clusters and scans a few posting lists: more sequential and cheaper
+  in memory, but needs training and loses recall on skewed data.
+- **Quantization** (scalar int8, product quantization, binary) shrinks the vectors touched during traversal.
+  The small recall loss is recovered by rescoring final candidates against full-precision vectors on disk.
+- **DiskANN-style designs** keep a compressed copy in RAM to guide the walk and put full vectors plus
+  adjacency on SSD, one read per visited node; that is how billion-scale search fits on one machine.
 
 ### Write path: segments, tombstones and compaction
 Writes do not go into the graph directly. The common design, shared in spirit by Qdrant, Milvus and
-Lucene-based engines, is: append to a write-ahead log for durability; insert into a small mutable segment
-that is searched by brute force; when it reaches a threshold, seal it and build an index in the
-background; serve queries across all segments and merge. Deletes mark a tombstone bitmap consulted at
-query time, and updates are a delete plus an insert. Periodic compaction merges segments, drops
-tombstoned points and rebuilds the graph. This design exists because it keeps writes cheap and the index
-immutable, at the cost of eventual visibility (a point is searchable after it lands in the mutable segment,
-which may be after a refresh interval) and of query cost that creeps upward between compactions as
-tombstones accumulate and segment counts grow.
+Lucene-based engines:
+1. Append to a write-ahead log for durability.
+2. Insert into a small mutable segment searched by brute force.
+3. At a threshold, seal it and build an index in the background.
+4. Serve queries across all segments and merge.
+5. Deletes mark a tombstone bitmap consulted at query time; updates are a delete plus an insert.
+6. Periodic compaction merges segments, drops tombstoned points and rebuilds the graph.
+
+- **Why:** writes stay cheap and the index stays immutable.
+- **The cost:** eventual visibility (a point is searchable once it lands in the mutable segment, possibly after
+  a refresh interval), and query cost that creeps up between compactions as tombstones and segment counts
+  grow.
 
 ### Query path and the filtering problem
-A query is: embed (outside the database), evaluate the filter to a candidate set, search, merge across
-segments and shards, rescore if quantized, fetch payloads, return top-k. The filter strategy is the
-subtle part.
+A query: embed (outside the database), evaluate the filter to a candidate set, search, merge across segments
+and shards, rescore if quantized, fetch payloads, return top-k. The filter strategy is the subtle part.
 
-- **Post-filtering:** run ANN for top-k′ (k′ > k), then drop points failing the filter. Simple, and
-  wrong when the filter is selective: if 1 % of points match, top-100 contains on average one survivor.
-- **Pre-filtering:** compute the allowed-id bitmap from the payload index, then search only among them.
-  Correct, but a graph traversal restricted to 1 % of nodes becomes disconnected, so engines fall back to
-  brute force over the allowed set when it is small, which is fine precisely because it is small.
-- **Filter-aware traversal:** check the filter at each hop and keep exploring through disallowed nodes
-  without returning them, with extra graph links built per indexed payload field so the subgraph stays
-  connected (Qdrant's approach), or a flat-search cutoff below which the engine abandons the graph
-  (Weaviate's `flatSearchCutoff`; newer Weaviate releases also offer an ACORN-style filtered traversal). pgvector historically returned fewer than k rows under a selective `WHERE`
-  because the index scan ran first; newer releases added iterative index scans that keep walking until
-  enough rows pass.
+| Strategy | How | When it works | When it fails |
+|---|---|---|---|
+| Post-filtering | ANN for top-k′ (k′ > k), then drop points failing the filter | filter matches most points | selective filters: at 1 % matching, top-100 has on average one survivor |
+| Pre-filtering | allowed-id bitmap from the payload index, search only among them | always correct; engines brute-force the allowed set when it is small, fine precisely because it is small | traversal restricted to 1 % of nodes is disconnected; exact scan is expensive when the set is large |
+| Filter-aware traversal | check the filter at each hop, keep walking through disallowed nodes without returning them | mid and large selectivity | needs engine support |
 
-A plain `WHERE tenant_id = ?` across millions of points is therefore an architecture question, not a
-syntax question, and it is the first thing to test when evaluating an engine.
+**How engines implement filter-aware search:**
+- **Qdrant** builds extra graph links per indexed payload field so the filtered subgraph stays connected.
+- **Weaviate** uses a flat-search cutoff (`flatSearchCutoff`) below which it abandons the graph; newer
+  releases also offer an ACORN-style filtered traversal.
+- **pgvector** historically returned fewer than k rows under a selective `WHERE` because the index scan ran
+  first; newer releases added iterative index scans that keep walking until enough rows pass.
+
+A plain `WHERE tenant_id = ?` across millions of points is therefore an architecture question, not a syntax
+question, and the first thing to test when evaluating an engine.
 
 ### Distribution and multi-tenancy
-Sharding by hashed point id spreads load evenly but makes every query scatter to all shards and merge,
-so latency is the slowest shard's. Sharding by a routing key such as tenant sends each query to one
-shard, which is both faster and a natural isolation boundary, at the cost of hot shards for large tenants.
-Replication provides availability and read scaling; most engines offer per-request consistency levels
-because replicas apply writes asynchronously. Multi-tenancy has three patterns: a collection per tenant
-(strong isolation, but each HNSW graph carries fixed overhead and thousands of tiny collections waste
-memory), a payload filter per tenant (cheap, relies on the filtered-search path and on nobody forgetting
-the filter), and tenant-partitioned indexes where the engine builds a separate graph per tenant value
-inside one collection, which is the usual recommendation for many small tenants.
+- **Shard by hashed point id:** even load, but every query scatters to all shards and merges, so latency is
+  the slowest shard's.
+- **Shard by a routing key such as tenant:** one shard per query, faster and a natural isolation boundary, at
+  the cost of hot shards for large tenants.
+- **Replication** gives availability and read scaling; most engines offer per-request consistency levels
+  because replicas apply writes asynchronously.
+
+| Multi-tenancy pattern | Strength | Weakness |
+|---|---|---|
+| Collection per tenant | strong isolation | each HNSW graph carries fixed overhead; thousands of tiny collections waste memory |
+| Payload filter per tenant | cheap | relies on the filtered-search path and on nobody forgetting the filter |
+| Tenant-partitioned indexes (a graph per tenant value inside one collection) | the usual recommendation for many small tenants | engine support required |
 
 ### Dedicated engine versus extension
-pgvector gives ANN inside the database that already holds the chunks, with transactions, joins and row
-security, and it is the right answer until the index no longer fits comfortably in the database's memory
-or filtered recall and write throughput become the bottleneck. OpenSearch and Elasticsearch give HNSW
-beside BM25 and existing log infrastructure. Dedicated engines win on filtered-search machinery,
-quantization options, segment management and horizontal scaling. The architecture above is the lens for
-deciding which of those you will actually hit.
+- **pgvector:** ANN inside the database that already holds the chunks, with transactions, joins and row
+  security. Right until the index no longer fits comfortably in the database's memory, or filtered recall and
+  write throughput become the bottleneck.
+- **OpenSearch and Elasticsearch:** HNSW beside BM25 and existing log infrastructure.
+- **Dedicated engines:** win on filtered-search machinery, quantization options, segment management and
+  horizontal scaling.
+- The architecture above is the lens for deciding which of those you will actually hit.
 
-## Example
-The filtering problem, made visible. This simulation uses exact similarity, so the only variable is
-*when* the filter is applied. One collection holds three tenants owning 90 %, 9.5 % and 0.5 % of the
-points. Post-filtering takes the top-k′ by similarity and then drops other tenants' points.
-Pre-filtering builds the allowed-id set first and scans it exactly.
+## Diagram
+Writes land in a log and a brute-force segment before background indexing; queries plan the filter by
+estimated selectivity, search every segment, skip tombstones and merge.
+
+```mermaid
+flowchart TD
+    W["Upsert or delete"] --> WAL[("Write-ahead log")]
+    WAL --> MS["Mutable segment, brute force"]
+    MS -->|"threshold reached"| IS["Sealed segment, HNSW built"]
+    W -.->|"delete"| TB["Tombstone bitmap"]
+    IS -->|"compaction drops tombstones"| IS
+    Q["Query vector + filter"] --> P{"Estimated allowed-set size"}
+    P -->|"small"| EX["Exact scan of allowed ids"]
+    P -->|"large"| FT["Filter-aware graph walk"]
+    EX --> M["Merge segments, skip tombstones, rescore"]
+    FT --> M
+    M --> R["Top-k + payloads"]
+```
+
+## Examples
+### The filtering problem, made visible
+This simulation uses exact similarity, so the only variable is *when* the filter is applied. One collection
+holds three tenants owning 90 %, 9.5 % and 0.5 % of the points. Post-filtering takes the top-k′ by
+similarity, then drops other tenants' points; pre-filtering builds the allowed-id set first and scans it
+exactly.
 
 ```python
 import numpy as np
@@ -155,64 +180,113 @@ for t in share:
 # small: post-filter results for k'=10/100/1000 -> [0, 0, 4]; pre-filter -> 10 results, scanned 997 vectors
 ```
 
-Read the output as the planner's decision table. Post-filtering returns about `k′ × selectivity`
-survivors: fine for the big tenant, and empty for the small one even at k′ = 1,000, a hundred times the
-requested k. Pre-filtering is always correct, but its cost is the size of the allowed set. Now scale to a
-production collection of 10 million 1,024-dimensional float32 vectors (4 KB each). The small tenant's
-50,000 vectors are about 200 MB to scan exactly, a few milliseconds to a few tens of milliseconds on one
-node depending on memory bandwidth and threads. The big tenant's 9 million are about 36 GB, which is far
-too much per query, so for it the engine must walk the graph and check the filter during traversal,
-where the filter hardly prunes anything. A good engine estimates the allowed-set size from the payload
-index and picks per query: exact scan below a threshold (Qdrant's `full_scan_threshold`, Weaviate's
-`flatSearchCutoff`), filter-aware graph search above it. When you evaluate an engine, test the tenant
-sizes in between, where neither strategy is cheap.
+- **Read the output as the planner's decision table.** Post-filtering returns about `k′ × selectivity`
+  survivors: fine for the big tenant, empty for the small one even at k′ = 1,000, a hundred times the
+  requested k.
+- **Pre-filtering is always correct,** but its cost is the size of the allowed set.
 
+### Worked scenario: scaling the same tenants to 10 million vectors
+A production collection of 10 million 1,024-dimensional float32 vectors (4 KB each), same tenant shares.
+
+| Tenant | Vectors | Bytes to scan exactly | Right strategy |
+|---|---|---|---|
+| small (0.5 %) | 50,000 | about 200 MB: a few ms to a few tens of ms on one node, depending on memory bandwidth and threads | exact scan of the allowed set |
+| big (90 %) | 9 million | about 36 GB: far too much per query | graph walk checking the filter during traversal, where the filter hardly prunes |
+| mid (9.5 %) | about 950,000 | about 3.8 GB | neither is cheap: the range to benchmark |
+
+- **A good engine picks per query.** It estimates the allowed-set size from the payload index: exact scan below
+  a threshold (Qdrant's `full_scan_threshold`, Weaviate's `flatSearchCutoff`), filter-aware graph search above.
+- **Test the tenant sizes in between,** where neither strategy is cheap.
+
+### Production setup in Qdrant
 In a real engine the setup is a payload index on the filtered field, for example
-`client.create_payload_index("chunks", field_name="tenant", field_schema="keyword")` in Qdrant, plus a
-filter passed with the query. A delete marks a tombstone and returns at once; its memory comes back when
-the segment is optimized. Neither behaviour shows on a toy collection, because servers brute-force
-segments below their indexing threshold. Benchmark at realistic sizes.
+`client.create_payload_index("chunks", field_name="tenant", field_schema="keyword")` in Qdrant, plus a filter
+passed with the query. For many small tenants, Qdrant's multitenancy setup builds graphs per tenant value
+instead of one global graph.
+
+```python
+from qdrant_client import QdrantClient, models
+
+client = QdrantClient(url="http://localhost:6333")
+client.create_collection(
+    "chunks",
+    vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
+    hnsw_config=models.HnswConfigDiff(payload_m=16, m=0),     # per-tenant graphs, no global graph
+)
+client.create_payload_index(
+    "chunks", field_name="tenant",
+    field_schema=models.KeywordIndexParams(type="keyword", is_tenant=True),
+)
+
+def search(tenant_from_auth, query_vector, k=10):            # tenant comes from auth, never the request
+    return client.query_points(
+        "chunks", query=query_vector, limit=k,
+        query_filter=models.Filter(must=[
+            models.FieldCondition(key="tenant", match=models.MatchValue(value=tenant_from_auth))]),
+    ).points
+```
+
+- **Deletes are eventual in memory.** A delete marks a tombstone and returns at once; its memory comes back
+  when the segment is optimized.
+- **Neither behaviour shows on a toy collection,** because servers brute-force segments below their indexing
+  threshold. Benchmark at realistic sizes.
+
+## Production patterns
+- **Shadow exact search for recall.** Sample a few hundred real queries with their real filters each week, run
+  them with exact search (Qdrant's `exact=True` search parameter, or a sequential scan in Postgres) and with
+  normal settings, and chart recall@k next to p99 latency. Alert when recall drops after weeks of writes.
+- **Turn on iterative scans in pgvector.** On pgvector 0.8 or later, set `hnsw.iterative_scan` (for example to
+  `relaxed_order`) so filtered queries keep walking until enough rows pass, and tune `hnsw.ef_search`. Monitor
+  queries that return fewer than k rows.
+- **Quantize with rescoring.** Enable scalar int8 quantization with rescoring against original vectors for
+  collections that strain RAM, and keep originals on disk. Compare recall@k before and after on the same
+  query sample.
+- **Watch segment health.** Track segment count, deleted-point count and optimizer status per collection;
+  rising tombstones with flat traffic mean compaction is falling behind, and latency will follow.
+- **Isolate whales, partition minnows.** Put the few very large tenants on dedicated shards or collections and
+  keep many small tenants in one collection with per-tenant indexing. Monitor p99 latency per tenant size
+  bucket, not just overall.
 
 ## Trade-offs
-- HNSW gives high recall at low latency but costs RAM for links plus vectors and a slow build; IVF or
-  disk-based indexes flip the choice when the corpus is billions of vectors or memory is the budget line.
-- Quantization cuts index memory by 4× to 32× and often speeds traversal, at a recall cost that rescoring
-  mostly recovers; it stops being worth it when the collection is small enough to fit unquantized anyway.
-- Pre-filtering is correct for selective filters but expensive when the filter matches most of the
+- **HNSW vs IVF or disk-based indexes.** HNSW gives high recall at low latency but costs RAM for links plus
+  vectors and a slow build; IVF or disk-based indexes win when the corpus is billions of vectors or memory is
+  the budget line.
+- **Quantization vs recall.** It cuts index memory by 4× to 32× and often speeds traversal, at a recall cost
+  that rescoring mostly recovers; not worth it when the collection fits unquantized anyway.
+- **Pre-filtering vs cost.** Correct for selective filters but expensive when the filter matches most of the
   collection; engines pick per query by estimated selectivity, and you should test both extremes.
-- Tenant-routed sharding gives isolation and single-shard queries, but a tenant larger than one shard
-  forces a hybrid of routing plus scatter-gather that most engines handle less gracefully.
-- A vector extension in an existing database saves a system and gives transactions with the chunk
-  tables, but it flips toward a dedicated engine when filtered recall, write throughput or memory
-  residency in the shared database become the bottleneck.
+- **Tenant-routed sharding vs large tenants.** Isolation and single-shard queries, but a tenant larger than
+  one shard forces routing plus scatter-gather, which most engines handle less gracefully.
+- **Extension vs dedicated engine.** An extension saves a system and gives transactions with the chunk
+  tables; it flips toward a dedicated engine when filtered recall, write throughput or memory residency in
+  the shared database become the bottleneck.
 
 ## Pitfalls
-- Post-filtering with a selective filter; the symptom is queries that return fewer than k results, or
-  none, for small tenants while large tenants work fine.
-- Measuring recall only on a freshly built index; the symptom is retrieval quality and latency drifting
-  worse over months as tombstones and segment fragmentation accumulate without compaction.
-- Sizing memory for vectors alone and forgetting graph links, payload and merge headroom; the symptom is
-  OOM kills during background index builds rather than during steady-state queries.
-- Storing large payloads such as full chunk text inside the vector engine; the symptom is RAM dominated
-  by text while the index itself is small, and slow snapshots and rebalances.
-- Relying on application code to add the tenant filter; the symptom is a cross-tenant result in a log or
-  a security review, which the ACL-aware retrieval lesson treats as a structural problem.
-- Expecting writes to be immediately searchable; the symptom is an integration test that upserts and
-  queries in the same millisecond and intermittently fails.
+- **Post-filtering with a selective filter.** Symptom: queries return fewer than k results, or none, for small
+  tenants while large tenants work fine.
+- **Measuring recall only on a freshly built index.** Symptom: retrieval quality and latency drift worse over
+  months as tombstones and segment fragmentation accumulate without compaction.
+- **Sizing memory for vectors alone,** forgetting graph links, payload and merge headroom. Symptom: OOM kills
+  during background index builds rather than steady-state queries.
+- **Large payloads such as full chunk text inside the vector engine.** Symptom: RAM dominated by text while
+  the index itself is small, and slow snapshots and rebalances.
+- **Relying on application code to add the tenant filter.** Symptom: a cross-tenant result in a log or a
+  security review, which the ACL-aware retrieval lesson treats as a structural problem.
+- **Expecting writes to be immediately searchable.** Symptom: an integration test that upserts and queries in
+  the same millisecond and intermittently fails.
 
 ## When to use
-Think in these terms whenever you choose or tune a vector store, size a cluster, or debug retrieval that
-is correct in notebooks and wrong in production. The questions to answer are concrete: how selective are
-the filters you will run, how many writes and deletes per hour, does the index fit in RAM with headroom,
-how many tenants and how skewed are they, and what recall at what p99 latency. Benchmark filtered recall
-and latency at your real selectivity, not the vendor's. Recall has a precise meaning here: take a few
-hundred real queries with their real filters, compute the exact top-k by brute force, and report the
-fraction of those ids the engine returns, at the p99 latency you get with the same settings. Repeat
-after a month of writes and deletes, because a freshly built index is the best case. Start with pgvector when the chunk tables already
-live in Postgres and the corpus is in the low millions; move to a dedicated engine when the architecture
-above says one of its mechanisms is what you need. In interviews, explaining why a selective filter
-breaks naive ANN and how segments and tombstones make deletes eventual is the level expected of an
-architect.
+- **Think in these terms** whenever you choose or tune a vector store, size a cluster, or debug retrieval that
+  is correct in notebooks and wrong in production.
+- **Answer concretely:** how selective are your filters, how many writes and deletes per hour, does the index
+  fit in RAM with headroom, how many tenants and how skewed, and what recall at what p99 latency.
+- **Measure recall precisely.** Take a few hundred real queries with their real filters, compute exact top-k
+  by brute force, report the fraction of those ids the engine returns at the p99 latency of the same
+  settings. Repeat after a month of writes and deletes, because a fresh index is the best case.
+- **Start with pgvector** when the chunk tables already live in Postgres and the corpus is in the low
+  millions; move to a dedicated engine when one of the mechanisms above is what you need.
+- **Interviews:** explaining why a selective filter breaks naive ANN, and how segments and tombstones make
+  deletes eventual, is the level expected of an architect.
 
 ## Role lens
 - **Engineer:** Creates payload indexes for every filtered field, sets `ef` and quantization per
@@ -243,6 +317,39 @@ of a huge one. Second, put the handful of very large tenants on dedicated shards
 gives them isolation and predictable latency. Third, enforce the filter in a retrieval service that
 derives `tenant_id` from authentication, never from the request body. Then verify with recall@k against
 exact search, measured separately at the smallest, median and largest tenant sizes.
+
+## Interview questions
+### Why can't you just bolt a metadata filter onto an HNSW search?
+- **Post-filtering loses results:** survivors are about k′ × selectivity, so a 0.5 % tenant gets nothing from a
+  top-100 and only a handful from a top-1,000.
+- **Pre-filtering breaks the graph:** restricting traversal to a small allowed set leaves it disconnected, so
+  engines brute-force small sets and use filter-aware traversal for large ones.
+- **So the planner must estimate selectivity per query,** which is why payload indexes are mandatory.
+
+### Deletes return instantly, yet memory and latency keep climbing. What is going on?
+- **Tombstones, not removal:** a delete marks a bitmap consulted at query time; the graph node and memory stay
+  until compaction rebuilds the segment.
+- **Check** deleted-point counts, segment counts and optimizer status; a backlog means compaction is starved.
+- **Fix:** give compaction resources or schedule it after bulk deletes, and re-measure recall afterwards.
+
+### When would you stay on pgvector instead of a dedicated vector database?
+- **When the chunks already live in Postgres** and the corpus is in the low millions: you get transactions,
+  joins and row security with no extra system.
+- **Move** when the index no longer fits comfortably in the database's memory, or filtered recall and write
+  throughput become the bottleneck.
+- **Check first** whether iterative index scans on a newer pgvector already fix the filtered-recall problem.
+
+### How many bytes does an exact scan read per query at 10 million 1,024-dimensional vectors?
+- **Per vector:** 1,024 × 4 bytes = 4 KB, so the whole collection is about 40 GB of reads.
+- **Per tenant:** a 0.5 % tenant is about 200 MB, cheap to scan; a 90 % tenant is about 36 GB, which needs the
+  graph.
+- **The planner's threshold** sits between those, and the mid-sized tenants are what you benchmark.
+
+### How do you design multi-tenancy for thousands of tenants of very different sizes?
+- **Many small tenants:** one collection with per-tenant index structure, so each is searched exactly or as a
+  small graph.
+- **A few very large tenants:** dedicated shards or collections for isolation and predictable latency.
+- **Security:** a retrieval service derives the tenant from authentication and always applies the filter.
 
 ## Quiz
 ### Q: Why does an HNSW index need to be resident in RAM to perform well?

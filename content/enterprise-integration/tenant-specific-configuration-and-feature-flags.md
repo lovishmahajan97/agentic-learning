@@ -5,7 +5,7 @@ name: Tenant-specific configuration & feature flags
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/tenant-isolation
   - enterprise-integration/sandbox-vs-production-environments
@@ -21,41 +21,40 @@ sources:
 ---
 
 ## TL;DR
-Every enterprise customer wants something slightly different: another model, a stricter guardrail, a
-different connector, a feature switched off until their legal team signs off. Tenant-specific
-configuration expresses those differences as typed, versioned data resolved at runtime, and feature
-flags decide who gets which code path, so one codebase serves every customer. The alternative, a branch
-or fork per customer, works for the first three and becomes unmaintainable by the tenth.
+Tenant configuration expresses each customer's differences (model, guardrails, connectors, enabled
+features) as typed, versioned data resolved at runtime, and feature flags decide who gets which code
+path, so one codebase serves every customer instead of a fork per customer.
 
 ## Why it exists
-The first enterprise customer gets the product as built. The second needs answers in German, a
-retrieval source that is Confluence rather than SharePoint, and a refusal policy for HR questions. The
-third is in a regulated industry and cannot use one of your model providers at all. The fastest way to
-ship each of these is an `if customer == "acme":` in the code, or a branch deployed only for them. Both
-work at first and both decay quickly.
-
-Hard-coded customer checks scatter policy across the codebase, so nobody can answer "what is different
-about Acme?" without grepping, and every change has to consider every customer's special case by hand.
-Per-customer branches are worse: a security fix or a model upgrade must be merged into N branches,
-testing multiplies by N, and the branches drift until some customers run code months old. The naive
-alternative of "one configuration for everyone" fails the other way, because enterprise deals are often
-won on exactly these differences.
-
-The pattern that survives is to separate *what varies per tenant* (data, resolved at runtime) from
-*the code that reads it* (one version, deployed everywhere), and to separate *configuration* (a durable
-statement about how this tenant works) from *feature flags* (a usually temporary decision about who sees
-a code path). Doing so makes differences inspectable, testable and auditable, and lets you change a
-tenant's behaviour without a deploy, which in an AI product is frequent because prompts, models and
-thresholds change far more often than code.
+- **Every customer wants something different.** The first gets the product as built. The second needs
+  answers in German, Confluence rather than SharePoint, and a refusal policy for HR questions. The third
+  is regulated and cannot use one of your model providers at all.
+- **Hard-coded checks decay.** An `if customer == "acme":` ships fastest but scatters policy across the
+  codebase, so nobody can answer "what is different about Acme?" without grepping, and every change must
+  consider every special case by hand.
+- **Per-customer branches are worse.** A security fix or model upgrade must be merged into N branches,
+  testing multiplies by N, and branches drift until some customers run code months old. It works for the
+  first three customers and becomes unmaintainable by the tenth.
+- **One configuration for everyone fails the other way,** because enterprise deals are often won on
+  exactly these differences.
+- **What survives: two separations.** *What varies per tenant* (data, resolved at runtime) is separate
+  from *the code that reads it* (one version, deployed everywhere); *configuration* (a durable statement
+  about how this tenant works) is separate from *feature flags* (a usually temporary decision about who
+  sees a code path). Differences become inspectable, testable and auditable, and change without a deploy,
+  which in an AI product is frequent because prompts, models and thresholds change far more often than
+  code.
 
 ## How it works
 ### What goes in tenant configuration
-Typical per-tenant settings in an AI product: allowed model providers and the default model; prompt
-template version; retrieval sources and their connector settings; guardrail policy and thresholds;
-language and tone; data residency region; rate limits and token budgets; enabled integrations; and
-which tools an agent may call. Secrets (API keys, connector credentials) are *referenced* by name from
-configuration and stored in a secrets manager, because configuration is read widely, logged and diffed,
-and secrets must not be.
+Typical per-tenant settings in an AI product:
+- **Models:** allowed model providers and the default model.
+- **Behaviour:** prompt template version, guardrail policy and thresholds, language and tone.
+- **Data:** retrieval sources and their connector settings, data residency region.
+- **Limits:** rate limits and token budgets.
+- **Capabilities:** enabled integrations and which tools an agent may call.
+- **Secrets are referenced, never stored.** API keys and connector credentials are *referenced* by name
+  and stored in a secrets manager, because configuration is read widely, logged and diffed, and secrets
+  must not be.
 
 ### Layered resolution
 Configuration is resolved by merging layers from general to specific, with the most specific winning:
@@ -64,62 +63,80 @@ Configuration is resolved by merging layers from general to specific, with the m
 global defaults  <  plan tier  <  region / deployment  <  tenant  <  environment override
 ```
 
-This exists *because* most tenants differ in a handful of keys. Storing full configurations per tenant
-means a new default must be copied into every tenant record; storing only overrides means a new default
-reaches everyone who has not opted out. The resolved result is validated against a typed schema before
-use, because a typo in a key or an out-of-range threshold should fail at write time in an admin tool,
-not at 2 a.m. inside a request.
+- **Why layers.** Most tenants differ in a handful of keys. Full configurations per tenant mean a new
+  default must be copied into every tenant record; overrides alone mean a new default reaches everyone
+  who has not opted out.
+- **Validate the resolved result** against a typed schema before use, because a typo in a key or an
+  out-of-range threshold should fail at write time in an admin tool, not at 2 a.m. inside a request.
 
 ### Versioning and audit
-Each change to a tenant's configuration creates a new immutable version with author, timestamp and
-reason, and requests log the configuration version they ran under. This matters more for AI than for
-ordinary software: when a customer reports that answers got worse on Tuesday, the first question is what
-changed, and a prompt version or retrieval threshold changed by an admin is as likely a cause as a deploy.
-A config change that alters model behaviour should go through the same evaluation gate as code: run the
-tenant's regression suite against the new version before activating it.
+1. **Every change creates a new immutable version** with author, timestamp and reason.
+2. **Every request logs the configuration version** it ran under. When a customer reports answers got
+   worse on Tuesday, the first question is what changed, and a prompt version or retrieval threshold
+   changed by an admin is as likely a cause as a deploy.
+3. **Behaviour-changing config goes through the eval gate.** Run the tenant's regression suite against the
+   new version before activating it, as you would for code.
 
 ### Feature flags, and their four kinds
 A flag is a runtime decision about which code path runs, evaluated against a context (tenant, user,
 environment, percentage bucket). Hodgson's taxonomy separates them by lifetime and owner, which is the
 useful distinction:
-- **Release flags** hide unfinished or unproven work; short-lived, removed once the feature is on for
-  everyone.
-- **Experiment flags** split traffic to compare variants (two prompts, two rerankers); removed when the
-  experiment concludes.
-- **Ops flags / kill switches** let on-call turn off an expensive or misbehaving path (a costly model, an
-  external tool) without a deploy; long-lived by design.
-- **Permission or entitlement flags** gate features by plan or contract; effectively long-lived tenant
-  configuration and better modelled as such.
 
-Treating these the same causes trouble: release flags that are never removed become permanent
-branching, and entitlements implemented as ad hoc flags get lost when someone cleans up "old flags".
+| Kind | Purpose | Lifetime |
+|---|---|---|
+| **Release flags** | hide unfinished or unproven work | short; removed once on for everyone |
+| **Experiment flags** | split traffic between variants (two prompts, two rerankers) | removed when the experiment concludes |
+| **Ops flags / kill switches** | let on-call turn off an expensive or misbehaving path (a costly model, an external tool) without a deploy | long-lived by design |
+| **Permission or entitlement flags** | gate features by plan or contract | effectively long-lived tenant configuration; better modelled as such |
+
+Treating them the same causes trouble: release flags never removed become permanent branching, and
+entitlements implemented as ad hoc flags get lost when someone cleans up "old flags".
 
 ### Evaluation mechanics
-Flag and config lookups sit on the request path, so they are served from an in-process cache refreshed
-by polling or streaming from the flag service. During an outage the cache keeps serving last-known
-values; the coded default is what a process uses when it has no value at all, typically a pod that
-started while the service was unreachable. That default must be the conservative path (feature off, stricter guardrail) *because* an outage of the
-config service should degrade capability, not remove protections. Percentage rollouts hash a stable key
-(tenant ID, or user ID within a tenant) so a given user stays in the same bucket across requests, and
-salt it with the flag name so the same users are not first in line for every rollout.
-Vendor-neutral SDK interfaces such as OpenFeature let application code evaluate flags without binding
-to one flag vendor.
-
-Resolve once per unit of work and pin the result. An agent run or a multi-turn conversation that
-re-reads configuration at every step can switch prompt version, model or tool list halfway through when
-an admin saves a change, producing a run that no single configuration version explains and that cannot
-be reproduced. Snapshot the resolved config (and the flag decisions) at the start of the request, job or
-conversation, carry its version in the trace, and let changes take effect at the next unit. The cache
-itself must be keyed by tenant, *because* a cache keyed by flag name alone is a cross-tenant leak: the
-first tenant to resolve a key sets it for everyone.
+- **Serve from an in-process cache.** Lookups sit on the request path, so they come from a cache refreshed
+  by polling or streaming from the flag service. During an outage it keeps serving last-known values.
+- **The coded default must be conservative.** It is what a process uses with no value at all, typically a
+  pod started while the service was unreachable. Make it the conservative path (feature off, stricter
+  guardrail) *because* a config-service outage should degrade capability, not remove protections.
+- **Hash a stable key for percentage rollouts.** Use tenant ID, or user ID within a tenant, so a user stays
+  in the same bucket across requests, and salt it with the flag name so the same users are not first in
+  line for every rollout.
+- **Use a vendor-neutral interface.** SDK interfaces such as OpenFeature let application code evaluate
+  flags without binding to one flag vendor.
+- **Resolve once per unit of work and pin it.** An agent run or conversation that re-reads config at every
+  step can switch prompt version, model or tool list halfway through when an admin saves a change,
+  producing a run no single version explains and nobody can reproduce. Snapshot the resolved config and
+  flag decisions at the start of the request, job or conversation, carry its version in the trace, and
+  apply changes at the next unit.
+- **Key the cache by tenant,** *because* a cache keyed by flag name alone is a cross-tenant leak: the
+  first tenant to resolve a key sets it for everyone.
 
 ### Keeping the matrix testable
-Each independent boolean doubles the number of possible combinations, so you cannot test them all. The
-practical answer is to test the combinations tenants actually run (pull the resolved configs of live
-tenants into CI), keep the number of live flags small, and give each release flag an owner and a removal
-date.
+Each independent boolean doubles the possible combinations, so you cannot test them all:
+- **Test what tenants actually run:** pull the resolved configs of live tenants into CI.
+- **Keep the number of live flags small.**
+- **Give each release flag an owner and a removal date.**
 
-## Example
+## Diagram
+A request resolves its tenant's layered config once, validates it, pins it for the whole unit of work and
+evaluates flags against it; an unreachable service falls back to the conservative default.
+
+```mermaid
+flowchart TD
+    R["Request or agent run starts"] --> C{"Tenant-keyed cache has value?"}
+    C -->|"no and service down"| D["Conservative coded default"]
+    C -->|"yes"| M["Merge: global, plan, region, tenant, env"]
+    M --> V{"Schema valid?"}
+    V -->|"no"| E["Reject change at write time"]
+    V -->|"yes"| P["Pin snapshot and config version"]
+    D --> P
+    P --> F["Evaluate flags: hash of flag and user"]
+    F --> X["Run code path"]
+    X --> T["Trace logs config version and flag decisions"]
+```
+
+## Examples
+### A layered resolver with validation and stable rollout buckets
 A minimal layered resolver with validation, versioning and a conservative fallback. The schema is the
 contract; overrides are partial dictionaries.
 
@@ -168,54 +185,115 @@ cfg = resolve("globex", "enterprise")
 print(cfg.retrieval_top_k, in_rollout("new_reranker", "globex:u-1842", cfg.new_reranker_pct))
 ```
 
-Acme gets a German prompt and a single allowed provider; Globex gets a quarter of users on the new
-reranker; both inherit the enterprise `top_k`. The rollout percentage sits in the config only to keep
-the sketch short; in practice it lives in the flag service with an owner and a removal date, which is
-the separation the section above argues for. Setting `model="b-large"` for Acme would fail validation
-before any request runs, because the contract forbids that provider for that tenant.
+- **What each tenant gets.** Acme gets a German prompt and a single allowed provider; Globex gets a quarter
+  of users on the new reranker; both inherit the enterprise `top_k`.
+- **Where the rollout belongs.** The percentage sits in the config only to keep the sketch short; in
+  practice it lives in the flag service with an owner and a removal date, the separation argued above.
+- **Validation as contract.** Setting `model="b-large"` for Acme would fail validation before any request
+  runs, because the contract forbids that provider for that tenant.
+
+### Pinning the config for a conversation
+A runnable sketch of why snapshots matter: an admin saves a new prompt version mid-conversation, and only
+the pinned path stays consistent.
+
+```python
+store = {"acme": {"version": 41, "prompt_version": "support-v7-de"}}
+
+def live_lookup(tenant):
+    return store[tenant]
+
+def run_conversation(tenant, turns, pin, admin_edit_at):
+    snapshot = dict(live_lookup(tenant)) if pin else None
+    used = []
+    for turn in range(turns):
+        if turn == admin_edit_at:   # admin saves a change mid-run
+            store[tenant] = {"version": 42, "prompt_version": "support-v8-de"}
+        cfg = snapshot if pin else live_lookup(tenant)
+        used.append(cfg["version"])
+    store[tenant] = {"version": 41, "prompt_version": "support-v7-de"}   # reset for the demo
+    return used
+
+print(run_conversation("acme", 4, pin=False, admin_edit_at=2))  # [41, 41, 42, 42] mixed run
+print(run_conversation("acme", 4, pin=True, admin_edit_at=2))   # [41, 41, 41, 41] reproducible
+```
+
+### Worked scenario: rolling a new model to fifty tenants
+Illustrative plan using tenant config plus a release flag.
+
+| Wave | Tenants | Gate before enabling | Result |
+|---|---|---|---|
+| 0 | 3 barred by contract | validation rejects the provider | never switched |
+| 1 | 10 low-risk | regression suite per tenant | all pass, enabled |
+| 2 | 35 standard | suite plus a week of feedback metrics on wave 1 | 33 pass; 2 held on a threshold tweak |
+| 3 | 2 with past complaints | shadow traffic, then suite | enabled last |
+
+After wave 3 the flag is removed and the new model becomes the default; the old one stays only as a kill
+switch target.
+
+## Production patterns
+- **Resolved-config viewer with provenance.** Use as soon as layers exist. An admin view or CLI that prints
+  each key's resolved value and the layer that set it. Monitor how many tenants override each key; a key
+  everyone overrides should become the default.
+- **Config changes through the eval gate.** Use for any key that changes model behaviour (prompt version,
+  model, thresholds). Saving a new version triggers the tenant's regression suite, and activation waits
+  on a pass. Monitor gate failures and time from save to activation.
+- **Flag hygiene with owner and expiry.** Use for every release and experiment flag. Record an owner and a
+  removal date at creation and fail CI or open a ticket when a flag passes its date. Monitor live flag
+  count and median flag age.
+- **Kill switches for expensive or external paths.** Use for costly models and third-party tools. A
+  long-lived ops flag, default off-path when unknown, that on-call can flip without a deploy. Monitor how
+  often it is flipped and time to recovery.
+- **Config version in every trace.** Use always. Stamp the pinned config version and flag decisions on
+  each request, job or conversation span. Monitor quality metrics broken down by config version so a
+  regression is attributable to a save, not just a deploy.
 
 ## Trade-offs
-- Runtime configuration lets you change tenant behaviour without a deploy, but a config change can break
-  a tenant as surely as a code change, so it needs the same review and evaluation gate once it touches
-  prompts, models or thresholds.
-- Layered overrides keep tenant records small and let new defaults propagate, but they make "what does
-  this tenant actually run?" a computed answer; you need a tool that shows the resolved config and which
-  layer set each key. The same propagation cuts the other way: editing a global default is a change to
-  every tenant that has not overridden it, so once a key affects model behaviour, a default change needs
-  a staged rollout (a release flag over the new default) rather than a single save.
-- Feature flags decouple deploy from release and give on-call kill switches, but each live flag doubles
-  the theoretical test matrix; the benefit flips to a cost once flags outlive their purpose.
-- A managed flag service gives targeting, audit and UI for free, but adds a dependency on the request
-  path; for a handful of long-lived entitlements a typed config table you own is simpler.
-- Allowing deep per-tenant customization wins deals, but past some point you are running N products; the
-  trade flips when customization requests start requiring code paths no other tenant uses.
+- **No-deploy changes vs config-caused breakage.** Runtime configuration changes tenant behaviour without
+  a deploy, but a config change can break a tenant as surely as a code change, so it needs the same review
+  and evaluation gate once it touches prompts, models or thresholds.
+- **Small override records vs computed answers.** Layered overrides let new defaults propagate, but make
+  "what does this tenant actually run?" a computed answer, so you need a tool showing the resolved config
+  and which layer set each key.
+- **Propagation cuts both ways.** Editing a global default changes every tenant that has not overridden
+  it, so once a key affects model behaviour a default change needs a staged rollout (a release flag over
+  the new default) rather than a single save.
+- **Decoupled release vs test matrix.** Flags decouple deploy from release and give on-call kill switches,
+  but each live flag doubles the theoretical test matrix; the benefit flips to a cost once flags outlive
+  their purpose.
+- **Managed flag service vs owned table.** A service gives targeting, audit and UI for free but adds a
+  dependency on the request path; for a handful of long-lived entitlements a typed config table you own
+  is simpler.
+- **Deep customization vs N products.** It wins deals, but past some point you are running N products; the
+  trade flips when requests start requiring code paths no other tenant uses.
 
 ## Pitfalls
-- Customer names in code (`if tenant == "acme"`); the symptom is that nobody can list a tenant's
-  differences without grepping, and a refactor silently drops one customer's behaviour.
-- Release flags that are never removed; the symptom is dozens of stale flags, dead code paths that
-  still need testing, and an incident when someone flips one nobody remembers.
-- A fallback default that is the permissive path; the symptom shows during a flag-service outage, when
-  guardrails or redaction quietly switch off for every tenant.
-- Not logging the config version per request; the symptom is a quality regression report you cannot
+- **Customer names in code** (`if tenant == "acme"`). Symptom: nobody can list a tenant's differences
+  without grepping, and a refactor silently drops one customer's behaviour.
+- **Release flags that are never removed.** Symptom: dozens of stale flags, dead code paths that still
+  need testing, and an incident when someone flips one nobody remembers.
+- **A fallback default that is the permissive path.** Symptom: during a flag-service outage, guardrails or
+  redaction quietly switch off for every tenant.
+- **Not logging the config version per request.** Symptom: a quality regression report you cannot
   attribute, because a prompt version changed by an admin left no trace in the trace.
-- Putting secrets or connector credentials directly in tenant configuration; the symptom is API keys
-  appearing in admin UIs, config diffs and debug logs.
-- Re-reading configuration at every step of a long agent run or conversation; the symptom is a trace in
-  which the prompt version or model changes mid-run, and a bug report nobody can reproduce because no
-  single config version produced it.
-- Unvalidated free-form JSON config; the symptom is a typoed key that is silently ignored, so the tenant
-  runs the default and nobody notices until the customer does.
+- **Secrets or connector credentials directly in tenant configuration.** Symptom: API keys appearing in
+  admin UIs, config diffs and debug logs.
+- **Re-reading configuration at every step of a long agent run or conversation.** Symptom: a trace in which
+  the prompt version or model changes mid-run, and a bug report nobody can reproduce because no single
+  config version produced it.
+- **Unvalidated free-form JSON config.** Symptom: a typoed key is silently ignored, so the tenant runs the
+  default and nobody notices until the customer does.
 
 ## When to use
-Introduce tenant configuration as soon as a second customer needs something the first does not, and
-before the first customer-specific `if` lands. Keep it typed and validated from day one; retrofitting a
-schema onto a pile of free-form overrides is painful. Use release flags for every risky AI change
-(a new model, prompt or retriever), enabling it tenant by tenant while watching each tenant's eval and
-feedback metrics. Use kill switches for anything expensive or external. Measure the number of live
-flags, their age, and how many tenants run non-default values for each key; a key that every tenant
-overrides should become the new default. In interviews, expect to be asked how you would roll out a new
-model to fifty enterprise tenants without a fork per customer.
+- **Introduce tenant configuration** as soon as a second customer needs something the first does not, and
+  before the first customer-specific `if` lands.
+- **Type and validate from day one;** retrofitting a schema onto a pile of free-form overrides is painful.
+- **Use release flags for every risky AI change** (a new model, prompt or retriever), enabling it tenant
+  by tenant while watching each tenant's eval and feedback metrics. Use kill switches for anything
+  expensive or external.
+- **Measure:** the number of live flags, their age, and how many tenants run non-default values for each
+  key; a key that every tenant overrides should become the new default.
+- **Interviews:** expect to be asked how you would roll out a new model to fifty enterprise tenants
+  without a fork per customer.
 
 ## Role lens
 - **Engineer:** Implements the typed resolver, caches lookups on the request path, logs config version
@@ -235,6 +313,40 @@ enabling it for them, start with low-risk tenants, and leave the two sensitive o
 with shadow traffic first. Log model and config version per request so any regression is attributable,
 keep the old model as the conservative fallback and a kill switch, and remove the flag once every
 eligible tenant is migrated.
+
+## Interview questions
+### What is the difference between tenant configuration and a feature flag?
+- **Configuration is a durable statement** about how a tenant works (allowed providers, residency region,
+  prompt version), typed, versioned and audited.
+- **A flag is a usually temporary decision** about who sees a code path; release and experiment flags
+  should be deleted once their job is done.
+- **Entitlements blur the line,** so model them as configuration; ad hoc entitlement flags get lost in
+  flag clean-ups.
+
+### A customer says answers got worse on Tuesday and there was no deploy. How do you investigate?
+- **Pull the config version from the traces** for that tenant before and after Tuesday; an admin change
+  to a prompt version or retrieval threshold is as likely as a deploy.
+- **Diff the resolved configs,** including inherited layers, since a global default edit also changes
+  every non-overriding tenant.
+- **Re-run the tenant's regression suite** on both versions to confirm, then roll back by activating the
+  previous immutable version.
+
+### What should a flag client do when the flag service is down, and why?
+- **Serve last-known values from the in-process cache,** so most processes keep their current behaviour.
+- **With no value at all, use the conservative coded default** (feature off, stricter guardrail), because
+  an outage should reduce capability, not remove protections.
+
+### When would you not use a managed feature-flag service?
+- **When flags are few and long-lived.** A handful of entitlements fits a typed config table you own,
+  without adding a dependency on the request path.
+- **The service earns its place** when you run many short-lived release and experiment flags that need
+  targeting, percentage rollouts, audit and a UI for non-engineers.
+
+### How do you keep the flag and config matrix testable as tenants grow?
+- **Test the combinations tenants actually run** by pulling live resolved configs into CI, since each
+  independent boolean doubles the theoretical matrix.
+- **Cap live flags and expire them** with an owner and removal date.
+- **Watch override counts per key** and promote universal overrides to defaults, shrinking variation.
 
 ## Quiz
 ### Q: Why should a feature-flag client fall back to the conservative path when the flag service is unreachable?

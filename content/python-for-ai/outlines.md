@@ -5,7 +5,7 @@ name: Outlines
 kind: tool
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/instructor
   - python-for-ai/pydantic
@@ -21,8 +21,8 @@ sources:
 
 ## TL;DR
 Outlines makes model output match a regex, JSON Schema, choice list or grammar *by construction*, by
-masking tokens that would break the pattern before sampling. Invalid output becomes impossible, but it
-needs logit access, so it fits self-run models, not closed hosted APIs.
+masking tokens that would break the pattern before sampling, so invalid output is impossible. It needs
+logit access: self-run models or engines integrating it, not closed hosted APIs.
 
 ## Why it exists
 - **Sampling knows nothing about your format.** A model samples one token at a time over its whole
@@ -102,11 +102,11 @@ Two mechanisms make this worse than it sounds:
   carefully, but constraints guarantee syntax, never correctness.
 
 ## Diagram
-The left half runs once per (pattern, tokenizer) pair; the loop on the right runs every token and only
-does a lookup and a mask.
+The top half (pattern to index) runs once per (pattern, tokenizer) pair; the loop below it runs every
+token and only does a lookup and a mask.
 
 ```mermaid
-flowchart LR
+flowchart TD
     S["Regex, JSON Schema or choice list"] --> R["Compile to regex"]
     R --> F["Character-level FSM"]
     F --> I[("Index: state to allowed tokens and next state")]
@@ -190,8 +190,9 @@ print(Ticket.model_validate_json(raw))   # always parses; may still be the wrong
   starts so no request pays compile latency; for dynamic schemas, cache by a hash of the schema plus
   tokenizer. Monitor compile time and cache hit rate.
 - **Constrain in the serving engine.** When serving with vLLM or a similar engine, request structured
-  output per call through its OpenAI-compatible JSON-schema option instead of embedding Outlines in app
-  code; the backend is an engine setting whose name varies by version. Monitor per-token latency with and
+  output per call through its OpenAI-compatible API (`response_format` with `"type": "json_schema"`)
+  instead of embedding Outlines in app code; which decoding backend runs is an engine setting whose name
+  varies by version. Monitor per-token latency with and
   without constraints.
 - **Bound every free-text field.** Use `Field(max_length=...)` (JSON Schema `maxLength`) on strings and
   set `max_new_tokens` above the longest valid output. Monitor how often generation stops at the token
@@ -217,11 +218,12 @@ print(Ticket.model_validate_json(raw))   # always parses; may still be the wrong
 
 ## Pitfalls
 - **Unbounded strings or whitespace in the pattern.** The model can fill tokens until `max_new_tokens`.
-  Symptom: outputs truncated at the limit, which then fail to parse despite the constraint.
+  Symptom: outputs truncated at the limit, which then fail to parse despite the constraint. Fix: bound
+  strings with `maxLength`.
 - **Assuming constrained output is correct output.** Symptom: a perfect parse rate alongside poor accuracy
   on a labelled set, because format and truth are different properties.
 - **Answer field before any reasoning field.** The label is committed first. Symptom: lower accuracy than
-  the same model achieves in free-form chain-of-thought.
+  the same model achieves in free-form chain-of-thought. Fix: put a bounded `reasoning` field first.
 - **Copying tutorial code across major versions.** The `outlines.generate.*` functions and the old
   `outlines.models.transformers(...)` loader are pre-1.0 idioms. Symptom: `AttributeError` or `TypeError`
   on those calls after an upgrade.

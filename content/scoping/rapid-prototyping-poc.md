@@ -5,7 +5,7 @@ name: Rapid prototyping / PoC
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - scoping/timeboxing
   - scoping/demos
@@ -17,93 +17,121 @@ related:
 ---
 
 ## TL;DR
-A rapid prototype is a cheap, usually disposable build that answers "what should this be?" by putting
-something in front of users. A proof of concept (PoC) answers "can this work?" by testing the single
-riskiest technical assumption against pass/fail criteria on real data. Both exist to buy information
-cheaply; they fail when they test the easy part, use clean sample data, or never end in a decision.
+A rapid prototype is a cheap, disposable build asking "what should this be?"; a proof of concept (PoC)
+asks "can this work?" against pass/fail criteria on real data. Both buy information cheaply and fail
+when they test the easy part or never decide.
 
 ## Why it exists
-An AI project carries two kinds of uncertainty that specifications cannot remove. The first is
-*desirability*: will users actually want an assistant that drafts replies, or do they want a better
-search box? The second is *feasibility*: can a model achieve the accuracy, latency and cost the use case
-needs on this customer's data? Neither can be settled by discussion. A written spec for "an AI that
-summarizes claims files" hides whether the summaries are useful and whether the model gets the dates
-right on scanned forms.
-
-The naive approach is to commit to the full build and discover the answers along the way. That is
-expensive in the worst way: the integration, UI, auth and deployment work, most of the budget, gets done
-before anyone learns that the core model step reaches 70% when the business needs 95%. The opposite
-mistake is endless exploration in notebooks with no criteria, which produces impressive anecdotes and no
-decision.
-
-Prototypes and PoCs sit in between. They are deliberately incomplete builds aimed at one uncertainty at a
-time, so you spend days rather than months finding out whether the idea survives contact with users and
-data. They are cheap because they skip everything that is not under test, and that same omission is why
-they must not be mistaken for the product.
+- **Two uncertainties no spec removes.** *Desirability*: do users want an assistant that drafts replies, or
+  a better search box? *Feasibility*: can a model hit the accuracy, latency and cost the use case needs on
+  this customer's data? Neither is settled by discussion.
+- **Specs hide both.** A written spec for "an AI that summarizes claims files" hides whether the summaries
+  are useful and whether the model gets the dates right on scanned forms.
+- **Committing to the full build is expensive in the worst way.** Integration, UI, auth and deployment,
+  most of the budget, get done before anyone learns the core model step reaches 70% when the business needs
+  95%.
+- **Endless notebook exploration fails the other way.** With no criteria it produces impressive anecdotes
+  and no decision.
+- **Prototypes and PoCs sit in between.** Deliberately incomplete builds aimed at one uncertainty at a time,
+  so you spend days rather than months learning whether the idea survives users and data. They are cheap
+  because they skip everything not under test, which is also why they must not be mistaken for the product.
 
 ## How it works
 ### Prototype vs. PoC: different questions
-A **prototype** tests the experience: the workflow, the interaction, what output format is useful. It can
-be crude, even partly faked (a "Wizard of Oz" prototype where a person produces the "AI" output behind the
-scenes), *because* the question is about the human, not the model. A **PoC** tests technical feasibility:
-it must use the real model, real data and a real metric, *because* faking any of those invalidates the
-answer. Mixing the two questions into one build usually answers neither well. Neither is a pilot (real
-users doing real work, measuring business impact) or an MVP (the smallest version you would actually
-ship and support); a PoC that passes earns a pilot, not a launch.
+| | Prototype | PoC |
+|---|---|---|
+| Question | what should the experience be? | can this work technically? |
+| Tests | workflow, interaction, useful output format | model, data, metric |
+| Can fake | yes, even the AI ("Wizard of Oz": a person produces the output behind the scenes), because the question is about the human | no: real model, real data, real metric, because faking any invalidates the answer |
+
+- **Do not mix the two questions** into one build; it usually answers neither well.
+- **Neither is a pilot** (real users doing real work, measuring business impact) **or an MVP** (the smallest
+  version you would actually ship and support). A PoC that passes earns a pilot, not a launch.
 
 ### 1. Find the riskiest assumption
-List what must be true for the project to succeed (the data is accessible, the model can read these
-documents, latency fits the workflow, cost per transaction fits the budget, users trust the output). Rank
-by likelihood of being false times cost if false. The PoC targets the top item; everything else can be
-stubbed.
+- **List what must be true:** the data is accessible, the model can read these documents, latency fits the
+  workflow, cost per transaction fits the budget, users trust the output.
+- **Rank** by likelihood of being false times cost if false.
+- **Target the top item;** everything else can be stubbed.
 
 ### 2. State a hypothesis with a threshold
-"Using a general-purpose model with retrieval over the policy manual, at least 85% of answers to 100
-real employee questions will be judged correct and grounded." The threshold comes from the business
-need, *because* "it works pretty well" cannot be passed or failed.
+- **Example:** "Using a general-purpose model with retrieval over the policy manual, at least 85% of answers
+  to 100 real employee questions will be judged correct and grounded."
+- **The threshold comes from the business need,** because "it works pretty well" cannot be passed or failed.
 
 ### 3. Build the eval set from real data first
-Collect real inputs, including messy ones, and label expected outputs with domain experts. Fifty to a few
-hundred examples is a common scale for a PoC, enough to see error categories, though small sets give
-wide confidence intervals. This comes first *because* every later decision is read off this set. Size it
-with the binomial interval for a measured accuracy *p* on *n* examples:
+- **Collect real inputs,** including messy ones, and label expected outputs with domain experts.
+- **Scale:** fifty to a few hundred examples is common for a PoC, enough to see error categories, though
+  small sets give wide confidence intervals.
+- **It comes first** because every later decision is read off this set.
+
+Size it with the binomial interval for a measured accuracy *p* on *n* examples:
 
 ```
 95% half-width ≈ 1.96 × sqrt(p(1 − p) / n)
 n ≈ 1.96² × p(1 − p) / E²     (examples needed for half-width E)
 ```
 
-At *p* = 0.85, 100 examples give about ±7 points and 400 give about ±3.5; resolving ±3 points needs
-roughly 550. If the business threshold and the likely result are close, the set has to be large; if
-they are far apart, 100 is plenty.
+| *p* = 0.85, examples | 95% half-width |
+|---|---|
+| 100 | about ±7 points |
+| 400 | about ±3.5 points |
+| roughly 550 | ±3 points |
 
-Split the set before tuning: a *dev* portion you read and iterate on, and a *held-out* portion nobody
-looks at until the readout. Every prompt change chosen because it fixed dev failures fits the system to
-those examples, so the dev score drifts upward faster than true accuracy; the held-out number is the one
-the decision uses.
+- **Rule of thumb:** if the business threshold and the likely result are close, the set has to be large; if
+  far apart, 100 is plenty.
+- **Split before tuning:** a *dev* portion you read and iterate on, and a *held-out* portion nobody looks at
+  until the readout.
+- **Why the split:** every prompt change chosen because it fixed dev failures fits the system to those
+  examples, so the dev score drifts upward faster than true accuracy. The held-out number is the one the
+  decision uses.
 
 ### 4. Build the thinnest end-to-end slice
-Wire input to output with the least code possible. Start with the strongest available model to establish
-the ceiling, *because* if the best general-purpose model cannot do it with your prompt and retrieval,
-cheaper off-the-shelf models almost certainly will not; cost optimization comes after feasibility. The
-ceiling is approach-specific, not absolute: fine-tuning, a specialized component (say, a dedicated OCR or
-table parser) or a redesigned pipeline can beat it, so a failed PoC rules out the approach tested, not
-the use case.
+- **Wire input to output** with the least code possible.
+- **Start with the strongest available model** to establish the ceiling, because if the best
+  general-purpose model cannot do it with your prompt and retrieval, cheaper off-the-shelf models almost
+  certainly will not. Cost optimization comes after feasibility.
+- **The ceiling is approach-specific, not absolute.** Fine-tuning, a specialized component (say, a dedicated
+  OCR or table parser) or a redesigned pipeline can beat it, so a failed PoC rules out the approach tested,
+  not the use case.
 
 ### 5. Iterate with error analysis, inside a timebox
-Read failures on the dev split, group them, fix the largest group, re-run. Largest group first *because*
-fixes are roughly one category at a time, so the biggest category is the biggest available gain. Track
-latency and cost per example alongside accuracy, since a design that passes on quality but takes 40
-seconds per answer has not passed. Stop when the threshold is met, the curve flattens, or the box closes.
+1. **Read failures** on the dev split and group them.
+2. **Fix the largest group, re-run,** because fixes land roughly one category at a time, so the biggest
+   category is the biggest available gain.
+3. **Track latency and cost per example** alongside accuracy, since a design that passes on quality but
+   takes 40 seconds per answer has not passed.
+4. **Stop** when the threshold is met, the curve flattens, or the box closes.
 
 ### 6. Write the findings and decide
-Record the result, the error breakdown, what was stubbed, and what production would require. Decide:
-proceed to pilot, pivot the design, or stop. A disposable prototype gets thrown away; an evolutionary one
-is kept only if it was built with that intent.
+- **Record** the result, the error breakdown, what was stubbed, and what production would require.
+- **Decide:** proceed to pilot, pivot the design, or stop.
+- **Disposable vs evolutionary:** a disposable prototype gets thrown away; an evolutionary one is kept only
+  if it was built with that intent.
 
-## Example
-A minimal PoC harness: real labeled examples, one function under test, a pre-written threshold, and a
-decision printed at the end. The model call is a placeholder for whichever provider SDK you use.
+## Diagram
+The PoC path: one risky assumption, a threshold and a held-out split fixed before tuning, a dev-only
+iteration loop, then a single held-out readout that ends in pass, fail or inconclusive.
+
+```mermaid
+flowchart TD
+    A["Rank assumptions, pick riskiest"] --> H["Hypothesis plus threshold"]
+    H --> E[("Real eval set: dev and held-out")]
+    E --> S["Thinnest slice, strongest model"]
+    S --> L["Run on dev split"]
+    L --> G["Group errors, fix largest"]
+    G -->|"curve still rising, box open"| L
+    G -->|"threshold met or curve flat"| R["Read held-out once"]
+    R --> V{"Interval vs threshold"}
+    V -->|"above"| P["Pass: propose pilot"]
+    V -->|"straddles"| I["Inconclusive: label more"]
+    V -->|"below"| F["Fail: pivot or stop"]
+```
+
+## Examples
+### A minimal PoC harness
+Real labeled examples, one function under test, a pre-written threshold, and a decision printed at the end.
+The model call is a placeholder for whichever provider SDK you use.
 
 ```python
 import json, math, collections, time
@@ -145,43 +173,86 @@ def run_poc(path: str = "eval_set.jsonl", split: str = "dev") -> None:
         print("DECISION:", verdict)
 ```
 
-The design choices are the point: the threshold is a constant set before the loop; errors are grouped by
-category so the next iteration targets the biggest one; latency is measured, not assumed; and the
-decision is only printed for the held-out split, with an explicit "inconclusive" band when the interval
-straddles the threshold. Run on a 200-example held-out split, 88% gives about ±4.5 points, so the verdict
-is "inconclusive" against 85%, which is the honest answer and tells you to label more data, not to
-celebrate.
+- **The threshold is a constant set before the loop.**
+- **Errors are grouped by category,** so the next iteration targets the biggest one.
+- **Latency is measured, not assumed.**
+- **The decision prints only for the held-out split,** with an explicit "inconclusive" band when the interval
+  straddles the threshold.
+- **Worked readout:** on a 200-example held-out split, 88% gives about ±4.5 points, so the verdict is
+  "inconclusive" against 85%. That is the honest answer: label more data, do not celebrate.
+
+### Sizing the eval set before you label
+Run this before asking experts to label, so you request enough examples to make the decision resolvable.
+
+```python
+import math
+
+def half_width(p, n, z=1.96):
+    return z * math.sqrt(p * (1 - p) / n)
+
+def n_needed(p, e, z=1.96):
+    return math.ceil(z * z * p * (1 - p) / (e * e))
+
+for n in (100, 200, 400):
+    print(f"p=0.85, n={n}: ±{half_width(0.85, n):.1%}")   # ±7.0%, ±4.9%, ±3.5%
+print("n for ±3 points at p=0.85:", n_needed(0.85, 0.03))  # 545
+print(f"p=0.88, n=200: ±{half_width(0.88, 200):.1%}")      # ±4.5%
+```
+
+| Likely result vs threshold | Gap | Examples worth labeling |
+|---|---|---|
+| 95% vs 85% | 10 points | ~100 resolves it |
+| 88% vs 85% | 3 points | ~550, or accept a pilot with the risk stated |
+
+## Production patterns
+- **Locked held-out split** — every PoC. How: assign each example to dev or held-out once (for example by a
+  stable hash of its id) and store the split in the file, so nobody re-splits after seeing results. Monitor:
+  the gap between dev and held-out accuracy; a widening gap means you are fitting the dev set.
+- **Versioned prompt and model in every result row** — while iterating. How: log prompt version, model id,
+  retrieval settings and commit with each run's score and latency, so the readout cites an exact
+  configuration. Monitor: which change moved which error category.
+- **Strongest-model ceiling, then a cost pass** — when feasibility is the risk. How: first run with the most
+  capable model you can access, then re-run the same held-out set on cheaper candidates. Monitor: accuracy
+  drop per cost saved; skip this order when cost itself is the riskiest assumption.
+- **Random sample from the real source** — before building the eval set. How: ask for a random draw across
+  the full archive or ticket history, including old scans and edge formats, not a curated folder. Monitor:
+  the share of examples by format or age compared with production.
+- **Throwaway repo for disposable code** — for prototypes. How: keep prototype code in a separate repository
+  or folder marked disposable, so it cannot be merged into the product by accident. Monitor: any import of
+  prototype modules from production code.
 
 ## Trade-offs
-- Disposable prototypes are fast because they ignore quality, but teams are tempted to ship them; keep
-  the code only when it was built evolutionarily with tests and structure from the start.
-- Starting with the strongest model establishes feasibility quickly, but it can hide a cost problem;
+- **Disposable speed vs shipping temptation.** Disposable prototypes are fast because they ignore quality,
+  but teams are tempted to ship them; keep the code only when it was built evolutionarily with tests and
+  structure from the start.
+- **Strongest model first vs hidden cost.** It establishes feasibility quickly but can hide a cost problem;
   this flips when cost per transaction is itself the riskiest assumption and must be tested first.
-- Wizard-of-Oz prototypes answer desirability without any model work, but they say nothing about
-  feasibility; use them only when the user experience is the main unknown.
-- Small eval sets let a PoC finish in days, but with 100 examples the sampling error on accuracy is
-  several points, so a near-threshold result needs more data before a firm decision.
+- **Wizard of Oz vs feasibility.** Wizard-of-Oz prototypes answer desirability without any model work, but
+  say nothing about feasibility; use them only when the user experience is the main unknown.
+- **Small eval sets vs firm decisions.** They let a PoC finish in days, but with 100 examples the sampling
+  error on accuracy is several points, so a near-threshold result needs more data before a firm decision.
 
 ## Pitfalls
-- Running the PoC on clean sample data the vendor or customer prepared, not on production-like data; the
-  symptom is accuracy that drops sharply in the pilot on scanned, partial or messy inputs.
-- Proving the easy part, such as showing a chat UI works, while the hard assumption (data access, a
-  rare document type, latency) stays untested; the symptom is surprise blockers after the contract.
-- Defining success after seeing the results, so the PoC always "succeeds"; the symptom is a criterion
-  that suspiciously matches the number achieved.
-- PoC purgatory: a successful PoC with no owner, budget or plan for the next stage; the symptom is a
+- **Clean sample data the vendor or customer prepared.** Not production-like; the symptom is accuracy that
+  drops sharply in the pilot on scanned, partial or messy inputs.
+- **Proving the easy part.** Showing a chat UI works while the hard assumption (data access, a rare document
+  type, latency) stays untested; the symptom is surprise blockers after the contract.
+- **Defining success after seeing the results.** The PoC always "succeeds"; the symptom is a criterion that
+  suspiciously matches the number achieved.
+- **PoC purgatory.** A successful PoC with no owner, budget or plan for the next stage; the symptom is a
   well-received demo followed by months of silence.
-- Shipping the prototype code into production because "it already works", which brings hard-coded
-  credentials, no retries and no tests; the symptom is the first production incident.
-- Tuning and reporting on the same examples, so the reported accuracy is fitted to the eval set; the
-  symptom is a readout number several points above what a fresh sample or the pilot shows.
+- **Shipping the prototype code because "it already works".** It brings hard-coded credentials, no retries
+  and no tests; the symptom is the first production incident.
+- **Tuning and reporting on the same examples.** Reported accuracy is fitted to the eval set; the symptom is
+  a readout number several points above what a fresh sample or the pilot shows.
 
 ## When to use
-Build a prototype when the main unknown is what users need or how they will interact; build a PoC when
-the main unknown is whether the model can meet a quantified bar on real data. Do both before committing
-to an integration-heavy build, and inside a timebox. Skip them when the task is well understood and the
-same pattern already runs in production elsewhere with similar data; a pilot may then be the cheaper first
-step. Measure a PoC by the decision it enabled and the risks it retired, not by how polished it looks.
+- **Prototype when:** the main unknown is what users need or how they will interact.
+- **PoC when:** the main unknown is whether the model can meet a quantified bar on real data.
+- **Do both** before committing to an integration-heavy build, and inside a timebox.
+- **Skip when:** the task is well understood and the same pattern already runs in production elsewhere with
+  similar data; a pilot may then be the cheaper first step.
+- **Measure:** a PoC by the decision it enabled and the risks it retired, not by how polished it looks.
 
 ## Role lens
 - **Engineer:** Builds the eval harness and thinnest slice, tracks error categories per iteration, and
@@ -200,6 +271,36 @@ which a clean 200-PDF set would hide. Ask for a random sample across the archive
 build the eval questions with engineers who actually ask them. State the threshold up front. If full
 access is impossible in the timebox, report results as conditional on the sample and list what remains
 untested. Otherwise the PoC passes and the pilot fails on the very data the curated set excluded.
+
+## Interview questions
+### What is the difference between a prototype, a PoC, a pilot and an MVP?
+- **Prototype:** tests the experience and may fake the AI, because the question is about users.
+- **PoC:** tests feasibility with the real model, data and metric against a pre-set threshold.
+- **Pilot and MVP:** a pilot puts real users on real work to measure business impact; an MVP is the smallest
+  version you would ship and support. A passing PoC earns a pilot, not a launch.
+
+### How do you choose what a PoC should test?
+- **List the assumptions that must hold,** such as data access, document parsing, latency, cost and trust.
+- **Rank by likelihood of being false times cost if false,** and point the PoC at the top item while stubbing
+  everything else, because proving the easy part leaves the real blocker for after the contract.
+
+### Your dev accuracy rose from 78% to 91% over a week but the held-out set says 82%. What happened?
+- **Overfitting to dev:** each prompt change chosen to fix dev failures fits the system to those examples,
+  so the dev score drifts up faster than true accuracy.
+- **Response:** report the held-out number, check which error categories differ between splits, and if needed
+  draw a fresh sample from the real source to confirm.
+
+### How many examples does a PoC eval set need?
+- **Depends on the gap to the threshold.** At 85% accuracy, 100 examples give about ±7 points, 400 give about
+  ±3.5, and ±3 points needs roughly 550.
+- **So** if the expected result is far from the threshold, 100 is plenty; if close, label more or report the
+  result as inconclusive.
+
+### When would you skip a PoC entirely?
+- **When the pattern is proven:** the same approach already runs in production elsewhere on similar data, so
+  a pilot is the cheaper first step.
+- **When the risk is desirability, not feasibility:** a Wizard-of-Oz prototype answers that faster without
+  any model work.
 
 ## Quiz
 ### Q: What best distinguishes a PoC from a rapid prototype?

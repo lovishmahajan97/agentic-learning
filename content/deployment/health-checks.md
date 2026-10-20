@@ -5,7 +5,7 @@ name: Health checks
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/health-readiness-endpoints
   - backend-fundamentals/kubernetes
@@ -19,93 +19,109 @@ sources:
 ---
 
 ## TL;DR
-Health checks are endpoints or probes that let infrastructure and operators ask "should this instance
-get traffic, and should it be restarted?". They answer different questions, so they are separate checks:
-liveness (is the process stuck, restart it), readiness (can it serve right now, route around it if not),
-startup (has slow initialisation such as loading a model finished) and end-to-end synthetic checks (does
-the whole system produce a correct answer). Mixing these up turns a degraded dependency into a total
-outage.
+Health checks tell infrastructure whether an instance should get traffic or be restarted. Liveness,
+readiness, startup and synthetic end-to-end checks answer different questions, so they stay separate;
+mixing them turns a degraded dependency into a total outage.
 
 ## Why it exists
-A load balancer or orchestrator cannot tell a healthy instance from a broken one unless the instance
-tells it. Without checks, traffic keeps flowing to a process that has deadlocked, run out of GPU memory,
-or is still loading a multi-gigabyte model, and users see errors while every infrastructure dashboard
-shows "running". Rolling deployments also depend on them: a new version is only safe to shift traffic to
-once it says it is ready.
-
-The naive check is a single `/health` endpoint that returns 200 if the web server responds. It fails in
-both directions. It is too shallow, because a server can answer HTTP while its model failed to load or
-its connection pool is exhausted. And when teams make it deeper by checking every dependency (database,
-vector store, LLM provider) and wire it to the restart probe, it becomes dangerous: if the shared LLM
-provider has a blip, every instance fails its check at once, the orchestrator restarts all of them, and
-a brief upstream problem becomes a fleet-wide restart storm with cold model loads on top.
-
-The fix is to recognise that "healthy" is not one question. Whether to restart, whether to route traffic
-and whether the product works end to end have different answers and different consequences, so each
-gets its own check with its own scope.
+- **Infrastructure cannot see inside an instance.** Without checks, traffic keeps flowing to a process
+  that has deadlocked, run out of GPU memory, or is still loading a multi-gigabyte model, while every
+  dashboard shows "running".
+- **Rolling deploys depend on them.** A new version is only safe to receive traffic once it says it is
+  ready.
+- **A single shallow `/health` returning 200 is too shallow.** A server can answer HTTP while its model
+  failed to load or its connection pool is exhausted.
+- **A single deep check wired to restarts is dangerous.** Checking every dependency (database, vector
+  store, LLM provider) in the restart probe means one provider blip fails every instance at once: a
+  fleet-wide restart storm with cold model loads on top.
+- **"Healthy" is not one question.** Restart, route traffic, and "does the product work end to end" have
+  different answers and consequences, so each gets its own check and scope.
 
 ## How it works
+### The four checks
+| Check | Question | Checks | Action on failure |
+|---|---|---|---|
+| **Liveness** | Is this process irrecoverably stuck? | Event loop responds, no deadlocked worker | Restart (kubelet, after repeated failures) |
+| **Readiness** | Can it serve a request successfully right now? | Model loaded, GPU usable, not overloaded, not shutting down | Remove from Service endpoints, no restart |
+| **Startup** | Has slow initialisation finished? | Weights loaded, GPU warmed, in-memory index built | Liveness and readiness wait until it passes |
+| **Synthetic end-to-end** | Does the product produce a correct answer? | Golden request through the real entry point | Alert and dashboard, never restart |
+
 ### Liveness: should this process be restarted?
-Liveness answers only "is this process irrecoverably stuck?". It should check things a restart would fix:
-the event loop responds, a worker thread is not deadlocked. It must **not** check external dependencies,
-*because* restarting your service does not fix someone else's outage and restarts at fleet scale add
-load exactly when the system is weakest. In Kubernetes, repeated liveness failures make the kubelet
-restart the container.
+- **Check only what a restart would fix:** the event loop responds, a worker thread is not deadlocked.
+- **Never check external dependencies**, because restarting your service does not fix someone else's
+  outage, and fleet-scale restarts add load exactly when the system is weakest.
 
 ### Readiness: should this instance receive traffic right now?
-Readiness answers "can I serve a request successfully at this moment?". It checks local conditions: the
-model is loaded, the GPU is usable, the instance is not overloaded, the instance is not shutting down. In
-Kubernetes a failing readiness probe removes the pod from the Service's endpoints without restarting it,
-so traffic flows to other replicas. Two design choices matter here:
-- **Shared dependencies are risky in readiness.** If every replica checks the same LLM provider and it
-  fails, every replica goes unready and the service has zero endpoints, so even a fallback path cannot be
-  served. Prefer to keep serving and degrade (fallback model, cached answer, clear error) and report the
-  dependency's state through metrics and alerts instead.
-- **Drain before exiting.** On shutdown the instance must stop receiving new requests, then finish
-  in-flight ones, *because* long LLM streams cut mid-answer are user-visible errors during every deploy.
-  Behind a plain load balancer that means failing readiness first and waiting before exit. Kubernetes
-  removes a terminating pod from endpoints itself, but asynchronously, so a short pre-stop delay plus a
-  graceful-shutdown timeout longer than the longest stream is the usual pattern.
+- **Check local conditions only.** In Kubernetes a failing readiness probe removes the pod from the
+  Service's endpoints without restarting it, so traffic flows to other replicas.
+- **Shared dependencies are risky here.** If every replica checks the same LLM provider and it fails, every
+  replica goes unready and the service has zero endpoints, so even a fallback path cannot be served.
+  Instead keep serving and degrade (fallback model, cached answer, clear error) and report the
+  dependency through metrics and alerts.
+- **Drain before exiting:** stop new requests, then finish in-flight ones, because long LLM streams cut
+  mid-answer are user-visible errors on every deploy. Behind a plain load balancer, fail readiness first
+  and wait before exit.
+- **Kubernetes removes a terminating pod from endpoints itself, but asynchronously**, so the usual pattern
+  is a short pre-stop delay plus a graceful-shutdown timeout longer than the longest stream.
 
 ### Startup: has slow initialisation finished?
-Loading model weights, warming a GPU or building an in-memory index can take minutes. A startup probe
-covers that window; in Kubernetes, liveness and readiness probes are not run until the startup probe
-succeeds. Without it, teams either set a huge liveness delay (slow to detect real hangs later) or watch
-pods get killed mid-load in a restart loop.
+- **Loading weights, warming a GPU or building an in-memory index can take minutes.** A startup probe
+  covers that window; Kubernetes does not run liveness and readiness until it succeeds.
+- **Without it** teams either set a huge liveness delay (slow to detect real hangs later) or watch pods
+  get killed mid-load in a restart loop.
 
 ### Synthetic end-to-end checks
-Probes tell infrastructure about one instance. They do not tell you the product works. A synthetic check
-runs from outside on a schedule: send a fixed golden request through the real entry point (auth,
-retrieval, model, guardrails) and assert on the answer, for example that it cites the expected document.
-This catches failures probes never see: a stale index, an expired credential to a customer system, a
-model silently changed behind an alias. Synthetic results feed alerts and dashboards, not restarts.
+- **Probes describe one instance, not the product.** A synthetic check runs from outside on a schedule:
+  a fixed golden request through the real entry point (auth, retrieval, model, guardrails), asserting on
+  the answer, for example that it cites the expected document.
+- **It catches what probes never see:** a stale index, an expired credential to a customer system, a model
+  silently changed behind an alias.
+- **Results feed alerts and dashboards, not restarts.**
 
 ### Probe timing is arithmetic, not taste
-Each probe acts only after `failureThreshold` consecutive failures, checked every `periodSeconds`, so
-the time before the platform reacts is roughly
+Each probe acts only after `failureThreshold` consecutive failures, checked every `periodSeconds`:
 
 ```
 reaction_time ≈ periodSeconds × failureThreshold   (+ up to timeoutSeconds per attempt)
 ```
 
-That one product sets three budgets. For **startup**, it must exceed the worst-case initialisation, not
-the typical one: if weights load in 90 seconds normally but 4 minutes on a cold node pulling from object
-storage, `periodSeconds: 10, failureThreshold: 30` gives a 300-second window, while a 60-second window
-would kill every pod on a cold node and loop forever. For **liveness**, it is how long a hung process
-keeps receiving its share of traffic before a restart, so a short product detects hangs fast but also
-restarts pods that were merely slow under a load spike (a long GC pause, a CPU-starved event loop). For
-**readiness**, it is how long an overloaded or draining instance keeps getting new requests, and the
-matching `successThreshold` decides how quickly it is trusted again. Choosing these from measured load
-times and latency, rather than copying defaults, is most of the difference between probes that help and
-probes that cause outages.
+| Probe | What the product means | How to set it |
+|---|---|---|
+| **Startup** | Window for initialisation | Exceed the worst case, not the typical one. Weights load in 90 seconds normally but 4 minutes on a cold node pulling from object storage: `periodSeconds: 10, failureThreshold: 30` gives a 300-second window; a 60-second window kills every pod on a cold node and loops forever |
+| **Liveness** | How long a hung process keeps its share of traffic before restart | Short detects hangs fast but also restarts pods merely slow under a load spike (a long GC pause, a CPU-starved event loop) |
+| **Readiness** | How long an overloaded or draining instance keeps getting new requests | The matching `successThreshold` decides how quickly it is trusted again |
+
+- **Choose from measured load times and latency, not copied defaults.** That is most of the difference
+  between probes that help and probes that cause outages.
 
 ### Making checks cheap and honest
-Probes run often, so they must be fast and must not call the LLM. Deeper checks run on a background
-schedule and the endpoint returns the cached result, *because* a probe that waits on a slow dependency
-times out and reports failure for the wrong reason. Return a body explaining which condition failed, so
-operators following a runbook can see why an instance is unready.
+- **Fast, and never calling the LLM**, because probes run often.
+- **Deeper checks on a background schedule; the endpoint returns the cached result**, because a probe that
+  waits on a slow dependency times out and reports failure for the wrong reason.
+- **Return a body saying which condition failed**, so operators following a runbook see why an instance is
+  unready.
 
-## Example
+## Diagram
+Kubernetes runs the startup probe first; after it passes, liveness and readiness run independently and
+trigger different actions.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Starting
+    Starting --> Starting: startup probe fails, under threshold
+    Starting --> Restarted: startup window exceeded
+    Starting --> Ready: startup passes, readiness passes
+    Ready --> NotReady: readiness fails
+    NotReady --> Ready: readiness passes again
+    Ready --> Restarted: liveness fails threshold times
+    NotReady --> Restarted: liveness fails threshold times
+    Ready --> Draining: termination signal
+    Draining --> [*]: in-flight streams finished
+    Restarted --> Starting
+```
+
+## Examples
+### FastAPI service with separate probes
 A FastAPI service that loads a model at startup, separates liveness from readiness and reports
 overload. The model loader is a stand-in for real initialisation. It runs as a background task because
 an `await` inside the lifespan would delay the server from accepting connections until loading ends:
@@ -151,42 +167,104 @@ async def readyz(resp: Response):
     return {"ready": not reasons, "reasons": reasons}
 ```
 
-Note that no check calls the LLM provider or the vector store. Their health is reported by metrics and a
-separate synthetic check, so an upstream outage degrades the service instead of emptying the load
-balancer. A real deployment increments and decrements `in_flight` around each generation (including
-the whole duration of a streamed response) and configures draining in the platform, for example a
-Kubernetes pre-stop delay, rather than overriding the server's own signal handling.
+- **No check calls the LLM provider or the vector store.** Their health is reported by metrics and a
+  separate synthetic check, so an upstream outage degrades the service instead of emptying the load
+  balancer.
+- **A real deployment increments and decrements `in_flight`** around each generation (including the whole
+  duration of a streamed response).
+- **Draining is configured in the platform**, for example a Kubernetes pre-stop delay, rather than by
+  overriding the server's own signal handling.
+
+### Kubernetes probe configuration for the service above
+Illustrative values for a model that loads in 90 seconds typically and up to 4 minutes on a cold node.
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 120      # longer than the longest streamed answer
+  containers:
+    - name: assistant
+      image: registry.example.internal/assistant:1.4.2
+      ports:
+        - containerPort: 8000
+      startupProbe:
+        httpGet: { path: /startupz, port: 8000 }
+        periodSeconds: 10
+        failureThreshold: 30              # 300 s window, above the 4-minute worst case
+      livenessProbe:
+        httpGet: { path: /livez, port: 8000 }
+        periodSeconds: 10
+        failureThreshold: 3               # about 30 s of hang before restart
+        timeoutSeconds: 2
+      readinessProbe:
+        httpGet: { path: /readyz, port: 8000 }
+        periodSeconds: 5
+        failureThreshold: 2               # about 10 s before routing away
+        successThreshold: 1
+      lifecycle:
+        preStop:
+          exec:
+            command: ["sleep", "10"]      # let endpoint removal propagate before SIGTERM
+```
+
+### Worked scenario: the 90-second provider blip
+| Design | What happens during a 90-second provider outage |
+|---|---|
+| Provider checked in **liveness** | Every pod fails together, all restart, each reloads weights; recovery takes many minutes after the provider is back |
+| Provider checked in **readiness** | No restarts, but every pod goes unready; zero endpoints for roughly the outage's duration, so even the fallback cannot be served |
+| Provider in **metrics and synthetic check only** | Pods stay ready; requests use the fallback model or return a clear error; an alert links to the runbook |
+
+## Production patterns
+- **Separate endpoints per probe.** Expose `/livez`, `/readyz` and `/startupz` (the naming Kubernetes
+  itself uses for its API server) with distinct logic, and wire each to the matching probe. Monitor
+  container restart counts and ready replica count per deployment.
+- **Startup window from measured cold loads.** Measure model load time on a cold node (image pull plus
+  weight download), then set startup `periodSeconds × failureThreshold` above the worst case with margin.
+  Monitor startup duration percentiles after each model or image change.
+- **Pre-stop delay plus graceful timeout.** Add a short pre-stop sleep so endpoint removal propagates, and
+  set `terminationGracePeriodSeconds` above the longest stream; the server should finish in-flight
+  requests on SIGTERM. Monitor client-side disconnects and truncated streams during deploys.
+- **Golden-request synthetic check.** Run a scheduled job (every few minutes) from outside the cluster
+  that sends a fixed question through the public entry point and asserts on a cited document ID. Alert
+  on consecutive failures and track synthetic latency separately from real traffic.
+- **Capacity-aware readiness with autoscaling.** Fail readiness at a per-replica in-flight budget, and
+  pair it with a horizontal autoscaler and a front-door rate limit so the fleet never reaches zero ready
+  endpoints. Monitor the fraction of replicas reporting "at capacity".
 
 ## Trade-offs
-- Deep readiness checks catch more broken instances, but couple every replica to shared dependencies; the
-  balance flips toward deep checks only for dependencies that are per-instance, such as a local GPU.
-- Aggressive probe intervals and low failure thresholds detect problems fast, but cause flapping and
-  needless restarts under load spikes; tolerate a few consecutive failures before acting.
-- Readiness based on load ("at capacity") sheds traffic gracefully, but if every replica hits capacity at
-  once the service has no endpoints; pair it with autoscaling and a front-door rate limit.
-- Synthetic checks prove end-to-end correctness, but each one costs a real model call and can drift from
-  real usage; keep them few, cheap and representative of the critical path.
+- **Detection vs coupling.** Deep readiness checks catch more broken instances but couple every replica to
+  shared dependencies; the balance flips toward deep checks only for dependencies that are per-instance,
+  such as a local GPU.
+- **Fast detection vs flapping.** Aggressive probe intervals and low failure thresholds detect problems
+  fast but cause flapping and needless restarts under load spikes; tolerate a few consecutive failures
+  before acting.
+- **Graceful shedding vs empty endpoints.** Load-based readiness ("at capacity") sheds traffic gracefully,
+  but if every replica hits capacity at once the service has no endpoints; pair it with autoscaling and a
+  front-door rate limit.
+- **End-to-end proof vs cost and drift.** Synthetic checks prove end-to-end correctness, but each costs a
+  real model call and can drift from real usage; keep them few, cheap and representative of the critical
+  path.
 
 ## Pitfalls
-- Checking the LLM provider or database in the liveness probe; the symptom is every pod restarting at
-  once during a short upstream incident, followed by slow cold starts.
-- No startup probe for a service that loads large weights; the symptom is pods killed by liveness during
-  model loading and stuck in a restart loop.
-- Exiting without draining, so new requests still arrive during shutdown; the symptom is streamed responses cut off mid-answer on
-  every deploy or scale-down.
-- Probes that are only shallow HTTP pings; the symptom is instances that report healthy while every
-  request fails because the model never loaded or a GPU is in an error state.
-- Treating green probes as proof the product works; the symptom is all-green dashboards while users get
-  wrong answers from a stale index, which only a synthetic end-to-end check would have caught.
+- **Checking the LLM provider or database in liveness.** Symptom: every pod restarts at once during a short
+  upstream incident, followed by slow cold starts. Fix: liveness is local only.
+- **No startup probe for a service loading large weights.** Symptom: pods killed by liveness during model
+  loading and stuck in a restart loop. Fix: a startup probe sized to the worst case.
+- **Exiting without draining**, so new requests still arrive during shutdown. Symptom: streamed responses
+  cut off mid-answer on every deploy or scale-down. Fix: pre-stop delay and graceful timeout.
+- **Only shallow HTTP pings.** Symptom: instances that report healthy while every request fails because
+  the model never loaded or a GPU is in an error state. Fix: readiness checks model and GPU state.
+- **Treating green probes as proof the product works.** Symptom: all-green dashboards while users get wrong
+  answers from a stale index, which only a synthetic end-to-end check would have caught.
 
 ## When to use
-Every deployed service needs liveness and readiness; any service with slow initialisation needs a startup
-probe; any customer-facing AI system needs at least one synthetic end-to-end check on its critical path.
-Decide check scope by asking what action the check triggers: restart, route away, or alert. Watch probe
-failure counts, restart counts, ready replica count and synthetic pass rate, and link each health alert
-to a runbook. In interviews, the expected depth is explaining why liveness must not include dependencies,
-how readiness interacts with draining and rolling deploys, and why a probe cannot tell you answers are
-correct.
+- **Every deployed service:** liveness and readiness.
+- **Slow initialisation:** add a startup probe.
+- **Customer-facing AI system:** at least one synthetic end-to-end check on the critical path.
+- **Decide scope by the action triggered:** restart, route away, or alert.
+- **Measure:** probe failure counts, restart counts, ready replica count and synthetic pass rate, with each
+  health alert linked to a runbook.
+- **Interviews:** explain why liveness must not include dependencies, how readiness interacts with draining
+  and rolling deploys, and why a probe cannot tell you answers are correct.
 
 ## Role lens
 - **Engineer:** Implements separate liveness, readiness and startup endpoints, keeps them fast and
@@ -208,6 +286,37 @@ I would make liveness local only (process responsive), keep readiness to per-ins
 model loaded, capacity and draining, and report provider health through metrics, alerts and a synthetic
 check. The request path should degrade with a fallback model or clear error, and add a startup probe so
 slow loads are not killed.
+
+## Interview questions
+### What is the difference between liveness and readiness, and why does it matter?
+- **Liveness decides restarts:** it asks whether the process is irrecoverably stuck, so it checks only
+  what a restart fixes.
+- **Readiness decides routing:** a failing pod leaves the Service endpoints without restarting, so it
+  checks whether this instance can serve now.
+- **Mixing them** turns a shared-dependency blip into a restart storm or an empty endpoint list.
+
+### Your model takes 90 seconds to load, sometimes 4 minutes. How do you configure the probes?
+- **Startup probe sized to the worst case:** reaction time is about `periodSeconds × failureThreshold`, so
+  10 × 30 gives 300 seconds; a 60-second window would loop forever on cold nodes.
+- **Then short liveness and readiness**, which Kubernetes only starts after startup passes, so hangs are
+  still detected quickly later.
+
+### Users see streamed answers cut off during every deploy. What do you change?
+- **Drain properly:** a short pre-stop delay so endpoint removal propagates, then a grace period longer than
+  the longest stream so in-flight requests finish.
+- **Verify:** count truncated streams and client disconnects during a rollout before and after the change.
+
+### All probes are green but users report wrong answers. What check is missing?
+- **A synthetic end-to-end check:** probes describe local instance state, so a stale index, expired
+  customer credential or model silently changed behind an alias leaves every probe green.
+- **Design it:** a golden request through the real entry point, asserting on a cited document, feeding
+  alerts rather than restarts.
+
+### When would you put a dependency into readiness after all?
+- **When it is per-instance:** a local GPU or a sidecar only that pod uses, where routing away from this
+  replica actually helps.
+- **Not for shared dependencies:** if every replica shares it, all go unready together and nothing,
+  not even a fallback, can be served.
 
 ## Quiz
 ### Q: What happens in Kubernetes when a pod fails its readiness probe but passes liveness?

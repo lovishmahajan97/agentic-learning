@@ -5,7 +5,7 @@ name: Exec communication
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - adoption/stakeholder-management
   - adoption/adoption-and-value-realization-measurement
@@ -19,43 +19,42 @@ sources:
 ---
 
 ## TL;DR
-Executive communication means giving a busy decision-maker the conclusion first, in business terms, with
-the decision you need from them and the evidence behind it, in a form they can absorb in minutes. It
-matters for AI because executives fund and protect projects based on a few short updates, and
-probabilistic quality, technical jargon or late bad news can turn a healthy project into a cancelled one.
+Executive communication gives a busy decision-maker the conclusion first, in business terms, with the
+decision needed and the evidence, readable in minutes. For AI, jargon, unexplained error rates or late
+bad news can get a healthy project cancelled.
 
 ## Why it exists
-Executives allocate money, people and political cover across many initiatives at once. They see your
-project for a few minutes a week, usually between other meetings, and decide from that whether to keep
-funding it, expand it, or intervene. Their attention, not your work, is the bottleneck.
-
-Engineers default to chronological, bottom-up reporting: what we did, what we found, and finally what it
-means. That order mirrors how the work happened, but forces the reader to do the synthesis, and the
-conclusion often arrives after their attention has gone. Worse, technical framing ("retrieval recall@10
-improved from 0.71 to 0.83") leaves the executive unable to tell whether this is good news for the
-business.
-
-AI makes it harder in three ways. Quality is a rate, not a yes or no, so "it works" and "it fails" are both
-misleading; executives need the error rate translated into cases, cost and risk. Results are uncertain
-early, so honest ranges beat false precision. And AI projects carry reputational and compliance risk, so
-bad news that arrives late destroys trust faster than the bad news itself. The naive alternatives,
-dumping the full status report or polishing everything green, both fail: one is not read, the other is
-believed until it is not.
+- **Executive attention is the bottleneck, not your work.** Executives allocate money, people and
+  political cover across many initiatives. They see your project for a few minutes a week, usually
+  between meetings, and decide from that whether to keep funding, expand or intervene.
+- **Engineers default to chronological, bottom-up reporting:** what we did, what we found, finally what it
+  means. That mirrors how the work happened but forces the reader to do the synthesis, and the conclusion
+  often arrives after their attention has gone.
+- **Technical framing hides the meaning.** "Retrieval recall@10 improved from 0.71 to 0.83" leaves the
+  executive unable to tell whether this is good news for the business.
+- **AI makes it harder in three ways.** Quality is a rate, not a yes or no, so "it works" and "it fails"
+  both mislead; results are uncertain early, so honest ranges beat false precision; and AI carries
+  reputational and compliance risk, so bad news that arrives late destroys trust faster than the bad news
+  itself.
+- **The naive alternatives both fail.** Dumping the full status report is not read; polishing everything
+  green is believed until it is not.
 
 ## How it works
 ### 1. Lead with the answer
-Put the conclusion and any ask in the first two lines: bottom line up front (BLUF). Minto's Pyramid
-Principle gives the structure: state the governing point, support it with a few grouped arguments, support
-each with evidence. *Because* the reader may stop at any point, each level should stand on its own.
-SCQA (situation, complication, question, answer) is a useful way to frame the opening when context is
-needed: what is true, what changed, what question that raises, what you recommend.
+- **BLUF (bottom line up front):** put the conclusion and any ask in the first two lines.
+- **Minto's Pyramid Principle gives the structure:** state the governing point, support it with a few
+  grouped arguments, support each with evidence. *Because* the reader may stop at any point, each level
+  should stand on its own.
+- **SCQA frames the opening when context is needed:** situation (what is true), complication (what
+  changed), question (what that raises), answer (what you recommend).
 
 ### 2. Speak in business outcomes and baselines
-Translate model metrics into the KPI the executive owns, against the baseline measured before deployment:
-"average handling time on long claims is down from 42 to 31 minutes" rather than "summary ROUGE improved".
-*Because* the executive's question is always "is this worth it", every number should connect to value,
-cost or risk. The translation is usually one line of arithmetic, and showing it makes the number
-checkable:
+- **Translate model metrics into the KPI the executive owns**, against the baseline measured before
+  deployment: "average handling time on long claims is down from 42 to 31 minutes" rather than "summary
+  ROUGE improved".
+- **Why:** the executive's question is always "is this worth it", so every number should connect to value,
+  cost or risk.
+- **Show the arithmetic.** The translation is usually one line, and showing it makes the number checkable:
 
 ```
 value per month   = volume × time saved per item × loaded cost per hour
@@ -66,95 +65,181 @@ A per-item saving means little to an executive; "about 220 adjuster-hours a mont
 with the cost of the system and with their other options.
 
 ### 3. Make uncertainty and error rates concrete
-Express quality per volume and with consequence: "about 3 in 100 drafts need a material correction; all
-are caught at human review; zero reached customers this month". Give ranges when the sample is small,
-and say what would change the estimate. *Because* executives make risk decisions, they need to know the
-size and containment of the failure, not just the average. "3% error rate" sounds small; at 20,000
-drafts a month it is 600 corrections, and if review catches 95% of them, about 30 a month reach
-customers. Whether 30 is acceptable is the executive's decision, and they cannot make it from "97%
-accurate". Be explicit about the sample, too: zero failures in 50 cases is still consistent with a true
-failure rate as high as about 6% (the "rule of three" gives roughly 3/n as the upper 95% bound when no
-failures are seen), so say "no failures yet in 50 cases" rather than "no failures".
+- **Express quality per volume and with consequence:** "about 3 in 100 drafts need a material
+  correction; all are caught at human review; zero reached customers this month".
+- **Give ranges when the sample is small**, and say what would change the estimate.
+- **Why:** executives make risk decisions, so they need the size and containment of the failure, not just
+  the average.
+
+| Framing | What the executive can decide from it |
+|---|---|
+| "97% accurate" | Nothing |
+| "3% error rate" | Sounds small |
+| 3% of 20,000 drafts a month | 600 corrections |
+| Review catches 95% of them | About 30 a month reach customers |
+
+Whether 30 is acceptable is the executive's decision, and they cannot make it from "97% accurate".
+
+**Be explicit about the sample.** Zero failures in 50 cases is still consistent with a true failure rate
+as high as about 6%. The "rule of three" gives roughly 3/n as the upper 95% bound when no failures are
+seen, so say "no failures yet in 50 cases" rather than "no failures".
 
 ### 4. Ask for a decision explicitly
-When you need something, state the decision, the options, your recommendation, the cost of each, and the
-date by which it must be made. *Because* "FYI" items get read and forgotten, an update without a clear ask
-cannot unblock you.
+- **State** the decision, the options, your recommendation, the cost of each, and the date by which it must
+  be made.
+- **Why:** "FYI" items get read and forgotten, so an update without a clear ask cannot unblock you.
 
 ### 5. No surprises: escalate early, pre-wire big messages
-Report risks while they are still yellow, with a mitigation. Before a steering meeting where you will
-deliver difficult news, brief the sponsor one-to-one, *because* executives react badly to learning
-something in front of peers that they could have known earlier.
+- **Report risks while they are still yellow**, with a mitigation.
+- **Pre-wire difficult news.** Before a steering meeting, brief the sponsor one-to-one, *because*
+  executives react badly to learning something in front of peers that they could have known earlier.
 
 ### 6. Fix the format, the cadence and the status rules
-A one-page update with a stable structure (headline, status with trend, KPI versus baseline and target,
-top risks, decisions needed) lets the reader compare week to week. Keep the detail in an appendix for
-those who want it.
+- **One page, stable structure:** headline, status with trend, KPI versus baseline and target, top risks,
+  decisions needed. It lets the reader compare week to week.
+- **Detail goes in an appendix** for those who want it.
 
-Define what each status colour means at the start, in terms the sponsor agreed: for example, green is
-"on track for the target date and KPI with no unmitigated risk", amber is "at risk, mitigation in
-place, no decision needed yet", red is "will miss without a decision from you". *Because* an undefined
-colour is chosen by the author's optimism, undefined status drifts toward green until it jumps to red,
-which is how watermelon reporting happens without anyone intending to mislead. Amber with a mitigation
-is a normal, healthy state for a pilot; reporting it is what earns belief in your greens.
+Define what each status colour means at the start, in terms the sponsor agreed, for example:
+
+| Colour | Meaning |
+|---|---|
+| Green | On track for the target date and KPI with no unmitigated risk |
+| Amber | At risk, mitigation in place, no decision needed yet |
+| Red | Will miss without a decision from you |
+
+- **Why define them:** an undefined colour is chosen by the author's optimism, so status drifts toward
+  green until it jumps to red. That is how watermelon reporting happens without anyone intending to
+  mislead.
+- **Amber with a mitigation is a normal, healthy state for a pilot**; reporting it is what earns belief in
+  your greens.
 
 ### 7. Match the channel to the decision
-A written pre-read works when the reader needs to think before deciding; a live discussion works when
-options must be negotiated; a two-line message works for a yes/no that is already pre-wired. Send
-pre-reads early enough to be read, and open the meeting with the decision, not a recap of the
+| Channel | Works when |
+|---|---|
+| Written pre-read | The reader needs to think before deciding |
+| Live discussion | Options must be negotiated |
+| Two-line message | A yes/no that is already pre-wired |
+
+Send pre-reads early enough to be read, and open the meeting with the decision, not a recap of the
 document.
 
-## Example
+## Diagram
+Read top-down as the order of an update; the branch on the right is the pre-wire path for bad news.
+
+```mermaid
+flowchart TD
+    E["Eval and telemetry results"] --> T["Translate to KPI vs baseline"]
+    T --> Q["Error rate as volume and containment"]
+    Q --> B["Bottom line and ask first"]
+    B --> N{"Bad news or red?"}
+    N -->|"yes"| P["Pre-wire sponsor one-to-one"]
+    N -->|"no"| C{"Decision type"}
+    P --> C
+    C -->|"needs thought"| R["Written pre-read"]
+    C -->|"negotiate options"| L["Live discussion"]
+    C -->|"pre-wired yes or no"| M["Two-line message"]
+```
+
+## Examples
+### Turning eval numbers into executive numbers
+These three helpers produce every number in a typical AI steering update; the inputs are the
+illustrative figures used in this lesson.
+
+```python
+def value_hours(volume, minutes_saved):
+    return volume * minutes_saved / 60
+
+def escaped_errors(volume, error_rate, catch_rate):
+    return volume * error_rate * (1 - catch_rate)
+
+def zero_failure_upper_bound(n, exact=False):
+    # rule of three: ~3/n is the 95% upper bound when 0 failures are seen in n
+    return 1 - 0.05 ** (1 / n) if exact else 3 / n
+
+print(value_hours(1_200, 42 - 31))                   # 220.0 adjuster-hours a month
+print(20_000 * 0.03)                                 # 600.0 corrections a month
+print(round(escaped_errors(20_000, 0.03, 0.95)))     # 30 reach customers a month
+print(f"{zero_failure_upper_bound(50):.0%}")             # 6%
+print(f"{zero_failure_upper_bound(50, exact=True):.1%}") # 5.8%
+```
+
+Multiply `value_hours` by the loaded cost per hour to get the money figure for the value line.
+
+### Worked scenario: rewriting a steering update
 A hypothetical engineer drafts a steering update for the VP of Operations about an AI claims-summary
-pilot:
+pilot.
 
-"This sprint we migrated to a new embedding model, rebuilt the index, fixed a PDF parsing bug affecting
-scanned files and ran the eval suite. Recall@10 went from 0.71 to 0.83. We are also seeing some issues
-with handwritten notes. Usage is around 60%. Next sprint we will look at OCR options."
+**Before (chronological, technical):**
 
-The VP cannot tell whether the pilot is on track, what the numbers mean or what is being asked. The
-rewrite, using the pyramid structure:
+> "This sprint we migrated to a new embedding model, rebuilt the index, fixed a PDF parsing bug affecting
+> scanned files and ran the eval suite. Recall@10 went from 0.71 to 0.83. We are also seeing some issues
+> with handwritten notes. Usage is around 60%. Next sprint we will look at OCR options."
 
-"**Bottom line:** the pilot is on track to hit its target, and I need a decision on OCR budget by 3
-November.
-**Value:** handling time on long claims is down from 42 to 31 minutes against a 30-minute target, across
-the 40 adjusters in the pilot. At about 1,200 long claims a month that is roughly 220 adjuster-hours a
-month (1,200 × 11 minutes).
-**Quality:** about 3 in 100 summaries need a material correction; all were caught at adjuster review and
-none reached a claimant.
-**Risk:** about one file in eight contains handwritten notes, which the system cannot read today, so
-those files fall back to manual review.
-**Decision:** fund a specialist OCR service (estimated cost in the appendix) to extend coverage to those
-files, or accept manual handling for them. I recommend funding it, because it is the largest remaining
-gap to the target."
+The VP cannot tell whether the pilot is on track, what the numbers mean or what is being asked.
+
+**After (pyramid structure):**
+
+| Line | Content |
+|---|---|
+| **Bottom line** | The pilot is on track to hit its target, and I need a decision on OCR budget by 3 November. |
+| **Value** | Handling time on long claims is down from 42 to 31 minutes against a 30-minute target, across the 40 adjusters in the pilot. At about 1,200 long claims a month that is roughly 220 adjuster-hours a month (1,200 × 11 minutes). |
+| **Quality** | About 3 in 100 summaries need a material correction; all were caught at adjuster review and none reached a claimant. |
+| **Risk** | About one file in eight contains handwritten notes, which the system cannot read today, so those files fall back to manual review. |
+| **Decision** | Fund a specialist OCR service (estimated cost in the appendix) to extend coverage to those files, or accept manual handling for them. I recommend funding it, because it is the largest remaining gap to the target. |
 
 The technical details move to an appendix. (All figures are illustrative.)
 
+## Production patterns
+- **Fixed one-page template with agreed colour rules** — at kickoff, agree the green, amber and red
+  definitions with the sponsor and write them at the bottom of every update. Monitor how often a red
+  appears without a preceding amber; each one is a reporting failure.
+- **Metric translation sheet** — keep one sheet or notebook that turns eval and telemetry outputs into
+  the update's business numbers using the value and escaped-error formulas, rerun for every update.
+  Monitor its inputs (volume, catch rate at review) for drift, since they move the headline numbers.
+- **Pre-wire before every steering meeting with bad news** — a one-to-one with the sponsor ahead of the
+  meeting, sharing the bottom line, the options and your recommendation. Monitor whether steering meetings
+  end with a decision rather than a request for more analysis.
+- **Decision log with due dates** — each ask in an update carries options, a recommendation, costs and a
+  decision date, tracked in a log the sponsor can see. Monitor decisions arriving after their date.
+- **Small-sample wording rule** — when an eval or pilot has seen no failures, report "no failures yet in
+  n cases" plus the rule-of-three bound of about 3/n. Monitor for absolute claims ("no errors") in drafts
+  before they go out.
+
 ## Trade-offs
-- Leading with the conclusion saves executive time, but needs the analysis finished first; when it is not, say what you know and when you will know more.
-- Translating into business metrics makes value visible, but hides technical nuance; keep an appendix for technical reviewers who need it.
-- Reporting risks early builds trust, but may trigger premature intervention; pair each risk with a mitigation and an owner.
-- A fixed one-page format enables week-to-week comparison, but can feel rigid when a crisis needs a dedicated note.
-- Pre-wiring the sponsor avoids public surprises, but adds a meeting; skip it only when the news is routine.
+- **Conclusion first vs unfinished analysis.** Leading with the conclusion saves executive time but needs
+  the analysis finished; when it is not, say what you know and when you will know more.
+- **Business metrics vs technical nuance.** Translation makes value visible but hides nuance; keep an
+  appendix for technical reviewers who need it.
+- **Early risk reporting vs premature intervention.** It builds trust but may trigger intervention; pair
+  each risk with a mitigation and an owner.
+- **Fixed one-page format vs flexibility.** It enables week-to-week comparison but can feel rigid when a
+  crisis needs a dedicated note.
+- **Pre-wiring vs an extra meeting.** It avoids public surprises but adds a meeting; skip it only when the
+  news is routine.
 
 ## Pitfalls
-- Chronological reporting that buries the conclusion; the symptom is executives asking "so is this on track?" after every update.
-- Reporting model metrics without a business translation, revealed when steering discussions never touch value.
-- Watermelon status (green outside, red inside) that hides problems until they explode, destroying trust in later updates.
-- Updates without an explicit ask, so blockers wait weeks because nobody realized a decision was needed.
-- Quoting a single accuracy number without volume, consequence or uncertainty, leading to over-confidence or panic.
-- Leaving status colours undefined, which shows up as a project reported green for weeks that turns red in a single update.
-- Claiming "no errors" from a small sample, revealed when the first production failures arrive and the executive feels misled.
+- **Chronological reporting that buries the conclusion.** Symptom: executives asking "so is this on
+  track?" after every update.
+- **Model metrics without a business translation.** Revealed when steering discussions never touch value.
+- **Watermelon status (green outside, red inside).** It hides problems until they explode, destroying trust
+  in later updates.
+- **Updates without an explicit ask.** Blockers wait weeks because nobody realized a decision was needed.
+- **A single accuracy number without volume, consequence or uncertainty.** Leads to over-confidence or
+  panic.
+- **Undefined status colours.** Shows up as a project reported green for weeks that turns red in a single
+  update.
+- **Claiming "no errors" from a small sample.** Revealed when the first production failures arrive and the
+  executive feels misled.
 
 ## When to use
-Use this structure for any communication with someone who decides about funding, scope or risk but does
-not do the work: steering updates, escalations, go/no-go recommendations and quarterly value reviews. With
-peers who need detail, lead with the conclusion but include the technical depth. Measure success by
-whether decisions arrive on time, whether executives can restate the status and the ask after reading
-(ask the sponsor to play it back), and whether their understanding of status matches reality: a red
-that was never preceded by an amber is a reporting failure, not just a project one. In
-interviews, you may be asked to explain a technical result to an executive; lead with the outcome and the
-ask, give one number tied to value, and state the main risk.
+- **Use for** any communication with someone who decides about funding, scope or risk but does not do the
+  work: steering updates, escalations, go/no-go recommendations and quarterly value reviews.
+- **With peers who need detail**, still lead with the conclusion but include the technical depth.
+- **Measure** whether decisions arrive on time, whether executives can restate the status and the ask
+  after reading (ask the sponsor to play it back), and whether their understanding of status matches
+  reality: a red never preceded by an amber is a reporting failure, not just a project one.
+- **Interviews:** you may be asked to explain a technical result to an executive; lead with the outcome and
+  the ask, give one number tied to value, and state the main risk.
 
 ## Role lens
 - **Engineer:** Turns eval and telemetry output into the few business-facing numbers an update needs, with honest error rates and ranges.
@@ -164,6 +249,43 @@ ask, give one number tied to value, and state the main risk.
 ## Check yourself
 **Q:** Your pilot's accuracy is below the target agreed with the customer's executive, but a fix is likely. How do you communicate this?
 **A:** Early and directly, before the steering meeting, in a one-to-one with the sponsor. I would lead with the bottom line: we are below target, here is the gap in business terms (what share of cases need correction and whether any reached customers), here is the cause, here is the fix with a realistic date and its uncertainty, and here is the decision I need, such as extending the pilot by three weeks or narrowing scope to the case types already above target. I would not bury it or polish it green, because finding out later costs far more trust than the gap itself.
+
+## Interview questions
+### What is BLUF, and why does it matter more for executives than for peers?
+- **Definition:** bottom line up front, the conclusion and any ask in the first two lines, with supporting
+  arguments and evidence below (the Pyramid Principle).
+- **Why executives:** they see the project for minutes between meetings and may stop reading at any point,
+  so the conclusion must survive a partial read.
+- **Peers** still get the conclusion first, but with the technical depth included rather than moved to an
+  appendix.
+
+### Explain a recall@10 improvement from 0.71 to 0.83 to a VP of Operations.
+- **Do not lead with recall.** Lead with the KPI it moved, such as handling time on long claims against
+  the pre-deployment baseline.
+- **Give one value number with its arithmetic**, for example volume times minutes saved, so it can be
+  checked and compared with the system's cost.
+- **Close with the main risk and any decision needed**; recall@10 goes to the appendix.
+
+### Your eval saw zero failures in 50 cases. What do you tell the sponsor?
+- **"No failures yet in 50 cases", not "no failures".** By the rule of three, the true failure rate could
+  still be as high as about 3/n, here roughly 6%, at 95% confidence.
+- **Translate it to volume:** at production volume, a few percent could mean many cases a month, which is
+  the number the sponsor needs for a risk decision.
+- **Say what would tighten the estimate**, such as a larger eval set before expansion.
+
+### Your weekly status has been green for six weeks and is about to go red. What went wrong, and what now?
+- **Likely cause:** undefined colour rules, so optimism chose green and ambers were never reported
+  (watermelon reporting).
+- **Now:** pre-wire the sponsor one-to-one, lead with the bottom line, the gap in business terms, the
+  options with costs and a decision date.
+- **Prevent recurrence:** agree written green, amber and red definitions with the sponsor and treat amber
+  with a mitigation as normal.
+
+### When would you not send a written pre-read?
+- **When options must be negotiated live**, because a document cannot trade off positions between
+  executives in real time.
+- **When it is a pre-wired yes or no**, where a two-line message is enough and a document adds delay.
+- **Otherwise** send it early enough to be read, and open the meeting with the decision.
 
 ## Quiz
 ### Q: What should come first in an executive status update?

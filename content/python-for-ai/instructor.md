@@ -5,7 +5,7 @@ name: Instructor
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/pydantic
   - python-for-ai/outlines
@@ -226,13 +226,14 @@ Illustrative token counts for one 20k-token contract that fails validation on ev
 
 ## Production patterns
 - **Cap retries with an explicit policy.** For long inputs pass a small integer or a Tenacity policy,
-  e.g. `max_retries=Retrying(stop=stop_after_attempt(2))`. Monitor retries per request and cost per
+  e.g. `max_retries=Retrying(stop=stop_after_attempt(2))` with both names imported from `tenacity`.
+  Monitor retries per request and cost per
   successful extraction by route.
 - **Escalate instead of looping.** Catch `InstructorRetryException`, then send the input to a stronger
   model or a human-review queue with the last completion attached. Monitor escalation rate and the
   validators that triggered it.
-- **Log every attempt.** Use `create_with_completion` for usage, and Instructor's hooks (for example a
-  handler for parse errors) to record each failed attempt and its `ValidationError`. Reconcile monthly
+- **Log every attempt.** Use `create_with_completion` for usage, and Instructor's hooks (for example
+  `client.on("parse:error", handler)`) to record each failed attempt and its `ValidationError`. Reconcile monthly
   against the provider invoice.
 - **Ground with context validators.** Pass the source via `context=` and check quotes, IDs or totals
   against it in validators, so hallucinated values cause a reask. Monitor the rate of grounding failures.
@@ -255,14 +256,16 @@ Illustrative token counts for one 20k-token contract that fails validation on ev
 
 ## Pitfalls
 - **High `max_retries` with no budget.** One pathological input triggers several full-price calls.
-  Symptom: a cost spike traced to a handful of requests with repeated identical errors.
+  Symptom: a cost spike traced to a handful of requests with repeated identical errors. Fix: cap
+  attempts per route and escalate.
 - **Vague validator messages like "invalid".** The model cannot act on them. Symptom: retries returning
   the same wrong value each time. Fix: say what is wrong and how to fix it.
 - **Cost reporting that misses failed attempts.** Per-call logs, or a provider adapter that does not
   accumulate usage across retries, make failed attempts vanish. Symptom: dashboards under-report against
   the provider invoice. Verify with a forced validation failure, or log each attempt through hooks.
 - **Answer field before the reasoning field.** Field order is generation order, so the answer is
-  committed before the reasoning exists and accuracy drops on harder cases.
+  committed before the reasoning exists and accuracy drops on harder cases. Fix: declare a `reasoning`
+  field first.
 - **Every field required when the source often omits some.** The model must fill them. Symptom:
   plausible but absent values (a made-up phone number, a guessed date) that pass validation.
 - **Treating a validated object as true.** Validation proves the shape and your rules, not that the facts

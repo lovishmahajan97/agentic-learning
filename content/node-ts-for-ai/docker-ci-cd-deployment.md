@@ -5,7 +5,7 @@ name: Docker / CI/CD deployment
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/ci-cd
@@ -22,110 +22,126 @@ sources:
 ---
 
 ## TL;DR
-The general Docker and CI/CD lessons live in backend-fundamentals; this one covers what a Node/TypeScript
-AI service needs from them. Build the image in stages so the runtime layer holds compiled JavaScript
-and production dependencies only, run Node as PID 1 in exec form so `SIGTERM` can drain in-flight
-model streams, inject provider keys at runtime rather than baking them in, and gate the pipeline on
-typecheck, deterministic tests and a commit-tagged build, with real-model evals beside the gate, not
-inside it.
+Ship a Node AI service as a multi-stage image of compiled JavaScript and production deps, run Node as PID
+1 so `SIGTERM` drains streams, inject keys at runtime, and gate on typecheck and tests, with evals beside
+the gate.
 
 ## Why it exists
-A TypeScript service does not run as written. It has to be compiled (or at least type-stripped),
-its dependency tree is large and mostly only needed at build time, and `node_modules` can contain
-native addons compiled for one libc. Shipping the source checkout and running `npm install` on the
-server reproduces none of this reliably: the lockfile may be ignored, `devDependencies` land in
-production, the compile step depends on whatever `tsc` version the host has, and the image weighs
-hundreds of megabytes more than it needs to. Docker exists so the artifact that passed the tests is
-the artifact that runs; the Node-specific work is arranging the build so that is actually true.
-
-AI services add three pressures ordinary web services lack. First, requests are long: a streamed
-completion holds a connection for seconds to minutes, so a deploy that kills the process on `SIGTERM`
-without draining cuts users off mid-answer and wastes tokens already billed. Second, the process holds
-the most sensitive secret in the company, the provider API key, and a key baked into an image layer is
-visible to anyone who can pull it. Third, "the code" now includes prompts, tool schemas and model
-identifiers whose change can regress quality without any test turning red; the pipeline has to version
-them with the build and make the quality check a visible, budgeted step.
-
-The naive pipeline, "build on push, deploy on green", is not wrong; it is incomplete. Without
-reproducible installs it is not building what you tested; without a drain step it is not deploying
-safely; without an eval beside the gate it is deploying prompt changes blind.
+- **TypeScript does not run as written.** It must be compiled (or type-stripped), its dependency tree is
+  large and mostly build-time only, and `node_modules` can hold native addons compiled for one libc.
+  Running `npm install` on the server may ignore the lockfile, land `devDependencies` in production, use
+  whatever `tsc` the host has, and add hundreds of megabytes.
+- **Docker makes the tested artifact the running artifact.** The Node-specific work is arranging the
+  build so that is actually true. The general Docker and CI/CD lessons live in backend-fundamentals.
+- **AI requests are long.** A streamed completion holds a connection for seconds to minutes, so a deploy
+  that kills the process on `SIGTERM` without draining cuts users off mid-answer and wastes tokens already
+  billed.
+- **The process holds the company's most sensitive secret.** A provider API key baked into an image layer
+  is visible to anyone who can pull the image.
+- **"The code" includes prompts, tool schemas and model identifiers.** Changing them can regress quality
+  with no test turning red. "Build on push, deploy on green" is incomplete: without reproducible installs it
+  does not build what you tested, without a drain it does not deploy safely, and without an eval it ships
+  prompt changes blind.
 
 ## How it works
 ### The image: stages because the runtime needs almost nothing
-A multi-stage Dockerfile separates *installing*, *building* and *running*. The deps stage copies only
-`package.json` and the lockfile and runs `npm ci` (`pnpm install --frozen-lockfile`, `yarn install
---immutable`): `ci` refuses to proceed if the lockfile and manifest disagree, which is exactly the
-guarantee a build wants, and copying the manifests before the source means this expensive layer is
-cached until a dependency changes rather than on every commit. The build stage adds the source and
-runs `tsc` (or a bundler such as esbuild), then prunes dev dependencies. The runtime stage starts from
-a fresh base image and copies in only `dist/`, the pruned `node_modules` and `package.json`. The result
-is smaller, has a smaller attack surface, and cannot accidentally depend on a dev tool.
+1. **Deps stage (the cached layer):** copy only `package.json` and the lockfile, then run `npm ci` (`pnpm install --frozen-lockfile`,
+   `yarn install --immutable`).
+   - `ci` refuses to proceed if lockfile and manifest disagree, exactly the guarantee a build wants.
+   - Copying manifests before source caches this expensive layer until a dependency changes, not on every
+     commit.
+2. **Build stage.** Add the source, run `tsc` (or a bundler such as esbuild), then prune dev dependencies.
+3. **Runtime stage.** Start from a fresh base image and copy only `dist/`, the pruned `node_modules` and
+   `package.json`. Smaller, smaller attack surface, and it cannot accidentally depend on a dev tool.
 
-Choose the base deliberately. `node:<major>-slim` is Debian-based with glibc and is the safe default;
-`node:<major>-alpine` is smaller but uses musl, which breaks some native addons and some prebuilt
-binaries (tokenizer and ONNX packages are common victims). Pin the major version to an LTS line and
-set `NODE_ENV=production`, which some libraries read to disable debug paths. A `.dockerignore` listing
-`node_modules`, `.env`, `dist` and `.git` keeps the build context small and keeps local secrets out of
-the image. Run as the `node` user the official image provides rather than root.
+| Choice | Guidance | Because |
+|---|---|---|
+| `node:<major>-slim` | Safe default | Debian-based, glibc |
+| `node:<major>-alpine` | Only after testing native deps | Smaller, but musl breaks some native addons and prebuilt binaries (tokenizer and ONNX packages are common victims) |
+| Version | Pin the major to an LTS line | Predictable runtime |
+| `NODE_ENV=production` | Set it | Some libraries read it to disable debug paths |
+| `.dockerignore` | List `node_modules`, `.env`, `dist`, `.git` | Small build context, local secrets stay out |
+| User | The `node` user the official image provides | Not root |
 
 ### Signals: exec form, PID 1 and draining
-`CMD ["node", "dist/server.js"]` (exec form) makes Node PID 1. The shell form `CMD node dist/server.js`
-runs `/bin/sh -c "node dist/server.js"`, so the shell is PID 1 and Node its child, and a shell does not
-forward `SIGTERM` to its children; the orchestrator waits out its grace period and then `SIGKILL`s the
-process mid-stream. (Some shells exec a lone `-c` command directly, which would accidentally make
-Node PID 1; do not rely on it, since it breaks the moment someone adds `&&`.) Being PID 1 has two
-consequences of its own. The kernel applies no default action to signals sent to PID 1, so Node only
-reacts to `SIGTERM` if your code installs a handler; without one the signal is ignored and you again
-wait for `SIGKILL`. And Node does not reap zombie children; if the service spawns subprocesses (an MCP
-server over stdio, a converter), run with `docker run --init`, `tini` or `dumb-init` as the entrypoint. The drain itself, stop accepting, finish or
-abort in-flight streams, close the pool, is the graceful-shutdown lesson; the deployment's job is to
-deliver the signal and to set the grace period longer than the longest completion you allow.
+- **Exec form makes Node PID 1.** `CMD ["node", "dist/server.js"]` runs Node directly.
+- **Shell form hides Node behind a shell.** `CMD node dist/server.js` runs `/bin/sh -c "node dist/server.js"`;
+  the shell is PID 1, it does not forward `SIGTERM`, and the orchestrator waits out the grace period then
+  `SIGKILL`s mid-stream.
+- **Do not rely on shell luck.** Some shells exec a lone `-c` command directly, accidentally making Node
+  PID 1; that breaks the moment someone adds `&&`.
+- **PID 1 gets no default signal action.** The kernel applies none, so Node reacts to `SIGTERM` only if
+  your code installs a handler; otherwise the signal is ignored and you wait for `SIGKILL` again.
+- **PID 1 must reap zombies.** Node does not. If the service spawns subprocesses (an MCP server over stdio,
+  a converter), run with `docker run --init`, `tini` or `dumb-init` as the entrypoint.
+- **Division of labour.** The drain (stop accepting, finish or abort in-flight streams, close the pool) is
+  the graceful-shutdown lesson. The deployment delivers the signal and sets the grace period longer than
+  the longest completion you allow.
 
 ### Memory and the container boundary
-Node's default V8 heap limit is a heuristic derived from the memory it detects. Older releases read
-the host's total memory and ignored the container's cgroup limit; newer ones read the cgroup limit,
-but how well depends on the Node version and cgroup v1 versus v2. Either way the heap limit covers only
-the JavaScript heap: `Buffer`s, native addons, thread stacks and the code cache live outside it, so the
-process's resident memory can cross the container limit while V8 still believes it has room, and the
-kernel's OOM killer ends it. Set `--max-old-space-size` explicitly, somewhat below the container limit
-(the example leaves about a quarter of a 1 GiB limit for non-heap memory), and confirm with
-`v8.getHeapStatistics()` at startup; streaming large contexts and holding many concurrent responses
-are where Node services discover this.
+- **The default V8 heap limit is a heuristic** from detected memory. Older releases read host memory and
+  ignored the cgroup limit; newer ones read the cgroup limit, with quality depending on the Node version
+  and cgroup v1 versus v2.
+- **The heap limit covers only the JavaScript heap.** `Buffer`s, native addons, thread stacks and the code
+  cache live outside it, so resident memory can cross the container limit while V8 thinks it has room, and
+  the kernel's OOM killer ends the process.
+- **Set `--max-old-space-size` explicitly**, somewhat below the container limit. The example leaves about a
+  quarter of a 1 GiB limit for non-heap memory. Confirm with `v8.getHeapStatistics()` at startup.
+- **Where services discover this:** streaming large contexts and holding many concurrent responses.
 
 ### Health, readiness and config
-Expose a liveness endpoint that only proves the event loop is responsive and a readiness endpoint that
-checks dependencies (database, cache, and whether the process is draining). Keep the two apart
-*because* a liveness probe that checks the database turns a database blip into a restart of every
-replica at once. On shutdown, readiness flips to false the moment `SIGTERM` arrives, which is the
-signal a plain load balancer uses to stop routing. Kubernetes adds a race: a terminating pod is
-removed from the Service's endpoints, but that removal reaches kube-proxy and ingress controllers
-asynchronously, so for a few seconds after `SIGTERM` new connections can still arrive. If the
-process closes its listener immediately, those requests fail. The usual fix is a short `preStop`
-sleep (or a delay in the handler) before `server.close()`, and the grace period must cover that
-delay plus the longest stream, since `preStop` time counts against it. Configuration comes from the environment, parsed once at startup with a schema so a
-missing `ANTHROPIC_API_KEY` or a non-numeric `PORT` fails before the first request. Secrets are
-mounted or injected by the platform at runtime (Kubernetes Secrets, a secret manager, CI-provided
-environment), never passed as `ARG`/`ENV` at build time: build args are recorded in image history.
+- **Liveness proves only that the event loop responds; readiness checks dependencies** (database, cache,
+  draining). Keep them apart *because* a liveness probe that checks the database turns a database blip
+  into a restart of every replica at once.
+- **Readiness flips to false the moment `SIGTERM` arrives**, the signal a plain load balancer uses to stop
+  routing.
+- **Kubernetes adds an endpoint race.** A terminating pod is removed from the Service's endpoints, but the
+  removal reaches kube-proxy and ingress controllers asynchronously, so new connections can arrive for a few
+  seconds. Closing the listener immediately fails them.
+- **Fix the race with a delay.** A short `preStop` sleep (or a delay in the handler) before `server.close()`.
+  The grace period must cover that delay plus the longest stream, since `preStop` time counts against it.
+- **Parse config once at startup with a schema**, so a missing `ANTHROPIC_API_KEY` or a non-numeric `PORT`
+  fails before the first request.
+- **Secrets arrive at runtime** from the platform (Kubernetes Secrets, a secret manager, CI-provided
+  environment), never as `ARG`/`ENV` at build time, because build args are recorded in image history.
 
 ### The pipeline
-A pull request runs, in parallel where possible: `tsc --noEmit`, lint, unit tests, and integration
-tests against service containers started by CI. `main` additionally builds the image once with
-BuildKit, tags it with the git SHA (and a semver tag at release), pushes it to a registry, and deploys
-that digest, so staging and production run byte-identical images and a rollback is a tag swap. Note
-the gap this leaves: the PR tests ran against the source on the CI runner, not against the image.
-A file missing from a `COPY`, a native addon built for the wrong libc, or a `dist/` path typo only
-appears in the image, so a smoke test against the deployed digest in staging (start, hit readiness,
-make one request through a stubbed or cheap model) is what makes "the artifact we tested" true. Prompt
-files, tool schemas and the model identifier are part of the repository and therefore of the image;
-changing them is a deploy like any other. Beside the gate, an eval job runs the golden set against
-the real model with a budget and publishes its score; a drop blocks promotion to production without
-making every pull request pay for model calls. Rollouts of prompt or model changes are safest as a
-canary: route a slice of traffic, compare quality and cost metrics, then widen.
+1. **Pull request**, in parallel where possible: `tsc --noEmit`, lint, unit tests, and integration tests
+   against service containers started by CI.
+2. **`main`** additionally builds the image once with BuildKit, tags it with the git SHA (plus a semver tag
+   at release), pushes it to a registry and deploys that digest. Staging and production run byte-identical
+   images, and a rollback is a tag swap.
+3. **Smoke test the image in staging.** PR tests ran against source on the runner, not the image. A file
+   missing from a `COPY`, a native addon built for the wrong libc, or a `dist/` path typo only appears in the
+   image. Start it, hit readiness, make one request through a stubbed or cheap model.
+4. **Prompts, tool schemas and the model identifier ship in the image**, so changing them is a deploy like
+   any other.
+5. **Eval beside the gate.** A job runs the golden set against the real model with a budget and publishes a
+   score; a drop blocks promotion to production without making every PR pay for model calls.
+6. **Canary prompt or model changes.** Route a slice of traffic, compare quality and cost metrics, widen.
 
-## Example
-A multi-stage Dockerfile for a TypeScript service, then a trimmed GitHub Actions workflow that gates on
-typecheck and tests against a real Postgres, builds once, and pushes an image tagged with the commit.
-Secrets reach the runtime from the platform, not from either file.
+## Diagram
+Pull requests stop at the deterministic gate; `main` builds one SHA-tagged image that is smoke-tested,
+eval-checked and canaried before it reaches all traffic.
+
+```mermaid
+flowchart TD
+    PR["Pull request"] --> G["Typecheck, lint, unit, integration"]
+    G -->|"merge to main"| B["Build image once, tag git SHA"]
+    B --> R[("Registry")]
+    R --> S["Deploy digest to staging"]
+    S --> SM["Smoke test: readiness plus one request"]
+    SM --> EV{"Eval score holds?"}
+    EV -->|"no"| X["Block promotion"]
+    EV -->|"yes"| C["Canary slice in production"]
+    C -->|"quality and cost OK"| P["Widen to all traffic"]
+    C -.->|"regression"| RB["Rollback: tag swap"]
+```
+
+## Examples
+### Multi-stage Dockerfile
+Installs from the lockfile with a cached layer, compiles, prunes, and runs as `node` in exec form.
+Secrets reach the runtime from the platform, not from this file.
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -150,6 +166,10 @@ EXPOSE 3000
 # exec form so SIGTERM reaches node; heap set for a 1 GiB container memory limit
 CMD ["node", "--max-old-space-size=768", "dist/server.js"]
 ```
+
+### GitHub Actions: gate, build once, tag with the commit
+Typecheck and tests run against a real Postgres service container; only `main` builds and pushes an image
+tagged with the commit SHA.
 
 ```yaml
 name: ci
@@ -188,48 +208,85 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
 ```
 
+### Worked scenario: sizing the grace period for streams
+A chat service caps completions at 120 seconds by policy (an illustrative value; use your own maximum).
+
+| Phase after `SIGTERM` | Time budget | Why |
+|---|---|---|
+| Readiness flips to false | immediate | load balancer stops routing |
+| `preStop` sleep | 5 s | endpoint removal propagates to kube-proxy and ingress |
+| `server.close()`, finish or abort streams | up to 120 s | longest allowed completion |
+| Close pools, flush telemetry | ~5 s | clean exit |
+| Margin | ~5 s | jitter |
+| **`terminationGracePeriodSeconds`** | **135** | default of 30 would cut long streams |
+
+- **Check:** old pods should exit as soon as their last stream ends, not at exactly 135 s; lingering for the
+  full period means the handler never acted.
+- **Cost:** every rollout can now take up to that long per pod batch, which is why the cap is the policy
+  maximum, not "infinite".
+
+## Production patterns
+- **Deploy by digest, roll back by tag.** Tag every image with `${{ github.sha }}` and deploy that exact
+  digest to staging and then production, so rollback re-points to the previous SHA without a rebuild.
+  Monitor which digest each environment runs and alert on drift between them.
+- **Smoke test the artifact, not the source.** After the staging deploy, a CI job starts the image, waits
+  for readiness and sends one request through a stubbed or cheap model before promotion. Watch for
+  failures caused by a missing `COPY` or wrong-libc addons that PR tests cannot see.
+- **`preStop` sleep plus readiness flip.** In the pod spec, add a `lifecycle.preStop` exec hook running a
+  short `sleep` (a few seconds), flip readiness on `SIGTERM`, and size `terminationGracePeriodSeconds` from
+  the longest allowed completion. Monitor 502s and connection resets during each rollout; the target is zero.
+- **Scheduled rebuild of a pinned major.** Keep `FROM node:22-slim` and add an `on: schedule` cron trigger
+  to the workflow that rebuilds weekly, so base-image security patches land without unpinning. Watch
+  image scan findings and image size over time.
+- **Audit images for leaked secrets.** Run `docker history --no-trunc <image>` (or a scanner in CI) on
+  release images to confirm no key appears in build args or layers. Alert on any match and rotate the key
+  immediately, since registry copies cannot be recalled.
+- **Canary prompt and model changes.** Route a small slice of traffic to the new digest, compare quality
+  score, cost per request and error rate against the baseline, then widen. Monitor the eval score as the
+  promotion gate.
+
 ## Trade-offs
-- Multi-stage builds shrink the runtime image and its attack surface but add build complexity; for a
+- **Multi-stage: smaller image vs build complexity.** Shrinks the runtime image and attack surface; for a
   throwaway prototype a single-stage image is fine until it ships to a shared environment.
-- Alpine images are smaller than slim ones, yet musl breaks some native tokenizer and ML addons; the
-  saving flips to a loss the first time a prebuilt binary fails to load.
-- Bundling with esbuild into one file speeds cold start and removes `node_modules` from the image, but
-  it hides dependency versions from scanners and breaks packages that rely on `__dirname` or dynamic
-  requires.
-- Keeping evals out of the PR gate keeps merges fast and cheap, but only if the scheduled eval blocks
-  promotion; an eval that merely reports is a dashboard nobody reads.
-- A long termination grace period lets streams finish cleanly, while a very long one slows every
-  rollout and masks handlers that never stop; cap it at the maximum completion time you actually allow.
-- Pinning the base image by digest is reproducible but freezes security patches; a pinned major tag
-  plus a scheduled rebuild is the usual compromise.
+- **Alpine vs slim: size vs compatibility.** Alpine is smaller, yet musl breaks some native tokenizer and ML
+  addons; the saving flips to a loss the first time a prebuilt binary fails to load.
+- **esbuild bundle: cold start vs visibility.** One file speeds cold start and removes `node_modules`, but
+  hides dependency versions from scanners and breaks packages relying on `__dirname` or dynamic requires.
+- **Evals outside the PR gate: speed vs enforcement.** Merges stay fast and cheap only if the scheduled eval
+  blocks promotion; an eval that merely reports is a dashboard nobody reads.
+- **Grace period: clean streams vs slow rollouts.** Long lets streams finish; very long slows every rollout
+  and masks handlers that never stop. Cap it at the maximum completion time you actually allow.
+- **Digest pin vs patch flow.** Pinning the base image by digest is reproducible but freezes security
+  patches; a pinned major tag plus a scheduled rebuild is the usual compromise.
 
 ## Pitfalls
-- Shell-form `CMD` or an entrypoint script that does not `exec`; the symptom is pods that always take
-  the full grace period to stop and users whose streams cut off at every deploy.
-- Copying the whole source before `npm ci`; the symptom is a dependency install on every commit and a
+- **Shell-form `CMD` or an entrypoint script that does not `exec`.** Symptom: pods always take the full grace
+  period to stop and users' streams cut off at every deploy.
+- **Copying the whole source before `npm ci`.** Symptom: a dependency install on every commit and a
   ten-minute build for a one-line change.
-- Passing the provider key as a build `ARG` or `ENV`; the symptom is the key readable in the image
-  history (`docker history`) and in every registry that image was pushed to.
-- Leaving the heap limit to the default heuristic; the symptom is OOM kills by the kernel under load
-  (exit code 137) with no JavaScript heap error in the logs.
-- Running `npm install` instead of `npm ci`; the symptom is a dependency version in production that no
+- **Passing the provider key as a build `ARG` or `ENV`.** Symptom: the key is readable in image history
+  (`docker history`) and in every registry the image was pushed to.
+- **Leaving the heap limit to the default heuristic.** Symptom: kernel OOM kills under load (exit code 137)
+  with no JavaScript heap error in the logs.
+- **Running `npm install` instead of `npm ci`.** Symptom: a dependency version in production that no
   developer machine or CI run ever tested.
-- A readiness probe that stays green while draining, or a listener closed the instant `SIGTERM`
-  arrives with no `preStop` delay; the symptom is a burst of 502s or connection resets at every
-  rollout even though the drain code looks correct.
-- Deploying prompt or model-id changes with no eval in the pipeline; the symptom is a quality
-  regression reported by users days after a deploy that "only touched a text file".
+- **Readiness green while draining, or the listener closed the instant `SIGTERM` arrives with no `preStop`
+  delay.** Symptom: a burst of 502s or connection resets at every rollout even though the drain code looks
+  correct.
+- **Deploying prompt or model-id changes with no eval.** Symptom: users report a quality regression days
+  after a deploy that "only touched a text file".
 
 ## When to use
-Every Node AI service that runs anywhere but a laptop needs this; the question is how much. A single
-multi-stage Dockerfile, `npm ci`, exec-form `CMD`, runtime secrets and a PR pipeline with typecheck and
-tests are the floor. Add integration tests with service containers once a database or queue is in the
-path, an explicit heap limit and readiness-aware drain once you stream, and a budgeted eval job as soon
-as prompts change regularly. Measure image size, build time for a one-line change (with warm caches it
-should cost little more than the compile step, since the install layer is reused), deploy duration, and the count of requests failed during a
-rollout, which should be zero. Interviewers ask why `SIGTERM` is not reaching the process, what
-`npm ci` guarantees, and where the API key should live; concrete answers to those three separate a
-senior engineer from someone who has only run `docker build`.
+- **The floor, for any Node AI service beyond a laptop:** a multi-stage Dockerfile, `npm ci`, exec-form
+  `CMD`, runtime secrets, and a PR pipeline with typecheck and tests.
+- **Add as you grow:** integration tests with service containers once a database or queue is in the path;
+  an explicit heap limit and readiness-aware drain once you stream; a budgeted eval job as soon as prompts
+  change regularly.
+- **Measure:** image size, build time for a one-line change (with warm caches, little more than the compile
+  step, since the install layer is reused), deploy duration, and requests failed during a rollout, which
+  should be zero.
+- **Interviews:** why `SIGTERM` is not reaching the process, what `npm ci` guarantees, and where the API key
+  should live; concrete answers separate a senior engineer from someone who has only run `docker build`.
 
 ## Role lens
 - **Engineer:** Writes the Dockerfile and workflow, keeps the layer order cache-friendly, wires the
@@ -251,6 +308,38 @@ server and in-flight streams. In each case the orchestrator finally sends `SIGKI
 (a `preStop` sleep) for endpoint removal to propagate, then calling `server.close()`, aborting or finishing active streams with an `AbortController`, and closing pools;
 then set the grace period above the longest allowed completion. Verify with a deploy under synthetic
 streaming load and confirm zero truncated responses.
+
+## Interview questions
+### What does `npm ci` guarantee that `npm install` does not, and why does it matter in a Dockerfile?
+- **Definition:** `npm ci` installs exactly what the lockfile says and fails if lockfile and `package.json`
+  disagree, instead of resolving and possibly rewriting versions.
+- **Why it matters:** the image then contains the dependency tree CI tested, not a version no machine ever ran.
+- **Layer order:** copying only the manifests before `npm ci` keeps that slow layer cached until dependencies change.
+
+### A pod is killed with exit code 137 under load, but the logs show no JavaScript heap error. What do you check?
+- **Diagnosis:** 137 means `SIGKILL`, here from the kernel OOM killer: resident memory crossed the container
+  limit while V8 thought it had heap room.
+- **Cause:** `Buffer`s, native addons, thread stacks and the code cache live outside the V8 heap limit.
+- **Fix:** set `--max-old-space-size` below the limit (768 for 1 GiB leaves about a quarter), check
+  `v8.getHeapStatistics()` at startup, and measure memory under concurrent streams.
+
+### Why should the provider API key never be a Docker build argument?
+- **Build args are recorded in image history**, so anyone who can pull the image, from any registry copy,
+  can read the key with `docker history`.
+- **Runtime injection** from a secret manager or orchestrator secret keeps it out of the artifact, allows
+  rotation without a rebuild, and lets each environment use its own key.
+
+### When would you choose an Alpine base image over slim, and when not?
+- **Choose Alpine** when the dependency tree is pure JavaScript and image size matters.
+- **Avoid it** with native tokenizer, ONNX or other prebuilt binaries, because musl breaks some of them.
+- **Default:** `node:<major>-slim` (glibc), pinned to an LTS major and rebuilt on a schedule for patches.
+
+### How would you size `terminationGracePeriodSeconds` for a streaming service?
+- **Add the phases:** `preStop` delay for endpoint propagation, plus the longest allowed completion, plus
+  pool close and a margin.
+- **Example:** 5 s + 120 s + about 10 s gives about 135 s, versus the default of 30.
+- **Verify:** deploy under synthetic streaming load; zero truncated responses and pods exiting before the
+  deadline mean the drain works.
 
 ## Quiz
 ### Q: Why copy `package.json` and the lockfile and run `npm ci` before copying the source tree?

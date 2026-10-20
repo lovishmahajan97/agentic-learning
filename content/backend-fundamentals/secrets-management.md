@@ -234,6 +234,7 @@ from OIDC instead of a stored key.
 
 ```dockerfile
 # syntax=docker/dockerfile:1
+# build with: docker build --secret id=pip_token,src=./pip_token.txt .
 FROM python:3.12-slim
 COPY requirements.txt .
 # the token exists only during this RUN step and is never written to a layer
@@ -243,7 +244,6 @@ RUN --mount=type=secret,id=pip_token \
 ```
 
 ```yaml
-# docker build --secret id=pip_token,src=./pip_token.txt .
 permissions:
   id-token: write        # lets the job request an OIDC token
   contents: read

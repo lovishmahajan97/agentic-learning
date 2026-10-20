@@ -5,7 +5,7 @@ name: CLIP
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - multimodal/image-embeddings
   - multimodal/vision-language-models
@@ -22,47 +22,44 @@ sources:
 ---
 
 ## TL;DR
-CLIP trains an image encoder and a text encoder together so that an image and its caption land close
-in one shared vector space, using a contrastive loss over large batches of (image, text) pairs scraped
-from the web. Because the labels are free-form text rather than a fixed class list, the result can
-classify, search and filter images by *description*, zero-shot, and its encoders became the standard
-visual front end for vision-language models and multimodal search.
+CLIP trains image and text encoders with a contrastive loss so images and their captions land close in
+one vector space. Free-form text labels let it classify and search images by description, zero-shot; its
+encoders became the standard VLM vision front end.
 
 ## Why it exists
-Supervised image classifiers learn a closed vocabulary. An ImageNet model knows 1,000 nouns and nothing
-else; to add "forklift blocking a fire exit" you collect and label thousands of images, retrain, and
-still cannot ask about "a forklift blocking a *different* exit". The labelling cost is the limiting
-factor, and the learned features are biased toward whatever distinguishes the chosen classes.
-
-The web already contains hundreds of millions of images with text next to them: alt text, captions,
-product titles. That text is noisy but free and open-vocabulary. The question is how to learn from it.
-The obvious route, train a captioning model that predicts the exact words, spends enormous capacity on
-predicting the *phrasing* of a caption ("a photo of", "stock image") rather than its content, and the
-CLIP authors found it learned far more slowly than a bag-of-words baseline.
-
-The reframing that works is to stop predicting words and instead predict *which caption goes with which
-image*. That is a matching problem: among a batch of pairs, pick the right partner. It only needs the
-representation to capture content that distinguishes captions from each other, which is exactly the
-semantic content a downstream search or classifier wants. CLIP exists because matching scales where
-generation and labelling did not.
+- **Supervised classifiers have a closed vocabulary.** An ImageNet model knows 1,000 nouns and nothing
+  else. Adding "forklift blocking a fire exit" means collecting and labelling thousands of images and
+  retraining, and you still cannot ask about "a forklift blocking a *different* exit".
+- **Labels are the bottleneck and the bias.** Labelling cost limits what you can learn, and the features
+  skew toward whatever distinguishes the chosen classes.
+- **The web has free, open-vocabulary labels.** Hundreds of millions of images sit next to alt text,
+  captions and product titles: noisy, but free.
+- **Predicting the caption's words is the wrong target.** A captioning model spends capacity on the
+  *phrasing* ("a photo of", "stock image") rather than content; the CLIP authors found it learned far more
+  slowly than a bag-of-words baseline.
+- **Matching scales where generation and labelling did not.** Predict *which caption goes with which
+  image* in a batch. That only needs content that distinguishes captions from each other, which is exactly
+  the semantic content search and classification want.
 
 ## How it works
 ### Two encoders, one space
-An image encoder (ResNet or, in the stronger variants, a Vision Transformer such as ViT-B/32 or
-ViT-L/14) maps an image to a vector. A text encoder (a transformer over byte-pair-encoded text with a
-maximum length of 77 tokens) maps a caption to a vector. Each is followed by a linear projection to a
-common dimension (512 for ViT-B/32, 768 for ViT-L/14) and L2-normalised, so similarity is a cosine
-similarity, a dot product of unit vectors.
+| Part | What it is | Output |
+|---|---|---|
+| Image encoder | ResNet or, in stronger variants, a ViT such as ViT-B/32 or ViT-L/14 | image vector |
+| Text encoder | transformer over byte-pair-encoded text, maximum length 77 tokens | caption vector |
+| Projection | linear layer to a common dimension: 512 for ViT-B/32, 768 for ViT-L/14 | shared-space vector |
+| Normalise | L2-normalise both | unit vectors, so similarity is cosine (a dot product) |
 
 ### The contrastive objective
-Take a batch of N (image, text) pairs. Compute all N × N cosine similarities between every image and
-every text, scaled by a learned temperature (initialised so that logits are multiplied by about 1/0.07
-and clipped so the scale never exceeds 100). The N diagonal entries are the true pairs; the N² − N
-off-diagonal entries are negatives. The loss is a symmetric cross-entropy: for each image, a softmax
-over the N texts should put its mass on the matching text, and for each text, a softmax over the N
-images should pick the matching image. The two directions are averaged. This is the InfoNCE loss; it
-pushes matching pairs together and all other pairs in the batch apart. Written out, with unit vectors
-`x_i` (images), `y_j` (texts) and learned scale `s = 1/T`:
+1. **Take a batch** of N (image, text) pairs.
+2. **Score everything.** Compute all N × N cosine similarities, scaled by a learned temperature
+   (initialised so logits are multiplied by about 1/0.07, clipped so the scale never exceeds 100).
+3. **Label the matrix.** The N diagonal entries are true pairs; the N² − N off-diagonal entries are
+   negatives.
+4. **Symmetric cross-entropy.** For each image, a softmax over the N texts should pick its text; for each
+   text, a softmax over the N images should pick its image. Average the two directions.
+
+This is the InfoNCE loss, with unit vectors `x_i` (images), `y_j` (texts) and learned scale `s = 1/T`:
 
 ```
 logits[i, j] = s · (x_i · y_j)                         # N × N matrix
@@ -71,63 +68,84 @@ L_txt→img    = −(1/N) Σ_j log( exp(logits[j,j]) / Σ_i exp(logits[i,j]) )
 L            = (L_img→txt + L_txt→img) / 2
 ```
 
-In code this is two `cross_entropy(logits, arange(N))` calls, one on the matrix and one on its
-transpose. The temperature is learned rather than fixed because the right sharpness changes during
-training: too soft and the gradient from hard negatives vanishes, too sharp and training is unstable.
-
-Two consequences follow. First, the batch *is* the negative set, so larger batches give harder, more
-informative negatives; CLIP used a batch of 32,768 pairs, and the training data was about 400 million
-pairs. Second, the loss is relative: it never says what absolute similarity a match should have, only
-that the match must beat the others in the batch. That is why raw CLIP scores are not calibrated
-probabilities and why thresholds must be tuned per task.
+- **In code** it is two `cross_entropy(logits, arange(N))` calls, one on the matrix and one on its
+  transpose.
+- **Why the temperature is learned.** The right sharpness changes during training: too soft and the
+  gradient from hard negatives vanishes, too sharp and training is unstable.
+- **The batch is the negative set.** Larger batches give harder, more informative negatives. CLIP used a
+  batch of 32,768 pairs; the training data was about 400 million pairs.
+- **The loss is relative.** It never says what absolute similarity a match should have, only that it must
+  beat the others in the batch. That is why raw CLIP scores are not calibrated probabilities and why
+  thresholds must be tuned per task.
 
 ### Zero-shot classification by prompting
-To classify an image into classes you never trained on, write each class as a sentence, "a photo of a
-{label}", encode all sentences, encode the image, and take the softmax over the cosine similarities. The
-text encoder turns a class list into a classifier weight matrix on the fly. Prompt ensembling (averaging
-"a photo of a {}", "a blurry photo of a {}", "a drawing of a {}") improves accuracy because the training
-captions were varied too. Reported zero-shot ImageNet top-1 for the largest CLIP variant was in the
-mid-70s percent, matching a supervised ResNet-50 without using any ImageNet labels; the exact number is
-in the paper.
+1. Write each class as a sentence: "a photo of a {label}".
+2. Encode all sentences and the image.
+3. Take the softmax over the cosine similarities.
+- **The text encoder builds the classifier.** It turns a class list into a weight matrix on the fly.
+- **Prompt ensembling helps.** Averaging "a photo of a {}", "a blurry photo of a {}", "a drawing of a {}"
+  improves accuracy because the training captions were varied too.
+- **How good.** Reported zero-shot ImageNet top-1 for the largest CLIP variant was in the mid-70s
+  percent, matching a supervised ResNet-50 without any ImageNet labels; the exact number is in the paper.
 
 ### Why this representation transfers
-Because training only rewarded distinguishing captions, the encoder learns whatever visual evidence
-correlates with words: objects, scenes, styles, text in the image, brands. It does not learn to count
-or to encode precise spatial layout, because captions rarely make those distinctions. The representation
-is therefore excellent for retrieval and coarse classification and weak for compositional reasoning,
-which is the reason VLMs bolt an LLM on top of it rather than using it alone.
+- **It learns what correlates with words:** objects, scenes, styles, text in the image, brands.
+- **It does not learn counting or precise layout,** because captions rarely make those distinctions.
+- **So:** excellent for retrieval and coarse classification, weak for compositional reasoning. That is
+  why VLMs bolt an LLM on top of it rather than using it alone.
 
 ### The modality gap
-"One shared space" is looser than it sounds. In practice image embeddings and text embeddings occupy
-two separated regions of the sphere: a caption is closer to its own image than to other images, but
-almost any image is closer to other images than to any text. The loss only requires the right ordering
-within each row, not that the two clouds overlap. Practically, cross-modal cosines sit in a narrow low
-band while image-to-image cosines sit much higher, so a threshold tuned for one direction is meaningless
-in the other, and mixing image and text vectors in one nearest-neighbour index without care ranks all
-same-modality items first.
+- **"One shared space" is looser than it sounds.** Image and text embeddings occupy two separated regions
+  of the sphere. A caption is closer to its own image than to other images, but almost any image is closer
+  to other images than to any text.
+- **Why.** The loss only requires the right ordering within each row, not that the two clouds overlap.
+- **Practical effect.** Cross-modal cosines sit in a narrow low band; image-to-image cosines sit much
+  higher. A threshold tuned for one direction is meaningless in the other.
+- **Mixed indexes misrank.** Putting image and text vectors in one nearest-neighbour index without care
+  ranks all same-modality items first.
 
 ### Zero-shot versus linear probe
-Zero-shot uses the text encoder to build the classifier. When you have even a few labelled examples per
-class, a logistic-regression "linear probe" trained on frozen image embeddings usually beats the
-zero-shot classifier, because it learns which embedding directions matter for *your* classes instead of
-relying on how well a sentence describes them. The CLIP paper notes that with very few examples per
-class a probe can underperform zero-shot; once labels exist in modest numbers, the probe is the cheap
-upgrade to try before any fine-tuning.
+- **Probe wins once labels exist.** With even a few labelled examples per class, a logistic-regression
+  "linear probe" on frozen image embeddings usually beats zero-shot, because it learns which embedding
+  directions matter for *your* classes instead of relying on how well a sentence describes them.
+- **Caveat.** The CLIP paper notes that with very few examples per class a probe can underperform
+  zero-shot.
+- **Order of upgrades.** Once labels exist in modest numbers, the probe is the cheap upgrade to try before
+  any fine-tuning.
 
 ### Successors and variants
-OpenCLIP reproduced and scaled the recipe on public data (LAION). SigLIP replaces the batch-wide softmax
-with an independent sigmoid loss per pair, so each (image, text) pair is a binary "match or not"
-decision: `−log σ(z_ij · (t · x_i·y_j + b))` with `z_ij = +1` for the true pair and `−1` otherwise,
-and a learned bias `b`, initialised strongly negative, that offsets the fact that almost every pair is a
-negative. Because no row has to be normalised across the whole batch, the batch can be split across
-devices without gathering all embeddings for one softmax, memory scales better, and it trains well at
-smaller batch sizes; many recent VLMs use SigLIP encoders as their vision tower. The mechanism, two encoders aligned by
-positives-versus-negatives, is unchanged.
+- **OpenCLIP** reproduced and scaled the recipe on public data (LAION).
+- **SigLIP** replaces the batch-wide softmax with an independent sigmoid loss per pair, a binary "match or
+  not" decision: `−log σ(z_ij · (t · x_i·y_j + b))` with `z_ij = +1` for the true pair and `−1` otherwise.
+- **SigLIP's bias.** A learned bias `b`, initialised strongly negative, offsets the fact that almost every
+  pair is a negative.
+- **Why SigLIP scales better.** No row is normalised across the whole batch, so the batch can be split
+  across devices without gathering all embeddings for one softmax; memory scales better and it trains well
+  at smaller batch sizes. Many recent VLMs use SigLIP encoders as their vision tower.
+- **Same mechanism.** Two encoders aligned by positives-versus-negatives is unchanged.
 
-## Example
-Zero-shot classification with the Hugging Face CLIP implementation, then the same thing by hand with
-the raw embeddings so the cosine-similarity-and-softmax mechanism is visible. The second form is what
-you reuse for search: encode once, compare many times.
+## Diagram
+A batch of pairs goes through two encoders into one space; the N × N similarity matrix is trained so the
+diagonal wins in both directions.
+
+```mermaid
+flowchart TD
+    B["Batch of N image-text pairs"] --> IE["Image encoder: ViT or ResNet"]
+    B --> TE["Text encoder: max 77 tokens"]
+    IE --> P1["Project and L2-normalise"]
+    TE --> P2["Project and L2-normalise"]
+    P1 --> M["N x N cosine matrix times scale"]
+    P2 --> M
+    M --> L1["Softmax per row: image to text"]
+    M --> L2["Softmax per column: text to image"]
+    L1 --> L["Average loss: diagonal are positives"]
+    L2 --> L
+```
+
+## Examples
+### Zero-shot classification, then the same by hand
+The Hugging Face CLIP implementation first, then the raw embeddings so the cosine-similarity-and-softmax
+mechanism is visible. The second form is what you reuse for search: encode once, compare many times.
 
 ```python
 import torch
@@ -161,37 +179,100 @@ print(cos, (cos * model.logit_scale.exp()).softmax(-1))   # logit_scale.exp() is
 The hand-computed cosines are small and close together (the shared space is not spread out), which is
 why the learned scale of roughly 100 is needed before the softmax produces a decisive distribution.
 
+### The InfoNCE loss in plain Python
+Runnable with no dependencies. Matched pairs drive the loss toward zero at scale 100; with scale 1 the
+softmax is too soft and even matched pairs sit near log N, which is why the temperature matters.
+
+```python
+import math, random
+
+def unit(v):
+    n = math.sqrt(sum(x * x for x in v))
+    return [x / n for x in v]
+
+def info_nce(imgs, txts, scale=100.0):
+    imgs, txts = [unit(v) for v in imgs], [unit(v) for v in txts]
+    logits = [[scale * sum(a * b for a, b in zip(i, t)) for t in txts] for i in imgs]  # N x N
+    def ce(rows):                       # cross-entropy where row k's target is column k
+        loss = 0.0
+        for k, row in enumerate(rows):
+            m = max(row)
+            loss -= row[k] - m - math.log(sum(math.exp(x - m) for x in row))
+        return loss / len(rows)
+    cols = [list(c) for c in zip(*logits)]                 # transpose: text -> image
+    return (ce(logits) + ce(cols)) / 2
+
+random.seed(0)
+N, d = 16, 64
+imgs = [[random.gauss(0, 1) for _ in range(d)] for _ in range(N)]
+matched = [[x + random.gauss(0, 1) for x in v] for v in imgs]     # caption near its image
+unrelated = [[random.gauss(0, 1) for _ in range(d)] for _ in range(N)]
+print(round(info_nce(imgs, matched), 3), round(info_nce(imgs, unrelated), 3))   # 0.0 28.322
+print(round(info_nce(imgs, matched, scale=1.0), 3), round(math.log(N), 3))      # 2.159 2.773
+```
+
+### Worked numbers: batch size and index size
+| Quantity | Value |
+|---|---|
+| Negatives per batch, N = 256 | 256² − 256 = 65,280 |
+| Negatives per batch, N = 32,768 (CLIP) | about 1.07 billion |
+| One ViT-B/32 embedding, float32 | 512 × 4 = 2,048 bytes |
+| 10 million images, ViT-B/32, float32 | ~20.5 GB of raw vectors |
+| Same at float16, or ViT-L/14 at float32 | ~10.2 GB, or ~30.7 GB |
+
+The first rows explain why CLIP needed huge batches; the last rows are the storage line in a catalogue
+search plan, before any index overhead.
+
+## Production patterns
+- **Pin the checkpoint as an index dependency.** When: any persisted embedding index. How: store the model
+  name (for example `openai/clip-vit-base-patch32`) and preprocessing version beside every vector; a
+  change means a planned re-embed into a new index, then an alias swap. Monitor: mixed-version vectors.
+- **Tune thresholds per direction.** When: filtering or "no match" decisions. How: label a few hundred
+  pairs, pick separate cut-offs for text-to-image and image-to-image from precision-recall curves.
+  Monitor: precision on a weekly labelled sample.
+- **Prompt-ensemble the class list.** When: zero-shot classification. How: encode several templates per
+  label, average the normalised text vectors, renormalise, and cache them as a fixed weight matrix.
+  Monitor: per-class confusion on a labelled set.
+- **Add a "none of these" escape.** When: open-world inputs. How: include background labels or a
+  similarity floor before the softmax, because softmax always sums to one over your list. Monitor: the
+  share of images landing on the escape class.
+- **Upgrade to a linear probe.** When: you have tens of labels per class. How: fit logistic regression on
+  frozen embeddings and compare against zero-shot on the same split. Monitor: accuracy and drift.
+
 ## Trade-offs
-- Open-vocabulary classification with no labelling costs, but accuracy on fine-grained or domain-specific
-  classes (medical, industrial parts) lags a supervised model trained on even a few thousand labels.
-- Contrastive training is sample-efficient compared with caption generation, but needs very large
-  batches and web-scale data, so training your own CLIP is rarely worth it versus fine-tuning OpenCLIP.
-- A single shared space enables text-to-image and image-to-image search from one index, yet scores are
-  uncalibrated, so each use direction needs its own threshold tuned on labelled examples.
-- Captions as supervision teach what is in an image, not how many or where; when the task is counting,
-  reading layout or spatial relations, a VLM or a detector is the right tool instead.
+- **Open vocabulary vs fine-grained accuracy.** No labelling cost, but accuracy on fine-grained or
+  domain-specific classes (medical, industrial parts) lags a supervised model trained on even a few
+  thousand labels.
+- **Sample-efficient vs data-hungry.** Contrastive training beats caption generation on efficiency, but
+  needs very large batches and web-scale data, so training your own CLIP is rarely worth it versus
+  fine-tuning OpenCLIP.
+- **One space vs calibrated scores.** A shared space enables text-to-image and image-to-image search from
+  one index, yet scores are uncalibrated, so each use direction needs its own threshold.
+- **What vs how many and where.** Captions teach what is in an image; for counting, layout or spatial
+  relations, a VLM or a detector is the right tool instead.
 
 ## Pitfalls
-- Treating softmax outputs as probabilities of correctness; the symptom is high-confidence predictions
-  for images that match none of the offered labels, because softmax must sum to one over your list.
-- Using bare labels instead of sentences; the symptom is a measurable accuracy drop, since training text
+- **Treating softmax outputs as probabilities of correctness.** Symptom: high-confidence predictions for
+  images that match none of the offered labels, because softmax must sum to one over your list.
+- **Using bare labels instead of sentences.** Symptom: a measurable accuracy drop, since training text
   looked like captions, and "a photo of a dog" matches the distribution far better than "dog".
-- Expecting robustness to text in images; the symptom is an object with a handwritten label being
-  classified as the label's word (the typographic-attack effect), which matters for moderation and retail.
-- Comparing scores across encoders or across text-to-image versus image-to-image queries; the symptom
-  is a threshold that works in one direction and silently returns garbage in the other.
-- Truncating long descriptions silently at 77 tokens; the symptom is that a detailed query's later
-  constraints have no effect on the results.
+- **Expecting robustness to text in images.** Symptom: an object with a handwritten label classified as
+  the label's word (the typographic-attack effect), which matters for moderation and retail.
+- **Comparing scores across encoders or query directions.** Symptom: a threshold that works for
+  text-to-image silently returns garbage for image-to-image.
+- **Truncating long descriptions silently at 77 tokens.** Symptom: a detailed query's later constraints
+  have no effect on the results. Fix: keep queries short or split constraints into filters.
 
 ## When to use
-Use CLIP-family encoders when you need to search, filter, cluster or coarsely classify images by
-description without training data: content moderation prefilters, product search, deduplication,
-labelling candidate images for a dataset, or as the vision tower when assembling a VLM. Avoid it as the
-final decision maker where errors are costly and fine-grained; there, use it to narrow candidates and
-let a supervised model or a VLM decide. Measure recall@k on a labelled retrieval set and accuracy at a
-tuned threshold, not raw similarity values. Interviewers ask you to write the contrastive loss on a
-whiteboard, explain why batch size matters, and say why zero-shot works at all; those three answers
-cover the idea.
+- **Use when** you need to search, filter, cluster or coarsely classify images by description without
+  training data: moderation prefilters, product search, deduplication, labelling candidates for a
+  dataset, or as the vision tower when assembling a VLM.
+- **Avoid as the final decision maker** where errors are costly and fine-grained; use it to narrow
+  candidates and let a supervised model or a VLM decide.
+- **Measure:** recall@k on a labelled retrieval set and accuracy at a tuned threshold, not raw similarity
+  values.
+- **Interviews:** write the contrastive loss on a whiteboard, explain why batch size matters, and say why
+  zero-shot works at all; those three answers cover the idea.
 
 ## Role lens
 - **Engineer:** Encodes images and text with the same checkpoint, stores normalised vectors, and tunes
@@ -213,6 +294,37 @@ transfer. Options: compute similarity in the text space by first classifying eac
 taxonomy with zero-shot prompts and restricting neighbours to the same class; fine-tune the encoder with
 product pairs as positives; or combine CLIP similarity with structured attributes in a hybrid ranker and
 evaluate recall@k on labelled "similar item" judgements.
+
+## Interview questions
+### Write CLIP's training loss and explain each term.
+- **Similarity matrix.** Normalise image and text vectors, compute the N × N dot products, multiply by a
+  learned scale (about 1/0.07 at init, capped at 100).
+- **Two cross-entropies.** Rows (image to text) and columns (text to image), each with targets on the
+  diagonal, averaged. The other pairs in the batch are the negatives.
+
+### Why does batch size matter so much for CLIP, and how does SigLIP change that?
+- **Negatives come from the batch.** N pairs give N² − N negatives, so bigger batches give harder
+  negatives; CLIP used 32,768.
+- **SigLIP decouples pairs.** A per-pair sigmoid with a learned negative bias needs no batch-wide softmax,
+  so it shards across devices without gathering every embedding and trains well at smaller batches.
+
+### Your zero-shot classifier confidently labels unrelated images. How do you fix it?
+- **Diagnose the softmax.** It must sum to one over your labels, so an out-of-scope image still gets a
+  winner with high probability.
+- **Fix.** Add background or "other" prompts, apply a cosine floor tuned on labelled negatives before the
+  softmax, and measure precision on images that match no class.
+
+### When would you not use CLIP, even though it is cheap?
+- **Counting and spatial questions.** Captions rarely encode "how many" or "left of", so the space does
+  not represent them; use a detector or a VLM.
+- **Fine-grained, costly decisions.** Medical or industrial parts need a supervised or probed model;
+  CLIP can narrow candidates first.
+
+### You must embed a 10-million-image catalogue. What do you plan for?
+- **Storage.** 512-dimensional float32 vectors are 2,048 bytes each, about 20.5 GB raw, roughly half in
+  float16, before index overhead.
+- **Versioning.** Pin the checkpoint and preprocessing; any change is a full re-embed into a new index,
+  so budget GPU hours and an alias swap rather than mixing versions.
 
 ## Quiz
 ### Q: In CLIP's contrastive loss, where do the negative examples come from?

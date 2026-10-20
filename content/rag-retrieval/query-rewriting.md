@@ -5,7 +5,7 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/hyde
@@ -191,9 +191,10 @@ Illustrative review of a support bot's 40 worst retrievals, grouped by cause:
 | "why did key K-7 get 429?" | incident threads only | step-back | rate-limit rules plus the original's hits |
 
 ## Production patterns
-- **Rewrite only when it is needed.** For multi-turn chat, have the rewriter return `standalone` and
-  `needs_retrieval` flags; skip the second retrieval when the turn is already standalone and skip retrieval
-  entirely for small talk. Monitor the share of turns rewritten and the rewrite-call p95 latency.
+- **Retrieve only what each turn needs, and hide the latency.** Have the rewriter return `standalone` and
+  `needs_retrieval` flags; skip retrieval entirely for small talk, and start the original query's
+  retrieval in parallel with the rewrite call so only the rewrites' retrieval waits on the LLM. Monitor the
+  share of turns rewritten and the rewrite-call p95 latency.
 - **Literal-preservation guard.** After rewriting, check that every quoted string, code-like token (for
   example matching a pattern such as `[A-Z]+_\d+`) and number in the input still appears in at least one
   rewrite; if not, fall back to the original. Monitor the guard's fallback rate per release of the prompt.
@@ -286,7 +287,8 @@ and after.
 ### When would you not add a query rewriter?
 - **Well-formed single-turn input:** trained users already write in the corpus's vocabulary, so the step
   adds a sequential call with no recall gain.
-- **Tight latency budgets:** the rewrite runs before retrieval and cannot be parallelised with it.
+- **Tight latency budgets:** retrieval for the rewrites must wait for the rewrite call, so it adds one
+  sequential LLM round trip even if the original's retrieval runs in parallel.
 - **No failure evidence:** each form fixes a specific mismatch, so without failure analysis you are paying
   for drift risk without a measured benefit.
 

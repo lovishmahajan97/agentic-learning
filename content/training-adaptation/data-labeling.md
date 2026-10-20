@@ -5,7 +5,7 @@ name: Data labeling
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/data-curation
   - training-adaptation/supervised-fine-tuning
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Data labeling turns raw inputs into measurable targets (classes, spans, demonstrations, preferences). A
-fine-tuned model learns the labeling function, inconsistencies included, and at fine-tuning scale a few
-thousand examples carry the whole signal, so quality is measured by agreement.
+Data labeling turns raw inputs into targets (classes, spans, demonstrations, preferences) whose quality
+you can measure, chiefly by inter-annotator agreement. A fine-tuned model learns the labeling function,
+inconsistencies included, and a few thousand examples carry the whole signal.
 
 ## Why it exists
 - **Everything downstream needs targets.** Supervised fine-tuning, reward models, and the small
@@ -218,7 +218,8 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_predict
 
-# X: features (e.g. text embeddings), y: integer labels from annotators
+# X: features (e.g. text embeddings), y: annotator labels encoded as integers 0..K-1
+# (so column k of probs is class k; give every class at least as many items as folds)
 probs = cross_val_predict(LogisticRegression(max_iter=1000), X, y, cv=5, method="predict_proba")
 given_label_prob = probs[np.arange(len(y)), y]      # model's belief in the label it was given
 suspects = np.argsort(given_label_prob)[:200]       # lowest-confidence labels first
@@ -269,7 +270,8 @@ suspects = np.argsort(given_label_prob)[:200]       # lowest-confidence labels f
   accuracy with near-zero recall on the class you built the model for. Fix: stratify.
 - **Reading low kappa on a skewed task as careless raters.** With a 97% majority class, kappa can be low
   even at very high raw agreement. Symptom: the confusion matrix shows all disagreement on the rare
-  class, a guideline problem for that class, not a workforce problem.
+  class, a guideline problem for that class, not a workforce problem. Fix: add boundary cases for that
+  class and re-pilot with it oversampled.
 - **Rubric scores without anchor examples per level.** Symptom: one annotator's "4" is another's "2",
   hidden because most items cluster in the middle. Fix: anchor every score level.
 - **Raw customer text to a vendor without PII redaction and a data-processing agreement.** Symptom: a
@@ -309,13 +311,15 @@ any model suggestion. Finally, record guideline version and annotator id on ever
 analysis can isolate a bad batch instead of discarding the whole dataset.
 
 ## Interview questions
-### What is Cohen's kappa and why not just report percent agreement?
-- **Definition:** κ = (p_o − p_e) / (1 − p_e), observed agreement corrected for the agreement two raters
-  would reach by chance given their own label frequencies.
-- **Why it matters:** on skewed labels raw agreement is inflated. Two raters who both say "not spam" 95%
-  of the time agree about 90% of the time by luck, so kappa shows whether the judgement calls agree.
-- **Beyond two raters:** Fleiss' kappa for many raters, Krippendorff's alpha for missing labels or ordinal
-  scales.
+### Cohen's kappa, Fleiss' kappa or Krippendorff's alpha: which do you use, and when?
+- **Cohen's kappa:** exactly two raters on nominal labels, every item labeled by both. It is
+  κ = (p_o − p_e) / (1 − p_e), observed agreement corrected for chance agreement given each rater's own
+  label frequencies, which matters because skewed labels inflate raw agreement.
+- **Fleiss' kappa:** three or more raters on nominal labels, the usual choice for a multi-rater pilot.
+- **Krippendorff's alpha:** when some items are missing labels, or the scale is ordinal (rubric 1–5),
+  because it can count a 4-vs-5 disagreement as smaller than a 1-vs-5 one.
+- **Whichever you pick:** bootstrap an interval on a small pilot and read the confusion matrix, because
+  one number hides which classes the guideline fails to separate.
 
 ### Your classifier plateaus at 80% validation accuracy. How do you tell whether the labels or the model are the limit?
 - **Measure label noise first:** have two or three people independently relabel a few hundred validation

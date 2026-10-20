@@ -5,7 +5,7 @@ name: Vercel AI SDK
 kind: tool
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/openai-anthropic-node-sdks
   - node-ts-for-ai/streams-and-backpressure
@@ -21,120 +21,131 @@ sources:
 ---
 
 ## TL;DR
-The Vercel AI SDK (`ai` on npm) is a provider-agnostic TypeScript layer with two halves: a core API
-(`generateText`, `streamText`, `generateObject`, `tool`, `embed`) that maps one call shape onto OpenAI,
-Anthropic, Google and others through small provider packages, and a UI half (`useChat`) that streams
-text, tool calls and structured data to the browser over a defined protocol. Swapping a model becomes
-one line and browser streaming stops being a hand-rolled parser; the price is that provider-specific
-features sit behind an escape hatch.
+The Vercel AI SDK (`ai` on npm) gives one TypeScript call shape across model providers plus a streaming
+UI protocol for `useChat`. Swapping models becomes one line and browser streaming needs no hand-rolled
+parser; provider-specific features sit behind an escape hatch.
 
 ## Why it exists
-Two kinds of plumbing dominate the first week of any TypeScript AI product. The first is provider
-shape: OpenAI returns `choices[0].message.content` and tool calls with JSON-string arguments, Anthropic
-returns an array of content blocks with parsed `input`, Google differs again, and each streams a
-different event vocabulary. A team that wants to compare models, keep a fallback provider, or let a
-customer bring their own key ends up writing an adapter per provider and a normalised stream type of
-its own. The second is the browser: a chat UI needs tokens as they arrive, tool-call progress, partial
-structured objects, stop buttons and message history, and the naive `fetch` plus `TextDecoder` loop
-grows into a protocol with no name that only one engineer understands.
-
-Calling the native SDKs directly is the right choice when you use one provider and need its full
-surface, but it does not solve either problem; it is the thing the adapter would wrap. Picking a
-heavyweight agent framework solves them at the cost of owning its abstractions for everything else.
-The AI SDK is deliberately narrower: it standardises the model call and the UI stream and stops
-there. Its design bet is that the unified call can cover the large common core (messages, tools,
-structured output, streaming, usage) and that the provider-specific long tail can be reached through
-typed provider options rather than by abandoning the layer. Whether that bet holds for your use case is
-exactly the decision this lesson is about.
+- **Every provider has its own shape.** OpenAI returns `choices[0].message.content` and tool calls with
+  JSON-string arguments; Anthropic returns an array of content blocks with parsed `input`; Google differs
+  again, and each streams a different event vocabulary. Comparing models, keeping a fallback or letting a
+  customer bring their own key means an adapter per provider and a normalised stream type of your own.
+- **The browser needs a protocol.** A chat UI needs tokens as they arrive, tool-call progress, partial
+  structured objects, stop buttons and history. The naive `fetch` plus `TextDecoder` loop grows into a
+  protocol with no name that only one engineer understands.
+- **Native SDKs and frameworks miss the middle.** Native SDKs are right for one provider and its full
+  surface, but they are what the adapter would wrap. A heavyweight agent framework solves both problems at
+  the cost of owning its abstractions for everything else.
+- **The design bet: standardise the call and the UI stream, then stop.** The unified call covers the large
+  common core (messages, tools, structured output, streaming, usage); the provider-specific long tail is
+  reached through typed provider options. Whether that bet holds for you is this lesson's decision.
 
 ## How it works
 ### The provider abstraction
-Every provider package (`@ai-sdk/openai`, `@ai-sdk/anthropic`, `@ai-sdk/google`, plus community ones)
-implements the SDK's language-model specification: a small interface with a `doGenerate` and a
-`doStream` method that take the unified prompt (system, messages with typed parts, tool definitions,
-settings) and return either a result or a stream of unified parts: text deltas, reasoning deltas,
-tool-call deltas, tool results, a finish part with `finishReason` and `usage`. The core functions are
-written once against that interface, which is *why* `anthropic("...")` and `openai("...")` are
-interchangeable at the call site: the mapping from the unified shape to each provider's wire format and
-back lives inside the provider package, not in your code. Provider-only features (Anthropic's
-`cache_control` breakpoints or thinking settings, OpenAI's reasoning effort, a Google safety setting)
-are passed through `providerOptions` keyed by provider, so you can reach them without leaving the
-unified call; they simply do nothing on a provider that lacks them.
+- **One specification, many packages.** `@ai-sdk/openai`, `@ai-sdk/anthropic`, `@ai-sdk/google` and
+  community packages implement the SDK's language-model specification: a small interface with `doGenerate`
+  and `doStream`.
+- **Unified input and output.** Both take the unified prompt (system, messages with typed parts, tool
+  definitions, settings) and return a result or a stream of unified parts: text deltas, reasoning deltas,
+  tool-call deltas, tool results, and a finish part with `finishReason` and `usage`.
+- **Why models are interchangeable.** The core functions are written once against that interface, so
+  `anthropic("...")` and `openai("...")` swap at the call site; the wire-format mapping lives in the
+  provider package, not your code.
+- **The escape hatch.** Provider-only features (Anthropic's `cache_control` breakpoints or thinking settings,
+  OpenAI's reasoning effort, a Google safety setting) go through `providerOptions` keyed by provider. They
+  simply do nothing on a provider that lacks them.
 
 ### Core functions
-- `generateText` and `streamText` take `model`, `system`, `messages` (or `prompt`), optional `tools`,
-  and settings such as `temperature`, `maxOutputTokens` and `abortSignal`. The streaming variant returns
-  an object whose `textStream` and `fullStream` are async iterables and whose `text`, `usage` and
-  `steps` are promises that resolve when the stream finishes, so one call serves both the response
-  body and your logging.
-- `tool({ description, inputSchema, execute })` defines a tool from a Zod (or JSON) schema; the schema
-  becomes the provider's tool definition and the model's arguments are validated against it before
-  `execute` runs, which is the same contract-as-value idea as the schema-validation lesson. When
-  `execute` is present the SDK runs the tool and records its result, and if you set `stopWhen` (for
-  example `stepCountIs(n)`) it appends the result and calls the model again, looping until the condition
-  holds or the model stops calling tools. The default for `generateText` / `streamText` is a single
-  step (`stepCountIs(1)`), so without `stopWhen` the tool runs but the model never sees its result and
-  never writes the final answer. Omit `execute` to receive the tool call and run it yourself, for
-  approvals or client-side tools.
-- `generateObject` and `streamObject` take a Zod schema and return a typed, validated object (or a
-  stream of partial objects). Under the hood the provider package picks its best mechanism, a JSON
-  schema response format, a forced tool call, or an instruction, and the SDK validates the result
-  against the schema, so a non-conforming answer surfaces as an error (`NoObjectGeneratedError`) rather
-  than a mis-typed value.
-- `embed` and `embedMany` do the same unification for embedding models.
+| Function | Takes | Returns / does |
+|---|---|---|
+| `generateText`, `streamText` | `model`, `system`, `messages` (or `prompt`), optional `tools`, settings such as `temperature`, `maxOutputTokens`, `abortSignal` | Streaming variant: `textStream` and `fullStream` async iterables, plus `text`, `usage` and `steps` promises that resolve at the end, so one call serves the response body and your logging |
+| `tool({ description, inputSchema, execute })` | A Zod (or JSON) schema | Becomes the provider's tool definition; arguments are validated before `execute` runs (contract-as-value, as in the schema-validation lesson) |
+| `generateObject`, `streamObject` | A Zod schema | Typed, validated object (or partial objects); a non-conforming answer is an error (`NoObjectGeneratedError`), not a mis-typed value |
+| `embed`, `embedMany` | Embedding model and values | Same unification for embeddings |
+
+- **Tool execution and the loop.** With `execute` present the SDK runs the tool and records its result. With
+  `stopWhen` (for example `stepCountIs(n)`) it appends the result and calls the model again until the
+  condition holds or the model stops calling tools.
+- **The default is a single step** (`stepCountIs(1)`) for `generateText` / `streamText`. Without `stopWhen`
+  the tool runs but the model never sees its result and never writes the final answer.
+- **Omit `execute`** to receive the tool call and run it yourself, for approvals or client-side tools.
+- **How `generateObject` constrains output.** The provider package picks its best mechanism (a JSON schema
+  response format, a forced tool call, or an instruction) and the SDK validates the result against the schema.
 
 ### One request through the tool loop
 With `tools` that have `execute` and `stopWhen: stepCountIs(4)`, a single `streamText` call runs:
-1. **Step 1.** The SDK maps `system`, `messages` and the tool schemas to the provider's request and
-   streams the reply. The model emits a tool call; the SDK accumulates its argument fragments and
-   validates the parsed input against the tool's Zod schema.
-2. **Execute.** `execute` runs with the typed input. The SDK appends two messages to the step's
-   history: the assistant message holding the tool call and a tool message holding the result.
-   (In v5 a failed execution is recorded as a tool-error part rather than thrown, so the model can
-   read it; check how your version treats errors.)
-3. **Check the stop condition.** The loop continues only if the last step ended in tool calls and
-   `stopWhen` is not yet satisfied. Otherwise the finish part is emitted.
-4. **Step 2.** A *new* provider request is sent containing the original prompt plus the appended
-   messages. The model now writes the answer.
+1. **Step 1.** The SDK maps `system`, `messages` and the tool schemas to the provider's request and streams
+   the reply. The model emits a tool call; the SDK accumulates argument fragments and validates the parsed
+   input against the tool's Zod schema.
+2. **Execute.** `execute` runs with the typed input. The SDK appends the assistant message holding the tool
+   call and a tool message holding the result. (In v5 a failed execution is recorded as a tool-error part
+   rather than thrown, so the model can read it; check how your version treats errors.)
+3. **Check the stop condition.** The loop continues only if the last step ended in tool calls and `stopWhen`
+   is not yet satisfied. Otherwise the finish part is emitted.
+4. **Step 2.** A *new* provider request is sent with the original prompt plus the appended messages. The
+   model now writes the answer.
 
-Two consequences follow from step 4. Each step is a separate billed request that resends the whole
-history, so input tokens grow with every round, which is *why* `totalUsage` (summed over steps)
-can be several times the first request's input and why a step limit is a cost control, not only a
-loop guard. And the result exposes `steps`, each with its own text, tool calls, results and usage,
-which is what you log to see where a slow or expensive answer spent its rounds.
+Two consequences of step 4:
+- **Each step is a separate billed request that resends the whole history**, so input tokens grow every
+  round. That is *why* `totalUsage` (summed over steps) can be several times the first request's input, and
+  why a step limit is a cost control, not only a loop guard.
+- **`steps` is your trace.** Each step carries its own text, tool calls, results and usage; log them to see
+  where a slow or expensive answer spent its rounds.
 
 ### The UI half and its protocol
-`useChat` (from `@ai-sdk/react` in v5; Vue and Svelte packages exist too) on the client keeps the
-message list, sends it to your route on submit, and appends parts as
-they stream: text, tool invocations with their state, and custom data. The server route returns the
-result's response helper, which encodes the unified stream parts into the SDK's UI message stream
-(in v5, JSON parts sent as server-sent events and marked by a protocol-version header; v4 used a
-line-prefixed "data stream" format), consumed by the hook; a plain text alternative exists when you
-only need tokens. This is the piece that lets a tool call started on the server render
-as a progress card in the browser without you writing the protocol. The client and server packages
-must agree on the protocol version, which is why the two sides are upgraded together.
+- **Client.** `useChat` (from `@ai-sdk/react` in v5; Vue and Svelte packages exist too) keeps the message
+  list, sends it to your route on submit, and appends parts as they stream: text, tool invocations with their
+  state, and custom data.
+- **Server.** The route returns the result's response helper, which encodes unified stream parts into the
+  UI message stream. In v5 that is JSON parts sent as server-sent events and marked by a protocol-version
+  header; v4 used a line-prefixed "data stream" format. A plain text alternative exists when you only need tokens.
+- **What it buys.** A tool call started on the server renders as a progress card in the browser without you
+  writing the protocol.
+- **The coupling.** Client and server packages must agree on the protocol version, which is why the two
+  sides are upgraded together.
 
 ### Middleware and telemetry
-`wrapLanguageModel` wraps any model with middleware that can transform the prompt, intercept the
-result or short-circuit the call: logging, caching, guardrails and default settings live here instead
-of at every call site. OpenTelemetry support, switched on per call with the `experimental_telemetry`
-option, emits spans for each call and step with token usage, which plugs into the same tracing
-pipeline as the rest of the service.
+- **`wrapLanguageModel`** wraps any model with middleware that can transform the prompt, intercept the
+  result or short-circuit the call. Logging, caching, guardrails and default settings live here instead of
+  at every call site.
+- **OpenTelemetry**, switched on per call with the `experimental_telemetry` option, emits spans for each
+  call and step with token usage, into the same tracing pipeline as the rest of the service.
 
-### Runtime fit
-The core runs anywhere `fetch` exists: Node, Bun, Deno, edge runtimes, and inside Express, Fastify,
-Hono or Next.js route handlers. Nothing requires Vercel's platform; the UI hooks require a framework
-only on the client side. Note that names have shifted across major versions: in v5 tool `parameters`
-became `inputSchema`, `maxTokens` became `maxOutputTokens`, `maxSteps` became `stopWhen`, and
-`convertToCoreMessages` became `convertToModelMessages`. v6 then deprecated `generateObject` /
-`streamObject` in favour of `generateText` / `streamText` with an `output` setting and added an agent
-abstraction, and its migration guide lists further signature changes. Check the version you install
-against its docs rather than copying old snippets.
+### Runtime fit and versions
+- **Runs anywhere `fetch` exists:** Node, Bun, Deno, edge runtimes, and inside Express, Fastify, Hono or
+  Next.js route handlers. Nothing requires Vercel's platform; the UI hooks need a framework only on the client.
+- **Names shift across majors.** In v5 tool `parameters` became `inputSchema`, `maxTokens` became
+  `maxOutputTokens`, `maxSteps` became `stopWhen`, and `convertToCoreMessages` became `convertToModelMessages`.
+- **v6 moved again.** It deprecated `generateObject` / `streamObject` in favour of `generateText` /
+  `streamText` with an `output` setting, added an agent abstraction, and its migration guide lists further
+  signature changes. Check the version you install against its docs rather than copying old snippets.
 
-## Example
+## Diagram
+One `streamText` call with a tool is two billed provider requests; the second resends the history plus the
+tool call and result.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser useChat
+    participant R as Route streamText
+    participant P as Provider
+    participant T as Tool execute
+    B->>R: POST messages
+    R->>P: Step 1: system, messages, tool schemas
+    P-->>R: tool call, args validated by Zod
+    R-->>B: tool card: input available
+    R->>T: execute with typed input
+    T-->>R: result
+    R->>P: Step 2: history plus call and result
+    P-->>R: answer text and finish part
+    R-->>B: text parts, output available
+```
+
+## Examples
+### Streaming tool route plus typed classification
 A route handler that streams a tool-using answer to a `useChat` client, and a separate function that
-classifies text into a typed object. The model line is the only provider-specific code; written
-against AI SDK 5 naming.
+classifies text into a typed object. The model line is the only provider-specific code; written against
+AI SDK 5 naming.
 
 ```ts
 import { streamText, generateObject, tool, stepCountIs, convertToModelMessages } from "ai";
@@ -176,57 +187,96 @@ export async function classify(text: string) {
 }
 ```
 
-Walk the chat route for "Where is ord_42?". Step 1 sends the system prompt, one user message and
-the `lookupOrder` schema; the model replies with a tool call `{ orderId: "ord_42" }`, the regex
-passes, and `execute` reads the database. Step 2 resends everything plus the call and its result,
-and the model writes the answer. `steps.length` is 2, the browser saw a tool card move from
-"input available" to "output available" before any answer text, and `totalUsage.inputTokens` counts
-the system prompt twice, because it was sent twice. Had the model asked for `"42"`, the Zod regex
-would have rejected the input before `execute` ran. Swapping `anthropic(...)` for `openai(...)`
-changes the bytes on the wire (a `tool_calls` entry with string arguments instead of a `tool_use`
-block) and nothing in this file.
+### Worked trace: "Where is ord_42?"
+| Moment | What happens |
+|---|---|
+| Step 1 request | System prompt, one user message and the `lookupOrder` schema are sent |
+| Step 1 reply | Tool call `{ orderId: "ord_42" }`; the regex passes; `execute` reads the database |
+| Browser | A tool card moves from "input available" to "output available" before any answer text |
+| Step 2 request | Everything resent plus the call and its result; the model writes the answer |
+| `onFinish` | `steps.length` is 2; `totalUsage.inputTokens` counts the system prompt twice, because it was sent twice |
+
+- **Bad input never reaches the tool.** Had the model asked for `"42"`, the Zod regex would have rejected
+  the input before `execute` ran.
+- **A provider swap changes only the wire.** Swapping `anthropic(...)` for `openai(...)` changes the bytes
+  (a `tool_calls` entry with string arguments instead of a `tool_use` block) and nothing in this file.
+
+### Handling a structured-output failure explicitly
+`generateObject` can still fail when the model's answer does not match the schema. Catch that error type,
+log what the model wrote, and return an explicit fallback that your metrics count as a failure.
+
+```ts
+import { NoObjectGeneratedError } from "ai";
+
+export async function classifySafe(text: string) {
+  try {
+    return await classify(text);                       // from the example above
+  } catch (e) {
+    if (NoObjectGeneratedError.isInstance(e)) {
+      console.warn({ msg: "intent schema failure", raw: e.text, finishReason: e.finishReason });
+      return { intent: "other" as const, confidence: 0 };   // explicit fallback, never silent
+    }
+    throw e;                                            // network, auth, abort: let the caller decide
+  }
+}
+```
+
+## Production patterns
+- **Budgeted, cancellable tool loops.** On every route with tools, set `stopWhen: stepCountIs(n)` with a
+  small `n` and pass `abortSignal: req.signal`, so a looping model or a closed tab stops billing. Monitor
+  steps per request and `totalUsage` per conversation from `onFinish`, and alert on the tail.
+- **Upgrade client and server together.** Pin `ai`, the provider packages and `@ai-sdk/react` to exact
+  versions and bump them in one PR, because the UI stream protocol version must match on both sides. After
+  deploy, watch for client render errors or empty messages on the chat page.
+- **Cross-cutting policy in middleware.** Wrap the shared model once with `wrapLanguageModel` for logging,
+  default settings or a guardrail, and export that wrapped model to every route. Monitor latency added by
+  the middleware and keep per-route exceptions out of it.
+- **Per-call tracing.** Turn on `experimental_telemetry` for production calls so each call and step emits an
+  OpenTelemetry span with token usage. Track p95 time to first token, tool-call counts and cost per route
+  in the same dashboards as the HTTP spans.
+- **Provider comparison as an eval job.** Run the golden set through the same code with the model line set
+  to each candidate (`anthropic(...)`, `openai(...)`) in a scheduled job, and record quality, latency and
+  cost side by side. Also run the tool schemas against each provider, since some reject schemas others accept.
 
 ## Trade-offs
-- One call shape across providers makes comparisons and fallbacks cheap, but the newest
-  provider-specific feature usually arrives behind `providerOptions` or not at all for a while;
-  if your product is built on such a feature, the native SDK is the better primary interface.
-- The built-in tool loop and `generateObject` remove boilerplate, yet they decide the mechanism
-  (forced tool versus JSON mode) for you; when you need deterministic control over every request body,
-  for caching or auditing, drop to the native SDK for that path.
-- The UI protocol gives streaming tool and data parts for free, at the cost of coupling client and
-  server package versions and of a wire format you do not own; a plain text stream is simpler when
-  the client is not yours.
-- Middleware centralises logging, caching and guardrails, but a stack of middlewares is a second place
-  behaviour hides; it pays while every call site needs the same policy, and stops paying once
-  middlewares need per-route exceptions, at which point explicit calls are clearer.
-- Major versions have renamed core options, which is cheap to follow in a small codebase and painful in
-  a large one; pin the version and schedule upgrades rather than floating.
+- **One call shape vs newest features.** Comparisons and fallbacks get cheap, but the newest
+  provider-specific feature usually arrives behind `providerOptions` or not at all for a while. If your
+  product is built on such a feature, the native SDK is the better primary interface.
+- **Built-in loop vs request control.** The tool loop and `generateObject` remove boilerplate, yet they
+  decide the mechanism (forced tool versus JSON mode) for you. When you need deterministic control over
+  every request body, for caching or auditing, drop to the native SDK for that path.
+- **UI protocol vs ownership.** Streaming tool and data parts come free, at the cost of coupling client and
+  server versions and a wire format you do not own. A plain text stream is simpler when the client is not yours.
+- **Middleware vs hidden behaviour.** It centralises logging, caching and guardrails, but a stack of
+  middlewares is a second place behaviour hides. It pays while every call site needs the same policy, and
+  stops once middlewares need per-route exceptions; then explicit calls are clearer.
+- **Following majors vs stability.** Renamed core options are cheap to follow in a small codebase and painful
+  in a large one; pin the version and schedule upgrades rather than floating.
 
 ## Pitfalls
-- Assuming `generateObject` removes the need to handle failure; the symptom is an unhandled schema
-  validation error in production when the model returns a value outside the enum.
-- Setting a generous `stopWhen` limit, or using an agent abstraction with a high default, without a
-  budget; the symptom is a request that makes a dozen tool calls, times out at the proxy and bills for
-  every round. The opposite mistake, omitting `stopWhen`, shows up as a tool that runs but a reply that
-  ends with no answer text.
-- Forgetting to pass `abortSignal` from the request; the symptom is server logs showing completions
-  finishing minutes after users closed the tab.
-- Upgrading `ai` on the server without the client package; the symptom is a UI that renders nothing
-  or shows raw protocol lines because the stream format changed.
-- Reaching for `providerOptions` without checking the provider; the symptom is a cache or thinking
-  setting silently ignored after switching models, with cost and latency changing unexpectedly.
-- Treating the model string as configuration-free; the symptom is a provider swap that passes tests
-  with the fake and fails on tool schemas the new provider rejects.
+- **Assuming `generateObject` removes failure handling.** Symptom: an unhandled schema validation error in
+  production when the model returns a value outside the enum.
+- **A generous `stopWhen` limit, or an agent abstraction with a high default, with no budget.** Symptom: a
+  request makes a dozen tool calls, times out at the proxy and bills for every round.
+- **Omitting `stopWhen` entirely.** Symptom: the tool runs but the reply ends with no answer text.
+- **Forgetting to pass `abortSignal` from the request.** Symptom: server logs show completions finishing
+  minutes after users closed the tab.
+- **Upgrading `ai` on the server without the client package.** Symptom: the UI renders nothing or shows raw
+  protocol lines because the stream format changed.
+- **Reaching for `providerOptions` without checking the provider.** Symptom: a cache or thinking setting is
+  silently ignored after switching models, and cost and latency change unexpectedly.
+- **Treating the model string as configuration-free.** Symptom: a provider swap passes tests with the fake
+  and fails on tool schemas the new provider rejects.
 
 ## When to use
-Use it when you want to compare or switch providers, when a browser UI needs streamed text, tool state
-or partial objects, or when a small team wants typed tools and structured output without owning an
-agent framework. Prefer the native provider SDK when you commit to one provider and lean on its
-specific features (explicit prompt caching, batch APIs, server-side tools), when you need byte-level
-control over requests, or when you are writing a library others will consume. Measure the same things
-as with a native client: tokens and cost per request, p95 time to first token, tool-call counts per
-conversation, and schema validation failure rate. In interviews the useful answer explains what the
-abstraction normalises, what it cannot, and when you would step outside it.
+- **Use when** you want to compare or switch providers, a browser UI needs streamed text, tool state or
+  partial objects, or a small team wants typed tools and structured output without owning an agent framework.
+- **Prefer the native SDK when** you commit to one provider and lean on its specific features (explicit
+  prompt caching, batch APIs, server-side tools), need byte-level control over requests, or are writing a
+  library others will consume.
+- **Measure** the same things as with a native client: tokens and cost per request, p95 time to first token,
+  tool-call counts per conversation, and schema validation failure rate.
+- **Interviews:** explain what the abstraction normalises, what it cannot, and when you would step outside it.
 
 ## Role lens
 - **Engineer:** Writes route handlers with `streamText`, defines tools with Zod, sets step limits and
@@ -248,6 +298,35 @@ which trades latency for a lower price and is not something the unified call mod
 directly against the native SDK, reuse the same Zod schema for validation, and keep the interactive
 paths on the AI SDK. The rule is: unified layer for the common interactive surface, native SDK for
 provider-specific economics.
+
+## Interview questions
+### What does the AI SDK actually normalise across providers, and what does it leave to you?
+- **Normalised:** the call shape (system, messages, tools, settings), the stream parts (text, reasoning and
+  tool-call deltas, finish with `usage`), tool validation and the structured-output path.
+- **Left to you:** provider-only features via `providerOptions`, endpoints it does not model such as batch
+  APIs, and checking that each provider accepts your tool schemas.
+
+### A user reports that the assistant "looked up the order and then said nothing." What happened?
+- **Likely cause:** no `stopWhen`, so the default single step (`stepCountIs(1)`) ran the tool but never sent
+  its result back for a second model request.
+- **Confirm:** `steps.length` is 1 and the last step ended in tool calls.
+- **Fix:** set `stopWhen: stepCountIs(n)` with a small budget and log steps per request.
+
+### Why can a tool-using request cost several times its first request's input tokens?
+- **Each step is a new billed request** that resends the full history plus the appended tool call and result.
+- **So input grows every round:** with two steps the system prompt is counted twice in `totalUsage`.
+- **Control it** with a step limit, a short system prompt or provider caching, and monitor `totalUsage`, not `usage`.
+
+### When would you not use the AI SDK?
+- **One provider, deep features:** explicit prompt caching, batch jobs or server-side tools favour the native SDK.
+- **Byte-level control:** auditing or caching that needs the exact request body.
+- **Writing a library:** consumers should not inherit your abstraction and its version churn.
+
+### How would you roll out an upgrade from AI SDK v4 to v5 safely?
+- **Upgrade server and client packages together**, because v4 used a line-prefixed data stream and v5 uses
+  server-sent JSON parts with a protocol-version header.
+- **Apply the renames:** `parameters` to `inputSchema`, `maxTokens` to `maxOutputTokens`, `maxSteps` to `stopWhen`.
+- **Verify** with an interception test of the route and a canary, watching empty-message and render errors.
 
 ## Quiz
 ### Q: What makes `anthropic("...")` and `openai("...")` interchangeable in a `streamText` call?

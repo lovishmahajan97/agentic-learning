@@ -5,7 +5,7 @@ name: Document parsing (OCR, layout, tables)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - multimodal/ocr
   - multimodal/document-understanding
@@ -21,8 +21,8 @@ sources:
 
 ## TL;DR
 Parsing turns PDFs, scans and office files into clean, ordered, structured text before chunking: OCR for
-image pages, layout analysis for reading order, and tables that keep cells tied to their headers. Every
-later stage sees only what the parser produced.
+image pages, layout analysis for reading order and header removal, and tables that keep cells tied to
+their headers. Retrieval cannot find text the parser garbled, reordered or flattened.
 
 ## Why it exists
 - **A PDF is drawing instructions, not text.** Place these glyphs at these coordinates, draw this line.
@@ -141,8 +141,9 @@ flowchart TD
     X --> C["Clean: rejoin hyphens, NFKC normalise, fix line breaks"]
     O --> C
     C --> L["Layout: blocks, reading order, strip headers and footers"]
-    L --> T["Tables: structure as Markdown or HTML, rows with headers, stitch pages"]
-    T --> K[("Structured text plus heading and page metadata to chunking")]
+    S --> C
+    L --> T["Tables: Markdown or HTML, rows with headers, stitched"]
+    T --> K[("Structured text and metadata to chunking")]
 ```
 
 ## Examples
@@ -339,13 +340,13 @@ VLM transcription for numbers unless outputs are cross-checked.
 - **Inputs matter:** render around 300 DPI for Tesseract, deskew and set the correct language before
   blaming the engine.
 
-### How do you handle tables so that a single row is still answerable after chunking?
-- **Keep structure:** detect the table region, recognise rows, columns and merged or multi-row headers, and
-  output Markdown or HTML.
-- **Serialise each row with its headers**, such as "Plan: Enterprise; Refund window: 30 days", and stitch
-  tables that continue across pages so continuation rows keep their column labels.
-- **Avoid double indexing and know when to stop embedding:** crop table regions out of the prose extraction,
-  and load large numeric tables into a database for SQL instead.
+### How would you choose between an open-source stack and a managed document service?
+- **Benchmark on your own ugliest pages:** tools such as pdfplumber plus Tesseract, Docling or Unstructured,
+  and AWS Textract or Azure AI Document Intelligence differ mainly in layout and table quality on *your*
+  documents, so compare them on a hand-transcribed golden set.
+- **Score what breaks answers:** CER, digit CER and table cell accuracy, not a single overall score.
+- **Then weigh the constraints:** cost per page, latency, and data residency, since a managed service sends
+  pages outside your boundary; keep the golden set in CI to catch regressions on upgrades.
 
 ## Quiz
 ### Q: Why should OCR fallback be decided per page rather than per file?

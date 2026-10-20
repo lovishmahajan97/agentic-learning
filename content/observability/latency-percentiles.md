@@ -182,7 +182,7 @@ and interpolate linearly inside it. Hosts are merged by adding counts per bucket
 
 ```python
 edges = [0.5, 1, 2, 5, 10, float("inf")]           # bucket upper bounds (le), seconds
-host_a = [700, 900, 960, 990, 998, 1000]            # cumulative counts
+host_a = [7000, 9000, 9600, 9900, 9980, 10000]      # cumulative counts, busy host
 host_b = [10, 30, 60, 85, 98, 100]                  # small canary, slow
 
 def quantile(q, edges, cum):
@@ -204,9 +204,11 @@ print(f"fleet p99  {quantile(0.99, edges, merged):.2f} s")
 print(f"under 2 s  {merged[2] / merged[-1]:.1%}")   # exact at an edge: the SLO ratio
 ```
 
-- **Output:** A p99 5.00 s, B p99 10.00 s, average 7.50 s, fleet p99 5.30 s, 96.4% under 2 s.
+- **Output:** A p99 5.00 s, B p99 10.00 s, average of p99s 7.50 s, fleet p99 5.75 s, 95.6% under 2 s.
+- **The canary dominates the average** although it carries about 1% of traffic; the merged number is the
+  real fleet tail.
 - **The SLO ratio is exact** because 2 s is a bucket edge; the p99 values are only as precise as the bucket
-  widths (5 to 10 s here).
+  widths (5 to 10 s here). B's p99 falls in the +Inf bucket, so it is clamped to the last finite edge.
 
 ### Worked incident: a p99 that improved during an outage
 | Time | Successes timed | Timeouts (not timed) | Reported p99 |

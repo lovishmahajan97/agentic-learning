@@ -5,7 +5,7 @@ name: Chunk overlap
 kind: concept
 difficulty: intro
 est_minutes: 10
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -101,7 +101,7 @@ Overlap acts at two points: at index time the window repeats the previous chunk'
 time the retriever must collapse the neighbours that overlap makes rank together.
 
 ```mermaid
-flowchart LR
+flowchart TD
     T["Token stream, length T"] --> W["Window of S tokens"]
     W -->|"advance by stride S minus O"| W
     W --> C["Chunks i and i+1 share O tokens"]
@@ -115,7 +115,8 @@ flowchart LR
 
 ## Examples
 ### A token sliding window and its inflation
-A token-based sliding window with tiktoken. It returns token ids, decoded for display; production
+A token-based sliding window with tiktoken. It windows over token ids and decodes each window back to
+text; production
 splitters also snap the overlap to sentence boundaries so a chunk never begins mid-word or mid-sentence.
 
 ```python

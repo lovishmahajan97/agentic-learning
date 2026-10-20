@@ -5,7 +5,7 @@ name: Experiment tracking (MLflow, W&B)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - llmops-platform/model-registry
   - llmops-platform/reproducible-evaluations
@@ -21,106 +21,129 @@ sources:
 ---
 
 ## TL;DR
-Experiment tracking records every run of a training or evaluation job — fixed parameters, code and data
-versions, step-indexed metrics and output artifacts — in a queryable store so runs can be compared,
-reproduced and promoted. MLflow and Weights & Biases are the two common tools; they share the same data
-model and differ mainly in hosting (self-hosted open source versus SaaS-first), UI depth, and ecosystem
-(MLflow's registry and model packaging; W&B's sweeps, artifact lineage graph and Weave for LLM traces).
+Experiment tracking stores every training or eval run (params, code and data versions, step metrics,
+artifacts) so runs can be compared, reproduced and promoted. MLflow and W&B share that data model and
+differ in hosting, UI and ecosystem.
 
 ## Why it exists
-Any team that trains, fine-tunes or evaluates models produces runs faster than it can remember them.
-The first week it is a spreadsheet of learning rates and scores; by the third week the spreadsheet is
-missing the run everyone is talking about, nobody knows which checkpoint produced the 0.91, and the
-config that got it was edited in place since. Fine-tuning makes this combinatorial: LoRA rank, learning
-rate, data mix, epochs and base model revision interact, and a result without its full configuration
-cannot be reproduced or trusted.
-
-LLM application work has the same shape without the training loop. Every evaluation run is an
-experiment: a prompt version, a model snapshot, a dataset version and a judge configuration go in, and
-scores come out. Teams that keep those results in notebook cells and Slack screenshots cannot answer
-"did the last three prompt changes help on the refund slice" without re-running everything.
-
-The naive alternative, printing to logs and encoding settings in file names, fails because comparison
-and lineage are the whole job: you need to filter a thousand runs by parameter, overlay metric curves,
-and follow a model version back to the run, data and commit that produced it. That is a database with
-a specific schema and a UI on top, which is what a tracker is.
+- **Runs outpace memory.** Week one is a spreadsheet of learning rates and scores. By week three it is
+  missing the run everyone discusses, nobody knows which checkpoint produced the 0.91, and its config was
+  edited in place since.
+- **Fine-tuning is combinatorial.** LoRA rank, learning rate, data mix, epochs and base model revision
+  interact, so a result without its full configuration cannot be reproduced or trusted.
+- **LLM app evals are experiments too.** A prompt version, model snapshot, dataset version and judge
+  configuration go in; scores come out. Results in notebook cells and Slack screenshots cannot answer "did
+  the last three prompt changes help on the refund slice" without re-running everything.
+- **Logs and file names fail because comparison and lineage are the whole job.** You must filter a thousand
+  runs by parameter, overlay metric curves, and follow a model version back to its run, data and commit:
+  a database with a specific schema and a UI on top, which is what a tracker is.
 
 ## How it works
 ### The data model both tools share
-An **experiment** (MLflow) or **project** (W&B) groups **runs**. A run has **parameters** fixed at start
-(treated as immutable, because changing them mid-run would make comparisons meaningless; MLflow rejects
-re-logging a param with a different value, while W&B lets `config` be updated but that is an escape hatch,
-not the model), **metrics** logged as time
-series against a step or epoch (so you can see divergence or over-fitting at step *k*, not just the
-final number), **artifacts** which are files (checkpoints, per-item eval outputs, plots, configs),
-**tags** for free-form filtering, and automatically captured context: git commit, command line, Python
-environment and, where enabled, system metrics such as GPU utilisation (W&B records them by default;
-MLflow does once system-metrics logging is switched on). Runs can be nested for hyperparameter sweeps.
-Everything is queryable, so "all runs where `lora_r=16` sorted by `eval_acc`" is one call.
+| Concept | What it is | Why |
+|---|---|---|
+| **Experiment** (MLflow) / **project** (W&B) | groups runs | one place to compare |
+| **Parameters** | fixed at start, treated as immutable | changing them mid-run would make comparisons meaningless |
+| **Metrics** | time series against a step or epoch | see divergence or over-fitting at step *k*, not just the final number |
+| **Artifacts** | files: checkpoints, per-item eval outputs, plots, configs | error analysis and lineage |
+| **Tags** | free-form labels | filtering |
+| **Captured context** | git commit, command line, Python environment, optionally system metrics such as GPU utilisation | reproducibility |
+
+- **Param immutability differs by tool.** MLflow rejects re-logging a param with a different value. W&B
+  lets `config` be updated, but that is an escape hatch, not the model.
+- **System metrics:** W&B records them by default; MLflow does once system-metrics logging is switched on.
+- **Runs can be nested** for hyperparameter sweeps.
+- **Everything is queryable:** "all runs where `lora_r=16` sorted by `eval_acc`" is one call.
 
 ### What happens when you call `log`
-Both clients are thin writers to a store, and their transport explains several sharp edges. MLflow's
-client sends each logging call to the tracking server over REST (or writes to a local `mlruns`
-directory with no server), and the server writes rows into its SQL backend: params as key/value
-*strings*, metrics as `(key, value, timestamp, step)` rows, plus a "latest value" per metric that the
-run table and search use. Batch calls (`log_metrics`, `log_params`) exist *because* one HTTP round trip
-per scalar at every training step is slow; recent versions also offer asynchronous logging. W&B's
-`init` starts a background process that buffers everything to a local run directory and streams it to
-the server, *because* a training loop must never block on the network; the same design gives offline
-mode (`WANDB_MODE=offline`, uploaded later with `wandb sync`) for air-gapped clusters. Artifacts take a
-separate path: large files go to the artifact store (bucket or W&B storage) and only a reference lands
-in the run.
+Both clients are thin writers to a store; their transport explains several sharp edges.
 
-Three consequences follow. MLflow params are strings, so a filter such as `params.lr > 0.001` is not a
-numeric comparison; put numbers you will want to range-query into metrics or tags you control. MLflow's
-search and run table sort on a metric's *last* logged value, not its best, so log a separate
-`best_eval_acc` if that is what you will rank by. W&B requires the `step` passed to `log` to increase
-monotonically; a call with an earlier step is dropped with a warning, which bites when resuming a run or
-logging evaluation results after the training loop has advanced.
+- **MLflow over REST.** The client sends each logging call to the tracking server (or writes to a local
+  `mlruns` directory with no server). The server writes SQL rows: params as key/value *strings*, metrics as
+  `(key, value, timestamp, step)` rows, plus a "latest value" per metric that the run table and search use.
+- **MLflow batching.** `log_metrics` and `log_params` exist *because* one HTTP round trip per scalar at
+  every training step is slow; recent versions also offer asynchronous logging.
+- **W&B background process.** `init` starts a process that buffers everything to a local run directory and
+  streams it to the server, *because* a training loop must never block on the network.
+- **W&B offline mode** falls out of that design: `WANDB_MODE=offline`, uploaded later with `wandb sync`,
+  for air-gapped clusters.
+- **Artifacts take a separate path.** Large files go to the artifact store (bucket or W&B storage); only a
+  reference lands in the run.
+
+### Three sharp edges that follow
+1. **MLflow params are strings,** so a filter such as `params.lr > 0.001` is not a numeric comparison. Put
+   numbers you will range-query into metrics or tags you control.
+2. **MLflow sorts on a metric's *last* logged value, not its best.** Log a separate `best_eval_acc` if that
+   is what you will rank by.
+3. **W&B requires the `step` passed to `log` to increase monotonically.** A call with an earlier step is
+   dropped with a warning, which bites when resuming a run or logging eval results after the training loop
+   has advanced.
 
 ### MLflow
-MLflow is Apache-licensed open source that started at Databricks. Its tracking server has a backend
-store (a SQL database for runs, params and metrics) and an artifact store (local disk, S3, GCS or Azure
-Blob for files), which is why self-hosting is a container plus a database plus a bucket. Around tracking
-it adds a model registry with versions and aliases, a packaging format with "flavours" (`pyfunc`,
-`transformers`, `sklearn` and others) that lets any registered model be loaded with one call, and
-autologging integrations that capture params and metrics from common training frameworks without
-explicit calls. Through the later 2.x releases and the 3.x line it added GenAI features — tracing, LLM
-evaluation APIs and a prompt registry — so an LLM team can keep evals and prompts in the same store as
-training runs. Databricks offers a managed version, and some cloud ML platforms (Amazon SageMaker, for
-example) offer managed MLflow tracking servers; otherwise you self-host.
+- **Origin and licence:** Apache-licensed open source that started at Databricks.
+- **Two stores:** a backend store (a SQL database for runs, params and metrics) and an artifact store (local
+  disk, S3, GCS or Azure Blob for files). That is why self-hosting is a container plus a database plus a
+  bucket.
+- **Around tracking:** a model registry with versions and aliases; a packaging format with "flavours"
+  (`pyfunc`, `transformers`, `sklearn` and others) so any registered model loads with one call; and
+  autologging that captures params and metrics from common frameworks without explicit calls.
+- **GenAI features:** through the later 2.x releases and the 3.x line it added tracing, LLM evaluation APIs
+  and a prompt registry, so an LLM team can keep evals and prompts in the same store as training runs.
+- **Hosting:** Databricks offers a managed version, and some cloud ML platforms (Amazon SageMaker, for
+  example) offer managed MLflow tracking servers; otherwise you self-host.
 
 ### Weights & Biases
-W&B is SaaS-first with a self-hosted server option for data-residency requirements. The API is
-`wandb.init(project=..., config=...)`, `wandb.log({...}, step=...)` and `run.finish()`. Its distinguishing
-pieces are **Artifacts**, versioned datasets and models with an automatic lineage graph (which run
-consumed which artifact version and produced which), **Sweeps**, a built-in hyperparameter search
-orchestrator that schedules agents across machines, **Tables** for per-example analysis inside the UI,
-**Reports** for sharing, and **Weave**, its toolkit for tracing and evaluating LLM applications. The UI
-is the usual reason teams pick it; the usual reasons they do not are cost per seat and the fact that
-metrics and artifacts leave the network unless you self-host.
+- **SaaS-first,** with a self-hosted server option for data-residency requirements.
+- **API:** `wandb.init(project=..., config=...)`, `wandb.log({...}, step=...)` and `run.finish()`.
+- **Distinguishing pieces:**
+  - **Artifacts:** versioned datasets and models with an automatic lineage graph (which run consumed which
+    artifact version and produced which).
+  - **Sweeps:** a built-in hyperparameter search orchestrator that schedules agents across machines.
+  - **Tables** for per-example analysis in the UI, and **Reports** for sharing.
+  - **Weave:** its toolkit for tracing and evaluating LLM applications.
+- **Why teams pick it:** the UI. **Why they do not:** cost per seat, and metrics and artifacts leave the
+  network unless you self-host.
 
 ### How an LLM team uses either
-A fine-tuning run logs `base_model`, `base_revision`, `lora_r`, `lr`, `train_set` version hash and
-`git_sha` as params, train and eval loss per step as metrics, the adapter directory and the per-item
-eval outputs as artifacts, then registers the adapter as a model version so lineage flows into the
-registry. An evaluation run logs prompt version, model snapshot, dataset hash and judge config as
-params, aggregate and per-slice scores as metrics, and the per-item outputs file as an artifact so error
-analysis can start from the run page. The tracker becomes the place where "what did we try and what
-happened" is answered.
+| Run type | Params | Metrics | Artifacts | Then |
+|---|---|---|---|---|
+| Fine-tuning | `base_model`, `base_revision`, `lora_r`, `lr`, `train_set` version hash, `git_sha` | train and eval loss per step | adapter directory, per-item eval outputs | register the adapter as a model version so lineage flows into the registry |
+| Evaluation | prompt version, model snapshot, dataset hash, judge config | aggregate and per-slice scores | per-item outputs file | error analysis starts from the run page |
+
+The tracker becomes the place where "what did we try and what happened" is answered.
 
 ### Choosing
-Data residency or regulated environments push toward self-hosted MLflow or a W&B server. A team already
-on Databricks gets MLflow for free. A research-heavy team that runs sweeps daily usually prefers W&B's
-UI and sweep orchestration. LLM application teams increasingly keep traces and evals in an observability
-platform such as Langfuse or LangSmith and use the tracker only for training; the important decision is
-one system of record per artifact class, not one tool for everything.
+- **Data residency or regulated environments** push toward self-hosted MLflow or a W&B server.
+- **Already on Databricks:** you get MLflow for free.
+- **Research-heavy teams running sweeps daily** usually prefer W&B's UI and sweep orchestration.
+- **LLM application teams** increasingly keep traces and evals in an observability platform such as
+  Langfuse or LangSmith and use the tracker only for training.
+- **The important decision** is one system of record per artifact class, not one tool for everything.
 
-## Example
+## Diagram
+A run writes params once, metrics per step and artifacts by reference; registering from the run carries
+lineage into the registry.
+
+```mermaid
+flowchart TD
+    J["Training or eval job"] -->|"params once at start"| T["Tracking server"]
+    J -->|"metrics per step, batched"| T
+    J -->|"large files"| A[("Artifact store: bucket")]
+    T --> DB[("Backend store: runs, params, metrics")]
+    A -.->|"reference only"| DB
+    DB --> Q["Search and compare runs"]
+    Q -->|"register best run"| R["Model registry version"]
+    R -->|"lineage: run, data, commit"| DB
+```
+
+## Examples
+### The same LoRA run logged to MLflow and to W&B
 The same LoRA fine-tuning run logged two ways. Parameters are fixed at the start, metrics are
 step-indexed, artifacts are files, and the dataset and code versions are logged as params so the run is
-reproducible. `train_and_eval` is your loop, yielding per-step metrics; the two halves are alternatives,
-shown together only for comparison (as written, the loop would train twice).
+reproducible.
+
+`train_and_eval` is your loop, yielding per-step metrics. The two halves are alternatives, shown together
+only for comparison (as written, the loop would train twice).
 
 ```python
 import mlflow, wandb, subprocess
@@ -156,44 +179,95 @@ run.log_artifact(art)                                                 # becomes 
 run.finish()
 ```
 
+### Worked scenario: the run table hides the best checkpoint
+Pure Python, runnable. Two runs from one sweep; ranking by the last logged value (what the run table
+sorts on) picks the wrong one.
+
+```python
+curves = {                       # eval_acc per eval step, two runs from the same sweep
+    "lora-r16": [0.80, 0.88, 0.91, 0.86],   # peaked at step 2, then over-fit
+    "lora-r8":  [0.82, 0.86, 0.88, 0.89],   # still climbing at the end
+}
+
+by_last = sorted(curves, key=lambda r: curves[r][-1], reverse=True)   # what a run table sorts on
+by_best = sorted(curves, key=lambda r: max(curves[r]), reverse=True)  # what you meant
+print("by last value:", by_last)   # ['lora-r8', 'lora-r16']
+print("by best value:", by_best)   # ['lora-r16', 'lora-r8']
+
+for run, c in curves.items():      # log these as their own metrics so the tracker can rank on them
+    best_step = max(range(len(c)), key=c.__getitem__)
+    print(run, {"best_eval_acc": max(c), "best_step": best_step})
+```
+
+| Run | Last `eval_acc` | Best `eval_acc` | Best step | Rank by last | Rank by best |
+|---|---|---|---|---|---|
+| lora-r16 | 0.86 | 0.91 | 2 | 2nd | 1st |
+| lora-r8 | 0.89 | 0.89 | 3 | 1st | 2nd |
+
+- **Fix:** log `best_eval_acc` and `best_step` as metrics, keep the checkpoint from the best step as an
+  artifact, and rank on that.
+- **Still check the curve:** a single peak can be luck that the next seed will not repeat.
+
+## Production patterns
+- **Self-hosted MLflow with real stores** — when data must stay in your network. Run the tracking server
+  against a SQL database (`--backend-store-uri`) and a bucket for artifacts, behind your SSO proxy, rather
+  than the default local file store. Monitor database size, artifact bucket growth and server latency on
+  `log_metrics`.
+- **Mandatory run metadata** — when promoted models must be auditable. Wrap run start in a helper that logs
+  `git_sha`, dataset hashes and base revision, and refuses to start if any is missing. Monitor the share of
+  runs, and of registered versions, carrying all required params.
+- **Rank on a best-value metric** — whenever a metric can peak before the end. Log `best_eval_acc` and the
+  step it occurred at alongside the per-step series, and sort on that. Monitor the gap between last and best
+  values to spot over-fitting.
+- **Offline logging for air-gapped jobs** — when training nodes have no egress. Set `WANDB_MODE=offline` and
+  upload later with `wandb sync` from a node that can reach the server. Monitor runs left un-synced.
+- **Artifact retention tied to the registry** — when per-item outputs and checkpoints pile up. Apply bucket
+  lifecycle rules to run artifacts, but exclude anything a registered model version references. Monitor
+  storage growth and any registry version whose source URI no longer resolves.
+
 ## Trade-offs
-- Self-hosted MLflow keeps data in your network and costs nothing in licences, but you operate a
-  server, a database and an artifact store, and the UI is thinner than W&B's.
-- W&B's hosted UI, sweeps and lineage graph save engineering time, but per-seat pricing and data leaving
-  the network flip the decision in regulated environments unless you run the self-hosted server.
-- Logging every per-item output as an artifact makes error analysis one click away, at the cost of
-  storage that grows with runs times dataset size; sample or compress once eval sets reach six figures.
-- Autologging captures params and metrics with zero code, but it also captures whatever the framework
+- **Self-hosted MLflow vs operations.** It keeps data in your network and costs nothing in licences, but you
+  operate a server, a database and an artifact store, and the UI is thinner than W&B's.
+- **W&B convenience vs cost and residency.** Its hosted UI, sweeps and lineage graph save engineering time,
+  but per-seat pricing and data leaving the network flip the decision in regulated environments unless you
+  run the self-hosted server.
+- **Per-item artifacts vs storage.** Logging every per-item output makes error analysis one click away, at
+  the cost of storage that grows with runs times dataset size; sample or compress once eval sets reach six
+  figures.
+- **Autologging vs signal.** It captures params and metrics with zero code, but also whatever the framework
   decides is interesting, which can bury the three numbers you care about under three hundred.
-- Keeping LLM eval runs in the training tracker unifies history, whereas keeping them in the
-  observability platform links them to traces; the split that wins depends on whether your evals start
-  from production traces or from training jobs.
+- **Training tracker vs observability platform for evals.** The tracker unifies history; the observability
+  platform links evals to traces. The winner depends on whether your evals start from production traces or
+  from training jobs.
 
 ## Pitfalls
-- Logging the final metric only; the symptom is a run that looks best on its last value while its curve
-  shows it diverged and recovered by luck, which the next seed will not repeat.
-- Forgetting the data version and git commit in params; the symptom is a top run that nobody can
-  reproduce because the training set was regenerated since.
-- Mutating a config dict after `log_params` and assuming the tracker noticed; the symptom is runs whose
+- **Logging the final metric only.** Symptom: a run that looks best on its last value while its curve shows
+  it diverged and recovered by luck, which the next seed will not repeat.
+- **Forgetting the data version and git commit in params.** Symptom: a top run that nobody can reproduce
+  because the training set was regenerated since.
+- **Mutating a config dict after `log_params`.** And assuming the tracker noticed. Symptom: runs whose
   recorded learning rate differs from the one actually used.
-- Treating the tracker as a backup for weights; the symptom is a bucket bill that doubles monthly and a
+- **Treating the tracker as a backup for weights.** Symptom: a bucket bill that doubles monthly and a
   cleanup that deletes the one checkpoint the registry still points to.
-- Ranking runs by a metric whose final value is not its best, such as eval accuracy after over-fitting;
-  the symptom is the run table hiding the checkpoint that actually peaked, because sorting uses the last value.
-- Resuming a W&B run or logging post-training evals with a step lower than the last one logged; the symptom
-  is eval points that silently never appear on the chart, with only a warning in the console.
-- Running evals outside the tracker "because it is just a prompt change"; the symptom is a team arguing
-  from memory about whether version 11 or 12 did better on the hard slice.
+- **Ranking by a metric whose final value is not its best.** Such as eval accuracy after over-fitting.
+  Symptom: the run table hides the checkpoint that actually peaked, because sorting uses the last value.
+- **Logging with a lower step in W&B.** Resuming a run or logging post-training evals with a step lower than
+  the last one. Symptom: eval points that silently never appear on the chart, with only a warning in the
+  console.
+- **Running evals outside the tracker "because it is just a prompt change".** Symptom: a team arguing from
+  memory about whether version 11 or 12 did better on the hard slice.
 
 ## When to use
-Use a tracker from the first fine-tuning run or the first eval you intend to compare against a later
-one, which is essentially always. Choose MLflow when you need self-hosting, already run Databricks, or
-want the registry and model packaging in the same system; choose W&B when sweep orchestration, the UI
-and artifact lineage are worth the subscription and data can leave your network or you will run the
-self-hosted server. Measure whether every registered model version links to a run, whether every run
-has a data version and commit, and how long it takes a new team member to find "the best run on the
-refund slice". In interviews, be ready to describe the run data model, how lineage flows from a run into
-the registry, and the hosting and ecosystem differences between the two tools.
+- **Use from** the first fine-tuning run or the first eval you intend to compare against a later one, which
+  is essentially always.
+- **Choose MLflow** when you need self-hosting, already run Databricks, or want the registry and model
+  packaging in the same system.
+- **Choose W&B** when sweep orchestration, the UI and artifact lineage are worth the subscription, and data
+  can leave your network or you will run the self-hosted server.
+- **Measure** whether every registered model version links to a run, whether every run has a data version
+  and commit, and how long it takes a new team member to find "the best run on the refund slice".
+- **Interviews:** describe the run data model, how lineage flows from a run into the registry, and the
+  hosting and ecosystem differences between the two tools.
 
 ## Role lens
 - **Engineer:** Instruments training and eval scripts with params, step metrics and artifacts, and
@@ -215,6 +289,41 @@ divergent run that landed on a good value by chance. Fourth, where the per-item 
 refund-intent slice can be checked. The run should have logged base revision, dataset hashes, git sha
 and LoRA settings as params, train and eval metrics per step, and the eval outputs and adapter as
 artifacts, with the adapter registered from the run so the registry version carries that lineage.
+
+## Interview questions
+### What is the difference between a parameter, a metric and an artifact in a tracking run?
+- **Parameters** are the configuration, fixed at start, because changing them mid-run changes the question
+  the run answers.
+- **Metrics** are step-indexed time series, so you can see divergence or over-fitting rather than one final
+  number.
+- **Artifacts** are files (checkpoints, per-item outputs, plots) stored in a bucket with only a reference in
+  the run.
+
+### A search for `params.lr > 0.001` returns runs with lr = 0.0002. What is going on?
+- **MLflow stores params as strings,** so the comparison is lexicographic, not numeric.
+- **Fix:** log values you will range-query as metrics or as tags you control with a sortable format, and
+  keep params for exact-match filters.
+- **Related trap:** run-table sorting uses each metric's last value, so log a best-value metric too.
+
+### How do you choose between MLflow and W&B for a regulated customer?
+- **Residency usually decides:** MLflow is self-hosted by default; W&B is SaaS-first with a self-hosted
+  server option.
+- **Then ecosystem:** MLflow brings a registry and model flavours; W&B brings sweeps, a lineage graph and a
+  richer UI, at a per-seat cost.
+- **Either way,** pick one system of record per artifact class and enforce required run metadata.
+
+### Eval results logged after training never appear on the W&B chart. Why?
+- **Steps must increase monotonically in W&B.** A `log` call with a step lower than the last one is dropped
+  with a warning.
+- **This bites** when resuming a run or logging post-training evals at an earlier step.
+- **Fix:** log evals at the current or a later step, or under a separate metric axis, and watch the console
+  for the warning.
+
+### When would you not put LLM eval runs in the training tracker?
+- **When evals start from production traces:** an observability platform such as Langfuse or LangSmith
+  links each eval to the traces it came from.
+- **The cost** is split history between two systems, so define which one is the record for eval runs.
+- **Keep training** runs, adapters and lineage into the registry in the tracker.
 
 ## Quiz
 ### Q: Why are a run's parameters fixed at the start while metrics are logged over time?

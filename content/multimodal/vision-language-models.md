@@ -5,7 +5,7 @@ name: Vision-language models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - multimodal/clip
   - multimodal/image-embeddings
@@ -23,107 +23,134 @@ sources:
 ---
 
 ## TL;DR
-A vision-language model (VLM) lets a language model take images as input by turning each image into a
-sequence of "visual tokens" that sit in the same embedding space as text tokens. A pretrained vision
-encoder produces patch features, a small connector projects them into the LLM's input space, and the
-LLM attends over image and text jointly. It exists because describing an image as text first throws
-away exactly the details the question will turn out to need.
+A vision-language model (VLM) turns an image into "visual tokens" in the LLM's embedding space: an
+encoder makes patch features, a connector projects them, and the LLM attends over image and text
+together, so no detail is lost before the question is known.
 
 ## Why it exists
-Before VLMs, the way to get an LLM to "see" was a pipeline: run OCR or an image captioner, paste the
-text into the prompt, and hope. That fails for a structural reason. A caption is a lossy compression
-chosen *before* the question is known. "A bar chart of quarterly revenue" cannot answer "which quarter
-dropped, and by how much?"; an OCR dump of an invoice loses which number sits in the *Total* box. Every
-stage in the pipeline also has its own error rate, and errors compound: the LLM reasons confidently
-over a mis-read digit it never had the chance to doubt.
-
-The second problem is that text-only models have no grounding for spatial and visual concepts. They
-know the word "left of" but have never been shown anything to the left of anything. Tasks like reading
-a UI screenshot to click a button, checking whether a product photo matches its listing, or
-interpreting a radiology scan need the model to reason over pixels and words in the same forward pass.
-
-The naive fix, "train a transformer on raw pixels and text from scratch", is possible (early-fusion
-models do it) but expensive: the LLM has already learned language from trillions of tokens, and the
-vision encoder has already learned visual features from hundreds of millions of images. The dominant
-VLM design exists to *reuse* both and spend training only on the glue between them.
+- **Caption-then-LLM pipelines lose the answer.** Before VLMs you ran OCR or a captioner and pasted the
+  text into the prompt. A caption is a lossy compression chosen *before* the question is known: "a bar
+  chart of quarterly revenue" cannot answer "which quarter dropped, and by how much?".
+- **Layout disappears too.** An OCR dump of an invoice loses which number sits in the *Total* box.
+- **Pipeline errors compound.** Every stage has its own error rate, so the LLM reasons confidently over a
+  mis-read digit it never had the chance to doubt.
+- **Text-only models have no visual grounding.** They know the word "left of" but have never been shown
+  anything to the left of anything. Clicking a button in a UI screenshot, matching a product photo to its
+  listing or reading a radiology scan needs pixels and words in the same forward pass.
+- **Training from scratch is the expensive fix.** Early-fusion models do train one transformer on raw
+  pixels and text, but the LLM already learned language from trillions of tokens and the encoder learned
+  vision from hundreds of millions of images. The dominant design *reuses* both and trains only the glue.
 
 ## How it works
 ### Step 1: the image becomes a sequence
-Transformers consume sequences, so the image must be serialised. A Vision Transformer (ViT) cuts the
-image into fixed-size patches, flattens each patch's pixels, projects it with a linear layer, adds a
-position embedding, and runs standard transformer blocks over the patch sequence. With 16×16-pixel
-patches a 224×224 image becomes 14 × 14 = 196 patch tokens; with 14-pixel patches at 336×336 (the
-CLIP ViT-L/14-336 encoder used by LLaVA-1.5) it becomes 24 × 24 = 576 tokens. The encoder is usually a
-contrastively pretrained one (CLIP or SigLIP) *because* those encoders were trained to align visual
-features with language already, which makes the later alignment step much cheaper than starting from a
-classifier backbone.
+Transformers consume sequences, so the image is serialised by a Vision Transformer (ViT):
+1. Cut the image into fixed-size patches.
+2. Flatten each patch's pixels and project it with a linear layer.
+3. Add a position embedding.
+4. Run standard transformer blocks over the patch sequence.
+
+| Patch size | Input | Grid | Patch tokens |
+|---|---|---|---|
+| 16×16 pixels | 224×224 | 14 × 14 | 196 |
+| 14 pixels (CLIP ViT-L/14-336, used by LLaVA-1.5) | 336×336 | 24 × 24 | 576 |
+
+- **Why a contrastive encoder.** The encoder is usually CLIP or SigLIP, *because* those were trained to
+  align visual features with language already. That makes the later alignment step much cheaper than
+  starting from a classifier backbone.
 
 ### Step 2: a connector maps vision features into the LLM's token space
-The encoder's output vectors live in its own space, with its own dimension and statistics. A connector
-translates them into vectors the LLM can treat as if they were token embeddings. Three designs recur:
+The encoder's vectors live in their own space, with their own dimension and statistics. The connector
+translates them into vectors the LLM can treat as token embeddings. Three designs recur:
 
-- **Linear or MLP projector** (LLaVA): one vector per patch, projected to the LLM hidden size. Simple,
-  keeps all spatial detail, but every patch becomes an LLM token, so cost scales with resolution.
-- **Resampler / Q-Former** (Flamingo's Perceiver resampler, BLIP-2's Q-Former): a fixed set of learned
-  query vectors cross-attend to the patch features and emit a fixed number of tokens (e.g. 32 or 64)
-  regardless of image size. Cheaper per image, at the cost of compressing fine detail.
-- **Cross-attention into the LLM** (Flamingo, some Llama-vision variants): image features are not
-  inserted as tokens at all; gated cross-attention layers added between LLM blocks read them. The text
-  context is untouched, and the gates start at zero so the pretrained LLM is not disturbed at init.
+| Design | Used by | How | Gain | Cost |
+|---|---|---|---|---|
+| **Linear or MLP projector** | LLaVA | one vector per patch, projected to the LLM hidden size | keeps all spatial detail, simple | every patch is an LLM token, so cost scales with resolution |
+| **Resampler / Q-Former** | Flamingo's Perceiver resampler, BLIP-2's Q-Former | learned queries cross-attend to patch features and emit a fixed count (e.g. 32 or 64) | cheap per image, independent of size | compresses fine detail |
+| **Cross-attention into the LLM** | Flamingo, some Llama-vision variants | gated cross-attention layers between LLM blocks read image features | text context untouched | more model surgery |
+
+- **Why the gates start at zero.** In the cross-attention design the pretrained LLM is not disturbed at
+  initialisation; the gates open as training proceeds.
 
 ### Step 3: the LLM reasons over both
-After the connector, the input is a single sequence: text tokens, then image tokens at the point where
-the image appears, then more text. Self-attention does the rest: a text query token can attend to the
-patch tokens that contain the relevant region. Nothing about the decoder changes; it still predicts the
-next text token. This is why a VLM inherits its parent LLM's instruction following, tool calling and
-weaknesses almost unchanged.
+- **One sequence.** Text tokens, then image tokens at the point where the image appears, then more text.
+- **Self-attention does the rest.** A text query token can attend to the patch tokens that contain the
+  relevant region.
+- **The decoder is unchanged.** It still predicts the next text token. This is why a VLM inherits its
+  parent LLM's instruction following, tool calling and weaknesses almost unchanged.
 
 ### Training recipe
-Most open VLMs follow a two-stage recipe. Stage one freezes both the vision encoder and the LLM and
-trains only the connector on image-caption pairs, so the projector learns to speak the LLM's language
-without the LLM drifting. Stage two unfreezes the LLM (sometimes the encoder) and trains on visual
-instruction data: questions about images, OCR-style tasks, charts, documents, grounding with bounding
-boxes. The instruction data is what turns "can describe an image" into "can answer a question about it".
+1. **Stage one: align.** Freeze both the vision encoder and the LLM; train only the connector on
+  image-caption pairs. The projector learns to speak the LLM's language without the LLM drifting.
+2. **Stage two: instruct.** Unfreeze the LLM (sometimes the encoder) and train on visual instruction
+  data: questions about images, OCR-style tasks, charts, documents, grounding with bounding boxes.
+- **Why stage two matters.** The instruction data is what turns "can describe an image" into "can
+  answer a question about it".
 
 ### Resolution, tiling and token cost
-Fine detail (small text, chart labels) needs pixels, but a fixed-resolution encoder downsamples
-everything to one size. Common answers: tile a high-resolution image into several crops and feed each
-tile's tokens plus a downscaled global view (LLaVA-NeXT's "AnyRes"), or let the encoder accept variable
-numbers of patches so token count follows native resolution (Qwen2-VL-style dynamic resolution). Either
-way, image tokens consume context and are billed as tokens; a single high-resolution page can cost on the
-order of a thousand tokens or more, an illustrative figure that varies by model and vendor. Pre-resizing
-images to the detail you actually need is the cheapest optimisation available.
+A fixed-resolution encoder downsamples everything to one size, but small text and chart labels need
+pixels. Two common answers:
+- **Tiling.** Cut a high-resolution image into several crops and feed each tile's tokens plus a
+  downscaled global view (LLaVA-NeXT's "AnyRes").
+- **Dynamic resolution.** Let the encoder accept a variable number of patches so token count follows
+  native resolution (Qwen2-VL-style).
+- **Either way, image tokens cost money.** They consume context and are billed as tokens. A single
+  high-resolution page can cost on the order of a thousand tokens or more (an illustrative figure that
+  varies by model and vendor).
+- **Cheapest optimisation.** Pre-resize images to the detail you actually need.
 
-The arithmetic is worth doing by hand, because token count is quadratic in image side length:
+Do the arithmetic by hand, because token count is quadratic in image side length:
 
 ```
 tokens ≈ (H / (patch × merge)) × (W / (patch × merge))      # per tile, plus any global view
 ```
 
-With 14-pixel patches and a 2×2 token merge after the encoder (Qwen2-VL merges adjacent patches this
-way to cut sequence length 4×), a 1024 × 1024 image gives about (1024/28)² ≈ 1,340 tokens; halving the
-side to 512 gives about 335. Halving resolution quarters the cost, which is why a deliberate resize beats
-any prompt optimisation. A resampler breaks this relationship on purpose: its output count is fixed, so
-cost stops growing with resolution but so does the detail it can carry.
+- **Worked numbers.** With 14-pixel patches and a 2×2 token merge after the encoder (Qwen2-VL merges
+  adjacent patches this way to cut sequence length 4×), a 1024 × 1024 image gives about (1024/28)² ≈
+  1,340 tokens. Halving the side to 512 gives about 335.
+- **Halving resolution quarters the cost,** which is why a deliberate resize beats any prompt
+  optimisation.
+- **A resampler breaks this on purpose.** Its output count is fixed, so cost stops growing with
+  resolution, but so does the detail it can carry.
 
 ### Outputs that point back into the image
-The decoder only emits text, so "where" answers are serialised as text too: grounding-trained models
-emit bounding boxes as coordinate tokens (often normalised to a fixed grid such as 0–1000, convention
-varies by model). This is what lets a computer-use agent turn "click Submit" into pixel coordinates, and
-it is why such coordinates must be rescaled to the original image if you resized it before sending.
+- **"Where" answers are text too.** The decoder only emits text, so grounding-trained models emit
+  bounding boxes as coordinate tokens, often normalised to a fixed grid such as 0–1000 (convention varies
+  by model).
+- **This powers computer use.** It lets an agent turn "click Submit" into pixel coordinates.
+- **Rescale before use.** Coordinates refer to the image the model saw, so if you resized it before
+  sending, map them back to the original.
 
 ### Early-fusion variants
-Some models skip the separate encoder: Fuyu feeds linearly projected raw patches straight into the
-decoder, and models described as "natively multimodal" are pretrained on interleaved image and text
-from the start. They avoid the encoder's resolution bottleneck and modality seam, at the price of far
-more pretraining compute. For an application engineer the interface is identical.
+- **No separate encoder.** Fuyu feeds linearly projected raw patches straight into the decoder; models
+  described as "natively multimodal" are pretrained on interleaved image and text from the start.
+- **Gain vs cost.** They avoid the encoder's resolution bottleneck and modality seam, at the price of far
+  more pretraining compute.
+- **Same interface.** For an application engineer the API looks identical.
 
-## Example
+## Diagram
+Follow the image from pixels to patch tokens, through the connector, into the same sequence as the
+question; the token count is set at the resize and patch steps.
+
+```mermaid
+flowchart TD
+    I["Image"] --> R["Resize or tile"]
+    R --> E["Vision encoder: ViT patches"]
+    E --> C["Connector: MLP, resampler or cross-attn"]
+    Q["Text question"] --> T["Text token embeddings"]
+    C --> S["Joint sequence: text + image tokens"]
+    T --> S
+    S --> L["LLM decoder"]
+    L --> O["Text answer, JSON or box coordinates"]
+    O -.->|"rescale boxes to original"| R
+```
+
+## Examples
+### Asking a served VLM a question a caption could not answer
 Any VLM served behind an OpenAI-compatible chat API (vLLM does this for open models; hosted vendors use
-the same shape) accepts an image as a base64 data URL inside the message content. The snippet downsizes
-the image first, asks a question that a caption could not answer, and requests a JSON-only reply for
-parsing (`response_format` is honoured by vLLM and most hosted APIs; if a server ignores it, strip code
-fences before `json.loads`).
+the same shape) accepts an image as a base64 data URL inside the message content.
+- The snippet downsizes the image first and asks for a JSON-only reply for parsing.
+- `response_format` is honoured by vLLM and most hosted APIs; if a server ignores it, strip code fences
+  before `json.loads`.
 
 ```python
 import base64, io, json
@@ -156,39 +183,92 @@ print(answer)   # {'quarter': 'Q3', 'previous_value': 4.2, 'value': 3.1, 'units'
 print(resp.usage.prompt_tokens)  # watch this grow with image resolution
 ```
 
+### Image token budget calculator
+Pure Python, no model needed. It applies the formula above so you can see the quadratic cost before you
+ship a resolution.
+
+```python
+import math
+
+def image_tokens(h, w, patch=14, merge=2, tiles=1, global_view=False):
+    per_tile = math.ceil(h / (patch * merge)) * math.ceil(w / (patch * merge))
+    return per_tile * tiles + (per_tile if global_view else 0)
+
+for side in (512, 768, 1024, 2048):
+    print(side, image_tokens(side, side))
+# 512 -> 361, 768 -> 784, 1024 -> 1369, 2048 -> 5476 (ceil rounding; ~335 / ~1,340 unrounded)
+
+# Projector VLM, no merge, 336px tiles of 24x24 = 576 tokens: a 2x2 grid plus a global view
+print(image_tokens(336, 336, patch=14, merge=1, tiles=4, global_view=True))   # 2880
+```
+
+### Worked scenario: screenshot agent bill
+An agent sends one full-resolution screenshot per step; illustrative numbers using the merge-2 formula.
+
+| Choice | Tokens per screenshot | 20-step task |
+|---|---|---|
+| 2048 × 2048 sent as-is | ~5,350 | ~107,000 image tokens |
+| Resized to 1024 × 1024 | ~1,340 | ~26,800 |
+| Resized to 768 × 768, crop to active window | ~750 or fewer | ~15,000 |
+
+Accuracy on button clicks did not change between the first two rows because the UI text was already
+legible at 1024; the fix was a resize plus rescaling the returned coordinates back to screen pixels.
+
+## Production patterns
+- **Resize to the accuracy plateau.** When: every image endpoint. How: sweep `max_side` (for example
+  512, 768, 1024, 1536) on a labelled set, ship the smallest side that holds accuracy; for OpenAI-style
+  APIs, the `detail` field on `image_url` selects a low- or high-detail mode. Monitor
+  `usage.prompt_tokens` per request.
+- **Pin image token counts in tests.** When: any change to preprocessing or model version. How: assert
+  the prompt token count for a fixed fixture image within a tolerance. Monitor: CI diffs, because a silent
+  processor change can double cost.
+- **Reconcile read-out numbers.** When: extracting tables, invoices or charts. How: validate with
+  arithmetic (quantity × unit price ≈ line total, rows sum to total) and route failures to review.
+  Monitor: reconciliation failure rate per document type.
+- **Treat text inside images as untrusted input.** When: agents read screenshots or scanned documents.
+  How: keep tool permissions and approval gates independent of anything the image says. Monitor: actions
+  taken right after reading user-supplied images.
+- **Bound images per request on the server.** When: self-hosting with vLLM. How: set the server's
+  per-prompt multimodal limit (`--limit-mm-per-prompt`) and, for dynamic-resolution models, the
+  processor's maximum pixel budget. Monitor: KV-cache use and time to first token.
+
 ## Trade-offs
-- Reusing a pretrained encoder and LLM makes training cheap and inherits strong language skills, but the
-  encoder's fixed resolution caps fine detail; it flips when your inputs are dense documents or tiny text.
-- Projector designs keep every patch and preserve detail, while resamplers emit a fixed token budget and
-  cut cost; choose the resampler when you process many images per request and detail matters less.
-- Tiling high-resolution images recovers small text at the cost of several times the tokens and latency,
-  which is worth it for OCR-like tasks and wasteful for "what is in this photo" tasks.
-- A general VLM replaces a chain of specialised models (captioner, OCR, classifier) with one call, but
-  gives no per-field confidence, so specialised models win when you need calibrated scores or audits.
+- **Reuse vs resolution ceiling.** Reusing a pretrained encoder and LLM makes training cheap and inherits
+  strong language skills, but the encoder's fixed resolution caps fine detail; it flips when your inputs
+  are dense documents or tiny text.
+- **Projector vs resampler.** Projectors keep every patch and preserve detail; resamplers emit a fixed
+  token budget and cut cost. Choose the resampler when you process many images per request and detail
+  matters less.
+- **Tiling vs tokens.** Tiling high-resolution images recovers small text at several times the tokens and
+  latency: worth it for OCR-like tasks, wasteful for "what is in this photo" tasks.
+- **One VLM vs specialised models.** A general VLM replaces a chain (captioner, OCR, classifier) with one
+  call, but gives no per-field confidence, so specialised models win when you need calibrated scores or
+  audits.
 
 ## Pitfalls
-- Sending full-resolution screenshots by default; the symptom is prompt-token bills and latency that
-  dwarf the text part of the request, with no accuracy gain over a resized image.
-- Trusting read-out numbers and strings without a check; VLMs hallucinate plausible digits in tables, and
-  the symptom is answers that look right until reconciled against a total or a source system.
-- Asking for counts or exact spatial relations; many VLMs still count and localise poorly, and the symptom
-  is confident wrong answers on "how many" and "which is left of which" that a human spots instantly.
-- Assuming image input is immune to prompt injection; text rendered inside an image is read as text, and
-  the symptom is an agent following instructions embedded in a screenshot or a scanned document.
-- Evaluating on captioning quality when the task is question answering; the symptom is a model that
-  describes images beautifully and fails the actual extraction your product needs.
-- Resizing or padding an image and then using returned box coordinates as if they referred to the
-  original; the symptom is clicks or crops that land consistently offset or scaled from the target.
+- **Sending full-resolution screenshots by default.** Symptom: prompt-token bills and latency that dwarf
+  the text part of the request, with no accuracy gain over a resized image. Fix: resize to the plateau.
+- **Trusting read-out numbers and strings without a check.** VLMs hallucinate plausible digits in tables.
+  Symptom: answers that look right until reconciled against a total or a source system.
+- **Asking for counts or exact spatial relations.** Many VLMs still count and localise poorly. Symptom:
+  confident wrong answers on "how many" and "which is left of which" that a human spots instantly.
+- **Assuming image input is immune to prompt injection.** Text rendered inside an image is read as text.
+  Symptom: an agent following instructions embedded in a screenshot or a scanned document.
+- **Evaluating on captioning when the task is question answering.** Symptom: a model that describes
+  images beautifully and fails the actual extraction your product needs.
+- **Using returned boxes as if they referred to the original.** After resizing or padding, coordinates
+  are in the model's frame. Symptom: clicks or crops that land consistently offset or scaled.
 
 ## When to use
-Reach for a VLM when the answer depends on information that a caption or OCR dump would discard: charts,
-UI screenshots for computer-use agents, product photos checked against text, forms with layout, visual
-inspection with a natural-language rubric. Prefer plain OCR when you only need the text and want per-word
-confidence, and prefer CLIP-style embeddings when the job is search or classification over many images
-at low cost. Measure three things: task accuracy on a held-out set of your own images, image tokens per
-request at the resolution you ship, and hallucination rate on fields you can verify. In interviews,
-expect to explain the encoder-connector-LLM pipeline, why the connector is trained first, and how
-resolution turns into tokens and cost.
+- **Use when** the answer depends on information a caption or OCR dump would discard: charts, UI
+  screenshots for computer-use agents, product photos checked against text, forms with layout, visual
+  inspection with a natural-language rubric.
+- **Prefer plain OCR** when you only need the text and want per-word confidence.
+- **Prefer CLIP-style embeddings** when the job is search or classification over many images at low cost.
+- **Measure:** task accuracy on a held-out set of your own images, image tokens per request at the
+  resolution you ship, and hallucination rate on fields you can verify.
+- **Interviews:** explain the encoder-connector-LLM pipeline, why the connector is trained first, and how
+  resolution turns into tokens and cost.
 
 ## Role lens
 - **Engineer:** Resizes and tiles images deliberately, pins image token counts in tests, and wraps VLM
@@ -209,6 +289,37 @@ sending a downscaled global view alongside. Next: choose a model with dynamic re
 tile budget and measure the token cost increase. Then: run a classic OCR pass and give the VLM the text
 with coordinates as extra context so it reads rather than guesses. Finally, add validation such as
 quantity × unit price ≈ line total so remaining errors are caught instead of silently accepted.
+
+## Interview questions
+### Walk me through how an image gets into an LLM's context.
+- **Patches first.** A ViT cuts the image into fixed patches (for example 24 × 24 = 576 at 336 pixels
+  with 14-pixel patches) and encodes them into feature vectors.
+- **Then a connector.** An MLP projector maps each patch vector to the LLM hidden size, or a resampler
+  compresses them to a fixed count; the LLM then attends over text and image tokens in one sequence.
+
+### Why is the connector trained first with both the encoder and LLM frozen?
+- **Cheap alignment.** Only the small projector learns to emit vectors the LLM understands, using
+  image-caption pairs.
+- **Protects the LLM.** Unfreezing early on caption data would let the LLM drift and lose instruction
+  following; instruction tuning comes in stage two.
+
+### Your VLM bill tripled after a frontend change. How do you debug it?
+- **Check prompt tokens per request first.** Image tokens grow with the square of side length, so a
+  change that started sending retina screenshots (2× side) roughly quadruples image tokens.
+- **Then fix at the source.** Resize to the accuracy plateau before encoding, add a CI test pinning token
+  count for a fixture image, and alert on prompt-token p95.
+
+### When would you not use a VLM for document extraction?
+- **When you need calibrated confidence or audits.** OCR engines give per-word confidence; a VLM gives
+  none and can hallucinate plausible digits.
+- **When volume is high and layouts are fixed.** Templated OCR plus rules is cheaper and deterministic;
+  keep the VLM for the long tail or as a second reader.
+
+### Projector or resampler: which would you pick for a product that sends 20 images per request?
+- **Resampler, if detail is coarse.** A fixed 32 or 64 tokens per image keeps 20 images inside the
+  context and cost budget.
+- **Projector, if small text matters.** It keeps every patch, so detail survives, but 20 images at
+  hundreds of tokens each can fill the context; downsize or crop first.
 
 ## Quiz
 ### Q: Why do most open VLMs train the connector first with the LLM frozen?

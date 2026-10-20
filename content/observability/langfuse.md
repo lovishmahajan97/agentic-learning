@@ -5,7 +5,7 @@ name: Langfuse
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - observability/tracing
   - observability/token-cost-tracking
@@ -21,95 +21,129 @@ sources:
 ---
 
 ## TL;DR
-Langfuse is an open-source, self-hostable LLM engineering platform. It records nested observations
-(spans, generations, events) carrying the rendered prompt, the completion, token usage and cost, grouped
-into traces, sessions and users, and closes the loop with scores (user feedback, human annotation,
-LLM-as-a-judge), datasets and experiments, and versioned prompt management. Choose it for the
-trace-to-eval-to-prompt loop in one framework-independent tool that can run in your own infrastructure.
+Langfuse is an open-source, self-hostable LLM engineering platform: traces of prompts, completions, tokens
+and cost, plus scores, datasets, experiments and versioned prompts. Choose it for the trace-to-eval-to-prompt
+loop in one framework-independent tool you can run yourself.
 
 ## Why it exists
-A generic APM sees a model call as a three-second `POST` to a provider that returned 200. Debugging an LLM
-feature needs what was inside: the exact rendered prompt, the completion, the tool calls, the retrieved
-chunks, how many tokens it cost and which conversation it belonged to. It also needs a quality signal,
-because HTTP 200 says nothing about a wrong answer. And it needs a loop: find the bad traces, annotate
-them, turn them into a dataset, run the next prompt version against that dataset, compare, promote.
-
-Without a tool, teams rebuild this badly. Prompts and completions are dumped to JSON logs that nobody can
-query by user; costs are reconstructed monthly from the provider invoice; prompts live in code, so every
-wording change is a deployment; and "the new prompt is better" rests on three examples in a notebook.
-
-Langfuse's position among the alternatives named in this module is specific. LangSmith is the deepest fit
-for LangChain and LangGraph but is proprietary and hosted unless you buy enterprise self-hosting. Arize
-Phoenix is OpenTelemetry-native and strongest on evaluation and retrieval diagnostics in notebooks. Langfuse
-is framework-agnostic, product-complete (cost, sessions, scores, datasets, prompt management in one UI),
-MIT-licensed at its core, and runs in your VPC with a Docker Compose or Helm deployment, which matters when
-prompts contain customer data.
+- **APM sees the wrong thing.** A generic APM sees a model call as a three-second `POST` to a provider that
+  returned 200. Debugging needs what was inside: the rendered prompt, the completion, tool calls, retrieved
+  chunks, token cost and which conversation it belonged to.
+- **HTTP 200 says nothing about a wrong answer,** so you need a quality signal, and a loop: find bad traces,
+  annotate them, turn them into a dataset, run the next prompt version against it, compare, promote.
+- **Without a tool, teams rebuild this badly.** Prompts and completions go to JSON logs nobody can query by
+  user; costs are reconstructed monthly from the invoice; prompts live in code, so every wording change is a
+  deployment; "the new prompt is better" rests on three examples in a notebook.
+- **Its position is specific.** LangSmith is the deepest fit for LangChain and LangGraph but is proprietary
+  and hosted unless you buy enterprise self-hosting. Arize Phoenix is OpenTelemetry-native and strongest on
+  evaluation and retrieval diagnostics in notebooks.
+- **Langfuse** is framework-agnostic, product-complete (cost, sessions, scores, datasets, prompt management in
+  one UI), MIT-licensed at its core, and runs in your VPC with Docker Compose or Helm, which matters when
+  prompts contain customer data.
 
 ## How it works
 ### Data model
-A **trace** is one unit of work, typically one request or one agent task. It carries `user_id`,
-`session_id`, tags, metadata, an input and output, and a release or version label. Inside it, nested by
-parent, are **observations** of three types: a **span** (any step: retrieval, parsing, a tool call), a
-**generation** (a model call, with model name, parameters, input messages, output, usage split into input
-and output tokens, cost, and a completion-start timestamp from which time to first token is derived), and an
-**event** (a point in time). Recent SDK versions add finer observation types (agent, tool, retriever,
-embedding, guardrail and others) that render differently in the UI but are spans underneath; generation is
-the type that matters mechanically, because it is the only one that carries usage and cost. **Sessions** group the traces of one conversation so a reviewer reads it in
-order; **users** roll up cost and quality per customer.
+| Object | What it is |
+|---|---|
+| **Trace** | One unit of work, typically one request or agent task. Carries `user_id`, `session_id`, tags, metadata, input and output, and a release or version label |
+| **Span** (observation) | Any step: retrieval, parsing, a tool call |
+| **Generation** (observation) | A model call: model name, parameters, input messages, output, usage split into input and output tokens, cost, and a completion-start timestamp from which time to first token is derived |
+| **Event** (observation) | A point in time |
+| **Session** | Groups the traces of one conversation so a reviewer reads it in order |
+| **User** | Rolls up cost and quality per customer |
 
-**Scores** attach a named numeric, categorical or boolean value, with an optional comment, to a trace or an
-observation. They come from four places: your code or API (a thumbs-up, a programmatic check), human
-**annotation queues** in the UI, managed **LLM-as-a-judge evaluators** that run a judge prompt over a
-sampled share of incoming traces, and evaluators run during experiments. Because scores share one model,
-the same dashboard compares human labels, judge labels and user feedback per prompt version.
+- **Observations nest by parent** inside a trace.
+- **Finer types are spans underneath.** Recent SDKs add agent, tool, retriever, embedding, guardrail and
+  others that render differently in the UI.
+- **Generation is the type that matters mechanically,** because it is the only one that carries usage and
+  cost.
 
-**Prompts** are named, versioned objects with labels such as `production` or `staging`. The SDK fetches a
-prompt by name and label, caches it with a TTL and falls back to the cached or a supplied default when the
-server is unreachable; a generation records which prompt version produced it, so latency, cost and scores
-are broken down by version. This exists *because* prompt edits are the most frequent "deploy" in an LLM
-product and should not require a code release, while still being versioned and measurable.
+### Scores
+- **What:** a named numeric, categorical or boolean value, with an optional comment, on a trace or observation.
+- **Four sources:**
+  1. Your code or API (a thumbs-up, a programmatic check).
+  2. Human **annotation queues** in the UI.
+  3. Managed **LLM-as-a-judge evaluators** that run a judge prompt over a sampled share of incoming traces.
+  4. Evaluators run during experiments.
+- **Why one model:** the same dashboard compares human labels, judge labels and user feedback per prompt
+  version.
 
-**Datasets** hold items with an input, an expected output and metadata. A dataset run executes your
-application on each item, links the resulting trace to the item, and attaches evaluator scores; the UI
-compares runs side by side.
+### Prompts
+- **Named, versioned objects** with labels such as `production` or `staging`.
+- **Fetch, cache, fall back.** The SDK fetches a prompt by name and label, caches it with a TTL, and falls
+  back to the cached or a supplied default when the server is unreachable.
+- **Linked to generations,** so latency, cost and scores break down by prompt version.
+- **Why it exists:** prompt edits are the most frequent "deploy" in an LLM product and should not require a
+  code release, while still being versioned and measurable.
+
+### Datasets
+- **Items** hold an input, an expected output and metadata.
+- **A dataset run** executes your application on each item, links the resulting trace to the item, and
+  attaches evaluator scores; the UI compares runs side by side.
 
 ### Ingestion path
-The SDK does not block your request. Events are created in memory, batched, and posted by a background
-thread, which is why tracing adds negligible latency and why a script or serverless function must call
-`flush()` before it exits. On the server, the current architecture writes raw events to object storage,
-queues them through Redis and has workers materialise them into ClickHouse, a columnar store, because trace
-analytics are large scans and aggregations over millions of observations, which the earlier Postgres-only
-design handled poorly at scale; Postgres keeps transactional data such as projects, prompts and API keys.
-Cost is computed per generation by matching the model name against a price table (built in for the major
-providers, extensible with custom model definitions for fine-tunes, Azure deployment names or self-hosted
-models); usage comes from the provider response when present, and can be estimated with a tokenizer for
-some models when it is not. The arithmetic is per usage type:
+1. **SDK, off the request path.** Events are created in memory, batched and posted by a background thread.
+   That is why tracing adds negligible latency, and why a script or serverless function must call `flush()`
+   before it exits.
+2. **Server.** The current architecture writes raw events to object storage, queues them through Redis, and
+   workers materialise them into ClickHouse, a columnar store. That is because trace analytics are large
+   scans and aggregations over millions of observations, which the earlier Postgres-only design handled poorly
+   at scale.
+3. **Postgres** keeps transactional data such as projects, prompts and API keys.
+
+### Cost
+- **Price table match.** Cost is computed per generation by matching the model name against a price table:
+  built in for the major providers, extensible with custom model definitions for fine-tunes, Azure deployment
+  names or self-hosted models.
+- **Usage source.** From the provider response when present; for some models it can be estimated with a
+  tokenizer when it is not.
+- **Arithmetic per usage type:**
 
 ```
 cost = input_tokens × input_price + output_tokens × output_price (+ cached-read tokens × cached price, …)
 ```
 
-which is why a generation must carry usage split by type, not just a total: output tokens typically cost
-several times more than input tokens, so a total alone cannot be priced. You can also send a cost
-explicitly, which overrides the table, for providers whose invoice does not follow token counts.
+- **Why usage must be split by type:** output tokens typically cost several times more than input tokens, so
+  a total alone cannot be priced.
+- **Explicit override.** You can send a cost directly, which overrides the table, for providers whose invoice
+  does not follow token counts.
 
 ### Instrumentation options
-In Python the `@observe()` decorator wraps a function in a span, nests calls through context variables and
-turns the outermost call into the trace; `as_type="generation"` marks a model call. The OpenAI drop-in
-(`from langfuse.openai import openai`) captures model, messages, usage and latency automatically. There are
-a LangChain callback handler, LlamaIndex and LiteLLM integrations, a JS/TS SDK with Vercel AI SDK support,
-and an OTLP endpoint, so spans produced by any OpenTelemetry SDK, OpenLLMetry or OpenInference
-instrumentation are mapped onto generations using the GenAI attribute conventions. The current Python SDK
-is itself built on the OpenTelemetry SDK. A `mask` callback redacts fields before data leaves the process,
-and a client-side sample rate keeps a fixed fraction of traces; sampling is decided per trace so a kept
-trace is complete, but scores and cost totals then describe the sample and must be scaled to estimate the
-whole.
+| Option | What it does |
+|---|---|
+| `@observe()` (Python) | Wraps a function in a span, nests calls through context variables, turns the outermost call into the trace; `as_type="generation"` marks a model call |
+| OpenAI drop-in (`from langfuse.openai import openai`) | Captures model, messages, usage and latency automatically |
+| Framework integrations | LangChain callback handler, LlamaIndex, LiteLLM; JS/TS SDK with Vercel AI SDK support |
+| OTLP endpoint | Spans from any OpenTelemetry SDK, OpenLLMetry or OpenInference instrumentation are mapped onto generations using the GenAI attribute conventions |
 
-## Example
-A support bot traced with the Python SDK: the decorator builds the trace, the OpenAI drop-in records the
-generation, the prompt comes from prompt management and is linked to the generation, and the trace is tagged
-with user and session so cost and conversations can be reviewed per customer. Method names follow the
-current (v3) Python SDK; the earlier SDK exposed the same ideas through `langfuse_context`.
+- **Built on OTel.** The current Python SDK is itself built on the OpenTelemetry SDK.
+- **Masking.** A `mask` callback redacts fields before data leaves the process.
+- **Sampling.** A client-side sample rate keeps a fixed fraction of traces. It is decided per trace so a kept
+  trace is complete, but scores and cost totals then describe the sample and must be scaled to estimate the
+  whole.
+
+## Diagram
+The SDK ships batches in the background; the server lands them in ClickHouse; traces then feed scores,
+datasets and the next prompt version, which closes the loop.
+
+```mermaid
+flowchart TD
+    APP["App with @observe"] -->|"background batches"| API["Langfuse API"]
+    API --> OS[("Object storage")]
+    OS --> RQ["Redis queue and workers"]
+    RQ --> CH[("ClickHouse: traces")]
+    CH --> SC["Scores: users, judges, annotators"]
+    SC --> DS["Dataset from bad traces"]
+    DS --> EX["Experiment: new prompt version"]
+    EX -->|"move production label"| PR["Prompt management"]
+    PR -->|"cached fetch"| APP
+```
+
+## Examples
+### Tracing a support bot with the Python SDK
+The decorator builds the trace, the OpenAI drop-in records the generation, the prompt comes from prompt
+management and is linked to the generation, and the trace is tagged with user and session. Method names
+follow the current (v3) Python SDK; the earlier SDK exposed the same ideas through `langfuse_context`.
 
 ```python
 # pip install langfuse openai ; env: LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and the host URL if self-hosted
@@ -141,62 +175,100 @@ print(answer("How do I reset my password?", user_id="u_42", session_id="s_9"))
 langfuse.flush()                            # required in scripts and serverless: events are sent in background batches
 ```
 
-In the UI the trace shows `answer` → `retrieve` and `answer` → generation, with tokens, cost, latency and the
-prompt version; the trace's input and output default to the outermost function's arguments and return value.
-The session view shows the whole conversation `s_9`; the user view sums cost for `u_42`.
+- **Trace tree:** `answer` → `retrieve` and `answer` → generation, with tokens, cost, latency and the prompt
+  version. The trace's input and output default to the outermost function's arguments and return value.
+- **Rollups:** the session view shows the whole conversation `s_9`; the user view sums cost for `u_42`.
 
-Follow one turn through the cost machinery. Suppose the compiled prompt plus context is 1,850 input tokens
-and the answer is 120 output tokens, with illustrative prices of $0.15 per million input tokens and $0.60
-per million output tokens. The generation's cost is 1,850 × 0.15e-6 + 120 × 0.60e-6 ≈ $0.00028 + $0.00007 =
-$0.00035. Cost lives on generations; trace, session and user totals are aggregates over them, so a conversation of six turns that grows its context each turn might cost
-$0.003, and a user with forty such conversations about $0.12. If the deployment name were `support-gpt4o-mini-eu`
-instead of a recognised model id, the tokens would still be recorded and every one of those totals would read
-zero until a custom model definition matched the name.
+### Following one turn through the cost machinery
+Illustrative prices: $0.15 per million input tokens, $0.60 per million output tokens.
+
+| Quantity | Value |
+|---|---|
+| Input (compiled prompt plus context) | 1,850 tokens |
+| Output | 120 tokens |
+| Generation cost | 1,850 × 0.15e-6 + 120 × 0.60e-6 ≈ $0.00028 + $0.00007 = $0.00035 |
+| Conversation of six turns, context growing each turn | might cost $0.003 |
+| User with forty such conversations | about $0.12 |
+
+- **Cost lives on generations;** trace, session and user totals are aggregates over them.
+- **The unmatched-name trap.** If the deployment name were `support-gpt4o-mini-eu` instead of a recognised
+  model id, tokens would still be recorded, and every one of those totals would read zero until a custom model
+  definition matched the name.
+
+### Promoting a tone change through a dataset
+1. **Collect.** Filter traces with low user-feedback or judge scores; add the representative ones, with
+   corrected expected outputs, to a dataset.
+2. **Edit.** Create a new version of `support-answer` in prompt management, without the `production` label.
+3. **Run.** Execute a dataset run of the app against that version; each item's trace is linked and scored by
+   the same evaluators.
+4. **Compare.** Review the two runs side by side on scores, cost and latency.
+5. **Promote.** Move the `production` label to the new version; clients pick it up when their cache TTL
+   expires, and generations record the new version for monitoring.
+
+## Production patterns
+- **Prompt fetch with a fallback.** In the serving path, call `get_prompt` with a cache TTL and a fallback
+  prompt in code, so a Langfuse outage never takes the bot down. Monitor prompt-fetch errors and which
+  version generations report.
+- **Custom model definitions for every alias.** Add a model definition whose match pattern covers each Azure
+  deployment name, fine-tune id or vLLM model name before launch. Monitor the share of generations with a
+  matched cost; it should be near 100%.
+- **Project per environment.** Separate dev, staging and prod projects with their own API keys, so test
+  traffic never pollutes production cost and scores. Monitor key usage by project.
+- **Mask before send.** Pass a `mask` function to the client that strips emails, account numbers and secrets
+  from inputs and outputs before data leaves the process. Monitor a sampled audit of stored traces.
+- **Judge on a sample, calibrate with humans.** Run a managed LLM-as-a-judge evaluator on a small share of
+  production traces and a weekly annotation queue of about a hundred traces. Monitor judge-human agreement and
+  judge token spend.
+- **Sample only when storage binds.** Keep 100% while affordable; then set the client `sample_rate` and
+  scale cost and score totals by its inverse. Monitor ingestion lag and volume.
 
 ## Trade-offs
-- Self-hosting keeps prompts and customer data in your VPC with no licence cost, but you now operate
-  Postgres, ClickHouse, Redis and object storage; the balance flips to Langfuse Cloud when the team has no
+- **Self-host vs cloud.** Self-hosting keeps prompts and customer data in your VPC with no licence cost, but
+  you operate Postgres, ClickHouse, Redis and object storage. It flips to Langfuse Cloud when the team has no
   platform capacity or the volume is small.
-- Framework-agnostic decorators work with any code, but you place them yourself; LangSmith produces
-  node-level LangGraph traces with no decorators, which matters when the stack is entirely LangGraph.
-- Capturing full inputs and outputs is what makes a trace debuggable, and is also PII and storage; masking
-  and sampling cut both the risk and the debuggability, so decide per field rather than globally.
-- Client-side sampling cuts ingestion and storage cost proportionally, but rare failures and per-user cost
-  become estimates; keep 100% while volume is affordable and sample only once storage, not insight, is the
-  binding cost.
-- Managed LLM-as-a-judge evaluators give a continuous quality signal on production without labelling, at a
-  judge-model cost per evaluated trace and with judge bias; the sample rate is the knob, and a human
-  annotation queue is the calibration.
-- Prompt management decouples wording changes from deploys, but adds a runtime dependency on Langfuse;
-  the SDK cache and fallback mitigate it, and the trade is poor if prompts change rarely and must go
-  through code review anyway.
+- **Framework-agnostic vs automatic.** Decorators work with any code, but you place them yourself; LangSmith
+  produces node-level LangGraph traces with no decorators, which matters when the stack is entirely LangGraph.
+- **Full capture vs PII and storage.** Full inputs and outputs make a trace debuggable, and are also PII and
+  storage. Masking and sampling cut both the risk and the debuggability, so decide per field rather than
+  globally.
+- **Sampling vs fidelity.** Client-side sampling cuts ingestion and storage cost proportionally, but rare
+  failures and per-user cost become estimates. Keep 100% while volume is affordable; sample once storage, not
+  insight, is the binding cost.
+- **Judges vs labels.** Managed LLM-as-a-judge evaluators give a continuous production quality signal without
+  labelling, at a judge-model cost per evaluated trace and with judge bias. The sample rate is the knob; a
+  human annotation queue is the calibration.
+- **Prompt management vs a runtime dependency.** It decouples wording changes from deploys but adds a runtime
+  dependency on Langfuse. The SDK cache and fallback mitigate it; the trade is poor if prompts change rarely
+  and must go through code review anyway.
 
 ## Pitfalls
-- Missing or truncated traces from Lambda, Cloud Run jobs or scripts because `flush()` was never called;
-  the symptom is that everything works locally in a long-lived process and vanishes in production.
-- Tokens present but cost blank, because the model name (an Azure deployment name, a fine-tune id, a
-  vLLM-served open model) matched nothing in the price table; the fix is a custom model definition.
-- Flat traces: the decorator sits on the wrong boundary or async context was lost, so generations appear as
-  separate root traces and sessions look empty.
-- No `user_id` or `session_id` on traces, so nobody can answer "which customer burned $300 yesterday" or
+- **Never calling `flush()`.** Missing or truncated traces from Lambda, Cloud Run jobs or scripts. Symptom:
+  everything works locally in a long-lived process and vanishes in production.
+- **Unmatched model names.** Tokens present but cost blank, because an Azure deployment name, a fine-tune id or
+  a vLLM-served open model matched nothing in the price table. Fix: a custom model definition.
+- **Flat traces.** The decorator sits on the wrong boundary or async context was lost. Symptom: generations
+  appear as separate root traces and sessions look empty.
+- **No `user_id` or `session_id`.** Symptom: nobody can answer "which customer burned $300 yesterday" or
   review a conversation end to end.
-- Feedback scored against the wrong trace id because the id was regenerated or never returned to the
-  client; the symptom is scores that attach to nothing or to another user's trace.
-- Treating a judge score as ground truth; the symptom is a quality dashboard that disagrees with the humans
-  in the annotation queue, which nobody set up.
-- Sending prompts containing secrets or personal data to a hosted instance without `mask`; the symptom is a
+- **Scoring the wrong trace.** The trace id was regenerated or never returned to the client. Symptom: scores
+  that attach to nothing or to another user's trace.
+- **Judge score as ground truth.** Symptom: a quality dashboard that disagrees with the humans in the
+  annotation queue, which nobody set up.
+- **No `mask` on a hosted instance.** Prompts containing secrets or personal data are sent as-is. Symptom: a
   compliance finding, not an error message.
 
 ## When to use
-Choose Langfuse when you need traces with prompts, tokens and cost per user and session, want evaluation
-and prompt versioning in the same place as the traces, and either need self-hosting for data residency or
-want to avoid lock-in to a framework vendor. Prefer LangSmith when the application is LangGraph end to end
-and the hosted model is acceptable; prefer Phoenix when the work is evaluation-heavy notebook analysis over
-OpenTelemetry traces you already produce. Measure ingestion lag, the share of generations with a matched
-cost, the fraction of traces carrying `user_id`, and agreement between judge scores and human annotations.
-Day to day it is the tab you open when a customer forwards a bad answer; in interviews, be ready to explain
-the data model, why cost needs a price table, and how you would run a prompt change through a dataset
-before promoting its label.
+- **Choose Langfuse** for traces with prompts, tokens and cost per user and session, with evaluation and
+  prompt versioning beside them, when you need self-hosting for data residency or want to avoid lock-in to a
+  framework vendor.
+- **Prefer LangSmith** when the application is LangGraph end to end and the hosted model is acceptable.
+- **Prefer Phoenix** when the work is evaluation-heavy notebook analysis over OpenTelemetry traces you already
+  produce.
+- **Measure:** ingestion lag, the share of generations with a matched cost, the fraction of traces carrying
+  `user_id`, and agreement between judge scores and human annotations.
+- **Day to day,** it is the tab you open when a customer forwards a bad answer.
+- **Interviews:** explain the data model, why cost needs a price table, and how you would run a prompt change
+  through a dataset before promoting its label.
 
 ## Role lens
 - **Engineer:** Adds `@observe` at the request and tool boundaries, tags traces with user and session,
@@ -220,6 +292,38 @@ set built from annotated traces, compare scores, then move the `production` labe
 flushing in any serverless component, masking personal data if using the hosted service, SDK prompt
 caching with a fallback so an outage of Langfuse never takes the bot down, and keeping dev and prod in
 separate projects.
+
+## Interview questions
+### What is a generation in Langfuse, and why is it a separate observation type?
+- **Definition:** an observation for a model call carrying model name, parameters, messages, output, usage by
+  type, cost and completion-start time.
+- **Why separate:** cost and time to first token can only be computed where usage and a model name exist, so
+  that type is the unit everything aggregates from; spans for retrieval or tools carry none of it.
+
+### Cost dashboards read zero for one deployment although token counts are present. How do you fix it?
+- **Diagnose:** cost comes from matching the model name to a price table; an Azure deployment name or
+  fine-tune id matches nothing, so tokens are recorded and cost is not.
+- **Fix:** add a custom model definition whose match pattern covers the name, with input and output prices.
+- **Prevent:** alert on the share of generations with matched cost.
+
+### When would you not use Langfuse prompt management?
+- **When prompts change rarely** and must go through code review anyway; Git is simpler and has no runtime
+  dependency.
+- **When a fetch failure is unacceptable** and you cannot ship a fallback; the SDK cache helps but only after
+  a first successful fetch or with a supplied default.
+- **Otherwise** it pays off, because wording edits become versioned, measurable releases without a deploy.
+
+### How would you size judge evaluation on 50,000 traces a day?
+- **Judge cost scales with sample rate.** At 2%, about 1,000 judged traces a day; multiply by judge prompt plus
+  trace tokens and the judge model price to get the daily spend (rough planning figures, not a benchmark).
+- **Calibrate** with a weekly human annotation queue and track agreement, because an uncalibrated judge drifts
+  from what product means by quality.
+
+### Why does self-hosted Langfuse need ClickHouse and not just Postgres?
+- **Workload shape:** trace analytics are large scans and aggregations over millions of observations, which a
+  columnar store handles well and the earlier Postgres-only design handled poorly at scale.
+- **Split of duties:** Postgres keeps transactional data (projects, prompts, API keys); events land in object
+  storage and Redis-queued workers write them to ClickHouse.
 
 ## Quiz
 ### Q: In Langfuse, what distinguishes a generation from a span?

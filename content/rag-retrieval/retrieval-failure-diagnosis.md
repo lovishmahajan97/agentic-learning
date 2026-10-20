@@ -5,7 +5,7 @@ name: Retrieval failure diagnosis
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/retrieval-evaluation
   - evals/error-analysis
@@ -18,9 +18,9 @@ related:
 ---
 
 ## TL;DR
-A wrong RAG answer means the evidence was lost at one specific stage. Diagnosis traces the gold evidence
-through ingestion, parsing, chunking, indexing, filtering, ranking, context and generation to the *first*
-stage where it disappears, because each stage has a different fix.
+A wrong RAG answer means evidence was lost at one stage. Diagnosis traces the gold evidence through
+ingestion, parsing, chunking, indexing, filtering, ranking, context and generation to the *first* stage
+where it disappears, because each stage has its own fix and tuning another changes nothing.
 
 ## Why it exists
 - **A RAG pipeline is a chain of lossy steps**, and the user sees only the end. Stages where evidence can
@@ -30,8 +30,9 @@ stage where it disappears, because each stage has a different fix.
   the PDF was never synced; OCR turned "30" into "3O"; the number landed in a chunk with no mention of
   refunds; an ACL filter excluded it; a blog post outranked it; the reranker ranked it 6th when only the
   top 5 are kept; or the model preferred an older FAQ already in the prompt.
-- **Global changes are a coin toss.** Swapping the embedding model, raising top-k, rewriting the prompt or
-  adding a reranker can *look* like it worked because a few tried examples improve while others regress.
+- **Global changes are a coin toss without knowing where evidence was lost.** Swapping the embedding
+  model, raising top-k, rewriting the prompt or adding a reranker can even *look* like it worked, because
+  the few examples you tried improve while others regress.
   Teams burn weeks re-embedding when the parser was dropping every table.
 - **Answer-level metrics cannot locate the loss.** An LLM judge scoring "correct / incorrect" gives the
   failure rate, not its location. Per-stage visibility (where was the right chunk at every step?) turns an
@@ -107,7 +108,7 @@ bucket names the fix.
 flowchart TD
     Q["Failing query with gold span"] --> C{"Answer in any source document?"}
     C -->|"no"| G1["Content gap: abstain, add content"]
-    C -->|"yes"| P{"Parsed and chunked intact, indexed?"}
+    C -->|"yes"| P{"Synced, parsed, chunked and indexed intact?"}
     P -->|"no"| G2["Fix sync, parser, chunker or index job"]
     P -->|"yes"| F{"Survives filters and query rewrite?"}
     F -->|"no"| G3["Fix ACL, metadata filter or rewriter"]

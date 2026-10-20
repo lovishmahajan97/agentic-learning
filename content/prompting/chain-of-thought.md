@@ -5,7 +5,7 @@ name: Chain-of-thought prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - prompting/zero-shot
   - prompting/few-shot
@@ -23,95 +23,112 @@ sources:
 ---
 
 ## TL;DR
-Chain-of-thought (CoT) has the model write intermediate reasoning before its final answer. It works
-because a transformer spends a fixed amount of computation per generated token, so a problem that needs
-many dependent steps cannot be solved inside one token; writing the steps out buys more sequential
-computation and lets the sequence carry state. Gains are large on arithmetic, logic and multi-step
-planning, near zero on lookups, and the written chain is not guaranteed to be the real cause of the
-answer.
+Chain-of-thought (CoT) has the model write reasoning before its answer, buying sequential computation one
+fixed-compute token cannot supply. Gains are large on multi-step problems, near zero on lookups, and the
+chain is not guaranteed to be the answer's real cause.
 
 ## Why it exists
-Ask a model for the final answer to a multi-step word problem and it often fails; ask it to show its work
-first and it often succeeds, with the same weights and the same question. The explanation is
-architectural. Generating one token runs the input through a fixed number of layers once. There is no
-loop, no scratchpad, no way to do step three after step two inside that single pass. A problem with more
-sequential dependencies than a given network's depth can absorb cannot be solved in one token by that
-network; theoretical work on bounded-depth transformers shows that some inherently serial problems are out
-of reach without intermediate tokens (under standard complexity assumptions) and become solvable with
-them. Writing intermediate steps changes the computation: every emitted token is
-another full pass, conditioned on all the previous ones, so serial compute grows with the length of the
-chain and partial results become visible to later steps through attention.
-
-The naive alternatives both fail. A bigger model still has fixed per-token compute; it pushes the ceiling
-up at great cost without removing it. Asking for the answer and then an explanation produces post-hoc
-rationalisation: the answer token was already sampled before any reasoning existed, so the explanation
-can only justify it. CoT was first shown with few-shot demonstrations containing worked rationales, then
-as a zero-shot trigger phrase, and the gains appeared only above a certain model scale; smaller models
-write fluent chains that reach wrong answers.
+- **Same weights, different result.** Ask for the final answer to a multi-step word problem and the model
+  often fails; ask it to show its work first and it often succeeds.
+- **The cause is architectural.** Generating one token runs the input through a fixed number of layers
+  once: no loop, no scratchpad, no way to do step three after step two inside that pass. Theoretical work
+  on bounded-depth transformers shows some inherently serial problems are out of reach without
+  intermediate tokens (under standard complexity assumptions) and become solvable with them.
+- **Writing steps changes the computation.** Every emitted token is another full pass conditioned on all
+  previous ones, so serial compute grows with chain length and partial results reach later steps through
+  attention.
+- **The naive fixes fail.** A bigger model still has fixed per-token compute: it raises the ceiling at
+  great cost without removing it. Answer-then-explain is post-hoc rationalisation, because the answer token
+  was sampled before any reasoning existed.
+- **It needs scale.** CoT was first shown with few-shot worked rationales, then as a zero-shot trigger
+  phrase. Gains appeared only above a certain model scale; smaller models write fluent chains that reach
+  wrong answers.
 
 ## How it works
 ### Compute per token, and why order matters
-Each generated token gets the same number of layers of compute and can attend to every earlier token.
-Decoding is therefore a sequence of bounded-depth computations whose only memory is the text itself. A
-chain of k reasoning tokens gives roughly k additional passes, each able to read the partial results
-written so far. The consequence for prompt design is strict ordering: reasoning must come before the
-answer. In a JSON output the "reasoning" field must precede the "answer" field, because generation is
-left to right and a field cannot influence one already emitted. With tags, `<reasoning>` then
-`<answer>`.
+1. **Each token gets the same compute.** The same number of layers, with attention to every earlier token.
+2. **The text is the only memory.** Decoding is a sequence of bounded-depth computations; a chain of k
+   reasoning tokens gives roughly k additional passes, each able to read the partial results so far.
+3. **So reasoning must come before the answer.** Generation is left to right and a field cannot influence
+   one already emitted: in JSON the "reasoning" field precedes the "answer" field; with tags, `<reasoning>`
+   then `<answer>`.
 
 ### Variants
-- Few-shot CoT: demonstrations that include the rationale, so the model copies the reasoning style and
-  granularity. Flawed rationales get copied too.
-- Zero-shot CoT: a trigger such as "think step by step before answering". Cheaper to set up, less
-  control over the chain's shape.
-- Self-consistency: sample several chains for the same question and take the majority final answer. It
-  works because different chains make different mistakes, so wrong answers are spread across many values
-  while the right answer is reached repeatedly; it costs k times the tokens and needs a discrete answer
-  to vote on.
-- Built-in reasoning: current reasoning models are typically trained with reinforcement learning to
-  produce long internal chains before answering, often hidden or summarised by the API, with a budget or
-  effort control instead of a prompt trigger. On these models an explicit "think step by step" is usually
-  redundant and can produce a second, visible chain that duplicates the hidden one; tune the effort
-  setting and measure instead. The reasoning-models lesson covers the mechanism.
+| Variant | How | Note |
+|---|---|---|
+| **Few-shot CoT** | Demonstrations include the rationale | Model copies reasoning style and granularity; flawed rationales get copied too |
+| **Zero-shot CoT** | A trigger such as "think step by step before answering" | Cheaper to set up, less control over the chain's shape |
+| **Self-consistency** | Sample several chains, take the majority final answer | Costs k times the tokens; needs a discrete answer to vote on |
+| **Built-in reasoning** | Models trained, typically with reinforcement learning, to produce long internal chains | Often hidden or summarised by the API; controlled by a budget or effort setting, not a prompt trigger |
+
+- **Why self-consistency works:** different chains make different mistakes, so wrong answers spread
+  across many values while the right answer is reached repeatedly.
+- **On reasoning models, skip the trigger.** An explicit "think step by step" is usually redundant and can
+  produce a second, visible chain duplicating the hidden one; tune the effort setting and measure instead.
+  The reasoning-models lesson covers the mechanism.
 
 ### Why voting works, in numbers
-Suppose a single chain reaches the right answer with probability 0.6. With five independent chains and a
-strict majority vote, the answer is right when at least three chains are: 10·0.6³·0.4² + 5·0.6⁴·0.4 +
-0.6⁵ ≈ 0.35 + 0.26 + 0.08 = 0.68. Plurality voting does better still when wrong chains scatter across
-different wrong numbers, because the correct answer can win with two votes against four singletons. The
-same arithmetic shows when it backfires: if the model makes one *consistent* mistake more often than it
-reaches the truth, voting amplifies the mistake, and if chains are not independent (identical sampling,
-a shared misreading of the question), five votes carry little more information than one. Measure the
-vote margin as well as the answer: a 5/5 majority and a 2/5 plurality deserve different confidence, and
-the margin is a cheap uncertainty signal for routing low-agreement cases to a person.
+- **Strict majority of five.** If one chain is right with probability 0.6, five independent chains are
+  right when at least three are: 10·0.6³·0.4² + 5·0.6⁴·0.4 + 0.6⁵ ≈ 0.35 + 0.26 + 0.08 = 0.68.
+- **Plurality does better** when wrong chains scatter across different wrong numbers, because the correct
+  answer can win with two votes against four singletons.
+- **It backfires on consistent mistakes.** If one wrong answer is more likely than the truth, voting
+  amplifies it.
+- **It needs independence.** With identical sampling or a shared misreading of the question, five votes
+  carry little more information than one.
+- **Read the margin.** A 5/5 majority and a 2/5 plurality deserve different confidence; the margin is a
+  cheap uncertainty signal for routing low-agreement cases to a person.
 
 ### What the chain is, and is not
-The chain is a computation, and a useful debugging artefact: reading failed chains tells you whether the
-model misread the question, dropped a constraint or made an arithmetic slip. It is not a faithful account
-of why the answer was produced. Experiments that bias the prompt, for example by making the correct
-option always "A" in the demonstrations, show models producing chains that never mention the bias while
-their answers follow it. Treat the chain as evidence to inspect, never as an audit trail.
+- **It is a computation** and a useful debugging artefact: failed chains show whether the model misread
+  the question, dropped a constraint or made an arithmetic slip.
+- **It is not a faithful account** of why the answer was produced. When demonstrations are biased (the
+  correct option always "A"), models write chains that never mention the bias while their answers follow
+  it.
+- **Treat it as evidence to inspect, never as an audit trail.**
 
 ### Where it does not help
-Fact retrieval, short-text classification, sentiment and anything that is a lookup rather than a
-derivation: there are no intermediate steps to write, so you pay latency for nothing. Surveys of CoT
-across benchmarks report the gains concentrated in math and symbolic reasoning, with little or negative
-effect elsewhere; on format-sensitive tasks the extra prose makes outputs harder to parse and
-occasionally worse. CoT cannot recover knowledge the model lacks; a chain built on a missing fact is
-confidently wrong.
+- **Lookups:** fact retrieval, short-text classification, sentiment. There are no intermediate steps, so
+  you pay latency for nothing.
+- **Most non-math benchmarks.** Surveys report gains concentrated in math and symbolic reasoning, with
+  little or negative effect elsewhere.
+- **Format-sensitive tasks.** Extra prose makes outputs harder to parse and occasionally worse.
+- **Missing knowledge.** A chain built on a missing fact is confidently wrong.
 
 ### Operational details
-Reasoning needs room: size `max_tokens` for the chain, not the answer, or the output truncates mid-chain
-with no answer at all. On models with built-in reasoning the hidden thinking tokens typically count
-against the same limit and are billed as output even when you never see them. Parse only the delimited answer. Decide whether end users should see the chain; it
-can leak the contents of the context and it reads as authoritative even when unfaithful. Count the
-tokens: output tokens are typically priced several times above input tokens, and a chain can multiply output length by an order
-of magnitude.
+- **Reasoning needs room.** Size `max_tokens` for the chain, not the answer, or the output truncates
+  mid-chain with no answer at all.
+- **Hidden thinking still counts.** On built-in reasoning models the thinking tokens typically count
+  against the same limit and are billed as output even when you never see them.
+- **Parse only the delimited answer.**
+- **Decide whether users see the chain.** It can leak the contents of the context and reads as
+  authoritative even when unfaithful.
+- **Count the tokens.** Output tokens are typically priced several times above input tokens, and a chain
+  can multiply output length by an order of magnitude.
 
-## Example
-Three disciplines in one script: the reasoning block is placed before the answer, only the delimited
-answer is parsed, and self-consistency takes a majority over five sampled chains. The direct-answer
-variant is run the same way so the comparison is like for like.
+## Diagram
+Reasoning tokens come first so they can shape the answer; with self-consistency, several chains vote and
+the margin decides whether to trust the result.
+
+```mermaid
+flowchart TD
+    Q["Question"] --> T{"Multi-step task?"}
+    T -->|"no, lookup"| D["Direct answer, no chain"]
+    T -->|"yes"| C["Sample k chains"]
+    C --> R["Reasoning tokens first"]
+    R --> A["Delimited answer"]
+    A --> P["Parse only the answer"]
+    P --> V["Vote across chains"]
+    V --> M{"Vote margin high?"}
+    M -->|"yes"| OK["Return answer"]
+    M -->|"no"| H["Route to a person"]
+```
+
+## Examples
+### Direct vs CoT with self-consistency
+Three disciplines in one script: the reasoning block comes before the answer, only the delimited answer is
+parsed, and self-consistency takes a majority over five sampled chains. The direct-answer variant runs the
+same way so the comparison is like for like.
 
 ```python
 import anthropic, re, collections
@@ -141,41 +158,96 @@ for style in (DIRECT, COT):
 # shown here applies to any model.
 ```
 
+### When voting helps and when it backfires
+Pure Python, no API: the exact strict-majority formula from above, plus a simulation of plurality voting
+over five chains under two error patterns.
+
+```python
+import random, collections
+from math import comb
+
+def majority_exact(p, k=5):
+    """P(a strict majority of k independent chains is correct)."""
+    return sum(comb(k, j) * p**j * (1 - p)**(k - j) for j in range(k // 2 + 1, k + 1))
+
+def plurality_sim(answer_dist, k=5, trials=100_000, seed=0):
+    """answer_dist: {answer: probability}; 'right' is the correct one. Ties count as wrong."""
+    rng, answers = random.Random(seed), list(answer_dist)
+    weights, wins = list(answer_dist.values()), 0
+    for _ in range(trials):
+        top = collections.Counter(rng.choices(answers, weights, k=k)).most_common(2)
+        wins += top[0][0] == "right" and (len(top) == 1 or top[0][1] > top[1][1])
+    return wins / trials
+
+print(f"majority, p=0.6: {majority_exact(0.6):.2f}")                       # 0.68
+scattered = {"right": 0.6, **{f"wrong{i}": 0.4 / 8 for i in range(8)}}     # errors spread out
+print(f"plurality, scattered errors: {plurality_sim(scattered):.2f}")
+consistent = {"right": 0.4, "same_wrong": 0.5, "other_wrong": 0.1}        # one systematic error
+print(f"plurality, consistent error: {plurality_sim(consistent):.2f}")
+```
+
+| Error pattern | Single chain | Five chains, voted |
+|---|---|---|
+| Strict majority, p = 0.6 | 0.60 | 0.68 |
+| Plurality, wrong answers scattered over 8 values | 0.60 | about 0.84 |
+| Plurality, one wrong answer at 0.5, truth at 0.4 | 0.40 | about 0.32, worse than one chain |
+
+- **Scattered errors are where voting shines**, because the truth wins with a small plurality.
+- **A systematic misreading is amplified.** Fix the prompt or add a rule; more samples will not help.
+
+## Production patterns
+- **Route reasoning by request class.** Classify or route requests so only multi-step classes (math,
+  date logic, multi-constraint selection) get a chain or a higher effort setting; lookups and
+  classifications go direct. Monitor accuracy, output tokens and p95 latency per class.
+- **Reasoning field before answer in the schema.** In structured outputs, declare `reasoning` before
+  `answer` (or `<reasoning>` before `<answer>` tags) and parse only the answer. Monitor parse-failure rate,
+  which spikes when the chain bleeds into the answer.
+- **Budget for the chain.** Set `max_tokens` well above answer length; on models with extended thinking,
+  set the thinking budget or effort explicitly and keep it below the output limit. Alert on responses that
+  stop at the token limit with no answer tag.
+- **Self-consistency with margin routing.** For high-stakes discrete answers, sample several chains, vote,
+  and send low-margin cases (for example 2/5) to human review. Monitor the margin distribution and the cost
+  multiple.
+- **Keep chains internal.** Show users the answer, log chains for debugging under the same retention and
+  access rules as the context they may quote. Review a sample of failed chains weekly to find recurring
+  misreadings.
+
 ## Trade-offs
-- Higher accuracy on multi-step problems against latency and output tokens, which cost more than input
-  tokens; the trade becomes a net loss on lookups and short classifications, where there is nothing to
-  derive.
-- Self-consistency buys a further accuracy gain against k times the cost; it stops paying when
-  single-chain accuracy is already high or when the answer is free text that cannot be voted on.
-- A visible chain is a debugging aid against a leak and liability risk: it can expose context contents and
-  reads as an explanation even when it is not one; hide it from end users unless the product is about
-  showing work.
-- On reasoning-native models an explicit CoT instruction duplicates work the model already does, so the
-  lever becomes the effort or budget setting; on models without built-in reasoning the prompt trigger is
-  still the main lever.
+- **Accuracy vs latency and output tokens.** Multi-step accuracy rises, but output tokens cost more than
+  input tokens; the trade becomes a net loss on lookups and short classifications, where there is nothing
+  to derive.
+- **Self-consistency vs k times the cost.** It buys a further accuracy gain, and stops paying when
+  single-chain accuracy is already high or the answer is free text that cannot be voted on.
+- **Debugging aid vs leak and liability.** A visible chain can expose context contents and reads as an
+  explanation even when it is not one; hide it from end users unless the product is about showing work.
+- **Prompt trigger vs effort setting.** On reasoning-native models an explicit CoT instruction duplicates
+  work the model already does, so the lever becomes the effort or budget setting; on models without
+  built-in reasoning the prompt trigger is still the main lever.
 
 ## Pitfalls
-- Asking for the answer first and the reasoning after; the symptom is articulate justifications of wrong
+- **Asking for the answer first and the reasoning after.** Symptom: articulate justifications of wrong
   answers that never change the answer.
-- Setting `max_tokens` for the answer length; the symptom is truncated chains and missing answer tags,
+- **Setting `max_tokens` for the answer length.** Symptom: truncated chains and missing answer tags,
   showing up as parse failures.
-- Parsing the whole response as the answer; the symptom is JSON decode errors because the chain is prose.
-- Reading the chain as the cause of the answer; the symptom is answers that track a feature of the prompt
-  the chain never mentions.
-- Applying CoT to every call by default; the symptom is latency and cost tripling on a classification task
+- **Parsing the whole response as the answer.** Symptom: JSON decode errors because the chain is prose.
+- **Reading the chain as the cause of the answer.** Symptom: answers that track a feature of the prompt the
+  chain never mentions.
+- **Applying CoT to every call by default.** Symptom: latency and cost tripling on a classification task
   with no accuracy change.
-- Few-shot CoT with sloppy rationales; the symptom is the model copying the same shortcut and failing on
-  exactly the cases the shortcut misses.
+- **Few-shot CoT with sloppy rationales.** Symptom: the model copies the same shortcut and fails on exactly
+  the cases the shortcut misses.
 
 ## When to use
-Use CoT when the task has intermediate steps: arithmetic, unit conversion, date logic, multi-constraint
-selection, planning, code reasoning, anything where a person would want scratch paper. Skip it for
-lookups, sentiment, short classification and plain extraction, and add a reasoning field to structured
-outputs only when the eval shows a gain. Always A/B against the direct-answer prompt on your eval set and
-track accuracy, output tokens and latency together; add self-consistency only where the remaining errors
-are inconsistent across samples. On models with built-in reasoning, treat the effort or budget setting as
-the dial and measure before adding prompt triggers. In interviews, the expected depth is the
-compute-per-token argument, the ordering rule, self-consistency and the faithfulness caveat.
+- **Use when** the task has intermediate steps: arithmetic, unit conversion, date logic, multi-constraint
+  selection, planning, code reasoning, anything where a person would want scratch paper.
+- **Skip for** lookups, sentiment, short classification and plain extraction; add a reasoning field to
+  structured outputs only when the eval shows a gain.
+- **Measure:** always A/B against the direct-answer prompt, tracking accuracy, output tokens and latency
+  together; add self-consistency only where remaining errors are inconsistent across samples.
+- **Reasoning models:** treat the effort or budget setting as the dial and measure before adding prompt
+  triggers.
+- **Interviews:** the expected depth is the compute-per-token argument, the ordering rule,
+  self-consistency and the faithfulness caveat.
 
 ## Role lens
 - **Engineer:** Adds a delimited reasoning section before the answer, sizes `max_tokens` for the chain,
@@ -197,6 +269,36 @@ block or in a "reasoning" field that precedes the answer fields, parse only the 
 `max_tokens` so the chain cannot truncate, and A/B it on the eval set measuring accuracy, parse-failure
 rate, latency and output tokens. If the model has built-in reasoning I would tune its effort setting
 instead of adding a trigger. Keeping CoT would require a measured gain, not a hunch.
+
+## Interview questions
+### Why does chain-of-thought help on multi-step problems at all?
+- **Fixed compute per token.** One token is one bounded pass through the layers, so a problem with more
+  dependent steps than the depth can absorb cannot be solved in a single token.
+- **The chain is the scratchpad.** Each reasoning token is another pass that can read earlier partial
+  results through attention, so serial compute grows with chain length.
+
+### Your CoT prompt explains its answers well but accuracy did not improve. What do you check?
+- **Order.** If the answer comes before the reasoning, the explanation is post-hoc and cannot change it.
+- **Task type.** Lookups and classification have no intermediate steps, so CoT adds tokens, not accuracy.
+- **Truncation and parsing.** Confirm `max_tokens` fits the chain and only the delimited answer is parsed.
+
+### When would you not use self-consistency?
+- **When single-chain accuracy is already high**, since k times the cost buys little.
+- **When the answer is free text** with no discrete value to vote on.
+- **When errors are systematic.** If one wrong answer beats the truth, voting amplifies it: at truth 0.4
+  and one wrong answer at 0.5, five-chain plurality drops to about 0.32.
+
+### Can you use the chain as an explanation for auditors?
+- **No.** Biased-prompt experiments show chains omitting the real cause of the answer, so the chain is not
+  a faithful account.
+- **Use it as debugging evidence** to find misreadings, and keep auditable decisions in code, logged inputs
+  and deterministic rules.
+
+### How do you budget tokens for reasoning in production?
+- **Size for the chain.** `max_tokens` must cover hidden or visible reasoning plus the answer, or responses
+  truncate with no answer.
+- **Price output separately.** Output tokens typically cost several times more than input, and chains can
+  multiply output length by an order of magnitude, so route only multi-step classes to reasoning.
 
 ## Quiz
 ### Q: Why does writing out intermediate steps improve a model's accuracy on multi-step arithmetic?

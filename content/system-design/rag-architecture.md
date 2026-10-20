@@ -85,8 +85,8 @@ Reciprocal rank fusion is the common default:
 - **It fuses ranks, not raw scores,** *because* a BM25 score and a cosine similarity live on different
   scales and cannot be added.
 - **Agreement beats a single strong vote.** With k = 60, a chunk ranked 1st by dense search only
-  scores 1/61 ≈ 0.0164; a chunk ranked 3rd in both lists scores 2/63 ≈ 0.0317. That is exactly the
-  behaviour you want from fusion.
+  scores 1/61 ≈ 0.0164; a chunk ranked 3rd in both lists scores 2/63 ≈ 0.0317. Agreement between two
+  independent retrievers is exactly the behaviour you want from fusion.
 - **The large k flattens the curve,** so rank 1 versus rank 5 matters little and presence in a list
   matters a lot.
 
@@ -126,11 +126,12 @@ Reciprocal rank fusion is the common default:
   argument for retrieval over stuffing.
 
 ## Diagram
-The top row is the offline pipeline that builds the index; the bottom row is the online path. Note that
-the ACL filter runs inside the search, before fusion and reranking.
+The left branch is the offline pipeline that builds the index; the right branch is the online query
+path, which meets the index and continues down to the answer. Note that the ACL filter runs inside the
+search, before fusion and reranking.
 
 ```mermaid
-flowchart LR
+flowchart TD
     S["Source systems"] --> I["Ingest and parse"]
     I --> CH["Chunk"]
     CH --> E["Embed dense and sparse"]
@@ -223,7 +224,8 @@ are illustrative.
 - **ACL predicate inside the vector query.** When multiple tenants or groups share an index, put the
   filter in the same query as the similarity order (in pgvector, a `WHERE tenant_id = ...` clause next
   to `ORDER BY embedding <=> ...`). With HNSW and selective filters, enable pgvector's iterative index
-  scans (0.8.0+). Monitor zero-result rate per user group.
+  scans (0.8.0+, `SET hnsw.iterative_scan = relaxed_order`) so a filter cannot starve top-k. Monitor
+  zero-result rate per user group.
 - **Versioned embeddings with blue/green re-index.** Store the embedding model name on every row, build
   the new index side by side, run the golden query set against both, then switch the read alias.
   Monitor recall@k before and after cutover and keep the old index until it holds.
@@ -258,14 +260,16 @@ are illustrative.
 - **Treating parsing as solved.** Symptom: retrieval returns the right document but its chunk text is a
   mangled table, so the model answers confidently and wrongly. Fix: inspect parsed output per source type.
 - **Upgrading the embedding model without re-indexing everything.** Symptom: a sudden recall collapse
-  that only affects documents ingested after the upgrade, or only those before it.
+  that only affects documents ingested after the upgrade, or only those before it. Fix: re-embed the
+  whole corpus into a new index and cut over, never mix model versions.
 - **Judging by end-to-end answer quality alone.** Without recall@k on a labeled query set you cannot
   tell retrieval failures from generation failures, and you end up tuning prompts to fix an index
-  problem.
+  problem. Fix: measure retrieval and generation separately.
 - **Adding chunks to paper over retrieval misses.** Symptom: cost per question climbs while faithfulness
-  falls, because the right passage is now buried among near-misses and the model blends them.
+  falls, because the right passage is now buried among near-misses and the model blends them. Fix:
+  improve recall (parsing, chunking, hybrid, rerank) instead of widening the context.
 - **Letting the index become the system of record.** Hand-edited chunks, data that exists nowhere else.
-  Symptom: a re-chunking project that nobody dares to run.
+  Symptom: a re-chunking project that nobody dares to run. Fix: write corrections back to the source.
 
 ## When to use
 - **Use when:** answers must come from content that is private, changing, large or access-controlled,

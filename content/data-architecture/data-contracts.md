@@ -5,7 +5,7 @@ name: Data contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - data-architecture/ingestion-pipelines
   - data-architecture/data-lineage
@@ -21,115 +21,139 @@ sources:
 ---
 
 ## TL;DR
-A data contract is an explicit, versioned, machine-checked agreement between the team that produces a
-dataset and the teams that consume it: schema, meaning, quality guarantees, freshness and ownership. It
-exists because AI pipelines are the most fragile consumers in the company: a renamed column or a changed
-unit does not crash an embedding job or a training run, it quietly produces a worse model or index. The
-contract moves the failure to the producer's side, at write time, where it is loud and cheap.
+A data contract is a versioned, machine-checked agreement between a dataset's producer and its consumers:
+schema, meaning, quality, freshness, ownership. AI pipelines fail silently on upstream changes, so the
+contract moves failure to the producer at write time: loud and cheap.
 
 ## Why it exists
-Imagine the support-ticket pipeline that feeds a RAG index and a fine-tuning set. The ticketing team
-renames `resolution_text` to `resolution` and starts writing `category` as an integer id instead of a
-label. Nothing errors. The chunker reads a missing field as an empty string and emits empty chunks; the
-metadata filter on `category == "billing"` silently matches nothing; the fine-tuning set gets three weeks
-of examples with blank targets. The first signal is a product manager asking why answers got worse, and
-the investigation takes days because the producer did not know anyone depended on those fields.
-
-Traditional applications fail fast on this: a typed API client breaks at compile time or returns a 400.
-Data pipelines do not, *because* data flows through files and tables with no type-checked boundary, and
-*because* consumers are typically discovered after the fact. AI pipelines make it worse: embeddings and
-gradients absorb any input, so bad data becomes a slightly wrong vector or weight, invisible until an
-evaluation runs, if one runs.
-
-The naive alternative is defensive consumer-side validation: each pipeline checks what it reads. It helps,
-but it fails on three counts. The check runs after the bad data was written, so the producer still has to
-be found and persuaded to fix it. Every consumer writes its own checks and they disagree. And semantic
-changes (the same column now in cents instead of dollars) pass schema checks entirely. A contract makes
-the producer responsible for a published, versioned specification and enforces it at the point of
-production, where the person who made the change sees the failure.
+- **Upstream changes break AI pipelines silently.** The ticketing team renames `resolution_text` to
+  `resolution` and starts writing `category` as an integer id instead of a label. Nothing errors. The
+  chunker reads the missing field as an empty string and emits empty chunks; the filter on
+  `category == "billing"` silently matches nothing; the fine-tuning set gets three weeks of examples with
+  blank targets.
+- **Detection is late and slow.** The first signal is a product manager asking why answers got worse, and
+  the investigation takes days because the producer did not know anyone depended on those fields.
+- **Data has no type-checked boundary.** A typed API client breaks at compile time or returns a 400. Data
+  pipelines do not, *because* data flows through files and tables with no type-checked boundary, and
+  *because* consumers are typically discovered after the fact.
+- **AI makes it worse.** Embeddings and gradients absorb any input, so bad data becomes a slightly wrong
+  vector or weight, invisible until an evaluation runs, if one runs.
+- **Consumer-side validation alone fails three ways.** It runs after the bad data was written, so the
+  producer still has to be found and persuaded. Every consumer writes its own checks and they disagree. And
+  semantic changes (the same column now in cents instead of dollars) pass schema checks entirely. A contract
+  makes the producer own a published, versioned spec enforced where the change is made.
 
 ## How it works
 ### What a contract contains
-1. **Schema.** Field names, types, nullability, and allowed values, in a machine-readable form (JSON
-   Schema, Avro, Protobuf, or a Pydantic or dataclass model that generates one). This catches renames and
-   type changes.
-2. **Semantics.** What each field means, its unit, its timezone, its reference data. `amount` is "USD,
-   two decimal places, net of tax". This is prose plus, where possible, checks: ranges, regexes,
-   cross-field rules such as `closed_at >= opened_at`.
-3. **Quality guarantees.** Null rates, uniqueness of keys, referential integrity, row-count bounds per
+1. **Schema.** Field names, types, nullability and allowed values, machine-readable (JSON Schema, Avro,
+   Protobuf, or a Pydantic or dataclass model that generates one). Catches renames and type changes.
+2. **Semantics.** What each field means, its unit, timezone and reference data: `amount` is "USD, two
+   decimal places, net of tax". Prose plus, where possible, checks: ranges, regexes, cross-field rules such
+   as `closed_at >= opened_at`.
+3. **Quality guarantees.** Null rates, key uniqueness, referential integrity, row-count bounds per
    partition, and distribution expectations that catch "all categories are suddenly 0".
 4. **Freshness and delivery.** How often data lands, maximum lag, partitioning, and how late data is
    handled.
-5. **Ownership and change policy.** Who owns the dataset, how changes are proposed, what counts as a
-   breaking change, and how long a deprecated version stays available.
-6. **Version.** The contract has a version; the data carries it, so consumers know which contract a
+5. **Ownership and change policy.** Who owns the dataset, how changes are proposed, what counts as breaking,
+   and how long a deprecated version stays available.
+6. **Version.** The contract has a version and the data carries it, so consumers know which contract a
    record was written under.
-7. **Known consumers.** Which pipelines depend on which fields. This is what lets a producer's CI tell the
-   author of a breaking change whom it will break; the list is best derived from lineage (a forward
-   traversal from the dataset) rather than maintained by hand, because hand-kept lists miss the newest
-   consumer, which is usually the AI pipeline.
+7. **Known consumers.** Which pipelines depend on which fields, so the producer's CI can tell the author of
+   a breaking change whom it will break. Derive this from lineage (a forward traversal from the dataset),
+   because hand-kept lists miss the newest consumer, which is usually the AI pipeline.
 
-The schema part is usually expressed in an existing format; the remaining parts are often kept in a YAML
-specification beside it. Open specifications for the whole document exist (the Open Data Contract
-Standard is one), but the format matters far less than that it is versioned, reviewed and checked by
-machines.
+- **Format matters less than discipline.** The schema usually uses an existing format; the rest often lives
+  in a YAML spec beside it. Open specifications for the whole document exist (the Open Data Contract
+  Standard is one), but what matters is that it is versioned, reviewed and machine-checked.
 
 ### Where enforcement lives
-The contract is enforced at the **producer boundary**, *because* a failure there is attributed correctly
-and happens before any consumer reads bad data. Concretely: the producing service validates each record
-against the schema before publishing; a streaming platform's schema registry rejects incompatible schema
-versions at registration time (Confluent's registry has backward, forward and full compatibility modes
-for exactly this); a batch pipeline runs a quality suite (Great Expectations or a hand-rolled equivalent)
-on the output partition and refuses to mark it complete if checks fail. Records that violate the contract
-go to a dead-letter location with the violation attached, not silently dropped and not passed through.
+Enforce at the **producer boundary**, *because* a failure there is attributed correctly and happens before
+any consumer reads bad data.
 
-Per-record dead-lettering needs a batch-level circuit breaker beside it. If 0.1% of a partition violates
-the contract, quarantining those rows and publishing the rest is right. If 40% violates it, the cause is
-almost certainly a systematic upstream change, and publishing the surviving 60% hands consumers a biased
-sample that looks valid: a training set missing every ticket from one product, say. So the contract also
-states a violation-rate threshold above which the whole partition fails and nothing is published,
-*because* "no new data today" is a loud, safe failure and "a skewed subset" is a silent one.
+| Producer type | Enforcement point |
+|---|---|
+| Service | validates each record against the schema before publishing |
+| Streaming platform | schema registry rejects incompatible schema versions at registration time (Confluent's registry has backward, forward and full compatibility modes for exactly this) |
+| Batch pipeline | quality suite (Great Expectations or a hand-rolled equivalent) on the output partition; refuses to mark it complete if checks fail |
 
-Consumers still validate, but against the same published contract, so the two sides cannot disagree about
-what valid means. The contract file lives in version control; a CI check diffs proposed changes and
-classifies them as compatible (adding an optional field) or breaking (removing or renaming a field,
-narrowing a type, changing a unit), and breaking changes require a new major version and a migration
-window during which both versions are produced.
+- **Violations go to a dead-letter location** with the violation attached: not silently dropped, not passed
+  through.
+- **Consumers still validate,** but against the same published contract, so the two sides cannot disagree
+  about what valid means.
+- **The contract lives in version control.** A CI check diffs proposed changes and classifies them as
+  compatible (adding an optional field) or breaking (removing or renaming a field, narrowing a type,
+  changing a unit). Breaking changes need a new major version and a migration window during which both
+  versions are produced.
+
+### Batch-level circuit breaker
+Per-record dead-lettering needs a batch-level threshold beside it.
+
+| Violation rate | Likely cause | Right action |
+|---|---|---|
+| 0.1% of a partition | scattered bad records | quarantine those rows, publish the rest |
+| 40% of a partition | a systematic upstream change | fail the whole partition, publish nothing |
+
+- **Why fail everything at 40%:** publishing the surviving 60% hands consumers a biased sample that looks
+  valid, for example a training set missing every ticket from one product.
+- **So the contract states a violation-rate threshold,** *because* "no new data today" is a loud, safe
+  failure and "a skewed subset" is a silent one.
 
 ### Compatibility rules
-The two directions are easy to swap, so use the schema-registry definitions. *Backward* compatible means
-a consumer using the new schema can read data written with the old one; it lets you upgrade consumers
-first, and permits deleting fields and adding fields that have defaults. *Forward* compatible means data
-written with the new schema can be read by consumers still on the old one; it lets producers upgrade
-first, and permits adding fields and deleting only fields that had defaults. *Full* compatibility is
-both. Renaming a field breaks both directions. For AI consumers fed by an independent producer, forward
-compatibility is the one that matters most day to day, *because* the producer ships first and a chunker or
-feature pipeline deployed last month must keep working on today's data; backward compatibility matters
-when you deploy a new consumer and reprocess history written under older schemas. Write the direction
-into the contract explicitly, since teams outside the streaming world often use the words the other way
-round.
+The two directions are easy to swap, so use the schema-registry definitions:
+
+| Mode | Meaning | Lets you | Permits |
+|---|---|---|---|
+| *Backward* | a consumer on the new schema can read data written with the old one | upgrade consumers first | deleting fields; adding fields that have defaults |
+| *Forward* | data written with the new schema can be read by consumers still on the old one | upgrade producers first | adding fields; deleting only fields that had defaults |
+| *Full* | both | either order | the intersection |
+
+- **Renaming a field breaks both directions.**
+- **Forward matters most for AI consumers** fed by an independent producer, *because* the producer ships
+  first and a chunker or feature pipeline deployed last month must keep working on today's data.
+- **Backward matters** when you deploy a new consumer and reprocess history written under older schemas.
+- **Write the direction into the contract explicitly,** since teams outside the streaming world often use
+  the words the other way round.
 
 ### Contracts specific to AI pipelines
-The datasets that feed AI have fields the rest of the company does not think about, and the contract is
-where they become explicit:
-- **Text fields intended for embedding:** encoding, language tag, maximum length, and whether the field
-  may contain PII (which decides redaction before embedding).
+- **Text fields intended for embedding:** encoding, language tag, maximum length, and whether the field may
+  contain PII (which decides redaction before embedding).
 - **Metadata used for filtering:** the exact value set for `tenant_id`, `access_scope`, `product`, since a
   filter on a value that stopped being produced returns nothing with no error.
-- **Labels for fine-tuning or evaluation:** the label taxonomy version and the annotation guideline
-  version, because a change in labeling policy is a semantic break even when the schema is unchanged.
-- **Timestamps for point-in-time joins:** which timestamp is the event time versus the ingestion time,
-  because confusing them creates leakage in training data.
+- **Labels for fine-tuning or evaluation:** the label taxonomy version and the annotation guideline version,
+  because a change in labeling policy is a semantic break even when the schema is unchanged.
+- **Timestamps for point-in-time joins:** which timestamp is event time versus ingestion time, because
+  confusing them creates leakage in training data.
 
 ### Testing the contract
-Producer CI runs the validation suite against sample output; consumer CI runs its pipeline against
-fixture data generated from the contract; and a compatibility check compares the proposed contract
-version against the current one. This is the data equivalent of contract testing between services.
+1. **Producer CI** runs the validation suite against sample output.
+2. **Consumer CI** runs its pipeline against fixture data generated from the contract.
+3. **A compatibility check** compares the proposed contract version against the current one.
 
-## Example
-A contract as code for a support-ticket feed: a Pydantic model carrying schema and semantic checks, a
-contract version embedded in every record, and a producer-side gate that routes violations to a
-dead-letter list instead of publishing them.
+This is the data equivalent of contract testing between services.
+
+## Diagram
+Every record and every partition passes the contract at the producer; consumers only ever see data that
+passed.
+
+```mermaid
+flowchart TD
+    P["Producer writes records"] --> V{"Record valid vs contract?"}
+    V -->|"no"| DL[("Dead-letter with violations")]
+    V -->|"yes"| B["Partition buffer"]
+    B --> G{"Violation rate under threshold?"}
+    G -->|"no"| F["Fail partition, alert producer"]
+    G -->|"yes"| Q{"Quality and distribution checks pass?"}
+    Q -->|"no"| F
+    Q -->|"yes"| PUB["Publish with contract_version"]
+    PUB --> C1["RAG chunker and filters"]
+    PUB --> C2["Fine-tuning set"]
+    CI["CI: diff contract, classify change"] -.->|"breaking needs new major"| P
+```
+
+## Examples
+### Contract as code with producer-side dead-lettering
+A Pydantic model carrying schema and semantic checks, a contract version embedded in every record, and a
+producer-side gate that routes violations to a dead-letter list instead of publishing them.
 
 ```python
 from datetime import datetime, timezone
@@ -181,45 +205,103 @@ print(len(good), "published;", len(dead), "dead-lettered:", dead[0]["violations"
 The second record is the silent failure from the "Why it exists" section, now caught at the producer with
 a message naming the field, before the embedding job ever sees it.
 
+### Batch-level circuit breaker on a partition
+Runs after per-record validation. The 1% threshold and the 10-point distribution tolerance are illustrative
+values a contract would state explicitly.
+
+```python
+from collections import Counter
+
+MAX_VIOLATION_RATE = 0.01      # contract: above 1% the whole partition fails
+
+def gate_partition(good: list[dict], dead: list[dict], baseline: dict[str, float]):
+    total = len(good) + len(dead)
+    rate = len(dead) / total if total else 1.0
+    if rate > MAX_VIOLATION_RATE:
+        return "FAIL", f"violation rate {rate:.1%} > {MAX_VIOLATION_RATE:.0%}; nothing published"
+    share = Counter(r["category"] for r in good)
+    for cat, expected in baseline.items():              # distribution check on what survives
+        seen = share[cat] / len(good)
+        if abs(seen - expected) > 0.10:
+            return "FAIL", f"category {cat!r} share {seen:.0%} vs expected {expected:.0%}"
+    return "PUBLISH", f"{len(good)} rows published, {len(dead)} quarantined ({rate:.1%})"
+
+baseline = {"billing": 0.4, "login": 0.3, "bug": 0.3}
+good = [{"category": c} for c in ["billing"] * 400 + ["login"] * 300 + ["bug"] * 299]
+print(gate_partition(good, [{}], baseline))            # 1 of 1,000 bad: publish
+good = [{"category": c} for c in ["login"] * 300 + ["bug"] * 300]
+print(gate_partition(good, [{}] * 400, baseline))      # every billing row broke upstream: fail
+```
+
+| Partition | Dead-lettered | Outcome | Why it is right |
+|---|---|---|---|
+| 1,000 rows, 1 bad | 0.1% | publish 999 | scattered noise, consumers lose nothing material |
+| 1,000 rows, all 400 billing rows bad | 40.0% | publish nothing | the 600 survivors contain zero billing tickets, a silently skewed sample |
+
+## Production patterns
+- **Registry-enforced compatibility on streams.** Use for Kafka topics feeding embedding or feature
+  pipelines. Set the subject's compatibility mode in Confluent Schema Registry (its config endpoint accepts
+  `{"compatibility": "FORWARD"}` or `"FULL"`) so incompatible schemas are rejected at registration. Monitor
+  rejected registrations; each one is a breaking change caught before production.
+- **Contract diff in producer CI.** Use for every contract file in version control. A CI step compares the
+  proposed schema with the current one, labels the change compatible or breaking, and blocks breaking
+  changes without a major version bump and listed consumer sign-off. Monitor breaking changes per quarter.
+- **Dead-letter queue with rate and age alerts.** Use with any per-record validation. Write violations with
+  the record and the error list, alert on a change in rate (not only its level) and on the oldest
+  unprocessed item's age. Monitor both on the producer team's dashboard, not only the AI team's.
+- **Partition circuit breaker.** Use for batch partitions feeding training or indexes. Fail the whole
+  partition above the contract's violation-rate threshold, and check category distribution on survivors.
+  Monitor partitions failed by the threshold.
+- **Tolerant readers on consumers.** Use when producers may add fields. In Pydantic, `model_config =
+  ConfigDict(extra="ignore")` ignores unknown fields while required fields stay required, which is the
+  "ignore unknown fields, forbid missing ones" compromise. Monitor unknown-field counts as an early signal
+  of an upcoming contract change.
+- **Dual-production migration window.** Use for breaking changes. The producer emits old and new fields (or
+  topics) with the version stamped on each record until consumers migrate; CI prevents dropping the old
+  field early. Monitor reads of the old field to know when the window can close.
+
 ## Trade-offs
-- Producer-side enforcement attributes failures correctly and stops bad data early, but it asks the
-  producing team to own a specification; without organisational buy-in, consumer-side checks are the
-  realistic fallback.
-- A closed value set for categorical fields makes filters safe, but every new business category needs a
-  contract change; if categories churn weekly, use an open set plus a reference table the contract points to.
-- Strict schemas reject records with unexpected fields and prevent drift, but they also reject harmless
-  additions; "ignore unknown fields, forbid missing ones" is the usual compromise.
-- Dead-lettering violations preserves data for repair, but a dead-letter queue nobody monitors is a
-  silent data loss; alert on its rate and age.
-- Versioning with dual-production windows makes breaking changes safe, but doubles the producer's
-  output for the window; for high-volume streams, make the window short and the migration automated.
+- **Correct attribution vs organisational buy-in.** Producer-side enforcement attributes failures correctly
+  and stops bad data early, but asks the producing team to own a specification. Without buy-in,
+  consumer-side checks are the realistic fallback.
+- **Safe filters vs category churn.** A closed value set for categorical fields makes filters safe, but every
+  new business category needs a contract change. If categories churn weekly, use an open set plus a
+  reference table the contract points to.
+- **No drift vs rejecting harmless additions.** Strict schemas that reject unexpected fields prevent drift
+  but also reject harmless additions; "ignore unknown fields, forbid missing ones" is the usual compromise.
+- **Repairable data vs silent loss.** Dead-lettering preserves data for repair, but a dead-letter queue
+  nobody monitors is silent data loss; alert on its rate and age.
+- **Safe breaking changes vs doubled output.** Dual-production windows make breaking changes safe but double
+  the producer's output for the window. For high-volume streams, keep the window short and the migration
+  automated.
 
 ## Pitfalls
-- Validating only schema and not semantics; the symptom is a model whose quality drops with no schema
-  errors, traced weeks later to a unit or label-taxonomy change.
-- Enforcing the contract only in the consumer; the symptom is the AI team discovering every upstream
-  change and arguing for a fix after the damage is done.
-- Omitting the contract version from the records themselves; the symptom is a reprocessing job that
-  cannot tell which rules applied to which historical rows.
-- Treating filter metadata as free text; the symptom is `tenant_id` values with different casing or
-  whitespace making ACL filters leak or return nothing.
-- Silently dropping violating records to keep the pipeline green; the symptom is row counts drifting down
-  and a training set that over-represents whatever happened to validate.
-- Making every field required to be safe; the symptom is the producer defaulting fields to placeholder
-  values just to pass, which is worse than null.
-- Dead-lettering per record with no batch-level threshold; the symptom is a partition that publishes on
+- **Validating only schema and not semantics.** Symptom: model quality drops with no schema errors, traced
+  weeks later to a unit or label-taxonomy change. Fix: range and unit checks plus taxonomy versions.
+- **Enforcing the contract only in the consumer.** Symptom: the AI team discovers every upstream change and
+  argues for a fix after the damage is done. Fix: producer-side gate.
+- **Omitting the contract version from the records themselves.** Symptom: a reprocessing job that cannot
+  tell which rules applied to which historical rows.
+- **Treating filter metadata as free text.** Symptom: `tenant_id` values with different casing or whitespace
+  making ACL filters leak or return nothing. Fix: closed or normalised value sets.
+- **Silently dropping violating records to keep the pipeline green.** Symptom: row counts drift down and a
+  training set over-represents whatever happened to validate. Fix: dead-letter and alert.
+- **Making every field required to be safe.** Symptom: the producer defaults fields to placeholder values
+  just to pass, which is worse than null.
+- **Dead-lettering per record with no batch-level threshold.** Symptom: a partition that publishes on
   schedule with a fraction of its usual rows and a quietly shifted category distribution.
 
 ## When to use
-Introduce a contract for any dataset that crosses a team boundary into an embedding, fine-tuning, feature
-or evaluation pipeline; these are the consumers that fail silently, so they benefit most. A dataset
-produced and consumed by the same team can get by with in-pipeline validation until a second consumer
-appears. Measure the dead-letter rate (and alert on its change, not only its level), partitions failed by the
-batch threshold, the time from an upstream change to its detection (should be minutes, at the producer),
-and the number of breaking changes per quarter. In day-to-day work the contract
-is the file you open before adding a metadata filter or a training feature. In interviews, "how do you
-keep upstream schema changes from degrading your model" is answered with producer-side contracts,
-compatibility checks in CI and versioned records, not with "we validate inputs".
+- **Use for any dataset crossing a team boundary** into an embedding, fine-tuning, feature or evaluation
+  pipeline; these consumers fail silently, so they benefit most.
+- **Defer when** the same team produces and consumes the dataset: in-pipeline validation is enough until a
+  second consumer appears.
+- **Measure:** dead-letter rate (alert on its change, not only its level), partitions failed by the batch
+  threshold, time from an upstream change to detection (should be minutes, at the producer), and breaking
+  changes per quarter.
+- **Day to day:** the contract is the file you open before adding a metadata filter or a training feature.
+- **Interviews:** "how do you keep upstream schema changes from degrading your model" is answered with
+  producer-side contracts, compatibility checks in CI and versioned records, not with "we validate inputs".
 
 ## Role lens
 - **Engineer:** Writes the contract as a typed model, wires validation and dead-lettering into the
@@ -242,6 +324,36 @@ stamped on each record. During the window, update the filter logic to use codes,
 metadata, and retrain or remap the router with the new values, validating on the eval set. Run the
 compatibility check in CI so the old field cannot be dropped before consumers have migrated, and dead-letter
 any record whose `region_code` is outside the agreed list.
+
+## Interview questions
+### What is a data contract, and how is it different from schema validation?
+- **A contract is broader:** schema plus semantics (units, timezones, meaning), quality guarantees,
+  freshness, ownership, change policy and a version carried by every record.
+- **Why it matters:** schema validation passes a dollars-to-cents switch; a contract's semantic checks and
+  version bump catch it.
+
+### An embedding job started producing empty chunks last week with no errors. How do you investigate and prevent a repeat?
+- **Investigate:** compare recent source records with older ones for renamed or retyped fields, such as
+  `resolution_text` becoming `resolution`; the chunker read a missing field as an empty string.
+- **Prevent:** a producer-side contract that requires the field, dead-letters violations, and fails the
+  partition above a violation-rate threshold, plus a CI diff that flags the rename as breaking.
+
+### Backward versus forward compatibility: which do you enforce for a feed into your RAG pipeline?
+- **Forward,** because the independent producer ships first and last month's chunker must still read
+  today's data.
+- **Add backward** if you will deploy new consumers that reprocess history; renames break both, so they
+  always need a new major version and a migration window.
+
+### When would you publish a partial partition, and when would you fail it entirely?
+- **Publish** when violations are scattered, such as 0.1%, quarantining the bad rows.
+- **Fail** when the rate signals a systematic change, such as 40%, because the surviving rows are a biased
+  sample; "no new data today" is the safer, louder failure.
+
+### Which fields in an AI-facing contract do teams most often forget?
+- **PII flags on text that will be embedded,** which decide redaction.
+- **Closed value sets for filter metadata** like `tenant_id` and `access_scope`.
+- **Label taxonomy and guideline versions,** and which timestamp is event time versus ingestion time, to
+  avoid leakage.
 
 ## Quiz
 ### Q: Why are AI pipelines more exposed to upstream data changes than typical application code?

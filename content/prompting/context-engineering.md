@@ -5,7 +5,7 @@ name: Context engineering
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - prompting/system-prompt
   - prompting/prompt-caching
@@ -21,102 +21,132 @@ sources:
 ---
 
 ## TL;DR
-The context window is the model's entire working memory for one call: finite, billed per token and
-attended to unevenly. Context engineering is deciding, for every call, what goes in, in what order, in
-what form and under what budget: instructions, tool definitions, retrieved documents, memory, history and
-tool results. Prompt engineering writes the instructions; context engineering manages everything around
-them, and in multi-step systems that is where quality and cost are decided.
+The context window is the model's whole working memory for a call: finite, billed per token, attended
+unevenly. Context engineering decides what goes in, in what order, form and budget; in multi-step systems
+that decides quality and cost.
 
 ## Why it exists
-A single chat turn fits comfortably in any modern window. The problem appears when a system has more
-relevant material than fits, or more than the model can use well: an agent on step 60 with sixty tool
-results behind it, a retrieval pipeline with forty candidate chunks, a customer with a 300-page manual.
-Three forces make "put it all in" the wrong default even when it fits.
-
-First, cost and latency scale with tokens, and in a loop the whole history is re-sent every turn, so a
-context that grows linearly produces a bill that grows quadratically. Second, attention is not uniform:
-models use material at the start and end of a long context better than material in the middle, and
-irrelevant tokens do not merely cost money, they distract, so accuracy can fall as context grows (often
-called "context rot"; how fast it sets in varies by model and task). Third,
-without management the window eventually overflows mid-task, usually at the worst moment.
-
-The opposite naive answer, aggressive truncation, fails the other way: it drops the one earlier fact
-the next step needed, and the agent redoes work or contradicts a decision it made ten steps ago. The
-resolution is to treat context as a managed resource with a budget, a priority order and a lifecycle,
-the way an operating system treats memory.
+- **More material than the model can use well.** A single chat turn fits any modern window. Problems
+  start with an agent on step 60 with sixty tool results behind it, a retrieval pipeline with forty
+  candidate chunks, or a customer's 300-page manual. Prompt engineering writes the instructions; context
+  engineering manages everything around them: tools, documents, memory, history, tool results.
+- **Cost grows faster than context.** Cost and latency scale with tokens, and a loop re-sends the whole
+  history every turn, so a linearly growing context produces a quadratically growing bill.
+- **Attention is uneven, and noise distracts.** Models use the start and end of a long context better than
+  the middle. Irrelevant tokens lower accuracy as context grows ("context rot"; how fast varies by model
+  and task). Unmanaged, the window also overflows mid-task, at the worst moment.
+- **Aggressive truncation fails the other way.** It drops the one earlier fact the next step needed, so
+  the agent redoes work or contradicts a decision from ten steps ago.
+- **The resolution:** treat context as a managed resource with a budget, a priority order and a
+  lifecycle, the way an operating system treats memory.
 
 ## How it works
 ### What the context contains, in layers
-Every API renders the request in a fixed order (on Anthropic's: tool definitions, then the system
-prompt, then messages; other providers fix their own). Inside that, the
-material has very different stability: identity and rules (never change), tool definitions (rarely),
-long-lived reference and memory (per deployment or per user), session state such as retrieved chunks and
-a user profile (per task), conversation history (grows), the latest tool results (short-lived), and the
-current question. Stability drives placement *because* caching is a prefix match and because the model
-should meet the durable rules before the volatile data.
+Every API renders the request in a fixed order (on Anthropic's: tool definitions, then the system prompt,
+then messages; other providers fix their own). Inside that, stability varies:
+
+| Layer | Changes |
+|---|---|
+| Identity and rules | never |
+| Tool definitions | rarely |
+| Long-lived reference and memory | per deployment or per user |
+| Session state (retrieved chunks, user profile) | per task |
+| Conversation history | grows |
+| Latest tool results | short-lived |
+| Current question | every call |
+
+Stability drives placement *because* caching is a prefix match, and because the model should meet the
+durable rules before the volatile data.
 
 ### Budgeting
-Give each layer a token budget that sums to less than the window minus a reserve for output. Count
-tokens with the tokenizer or the provider's count endpoint, never characters, since code and non-Latin
-text produce more tokens per character than English prose. Trigger compaction at a threshold well below the limit (say 70% of the window, an
-illustrative figure) rather than on overflow, because compaction itself needs room to run.
+1. **Give each layer a token budget** summing to less than the window minus a reserve for output.
+2. **Count tokens, never characters**, with the tokenizer or the provider's count endpoint, since code
+   and non-Latin text produce more tokens per character than English prose.
+3. **Trigger compaction at a threshold well below the limit** (say 70% of the window, an illustrative
+   figure) rather than on overflow, because compaction itself needs room to run.
 
 ### Placement
-Stable content first so it caches. Critical instructions at the start and the actual question at the
-end, exploiting primacy and recency. Retrieved documents ordered so the most relevant sit at the edges
-and the weakest in the middle, which is where attention is weakest (a heuristic from the lost-in-the-middle
-results; how much it helps varies by model, so verify it on your own evals). Explicit delimiters (XML tags, headed
-sections) so the model can tell instruction from data, and labels on untrusted content so it is less
-likely to be followed as instruction.
+- **Stable content first** so it caches.
+- **Critical instructions at the start, the question at the end**, exploiting primacy and recency.
+- **Best retrieved documents at the edges, weakest in the middle**, where attention is weakest. This is a
+  heuristic from the lost-in-the-middle results; how much it helps varies by model, so verify it on your
+  own evals.
+- **Explicit delimiters** (XML tags, headed sections) so the model can tell instruction from data, and
+  **labels on untrusted content** so it is less likely to be followed as instruction.
 
 ### Selection: preload or fetch just in time
-Preloading everything a task might need is simple and avoids retrieval misses; fetching on demand through
-tools (search, read file, query) keeps the context small and current. Agents increasingly keep
-lightweight references, such as file paths and record ids, and fetch content when a step needs it.
-Preload when the corpus is small and stable and latency matters; fetch when it is large, changing or
-only partly relevant to any one task.
+| | Preload | Fetch on demand (search, read file, query tools) |
+|---|---|---|
+| Gain | simple, no retrieval misses | small, current context |
+| Pick when | corpus small and stable, latency matters | corpus large, changing, or only partly relevant |
+
+Agents increasingly keep lightweight references (file paths, record ids) and fetch content when a step
+needs it.
 
 ### Lifecycle: pruning, compaction, memory
-Tool results are the highest-volume, shortest-lived content. Once a result has been consumed, clear it or
-replace it with a one-line note, keeping the decision it informed. When history nears the threshold,
-compact: summarise the older turns into a structured note (goal, decisions made, open items, current
-state of files or records) and keep the recent turns verbatim. Compaction is lossy, so keep the raw log
-outside the context where it can be retrieved. Facts that must survive across sessions go to a memory
-store and are loaded selectively, which the agents module covers.
+1. **Prune tool results.** They are the highest-volume, shortest-lived content. Once consumed, clear one
+   or replace it with a one-line note, keeping the decision it informed.
+2. **Compact near the threshold.** Summarise older turns into a structured note (goal, decisions made,
+   open items, current state of files or records) and keep recent turns verbatim.
+3. **Keep the raw log outside the context**, because compaction is lossy and the detail may be needed.
+4. **Persist cross-session facts in a memory store**, loaded selectively (the agents module covers it).
 
 ### The tension between pruning and caching
-Every edit to earlier context (stubbing a tool result, compacting, deleting a reminder) changes the
-prefix from that point, so the next request re-writes everything after the edit instead of reading it
-from cache. Work the numbers with the usual multipliers (writes about 1.25×, reads about 0.1× of base
-input; provider-dependent): in a 100k-token history, stubbing a 30k-token result that sits at position
-20k forces an 80k re-write, about 80k × (1.25 − 0.1) ≈ 92k token-equivalents extra, once. The saving is
-30k tokens no longer read per later turn, which at the cached rate is only about 3k-equivalents a turn,
-so the edit takes roughly thirty turns to pay back in money. The conclusion is not "never prune": the
-real reasons to prune cached content are attention quality and window headroom, not cost. It is to
-prune in batches when a threshold is crossed (one re-write, many tokens removed), to keep edits close
-to the tail where little follows them, and never to edit history on every turn.
+- **Every edit to earlier context changes the prefix from that point** (stubbing a tool result,
+  compacting, deleting a reminder), so the next request re-writes everything after the edit.
+- **Worked numbers** (writes about 1.25×, reads about 0.1× of base input; provider-dependent): in a
+  100k-token history, stubbing a 30k-token result at position 20k forces an 80k re-write, about
+  80k × (1.25 − 0.1) ≈ 92k token-equivalents extra, once.
+- **The saving is small per turn:** 30k tokens no longer read is only about 3k-equivalents a turn at the
+  cached rate, so the edit takes roughly thirty turns to pay back in money. (That count is an upper bound;
+  see the calculator below.)
+- **So the reasons to prune cached content are attention quality and window headroom, not cost.** It is
+  not "never prune": prune in batches when a threshold is crossed (one re-write, many tokens removed),
+  keep edits close to the tail, and never edit history on every turn.
 
 ### Isolation through sub-agents
-A read-heavy subtask (explore a codebase, survey twenty documents) can run in a sub-agent with its own
-context that returns only a distilled result. The parent's context stays small and focused; the cost is
-coordination and the loss of shared detail.
+- **A read-heavy subtask** (explore a codebase, survey twenty documents) runs in a sub-agent with its own
+  context and returns only a distilled result.
+- **Gain:** the parent's context stays small and focused. **Cost:** coordination and loss of shared
+  detail.
 
 ### Progressive disclosure
-Rather than loading every tool definition and every instruction set, expose an index and load on demand:
-a tool-search tool over a large catalogue, skill instructions pulled in when the task matches. The model
-sees what the current step needs, not everything it might ever need.
+- **Expose an index and load on demand** instead of every tool definition and instruction set: a
+  tool-search tool over a large catalogue, skill instructions pulled in when the task matches.
+- The model sees what the current step needs, not everything it might ever need.
 
 ### Measuring
-Tokens per turn and per task, cache hit ratio, task success as a function of context size, and needle
-tests on your own documents rather than published benchmarks, because position sensitivity varies by
-model and by content.
+- Tokens per turn and per task, cache hit ratio, and task success as a function of context size.
+- Needle tests on your own documents rather than published benchmarks, because position sensitivity
+  varies by model and by content.
 
-## Example
-A budgeted context assembler. Retrieved chunks are kept while they fit and ordered best-at-the-edges,
-consumed tool results are stubbed (not deleted, because every `tool_use` block in history must keep its
-matching `tool_result`), history is compacted at a plain user-text turn when over budget, and the total
-is asserted against the window minus the output reserve. `count` wraps your tokenizer or the
-provider's token-count endpoint; `summarize` is a model call that writes a structured state note.
+## Diagram
+Each call is assembled from layers under budgets; pruning and compaction run only when a threshold
+trips, and the total is checked before sending.
+
+```mermaid
+flowchart TD
+    S["Stable: tools, system rules"] --> B["Per-layer token budgets"]
+    R["Retrieved chunks"] --> B
+    H["History + tool results"] --> B
+    B --> O["Select and order: best at edges"]
+    O --> P["Stub consumed tool results"]
+    P --> Q{"History over budget?"}
+    Q -->|"yes"| C["Compact old turns to state note"]
+    Q -->|"no"| A["Assert total under window minus reserve"]
+    C --> A
+    C -.->|"raw log kept"| L[("Retrievable log")]
+    A --> M["Request: question last"]
+```
+
+## Examples
+### A budgeted context assembler
+Retrieved chunks are kept while they fit and ordered best-at-the-edges. Consumed tool results are
+stubbed, not deleted, because every `tool_use` block in history must keep its matching `tool_result`.
+History is compacted at a plain user-text turn when over budget, and the total is asserted against the
+window minus the output reserve.
+- `count` wraps your tokenizer or the provider's token-count endpoint.
+- `summarize` is a model call that writes a structured state note.
 
 ```python
 WINDOW, OUTPUT_RESERVE = 200_000, 16_000
@@ -156,49 +186,98 @@ def assemble(system, tools, retrieved, history, consumed, question, count, summa
     return {"system": system, "tools": tools, "messages": messages}
 ```
 
-In a cached agent loop, call `assemble` with a `consumed` set that changes only when the history
-budget trips, not every turn; otherwise each newly stubbed index rewrites the prefix from that message
-on and the cache never covers the history (see the pruning-versus-caching arithmetic above).
+In a cached agent loop, call `assemble` with a `consumed` set that changes only when the history budget
+trips, not every turn. Otherwise each newly stubbed index rewrites the prefix from that message on and the
+cache never covers the history (see the pruning-versus-caching arithmetic above).
+
+### Pruning versus caching, calculated (runnable)
+The rough figure above counts the whole 80k after position 20k as re-written. Strictly, the stubbed
+result itself shrinks to one line, so the re-write is closer to 50k; and an edit at the tail costs almost
+nothing.
+
+```python
+def prune_payback(history, pos, size, stub=50, write=1.25, read=0.1):
+    """Stub a tool result of `size` tokens at `pos` in a cached history of `history` tokens."""
+    rewrite = history - pos - size + stub          # everything after the edit is written again
+    extra_once = rewrite * (write - read)          # it would have been read; now it is written
+    saved_per_turn = (size - stub) * read          # tokens no longer read on each later turn
+    return round(rewrite), round(extra_once), round(saved_per_turn), round(extra_once / saved_per_turn, 1)
+
+for label, pos in [("result at 20k (mid-history)", 20_000), ("result at 70k (tail)", 70_000)]:
+    rw, extra, saved, turns = prune_payback(100_000, pos, 30_000)
+    print(f"{label}: rewrite {rw:,}, extra {extra:,} once, saves {saved:,}/turn, payback {turns} turns")
+# result at 20k (mid-history): rewrite 50,050, extra 57,557 once, saves 2,995/turn, payback 19.2 turns
+# result at 70k (tail): rewrite 50, extra 57 once, saves 2,995/turn, payback 0.0 turns
+```
+
+| Edit (100k history, 30k result) | Re-written | Extra cost once | Saved per turn | Payback |
+|---|---|---|---|---|
+| Rough upper bound, result at 20k | 80k | ≈ 92k | ≈ 3k | ≈ 30 turns |
+| Precise, result at 20k | ≈ 50k | ≈ 58k | ≈ 3k | ≈ 19 turns |
+| Result at the tail (70k to 100k) | ≈ 0 | ≈ 0 | ≈ 3k | immediate |
+
+Either way, the lesson holds: batch edits, and prefer edits near the tail.
+
+## Production patterns
+- **Per-layer budgets with real token counts.** Count with the provider's token-count endpoint (for
+  example `client.messages.count_tokens` in Anthropic's SDK) or the model's tokenizer, and log tokens per
+  layer per call. Alert when one layer (usually tool results) dominates the request.
+- **Threshold-triggered compaction with a state-note schema.** Compact once history crosses a set
+  fraction of the window, into a fixed structure (goal, decisions, files or records touched, open items),
+  keeping the last turns verbatim and the raw log in storage. Monitor post-compaction regressions such as
+  redone work.
+- **Batch tool-result clearing.** Stub consumed results only when a budget trips, all at once, so the
+  cache re-writes once. Monitor cache-read ratio before and after each clearing event.
+- **Snapshot tests for the request builder.** Render a fixed scenario and assert layer order, delimiters,
+  budgets and that every `tool_use` has its `tool_result`, because the builder is the most important
+  file in the product.
+- **Needle tests on your own corpus.** Plant a known fact at several positions and context sizes in your
+  real documents and chart accuracy by position, before trusting edge-ordering or long-context claims.
+- **Sub-agents for broad exploration.** Give a sub-agent the search and read tools and a cap on its
+  returned summary, and pass only that summary to the parent. Monitor parent tokens per step and total
+  task tokens.
 
 ## Trade-offs
-- Loading whole documents is simpler and has no retrieval misses, but costs tokens every turn and
-  degrades attention; it flips to retrieval once the corpus exceeds a fraction of the window or the same
-  context is re-sent across many turns.
-- Compaction saves tokens but is lossy; it flips to harmful when the task depends on exact earlier
-  details such as diffs or numbers, unless the raw log stays retrievable.
-- Just-in-time fetching keeps context small and fresh but adds tool round trips and latency; preload wins
+- **Whole documents vs retrieval.** Loading whole documents is simpler with no retrieval misses, but costs
+  tokens every turn and degrades attention. It flips to retrieval once the corpus exceeds a fraction of
+  the window or the same context is re-sent across many turns.
+- **Compaction vs fidelity.** It saves tokens but is lossy; it becomes harmful when the task depends on
+  exact earlier details such as diffs or numbers, unless the raw log stays retrievable.
+- **Just-in-time fetching vs latency.** Small, fresh context, but extra tool round trips; preload wins
   for small, stable corpora on latency-sensitive paths.
-- Sub-agent isolation keeps each context focused but spends tokens on coordination and loses shared
-  detail; it pays when the subtask would otherwise flood the parent with raw material.
-- Delimiters and labels cost tokens but improve the separation of data from instruction, which also
-  raises resistance to injection; the cost is small next to the content they wrap.
-- A large output reserve and compaction headroom reduce usable input; size them from the observed
-  distribution of output lengths rather than a fixed guess.
+- **Sub-agent isolation vs shared detail.** Each context stays focused, but coordination costs tokens and
+  shared detail is lost; it pays when the subtask would flood the parent with raw material.
+- **Delimiters and labels vs tokens.** They cost tokens but separate data from instruction, which also
+  raises injection resistance; the cost is small next to the content they wrap.
+- **Output reserve and headroom vs usable input.** Size them from the observed distribution of output
+  lengths rather than a fixed guess.
 
 ## Pitfalls
-- Letting tool results accumulate forever; the symptom is overflow errors mid-task or a quality collapse
-  after a few dozen steps even though the window was never exceeded.
-- Placing key constraints in the middle of a long prompt or the question before the documents; the
-  symptom is the model ignoring an instruction it demonstrably received.
-- Counting characters instead of tokens; the symptom is intermittent overflow on code, tables or
+- **Letting tool results accumulate forever.** Symptom: overflow mid-task, or a quality collapse after a
+  few dozen steps even though the window was never exceeded.
+- **Key constraints in the middle, or the question before the documents.** Symptom: the model ignores an
+  instruction it demonstrably received.
+- **Counting characters instead of tokens.** Symptom: intermittent overflow on code, tables or
   non-English text that looked short.
-- Compacting only at overflow; the symptom is a failed request with no room left to run the summary.
-- Compaction that loses state (paths, ids, decisions); the symptom is the agent redoing finished work or
-  contradicting an earlier choice right after a summary.
-- Exposing every tool definition on every call; the symptom is wrong tool selection and a prefix that
-  dwarfs the actual task.
-- Rewriting earlier history for context reasons without regard for caching; the symptom is a cache write
-  the size of the conversation on every turn.
+- **Compacting only at overflow.** Symptom: a failed request with no room left to run the summary.
+- **Compaction that loses state** (paths, ids, decisions). Symptom: the agent redoes finished work or
+  contradicts an earlier choice right after a summary.
+- **Every tool definition on every call.** Symptom: wrong tool selection and a prefix that dwarfs the
+  actual task.
+- **Rewriting earlier history without regard for caching.** Symptom: a cache write the size of the
+  conversation on every turn.
 
 ## When to use
-Every system does context engineering, deliberately or by accident. Do it deliberately as soon as any of
-these appear: multi-turn agents, retrieval, long documents, more than a handful of tools, or sessions
-that persist across days. Measure tokens per turn and per task, cache hit ratio, success rate against
-context length, and retrieval precision; a rising token count with flat success is the signal to prune.
-In day-to-day work the request builder is the most important file in an LLM product, and it deserves
-tests. In interviews, "how would you keep a 200-step agent within budget without losing state" expects
-budgets, pruning of tool results, threshold-triggered compaction with a structured state note, and
-just-in-time retrieval.
+- **Always, deliberately.** Every system does context engineering, deliberately or by accident; start
+  deliberately once multi-turn agents, retrieval, long documents, more than a handful of tools, or
+  sessions spanning days appear.
+- **Measure:** tokens per turn and per task, cache hit ratio, success rate against context length, and
+  retrieval precision. Rising tokens with flat success is the signal to prune.
+- **Treat the request builder as core code:** it is the most important file in an LLM product, and it
+  deserves tests.
+- **Interviews:** "how would you keep a 200-step agent within budget without losing state" expects
+  budgets, pruning of tool results, threshold-triggered compaction with a structured state note, and
+  just-in-time retrieval.
 
 ## Role lens
 - **Engineer:** Owns the assembler: per-layer budgets, placement order, pruning of consumed tool results,
@@ -220,6 +299,41 @@ items) that is refreshed rather than appended; compact at a threshold while the 
 verbatim and the raw log stays retrievable; and switch from loading whole files to just-in-time reads of
 the regions a step needs, with sub-agents for broad exploration. Measure tokens per step and success
 against step count to confirm the curve flattens.
+
+## Interview questions
+### How is context engineering different from prompt engineering?
+- **Prompt engineering writes the instructions**; context engineering decides everything else in the
+  window per call: tools, retrieved documents, memory, history and tool results, plus order, form and
+  budget.
+- **Why it matters:** in multi-step systems the non-instruction material dominates the tokens, so it
+  decides quality and cost.
+
+### Your RAG answers ignore a policy clause that was definitely retrieved. What do you check?
+- **Position:** was the chunk in the middle of a long context? Reorder so the best chunks sit at the
+  edges and the question comes last.
+- **Noise:** were forty chunks sent when five were relevant? Tighten the retrieval budget or rerank.
+- **Separation:** are documents wrapped in delimiters and is the instruction clearly separate? Verify with
+  a needle test on your own documents.
+
+### When would you preload a corpus instead of fetching just in time?
+- **Preload when** the corpus is small and stable and the path is latency-sensitive, because it avoids
+  tool round trips and retrieval misses, and caches well.
+- **Fetch when** it is large, changing or only partly relevant to any one task.
+- **Hybrid:** keep references (paths, ids) in context and fetch content when a step needs it.
+
+### Pruning a tool result made the agent's bill go up. Why?
+- **Editing earlier history invalidates the cached prefix after the edit**, so the next request writes
+  it at about 1.25× instead of reading it at about 0.1×.
+- **Pruned mid-history every turn**, the cache never covers the history.
+- **Fix:** prune in batches when a threshold trips and prefer edits near the tail; prune for attention
+  and headroom, not to save money.
+
+### What must a compaction summary contain for an agent to keep working?
+- **A fixed structure:** goal, decisions made, files or records touched with ids and paths, open items,
+  and current state.
+- **Recent turns verbatim**, because the next step usually depends on them exactly.
+- **A retrievable raw log**, because the summary is lossy; watch for redone work after compaction as the
+  failure signal.
 
 ## Quiz
 ### Q: Why is "load everything that fits" a poor default even when the window is large enough?

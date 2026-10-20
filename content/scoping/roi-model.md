@@ -5,7 +5,7 @@ name: ROI model
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - scoping/success-metrics-kpis
   - scoping/baseline-measurement-before-deployment
@@ -17,84 +17,103 @@ related:
 ---
 
 ## TL;DR
-An ROI model turns the success metrics into money: measured baseline × expected improvement ×
-adoption × capture rate, minus one-time and recurring costs, over a stated horizon. Build it as ranges
-with a sensitivity analysis and a break-even point, not as a single heroic number. The assumptions
-that decide AI ROI, such as how much freed time turns into real savings and how fast people adopt the
-tool, are rarely the ones vendors talk about.
+An ROI model turns success metrics into money: baseline × improvement × adoption × capture rate, minus
+one-time and recurring costs, over a horizon. Build ranges, sensitivity and break-even, not one heroic
+number, because capture rate and adoption usually decide it.
 
 ## Why it exists
-AI projects compete for budget against every other project, and the person who approves the budget
-reasons in payback periods and net present value, not in eval scores. If you cannot say what the
-system is worth, someone else will decide for you, usually with a vendor's slide or a gut feeling.
-The model also protects the customer: a use case that cannot clear break-even under plausible
-assumptions should be found in week two, not in month nine.
-
-The naive version is a one-line spreadsheet: "agents spend 12 minutes per ticket, AI saves 50%,
-40,000 tickets a month, so we save 240,000 minutes." It fails in four ways. It treats freed time as
-money, but salaries do not fall when each person saves twenty minutes a day unless hiring is avoided,
-overtime drops, or the time goes to work that has value. It assumes full adoption from day one, when
-real adoption ramps and plateaus below 100%. It ignores the recurring costs AI adds: inference per
-task (including failed and retried tasks), human review of outputs, eval-set upkeep, monitoring, and
-re-validation when a model version is deprecated. And it presents a point estimate. A point estimate
-hides which assumption the whole case rests on, so no one knows what to measure in the pilot to
-confirm or kill it.
+- **Budget holders reason in payback and NPV, not eval scores.** AI projects compete with every other
+  project; if you cannot say what the system is worth, someone else decides, usually with a vendor's slide
+  or a gut feeling.
+- **It protects the customer.** A use case that cannot clear break-even under plausible assumptions should
+  be found in week two, not in month nine.
+- **The one-line spreadsheet is wrong.** "Agents spend 12 minutes per ticket, AI saves 50%, 40,000 tickets
+  a month, so we save 240,000 minutes" fails in four ways:
+  1. **Freed time is not money.** Salaries do not fall when each person saves twenty minutes a day unless
+     hiring is avoided, overtime drops, or the time goes to work that has value.
+  2. **Adoption is not instant.** Real adoption ramps and plateaus below 100%.
+  3. **AI adds recurring costs:** inference per task (including failed and retried tasks), human review of
+     outputs, eval-set upkeep, monitoring, and re-validation when a model version is deprecated.
+  4. **A point estimate hides which assumption the case rests on,** so no one knows what to measure in the
+     pilot to confirm or kill it.
+- **The assumptions that decide AI ROI** (how much freed time becomes real savings, how fast people adopt)
+  are rarely the ones vendors talk about.
 
 ## How it works
 ### Benefit lines
-Build each benefit as a product of measurable factors, so every factor can be traced to a baseline or
-a pilot measurement:
+Build each benefit as a product of measurable factors, so every factor traces to a baseline or a pilot
+measurement:
 
-- **Labour efficiency** = eligible volume × adoption × time saved per used case × loaded cost per
-  minute × capture rate. The *capture rate* is the share of freed time that turns into cash or
-  redeployed capacity, and finance should own that number. It is high when the team is growing (hires
-  avoided), when there is overtime or contractor spend, or when there is a backlog with a cost. It is
-  low when the freed time just becomes slack.
-- **Quality / error avoidance** = volume × change in error rate × cost per error (rework, credits,
-  write-offs, penalties). This only counts if the error rate was baselined.
-- **Revenue** = affected volume × change in conversion or speed × value per unit. This is the hardest
-  line to attribute, so it needs a holdout group to defend.
-- **Risk reduction** = change in probability × impact of a loss event. Present it separately, because
-  finance discounts it heavily.
+| Benefit | Formula | Caveat |
+|---|---|---|
+| **Labour efficiency** | eligible volume × adoption × time saved per used case × loaded cost per minute × capture rate | capture rate should be owned by finance |
+| **Quality / error avoidance** | volume × change in error rate × cost per error (rework, credits, write-offs, penalties) | only counts if the error rate was baselined |
+| **Revenue** | affected volume × change in conversion or speed × value per unit | hardest to attribute; needs a holdout group to defend |
+| **Risk reduction** | change in probability × impact of a loss event | present separately, because finance discounts it heavily |
+
+- **Capture rate** is the share of freed time that turns into cash or redeployed capacity.
+- **It is high** when the team is growing (hires avoided), when there is overtime or contractor spend, or
+  when there is a backlog with a cost.
+- **It is low** when the freed time just becomes slack.
 
 ### Cost lines
-- **One-time:** discovery, integration, data preparation, building the eval set (SME hours count),
-  security review, training and change management.
-- **Recurring:** inference cost per task × total tasks attempted, platform or vendor fees, human
-  review minutes per output × loaded cost, engineering upkeep (prompt and eval maintenance,
-  monitoring, incident response), and periodic re-validation when the provider retires a model.
-
-Divide recurring cost by *successful* tasks, not attempted ones. Retries and failed attempts consume
-tokens but produce nothing, and the review time on a bad draft is a cost, not a saving.
+- **One-time:** discovery, integration, data preparation, building the eval set (SME hours count), security
+  review, training and change management.
+- **Recurring:** inference cost per task × total tasks attempted, platform or vendor fees, human review
+  minutes per output × loaded cost, engineering upkeep (prompt and eval maintenance, monitoring, incident
+  response), and periodic re-validation when the provider retires a model.
+- **Divide recurring cost by successful tasks, not attempted ones,** because retries and failed attempts
+  consume tokens but produce nothing, and the review time on a bad draft is a cost, not a saving.
 
 ### Compare against the next-best alternative
-The counterfactual is rarely "do nothing". A macro library, a form redesign, a rules engine or a
-process change might capture part of the same benefit at a fraction of the cost and risk, and a sharp
-finance reviewer will ask about it. State the AI case as incremental value over the next-best
-alternative. If better templates would remove half of the handle time the assistant targets, the AI
-project's return is computed on the other half, and its build cost is compared with the template
-project's cost, not with zero.
+- **The counterfactual is rarely "do nothing".** A macro library, a form redesign, a rules engine or a
+  process change might capture part of the same benefit at a fraction of the cost and risk, and a sharp
+  finance reviewer will ask about it.
+- **State the AI case as incremental value.** If better templates would remove half of the handle time the
+  assistant targets, the AI project's return is computed on the other half, and its build cost is compared
+  with the template project's cost, not with zero.
 
 ### Horizon, ramp and summary measures
-Model month by month over a horizon the sponsor uses, often 24 or 36 months, with an adoption ramp
-taken from comparable rollouts or the pilot. Report three numbers, because they answer different
-questions:
-- **ROI** = (total benefit − total cost) / total cost.
-- **Payback month**, the month cumulative net value turns positive, which is the cash-flow question.
-- **NPV**, net value discounted at the customer's rate, for comparing against other investments.
+Model month by month over a horizon the sponsor uses, often 24 or 36 months, with an adoption ramp from
+comparable rollouts or the pilot. Report three numbers, because they answer different questions:
+
+| Measure | Definition | Question it answers |
+|---|---|---|
+| **ROI** | (total benefit − total cost) / total cost | is it worth it overall? |
+| **Payback month** | month cumulative net value turns positive | the cash-flow question |
+| **NPV** | net value discounted at the customer's rate | how it compares with other investments |
 
 ### Sensitivity and break-even
-Vary one input at a time across its plausible range and rank the inputs by how far they swing NPV.
-This is a tornado analysis. Then solve for the break-even value of the most uncertain input. The model
-exists to answer this question. If break-even needs 2 minutes saved and the pilot measures 4, the
-case is robust. If it needs 3.8, the pilot has to be designed to measure that one number precisely.
+1. **Tornado analysis.** Vary one input at a time across its plausible range and rank inputs by how far
+   they swing NPV.
+2. **Break-even.** Solve for the break-even value of the most uncertain input; the model exists to answer
+   this. If break-even needs 2 minutes saved and the pilot measures 4, the case is robust. If it needs 3.8,
+   the pilot must be designed to measure that one number precisely.
+3. **Joint scenario.** One-at-a-time sensitivity assumes inputs move independently, and in AI rollouts they
+   often do not: low minutes saved and low adoption tend to arrive together, because people abandon a tool
+   that saves them little. Run a joint pessimistic scenario, or a simple Monte Carlo over the input ranges,
+   and report the chance that NPV is negative alongside the tornado chart.
 
-One-at-a-time sensitivity assumes the inputs move independently, and in AI rollouts they often do not.
-Low minutes saved and low adoption tend to arrive together, because people abandon a tool that saves
-them little. So also run a joint pessimistic scenario, or a simple Monte Carlo over the input ranges,
-and report the chance that NPV is negative alongside the tornado chart.
+## Diagram
+Benefits and costs both trace to measured inputs; the sensitivity loop finds the one input the pilot must
+measure.
 
-## Example
+```mermaid
+flowchart TD
+    B["Baseline: volume, handle time, errors"] --> BEN["Benefit lines"]
+    F["Finance: loaded cost, capture rate"] --> BEN
+    P["Pilot: minutes saved, adoption"] --> BEN
+    T["Traces: cost per successful task"] --> C["Cost lines: one-time and recurring"]
+    BEN --> M["Monthly model over 24-36 months"]
+    C --> M
+    M --> R["ROI, payback month, NPV"]
+    M --> S["Tornado and joint scenarios"]
+    S --> BE["Break-even of riskiest input"]
+    BE -->|"design pilot to measure it"| P
+```
+
+## Examples
+### Monthly model with sensitivity and break-even
 A drafting assistant for a 40,000-ticket-per-month support team. All inputs are illustrative. A real
 model takes volume and handle time from the baseline, loaded cost and capture rate from finance, and AI
 cost per ticket from a token measurement on real traffic.
@@ -137,49 +156,98 @@ for _ in range(40):
 print(f"break-even minutes saved: {hi:.2f}")       # ~2.0
 ```
 
-The base case looks strong. The sensitivity run shows that halving the capture rate wipes out the
-return entirely, while doubling engineering upkeep roughly halves it but leaves it clearly positive. So the most valuable scoping
-conversation is with finance about what happens to freed time, not with engineering about tokens.
-The pilot must also measure minutes saved precisely, because the case survives anything above about
-2 minutes. Finally, the one-at-a-time view flatters the case. A joint scenario that is only mildly
-pessimistic on each input (capture 0.45, adoption 0.5, 3 minutes saved, each milder than its
-single-input stress above) gives an ROI of about −17% and no payback within 24 months. Three modest
-disappointments together sink a case that survives each one alone.
+What the run tells you:
+
+| Finding | Implication |
+|---|---|
+| Base case: ROI about +100%, payback month 8 | looks strong |
+| Halving capture rate (0.6 to 0.3) wipes out the return entirely | the most valuable scoping conversation is with finance about what happens to freed time, not with engineering about tokens |
+| Doubling upkeep roughly halves the return but leaves it clearly positive | engineering cost matters less than capture |
+| Break-even at about 2 minutes saved | the pilot must measure minutes saved precisely; the case survives anything above that |
+| Joint mild pessimism (capture 0.45, adoption 0.5, 3 minutes saved, each milder than its single-input stress) | ROI of about −17% and no payback within 24 months |
+
+Three modest disappointments together sink a case that survives each one alone, so the one-at-a-time view
+flatters the case.
+
+### Monte Carlo with correlated inputs
+Continues the script above (reuses `BASE` and `evaluate`). A shared "usefulness" factor drives both minutes
+saved and adoption, because people abandon a tool that saves them little. Ranges are illustrative.
+
+```python
+import random
+
+def draw(rng):
+    u = rng.random()                                  # shared "how useful is the tool" factor
+    return {**BASE,
+            "min_saved": 2.5 + 2.5 * u,               # 2.5 to 5.0 minutes
+            "adoption_steady": 0.4 + 0.4 * (0.7 * u + 0.3 * rng.random()),  # tracks usefulness
+            "capture": rng.uniform(0.3, 0.8),         # finance's range, independent
+            "upkeep": rng.uniform(8_000, 20_000)}
+
+rng = random.Random(7)
+runs = [evaluate(draw(rng)) for _ in range(5_000)]
+npvs = sorted(r["npv"] for r in runs)
+print(f"P(NPV < 0) = {sum(n < 0 for n in npvs) / len(npvs):.0%}")   # about 36% with these ranges
+print(f"NPV p10 / p50 / p90 = {npvs[500]:,} / {npvs[2500]:,} / {npvs[4500]:,}")
+```
+
+- **Report the probability, not just the base case.** A base-case ROI near +100% still carries roughly a
+  one-in-three chance of negative NPV once the inputs are allowed to disappoint together.
+
+## Production patterns
+- **Finance-owned assumption sheet.** Keep capture rate, loaded cost per minute and discount rate in a
+  sheet the customer's finance owner signs, and have the model read from it. Monitor for assumption edits
+  between reviews, each with a named approver.
+- **Cost per successful task from traces.** Compute recurring AI cost as total inference, retry and review
+  spend divided by successful tasks, from production traces tagged by task ID. Monitor it weekly against
+  the modelled value, because retries and discarded drafts drift it upward.
+- **Re-run the model at each gate.** Refresh inputs with baseline numbers, then pilot measurements, and
+  re-run before every expansion decision. Monitor the gap between measured and break-even values of the
+  top sensitivity input.
+- **Adoption curve from usage logs.** Replace the assumed ramp with measured use on eligible work per
+  month. Monitor the plateau level, since a payback month that keeps slipping usually means the plateau
+  was overestimated.
+- **Lead with the conservative case.** Present the conservative scenario first, with the range and the
+  probability of negative NPV beside it. Track which assumption reviewers challenge most and measure it.
 
 ## Trade-offs
-- Ranges and sensitivity analysis are more honest than a point estimate, but sponsors often want one
-  number. Lead with the conservative case, and show the range alongside it.
-- Including risk-reduction and revenue benefits raises the headline, but those lines are hard to
-  attribute. Keep them separate unless a holdout group can measure them.
-- A longer horizon makes payback look easier, but it assumes model costs, prices and the workflow stay
-  stable. Use 24 months or less when the provider or the process is likely to change.
-- A detailed bottom-up model is defensible but slow to build. For an early go/no-go, a 10-line
-  version with honest ranges is enough, provided the break-even input is identified.
-- Counting capture rate at 100% simplifies the story but overstates value. It is only justified when
-  the team is actively hiring or paying for overtime the tool will remove.
+- **Honesty vs simplicity.** Ranges and sensitivity analysis are more honest than a point estimate, but
+  sponsors often want one number. Lead with the conservative case, and show the range alongside it.
+- **Headline vs attribution.** Including risk-reduction and revenue benefits raises the headline, but those
+  lines are hard to attribute. Keep them separate unless a holdout group can measure them.
+- **Long horizon vs stability.** A longer horizon makes payback look easier, but it assumes model costs,
+  prices and the workflow stay stable. Use 24 months or less when the provider or the process is likely to
+  change.
+- **Detail vs speed.** A detailed bottom-up model is defensible but slow to build. For an early go/no-go, a
+  10-line version with honest ranges is enough, provided the break-even input is identified.
+- **Clean story vs overstatement.** Counting capture rate at 100% simplifies the story but overstates
+  value. It is only justified when the team is actively hiring or paying for overtime the tool will remove.
 
 ## Pitfalls
-- Treating time saved as cash saved. The symptom is a CFO asking which budget line goes down, and
-  nobody being able to answer.
-- Pricing inference on successful tasks only. The symptom is actual monthly spend running well above
-  the model, because retries, failed runs and unused drafts were never counted.
-- Assuming instant, complete adoption. The symptom is a payback month that slips every quarter while
-  usage sits on a plateau far below the modelled figure.
-- Forgetting the human review cost. The symptom is "time saved" shrinking in the pilot because
-  reviewers spend minutes checking each output.
-- Comparing the AI case against doing nothing. The symptom is a finance reviewer asking why a cheaper
-  process or template fix was not costed, and the model having no answer.
-- Building the model before the baseline exists. The symptom is ROI inputs that the customer's own
-  data contradicts when the pilot report is reviewed.
+- **Treating time saved as cash saved.** Symptom: a CFO asks which budget line goes down, and nobody can
+  answer. Fix: a finance-owned capture rate.
+- **Pricing inference on successful tasks only.** Symptom: actual monthly spend runs well above the model,
+  because retries, failed runs and unused drafts were never counted. Fix: price per attempt, divide by
+  successes.
+- **Assuming instant, complete adoption.** Symptom: a payback month that slips every quarter while usage
+  sits on a plateau far below the modelled figure. Fix: a measured ramp and plateau.
+- **Forgetting the human review cost.** Symptom: "time saved" shrinks in the pilot because reviewers spend
+  minutes checking each output. Fix: a review-minutes line, or measure savings net of review.
+- **Comparing the AI case against doing nothing.** Symptom: a finance reviewer asks why a cheaper process
+  or template fix was not costed, and the model has no answer. Fix: cost the next-best alternative.
+- **Building the model before the baseline exists.** Symptom: ROI inputs that the customer's own data
+  contradicts when the pilot report is reviewed. Fix: baseline first.
 
 ## When to use
-Build a first-cut ROI model during scoping, as soon as the success metrics are agreed. Use it to kill
-or prioritise use cases before anyone writes integration code. Refine it with baseline numbers, then
-with pilot measurements, and re-run it before any expansion decision. Skip it only for exploratory
-work explicitly funded as learning. In practice the most useful outputs are the break-even value and
-the ranked sensitivity list, because they tell you which number the pilot must measure. In interviews,
-expect "this use case saves 50% of time, what is it worth?" The strong answer asks about capture rate,
-adoption, review cost and cost per successful task before multiplying.
+- **Use when:** scoping, as soon as the success metrics are agreed. Use it to kill or prioritise use cases
+  before anyone writes integration code.
+- **Refine:** with baseline numbers, then with pilot measurements, and re-run it before any expansion
+  decision.
+- **Skip only for:** exploratory work explicitly funded as learning.
+- **Measure:** the most useful outputs are the break-even value and the ranked sensitivity list, because
+  they tell you which number the pilot must measure.
+- **Interviews:** expect "this use case saves 50% of time, what is it worth?" The strong answer asks about
+  capture rate, adoption, review cost and cost per successful task before multiplying.
 
 ## Role lens
 - **Engineer:** Measures real cost per successful task from traces, including retries and failures, and
@@ -199,6 +267,40 @@ work at realistic adoption; review time on bad drafts was not subtracted; and in
 successful draft instead of per attempt. I would rebuild with finance's own capture assumption, which
 might be avoided hiring next year, overtime or backlog cost. I would use the measured adoption curve
 and full per-attempt cost, then show the break-even capture rate so they can judge whether it is plausible.
+
+## Interview questions
+### A vendor says their tool saves 50% of agent time. How would you turn that into a value estimate?
+- **Start from the baseline,** not the claim: eligible volume and measured handle time.
+- **Multiply through the real factors:** realistic adoption plateau, minutes saved net of review, loaded
+  cost and a finance-owned capture rate.
+- **Subtract recurring cost per successful task,** including retries, then report ROI, payback and NPV with
+  a break-even on the riskiest input.
+
+### Why is capture rate often the most sensitive input in an AI ROI model?
+- **Definition:** it is the share of freed time that becomes cash or valuable redeployed capacity.
+- **Why it swings the case:** in the worked example, halving it from 0.6 to 0.3 takes ROI from about +100%
+  to about zero, while doubling upkeep only roughly halves the return.
+- **It depends on the business,** not the model: hiring plans, overtime and costly backlogs.
+
+### When is one-at-a-time sensitivity analysis misleading?
+- **When inputs are correlated.** Low minutes saved and low adoption tend to arrive together, because
+  people abandon a tool that saves them little.
+- **Then mild joint pessimism can sink a case** that survives each single stress, as in the example where
+  three modest misses give about −17% ROI.
+- **Fix:** add a joint scenario or a Monte Carlo and report the probability that NPV is negative.
+
+### Six months after launch, actual AI spend is well above the model. Where do you look?
+- **Unit of cost:** whether inference was priced per successful task instead of per attempt, missing
+  retries, failed runs and unused drafts.
+- **Volume:** drafts generated for every ticket rather than only adopted cases, and growth in eligible
+  volume.
+- **Upkeep:** eval maintenance, monitoring and re-validation after a provider retired a model version.
+
+### How do you handle a finance reviewer who asks why you did not just fix the templates?
+- **Cost the next-best alternative.** Estimate how much of the targeted handle time a template or process
+  change removes, and at what cost.
+- **Restate the AI case as incremental value** on the remainder, with its build cost compared against the
+  template project's cost, not against zero.
 
 ## Quiz
 ### Q: In an AI labour-efficiency benefit, what does the capture rate represent?

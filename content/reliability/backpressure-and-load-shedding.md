@@ -5,7 +5,7 @@ name: Backpressure & load shedding
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/backpressure
   - serving-inference/backpressure
@@ -23,55 +23,62 @@ sources:
 ---
 
 ## TL;DR
-When requests arrive faster than a system can serve them, queues grow without bound, latency climbs
-past every timeout, clients retry, and throughput collapses. **Backpressure** pushes the "slow down"
-signal upstream through bounded queues, blocking producers and explicit 429/503 responses so the
-source stops sending. **Load shedding** deliberately rejects some work, cheaply and early, so the
-rest completes within its latency budget. Both exist because an overloaded system that tries to serve
-everyone serves no one.
+Overload grows queues until latency beats every timeout and throughput collapses. **Backpressure**
+pushes "slow down" upstream via bounded queues and 429/503; **load shedding** rejects some work early
+and cheaply so the rest meets its budget. Serving everyone means serving no one.
 
 ## Why it exists
-Little's law says the number of requests inside a system equals arrival rate times time spent:
-`L = λ × W`. A service that completes 50 requests per second and receives 60 accumulates 10 per
-second in its queue forever. After one minute, 600 requests are waiting, each facing a 12-second
-wait before service even starts. If the client timeout is 10 seconds, every one of those requests is
-already dead on arrival, yet the server will still spend full effort serving them to clients that
-have hung up and retried. Now the real arrival rate is 60 plus the retries. This is congestive
-collapse: throughput of *useful* work (goodput) falls toward zero while the machines run at 100%.
-
-Trouble starts well before arrival exceeds capacity. In the simplest queueing model (M/M/1: random
-arrivals, one server), mean time in system is `W = S / (1 − ρ)`, where `S` is the service time and
-`ρ` the utilisation. At 50% load a request spends 2× its service time in the system; at 90%, 10×; at
-95%, 20×. Real services are not M/M/1, but the shape, latency exploding as utilisation approaches 1, is
-general, and it is why a service that looks fine at 70% falls apart during a 30% surge.
-
-The naive alternative, "add a bigger queue", makes it worse, *because* queue depth converts directly
-into latency and buys nothing once wait time exceeds what callers will tolerate. "Autoscale" helps
-only if new capacity arrives faster than the queue grows, which is rarely true for GPU-backed
-services where a replica takes minutes to pull weights and warm up. Rate limiting by fixed quota
-helps with abuse but not with legitimate surges, and it cannot see the server's real condition.
-
-The system must therefore do two things the naive design does not: tell the source to slow down,
-and refuse work it cannot finish in time. LLM serving makes this concrete. A GPU server has a fixed
-number of sequences it can batch; beyond that, requests queue, time-to-first-token inflates, and
-users retry or send the same prompt from another tab. The provider's own 429 responses are
-backpressure aimed at you, and honouring them with backoff rather than retrying harder is the
-difference between a slow hour and a dead one.
+- **Little's law makes overload arithmetic.** `L = λ × W`: requests inside equal arrival rate times time
+  spent. A service completing 50 requests per second and receiving 60 accumulates 10 per second forever.
+- **Queued requests die on arrival.** After one minute, 600 requests wait, each facing a 12-second wait
+  before service starts. With a 10-second client timeout, every one is already dead, yet the server still
+  serves them to clients that hung up and retried; real arrival is now 60 plus retries.
+- **That is congestive collapse:** goodput (useful work) falls toward zero while machines run at 100%.
+- **Trouble starts before capacity is exceeded.** Latency explodes as utilisation approaches 1, so a
+  service that looks fine at 70% falls apart during a 30% surge (see the M/M/1 numbers below).
+- **The naive fixes fail.** "A bigger queue" converts depth into latency and buys nothing once wait
+  exceeds what callers tolerate. "Autoscale" helps only if capacity arrives faster than the queue grows,
+  rarely true for GPU services where a replica takes minutes to pull weights and warm up. Fixed-quota rate
+  limiting handles abuse but not legitimate surges, and cannot see the server's real condition.
+- **LLM serving makes it concrete.** A GPU server batches a fixed number of sequences; beyond that,
+  requests queue, time-to-first-token inflates, and users retry or resend from another tab. The
+  provider's own 429s are backpressure aimed at you; honouring them with backoff rather than retrying
+  harder is the difference between a slow hour and a dead one.
 
 ## How it works
+### Why latency explodes: the M/M/1 shape
+In the simplest queueing model (M/M/1: random arrivals, one server), mean time in system is
+`W = S / (1 − ρ)`, where `S` is the service time and `ρ` the utilisation.
+
+| Utilisation ρ | Time in system |
+|---|---|
+| 50% | 2× service time |
+| 90% | 10× |
+| 95% | 20× |
+
+- **Real services are not M/M/1,** but the shape, latency exploding as utilisation approaches 1, is general.
+
+### What the system must do
+The naive design does neither of these:
+1. **Tell the source to slow down** (backpressure).
+2. **Refuse work it cannot finish in time** (load shedding).
+
 ### Backpressure: propagate the limit upstream
-Backpressure is the chain of signals that makes the fastest component in a pipeline run at the
-speed of the slowest. Inside a process it is a bounded queue: a producer that calls `put()` on a full
-queue blocks or fails instead of allocating more memory. Across a network it is TCP flow control
-(the receive window), HTTP 429 or 503 with `Retry-After`, gRPC `RESOURCE_EXHAUSTED`, or a streaming
-protocol in which the consumer pulls chunks at its own pace. In message systems it is consumer lag
-you watch and a producer that pauses on it. The design rule is that every hop must have a bounded
-buffer and a defined behaviour when it is full, *because* an unbounded buffer anywhere silently
-absorbs the signal and the overload reappears there as memory exhaustion.
+Backpressure is the chain of signals that makes the fastest component in a pipeline run at the speed of
+the slowest.
+
+| Where | Mechanism |
+|---|---|
+| Inside a process | a bounded queue: a producer calling `put()` on a full queue blocks or fails instead of allocating more memory |
+| Across a network | TCP flow control (the receive window), HTTP 429 or 503 with `Retry-After`, gRPC `RESOURCE_EXHAUSTED`, a streaming protocol where the consumer pulls chunks at its own pace |
+| Message systems | consumer lag you watch, and a producer that pauses on it |
+
+- **Design rule:** every hop has a bounded buffer and a defined behaviour when it is full, *because* an
+  unbounded buffer anywhere silently absorbs the signal and the overload reappears there as memory
+  exhaustion.
 
 ### Load shedding: refuse early, refuse cheap
-Shedding is the decision to drop or reject some requests to keep the others within their SLO. The
-mechanics that matter:
+Shedding drops or rejects some requests to keep the others within their SLO. The mechanics that matter:
 - **Reject at the front door.** The cheapest point to refuse is before any expensive work: before
   retrieval, before tokenisation, before taking a GPU slot. A rejection that costs a millisecond
   preserves capacity; one that happens after ten seconds of queueing has already spent it.
@@ -83,49 +90,70 @@ mechanics that matter:
 - **Shed by priority.** Classify work as interactive, background or batch, by tenant tier, or by
   whether it is a retry. Under pressure drop batch first, then background, and protect health checks
   and control-plane traffic absolutely. Priority turns shedding from random failure into a policy.
-- **Prefer LIFO or CoDel under overload.** A FIFO queue serves the oldest request, which is the one
-  most likely to have been abandoned. Serving newest-first, or dropping when the minimum sojourn
-  time exceeds a target for a sustained interval (CoDel), keeps goodput up during the surge.
-- **Adaptive concurrency limits.** Instead of a fixed limit, measure latency and raise the limit while
-  latency stays flat, lower it when latency rises (gradient or TCP-Vegas-style controllers). This
-  tracks the service's real capacity as model sizes, prompt lengths and downstream speed change.
+- **Prefer LIFO or CoDel under overload.** A FIFO queue serves the oldest request, the one most likely
+  abandoned. Serving newest-first, or dropping when the minimum sojourn time exceeds a target for a
+  sustained interval (CoDel), keeps goodput up during the surge.
+- **Adaptive concurrency limits.** Instead of a fixed limit, raise it while latency stays flat and lower
+  it when latency rises (gradient or TCP-Vegas-style controllers). This tracks real capacity as model
+  sizes, prompt lengths and downstream speed change.
 
 ### Where retries fit
-Retries are a load multiplier. If a client retries each rejected request up to three times, every
-one of them comes back three more times, so a 10% excess becomes roughly 40% at first order; and
-because the retries are themselves rejected, total attempts can approach four times the original
-traffic before the budget runs out. Shedding only works if clients back off on 429/503 with jitter, honour `Retry-After`, and keep a
-retry budget. Circuit breakers on the client side stop the storm entirely once rejection rates are
-high; bulkheads keep one overloaded dependency from consuming every worker.
+- **Retries are a load multiplier.** If a client retries each rejected request up to three times, a 10%
+  excess becomes roughly 40% at first order; because retries are themselves rejected, total attempts can
+  approach four times the original traffic before the budget runs out.
+- **Shedding only works if clients back off** on 429/503 with jitter, honour `Retry-After`, and keep a
+  retry budget.
+- **Client-side circuit breakers** stop the storm once rejection rates are high; **bulkheads** keep one
+  overloaded dependency from consuming every worker.
 
 ### Metastable failure: why overload outlives its cause
-Bronson et al. describe a class of outage in which a temporary trigger (a surge, a brief dependency
-slowdown, a cold cache after a deploy) pushes the system into overload, and then a **sustaining
-effect** keeps it there after the trigger is gone. Retries are the classic sustaining effect: requests
-time out, clients retry, the retries add load, more requests time out. Others are cache misses that
-make every request more expensive, and work done for abandoned requests. The system has two stable
-states at the same offered load, healthy and collapsed, and returning to healthy needs load to drop
-well below normal, not just back to normal. Backpressure and shedding are how you break the loop:
-early rejection stops wasted work, and client backoff and retry budgets remove the amplification.
+Bronson et al. describe outages where a temporary trigger pushes the system into overload and a
+**sustaining effect** keeps it there after the trigger is gone.
+- **Triggers:** a surge, a brief dependency slowdown, a cold cache after a deploy.
+- **Sustaining effects:** retries (requests time out, clients retry, retries add load, more time out),
+  cache misses that make every request more expensive, work done for abandoned requests.
+- **Two stable states at the same offered load:** healthy and collapsed. Returning to healthy needs load
+  to drop well below normal, not just back to normal.
+- **Breaking the loop:** early rejection stops wasted work; client backoff and retry budgets remove the
+  amplification.
 
 ### Goodput, not throughput
-The metric that tells you whether this is working is successful requests completed within the SLO per
-second. A server reporting 100% utilisation and 50 req/s throughput while 90% of responses arrive
-after the client gave up has a goodput near zero. Dashboards should show queue wait distribution,
-rejection rate by priority, and goodput side by side.
+- **The metric:** successful requests completed within the SLO per second.
+- **Throughput lies.** A server at 100% utilisation doing 50 req/s while 90% of responses arrive after the
+  client gave up has goodput near zero.
+- **Dashboards:** queue wait distribution, rejection rate by priority, and goodput side by side.
 
 ### LLM-specific shape
-Capacity is in concurrent sequences and tokens, not requests, so admission control should estimate
-cost (prompt length, requested max tokens) and admit by a token budget. Streaming adds a second
-backpressure path: a slow consumer of server-sent events does not slow generation, so the server
-needs a bounded per-connection buffer and cancellation on disconnect, or it generates tokens nobody
-will read. Long generations hold their slot for the whole duration, so a few multi-minute requests
-can starve interactive ones unless they are in a separate pool.
+- **Capacity is concurrent sequences and tokens, not requests,** so admission should estimate cost
+  (prompt length, requested max tokens) and admit by a token budget.
+- **Streaming adds a second backpressure path.** A slow consumer of server-sent events does not slow
+  generation, so the server needs a bounded per-connection buffer and cancellation on disconnect, or it
+  generates tokens nobody will read.
+- **Long generations hold their slot for the whole duration,** so a few multi-minute requests can starve
+  interactive ones unless they are in a separate pool.
 
-## Example
-Admission control for a chat endpoint: shed at the door by priority, bound the queue wait by the
-SLO, release the slot if the client left while waiting. The limits would be derived from measured
-service rate and the latency budget, then adjusted by an adaptive controller.
+## Diagram
+The admission path for one request: every rejection happens before the GPU is touched, and the slot is
+released if the client left while queued.
+
+```mermaid
+flowchart TD
+    R["Incoming request"] --> P{"Queue full for this priority?"}
+    P -->|"yes"| X["503 with Retry-After, 1 ms"]
+    P -->|"no"| Q["Wait for a slot"]
+    Q -->|"wait over budget"| X
+    Q -->|"slot acquired"| D{"Client still connected?"}
+    D -->|"no"| F["Free slot, skip inference"]
+    D -->|"yes"| G["Run inference on GPU"]
+    G --> OK["Response within SLO"]
+    X -.->|"jittered backoff, retry budget"| R
+```
+
+## Examples
+### Admission control for a chat endpoint
+Shed at the door by priority, bound the queue wait by the SLO, release the slot if the client left while
+waiting. The limits would be derived from measured service rate and the latency budget, then adjusted by
+an adaptive controller.
 
 ```python
 import asyncio
@@ -160,52 +188,101 @@ async def chat(req: Request):
         slots.release()
 ```
 
-One runtime caveat: before Python 3.12, `asyncio.wait_for` could cancel `Semaphore.acquire()` at the
-same instant it succeeded and leak the slot; on older interpreters wrap the acquire so a timed-out
-acquisition releases what it won. Walk the numbers: if inference averages 640 ms per request with 32
-slots, service rate is about 50 req/s; a 64-deep queue therefore represents roughly 1.3 s of wait, inside the 2 s budget, and
-anything beyond is rejected in microseconds with a `Retry-After` the client should honour. Export
-`waiting`, rejections by priority and queue wait time, and the picture of an overload becomes a
-flat goodput line instead of a cliff.
+- **Runtime caveat:** before Python 3.12, `asyncio.wait_for` could cancel `Semaphore.acquire()` at the
+  same instant it succeeded and leak the slot; on older interpreters wrap the acquire so a timed-out
+  acquisition releases what it won.
+- **Walk the numbers:** inference averaging 640 ms per request with 32 slots gives a service rate of
+  about 50 req/s. A 64-deep queue therefore represents roughly 1.3 s of wait, inside the 2 s budget, and
+  anything beyond is rejected in microseconds with a `Retry-After` the client should honour.
+- **Export** `waiting`, rejections by priority and queue wait time, and an overload becomes a flat goodput
+  line instead of a cliff.
+
+### Worked scenario: queue growth and sizing from Little's law
+Pure Python, no dependencies: how fast an unprotected queue grows, when requests start dying, and how
+deep the queue may be for a given wait budget.
+
+```python
+def mm1_time_in_system(service_s, utilisation):
+    return service_s / (1 - utilisation)              # W = S / (1 - rho)
+
+def unprotected_wait_s(arrival, service_rate, seconds_in):
+    backlog = max(0, (arrival - service_rate) * seconds_in)
+    return backlog / service_rate                     # time a new arrival waits before service
+
+def max_queue(service_rate, wait_budget_s):
+    return int(service_rate * wait_budget_s)          # deeper only manufactures timeouts
+
+for rho in (0.5, 0.7, 0.9, 0.95):
+    print(f"rho={rho:.2f}: {mm1_time_in_system(1.0, rho):.1f}x service time")
+print(unprotected_wait_s(60, 50, 60))                 # 12.0 s after one minute at 60 vs 50 req/s
+print(max_queue(50, 2.0))                             # 100
+# rho=0.50: 2.0x   rho=0.70: 3.3x   rho=0.90: 10.0x   rho=0.95: 20.0x
+```
+
+| Second into a 60 vs 50 req/s overload | Backlog | Wait for a new arrival | With 10 s client timeout |
+|---|---|---|---|
+| 10 | 100 | 2 s | served |
+| 50 | 500 | 10 s | at the limit |
+| 60 | 600 | 12 s | dead on arrival, and its retry adds load |
+
+## Production patterns
+- **Semaphore plus wait timeout in front of every model client.** Size in-flight slots from measured
+  capacity (for vLLM, the engine's own `max_num_seqs` caps batched sequences) and the queue from
+  `service_rate × max_acceptable_wait`. Monitor queue wait p50/p99 and rejections by priority.
+- **Adaptive concurrency at the proxy or library.** Use a latency-gradient limiter such as Envoy's
+  adaptive concurrency filter or Netflix's concurrency-limits library instead of a hand-tuned constant.
+  Monitor the computed limit over time and alert when it collapses.
+- **Client SDK retry discipline.** Cap SDK retries (provider Python SDKs expose a `max_retries` setting),
+  honour `Retry-After`, add full jitter, and keep a per-client retry budget. Monitor retries as a share of
+  requests; a rising share during an incident is the metastable warning.
+- **Separate pools by class.** Run batch and long-generation work on its own queue or deployment with its
+  own slot limit, and keep health checks and control-plane endpoints outside any shed queue. Monitor
+  interactive time-to-first-token while batch load rises.
+- **Cancel on disconnect for streams.** Check for client disconnect while generating and abort the
+  request in the engine, with a bounded per-connection buffer. Monitor tokens generated for disconnected
+  clients.
 
 ## Trade-offs
-- Shedding sacrifices some requests to keep latency bounded for the rest, which is right whenever a
-  late answer is worthless; it flips to queueing when callers will genuinely wait, as in batch jobs.
-- Blocking backpressure keeps every request eventually served but stalls producers and can deadlock
-  if a producer also holds resources the consumer needs; explicit rejection is safer across services.
-- Fixed concurrency limits are predictable and easy to reason about but go stale as prompts, models
-  and dependencies change; adaptive limits track reality at the cost of a controller to tune.
-- LIFO serving maximises goodput under overload but starves old requests and breaks fairness; use it
-  only during overload and return to FIFO when the queue drains.
-- Priority shedding protects the work that matters most but needs honest classification; once every
+- **Shedding vs queueing.** Shedding sacrifices some requests to keep latency bounded for the rest, which
+  is right whenever a late answer is worthless; it flips to queueing when callers will genuinely wait, as
+  in batch jobs.
+- **Blocking backpressure vs explicit rejection.** Blocking keeps every request eventually served but
+  stalls producers and can deadlock if a producer also holds resources the consumer needs; explicit
+  rejection is safer across services.
+- **Fixed vs adaptive limits.** Fixed concurrency limits are predictable and easy to reason about but go
+  stale as prompts, models and dependencies change; adaptive limits track reality at the cost of a
+  controller to tune.
+- **LIFO vs fairness.** LIFO serving maximises goodput under overload but starves old requests and breaks
+  fairness; use it only during overload and return to FIFO when the queue drains.
+- **Priority shedding vs honest classification.** It protects the work that matters most, but once every
   team marks its traffic "critical", the mechanism degrades to random drops.
 
 ## Pitfalls
-- Unbounded queues anywhere in the path (an async job queue, an executor pool, a channel), visible as
+- **Unbounded queues anywhere in the path** (an async job queue, an executor pool, a channel), visible as
   latency rising for minutes before a memory crash instead of a quick, clean rejection.
-- Shedding after the expensive work: rejecting at the model call after retrieval and prompt assembly
+- **Shedding after the expensive work.** Rejecting at the model call after retrieval and prompt assembly
   already ran, so the server stays saturated while returning errors.
-- Clients that treat 429 and 503 as transient and retry immediately without backoff, so every shed
-  request returns within milliseconds and arrival rate doubles; the symptom is rejections climbing
-  faster than traffic.
-- Using CPU or request count as the overload signal for GPU-bound work; the GPU is saturated at 20% CPU
-  and queue wait time was the signal all along.
-- Waiting for the trigger to pass in a metastable collapse: the surge ends but errors stay high
-  because retries keep load above capacity; the symptom is an outage that outlasts its cause and
-  ends only when someone sheds hard or disables retries.
-- Health checks sharing the shed queue, so under load the load balancer marks healthy nodes dead and
+- **Clients retrying 429 and 503 immediately without backoff.** Every shed request returns within
+  milliseconds and arrival rate doubles; the symptom is rejections climbing faster than traffic.
+- **Using CPU or request count as the overload signal for GPU-bound work.** The GPU is saturated at 20%
+  CPU and queue wait time was the signal all along.
+- **Waiting for the trigger to pass in a metastable collapse.** The surge ends but errors stay high
+  because retries keep load above capacity; the outage outlasts its cause and ends only when someone
+  sheds hard or disables retries.
+- **Health checks sharing the shed queue.** Under load the load balancer marks healthy nodes dead and
   removes capacity exactly when it is needed, turning overload into an outage.
 
 ## When to use
-Every service with a finite capacity needs both: bounded buffers with a defined full behaviour at
-every hop, and an admission decision at the front door driven by queue wait time and priority. Start
-by measuring service rate and the latency budget, set queue bounds from them, and add adaptive limits
-once prompt lengths or model mix vary. Choose blocking backpressure inside a process or pipeline,
-explicit 429/503 across service boundaries, and always pair shedding with client backoff and retry
-budgets. Watch goodput, queue wait percentiles and rejection rate by priority; if rejections never
-happen, the limits are either generous or missing. In day-to-day work this is the semaphore in front
-of the model client and the `Retry-After` handling in the SDK. In interviews, the depth signal is
-deriving queue size from Little's law and explaining why early rejection raises goodput.
+- **Every service with finite capacity needs both:** bounded buffers with a defined full behaviour at
+  every hop, and an admission decision at the front door driven by queue wait time and priority.
+- **Start** by measuring service rate and the latency budget, set queue bounds from them, and add adaptive
+  limits once prompt lengths or model mix vary.
+- **Choose** blocking backpressure inside a process or pipeline, explicit 429/503 across service
+  boundaries, and always pair shedding with client backoff and retry budgets.
+- **Measure** goodput, queue wait percentiles and rejection rate by priority; if rejections never happen,
+  the limits are either generous or missing.
+- **Day to day:** the semaphore in front of the model client and the `Retry-After` handling in the SDK.
+- **Interviews:** derive queue size from Little's law and explain why early rejection raises goodput.
 
 ## Role lens
 - **Engineer:** Puts a bounded semaphore and a queue-wait timeout in front of every model and tool
@@ -232,6 +309,40 @@ interactive users stay protected; require the client SDK to back off with jitter
 budget; add an adaptive concurrency limit so the bound follows real latency; and alert on goodput and
 rejection rate rather than utilisation. The campaign then completes slower, not never, and nobody
 else notices.
+
+## Interview questions
+### What is the difference between backpressure and load shedding?
+- **Backpressure** propagates "slow down" upstream: bounded queues that block or fail, 429/503 with
+  `Retry-After`, flow control, so the source sends less.
+- **Load shedding** rejects some work early and cheaply so the admitted work meets its latency budget.
+- **You need both,** because backpressure only helps if the source listens, and shedding protects you when
+  it does not.
+
+### How would you size the request queue for an LLM endpoint?
+- **Measure service rate,** for example 32 slots at 640 ms each is about 50 req/s.
+- **Apply `max_queue ≈ service_rate × max_acceptable_wait`:** with a 2 s wait budget, about 100; deeper
+  only manufactures timeouts.
+- **Bound it by time too,** shedding when the oldest waiter exceeds the budget, since prompt lengths change
+  real service time.
+
+### A surge ended twenty minutes ago but errors are still high. What is happening and what do you do?
+- **Metastable failure:** retries, cold caches or work for abandoned requests sustain the overload after the
+  trigger is gone.
+- **Break the loop:** shed hard at the front door, disable or cap client retries, and let load fall well
+  below normal before reopening.
+- **Prevent recurrence** with retry budgets, jittered backoff and goodput alerts.
+
+### Why not just autoscale instead of shedding?
+- **Scaling is too slow for GPU services:** a replica takes minutes to pull weights and warm up, while the
+  queue grows every second.
+- **Shedding buys the time:** it keeps admitted requests within SLO while capacity arrives, and autoscaling
+  can still run in the background.
+
+### Which metric would you alert on for overload, and why not CPU or throughput?
+- **Goodput and queue wait percentiles:** successful requests within SLO per second, and how long requests
+  waited, are what users feel.
+- **CPU is meaningless** for GPU-bound work, and throughput stays high during collapse while nearly every
+  response arrives after the client gave up.
 
 ## Quiz
 ### Q: Why does adding a larger queue not fix an overloaded service?

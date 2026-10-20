@@ -5,7 +5,7 @@ name: Few-shot prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - prompting/zero-shot
   - prompting/prompt-engineering
@@ -23,95 +23,119 @@ sources:
 ---
 
 ## TL;DR
-Few-shot prompting puts input → output demonstrations in the prompt. The model performs in-context
-learning: conditioning on the examples shifts its output distribution toward their format, label space
-and style without any weight update. It is how you specify what is easier to show than to say. The price
-is tokens on every call and a set of biases the examples bring with them: order, label frequency and
-copied surface detail.
+Few-shot prompting puts input → output demonstrations in the prompt; in-context learning shifts output
+toward their format, labels and style with no weight update. It shows what is hard to say, at a per-call
+token cost plus order, frequency and copying biases.
 
 ## Why it exists
-Instructions say what to do; they are poor at conveying how a good answer looks. Try writing rules for the
-exact layout of a changelog entry, the tone of a refund email, or where the boundary falls between "bug"
-and "feature request" for one particular product. Each rule you add covers one case and introduces a
-possible contradiction with another, and the model follows a demonstrated pattern more reliably than a
-described one, because pattern continuation is what it was trained on from the first token.
-
-The observation that made this a technique was that sufficiently large pretrained models could learn a
-task from a handful of demonstrations in the prompt alone, with no gradient steps. This was striking
-because the model had never been trained to learn from examples; the ability emerged from next-token
-prediction over text that itself contains many lists, tables and repeated structures.
-
-Two naive alternatives bracket few-shot. Writing more rules fails because rules cannot enumerate a shape.
-Fine-tuning fails on loop time: hours to days per iteration versus seconds, and it typically needs far
-more labelled examples than the handful that works in context before it pays off. Few-shot is the middle: show the shape, measure, adjust the
-examples, and only bake them into weights once volume makes the per-call token cost the larger bill.
+- **Instructions are poor at conveying shape.** Try writing rules for the exact layout of a changelog
+  entry, the tone of a refund email, or where "bug" ends and "feature request" begins for one product.
+  Each rule covers one case and may contradict another.
+- **Models follow a demonstrated pattern more reliably than a described one**, because pattern continuation
+  is what they were trained on from the first token.
+- **The ability emerged, it was not trained.** Sufficiently large pretrained models learned tasks from a
+  handful of demonstrations alone, with no gradient steps. Next-token prediction over text full of lists,
+  tables and repeated structures produced it.
+- **More rules fail; fine-tuning is slow.** Rules cannot enumerate a shape. Fine-tuning takes hours to days
+  per iteration versus seconds, and typically needs far more labelled examples than the handful that works
+  in context before it pays off.
+- **Few-shot is the middle.** Show the shape, measure, adjust the examples, and bake them into weights
+  only once volume makes the per-call token cost the larger bill.
 
 ## How it works
 ### What demonstrations actually teach
-In-context learning is best understood as task inference: the demonstrations make "do the same thing to
-the next input" the overwhelmingly most probable continuation. Experiments that swap demonstration labels
-for random ones found, for many models and tasks, that much of the gain survives; what matters most is
-that the examples show the input distribution, the label space and the output format. Larger and more
-recent models do appear to use the labels more, and the picture varies by task, so treat it as a tendency
-rather than a law. The practical reading is the same either way: examples are a format and boundary
-specification first and a source of knowledge a distant second. They do not teach the model facts it
-lacks.
+- **Task inference.** The demonstrations make "do the same thing to the next input" the overwhelmingly
+  most probable continuation.
+- **Labels matter less than you think.** Swapping demonstration labels for random ones kept much of the
+  gain for many models and tasks; what matters most is the input distribution, the label space and the
+  output format.
+- **It is a tendency, not a law.** Larger and more recent models appear to use the labels more, and the
+  picture varies by task.
+- **Practical reading:** examples are a format and boundary specification first and a source of knowledge
+  a distant second. They do not teach the model facts it lacks.
 
-A partial mechanistic account exists. Interpretability work on transformers identified "induction
-heads", attention circuits that find an earlier occurrence of the current token pattern and copy what
-followed it, and linked their formation in training to the onset of in-context learning. That fits the
-observed behaviour: a demonstrated format is copied with high fidelity, surface details leak from
-examples into answers, and the example nearest the query has outsized pull. It is an account of
-the copying, not a full theory of how models infer a task from examples.
+### A partial mechanism: induction heads
+- **What they are.** Interpretability work identified "induction heads": attention circuits that find an
+  earlier occurrence of the current token pattern and copy what followed it. Their formation in training
+  was linked to the onset of in-context learning.
+- **What it explains.** A demonstrated format is copied with high fidelity, surface details leak from
+  examples into answers, and the example nearest the query has outsized pull.
+- **What it does not.** It accounts for the copying, not for how models infer a task from examples.
 
 ### How many, and which
-Returns diminish quickly; a few to around ten examples is a typical working range (illustrative, not a
-rule), and cost grows linearly with each one. What matters more than count is coverage: every label
-represented, and the examples drawn from the boundary cases where the zero-shot prompt was inconsistent,
-not from the easy middle. An example of an obviously-billing ticket teaches nothing the label definition
-did not.
-
-Long context windows have moved the ceiling. Work on many-shot in-context learning in 2024 reported
-that on some tasks accuracy kept rising with hundreds of demonstrations, which blurs the line with
-fine-tuning: the examples act like a training set read on every call. Whether it pays is arithmetic you
-can do. Three hundred 60-token examples are 18,000 input tokens per request; with a static, cached block
-that is mostly cache reads, and without caching it is a per-call bill that a fine-tune would remove.
+- **Returns diminish quickly.** A few to around ten examples is a typical working range (illustrative, not
+  a rule), and cost grows linearly with each one.
+- **Coverage beats count.** Every label represented, with examples drawn from the boundary cases where the
+  zero-shot prompt was inconsistent, not from the easy middle. An obviously-billing ticket teaches nothing
+  the label definition did not.
+- **Many-shot moved the ceiling.** Work on many-shot in-context learning in 2024 reported accuracy still
+  rising with hundreds of demonstrations on some tasks, blurring the line with fine-tuning: the examples
+  act like a training set read on every call.
+- **Whether it pays is arithmetic.** Three hundred 60-token examples are 18,000 input tokens per request.
+  A static, cached block makes that mostly cache reads; uncached, it is a per-call bill a fine-tune would
+  remove.
 
 ### Static versus dynamic selection
-Static examples are hand-picked and fixed, so they form a stable prefix that caches. Dynamic selection
-embeds the incoming input, retrieves the k most similar labelled examples from a store and renders those;
-it raises accuracy on heterogeneous inputs because each request sees demonstrations that look like it.
-The cost is a retrieval step on the request path, an example store to maintain, and a prompt whose
-content differs per request, which forfeits prefix caching unless the examples are placed after the
-cached block.
+| | Static | Dynamic |
+|---|---|---|
+| How | Hand-picked, fixed examples | Embed the input, retrieve the k most similar labelled examples, render them |
+| Accuracy | Good on homogeneous inputs | Higher on heterogeneous inputs, because each request sees look-alike demonstrations |
+| Caching | Stable prefix, caches well | Content differs per request, forfeits prefix caching unless examples sit after the cached block |
+| Cost | None beyond tokens | A retrieval step on the request path and an example store to maintain |
 
 ### The biases examples introduce
-Measured on classification tasks: majority-label bias (the model favours whichever label appears most
-among the demonstrations), recency bias (the last example's label is over-predicted) and common-token
-bias (labels that are frequent words get a head start). Order alone can swing accuracy substantially on
-the same set of examples. Mitigations: balance labels, choose an order by eval rather than by accident,
-restate the instruction after the examples, and for classification, calibrate by measuring the model's
-output on a content-free input (such as "N/A") and correcting the decision for the skew it reveals. The
-original method rescales the label probabilities, so it needs an API that exposes log-probabilities;
-without them you can only approximate it from sampled label frequencies.
+Measured on classification tasks:
+- **Majority-label bias:** the model favours whichever label appears most among the demonstrations.
+- **Recency bias:** the last example's label is over-predicted.
+- **Common-token bias:** labels that are frequent words get a head start.
+- **Order alone** can swing accuracy substantially on the same set of examples.
+
+Mitigations:
+1. **Balance labels.**
+2. **Choose the order by eval**, not by accident.
+3. **Restate the instruction after the examples.**
+4. **Calibrate classification.** Measure the output on a content-free input (such as "N/A") and correct the
+   decision for the skew it reveals. The original method rescales label probabilities, so it needs an API
+   that exposes log-probabilities; without them, approximate it from sampled label frequencies.
 
 ### Where the examples live in a chat API
-Two placements work. Inside the system prompt as delimited `<example>` blocks, which is simple and clearly
-marks them as demonstrations. Or as alternating user/assistant message pairs before the real user turn,
-which matches the structure the model was fine-tuned on and tends to anchor format most strongly, at the
-risk that the model treats them as real conversation history. Either way, label them as examples and keep
-the instructions distinct from them.
+| Placement | Strength | Risk |
+|---|---|---|
+| Delimited `<example>` blocks in the system prompt | Simple, clearly marked as demonstrations | Slightly weaker format anchoring |
+| Alternating user/assistant pairs before the real turn | Matches the fine-tuning structure, anchors format most strongly | Model may treat them as real conversation history |
+
+Either way, label them as examples and keep the instructions distinct from them.
 
 ### Examples usually beat instructions when they conflict
-If an instruction says "respond in one sentence" and the examples show three, the model will usually
-produce three. The demonstrated pattern tends to be the stronger signal (how strongly varies by model),
-so every example must comply with every rule rather than relying on the instruction to win.
+- **The pattern wins.** If an instruction says "respond in one sentence" and the examples show three, the
+  model will usually produce three; how strongly varies by model.
+- **So every example must comply with every rule**, rather than relying on the instruction to win.
 
-## Example
-Dynamic few-shot selection: a small labelled pool is embedded once, the four nearest neighbours of each
-incoming ticket are rendered as user/assistant pairs ahead of the real request, most similar last so it
-sits nearest the query, and the model copies their format. In production the pool would be a few
-hundred curated boundary cases, balanced by label, and the embedding lookup would be a vector index rather than a dot product over a list.
+## Diagram
+Dynamic selection on one request: the static instructions stay in the cached prefix, and the retrieved
+demonstrations go after it, most similar last.
+
+```mermaid
+flowchart TD
+    T["Incoming ticket"] --> E["Embed ticket"]
+    E --> R["Top-k similar from example store"]
+    S[("Labelled pool, balanced by label")] --> R
+    R --> O["Order: most similar last"]
+    SP["Cached system prompt"] --> P["Render prompt"]
+    O -->|"user and assistant pairs"| P
+    T --> P
+    P --> M["Model copies the shown format"]
+    M --> L["Label plus neighbour labels logged"]
+```
+
+## Examples
+### Dynamic few-shot selection
+A small labelled pool is embedded once. The four nearest neighbours of each ticket are rendered as
+user/assistant pairs ahead of the real request, most similar last so it sits nearest the query, and the
+model copies their format.
+
+In production the pool would be a few hundred curated boundary cases, balanced by label, and the lookup a
+vector index rather than a dot product over a list.
 
 ```python
 import anthropic, json
@@ -152,49 +176,111 @@ label, shown = classify("My invoice total is wrong and the PDF download is broke
 print(label, "<- neighbours:", shown)
 ```
 
-What to look for in the output. This ticket straddles two labels, so its nearest neighbours are likely a
-mix of billing and bug examples, and the label in the last slot, nearest the query, tends to have the
-most pull. If you log `shown` across a few hundred requests and the prediction agrees with the neighbour
-majority far more often than with the gold label, the model is copying the neighbourhood rather than
-reading the ticket; the fixes are a larger, balanced pool, a smaller *k*, or a decision rule for
-two-issue tickets ("label the issue the customer asks to have fixed first") stated in the system prompt
-and demonstrated by one example that obeys it.
+- **This ticket straddles two labels**, so its neighbours are likely a mix of billing and bug examples, and
+  the label in the last slot, nearest the query, tends to have the most pull.
+- **Log `shown` across a few hundred requests.** If predictions agree with the neighbour majority far more
+  often than with the gold label, the model is copying the neighbourhood rather than reading the ticket.
+- **Fixes:** a larger, balanced pool, a smaller *k*, or a decision rule for two-issue tickets ("label the
+  issue the customer asks to have fixed first") stated in the system prompt and demonstrated by one
+  example that obeys it.
+
+### Calibrating away majority-label bias
+Without log-probabilities, approximate contextual calibration from sampled label frequencies: divide out
+the skew the prompt shows on a content-free input. Pure Python; the counts are illustrative.
+
+```python
+LABELS = ["billing", "bug", "feature_request", "other"]
+
+def normalise(d):
+    s = sum(d.values())
+    return {k: v / s for k, v in d.items()}
+
+def calibrate(p_input, p_null, floor=1e-3):
+    """Divide out the skew the prompt shows on a content-free input, then renormalise."""
+    return normalise({y: p_input[y] / max(p_null[y], floor) for y in LABELS})
+
+# Label frequencies over 20 samples of a content-free input ("N/A") with the same examples:
+p_null = normalise({"billing": 2, "bug": 12, "feature_request": 3, "other": 3})
+# Frequencies over 20 samples of a real, borderline ticket:
+p_input = normalise({"billing": 8, "bug": 10, "feature_request": 1, "other": 1})
+
+raw = max(p_input, key=p_input.get)
+cal = calibrate(p_input, p_null)
+print("raw:", raw, "| calibrated:", max(cal, key=cal.get))
+print({k: round(v, 2) for k, v in cal.items()})
+# raw: bug | calibrated: billing
+# {'billing': 0.73, 'bug': 0.15, 'feature_request': 0.06, 'other': 0.06}
+```
+
+- **The null input exposes the prior.** With no content, the prompt still says "bug" 60% of the time:
+  that is the bias of the example set, not evidence about any ticket.
+- **Better still, fix the source.** Calibration corrects a skew; balancing the examples removes it.
+
+### Worked scenario: many-shot or fine-tune?
+300 examples of 60 tokens each, 100,000 requests a day. Cache reads at an illustrative 0.1× of the base
+input price; check your provider.
+
+| Option | Example tokens billed per day |
+|---|---|
+| Many-shot, uncached: 100,000 × 18,000 | 1.8B |
+| Many-shot, static and cached: 1.8B × 0.1 | about 180M equivalents |
+| Many-shot, dynamically selected per request | back toward 1.8B, since nothing is shared |
+| Fine-tuned model, no examples | 0, plus training cost and slower iteration |
+
+Static cached many-shot is often the sweet spot while behaviour is still changing; fine-tune once it is
+stable and volume stays high.
+
+## Production patterns
+- **Curated, versioned example set.** Keep demonstrations in a reviewed file with label, source ticket and
+  reason for inclusion, and pin the version in each trace. Monitor the per-label confusion matrix per
+  example-set version.
+- **Static examples inside the cached prefix.** Render a fixed, ordered set in the system prompt or as
+  leading message pairs, never shuffled per request. Monitor the cache-read token count; a drop to zero
+  means the order or content became dynamic.
+- **Dynamic selection after the cache boundary.** When inputs are heterogeneous, retrieve the top k from a
+  vector index of labelled boundary cases and place them after the cached instructions. Monitor retrieval
+  latency and the agreement rate between prediction and neighbour majority.
+- **Held-out eval with no demonstrations in it.** Build the eval set disjoint from the example pool and
+  compare every change against the zero-shot baseline, so gains are real and not memorised.
+- **Harvest failures into the pool.** Route production cases the model got wrong (or split on) to expert
+  labelling, then add balanced boundary cases to the pool. Track pool label balance as it grows.
 
 ## Trade-offs
-- Specification by demonstration against tokens on every call; the balance flips toward fine-tuning once
-  volume is high and the behaviour is stable, because fine-tuning is effectively few-shot with the examples
-  moved into the weights.
-- Dynamic selection raises accuracy on diverse inputs against a retrieval step, an example store and a
-  per-request prompt that caching cannot reuse; on homogeneous inputs a static, cached set is cheaper and
-  nearly as good.
-- Examples anchor format strongly against the model copying their content (names, numbers, phrasing); for
-  creative or diverse outputs that anchoring is a defect, and zero-shot or lighter guidance is better.
-- More examples stabilise the boundary until context cost and position effects take over; past a handful
-  the marginal example costs more than it adds, and long example lists push the real input toward the
-  middle of the context where it is used least reliably.
+- **Specification by demonstration vs per-call tokens.** The balance flips toward fine-tuning once volume
+  is high and behaviour is stable, because fine-tuning is effectively few-shot with the examples moved into
+  the weights.
+- **Dynamic accuracy vs cost and caching.** Dynamic selection raises accuracy on diverse inputs, against a
+  retrieval step, an example store and a per-request prompt caching cannot reuse; on homogeneous inputs a
+  static, cached set is cheaper and nearly as good.
+- **Format anchoring vs copied content.** Examples anchor format strongly, but the model copies their
+  content (names, numbers, phrasing); for creative or diverse outputs that anchoring is a defect, and
+  zero-shot or lighter guidance is better.
+- **Stability vs context cost and position.** More examples stabilise the boundary until context cost and
+  position effects take over; long example lists push the real input toward the middle of the context,
+  where it is used least reliably.
 
 ## Pitfalls
-- Unbalanced labels among the examples; the symptom is systematic over-prediction of the majority label,
+- **Unbalanced labels among the examples.** Symptom: systematic over-prediction of the majority label,
   visible as a skewed confusion matrix.
-- Examples that violate the instruction they accompany; the symptom is the model following the examples
-  while the rule appears to be ignored.
-- Choosing only clear-cut examples; the symptom is boundary cases failing exactly as they did zero-shot.
-- Entities or numbers from the examples appearing in outputs for unrelated inputs; the symptom is
-  hallucinations that look suspiciously like your demonstrations.
-- Evaluating on the same items used as demonstrations; the symptom is an eval score that collapses on
-  production traffic.
-- Rotating or re-ordering examples per request without need; the symptom is a cache hit rate near zero and
+- **Examples that violate the instruction they accompany.** Symptom: the model follows the examples while
+  the rule appears to be ignored.
+- **Choosing only clear-cut examples.** Symptom: boundary cases fail exactly as they did zero-shot.
+- **Copied entities.** Entities or numbers from the examples appear in outputs for unrelated inputs.
+  Symptom: hallucinations that look suspiciously like your demonstrations.
+- **Evaluating on the demonstrations.** Symptom: an eval score that collapses on production traffic.
+- **Rotating or re-ordering examples per request without need.** Symptom: a cache hit rate near zero and
   bills that do not drop after caching is enabled.
 
 ## When to use
-Reach for few-shot after a precise zero-shot prompt is still inconsistent on cases humans label
-consistently, when the output format is intricate, when the tone or style is hard to describe, or when
-labels are domain-specific and their boundaries are better shown than defined. Do not use it when outputs
-should be diverse, when every token matters at very high volume (fine-tune instead), or as a substitute
-for missing knowledge (retrieve instead). Measure the delta against the zero-shot baseline on a held-out
-set, the per-label confusion matrix for bias, tokens per request and, if examples are dynamic, retrieval
-latency. In interviews, be ready to explain what in-context learning actually conditions on and to name
-the three biases and their fixes.
+- **Use when** a precise zero-shot prompt is still inconsistent on cases humans label consistently, the
+  output format is intricate, tone or style is hard to describe, or domain labels are better shown than
+  defined.
+- **Avoid when** outputs should be diverse, every token matters at very high volume (fine-tune instead), or
+  as a substitute for missing knowledge (retrieve instead).
+- **Measure:** the delta against the zero-shot baseline on a held-out set, the per-label confusion matrix
+  for bias, tokens per request and, if examples are dynamic, retrieval latency.
+- **Interviews:** explain what in-context learning actually conditions on, and name the three biases and
+  their fixes.
 
 ## Role lens
 - **Engineer:** Curates a balanced example set from real boundary cases, renders it as cached message
@@ -217,6 +303,38 @@ send a content-free input, observe the label probabilities it produces (or, with
 the label frequencies over repeated samples), and correct the decision for that skew. Verification is a per-label confusion matrix on a held-out set containing none of the
 demonstrations, compared against the zero-shot baseline, plus a check that the examples are rendered in a
 stable prefix so caching still works.
+
+## Interview questions
+### What does a model actually learn from few-shot examples?
+- **Task inference, not weights.** The examples make "do the same to the next input" the most probable
+  continuation; nothing is trained.
+- **Mostly shape.** Random-label experiments kept much of the gain, so examples mainly convey input
+  distribution, label space and format, and they cannot add missing facts.
+
+### Outputs start containing names from your demonstrations. What is going on and how do you fix it?
+- **Surface copying.** Induction-style copying leaks entities and numbers from examples, especially the one
+  nearest the query.
+- **Fix:** use varied, neutral placeholder content in examples, add more diverse examples so no single one
+  dominates, and check outputs for example-specific strings in the eval.
+
+### Static or dynamic example selection: how do you choose?
+- **Static** when inputs are homogeneous: a fixed set caches as a stable prefix and costs nothing extra.
+- **Dynamic** when inputs are heterogeneous and accuracy matters: top-k retrieval gives look-alike
+  demonstrations, at the price of a retrieval step and lost caching unless examples follow the cached
+  block.
+
+### When would you stop adding examples and fine-tune instead?
+- **When volume is high and behaviour is stable.** 300 examples of 60 tokens are 18,000 tokens per request;
+  at 100,000 requests a day that is 1.8B tokens uncached.
+- **When many-shot keeps helping.** Rising accuracy with hundreds of examples means a training set is
+  being read every call; moving it into weights removes the per-call bill but slows iteration.
+
+### How do you test for order and label bias in a few-shot prompt?
+- **Permute and measure.** Run the eval under several example orders; a large accuracy swing means order
+  sensitivity.
+- **Content-free probe.** Send "N/A" with the same examples; a skewed label distribution reveals the prior
+  the examples impose.
+- **Confusion matrix per label** on a held-out set, compared against the zero-shot baseline.
 
 ## Quiz
 ### Q: What do few-shot demonstrations mainly teach the model?

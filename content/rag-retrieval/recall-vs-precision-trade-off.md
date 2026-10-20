@@ -5,7 +5,7 @@ name: Recall vs precision trade-off
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/precision-recall-f1
   - rag-retrieval/reranking
@@ -99,7 +99,7 @@ When end-to-end accuracy drops, these per-stage numbers tell you which stage bro
 | Lever | Recall | Precision | Catch |
 |---|---|---|---|
 | Smaller chunks | down (multi-part answer needs more hits) | up (sharper keys per hit) | depends on how self-contained chunks are |
-| Hybrid search | up (catches lexical matches dense misses) | neutral | extra index |
+| Hybrid search | up (catches lexical matches dense misses) | not its main effect | extra index |
 | Query expansion | up | down | more noise |
 | Metadata filters | destroyed if the filter is wrong | up (smaller pool) | filter correctness |
 | Score thresholds | down for some queries | up | scores are not calibrated across queries, so a fixed threshold silently returns nothing for some |

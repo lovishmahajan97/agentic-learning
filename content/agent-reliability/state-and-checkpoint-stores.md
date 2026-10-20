@@ -5,7 +5,7 @@ name: State & checkpoint stores
 kind: decision
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -20,120 +20,136 @@ sources:
 ---
 
 ## TL;DR
-Where agent state lives determines how fast each step is, what survives a crash, and how you isolate
-tenants and delete data. The decision weighs per-step write latency against durability, blob size
-against query needs, and short TTLs against audit retention. A sound default is a relational store
-(Postgres) for run records, events and small snapshots, object storage for large tool outputs, and
-Redis only for ephemeral leases and stream buffers, with a tenant id on every row.
+The agent state store sets per-step latency, crash survival, tenant isolation and deletion. A sound
+default: Postgres for run records, events and small snapshots, object storage for large tool outputs,
+Redis only for leases and stream buffers, and a tenant id on every row.
 
 ## Why it exists
-Checkpointing puts a durable write on the critical path of every agent step. That single fact drives
-the storage decision: a store that takes a few hundred milliseconds per write (illustrative) adds
-tens of seconds to a hundred-step run, and more once a step writes several times (intents, each tool
-result, the snapshot), and it is felt in every streaming response, while a store that
-acknowledges writes before they are durable silently loses the last step on a crash, which is
-precisely the step you needed. Agent state also has an awkward shape. It is mostly small structured
-records (run status, step index, budgets) plus a long append-only log plus occasional very large
-blobs (a tool returned megabytes of HTML, a sub-agent returned a full report). It must be queried by
-run id (resume), by conversation id (history), sometimes by step (time-travel and debugging), always
-scoped by tenant, and it must expire: operational checkpoints have a short useful life while audit
-records may need to be kept for years.
-
-The naive choice is whichever store is already there. A Redis instance is fast and has TTLs, so teams
-start there and discover that its persistence settings were never tuned, that multi-megabyte blobs
-eat memory, and that "the agent forgot everything after the cache restarted" is now a support ticket.
-Or they pick a document database for flexibility, write the checkpoint and the run status update as
-two independent operations because multi-document transactions are off the default path (MongoDB
-needs a replica set for them, DynamoDB's transactional writes are capped per call and cost extra
-capacity), and get half-updated runs after crashes. The store has to be
-chosen against the actual access pattern and durability needs, not convenience.
+- **Every step pays a durable write.** Checkpointing puts one on the critical path of each step. A store
+  taking a few hundred milliseconds per write (illustrative) adds tens of seconds to a hundred-step run,
+  more once a step writes several times (intents, each tool result, the snapshot), and it is felt in every
+  streaming response.
+- **Fast but not durable loses the step you need.** A store that acknowledges writes before they are
+  durable silently loses the last step on a crash, which is precisely the step a resume needs.
+- **Agent state has an awkward shape.** Mostly small structured records (run status, step index,
+  budgets), plus a long append-only log, plus occasional very large blobs (megabytes of HTML from a tool,
+  a full report from a sub-agent). It is queried by run id (resume), conversation id (history), sometimes
+  by step (time-travel and debugging), always scoped by tenant, and it must expire: operational
+  checkpoints have a short useful life while audit records may be kept for years.
+- **"Whatever is already there" fails: Redis.** It is fast with TTLs, so teams start there and discover
+  persistence was never tuned, multi-megabyte blobs eat memory, and "the agent forgot everything after the
+  cache restarted" is now a support ticket.
+- **"Whatever is already there" fails: document databases.** Teams write the checkpoint and the run status
+  as two independent operations because multi-document transactions are off the default path (MongoDB
+  needs a replica set for them; DynamoDB's transactional writes are capped per call and cost extra
+  capacity), and get half-updated runs after crashes. Choose against the access pattern and durability
+  needs, not convenience.
 
 ## How it works
 ### The data model
 Three logical tables (names illustrative) plus a blob store:
-- `runs(run_id, conversation_id, tenant_id, status, attempt, owner, lease_until, schema_version,
-  created_at, updated_at)`: one row per execution, the thing you lease and poll.
-- `events(run_id, seq, type, payload, created_at)`: append-only model responses, tool calls and tool
-  results. Small payloads inline as JSONB; large ones replaced by a reference.
-- `checkpoints(run_id, step, state, created_at)`: a small snapshot of the non-transcript state
-  (budgets, pending intents, loop-guard counters). Because the transcript lives in `events`, each
-  snapshot stays small and total storage grows linearly with steps rather than quadratically.
-- Blobs in object storage at `tenant/run_id/seq`, referenced from events by key and size.
+
+| Table | Columns | Role |
+|---|---|---|
+| `runs` | `runs(run_id, conversation_id, tenant_id, status, attempt, owner, lease_until, schema_version, created_at, updated_at)` | One row per execution; the thing you lease and poll |
+| `events` | `events(run_id, seq, type, payload, created_at)` | Append-only model responses, tool calls and tool results; small payloads inline as JSONB, large ones replaced by a reference |
+| `checkpoints` | `checkpoints(run_id, step, state, created_at)` | Small snapshot of non-transcript state (budgets, pending intents, loop-guard counters) |
+| Blob store | object storage at `tenant/run_id/seq` | Large payloads, referenced from events by key and size |
+
+- **Why snapshots stay small:** the transcript lives in `events`, so total storage grows linearly with
+  steps rather than quadratically.
 
 ### Write pattern per step
-One transaction: insert the step's events, upsert the checkpoint row, update the run's status and
-timestamp. Transactional because a crash between "events written" and "checkpoint written" produces
-a resume whose pending intents disagree with the log, so it re-issues calls that already have
-results. Relational stores give this for free; with a key-value store you emulate it with a single
-document per run (and then size becomes the problem) or accept a repair step on resume.
+- **One transaction:** insert the step's events, upsert the checkpoint row, update the run's status and
+  timestamp.
+- **Why transactional:** a crash between "events written" and "checkpoint written" produces a resume whose
+  pending intents disagree with the log, so it re-issues calls that already have results.
+- **By store type:** relational stores give this for free; with a key-value store you emulate it with a
+  single document per run (and then size becomes the problem) or accept a repair step on resume.
 
 ### What "durable" actually means
-"The write succeeded" can mean three different things: the store accepted it into memory, it reached
-the local disk with an fsync, or it reached a replica as well. Only the last two survive a crash of
-the node, and only the last survives losing the node. Postgres by default waits for its write-ahead
-log to be flushed before acknowledging a commit; turning `synchronous_commit` off trades a window of
-recently acknowledged commits for lower latency. Redis's append-only file is fsynced according to
-`appendfsync` (`always`, `everysec` or `no`), and with `everysec` a crash can lose about the last
-second of writes. With asynchronous replication, a failover can promote a replica that never received
-the latest commits. For a checkpoint store, the lost write is by definition the most recent step,
-the one a resume needs, so ask which of the three your configuration gives before calling it
-durable.
+"The write succeeded" can mean three things:
+
+| Acknowledged when | Survives node crash | Survives losing the node |
+|---|---|---|
+| Accepted into memory | No | No |
+| Reached local disk with an fsync | Yes | No |
+| Reached a replica as well | Yes | Yes |
+
+- **Postgres:** by default waits for its write-ahead log to flush before acknowledging a commit; turning
+  `synchronous_commit` off trades a window of recently acknowledged commits for lower latency.
+- **Redis:** the append-only file is fsynced per `appendfsync` (`always`, `everysec` or `no`); with
+  `everysec` a crash can lose about the last second of writes.
+- **Asynchronous replication:** a failover can promote a replica that never received the latest commits.
+- **Why it matters here:** the lost write is by definition the most recent step, the one a resume needs,
+  so ask which of the three your configuration gives before calling it durable.
 
 ### Leases, not locks
-Resume must be exclusive. A lease is a conditional update: set `owner` and `lease_until` only where
-the row is unowned or the lease has expired, returning the row on success. A lease expires if the
-worker dies; a lock would not. Renew on a heartbeat and stop working if renewal fails, because another
-worker may have taken over.
-
-Leases have a failure mode of their own: a worker pauses (a long GC, a stalled VM), its lease
-expires, a second worker takes over, and the first wakes up still believing it owns the run.
-Checking the lease inside every state write, as the example does, stops the stale worker from
-corrupting the store, because the check and the write share one transaction. It does not stop that
-worker's *external* calls. For those, give each claim a monotonically increasing epoch (a fencing
-token), send it with side-effecting calls, and have adapters or the downstream reject an epoch lower
-than one they have already seen. Where the downstream cannot do that, idempotency keys are what keep
-a stale worker's duplicate call harmless.
+- **A lease is a conditional update:** set `owner` and `lease_until` only where the row is unowned or the
+  lease has expired, returning the row on success.
+- **It expires if the worker dies; a lock would not.** Renew on a heartbeat and stop working if renewal
+  fails, because another worker may have taken over.
+- **The stale-worker failure mode.** A worker pauses (a long GC, a stalled VM), its lease expires, a
+  second worker takes over, and the first wakes up still believing it owns the run.
+  - **Lease check inside every state write** (as the example does) stops it corrupting the store, because
+    check and write share one transaction.
+  - **It does not stop external calls.** Give each claim a monotonically increasing epoch (a fencing
+    token), send it with side-effecting calls, and have adapters or the downstream reject an epoch lower
+    than one already seen.
+  - **Where the downstream cannot,** idempotency keys keep a stale worker's duplicate call harmless.
 
 ### The options
-- **In-memory** (a dict, LangGraph's `InMemorySaver`, formerly `MemorySaver`): zero latency, zero
-  durability. Tests and
-  notebooks only.
-- **Redis**: sub-millisecond writes, native TTL, good for leases, rate counters and resumable stream
-  buffers. As the checkpoint store only if persistence is configured deliberately (append-only file
-  with an fsync policy you understand) and blobs stay small; memory cost per byte is high, and most
-  people treat it as a cache, which is how it gets flushed.
-- **Postgres or another relational store**: durable by default, transactions, JSONB for flexible
-  payloads, indexes on (tenant, conversation), row-level security for tenant isolation, mature
-  backups, low-millisecond writes on a local network. The default for most teams; LangGraph ships
-  both a Postgres checkpointer and a SQLite one for local use.
-- **Document and wide-column stores** (DynamoDB, MongoDB, Cassandra): horizontal scale and per-item
-  TTL, and key-value access matches run id lookups; cross-item transactions are more limited
-  (bounded in size, extra cost, or single-partition only in Cassandra) and the operational knowledge
-  heavier. Choose them when a single relational primary becomes the bottleneck.
-- **Object storage** (S3-style): cheap and effectively unlimited but slower and unqueryable. For blobs
-  and long-term archive of event logs, never alone on the hot path.
-- **Workflow engines** (Temporal and similar): own the event history and the resume logic; you store
-  application state only. The decision becomes "adopt the engine" rather than "pick a database".
+| Store | Strengths | Limits | Use for |
+|---|---|---|---|
+| **In-memory** (a dict, LangGraph's `InMemorySaver`, formerly `MemorySaver`) | Zero latency | Zero durability | Tests and notebooks only |
+| **Redis** | Sub-millisecond writes, native TTL | Durability depends on persistence config; high memory cost per byte; usually treated as a cache, which is how it gets flushed | Leases, rate counters, resumable stream buffers; checkpoints only with deliberate persistence (append-only file, an fsync policy you understand) and small blobs |
+| **Postgres or another relational store** | Durable by default, transactions, JSONB, indexes on (tenant, conversation), row-level security, mature backups, low-millisecond writes on a local network | A single primary caps write throughput | The default for most teams; LangGraph ships a Postgres checkpointer and a SQLite one for local use |
+| **Document and wide-column** (DynamoDB, MongoDB, Cassandra) | Horizontal scale, per-item TTL, key-value access matches run id lookups | Cross-item transactions more limited (bounded in size, extra cost, or single-partition only in Cassandra); heavier operational knowledge | When a single relational primary becomes the bottleneck |
+| **Object storage** (S3-style) | Cheap, effectively unlimited | Slower, unqueryable | Blobs and long-term archive of event logs; never alone on the hot path |
+| **Workflow engines** (Temporal and similar) | Own the event history and resume logic | You adopt the engine | Application state only; the decision becomes "adopt the engine" rather than "pick a database" |
 
 ### Retention and deletion
-Separate hot from cold. Checkpoints and leases expire within hours or days of run completion; events
-may be kept longer for audit and evaluation, then archived to object storage and deleted on a
-schedule. Tenant-scoped deletion (right to erasure, contract end) must reach events, blobs and
-archives, which is why `tenant_id` is a column on every row and a prefix on every blob key, never
-something inferred by joining through conversations. Encrypt blobs at rest: tool outputs routinely
-contain customer data.
+- **Separate hot from cold.** Checkpoints and leases expire within hours or days of run completion; events
+  may be kept longer for audit and evaluation, then archived to object storage and deleted on a schedule.
+- **Tenant-scoped deletion must reach everything** (right to erasure, contract end): events, blobs and
+  archives. That is why `tenant_id` is a column on every row and a prefix on every blob key, never
+  inferred by joining through conversations.
+- **Encrypt blobs at rest:** tool outputs routinely contain customer data.
 
 ### Sizing
-Estimate events per run × average payload × runs per day × retention days, plus blob volume.
-Illustrative arithmetic: a thousand runs a day with fifty events of 4 KB each is about 200 MB a day
-of JSONB before blobs, comfortably within a single Postgres for a long time; the blob side is what
-grows unexpectedly.
+```
+daily_bytes = events_per_run × avg_payload × runs_per_day   (+ blob volume)
+total       = daily_bytes × retention_days
+```
+- **Illustrative:** a thousand runs a day with fifty events of 4 KB each is about 200 MB a day of JSONB
+  before blobs, comfortably within a single Postgres for a long time.
+- **The blob side is what grows unexpectedly.**
 
-## Example
-One transaction per step first checks that this worker still holds the lease (a fencing check, so a
-worker whose lease expired cannot overwrite its successor), then writes the events (offloading large
-payloads to object storage behind a reference) and upserts the small snapshot; `claim` takes an
-expiring lease so only one worker resumes a given run. Every table carries `tenant_id`.
+## Diagram
+Each step commits events, snapshot and run status in one transaction; large payloads go to object
+storage first, and Redis only holds what can be lost.
+
+```mermaid
+flowchart TD
+    W["Worker step"] --> B{"Payload over size threshold?"}
+    B -->|"yes"| O[("Object storage: tenant/run/seq")]
+    B -->|"no"| TX["One transaction"]
+    O -->|"reference row"| TX
+    TX --> F{"Lease still held?"}
+    F -->|"no"| X["Stop: another worker owns run"]
+    F -->|"yes"| PG[("Postgres: runs, events, checkpoints")]
+    W -.->|"lease heartbeat, stream deltas"| R[("Redis: ephemeral only")]
+    PG -->|"archive after retention"| O
+```
+
+## Examples
+### One transaction per step with lease check and blob offload
+- **Fencing check first:** the transaction verifies this worker still holds the lease, so a worker whose
+  lease expired cannot overwrite its successor.
+- **Then the writes:** events (large payloads offloaded to object storage behind a reference) and the
+  small snapshot upsert.
+- **`claim`** takes an expiring lease so only one worker resumes a given run. Every table carries
+  `tenant_id`.
 
 ```python
 import json, psycopg
@@ -181,58 +197,98 @@ def save_step(conn, run_id, tenant_id, worker, step, new_events, state, blobs, b
                      (run_id, tenant_id, step, json.dumps(state)))
 ```
 
-Walk a step through it. Worker `w2` claims run `r7` with a 30-second lease and renews it every 10
-seconds. Step 12 produces three events: the model response (2 KB, inline), a tool call (1 KB,
-inline) and a tool result of 900 KB of HTML, which goes to `acme/r7/37.json` with a reference row in
-`events`. The transaction then upserts checkpoint 12 and commits; a crash anywhere before the commit
-leaves neither the events nor the checkpoint, so the resume sees a consistent step 11. If `w2` had
-stalled for 40 seconds and `w3` had claimed the run meanwhile, `w2`'s next `save_step` would find
-`owner = w3`, update zero rows and stop. One gap remains visible in the code: the blob is written
-before the transaction commits, so a rollback can leave an orphan object. That is harmless,
-because nothing references it, and it is cleaned up by a sweep or a bucket lifecycle rule, which is
-cheaper than trying to make object storage transactional.
+### Worked step: what the transaction protects
+Worker `w2` claims run `r7` with a 30-second lease and renews it every 10 seconds.
+
+| Event | Size | Where it goes |
+|---|---|---|
+| Model response | 2 KB | inline in `events` |
+| Tool call | 1 KB | inline in `events` |
+| Tool result (HTML) | 900 KB | blob `acme/r7/37.json`, reference row in `events` |
+| Checkpoint 12 | small | upserted, then commit |
+
+- **Crash before the commit** leaves neither the events nor the checkpoint, so the resume sees a
+  consistent step 11.
+- **Stale worker:** had `w2` stalled for 40 seconds while `w3` claimed the run, `w2`'s next `save_step`
+  would find `owner = w3`, update zero rows and stop.
+- **The visible gap:** the blob is written before the transaction commits, so a rollback can leave an
+  orphan object. That is harmless, because nothing references it, and a sweep or a bucket lifecycle rule
+  cleans it up, which is cheaper than making object storage transactional.
+
+### Worked sizing: where the growth comes from
+Illustrative numbers for one year at a thousand runs a day:
+
+| Component | Per day | 365 days |
+|---|---|---|
+| Events: 1,000 runs × 50 events × 4 KB | 200 MB | ~73 GB |
+| Checkpoints: kept 7 days after completion | small, bounded by TTL | stays flat |
+| Blobs: if each run offloads two 500 KB tool results | ~1 GB | ~365 GB |
+
+- **Reading it:** the relational side stays comfortable for a single Postgres; the blob side is five times
+  larger and belongs in object storage with a lifecycle rule.
+
+## Production patterns
+- **Postgres as the durable default, partitioned by time.** Keep `events` in a range-partitioned table
+  (declarative partitioning by `created_at`), archive old partitions to object storage, then drop them,
+  which is far cheaper than bulk `DELETE`. Monitor checkpoint write p95 latency and table and index
+  size per day.
+- **Claim runs with `FOR UPDATE SKIP LOCKED`.** When workers pick up runnable or expired-lease runs from
+  a queue table, select candidates with `SELECT ... FOR UPDATE SKIP LOCKED` inside the claim transaction
+  so concurrent workers never block on the same row. Monitor claim latency and lease steals.
+- **Row-level security for tenant isolation.** Enable RLS on every state table with a policy such as
+  `using (tenant_id = current_setting('app.tenant_id'))`, and set that setting per connection or
+  transaction from the authenticated request. Monitor policy-violation errors in tests and audits.
+- **Redis configured for what it holds.** If Redis holds leases or stream buffers, set `appendonly yes`
+  with an `appendfsync` policy you have chosen, and a `maxmemory-policy` that will not silently evict
+  state keys (for example `noeviction`, so writes fail loudly). Monitor memory use, evictions and
+  persistence errors.
+- **Object storage lifecycle rules.** Prefix every blob key with tenant and run, and use bucket lifecycle
+  rules to expire orphans and transition archives to colder storage classes; run tenant deletion by
+  prefix. Monitor blob volume per tenant and deletion completeness.
 
 ## Trade-offs
-- Postgres gives transactions and durability with simple operations, but a single primary caps
-  write throughput; shard by tenant or move the event log to a wide-column store once writes per
-  second become the bottleneck.
-- Redis makes each step's write nearly free and handles leases and stream buffers well, but
-  durability depends on persistence configuration and memory cost limits payload size; use it
-  beside a durable store, not instead of one.
-- Offloading large payloads to object storage keeps the database small and fast, but adds a second
-  write and a fetch on resume; set the threshold from your payload distribution rather than
+- **Postgres simplicity vs write ceiling.** It gives transactions and durability with simple operations,
+  but a single primary caps write throughput; shard by tenant or move the event log to a wide-column
+  store once writes per second become the bottleneck.
+- **Redis speed vs durability.** It makes each step's write nearly free and handles leases and stream
+  buffers well, but durability depends on persistence configuration and memory cost limits payload size;
+  use it beside a durable store, not instead of one.
+- **Blob offload vs extra I/O.** Offloading large payloads keeps the database small and fast, but adds a
+  second write and a fetch on resume; set the threshold from your payload distribution rather than
   offloading everything.
-- Relaxing durability (asynchronous commit, `everysec` fsync) cuts per-step write latency, which is
-  acceptable when losing the last step only costs a repeated model call; it flips the moment that
-  step's record is what stands between a crash and a duplicated side effect.
-- Short TTLs on checkpoints control growth and limit exposure of sensitive tool outputs, but shorten
-  the window for resume and debugging; keep events longer than checkpoints and archive rather than
-  delete when audit demands it.
+- **Relaxed durability vs safety.** Asynchronous commit or `everysec` fsync cuts per-step write latency,
+  acceptable when losing the last step only costs a repeated model call; it flips the moment that step's
+  record stands between a crash and a duplicated side effect.
+- **Short TTLs vs debuggability.** They control growth and limit exposure of sensitive tool outputs, but
+  shorten the window for resume and debugging; keep events longer than checkpoints and archive rather
+  than delete when audit demands it.
 
 ## Pitfalls
-- Treating Redis as durable without checking persistence; the symptom is every in-flight run
-  vanishing after a cache node restart.
-- Writing events and checkpoint in separate statements without a transaction; the symptom is resumed
-  runs re-issuing tool calls that already have results in the log.
-- Storing the full transcript in every snapshot; the symptom is checkpoint storage and write latency
-  growing with the square of run length.
-- Omitting tenant_id from events and blobs; the symptom is a deletion request that needs multi-table
-  joins and still misses archived objects.
-- Locks instead of leases; the symptom is a run stuck forever as "owned" by a worker that died,
-  resumable only by manual intervention.
-- Calling a store durable because writes succeed, without checking fsync and replication settings;
+- **Treating Redis as durable without checking persistence.** The symptom is every in-flight run vanishing
+  after a cache node restart. Fix: a durable store for checkpoints.
+- **Events and checkpoint in separate statements without a transaction.** The symptom is resumed runs
+  re-issuing tool calls that already have results in the log. Fix: one transaction per step.
+- **The full transcript in every snapshot.** The symptom is checkpoint storage and write latency growing
+  with the square of run length. Fix: events table plus small snapshots.
+- **Omitting tenant_id from events and blobs.** The symptom is a deletion request that needs multi-table
+  joins and still misses archived objects. Fix: a column on every row, a prefix on every key.
+- **Locks instead of leases.** The symptom is a run stuck forever as "owned" by a dead worker, resumable
+  only by manual intervention. Fix: expiring leases with heartbeats.
+- **Calling a store durable because writes succeed.** Without checking fsync and replication settings,
   the symptom is a resume after a node failure or failover that restarts a step the run had already
-  completed and acknowledged.
+  completed and acknowledged. Fix: verify which of the three acknowledgement levels you have.
 
 ## When to use
-Make the decision when you first persist a run, because migrating state stores later is painful.
-Default to a relational store with object storage for blobs unless you already run a workflow engine
-or your write volume clearly exceeds a single primary. Add Redis for leases, counters and resumable
-stream buffers. Measure checkpoint write p95 latency (it is inside every step), store growth per day,
-resume success rate and deletion completeness. Day to day this shows up when a run cannot resume, a
-storage bill arrives, or a customer asks how their data is deleted. In interviews, expect "where do
-you keep agent state and why" and answer with the access pattern, durability and tenant requirements,
-not a product name.
+- **Decide when you first persist a run,** because migrating state stores later is painful.
+- **Default:** a relational store with object storage for blobs, unless you already run a workflow engine
+  or your write volume clearly exceeds a single primary.
+- **Add Redis** for leases, counters and resumable stream buffers.
+- **Measure:** checkpoint write p95 latency (it is inside every step), store growth per day, resume
+  success rate and deletion completeness.
+- **Day to day:** this shows up when a run cannot resume, a storage bill arrives, or a customer asks how
+  their data is deleted.
+- **Interviews:** expect "where do you keep agent state and why"; answer with the access pattern,
+  durability and tenant requirements, not a product name.
 
 ## Role lens
 - **Engineer:** Implements the schema, the per-step transaction, blob offloading and lease renewal,
@@ -253,6 +309,36 @@ threshold offloaded to object storage behind a reference whose key carries tenan
 for leases, rate counters and resumable stream buffers, where its speed matters and loss is
 tolerable. Set retention separately: checkpoints expire soon after completion, events are archived per
 audit policy, and tenant-scoped deletion covers the blobs too.
+
+## Interview questions
+### Where would you keep agent run state, and why there?
+- **Postgres for runs, events and small snapshots,** because each step needs a durable, transactional
+  write that is also queryable by run, conversation and tenant.
+- **Object storage for large tool outputs,** referenced from events, so the database stays small.
+- **Redis only for leases, counters and stream buffers,** where speed matters and loss is tolerable.
+
+### A worker paused for 40 seconds, its lease expired, and it then overwrote its successor's checkpoint. How do you prevent that?
+- **Check the lease inside the same transaction as every state write,** so a stale owner updates zero rows
+  and stops.
+- **Fence external calls too:** give each claim a rising epoch, send it with side effects, and have
+  adapters reject lower epochs; fall back on idempotency keys where the downstream cannot check.
+
+### When is relaxing durability (async commit, `everysec`) acceptable for a checkpoint store?
+- **Acceptable** when losing the last step only means repeating a model call, which costs tokens but has
+  no side effects.
+- **Not acceptable** when that step's record is what prevents a duplicated side effect after a crash,
+  such as recorded intents before a payment call.
+
+### How do you size a state store for a new agent product?
+- **Formula:** events per run × average payload × runs per day × retention days, plus blob volume.
+- **Example:** 1,000 runs a day × 50 events × 4 KB is about 200 MB a day of JSONB; blobs usually dominate,
+  so set an offload threshold and lifecycle rules early.
+
+### A customer asks you to prove their data is deleted at contract end. What must the design already have?
+- **`tenant_id` on every row and as a prefix on every blob key,** so deletion works by tenant without
+  joins or object scans.
+- **Coverage of archives and summaries,** with lifecycle rules or per-tenant encryption keys for backups
+  that cannot be rewritten, and a completeness check you can show.
 
 ## Quiz
 ### Q: Why should the per-step events and checkpoint be written in one transaction?

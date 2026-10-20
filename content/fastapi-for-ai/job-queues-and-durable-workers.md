@@ -30,7 +30,7 @@ asyncio-native; both need idempotent jobs.
 - **Intermediaries cut long requests.** Connections that run or idle too long are dropped, commonly after
   tens of seconds by default (vendor-dependent), so a five-minute corpus summarisation never returns.
 - **Clients retry on timeout.** The work runs twice, and the second run races the first.
-- **Deploys and crashes kill in-flight work** with nothing to say it existed.
+- **Deploys, crashes and scale-downs kill in-flight work** with nothing to say it existed.
 - **AI makes it worse.** One job can mean thousands of model calls at real cost, bounded by provider rate
   limits rather than your CPUs.
 - **The naive fixes fail.** `BackgroundTasks` runs after the response in the same process and vanishes
@@ -197,6 +197,7 @@ async def summarize_corpus(ctx, job_id: str, corpus_id: str):
 class WorkerSettings:
     functions = [summarize_corpus]
     redis_settings = RedisSettings()
+    # on_startup = startup   # your hook that puts the shared LLM client into ctx["llm"]
     max_jobs, job_timeout, max_tries = 10, 1800, 3   # concurrency bound by LLM rate limits, not CPU
 ```
 
@@ -233,7 +234,7 @@ minute, ~4 s per call.
 | In-flight calls to hit that rate | 10 calls/s × 4 s | ~40 concurrent |
 | ARQ processes at `max_jobs = 10` (one call each) | 40 / 10 | 4 workers |
 | Fastest possible corpus time | 1,000 / 10 calls/s | ~100 s |
-| Add an 8th worker | 80 in flight, still 10 calls/s allowed | only more 429s and retries |
+| Double to 8 workers | 8 × 10 = 80 in flight, still 10 calls/s allowed | only more 429s and retries |
 
 More workers past the rate limit add retries, not throughput; CPU never enters the sum.
 

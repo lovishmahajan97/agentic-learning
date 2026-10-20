@@ -5,7 +5,7 @@ name: Runbooks
 kind: practice
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - deployment/health-checks
   - deployment/hypercare
@@ -19,84 +19,102 @@ sources:
 ---
 
 ## TL;DR
-A runbook is a written, tested procedure for one operational situation: what triggered it, how to
-confirm the impact, the exact steps to mitigate, how to verify recovery and when to escalate. It exists
-because the person handling an incident is rarely the person who built the system, and at 3 a.m. under
-pressure nobody reasons well from first principles. Good runbooks are linked from the alert that fires,
-favour mitigation over diagnosis, and are rehearsed so they are known to work.
+A runbook is a written, tested procedure for one operational situation: trigger, impact check, exact
+mitigation steps, recovery check and escalation. It exists because the incident handler rarely built
+the system, so good runbooks are alert-linked, mitigation-first and rehearsed.
 
 ## Why it exists
-When something breaks, the knowledge needed to fix it usually lives in a few engineers' heads: which
-dashboard shows the real problem, which flag switches to the fallback model, which log query finds the
-failing tenant. That works until those engineers are asleep, on holiday, or have moved to another
-project. For forward-deployed work it fails structurally: after handoff, the customer's operations team
-is on call for a system they did not build, often in an environment the vendor cannot access.
-
-The naive alternatives both fail. "The on-call will figure it out" turns every incident into an
-investigation, stretching time to mitigation from minutes to hours while users are affected. A long
-architecture document does not help either: it explains how the system works, not what to do when the
-provider is returning 429s, and nobody reads twenty pages during an outage.
-
-AI systems add failure modes that conventional operations teams have not seen: an LLM provider degrading
-or rate-limiting, a cost spike from a prompt loop or an abusive user, a sudden rise in guardrail blocks,
-a stale or partially rebuilt retrieval index, a jailbreak or prompt-injection report, a model answering
-confidently and wrongly after an upstream change. Each needs a specific response, and some (pausing an
-agent's write tools, notifying security) carry business consequences the on-call needs explicit
-permission to take. A runbook is where that permission and procedure are written down in advance.
+- **Fix-it knowledge lives in a few heads.** Which dashboard shows the real problem, which flag switches
+  to the fallback model, which log query finds the failing tenant. That works until those engineers are
+  asleep, on holiday, or on another project.
+- **Forward-deployed work fails structurally.** After handoff the customer's operations team is on call
+  for a system they did not build, often in an environment the vendor cannot access. At 3 a.m. under
+  pressure nobody reasons well from first principles.
+- **"The on-call will figure it out" fails.** Every incident becomes an investigation, stretching time to
+  mitigation from minutes to hours while users are affected.
+- **An architecture document fails too.** It explains how the system works, not what to do when the
+  provider returns 429s, and nobody reads twenty pages during an outage.
+- **AI adds unfamiliar failure modes.** Provider degradation or rate limits, cost spikes from a prompt loop
+  or abusive user, guardrail-block surges, a stale or partially rebuilt index, jailbreak or
+  prompt-injection reports, confident wrong answers after an upstream change. Some responses (pausing
+  write tools, notifying security) need explicit permission, which the runbook writes down in advance.
 
 ## How it works
 ### One situation per runbook
-A runbook covers one alert or symptom, not a whole service, *because* the reader arrives from a specific
-page and needs the steps for that situation, not a tour. Every alert links to its runbook; an alert with
-no runbook is a sign the alert is either unnecessary or the knowledge is missing.
+- **One alert or symptom, not a whole service**, because the reader arrives from a specific page and
+  needs the steps for that situation, not a tour.
+- **Every alert links to its runbook.** An alert with no runbook means the alert is unnecessary or the
+  knowledge is missing.
 
 ### A fixed structure
 1. **Trigger:** the alert name and threshold, or the user-reported symptom.
-2. **Impact:** who is affected and how badly, with a severity guide, *because* severity decides who is
+2. **Impact:** who is affected and how badly, with a severity guide, because severity decides who is
    woken up and how fast customers are told.
-3. **Confirm:** one or two checks that tell a real problem from a false alarm, with exact dashboard
-   links or queries.
+3. **Confirm:** one or two checks that tell a real problem from a false alarm, with exact dashboard links
+   or queries.
 4. **Mitigate:** the steps that stop user harm, in order, with exact commands or flag names. Mitigation
-   comes before diagnosis *because* restoring service is urgent and root cause can wait for the
-   postmortem.
+   comes before diagnosis because restoring service is urgent and root cause can wait for the postmortem.
 5. **Verify:** what metric must return to normal, and for how long, before declaring recovery.
 6. **Escalate:** who to call if mitigation fails or the situation does not match, with names or rotas,
    not "the platform team".
 7. **Afterwards:** what to record for the postmortem (timeline, traces, request IDs).
 
 ### Precision over prose
-Steps are imperative and copy-pasteable: the flag name, the query, the expected output. Decision points
-are explicit ("if 429s are from one tenant, go to step 6; otherwise continue"). Vague steps such as
-"check the logs" are where incidents stall.
+- **Imperative, copy-pasteable steps:** the flag name, the query, the expected output.
+- **Explicit decision points:** "if 429s are from one tenant, go to step 6; otherwise continue".
+- **No vague steps.** "Check the logs" is where incidents stall.
 
 ### Pre-authorised actions
-Runbooks state which disruptive actions the on-call may take without asking: switching to a fallback
-model, disabling an agent's write tools, blocking a tenant, shedding load. Pre-authorisation exists
-*because* waiting for a manager's approval at night extends the incident.
+- **State what the on-call may do without asking:** switch to a fallback model, disable an agent's write
+  tools, block a tenant, shed load.
+- **Why:** waiting for a manager's approval at night extends the incident.
 
 ### Automation is the next step, not a replacement
-A runbook step that is run identically every time is a candidate for a script, then for automatic
-remediation. Keep the runbook even after automation, describing what the automation does and what to do
-when it fails, *because* automation fails in exactly the unusual situations where humans need context.
+- **Promote repeated steps:** a step run identically every time becomes a script, then automatic
+  remediation.
+- **Keep the runbook after automating**, describing what the automation does and what to do when it
+  fails, because automation fails in exactly the unusual situations where humans need context.
 
 ### Store them where the outage is not
-A runbook is useless if it is unreachable during the incident it covers. Keep runbooks somewhere that
-does not share fate with the system: not only on a wiki behind the same single sign-on that may be
-failing, not only in a cloud account the customer's on-call cannot access, and with an offline or mirrored
-copy for the scenarios (identity outage, network partition into an air-gapped site) where the primary
-location goes down too. The alert should carry the link, *because* searching for the right page costs
-minutes the incident does not have.
+- **Do not share fate with the system:** not only on a wiki behind the same single sign-on that may be
+  failing, and not only in a cloud account the customer's on-call cannot access.
+- **Keep an offline or mirrored copy** for scenarios (identity outage, network partition into an
+  air-gapped site) where the primary location goes down too.
+- **The alert carries the link**, because searching for the right page costs minutes the incident does
+  not have.
 
-Terminology varies: some teams say *playbook* for the broader incident-handling process (roles,
-communication, severity) and *runbook* for the per-situation procedure described here. The distinction
-matters less than having both, and not expecting one to do the other's job.
+### Runbook vs playbook
+- **Terminology varies:** some teams say *playbook* for the broader incident-handling process (roles,
+  communication, severity) and *runbook* for the per-situation procedure described here.
+- **Have both**, and do not expect one to do the other's job.
 
 ### Keep them alive
-Each runbook has an owner and a last-tested date. Teams rehearse them in game days (deliberately
-injected failures in staging) and update them after every incident where the runbook was wrong or
-missing. A runbook that has never been executed should be assumed not to work.
+- **Owner and last-tested date** on every runbook.
+- **Rehearse in game days** (deliberately injected failures in staging), and update after every incident
+  where the runbook was wrong or missing.
+- **Untested means broken:** a runbook that has never been executed should be assumed not to work.
 
-## Example
+## Diagram
+The responder's path through one runbook: confirm before acting, mitigate before diagnosing, and
+escalate when the steps do not match or do not work.
+
+```mermaid
+flowchart TD
+    A["Alert fires with runbook link"] --> C{"Confirm: real problem?"}
+    C -->|"no"| FA["Record false alarm, tune alert"]
+    C -->|"yes"| B{"Which branch matches?"}
+    B -->|"provider outage"| M1["Fail over to fallback"]
+    B -->|"rate limit"| M2["Cut own concurrency"]
+    B -->|"no match"| E["Escalate to named rota"]
+    M1 --> V{"Recovered for watch period?"}
+    M2 --> V
+    V -->|"no"| E
+    V -->|"yes"| R["Revert one change at a time"]
+    R --> P["Record timeline for postmortem"]
+```
+
+## Examples
+### An LLM provider-degraded runbook
 An abridged runbook for an LLM-backed assistant, written for a customer operations team after handoff.
 Flag names, dashboards and thresholds are illustrative stand-ins for the team's own.
 
@@ -127,47 +145,113 @@ Escalate
 Afterwards: export the incident timeline and five failing trace IDs to the postmortem doc.
 ```
 
-Notice what it encodes: a split between rate-limit and outage causes, a hot-tenant branch, actions the
-operator may take without approval, an explicit recovery condition, and an order for reverting changes.
-The two branches exist *because* the same alert has opposite fixes: for a provider outage you move traffic
-away, while for rate limiting you reduce your own pressure, and failing over a rate-limited workload can
-simply exhaust the fallback's quota too. The revert order is deliberate as well: one change at a time,
-with a watch period, so that if errors return you know which reverted change they depended on, and the
-most load-generating change (batch jobs) comes back last, when the system has proven it is stable.
+What it encodes:
+- **A rate-limit vs outage split**, because the same alert has opposite fixes. For an outage you move
+  traffic away; for rate limiting you reduce your own pressure, and failing over a rate-limited workload
+  can simply exhaust the fallback's quota too.
+- **A hot-tenant branch** and **actions the operator may take without approval**.
+- **An explicit recovery condition** before anything is reverted.
+- **A deliberate revert order:** one change at a time with a watch period, so if errors return you know
+  which reverted change they depended on. The most load-generating change (batch jobs) comes back last,
+  when the system has proven it is stable.
+
+### Linking alerts to runbooks, and linting the link
+Prometheus alerting rules conventionally carry a `runbook_url` annotation, so the page that wakes the
+on-call contains the link.
+
+```yaml
+groups:
+  - name: assistant
+    rules:
+      - alert: LLMUpstreamErrorRate
+        expr: llm_upstream_error_rate > 0.05
+        for: 5m
+        labels:
+          severity: sev2
+        annotations:
+          summary: "LLM upstream errors above 5% for 5 minutes"
+          runbook_url: "https://runbooks.example.internal/RB-07"
+```
+
+A CI check fails the build when an alert has no runbook or a runbook has gone untested too long.
+
+```python
+from datetime import date
+
+alerts = [  # parsed from the alert rules file
+    {"alert": "LLMUpstreamErrorRate", "runbook_url": "https://runbooks.example.internal/RB-07"},
+    {"alert": "GuardrailBlockSurge"},                       # no runbook link
+]
+runbooks = {"RB-07": {"owner": "cust-ops", "last_tested": date(2026, 3, 2)}}
+
+def lint(alerts, runbooks, today, max_age_days=180):
+    problems = []
+    for a in alerts:
+        url = a.get("runbook_url")
+        if not url:
+            problems.append(f"{a['alert']}: no runbook_url")
+            continue
+        rb = runbooks.get(url.rsplit("/", 1)[-1])
+        if rb is None:
+            problems.append(f"{a['alert']}: runbook {url} not found")
+        elif (today - rb["last_tested"]).days > max_age_days:
+            problems.append(f"{a['alert']}: runbook last tested {rb['last_tested']}")
+    return problems
+
+print(lint(alerts, runbooks, date(2026, 10, 20)))
+# ['LLMUpstreamErrorRate: runbook last tested 2026-03-02', 'GuardrailBlockSurge: no runbook_url']
+```
+
+## Production patterns
+- **Alert-embedded runbook links.** Put the runbook URL in every paging alert (for example the
+  `runbook_url` annotation in Prometheus rules) so it travels into the pager notification. Monitor the
+  share of paging alerts without a link; target zero.
+- **Game days before handoff.** Inject the failure in staging (block the provider endpoint, throttle a
+  connector, corrupt an index alias) and have the customer's on-call run the runbook unaided. Monitor time
+  to mitigate and every step where they hesitated.
+- **Runbook review in the postmortem template.** Each postmortem asks "was the runbook right, missing or
+  wrong?" and opens an update task. Monitor incidents where the runbook was wrong.
+- **Mirrored copy outside the blast radius.** Export runbooks to a location that does not depend on the
+  system's identity provider or network, refreshed on every change. Monitor the mirror's last sync time.
+- **Step-to-script promotion.** When a step is run identically in several incidents, wrap it in a script
+  or chat-ops command and reference that command from the runbook. Monitor how often automated
+  remediations fail and fall back to manual steps.
 
 ## Trade-offs
-- Detailed, command-level runbooks make incidents fast for unfamiliar operators, but go stale quickly as
-  the system changes; the cost flips when nobody owns updates, and a wrong runbook is worse than none.
-- Pre-authorising disruptive actions shortens incidents, but risks over-reaction on false alarms; keep
-  the confirm step strict so disruptive mitigation follows evidence.
-- Automating remediation removes human delay, but hides the system's behaviour from operators; keep
-  humans in the loop for actions with customer-visible or irreversible effects.
-- Many narrow runbooks match alerts precisely, but become hard to navigate; a short index by symptom
-  helps when the triggering alert is not obvious.
+- **Speed for strangers vs staleness.** Detailed, command-level runbooks make incidents fast for
+  unfamiliar operators but go stale quickly as the system changes; the cost flips when nobody owns
+  updates, and a wrong runbook is worse than none.
+- **Fast mitigation vs over-reaction.** Pre-authorising disruptive actions shortens incidents but risks
+  over-reaction on false alarms; keep the confirm step strict so disruptive mitigation follows evidence.
+- **No human delay vs hidden behaviour.** Automating remediation removes human delay but hides the
+  system's behaviour from operators; keep humans in the loop for actions with customer-visible or
+  irreversible effects.
+- **Precision vs navigability.** Many narrow runbooks match alerts precisely but become hard to navigate;
+  a short index by symptom helps when the triggering alert is not obvious.
 
 ## Pitfalls
-- Writing runbooks that explain the architecture instead of giving steps; the symptom is an on-call who
-  read the page and still had to page the original engineer.
-- Never testing them; the symptom is a step that references a flag, dashboard or command that was renamed
-  months ago, discovered mid-incident.
-- Alerts with no linked runbook; the symptom is repeated pages that each get the same ad-hoc response
-  and no consistent mitigation time.
-- Leaving out AI-specific situations such as cost spikes, guardrail-block surges or prompt-injection
-  reports; the symptom is a generic "service degraded" response to a problem that needed a kill switch.
-- Keeping runbooks only behind the system's own login or on infrastructure that fails with it; the
-  symptom is an identity or network outage in which the on-call cannot open the page that tells them
-  what to do.
-- Writing them only for the vendor team; the symptom is a customer operations team that escalates every
-  page during hypercare because the runbooks assume access and context they do not have.
+- **Explaining the architecture instead of giving steps.** Symptom: an on-call who read the page and still
+  had to page the original engineer. Fix: imperative, exact steps.
+- **Never testing them.** Symptom: a step references a flag, dashboard or command renamed months ago,
+  discovered mid-incident. Fix: game days and a last-tested date.
+- **Alerts with no linked runbook.** Symptom: repeated pages that each get the same ad-hoc response and no
+  consistent mitigation time. Fix: lint for the link in CI.
+- **Leaving out AI-specific situations** such as cost spikes, guardrail-block surges or prompt-injection
+  reports. Symptom: a generic "service degraded" response to a problem that needed a kill switch.
+- **Keeping runbooks only behind the system's own login** or on infrastructure that fails with it.
+  Symptom: in an identity or network outage the on-call cannot open the page that tells them what to do.
+- **Writing them only for the vendor team.** Symptom: a customer operations team that escalates every page
+  during hypercare because the runbooks assume access and context they do not have.
 
 ## When to use
-Write a runbook for every alert that pages a human and for every known failure mode a different team
-will handle, before go-live and as a readiness-review item. Start with the situations most likely to
-happen and most harmful when they do: provider outage, rate limits, cost runaway, index staleness, unsafe
-output reports, authentication failures to customer systems. Measure them by time to mitigate, by how
-often responders escalate despite the runbook, and by how often an incident finds a runbook wrong. In
-interviews, describing alert-linked runbooks with pre-authorised mitigations and rehearsal shows
-operational maturity beyond "we have monitoring".
+- **Use for:** every alert that pages a human, and every known failure mode a different team will
+  handle, before go-live and as a readiness-review item.
+- **Start with the likeliest and most harmful situations:** provider outage, rate limits, cost runaway,
+  index staleness, unsafe output reports, authentication failures to customer systems.
+- **Measure:** time to mitigate, how often responders escalate despite the runbook, and how often an
+  incident finds a runbook wrong.
+- **Interviews:** alert-linked runbooks with pre-authorised mitigations and rehearsal show operational
+  maturity beyond "we have monitoring".
 
 ## Role lens
 - **Engineer:** Writes runbooks for the failure modes they built in, with exact flags and queries, and
@@ -187,6 +271,37 @@ mitigation; or disruptive actions were not explicitly pre-authorised, so they wa
 follow from the cause: rewrite with their tools and links, add decision branches, state pre-authorisation
 in writing with their management's agreement, then run a game day so they execute each runbook once
 under realistic conditions.
+
+## Interview questions
+### What makes a runbook different from system documentation?
+- **Scope:** one alert or symptom with trigger, impact, confirm, mitigate, verify and escalate steps,
+  rather than an explanation of how the system works.
+- **Why it matters:** the responder is often not the builder, and under pressure needs exact commands, not
+  a twenty-page tour.
+
+### Your provider alert fires with 429s. Would you fail over to the fallback provider?
+- **Not first:** 429s mean you are being rate-limited, so the fix is reducing your own pressure (lower
+  concurrency, pause batch jobs, throttle a hot tenant).
+- **Failing over can backfire:** the same load can exhaust the fallback's quota too. Failover fits 5xx and
+  timeouts, which signal a provider outage.
+
+### Which actions would you pre-authorise for the on-call, and which not?
+- **Pre-authorise reversible, harm-stopping actions:** switch to a fallback model, disable an agent's write
+  tools, block or rate-limit a tenant, shed load.
+- **Keep approval for irreversible or customer-contract changes**, and keep the confirm step strict so
+  disruptive steps follow evidence rather than false alarms.
+
+### How do you know a runbook still works six months after handoff?
+- **Last-tested date and owner on each one**, with a CI check that flags stale runbooks and alerts missing
+  a link.
+- **Game days and postmortem reviews:** rehearse in staging and update the runbook after every incident
+  where it was wrong or missing.
+
+### Where should runbooks live, and why does it matter?
+- **Outside the system's blast radius:** not only behind the same single sign-on or in a cloud account the
+  customer cannot access.
+- **With a mirrored or offline copy**, so an identity outage or network partition does not hide the page
+  that tells the on-call what to do.
 
 ## Quiz
 ### Q: Why do runbooks put mitigation steps before diagnosis?

@@ -5,7 +5,7 @@ name: Knowledge distillation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/synthetic-data-generation
@@ -132,7 +132,8 @@ L = α · T² · KL( p_teacher(T) ‖ p_student(T) )  +  (1 − α) · CE( y, p_
 
 ## Diagram
 The decision path for a distillation pipeline: tokenizer and logit access pick the regime, and every
-regime ends in the same held-out evaluation on real traffic.
+regime ends in the same held-out evaluation on real traffic. The on-policy pass hangs off the white-box
+branch because the teacher must score every token the student writes.
 
 ```mermaid
 flowchart TD
@@ -143,8 +144,9 @@ flowchart TD
     BB --> F["Verifier filter or rejection sampling"]
     F --> SFT["Plain SFT on surviving responses"]
     KD --> OP["Optional on-policy pass: teacher scores student samples"]
-    SFT --> OP
     OP --> E["Eval on held-out real traffic plus a general benchmark"]
+    KD -->|"skip on-policy"| E
+    SFT --> E
 ```
 
 ## Examples
@@ -308,8 +310,8 @@ least rejection sampling with the teacher as judge.
   the student learns nothing beyond SFT; try *T* in roughly 1–4.
 - **Tokenizer alignment:** a naive logit loss across different tokenizers is meaningless, so confirm both
   models index the same vocabulary or switch to sequence-level distillation.
-- **The pipeline:** confirm the soft term actually reaches the loss and padded positions are masked, not
-  silently dropped.
+- **The pipeline:** log the soft and hard terms separately to confirm the soft term is non-zero and
+  weighted in, and that only padded positions are masked out of it.
 
 ### Forward or reverse KL for a small student: which, and why?
 - **Forward KL(teacher ‖ student)** is mode-covering: it punishes near-zero mass anywhere the teacher is

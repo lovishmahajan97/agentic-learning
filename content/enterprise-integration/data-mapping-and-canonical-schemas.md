@@ -5,7 +5,7 @@ name: Data mapping & canonical schemas (schema mapping)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - data-architecture/data-contracts
   - scoping/domain-modeling
@@ -20,51 +20,50 @@ sources:
 ---
 
 ## TL;DR
-Every client represents the same business concepts differently: one CRM's "Account" is another's
-"Customer", dates arrive in three formats, and a status of "Closed" may mean won, lost or cancelled. A
-canonical schema is your one internal model of those concepts; schema mapping is the per-source,
-versioned translation into it. With N sources and M consumers you then maintain about N + M mappings
-instead of N × M, and every downstream component, prompts and retrieval filters included, reads one shape.
+A canonical schema is your one internal model of business concepts; schema mapping is the per-source,
+versioned translation into it. With N sources and M consumers you maintain about N + M mappings instead
+of N × M, and every component reads one shape.
 
 ## Why it exists
-Suppose your AI product consumes tickets from Zendesk, ServiceNow and Jira Service Management across
-twelve customers, and feeds a retriever, a summarizer, an analytics view and an evaluation harness. If
-each consumer reads each source's native shape, every consumer contains knowledge of every source:
-the summarizer knows ServiceNow's `priority` is an integer from 1 (critical) to 5, derived from impact and
-urgency, while Zendesk uses strings such as `urgent` and `low`, the
-retrieval filter knows which field holds the product name in each system. Adding a source means editing
-every consumer; changing a consumer means testing it against every source. That is the N × M problem.
-
-The naive fix is to let the LLM cope: dump the raw JSON into the prompt and let the model figure out
-which field is the priority. That works in a demo and fails in production in three ways. Retrieval
-filters, access control and analytics are not LLM calls; they need a field they can query, so they still
-need the mapping. Model interpretation is inconsistent across records and model versions, so the same
-code can be read two ways on two days. And the meaning of a source value is often not in the data at all:
-whether `STATUS=7` means "escalated" or "awaiting customer" is knowledge held by the client's data owner,
-and no amount of inference recovers it reliably.
-
-The canonical data model, a named pattern in Hohpe and Woolf's catalogue, puts that knowledge in one
-place per source: a mapping, reviewed with the people who know the data, tested, and versioned.
+- **Every client represents the same concepts differently.** One CRM's "Account" is another's
+  "Customer", dates arrive in three formats, and a status of "Closed" may mean won, lost or cancelled.
+- **Point-to-point puts every source in every consumer.** Say your product consumes tickets from Zendesk,
+  ServiceNow and Jira Service Management across twelve customers, feeding a retriever, a summarizer,
+  analytics and an eval harness. Read natively, the summarizer must know ServiceNow's `priority` is an
+  integer from 1 (critical) to 5, derived from impact and urgency, while Zendesk uses strings such as
+  `urgent` and `low`; the retrieval filter must know which field holds the product name in each system.
+- **That is the N × M problem.** Adding a source means editing every consumer; changing a consumer means
+  testing it against every source.
+- **"Let the LLM cope" fails three ways.** Dumping raw JSON into the prompt works in a demo, but:
+  1. Retrieval filters, access control and analytics are not LLM calls; they need a queryable field, so
+     they still need the mapping.
+  2. Model interpretation is inconsistent across records and model versions, so the same code can be read
+     two ways on two days.
+  3. Meaning is often not in the data: whether `STATUS=7` means "escalated" or "awaiting customer" is held
+     by the client's data owner, and no inference recovers it reliably.
+- **The canonical data model puts that knowledge in one place per source.** It is a named pattern in Hohpe
+  and Woolf's catalogue: a mapping, reviewed with the people who know the data, tested, and versioned.
 
 ## How it works
 ### Designing the canonical schema
-The canonical schema models *your* domain, the concepts your product reasons about (case, party,
-document, interaction), not a union of every source's fields. Keep it small and stable, *because* each
-field is a promise every mapping must keep. Keep its scope to your product too. The pattern has a
-well-known failure at enterprise scale: a single canonical model for a whole company tries to make
-"customer" mean the same thing to sales, billing and support, needs every team's agreement to change,
-and becomes the bottleneck. Domain-driven design's answer is a model per bounded context with
-translation at the edges, and your product's canonical schema is exactly one such context; it does not
-need to be the client's enterprise data model, and should not try. Typical choices:
-- Types are normalized: timestamps in UTC with zone, money as amount plus ISO currency, explicit units.
-- Enumerations are closed and documented (`status ∈ {open, pending, resolved, closed}`), *because*
-  downstream logic branches on them.
-- Every record keeps provenance: source system, source ID, source version and mapping version, so any
-  canonical value can be traced back.
-- An **extensions** bag holds source fields with no canonical home, so mapping is lossless and a field
-  can be promoted later without re-ingesting.
-- Evolution is additive and versioned: new optional fields are cheap; renames and meaning changes are a
-  new version with a migration, as with any data contract.
+- **Model *your* domain,** the concepts your product reasons about (case, party, document, interaction),
+  not a union of every source's fields.
+- **Keep it small and stable,** *because* each field is a promise every mapping must keep.
+- **Keep its scope to your product.** At enterprise scale, a single company-wide canonical model tries to
+  make "customer" mean the same to sales, billing and support, needs every team's agreement to change, and
+  becomes the bottleneck. Domain-driven design's answer is a model per bounded context with translation at
+  the edges. Your product's schema is one such context; it need not be the client's enterprise data model,
+  and should not try.
+
+Typical choices:
+
+| Choice | Rule | Why |
+|---|---|---|
+| Normalized types | timestamps in UTC with zone, money as amount plus ISO currency, explicit units | consumers never guess formats |
+| Closed enumerations | documented, e.g. `status ∈ {open, pending, resolved, closed}` | downstream logic branches on them |
+| Provenance on every record | source system, source ID, source version, mapping version | any canonical value can be traced back |
+| **Extensions** bag | source fields with no canonical home | mapping is lossless; a field can be promoted later without re-ingesting |
+| Additive, versioned evolution | new optional fields cheap; renames and meaning changes are a new version with a migration | as with any data contract |
 
 ### Layers of a mapping
 Mapping is more than renaming, and the layers fail in different ways:
@@ -72,43 +71,67 @@ Mapping is more than renaming, and the layers fail in different ways:
 2. **Type and format:** parse dates and numbers, normalize time zones, convert units and currencies.
 3. **Value or semantic mapping:** crosswalks from source codes to canonical enums, agreed with the data
    owner. This is where meaning lives and where most real errors happen.
-4. **Identity:** resolve source keys to canonical IDs and link entities across sources (the same
-   customer in the CRM and in billing), which may need matching rules rather than equality.
+4. **Identity:** resolve source keys to canonical IDs and link entities across sources (the same customer
+   in the CRM and in billing), which may need matching rules rather than equality.
 5. **Derivation:** computed fields such as a canonical `is_escalated` from several source flags.
 
 ### Mappings as declarative, versioned config
-Express each source's mapping as data (a field table and value crosswalks) interpreted by one engine,
-rather than as hand-written code per customer, *because* data can be reviewed by non-engineers, diffed,
-validated and reused for the next tenant on the same system. Tenant-specific overrides layer on top of a
-per-system base mapping, since two customers on the same CRM often customize the same fields differently.
+- **Express each mapping as data** (a field table and value crosswalks) interpreted by one engine, not
+  hand-written code per customer, *because* data can be reviewed by non-engineers, diffed, validated and
+  reused for the next tenant on the same system.
+- **Layer tenant overrides on a per-system base mapping,** since two customers on the same CRM often
+  customize the same fields differently.
 
 ### Mapping back: write paths need the reverse direction
-An assistant that only reads needs the inbound mapping. One that writes back (updating a
-ticket's status, filing a case) needs the reverse, and the reverse is not automatic, *because* value crosswalks
-are often many-to-one. If source codes `W` and `K` both map to canonical `pending`, then canonical
-`pending` has no single source code to write. Either keep the original source value on the canonical
-record (provenance makes this cheap) and write it back unchanged when the meaning has not changed, or
-define an explicit reverse crosswalk agreed with the data owner (`pending` writes `W`), and test the
-round trip, source → canonical → source, as a fixture.
+- **Read-only needs only inbound.** An assistant that writes back (updating a ticket's status, filing a
+  case) needs the reverse too.
+- **The reverse is not automatic,** *because* crosswalks are often many-to-one. If source codes `W` and
+  `K` both map to canonical `pending`, then `pending` has no single source code to write.
+- **Two fixes:** keep the original source value on the canonical record (provenance makes this cheap) and
+  write it back unchanged when the meaning has not changed; or define an explicit reverse crosswalk agreed
+  with the data owner (`pending` writes `W`).
+- **Test the round trip,** source → canonical → source, as a fixture.
 
 ### Unmapped values are errors, not defaults
-When a value has no crosswalk entry, the record goes to a quarantine with the reason, and the value is
-reported to the data owner. Defaulting it to `other` or the most common value makes every downstream
-result for that category silently wrong, which is worse than a visible gap.
+- **Quarantine with the reason** when a value has no crosswalk entry, and report it to the data owner.
+- **Never default** to `other` or the most common value: every downstream result for that category
+  becomes silently wrong, which is worse than a visible gap.
 
 ### Testing and validating
-Each mapping has fixture tests (source record in, expected canonical record out) built from profiled
-samples, and every mapped record is validated against the canonical schema before it is written. Track
-per-field null and quarantine rates per source after each load, because a sudden rise is usually a
-source-side change rather than a data trend.
+- **Fixture tests per mapping:** source record in, expected canonical record out, built from profiled
+  samples.
+- **Validate every mapped record** against the canonical schema before it is written.
+- **Track per-field null and quarantine rates per source** after each load, because a sudden rise is
+  usually a source-side change rather than a data trend.
 
 ### LLM-assisted mapping
-LLMs are useful for *proposing* mappings: given source field names, descriptions and sample values,
-they can draft a field table and crosswalk quickly. Treat the output as a suggestion that a human
-confirms with the data owner, then freeze it as config. The model accelerates authoring; it should not
-be the runtime mapping.
+- **Good for *proposing*.** Given source field names, descriptions and sample values, an LLM drafts a field
+  table and crosswalk quickly.
+- **A human confirms with the data owner, then it is frozen as config.** The model accelerates authoring;
+  it should not be the runtime mapping.
 
-## Example
+## Diagram
+A source record passes through the mapping layers in order; anything without a crosswalk entry goes to
+quarantine and back to the data owner, and the original value is kept for write-back.
+
+```mermaid
+flowchart TD
+    S["Source record"] --> ST["Structural: rename, flatten"]
+    ST --> TY["Type: parse dates, UTC, units"]
+    TY --> V{"Value in crosswalk?"}
+    V -->|"no"| Q["Quarantine with reason"]
+    Q --> O["Data owner decides mapping"]
+    O -->|"new mapping version"| V
+    V -->|"yes"| ID["Identity: resolve canonical ID"]
+    ID --> DV["Derive fields"]
+    DV --> VAL{"Valid against schema?"}
+    VAL -->|"yes"| C[("Canonical store with provenance")]
+    VAL -->|"no"| Q
+    C -->|"source_status kept"| WB["Write-back via reverse crosswalk"]
+```
+
+## Examples
+### A declarative mapping with quarantine
 A declarative mapping for one customer's ticket export with a structural rename, type normalization, a
 value crosswalk, an extensions bag and quarantine on unknown values.
 
@@ -146,52 +169,106 @@ print(map_ticket({"TicketNo": "T-1042", "Subj": "VPN drops", "Opened": "03.11.20
 # opened_at becomes 2025-11-03T08:15:00+00:00 (CET is UTC+1 in November); "Kostenstelle" is kept in extensions.
 ```
 
-The crosswalk maps two source codes, `W` and `K`, to one canonical `pending`; that decision came from the
-client's helpdesk lead, not from the data. A new code `X` appearing next quarter raises `Unmapped` and
-lands in quarantine with a message the FDE can forward, instead of becoming a silently wrong status.
-Keeping `source_status` means a later write-back can restore `K` rather than guessing between `W` and
-`K`. One edge the sketch does not handle: naive local times are ambiguous for one hour each autumn (the
-clock repeats 02:00 to 03:00) and nonexistent for one hour each spring, and `replace(tzinfo=...)`
-silently picks one reading. If ordering within that hour matters, flag those values rather than trusting
-the default.
+- **The crosswalk is a human decision.** It maps two source codes, `W` and `K`, to one canonical
+  `pending`; that came from the client's helpdesk lead, not from the data.
+- **New codes become visible.** A code `X` appearing next quarter raises `Unmapped` and lands in quarantine
+  with a message the FDE can forward, instead of becoming a silently wrong status.
+- **Write-back stays exact.** Keeping `source_status` means a later write-back can restore `K` rather than
+  guessing between `W` and `K`.
+- **One edge it does not handle.** Naive local times are ambiguous for one hour each autumn (the clock
+  repeats 02:00 to 03:00) and nonexistent for one hour each spring, and `replace(tzinfo=...)` silently
+  picks one reading. If ordering within that hour matters, flag those values rather than trusting the
+  default.
+
+### Round-trip fixture for the write path
+A runnable test that the reverse direction never rewrites a code the user did not change.
+
+```python
+CROSSWALK = {"N": "open", "W": "pending", "K": "pending", "E": "resolved", "Z": "closed"}
+REVERSE = {"open": "N", "pending": "W", "resolved": "E", "closed": "Z"}   # agreed with data owner
+
+def to_source(canonical: dict) -> str:
+    # unchanged meaning: write back the original code; changed meaning: use the reverse crosswalk
+    if CROSSWALK.get(canonical["source_status"]) == canonical["status"]:
+        return canonical["source_status"]
+    return REVERSE[canonical["status"]]
+
+for code in CROSSWALK:
+    rec = {"status": CROSSWALK[code], "source_status": code}
+    assert to_source(rec) == code, code                     # round trip is exact
+rec = {"status": "resolved", "source_status": "K"}           # user resolved a K ticket
+print(to_source(rec))                                        # E
+naive = {v: k for k, v in CROSSWALK.items()}                 # inverted many-to-one map
+print(naive["pending"])                                      # K: every W ticket would become K
+```
+
+### Worked scenario: counting translations
+| Sources × consumers | Point-to-point (N × M) | Canonical (N + M) |
+|---|---|---|
+| 3 × 4 (Zendesk, ServiceNow, Jira; retriever, summarizer, analytics, eval) | 12 | 7 |
+| 6 × 4 | 24 | 10 |
+| 10 × 6 | 60 | 16 |
+
+With one source and one consumer both columns are 1 versus 2, which is why mapping directly is fine there.
+
+## Production patterns
+- **Base mapping per system, overrides per tenant.** Use when several customers run the same SaaS.
+  Store a versioned base field table and crosswalk per source system and layer each tenant's
+  customizations on top. Monitor how many tenants override each crosswalk entry.
+- **Quarantine queue routed to the data owner.** Use for every value crosswalk. Unmapped values go to a
+  table with record id, field, value and mapping version, and a weekly digest goes to the named owner.
+  Monitor quarantine rate per source and age of the oldest open question.
+- **Mapping version stamped on every record.** Use always. After a crosswalk fix, select records by the
+  old version and remap them from raw instead of remapping everything. Monitor the count of records still
+  on superseded versions.
+- **Fixture tests from profiled samples.** Use for every mapping change. Source-in, canonical-out fixtures,
+  plus a round-trip fixture for any field on a write path, run in CI. Monitor per-field null rate after
+  each load against the previous load.
+- **LLM-drafted, human-approved crosswalks.** Use when onboarding a large unfamiliar schema. Prompt with
+  field names, descriptions and sample values, then have the data owner approve each value mapping before
+  it is frozen as config. Monitor the share of proposals the owner changes.
 
 ## Trade-offs
-- A canonical schema turns N × M translations into roughly N + M, but costs an upfront modelling effort
-  and an extra hop; with one source and one consumer, mapping directly is simpler and fine.
-- A small canonical schema is stable and easy to map to, but pushes useful source detail into extensions;
-  promote a field once several consumers need it, not before.
-- Declarative mappings are reviewable and reusable, but awkward for genuinely complex logic such as
-  multi-record identity resolution; allow a code escape hatch for those cases, tested like any code.
-- Strict quarantine on unknown values keeps results correct, but lowers coverage and creates support
-  work; it is the right default when values drive filters, routing or access, and too strict for a
-  free-text field that is only shown to users.
-- LLM-proposed mappings speed authoring considerably, but a confident wrong crosswalk is hard to spot;
-  the saving holds only if a data owner reviews every proposed value mapping.
+- **N + M vs upfront modelling.** A canonical schema turns N × M translations into roughly N + M, but
+  costs modelling effort and an extra hop; with one source and one consumer, mapping directly is simpler
+  and fine.
+- **Small schema vs useful detail.** A small schema is stable and easy to map to, but pushes useful
+  source detail into extensions; promote a field once several consumers need it, not before.
+- **Declarative vs complex logic.** Declarative mappings are reviewable and reusable, but awkward for
+  genuinely complex logic such as multi-record identity resolution; allow a code escape hatch for those
+  cases, tested like any code.
+- **Strict quarantine vs coverage.** It keeps results correct but lowers coverage and creates support
+  work. It is the right default when values drive filters, routing or access, and too strict for a
+  free-text field only shown to users.
+- **LLM-proposed mappings vs hidden errors.** They speed authoring considerably, but a confident wrong
+  crosswalk is hard to spot; the saving holds only if a data owner reviews every proposed value mapping.
 
 ## Pitfalls
-- Designing the canonical schema as the union of every source's fields; the symptom is hundreds of mostly
+- **Designing the canonical schema as the union of every source's fields.** Symptom: hundreds of mostly
   null columns and no consumer able to tell which fields are reliably populated.
-- Mapping by field name alone without checking values; the symptom is two sources with a `priority` field
+- **Mapping by field name alone without checking values.** Symptom: two sources with a `priority` field
   whose scales run in opposite directions, so high-priority tickets from one source sort to the bottom.
-- Dropping naive timestamps into UTC without the source zone; the symptom is events shifted by hours and
+- **Dropping naive timestamps into UTC without the source zone.** Symptom: events shifted by hours and
   off-by-one-day errors around midnight and daylight-saving changes.
-- Defaulting unknown codes; the symptom is a canonical category that grows quietly and contains records
-  that belong elsewhere.
-- No mapping version on records; the symptom is that after a crosswalk fix you cannot tell which records
-  were mapped under the old rule and need remapping from raw.
-- Writing back through an inverted many-to-one crosswalk; the symptom is source records whose status
-  changes from `K` to `W` when the assistant updates an unrelated field, and the client's reports
-  shifting for no visible reason.
-- Letting the LLM interpret raw source records at query time instead of mapping; the symptom is filters
-  and permissions that do not work and answers that vary across model versions.
+- **Defaulting unknown codes.** Symptom: a canonical category that grows quietly and contains records that
+  belong elsewhere.
+- **No mapping version on records.** Symptom: after a crosswalk fix you cannot tell which records were
+  mapped under the old rule and need remapping from raw.
+- **Writing back through an inverted many-to-one crosswalk.** Symptom: source records whose status changes
+  from `K` to `W` when the assistant updates an unrelated field, and the client's reports shifting for no
+  visible reason.
+- **Letting the LLM interpret raw source records at query time instead of mapping.** Symptom: filters and
+  permissions that do not work and answers that vary across model versions.
 
 ## When to use
-Introduce a canonical schema once you have more than one source system or more than one consumer of the
-same data, which in enterprise AI is almost immediately. Keep the schema focused on the concepts your
-product reasons about and agree crosswalks with the client's data owners during onboarding. Measure,
-per source and mapping version, the quarantine rate, per-field null rate and the count of outstanding
-unmapped values. In day-to-day FDE work this is where most onboarding questions come from. In
-interviews, expect to explain why a canonical model reduces coupling and where it hurts.
+- **Introduce a canonical schema** once you have more than one source system or more than one consumer of
+  the same data, which in enterprise AI is almost immediately.
+- **Keep it focused** on the concepts your product reasons about, and agree crosswalks with the client's
+  data owners during onboarding.
+- **Measure** per source and mapping version: quarantine rate, per-field null rate and the count of
+  outstanding unmapped values.
+- **Day to day:** in FDE work this is where most onboarding questions come from.
+- **Interviews:** expect to explain why a canonical model reduces coupling and where it hurts.
 
 ## Role lens
 - **Engineer:** Builds the mapping engine, fixture tests and quarantine path, and stamps every canonical
@@ -211,6 +288,37 @@ model's guesses, which vary across records and model versions, and cannot know a
 picklist meanings. With a second source or consumer, every component inherits every source's quirks.
 I would map the fields used for filtering, routing and permissions to the canonical schema, keep
 everything else in extensions, and let the LLM draft the mapping for review, not perform it at runtime.
+
+## Interview questions
+### What problem does a canonical schema solve, and what does it cost?
+- **It decouples sources from consumers.** Each source maps in once and each consumer reads one shape, so
+  translations grow as N + M rather than N × M.
+- **The cost** is upfront modelling, an extra hop, and governance of a shared model; with one source and
+  one consumer it is not worth it.
+
+### Two customers on the same CRM use the same status field differently. How do you model the mapping?
+- **A per-system base mapping** holds the shared field table and default crosswalk.
+- **Tenant overrides layer on top** for each customer's customized picklist values, agreed with that
+  customer's data owner.
+- **Stamp the mapping version** that includes the tenant override, so fixes can be replayed precisely.
+
+### Your assistant now writes status back to the source, and the client says statuses are changing on their own. What happened?
+- **A many-to-one crosswalk was inverted.** Canonical `pending` came from both `W` and `K`, and the naive
+  reverse writes one of them for every record.
+- **Fix:** keep the original source value on the canonical record and write it back when meaning is
+  unchanged, use an agreed reverse crosswalk otherwise, and add a round-trip fixture.
+
+### When would you not quarantine an unmapped value?
+- **When the field is free text only shown to users,** strict quarantine lowers coverage for no
+  correctness gain.
+- **Always quarantine** when the value drives filters, routing or access, because a defaulted value makes
+  every downstream result for that category silently wrong.
+
+### What do you monitor on mappings in production?
+- **Per-field null rate and quarantine rate per source after each load;** a sudden rise usually means a
+  source-side change, not a data trend.
+- **Outstanding unmapped values and their age,** which measure how fast data owners are answering.
+- **Records on superseded mapping versions,** which should drain to zero after a remap from raw.
 
 ## Quiz
 ### Q: With 6 source systems and 4 consumers, roughly how many translations does a canonical schema need compared with point-to-point?

@@ -5,7 +5,7 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -23,116 +23,149 @@ sources:
 ---
 
 ## TL;DR
-Agent frameworks package the plumbing around model calls: control flow, state, tool wiring, retries,
-persistence, observability. LangChain is the broad integration layer; LangGraph is a typed
-state-machine runtime for agents; LlamaIndex is the data and retrieval framework with agent workflows
-on top; Pydantic AI is a small, type-first agent library; DSPy replaces hand-written prompts with
-declarative modules compiled against a metric. Each trades speed for abstraction you must understand,
-so choose by the plumbing problem you actually have.
+Agent frameworks package the plumbing around model calls. LangChain integrates, LangGraph runs typed
+resumable state machines, LlamaIndex handles data and retrieval, Pydantic AI is small and type-first,
+DSPy compiles prompts against a metric. Choose by the plumbing problem you actually have.
 
 ## Why it exists
-A production agent is mostly not model calls. It is the loop, tool schemas and dispatch, argument
-validation, retries and backoff, streaming, state that survives a crash, pausing for a human, tracing
-every step, swapping providers, and a retrieval pipeline behind it all. Teams writing this from scratch
-write the same two thousand lines, with the same bugs: tool results appended in the wrong order, a
-resume that double-executes, a provider migration that touches every file. Frameworks exist to make
-that plumbing reusable.
+- **A production agent is mostly not model calls.** It is the loop, tool schemas and dispatch, argument
+  validation, retries and backoff, streaming, crash-safe state, pausing for a human, tracing, provider
+  swaps, and a retrieval pipeline behind it all.
+- **Hand-rolled plumbing repeats the same bugs.** Teams write the same two thousand lines: tool results
+  appended in the wrong order, a resume that double-executes, a provider migration that touches every
+  file. Frameworks make that plumbing reusable.
+- **The problems cluster, and so do the frameworks.** Data (parsing, chunking, indexing, querying):
+  LlamaIndex. Inspectable, resumable control flow: LangGraph, after LangChain's early agent abstractions
+  proved too opaque for production. Typed I/O with no magic: Pydantic AI. Fragile prompts you want to
+  stop hand-tuning: DSPy, which treats prompts as parameters to optimize.
+- **Both naive paths cost something.** Writing everything yourself is slower at the start and fine later,
+  if you are disciplined about the loop and persistence. Adopting a framework blind is fast at the start
+  and painful later: hidden prompts, abstractions that leak the moment you need something different, and
+  version churn.
 
-They also exist because the problems cluster differently. Some teams' hard problem is data: parsing,
-chunking, indexing and querying documents; LlamaIndex grew from that. Some teams' problem is control
-flow that must be inspectable and resumable; LangGraph grew from that after LangChain's early agent
-abstractions proved too opaque for production. Some teams want typed, validated inputs and outputs with
-no magic; Pydantic AI is that position. And some teams discovered that the prompts are the fragile part
-and wanted to stop hand-tuning them; DSPy's answer is to treat prompts as parameters to be optimized.
-
-The naive alternatives both have costs. Writing everything yourself is slower at the start and fine
-later, if you are disciplined about the loop and persistence. Adopting a framework without
-understanding what it does under the hood is fast at the start and painful later: hidden prompts you
-cannot see, abstractions that leak the moment you need something slightly different, and version churn
-that breaks your code. The skill is knowing which problem each framework actually solves, so you adopt
-the layer you need and no more.
+The skill is knowing which problem each framework actually solves, so you adopt the layer you need and
+no more.
 
 ## How it works
 ### The common core
-Strip any of these frameworks down and the same loop remains: assemble messages (system prompt,
-history, tool schemas), call the model, validate and execute any tool calls, append the results, and
-repeat until a final answer or a budget. They differ on three questions. Who owns control flow: the
-model inside a loop, or an explicit graph or event flow you wrote? Where does state live: a message
-list, a typed state object, or event payloads? What is first-class: integrations, retrieval, types or
-prompt optimization? Answering those three for a framework tells you most of what it will be like to
-debug, and it is also how to evaluate frameworks not covered here, such as vendor agent SDKs or
-multi-agent libraries.
+Strip any framework down and the same loop remains:
+1. Assemble messages (system prompt, history, tool schemas).
+2. Call the model.
+3. Validate and execute any tool calls; append the results.
+4. Repeat until a final answer or a budget.
+
+They differ on three questions, which also let you evaluate frameworks not covered here (vendor agent
+SDKs, multi-agent libraries):
+- **Who owns control flow?** The model inside a loop, or an explicit graph or event flow you wrote.
+- **Where does state live?** A message list, a typed state object, or event payloads.
+- **What is first-class?** Integrations, retrieval, types or prompt optimization.
+
+Answering those three tells you most of what a framework will be like to debug.
 
 ### LangChain
-The broad integration layer: a common interface over chat models, embeddings, vector stores, document
-loaders and tools, plus composition primitives (prompt templates, output parsers, and the Runnable
-pipe syntax, LCEL, for chaining them with streaming, batching and async handled uniformly). Under the
-hood each integration is an adapter to a provider SDK; the value is that swapping providers or vector
-stores is a one-line change. Its early agent abstractions (a ReAct loop driven by parsing the model's
-text) are what pushed the project toward LangGraph for anything stateful. Sharp edges: deep class
-hierarchies, prompts embedded in components you did not write, and a history of breaking changes
-between versions.
+- **What it is:** the broad integration layer, a common interface over chat models, embeddings, vector
+  stores, document loaders and tools.
+- **Composition primitives:** prompt templates, output parsers, and the Runnable pipe syntax (LCEL) for
+  chaining them with streaming, batching and async handled uniformly.
+- **Under the hood:** each integration is an adapter to a provider SDK, so swapping providers or vector
+  stores is a one-line change.
+- **History:** its early agent abstractions (a ReAct loop driven by parsing the model's text) pushed the
+  project toward LangGraph for anything stateful.
+- **Sharp edges:** deep class hierarchies, prompts embedded in components you did not write, and a
+  history of breaking changes between versions.
 
 ### LangGraph
-A runtime for agents as graphs: nodes are functions (often model calls or tool executions), edges are
-fixed or conditional, and all nodes read and write a shared typed state (TypedDict or Pydantic model)
-through reducers that define how updates merge. Execution proceeds in supersteps, inspired by
-Pregel-style bulk synchronous processing, which is what makes parallel branches and fan-in
-well-defined. The parts that matter for production: checkpointers persist the state after every step
-to a store, which gives resume after crash, time travel for debugging, and interrupts, which pause a
-graph at a node for human input and resume later from the checkpoint. It is the state-machine lesson
-made concrete. An interrupt does not freeze a Python frame: on resume, the interrupted node runs again
-from its first line, with `interrupt()` now returning the human's answer. So any side effect placed
-before the interrupt inside that node executes twice; put side effects in their own node after the
-approval, or make them idempotent. Sharp edges: verbosity for simple cases, a learning curve around reducers and streaming
-modes, and a pull toward the vendor's hosted platform and tracing product for the full experience.
+- **Agents as graphs:** nodes are functions (often model calls or tool executions); edges are fixed or
+  conditional; all nodes read and write a shared typed state (TypedDict or Pydantic model) through
+  reducers that define how updates merge.
+- **Supersteps:** execution is inspired by Pregel-style bulk synchronous processing, which makes parallel
+  branches and fan-in well-defined.
+- **Checkpointers** persist state after every step to a store, giving resume after crash, time travel for
+  debugging, and **interrupts**: pause at a node for human input, resume later from the checkpoint. It is
+  the state-machine lesson made concrete.
+- **An interrupt does not freeze a Python frame.** On resume the interrupted node runs again from its
+  first line, with `interrupt()` now returning the human's answer. Any side effect before the interrupt in
+  that node executes twice; put side effects in their own node after the approval, or make them
+  idempotent.
+- **Sharp edges:** verbosity for simple cases, a learning curve around reducers and streaming modes, and
+  a pull toward the vendor's hosted platform and tracing product for the full experience.
 
 ### LlamaIndex
-A data framework first: readers for many sources, node parsers (chunking), indexes (vector, keyword,
-summary, knowledge graph), retrievers, response synthesizers and query engines, with an emphasis on
-structured and multi-document retrieval. Agents came later: tool-using agents over query engines, and
-an event-driven Workflows abstraction in which steps are functions that consume and emit typed events,
-a different shape from LangGraph's state graph. Choose it when the hard problem is getting documents
-into a model well; its agent layer is adequate, but the retrieval layer is the reason it exists. Sharp
-edges: many abstractions with overlapping names, and defaults (chunk sizes, prompts) that work for
-demos and need tuning for production.
+- **A data framework first:** readers for many sources, node parsers (chunking), indexes (vector,
+  keyword, summary, knowledge graph), retrievers, response synthesizers and query engines, with emphasis
+  on structured and multi-document retrieval.
+- **Agents came later:** tool-using agents over query engines, and an event-driven Workflows abstraction
+  where steps are functions that consume and emit typed events, a different shape from LangGraph's state
+  graph.
+- **Choose it when** the hard problem is getting documents into a model well; the agent layer is
+  adequate, but the retrieval layer is the reason it exists.
+- **Sharp edges:** many abstractions with overlapping names, and defaults (chunk sizes, prompts) that
+  work for demos and need tuning for production.
 
 ### Pydantic AI
-A deliberately small agent library from the Pydantic team: an `Agent` with a model, a system prompt,
-tools registered with a decorator, a dependency type injected into tools through a run context, and a
-typed output validated by Pydantic, with retries driven by validation failures (the model is shown the
-validation error and asked again). It is model-agnostic, integrates natively with Logfire for tracing,
-and ships a companion graph library for explicit state machines; recent versions also integrate with
-durable-execution engines such as Temporal for runs that must survive restarts. Under the hood it is the plain agent
-loop with schemas generated from type hints; little is hidden. Sharp edges: younger than the others,
-so fewer integrations, and an API that moved fast before its 1.0 release (2025), with names such as
-`result_type` renamed to `output_type`, so older tutorials no longer run as written.
+- **Deliberately small,** from the Pydantic team: an `Agent` with a model, a system prompt, tools
+  registered with a decorator, a dependency type injected into tools through a run context, and a typed
+  output validated by Pydantic.
+- **Validation-driven retries:** the model is shown the validation error and asked again.
+- **Ecosystem:** model-agnostic, native Logfire integration for tracing, a companion graph library for
+  explicit state machines, and in recent versions integration with durable-execution engines such as
+  Temporal for runs that must survive restarts.
+- **Under the hood** it is the plain agent loop with schemas generated from type hints; little is hidden.
+- **Sharp edges:** younger than the others, so fewer integrations, and an API that moved fast before its
+  1.0 release (2025), with names such as `result_type` renamed to `output_type`, so older tutorials no
+  longer run as written.
 
 ### DSPy
-A different kind of thing: a programming model in which you declare *signatures* (typed input and
-output fields with a docstring describing the task) and compose *modules* (Predict, ChainOfThought,
-ReAct and others) into a program, then *compile* the program with an optimizer against a metric and a
-small training set. Optimizers such as bootstrapped few-shot selection and instruction search generate
-and select the demonstrations and instructions that maximize the metric; some can also fine-tune
-weights. The prompt is an artifact the compiler produces, not something you write. It solves prompt
-fragility and lets you re-optimize when the model changes. Sharp edges: you need a metric and labelled
-examples before you get value, optimization costs model calls, and the resulting prompts are less
-legible than hand-written ones.
+- **A programming model, not a loop library.** Declare *signatures* (typed input and output fields with
+  a docstring describing the task), compose *modules* (Predict, ChainOfThought, ReAct and others) into a
+  program, then *compile* it with an optimizer against a metric and a small training set.
+- **Optimizers** such as bootstrapped few-shot selection and instruction search generate and select the
+  demonstrations and instructions that maximize the metric; some can also fine-tune weights.
+- **The prompt is a compiler artifact,** not something you write. That solves prompt fragility and lets
+  you re-optimize when the model changes.
+- **Sharp edges:** you need a metric and labelled examples before you get value, optimization costs model
+  calls, and the resulting prompts are less legible than hand-written ones.
 
 ### Comparing them
-Ask which plumbing problem is yours. Integration breadth: LangChain. Inspectable, resumable control
-flow with human interrupts: LangGraph. Document ingestion and retrieval quality: LlamaIndex. Typed tools
-and outputs with minimal magic: Pydantic AI. Prompt optimization against a metric: DSPy. They combine:
-DSPy modules inside a LangGraph node, LlamaIndex retrievers as Pydantic AI tools. What none of them
-removes is the need to understand the loop, persistence and gating yourself, because when the
-abstraction leaks, that is what you are debugging.
+| Your plumbing problem | Fit |
+|---|---|
+| integration breadth | LangChain |
+| inspectable, resumable control flow with human interrupts | LangGraph |
+| document ingestion and retrieval quality | LlamaIndex |
+| typed tools and outputs with minimal magic | Pydantic AI |
+| prompt optimization against a metric | DSPy |
 
-## Example
-Two philosophies on the same task, support-ticket triage. Pydantic AI makes the tool and the output
-type explicit and validates them; DSPy declares the task and leaves the prompt to the compiler. Model
-identifiers are configuration, not code, and the two libraries spell them differently (Pydantic AI
-uses `provider:model`, DSPy passes LiteLLM's `provider/model`). Parameter names follow Pydantic AI 1.x
-(`output_type`, `result.output`; older releases used `result_type` and `result.data`) and DSPy 2.5+.
+- **They combine:** DSPy modules inside a LangGraph node, LlamaIndex retrievers as Pydantic AI tools.
+- **None removes the need to understand** the loop, persistence and gating yourself, because when the
+  abstraction leaks, that is what you are debugging.
+
+## Diagram
+Pick the layer from the problem, and stop at the first box that matches; a small agent with none of
+these problems is often best as a hand-rolled loop.
+
+```mermaid
+flowchart TD
+    Q["What is the hard part?"] --> R{"Retrieval over documents?"}
+    R -->|"yes"| LI["LlamaIndex data layer"]
+    R -->|"no"| C{"Pause, resume, inspect control flow?"}
+    C -->|"yes"| LG["LangGraph with a checkpointer"]
+    C -->|"no"| T{"Typed tools and outputs, nothing hidden?"}
+    T -->|"yes"| PA["Pydantic AI or hand-rolled loop"]
+    T -->|"no"| P{"Fragile prompts, metric and labels?"}
+    P -->|"yes"| DS["DSPy compiled module"]
+    P -->|"no"| LC["LangChain integrations only"]
+    DS -.->|"can run inside"| LG
+    LI -.->|"retrievers as tools"| PA
+```
+
+## Examples
+### Two philosophies on support-ticket triage: Pydantic AI and DSPy
+- **Pydantic AI** makes the tool and the output type explicit and validates them; **DSPy** declares the
+  task and leaves the prompt to the compiler.
+- **Model identifiers are configuration, not code,** and the two libraries spell them differently:
+  Pydantic AI uses `provider:model`, DSPy passes LiteLLM's `provider/model`.
+- **Versions:** parameter names follow Pydantic AI 1.x (`output_type`, `result.output`; older releases
+  used `result_type` and `result.data`) and DSPy 2.5+.
 
 ```python
 import os
@@ -175,10 +208,12 @@ print(triage(ticket="I was charged twice this month"))
 #                 .compile(triage, trainset=examples)
 ```
 
-LangGraph on the part neither of those addresses: pausing for a person and resuming later from a
-checkpoint. The first `invoke` runs `draft`, reaches the interrupt and returns with the state saved
-under the thread id; the second, possibly days later in another process sharing the same checkpoint
-store, re-runs `legal_approval` from its top with the human's answer.
+### LangGraph: pause for a person, resume from a checkpoint
+The part neither of those addresses.
+1. **First `invoke`** runs `draft`, reaches the interrupt and returns with the state saved under the
+   thread id.
+2. **Second `invoke`,** possibly days later in another process sharing the same checkpoint store, re-runs
+   `legal_approval` from its top with the human's answer.
 
 ```python
 from typing import TypedDict
@@ -208,48 +243,108 @@ app.invoke({"doc": "msa.pdf"}, cfg)              # stops at the interrupt
 print(app.invoke(Command(resume="approve"), cfg))   # later: resumes from the checkpoint
 ```
 
+### The common core without a framework
+Runs as-is with a fake model. This is what every framework wraps; knowing it is how you debug them when
+an abstraction leaks.
+
+```python
+import json
+
+def run_agent(call_model, tools, messages, max_steps=10):
+    """The loop every framework wraps: call, execute tool calls, append results, repeat."""
+    for _ in range(max_steps):
+        reply = call_model(messages, tools=list(tools))          # a provider SDK call in practice
+        messages.append({"role": "assistant", "content": reply.get("content"),
+                         "tool_calls": reply.get("tool_calls", [])})
+        if not reply.get("tool_calls"):
+            return reply["content"]                                # no tool call: final answer
+        for tc in reply["tool_calls"]:                             # results in the order the calls were made
+            fn = tools.get(tc["name"])
+            try:
+                out = fn(**json.loads(tc["arguments"])) if fn else f"unknown tool {tc['name']}"
+            except Exception as e:                                 # errors go back to the model
+                out = f"error: {e}"
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(out)})
+    raise RuntimeError("step budget exhausted")
+
+def fake_model(messages, tools):                                  # stands in for a real model
+    if messages[-1]["role"] == "user":
+        return {"tool_calls": [{"id": "c1", "name": "account_plan", "arguments": '{"account_id": "42"}'}]}
+    return {"content": f"billing, priority 2 (plan: {messages[-1]['content']})"}
+
+print(run_agent(fake_model, {"account_plan": lambda account_id: {"42": "enterprise"}[account_id]},
+                [{"role": "user", "content": "Account 42: charged twice"}]))
+# billing, priority 2 (plan: enterprise)
+```
+
+## Production patterns
+- **Durable LangGraph checkpointer.** Whenever a graph uses interrupts or must survive redeploys. Use the
+  Postgres checkpointer (`PostgresSaver` from the `langgraph-checkpoint-postgres` package), keep
+  `InMemorySaver` for tests, and pass a stable `thread_id` per run. Monitor resume success after
+  redeploys and checkpoint table growth.
+- **Side effects after the interrupt node.** For every approval in LangGraph. Put the notification,
+  ticket or write in its own node that runs after the approval node, or give it an idempotency key.
+  Monitor duplicate side effects per resumed run, which should be zero.
+- **Pin and upgrade deliberately.** For every framework named here. Lock exact versions (a lock file
+  such as `uv.lock` or pinned requirements), upgrade on a branch, and run the golden task set before
+  merging. Monitor import and validation errors after each upgrade.
+- **Print the final rendered prompt.** When adopting any framework component with built-in prompts.
+  Turn on the framework's debug or tracing output and review the exact messages sent, including hidden
+  system prompts. Monitor prompt token count per call; unexplained growth means a component added text.
+- **Compile, save and re-check DSPy programs.** When prompts are fragile and labels exist. Compile on a
+  training set, evaluate on a held-out set, save the compiled program (DSPy modules have `save` and
+  `load`) and re-compile when the model changes. Monitor the metric on the held-out set and on a sample of
+  production traffic.
+- **A thin adapter around the framework.** When exit cost matters. Keep your tools, state types and
+  evals framework-neutral and call the framework through one module, so swapping it touches one place.
+  Monitor how many files import the framework directly.
+
 ## Trade-offs
-- A framework buys the loop, persistence and tool wiring in an afternoon but makes you a dependent of
-  its release cadence; it flips toward hand-rolling when the agent is small and the team can own two
-  hundred lines of loop.
-- LangGraph's typed state and checkpointers give resumability and interrupts for free, at the cost of
-  verbosity and a learning curve; for a three-call workflow plain functions are clearer.
-- LlamaIndex's defaults get a retrieval demo running in minutes, but production quality requires tuning
-  chunking, retrievers and prompts the framework hides, at which point the abstraction can be in the
-  way.
-- Pydantic AI's minimalism means you can read everything it does, but fewer integrations and a young
-  API mean more code you write and more renames you absorb.
-- DSPy's compiled prompts are more robust and portable across models than hand-written ones, but only
-  once you have a metric and labelled data; without them it is just another way to write prompts.
-- Vendor-hosted companions (tracing, deployment platforms) are convenient and commercially coupled; the
-  frameworks work without them, and the decision to adopt them is separate.
+- **Speed now vs dependency later.** A framework buys the loop, persistence and tool wiring in an
+  afternoon but makes you a dependent of its release cadence; flips toward hand-rolling when the agent is
+  small and the team can own two hundred lines of loop.
+- **LangGraph's resumability vs verbosity.** Typed state and checkpointers give resumability and
+  interrupts for free, at the cost of verbosity and a learning curve; for a three-call workflow plain
+  functions are clearer.
+- **LlamaIndex's quick demo vs hidden tuning.** Defaults get a retrieval demo running in minutes, but
+  production quality requires tuning chunking, retrievers and prompts the framework hides, at which point
+  the abstraction can be in the way.
+- **Pydantic AI's legibility vs breadth.** You can read everything it does, but fewer integrations and a
+  young API mean more code you write and more renames you absorb.
+- **DSPy's robustness vs prerequisites.** Compiled prompts are more robust and portable across models
+  than hand-written ones, but only once you have a metric and labelled data; without them it is just
+  another way to write prompts.
+- **Hosted companions vs coupling.** Vendor tracing and deployment platforms are convenient and
+  commercially coupled; the frameworks work without them, and adopting them is a separate decision.
 
 ## Pitfalls
-- Adopting LangChain's early text-parsing agent patterns for production; the symptom is an agent that
-  breaks when the model's phrasing changes and a loop you cannot inspect.
-- Using LangGraph without a checkpointer because "we will add persistence later"; the symptom is a
-  human-interrupt feature that cannot resume after a redeploy.
-- Pinning nothing and upgrading casually; the symptom is import errors and renamed parameters on a
-  Monday morning, across every framework named here.
-- Treating LlamaIndex's default chunking and prompts as tuned; the symptom is retrieval that works on
-  the demo PDF and fails on the customer's scanned contracts.
-- Running DSPy optimization on a metric that does not match the business outcome; the symptom is a
-  compiled prompt that scores well and ships worse answers.
-- Putting a side effect before `interrupt()` in a LangGraph node; the symptom is a notification or
-  ticket created twice, once when the graph paused and again when it resumed.
-- Letting a framework's hidden system prompts conflict with yours; the symptom is behaviour you cannot
-  explain until you print the final rendered prompt.
+- **LangChain's early text-parsing agent patterns in production.** Symptom: an agent that breaks when the
+  model's phrasing changes, and a loop you cannot inspect.
+- **LangGraph without a checkpointer** ("we will add persistence later"). Symptom: a human-interrupt
+  feature that cannot resume after a redeploy.
+- **Pinning nothing and upgrading casually.** Symptom: import errors and renamed parameters on a Monday
+  morning, across every framework named here.
+- **Treating LlamaIndex's default chunking and prompts as tuned.** Symptom: retrieval that works on the
+  demo PDF and fails on the customer's scanned contracts.
+- **DSPy optimization on a metric that does not match the business outcome.** Symptom: a compiled prompt
+  that scores well and ships worse answers.
+- **A side effect before `interrupt()` in a LangGraph node.** Symptom: a notification or ticket created
+  twice, once when the graph paused and again when it resumed.
+- **Hidden framework system prompts conflicting with yours.** Symptom: behaviour you cannot explain until
+  you print the final rendered prompt.
 
 ## When to use
-Choose by the problem, not the popularity. If the hard part is retrieval over documents, start with
-LlamaIndex's data layer and keep the agent layer thin. If the hard part is resumable, inspectable
-control flow with human interrupts, LangGraph is the strongest option and maps directly onto a
-state-machine design. If you want typed tools and outputs with nothing hidden, Pydantic AI, or a
-hand-rolled loop of similar size. If prompts are the fragile component and you have labelled examples
-and a metric, DSPy. Use LangChain's integrations where they save real work, not its older agent
-abstractions. Measure the same things regardless: task completion on a golden set, p95 cost and
-latency, resume success, and how long it takes a new engineer to read the final rendered prompt. In
-interviews, expect to be asked what a framework does under the hood and when you would not use one.
+- **Choose by the problem, not the popularity.**
+- **Retrieval over documents is the hard part:** start with LlamaIndex's data layer and keep the agent
+  layer thin.
+- **Resumable, inspectable control flow with human interrupts:** LangGraph is the strongest option and
+  maps directly onto a state-machine design.
+- **Typed tools and outputs with nothing hidden:** Pydantic AI, or a hand-rolled loop of similar size.
+- **Fragile prompts, with labelled examples and a metric:** DSPy.
+- **LangChain:** use its integrations where they save real work, not its older agent abstractions.
+- **Measure the same things regardless:** task completion on a golden set, p95 cost and latency, resume
+  success, and how long a new engineer takes to read the final rendered prompt.
+- **Interviews:** expect "what does a framework do under the hood?" and "when would you not use one?"
 
 ## Role lens
 - **Engineer:** Picks the thinnest layer that solves the actual problem, pins versions, reads the
@@ -276,6 +371,38 @@ LangGraph, or a small hand-rolled state machine, for control flow, and if the re
 fragile across models and the team has labelled examples, a DSPy-compiled module inside the review
 node. The retrieval side, if documents are large, is a separate decision where LlamaIndex's data layer
 may fit.
+
+## Interview questions
+### What does an agent framework actually do under the hood?
+- **The same loop as a hand-rolled agent:** assemble messages and tool schemas, call the model, validate
+  and execute tool calls, append results, repeat until an answer or a budget.
+- **Plus plumbing:** retries, streaming, persistence, interrupts, tracing and provider adapters. The
+  differences are who owns control flow, where state lives, and what is first-class.
+
+### When would you not use a framework?
+- **A small agent** with a few tools and no pause-and-resume needs, where two hundred lines of loop are
+  easier to read, test and own than a dependency's abstractions and release churn.
+- **Strict environments** where hidden prompts or vendor-coupled components are unacceptable; a
+  hand-rolled loop or a minimal library keeps everything visible.
+
+### After adding a LangGraph approval step, customers get duplicate notification emails. Why?
+- **Resume re-runs the interrupted node from its first line,** so an email sent before `interrupt()` in
+  that node goes out once on pause and again on resume.
+- **Fix:** move the email to its own node after the approval node, or give it an idempotency key so the
+  second send is a no-op.
+
+### When is DSPy worth the setup cost?
+- **When prompts are the fragile part** (they break across model versions or need constant hand-tuning)
+  and you have a metric and labelled examples, around tens of examples or more.
+- **Not when the metric is weak:** optimizing against a metric that does not match the business outcome
+  produces prompts that score well and ship worse answers. Evaluate on a held-out set.
+
+### A team wants RAG over 10,000 contracts plus an agent that drafts redlines. Which frameworks and why?
+- **Retrieval is likely the hard part,** so LlamaIndex's data layer (parsers, chunking, retrievers) is a
+  strong start, tuned beyond its defaults for scanned contracts.
+- **Control flow:** if drafts need approval and resume, LangGraph with a durable checkpointer, or Pydantic
+  AI with typed outputs if the flow is simple; expose the retrievers as tools.
+- **Keep evals framework-neutral** so either layer can be swapped later.
 
 ## Quiz
 ### Q: Which framework's core abstraction is a typed shared state updated by nodes in a graph, persisted by checkpointers?

@@ -5,7 +5,7 @@ name: Embedding models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - model-internals/embeddings
   - rag-retrieval/embedding-dimension-and-normalization
@@ -120,7 +120,7 @@ The document side runs once at index time; the query side runs per request throu
 prefix rules and pooling, and only then meets the stored vectors.
 
 ```mermaid
-flowchart LR
+flowchart TD
     DOC["Chunk text"] -->|"prefix passage"| ENC1["Encoder, pinned version"]
     ENC1 --> POOL1["Pool and L2-normalize"]
     POOL1 --> IDX[("Vector index, model id stored")]

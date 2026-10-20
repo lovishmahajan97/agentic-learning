@@ -5,7 +5,7 @@ name: DPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/rlhf
   - training-adaptation/grpo
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 DPO trains on preference pairs with a classification-style loss, no reward model or RL loop, because
-RLHF's KL-constrained objective has a closed-form optimum. You get most of RLHF's effect for an SFT
-run's cost, but offline.
+RLHF's KL-constrained optimum expresses reward through the policy itself. It gets most of RLHF's effect
+at SFT cost, but offline.
 
 ## Why it exists
 - **PPO's machinery is heavy.** Four models resident, two training; a generation loop dominating
@@ -119,14 +119,14 @@ loss pushes the implicit reward margin up, weighted by how wrong the current ran
 flowchart TD
     D[("Pairs: prompt, chosen, rejected")] --> REF["Frozen reference, the SFT model"]
     REF -->|"score once"| C[("Cached reference log-probs")]
-    D --> POL["Policy: sum log-probs over response tokens"]
-    POL --> M["Implicit reward margin: beta times log-ratio of chosen minus log-ratio of rejected"]
-    C --> M
-    M --> L["Loss: minus log sigmoid of margin"]
-    L -->|"weight high when pair is ranked backwards"| G["Gradient: raise chosen, lower rejected"]
+    D --> POL["Policy: response log-probs"]
+    POL -->|"policy log-probs"| M["Implicit reward margin"]
+    C -->|"reference log-probs"| M
+    M --> L["Loss: minus log sigmoid"]
+    L -->|"weighted by how wrong the ranking is"| G["Raise chosen, lower rejected"]
     G --> POL
-    POL -.->|"monitor"| W{"Chosen log-prob falling while margin grows?"}
-    W -.->|"yes: likelihood displacement"| FX["Raise beta or add SFT term on chosen"]
+    POL -.->|"monitor"| W{"Chosen log-prob falling?"}
+    W -.->|"yes: likelihood displacement"| FX["Raise beta or add SFT term"]
 ```
 
 ## Examples
@@ -292,12 +292,13 @@ artefacts.
   rejected, leaving a loss over the policy alone.
 - **The leash is inside the formula**, because reference log-probs appear in every pair.
 
-### Margins grow and reward accuracy looks great, but outputs get worse. What do you check?
-- **Chosen log-probability:** if it falls steadily while the margin grows, mass is leaving both
-  responses, the likelihood-displacement signature.
-- **The data's length ratio:** if chosen is usually longer, the model is learning length.
-- **Epochs and held-out accuracy:** near-100% training accuracy with flat held-out accuracy means the
-  pairs are memorised; go to one epoch, raise β or add an SFT term on chosen.
+### Your product only collects thumbs-up and thumbs-down on single responses. Can you still do DPO?
+- **Not directly:** DPO needs a chosen and a rejected response to the *same* prompt, and unpaired
+  feedback rarely gives you that.
+- **KTO fits the data as it comes:** each response is labelled desirable or undesirable, with no matched
+  pairs required.
+- **Or build pairs on purpose:** sample two responses per prompt from the current model and ask raters or
+  a calibrated judge to compare them, which also makes the data on-policy.
 
 ### When would you choose PPO or GRPO over DPO?
 - **When you need on-policy exploration**, because DPO only learns from the pairs you give it.

@@ -5,7 +5,7 @@ name: Platform strategy
 kind: decision
 difficulty: advanced
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - llmops-platform/centralized-vs-federated-ai-platform
   - llmops-platform/ai-control-plane-vs-data-plane
@@ -17,102 +17,155 @@ related:
 ---
 
 ## TL;DR
-Platform strategy decides which AI capabilities an organisation provides once, as a shared internal
-product, and which it leaves to each team, and when to make that move. The rule of thumb: platformise
-what several teams need, what varies little between them, and what carries organisation-wide risk or
-cost (model access, identity, budgets, audit, telemetry, evaluation tooling); leave the differentiating
-parts (prompts, corpora, agents, UX) with teams. Build the platform after demand appears, not before.
+Platform strategy decides which AI capabilities are provided once as a shared internal product and which
+stay with teams. Platformise what is widely needed, low-variance or risky organisation-wide; leave
+differentiating parts with teams; build after demand appears.
 
 ## Why it exists
-Once a company has more than a couple of AI projects, the same needs recur: an API key to a model
-provider, a way to log prompts and costs, a document-ingestion pipeline, an eval set and harness, PII
-redaction, a review UI. Left alone, each team builds its own. That has visible costs (duplicated
-engineering, several contracts with the same provider at worse prices) and invisible ones: no single
-inventory of where models are used, no consistent data-retention policy, no way to rotate a key or swap a
-deprecated model everywhere, and no organisation-wide view of spend.
-
-The naive fix is the opposite extreme: a central team designs a comprehensive "AI platform" up front and
-mandates it. That fails in a different way. The platform is designed from guesses about requirements, so
-it fits nobody exactly; it is built before anyone uses it, so there is no feedback; and because it is the
-only sanctioned path, every missing feature becomes a ticket in a queue while product teams wait. Teams
-then route around it, and you have both a platform and shadow stacks.
-
-Platform strategy is the discipline between these: deciding the boundary, the timing, the operating
-model and the funding so the shared layer is pulled by demand rather than pushed by architecture. It
-connects to two neighbouring lessons: build-vs-buy decides how each layer is sourced, and
-centralised-vs-federated decides the organisational ownership model. This lesson is about the sequencing
-and the economics that tie them together.
+- **The same needs recur.** Past a couple of AI projects, every team needs an API key to a model
+  provider, prompt and cost logging, document ingestion, an eval set and harness, PII redaction and a
+  review UI. Left alone, each team builds its own.
+- **Duplication has visible costs:** duplicated engineering, and several contracts with the same provider
+  at worse prices.
+- **And invisible ones:** no single inventory of where models are used, no consistent data-retention
+  policy, no way to rotate a key or swap a deprecated model everywhere, no organisation-wide view of
+  spend.
+- **The opposite extreme also fails.** A central team designs a comprehensive "AI platform" up front and
+  mandates it. It is designed from guesses, so it fits nobody exactly; built before anyone uses it, so
+  there is no feedback; and as the only sanctioned path, every missing feature becomes a ticket while
+  teams wait. Teams route around it, and you have both a platform and shadow stacks.
+- **Platform strategy sits between them.** It decides the boundary, timing, operating model and funding
+  so the shared layer is pulled by demand, not pushed by architecture. Build-vs-buy decides how each layer
+  is sourced; centralised-vs-federated decides ownership; this lesson covers the sequencing and economics
+  that tie them together.
 
 ## How it works
 ### 1. Inventory the recurring capabilities
-List what each current and roadmapped use case needs, layer by layer: model access, routing and
-fallback, secrets, prompt and model registry, retrieval and ingestion, evaluation, observability and cost
-attribution, guardrails, human review. The inventory is the demand signal; without it, the platform is
-designed from imagination.
+- **List what each current and roadmapped use case needs, layer by layer:** model access, routing and
+  fallback, secrets, prompt and model registry, retrieval and ingestion, evaluation, observability and
+  cost attribution, guardrails, human review.
+- **The inventory is the demand signal.** Without it, the platform is designed from imagination.
 
 ### 2. Score each capability on three questions
-- **Breadth of demand:** how many teams need it now or in the next two quarters? A common heuristic is to
-  wait until the third consumer, *because* by then you have seen enough variation to generalise correctly.
-- **Variance between teams:** do they need roughly the same thing (a gateway, audit logging) or genuinely
-  different things (a retrieval strategy tuned to legal contracts vs. support tickets)? Low-variance
-  capabilities centralise well; high-variance ones become a lowest-common-denominator abstraction that
-  every team fights.
-- **Externalities:** does getting it wrong in one team create risk or cost for everyone (leaked keys,
-  data sent to an unapproved region, uncapped spend, no audit trail)? Those belong in the shared layer
-  even with low demand, *because* the cost of inconsistency is organisational.
+| Question | What to ask | Implication |
+|---|---|---|
+| **Breadth of demand** | How many teams need it now or in the next two quarters? | Common heuristic: wait until the third consumer, *because* by then you have seen enough variation to generalise correctly. |
+| **Variance between teams** | Roughly the same thing (a gateway, audit logging) or genuinely different (retrieval tuned to legal contracts vs. support tickets)? | Low-variance capabilities centralise well; high-variance ones become a lowest-common-denominator abstraction every team fights. |
+| **Externalities** | Does getting it wrong in one team create risk or cost for everyone (leaked keys, data in an unapproved region, uncapped spend, no audit trail)? | These belong in the shared layer even with low demand, *because* the cost of inconsistency is organisational. |
 
 ### 3. Check the economics before you centralise
-The three questions combine into a rough break-even. With *n* teams each spending *c_team* to build and
-run their own version, and a platform costing *C_platform* to build and run plus *c_adopt* per team to
-integrate and adapt:
+With *n* teams each spending *c_team* to build and run their own version, and a platform costing
+*C_platform* to build and run plus *c_adopt* per team to integrate and adapt:
 
 ```
 centralise when  n × c_team  >  C_platform + n × c_adopt + coordination cost
                  (+ the expected cost of an inconsistency incident, for high-externality items)
 ```
 
-Variance is what makes this fail: when teams' needs differ, *c_adopt* rises toward *c_team* (every team
-still does most of the work, now fighting an abstraction), and the inequality never holds however large
-*n* gets. Externalities enter as the last term, which is why a gateway or audit log can justify itself at
-*n* = 2 while a shared chunking library cannot at *n* = 6. The same arithmetic covers sourcing: if a
-commercial or open-source gateway gives you most of *C_platform* for less, the platform team's job is to
-operate and integrate it, not to write one.
+- **Variance is what breaks it.** When needs differ, *c_adopt* rises toward *c_team* (every team still does
+  most of the work, now fighting an abstraction), and the inequality never holds however large *n* gets.
+- **Externalities enter as the last term.** That is why a gateway or audit log can justify itself at
+  *n* = 2 while a shared chunking library cannot at *n* = 6.
+- **The same arithmetic covers sourcing.** If a commercial or open-source gateway gives you most of
+  *C_platform* for less, the platform team's job is to operate and integrate it, not to write one.
 
 ### 4. Draw a thin mandatory core and an optional paved road
-The core is what every AI workload must go through: identity, approved model access through a gateway,
-budgets and rate limits, logging to a common trace store, data-classification rules. It is mandatory
-*because* its value comes from being universal (one inventory, one place to swap a model). The paved road
-is everything else the platform offers as defaults (an eval harness, an ingestion template, a review UI):
-optional, but easier than building your own. Teams that leave the paved road accept owning what they
-build.
+- **Mandatory core:** what every AI workload must go through: identity, approved model access through a
+  gateway, budgets and rate limits, logging to a common trace store, data-classification rules. Mandatory
+  *because* its value comes from being universal (one inventory, one place to swap a model).
+- **Paved road:** everything else offered as defaults (an eval harness, an ingestion template, a review
+  UI). Optional, but easier than building your own.
+- **Off-road teams own what they build.**
 
 ### 5. Treat the platform as a product
-It has users (internal teams), a roadmap driven by their needs, documentation, SLOs and adoption metrics:
-number of teams onboarded, time from idea to first production call, share of spend flowing through the
-gateway. A platform team measured on features shipped rather than on consumer outcomes drifts toward the
-over-built monolith described above.
+- **It has users** (internal teams), a roadmap driven by their needs, documentation and SLOs.
+- **Adoption metrics:** number of teams onboarded, time from idea to first production call, share of
+  spend flowing through the gateway.
+- **Measure outcomes, not output.** A platform team measured on features shipped drifts toward the
+  over-built monolith described above.
 
 ### 6. Choose a funding model
-Central funding makes adoption easy but hides cost. Showback (reporting each team's usage) creates
-awareness without friction. Chargeback (billing teams) aligns incentives but can push teams to route
-around the platform to save money. Many organisations start with central funding plus showback and move
-to chargeback for variable costs such as tokens once usage is significant.
+| Model | Effect |
+|---|---|
+| **Central funding** | Makes adoption easy but hides cost. |
+| **Showback** (reporting each team's usage) | Creates awareness without friction. |
+| **Chargeback** (billing teams) | Aligns incentives, but can push teams to route around the platform to save money. |
+
+Many organisations start with central funding plus showback, and move to chargeback for variable costs
+such as tokens once usage is significant.
 
 ### 7. Keep seams so decisions are reversible
-Expose the platform through stable internal interfaces (an OpenAI-compatible endpoint, a trace schema,
-an eval-result format) rather than leaking a vendor's SDK into every service, *because* the model and
-tooling market changes quickly and you will swap components under the interface.
+- **Expose stable internal interfaces:** an OpenAI-compatible endpoint, a trace schema, an eval-result
+  format.
+- **Do not leak a vendor's SDK into every service**, *because* the model and tooling market changes
+  quickly and you will swap components under the interface.
 
 ### 8. Engineer the core as shared infrastructure
-A mandatory gateway is on every AI request path, so its failure is everyone's outage. Run it with the
-availability target of the most demanding consumer, keep it stateless and horizontally scaled, and decide
-up front what happens when it is down (fail closed for high-risk traffic, fail open to a direct route only
-where policy allows), *because* the centralisation that gives you one place to swap a model also gives you
-one place to break all of them.
+- **A mandatory gateway is on every AI request path**, so its failure is everyone's outage.
+- **Run it at the availability target of the most demanding consumer**, stateless and horizontally
+  scaled.
+- **Decide the down-mode up front:** fail closed for high-risk traffic, fail open to a direct route only
+  where policy allows.
+- **Why:** the centralisation that gives you one place to swap a model also gives you one place to break
+  all of them.
 
-## Example
-A worked scenario. An insurer has six product teams using LLMs. The platform lead tabulates the
-capabilities (team counts come from the inventory; the scenario is illustrative):
+## Diagram
+Run each capability through this decision path: externalities pull it into the core even at low demand,
+while high variance keeps it with teams however many need it.
+
+```mermaid
+flowchart TD
+    C["Recurring capability from inventory"] --> X{"High externality?"}
+    X -->|"yes: spend, audit, residency"| CORE["Mandatory core"]
+    X -->|"no"| V{"Variance between teams?"}
+    V -->|"high"| TEAM["Team-owned, revisit later"]
+    V -->|"low"| N{"Three or more consumers?"}
+    N -->|"not yet"| TEAM
+    N -->|"yes"| E{"Break-even holds?"}
+    E -->|"yes"| PAVED["Paved road default"]
+    E -->|"no"| TEAM
+    CORE --> I["Stable interface: gateway, trace schema"]
+    PAVED --> I
+```
+
+## Examples
+### Break-even calculator for centralising a capability
+The inequality from step 3 as code. Costs are $k per year and illustrative; the point is how variance
+and externalities move the answer.
+
+```python
+def teams_cost(n, c_team, incident=0):
+    return n * c_team + incident          # every team builds and runs its own, plus expected incident cost
+
+def platform_cost(n, C_platform, c_adopt, coord):
+    return C_platform + n * c_adopt + coord
+
+items = {  # c_team, C_platform, c_adopt, coord, incident   ($k per year, illustrative)
+    "gateway+budgets":  (60, 150, 10, 20, 200),
+    "gateway, no risk": (60, 150, 10, 20, 0),
+    "chunking library": (40, 120, 35, 20, 0),
+}
+for name, (c_team, C, c_adopt, coord, inc) in items.items():
+    for n in (2, 6):
+        t, p = teams_cost(n, c_team, inc), platform_cost(n, C, c_adopt, coord)
+        print(f"{name:16} n={n}: teams {t:>3} vs platform {p:>3} ->",
+              "centralise" if t > p else "leave with teams")
+# gateway+budgets  n=2: teams 320 vs platform 190 -> centralise
+# gateway+budgets  n=6: teams 560 vs platform 230 -> centralise
+# gateway, no risk n=2: teams 120 vs platform 190 -> leave with teams
+# gateway, no risk n=6: teams 360 vs platform 230 -> centralise
+# chunking library n=2: teams  80 vs platform 210 -> leave with teams
+# chunking library n=6: teams 240 vs platform 350 -> leave with teams
+```
+
+- **The gateway clears break-even at n = 2 only because of the incident term**; without it, it needs more
+  consumers.
+- **The chunking library never clears it**, because `c_adopt` (35) is close to `c_team` (40): high
+  variance means each team still does most of the work.
+
+### Worked scenario: an insurer with six product teams
+The platform lead tabulates the capabilities (team counts come from the inventory; the scenario is
+illustrative):
 
 | Capability | Teams needing it | Variance | Externality | Decision |
 |---|---|---|---|---|
@@ -124,51 +177,73 @@ capabilities (team counts come from the inventory; the scenario is illustrative)
 | Retrieval strategy / chunking | 3 | high | low | team-owned |
 | Agent framework | 2 | high | low | team-owned, revisit |
 
-Before the platform, each team had its own provider account; finance saw six invoices and no per-feature
-breakdown, and security found two teams sending claim documents to a model region the data policy did
-not allow. The first platform release is deliberately small: a gateway in front of approved models, with
-per-team budgets, common logging and redaction. Migration is cheap for teams because the gateway speaks
-the same API shape they already call. Within a quarter, all spend is attributable per feature, one team's
-model deprecation is handled by changing a routing rule once that team's evals pass on the
-replacement model, and the eval harness is offered next because
-five teams asked for it. Agent frameworks stay team-owned: only two teams use them and their needs
-differ, so a shared abstraction now would freeze the wrong design.
+1. **Before:** each team had its own provider account; finance saw six invoices and no per-feature
+   breakdown; security found two teams sending claim documents to a model region the data policy did not
+   allow.
+2. **First release, deliberately small:** a gateway in front of approved models, with per-team budgets,
+   common logging and redaction.
+3. **Cheap migration:** the gateway speaks the same API shape teams already call.
+4. **Within a quarter:** all spend is attributable per feature; one team's model deprecation is handled by
+   changing a routing rule once that team's evals pass on the replacement model.
+5. **Next:** the eval harness, because five teams asked for it.
+6. **Agent frameworks stay team-owned:** only two teams use them and their needs differ, so a shared
+   abstraction now would freeze the wrong design.
+
+## Production patterns
+- **Gateway with per-team keys and budgets** — as the first core release, put an OpenAI-compatible proxy
+  (open-source such as LiteLLM's proxy, or a commercial gateway) in front of approved models, issue one key
+  per team or workload with a spend limit, and block direct provider keys. Monitor share of spend through
+  the gateway and provider invoices that map to no registered workload.
+- **Showback from request metadata** — require team and feature tags on every gateway request, write them
+  into the common trace store, and publish a monthly per-feature cost report before considering
+  chargeback. Monitor the share of untagged spend.
+- **Model aliases as the swap seam** — services call a stable alias (for example "extraction-default")
+  that the gateway maps to a concrete model version; change the mapping only after the consuming team's
+  evals pass. Monitor error rate and cost per alias after each remap.
+- **Tier-one gateway operations** — run the gateway stateless with multiple replicas across zones, with a
+  documented fail-closed or fail-open rule per traffic class. Monitor availability, added p99 latency and
+  how often teams request bypass routes.
+- **Exception register for off-road teams** — any team leaving the paved road records owner, reason and a
+  review date. Monitor the count; a rising number means the paved road no longer fits.
 
 ## Trade-offs
-- A mandatory core gives one inventory, one audit trail and one place to swap models, but adds a hop and
-  a dependency; it flips toward federation when latency budgets are tight or teams are in separate
-  regulatory domains.
-- Building the platform after the third consumer generalises from real needs, but tolerates some early
+- **Mandatory core vs latency and autonomy.** One inventory, one audit trail and one place to swap models,
+  but an extra hop and a dependency; it flips toward federation when latency budgets are tight or teams
+  are in separate regulatory domains.
+- **Wait for the third consumer vs early consistency.** Generalising from real needs tolerates some early
   duplication; it flips when an externality (data residency, spend) makes even two divergent stacks
   unacceptable.
-- Abstracting over model providers enables switching and routing, but hides provider-specific features
-  (caching modes, tool formats); allow pass-through for teams that need those features.
-- Chargeback aligns usage with cost, but taxes adoption; prefer showback until the platform is the
-  default path and token spend is material.
+- **Provider abstraction vs provider features.** Abstracting over providers enables switching and routing,
+  but hides provider-specific features (caching modes, tool formats); allow pass-through for teams that
+  need them.
+- **Chargeback vs adoption.** Chargeback aligns usage with cost but taxes adoption; prefer showback until
+  the platform is the default path and token spend is material.
 
 ## Pitfalls
-- Building a comprehensive platform before any consumer exists; the symptom is a polished system with
-  low adoption and teams quietly keeping their own API keys.
-- Centralising high-variance capabilities like retrieval strategy; teams file endless feature requests or
-  fork the shared component, and its configuration surface balloons.
-- A platform team measured on output, not adoption; it ships features nobody asked for while the top
+- **Building a comprehensive platform before any consumer exists.** Symptom: a polished system with low
+  adoption and teams quietly keeping their own API keys. Fix: build from the first projects' shared parts.
+- **Centralising high-variance capabilities like retrieval strategy.** Teams file endless feature requests
+  or fork the shared component, and its configuration surface balloons.
+- **A platform team measured on output, not adoption.** It ships features nobody asked for while the top
   consumer request ages in the backlog.
-- Leaking one vendor's SDK through the platform interface; the first provider migration turns into a
+- **Leaking one vendor's SDK through the platform interface.** The first provider migration turns into a
   change in every consuming service.
-- No exit path for teams off the paved road; exceptions accumulate as unreviewed shadow stacks that show
-  up as provider invoices finance cannot map to any registered workload.
-- Running the gateway like an internal tool rather than tier-one infrastructure; the symptom is a single
-  gateway incident that takes down every AI feature at once, followed by teams asking for bypass routes.
+- **No exit path for teams off the paved road.** Exceptions accumulate as unreviewed shadow stacks that
+  show up as provider invoices finance cannot map to any registered workload.
+- **Running the gateway like an internal tool rather than tier-one infrastructure.** A single gateway
+  incident takes down every AI feature at once, followed by teams asking for bypass routes.
 
 ## When to use
-Make platform decisions explicitly once two or three teams are building on models, or earlier if a
-compliance or spend externality already exists. Start with the thin core: gateway, identity, budgets,
-logging. Add paved-road components when demand is proven and variance is low. Measure adoption, time to
-first production call, share of traffic and spend through the core, lead time on the platform's top
-consumer requests, and the number of approved exceptions (a rising count means the paved road no longer
-fits). Do not build a
-platform as the first AI project; build it out of the first projects' shared parts. In interviews, show
-you can name what to centralise and why, and when you would deliberately leave duplication in place.
+- **Use when:** two or three teams are building on models, or earlier if a compliance or spend externality
+  already exists.
+- **Start with the thin core:** gateway, identity, budgets, logging. Add paved-road components when demand
+  is proven and variance is low.
+- **Measure:** adoption, time to first production call, share of traffic and spend through the core, lead
+  time on the platform's top consumer requests, and the number of approved exceptions (a rising count
+  means the paved road no longer fits).
+- **Avoid:** building a platform as the first AI project; build it out of the first projects' shared parts.
+- **Interviews:** show you can name what to centralise and why, and when you would deliberately leave
+  duplication in place.
 
 ## Role lens
 - **Engineer:** Consumes the platform through its stable interface and contributes back components that a
@@ -188,6 +263,39 @@ other. What the platform should provide now are the low-variance parts both team
 access through the gateway, tracing, budgets, sandboxed tool credentials. Revisit when a third team needs
 agents and the common shape is visible, and keep a light standard (trace format, approval-gate pattern)
 so convergence later is cheap.
+
+## Interview questions
+### What belongs in a mandatory AI platform core, and why make it mandatory at all?
+- **The core:** identity, approved model access through a gateway, budgets and rate limits, common
+  logging and data-classification rules.
+- **Mandatory because its value is universality.** One inventory, one audit trail and one place to swap a
+  deprecated model only work if every workload goes through it; everything else can be an optional paved
+  road.
+
+### Teams keep bypassing your gateway with their own provider keys. How do you investigate and fix it?
+- **Find the reason first:** check the backlog for the top consumer requests, the added latency, missing
+  provider features, and whether chargeback made bypassing cheaper locally.
+- **Fix the cause:** allow pass-through for provider-specific features, cut lead time on top requests,
+  switch to showback if billing drives the bypass.
+- **Then close the door:** block direct provider keys and reconcile invoices against registered workloads.
+
+### When would you deliberately leave duplication in place?
+- **High-variance capabilities** such as retrieval strategy or agent frameworks, because a shared
+  abstraction pushes adoption cost close to each team's own build cost and freezes the wrong design.
+- **Early, low-externality needs** with fewer than three consumers, since the real variation is not yet
+  visible; keep a light standard (trace format) so convergence later is cheap.
+
+### How do you decide between central funding, showback and chargeback?
+- **Start with central funding plus showback**, because adoption matters most while the platform is not
+  yet the default path, and showback builds cost awareness without friction.
+- **Move to chargeback for variable costs** such as tokens once usage is significant and the core is
+  unavoidable; earlier, billing pushes teams to route around the platform.
+
+### The gateway is on every AI request path. What do you put in its design review?
+- **Availability** set by the most demanding consumer, stateless replicas and horizontal scaling.
+- **Failure mode per traffic class:** fail closed for high-risk traffic, fail open to a direct route only
+  where policy allows, decided before the first incident.
+- **Numbers to watch:** added p99 latency, error rate per upstream model, and share of traffic through it.
 
 ## Quiz
 ### Q: Which capability is the strongest candidate for the mandatory platform core?

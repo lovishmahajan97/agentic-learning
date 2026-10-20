@@ -5,7 +5,7 @@ name: Docker
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/kubernetes
   - backend-fundamentals/ci-cd
@@ -22,112 +22,136 @@ sources:
 ---
 
 ## TL;DR
-Docker packages an application with its exact filesystem (OS libraries, interpreter, CUDA runtime,
-your code) into an immutable, content-addressed image, and runs it as an isolated process on the
-host's kernel using Linux namespaces and cgroups. It exists because "install these dependencies on the
-server" is not reproducible; the image makes the build the unit of deployment, so what passed CI is
-byte-for-byte what runs in production. For AI services the image pins the CUDA and torch stack, which
-is where most environment drift lives.
+Docker packages an app with its exact filesystem (OS libraries, interpreter, CUDA runtime, code) into an
+immutable, content-addressed image and runs it as an isolated process on the host kernel. What passed CI
+is byte-for-byte what runs in production.
 
 ## Why it exists
-A Python service depends on far more than its `requirements.txt`: the interpreter version, system
-libraries such as glibc and OpenSSL, compiled wheels built against a specific CUDA version, locale
-settings, environment variables. Installing all of that by hand or by script onto a VM drifts: two
-servers provisioned three months apart differ in ways nobody recorded, "works on my machine" is a
-literal description of the problem, and rolling back means uninstalling. Virtual machines fix
-isolation, but a VM image is gigabytes with its own kernel, boots in tens of seconds to minutes,
-and running one per service wastes memory and makes dev/prod parity painful, so people share VMs
-and the drift returns.
-
-The insight behind containers is that a process does not need its own kernel to be isolated. The Linux
-kernel already has namespaces (what a process can *see*: its own process tree, network interfaces,
-mount table) and cgroups (what it can *use*: CPU, memory, I/O). Add a filesystem built from a
-declarative recipe, make it immutable and addressable by content hash, and add a registry to move it
-between machines, and the artifact itself becomes the deployment unit: no install step on the target,
-no drift, rollback is pointing at the previous image.
-
-For AI work this is the difference between a day of "which torch wheel matches which CUDA" and an
-image that runs identically on a laptop GPU, a CI runner and a Kubernetes GPU node. The naive
-alternative, a virtualenv plus a setup script, pins Python packages but nothing beneath them, and the
-things beneath them (CUDA libraries, system codecs, build toolchains) are exactly what breaks.
+- **A service depends on far more than `requirements.txt`.** The interpreter version, system libraries such
+  as glibc and OpenSSL, compiled wheels built against a specific CUDA version, locale settings, environment
+  variables.
+- **Hand or scripted installs drift.** Two servers provisioned three months apart differ in ways nobody
+  recorded, "works on my machine" is a literal description of the problem, and rolling back means
+  uninstalling.
+- **VMs fix isolation at a high price.** A VM image is gigabytes with its own kernel, boots in tens of
+  seconds to minutes, and one per service wastes memory and makes dev/prod parity painful, so people share
+  VMs and the drift returns.
+- **A process does not need its own kernel to be isolated.** Linux namespaces control what a process can
+  *see* (process tree, network interfaces, mount table); cgroups control what it can *use* (CPU, memory,
+  I/O). Add an immutable, content-hashed filesystem and a registry, and the artifact becomes the deployment
+  unit: no install step, no drift, rollback is pointing at the previous image.
+- **For AI it ends "which torch wheel matches which CUDA".** A virtualenv plus setup script pins Python
+  packages but nothing beneath them, and CUDA libraries, system codecs and build toolchains are exactly
+  what breaks. One image runs identically on a laptop GPU, a CI runner and a Kubernetes GPU node.
 
 ## How it works
 ### Images: layers and content addressing
-A Dockerfile is a sequence of instructions. Each `RUN`, `COPY` and `ADD` produces a layer: a tarball
-of the filesystem changes relative to the previous layer, identified by the hash of its contents. An
-image is an ordered list of layer digests plus a config (entrypoint, environment, exposed ports,
-user). Layers are immutable and shared: twenty services built on the same `python:3.12-slim` base hold
-one copy of those layers on disk and in the registry, and a push uploads only layers the registry
-lacks. At run time a union filesystem (overlay2 on most hosts) stacks the layers read-only and adds a
-thin writable layer per container. Writes to that layer disappear with the container, which is *why*
-durable state goes in volumes and not in the container filesystem.
+- **Each `RUN`, `COPY` and `ADD` produces a layer:** a tarball of filesystem changes relative to the previous
+  layer, identified by the hash of its contents.
+- **An image is an ordered list of layer digests plus a config** (entrypoint, environment, exposed ports,
+  user).
+- **Layers are immutable and shared.** Twenty services built on the same `python:3.12-slim` base hold one copy
+  of those layers on disk and in the registry, and a push uploads only layers the registry lacks.
+- **At run time a union filesystem** (overlay2 on most hosts) stacks the layers read-only and adds a thin
+  writable layer per container. Writes there disappear with the container, which is *why* durable state goes
+  in volumes, not the container filesystem.
 
-The build cache follows from this. Each instruction's result is cached, keyed on the instruction and
-its inputs (for `COPY`, the content of the copied files). The first instruction whose inputs changed
-invalidates every later layer, so ordering is a performance decision: copy the dependency manifest,
-install, then copy source, because source changes every commit and dependencies change every few
-weeks. Get it backwards and every commit reinstalls torch.
+### The build cache
+1. Each instruction's result is cached, keyed on the instruction and its inputs (for `COPY`, the content of
+   the copied files).
+2. The first instruction whose inputs changed invalidates every later layer.
+3. So ordering is a performance decision: copy the dependency manifest, install, then copy source,
+   *because* source changes every commit and dependencies every few weeks. Get it backwards and every commit
+   reinstalls torch.
 
 ### Containers: namespaces and cgroups
-`docker run` starts a process with its own PID namespace (it sees itself as PID 1), network namespace
-(own interfaces and port space), mount namespace (its root is the image), UTS and IPC namespaces, and
-optionally a user namespace. A cgroup caps CPU and memory: exceeding `--memory` triggers the kernel's
-OOM killer for that container, which exits with code 137 and no application traceback. By default a
-container also drops most Linux capabilities and runs under a seccomp profile that filters syscalls.
-It remains a normal process: `ps` on the host shows it, a kernel vulnerability escapes it, and it
-starts in milliseconds. Isolation is therefore good enough for your own services and not enough for
-running untrusted code, which is why agent sandboxes use stronger boundaries such as gVisor or
-microVMs.
+| Mechanism | What `docker run` gives the process |
+|---|---|
+| PID namespace | Sees itself as PID 1 |
+| Network namespace | Own interfaces and port space |
+| Mount namespace | Its root is the image |
+| UTS, IPC, optional user namespace | Own hostname, IPC objects, optionally remapped users |
+| cgroup | CPU and memory caps; exceeding `--memory` triggers the kernel OOM killer: exit code 137, no traceback |
+| Capabilities and seccomp | Most Linux capabilities dropped; a seccomp profile filters syscalls |
+
+- **It remains a normal process.** `ps` on the host shows it, a kernel vulnerability escapes it, and it
+  starts in milliseconds.
+- **Good enough for your own services, not for untrusted code,** which is why agent sandboxes use stronger
+  boundaries such as gVisor or microVMs.
 
 ### PID 1 and signals
-The container's main process is PID 1 in its namespace, and the kernel treats PID 1 specially: default
-signal dispositions do not apply, so a process without an explicit SIGTERM handler ignores
-`docker stop` and is SIGKILLed when the grace period (10 seconds by default) expires. Two consequences:
-use the exec form `CMD ["uvicorn", ...]` rather than the shell form `CMD uvicorn ...`, because the
-shell form wraps the command in `/bin/sh -c`, and unless that shell happens to `exec` the command
-(behaviour varies by shell and command), the shell is PID 1 and does not forward the signal;
-and if the app spawns children, run under `--init` or `tini` so zombies are reaped. This plumbing is
-what makes graceful draining of an in-flight streaming response possible later in Kubernetes.
+- **The kernel treats PID 1 specially:** default signal dispositions do not apply, so a process without an
+  explicit SIGTERM handler ignores `docker stop` and is SIGKILLed when the grace period (10 seconds by
+  default) expires.
+- **Use the exec form** `CMD ["uvicorn", ...]`, not the shell form `CMD uvicorn ...`, *because* the shell
+  form wraps the command in `/bin/sh -c`; unless that shell happens to `exec` the command (behaviour varies by
+  shell and command), the shell is PID 1 and does not forward the signal.
+- **If the app spawns children,** run under `--init` or `tini` so zombies are reaped.
+- **Why it matters later:** this plumbing is what makes graceful draining of an in-flight streaming response
+  possible in Kubernetes.
 
 ### Tags, digests and registries
-A tag such as `:1.4.2` or `:latest` is a mutable pointer; the digest `sha256:…` is the immutable
-identity. Deploy by digest or by an immutable tag like the git SHA, because `:latest` on two nodes can
-mean two different images.
+- **A tag** such as `:1.4.2` or `:latest` is a mutable pointer; **the digest** `sha256:…` is the immutable
+  identity.
+- **Deploy by digest or an immutable tag like the git SHA,** because `:latest` on two nodes can mean two
+  different images.
 
 ### Multi-stage builds
-A build stage with compilers, headers and dev tools produces artifacts; the final stage copies only
-those artifacts into a slim runtime base. The toolchain never ships, the image shrinks, and the attack
-surface with it.
+A build stage with compilers, headers and dev tools produces artifacts; the final stage copies only those
+into a slim runtime base. The toolchain never ships, the image shrinks, and the attack surface with it.
 
 ### GPUs
-Containers see no GPU by default. The NVIDIA Container Toolkit injects the device nodes and the host
-driver's user-space libraries when you run with `--gpus all`. The split is: the image carries the CUDA
-runtime and torch, the host carries the kernel driver, and the host driver must be new enough for the
-CUDA version in the image. ML images are large (several gigabytes is typical, as an order of
-magnitude), so base-image choice and layer ordering directly set pull time, which becomes cold-start
-time when autoscaling.
+- **Containers see no GPU by default.** The NVIDIA Container Toolkit injects device nodes and the host
+  driver's user-space libraries when you run with `--gpus all`.
+- **The split:** the image carries the CUDA runtime and torch; the host carries the kernel driver, which must
+  be new enough for the image's CUDA version.
+- **Size is cold-start time.** ML images are large (several gigabytes is typical, as an order of magnitude),
+  so base-image choice and layer ordering set pull time, which becomes cold-start time when autoscaling.
 
 ### Compose
-`docker compose` runs several containers (API, Redis, Postgres, a vector database) on one network with
-named volumes from a single file: the local development stack that mirrors production topology.
+`docker compose` runs several containers (API, Redis, Postgres, a vector database) on one network with named
+volumes from a single file: the local development stack that mirrors production topology.
 
 ### What "Docker" actually is, and the alternatives
-"Docker" names a stack, and the pieces are separable *because* they were standardised by the Open
-Container Initiative. The `docker` CLI talks to the `dockerd` daemon; builds go through BuildKit; the
-daemon hands containers to containerd, which uses runc to set up the namespaces and cgroups. The image
-format and the runtime contract are OCI specifications, so an image built by Docker runs under any
-OCI runtime. Kubernetes nodes run containerd or CRI-O directly through the Container Runtime Interface
-and have not used Docker as the runtime since dockershim was removed (v1.24); Docker-built images run
-there unchanged, but `docker ps` on a node shows nothing. Podman offers a largely compatible CLI
-without a central root daemon and is common where rootless operation is required; Buildah and kaniko
-build images without a daemon, which suits CI runners that must not expose a privileged Docker socket.
-The choice rarely changes the Dockerfile; it changes who needs root on the build machine.
+"Docker" names a stack whose pieces are separable *because* the Open Container Initiative standardised them.
 
-## Example
-A multi-stage Dockerfile for a FastAPI inference service using `uv`. Dependencies are installed from
-the lockfile in their own layer before the source is copied, the runtime stage contains only the
-virtualenv and code, the process runs as a non-root user, and the exec-form `CMD` makes uvicorn PID 1
-so it receives SIGTERM. Pin the `uv` image to a specific version in a real repository.
+| Piece | Role |
+|---|---|
+| `docker` CLI → `dockerd` daemon | User interface and API |
+| BuildKit | Builds |
+| containerd → runc | Runs containers; runc sets up namespaces and cgroups |
+| OCI image and runtime specs | Any OCI runtime runs a Docker-built image |
+| containerd or CRI-O via the Container Runtime Interface | What Kubernetes nodes use; Docker not the runtime since dockershim was removed (v1.24) |
+| Podman | Largely compatible CLI, no central root daemon; common where rootless is required |
+| Buildah, kaniko | Daemonless builds, suited to CI runners that must not expose a privileged Docker socket |
+
+- **On a Kubernetes node** Docker-built images run unchanged, but `docker ps` shows nothing.
+- **The choice rarely changes the Dockerfile;** it changes who needs root on the build machine.
+
+## Diagram
+Follow an image from recipe to running process: build once, address by digest, and every node runs the same
+bytes with only a thin writable layer on top.
+
+```mermaid
+flowchart TD
+    DF["Dockerfile"] --> BK["BuildKit: one layer per step"]
+    BK --> IMG["Image: layer digests plus config"]
+    IMG -->|"push missing layers"| REG[("Registry")]
+    REG -->|"pull by digest"| N["Node: containerd and runc"]
+    N --> C["Container process, PID 1"]
+    C --- NS["Namespaces: what it sees"]
+    C --- CG["cgroups: what it uses"]
+    C --> WL["Thin writable layer, lost on exit"]
+    C -.->|"durable state"| V[("Volume")]
+```
+
+## Examples
+### Multi-stage Dockerfile for a FastAPI inference service
+Built with `uv`:
+- **Dependencies are installed from the lockfile in their own layer** before the source is copied.
+- **The runtime stage contains only the virtualenv and code,** and the process runs as a non-root user.
+- **The exec-form `CMD` makes uvicorn PID 1** so it receives SIGTERM.
+- **Pin the `uv` image** to a specific version in a real repository.
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -155,8 +179,8 @@ HEALTHCHECK --interval=30s --timeout=3s \
 CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-Build and run it with an immutable tag and a memory cap; a `.dockerignore` listing `.git`, `.venv`,
-`data/` and model weights keeps the build context small and the `COPY` cache stable:
+Build and run it with an immutable tag and a memory cap. A `.dockerignore` listing `.git`, `.venv`, `data/`
+and model weights keeps the build context small and the `COPY` cache stable.
 
 ```bash
 docker build -t llm-api:$(git rev-parse --short HEAD) .
@@ -164,49 +188,104 @@ docker run --rm -p 8000:8000 --memory=2g -e LLM_SECRET_ID=prod/llm llm-api:$(git
 docker history llm-api:$(git rev-parse --short HEAD)   # where did the bytes go?
 ```
 
+### A PID 1 that drains on SIGTERM
+Runnable with the standard library. As PID 1 this process gets no default SIGTERM behaviour, so it installs
+a handler, finishes in-flight work and exits 0 well inside the 10-second grace period.
+
+```python
+import signal, sys, threading, time
+
+stop = threading.Event()
+
+def on_term(signum, frame):
+    print("SIGTERM received: stop accepting work, finish in-flight", flush=True)
+    stop.set()
+
+signal.signal(signal.SIGTERM, on_term)
+print("serving", flush=True)
+while not stop.is_set():
+    time.sleep(0.2)            # stand-in for serving requests
+time.sleep(1)                  # stand-in for draining one in-flight stream
+print("drained, exiting 0", flush=True)
+sys.exit(0)
+# Try it: python drain.py & sleep 1; kill -TERM $!   (in a container: docker stop <name>)
+```
+
+### Worked scenario: reading exit codes after a restart
+Container exit codes above 128 mean "killed by signal (code minus 128)". That turns a silent restart into a
+diagnosis.
+
+| Exit code | Signal | Usual cause | Fix |
+|---|---|---|---|
+| 0 | none | Clean exit after handling SIGTERM | Nothing to fix |
+| 137 | 9 (SIGKILL) | Memory over `--memory` (OOM killer), or SIGTERM ignored until the grace period ended | Raise the limit above real peak, or add a handler and exec-form `CMD` |
+| 143 | 15 (SIGTERM) | Process died from SIGTERM with default handling | Add a handler that drains before exiting |
+| 1 | none | Application error | Read `docker logs` for the traceback |
+
+- **Telling the two 137 cases apart:** `docker inspect` reports `OOMKilled: true` for memory kills; a stop
+  that took exactly ten seconds points at signal handling.
+
+## Production patterns
+- **Deploy by digest.** Tag images with the git SHA, then record the pushed digest (shown by `docker push`,
+  or `docker inspect --format '{{index .RepoDigests 0}}' <image>`) in the deploy manifest. Monitor which
+  digest runs in each environment so "what is in prod" has one answer.
+- **Shared build cache in CI.** Export BuildKit cache to the registry with `docker buildx build --cache-to
+  type=registry,ref=<repo>:buildcache,mode=max --cache-from type=registry,ref=<repo>:buildcache`, so fresh
+  runners skip unchanged dependency layers. Track cached versus uncached build time.
+- **Scan and gate images.** Run an image scanner such as Trivy (`trivy image --severity CRITICAL,HIGH
+  --exit-code 1 <image>`) in CI and fail on fixable critical findings. Monitor open critical CVEs per base
+  image and rebuild on base-image updates.
+- **Harden the runtime.** Run as a non-root `USER`, add `--read-only` with a `--tmpfs /tmp`, and
+  `--cap-drop ALL`, adding back only what the service needs. Watch for permission errors in logs after
+  enabling, which reveal unexpected writes.
+- **Keep weights out of the image.** Ship code and runtime only; load weights from object storage or a
+  persistent volume with a node-local cache, and pre-pull large images on GPU nodes. Measure pull time and
+  model-load time separately.
+
 ## Trade-offs
-- Images make deploys reproducible and rollback a pointer change, but a multi-gigabyte CUDA image takes
-  minutes to pull onto a fresh node, so autoscaling latency becomes an image-size problem; the fix flips
-  toward runtime bases, pre-pulled nodes and weights stored outside the image.
-- Sharing the host kernel gives near-native performance and millisecond startup compared with a VM,
-  but weaker isolation; for code you did not write, such as agent-generated scripts, the balance flips
-  to gVisor or microVM sandboxes.
-- Layer caching makes rebuilds fast when instructions are ordered well, but the cache only knows the
-  inputs the Dockerfile shows it; an `apt-get update` cached from last month or a `pip install`
-  without a lockfile yields different images on different days.
-- One container holding the API and the model is simple to run, but splitting the model server from
-  the API adds a network hop in exchange for scaling and restarting the two independently.
+- **Reproducible images vs pull time.** Deploys are reproducible and rollback is a pointer change, but a
+  multi-gigabyte CUDA image takes minutes to pull onto a fresh node, so autoscaling latency becomes an
+  image-size problem. The fix flips toward runtime bases, pre-pulled nodes and weights outside the image.
+- **Shared kernel vs isolation.** Near-native performance and millisecond startup compared with a VM, but
+  weaker isolation; for code you did not write, such as agent-generated scripts, the balance flips to gVisor
+  or microVM sandboxes.
+- **Layer caching vs hidden inputs.** Rebuilds are fast when instructions are ordered well, but the cache
+  only knows the inputs the Dockerfile shows it; an `apt-get update` cached from last month or a `pip
+  install` without a lockfile yields different images on different days.
+- **One container vs split model server.** API plus model in one container is simple to run; splitting the
+  model server from the API adds a network hop in exchange for scaling and restarting the two independently.
 
 ## Pitfalls
-- Shell-form `CMD` or an application without a SIGTERM handler; the symptom is `docker stop` taking
-  exactly ten seconds and in-flight requests dying, and later, rolling updates dropping streams.
-- Running as root; the symptom is every security review flagging it, and any code-execution bug
-  becoming root inside the container. Add a `USER`.
-- No `.dockerignore`; the symptom is builds that send gigabytes of context (`.git`, `.venv`,
-  datasets, weights) and miss the cache on every build because a `COPY` input changed.
-- Copying source before installing dependencies; the symptom is every one-line change reinstalling
-  torch for several minutes.
-- A `:latest` base image or unpinned dependencies; the symptom is a rebuild of the "same" Dockerfile
-  producing a different image that fails, usually on the day of an incident.
-- Writing state inside the container; the symptom is data vanishing on restart, plus slow writes
-  through the overlay filesystem.
-- CUDA runtime newer than the host driver supports; the symptom is a "driver version is insufficient
-  for CUDA runtime version" error on one node pool and not another.
-- A memory limit below real peak usage; the symptom is silent restarts with exit code 137 and no
-  Python traceback, typically during model load or a large batch.
-- Mounting `/var/run/docker.sock` into a CI or agent container "so it can build"; the symptom is that
-  anything running in that container can start a privileged container and own the host. Use a
-  rootless or daemonless builder instead.
+- **Shell-form `CMD` or no SIGTERM handler.** Symptom: `docker stop` takes exactly ten seconds and in-flight
+  requests die; later, rolling updates drop streams.
+- **Running as root.** Symptom: every security review flags it, and any code-execution bug becomes root
+  inside the container. Fix: add a `USER`.
+- **No `.dockerignore`.** Symptom: builds send gigabytes of context (`.git`, `.venv`, datasets, weights) and
+  miss the cache every time because a `COPY` input changed.
+- **Copying source before installing dependencies.** Symptom: every one-line change reinstalls torch for
+  several minutes.
+- **A `:latest` base image or unpinned dependencies.** Symptom: a rebuild of the "same" Dockerfile produces
+  a different image that fails, usually on the day of an incident.
+- **Writing state inside the container.** Symptom: data vanishes on restart, plus slow writes through the
+  overlay filesystem.
+- **CUDA runtime newer than the host driver supports.** Symptom: a "driver version is insufficient for CUDA
+  runtime version" error on one node pool and not another.
+- **A memory limit below real peak usage.** Symptom: silent restarts with exit code 137 and no Python
+  traceback, typically during model load or a large batch.
+- **Mounting `/var/run/docker.sock` into a CI or agent container "so it can build".** Symptom: anything in
+  that container can start a privileged container and own the host. Fix: a rootless or daemonless builder.
 
 ## When to use
-Containerize anything you deploy more than once or onto more than one machine: inference APIs,
-workers, eval jobs, fine-tuning runs. Skip it for a notebook on your laptop, and note that serverless
-platforms that accept source or a zip build the image for you. Measure image size, cached and uncached
-build time, pull time, and time from container start to ready, and watch each of them when a deploy
-feels slow. Day to day you write Dockerfiles, debug with `docker exec`, `docker logs` and
-`docker history`, and run the local stack with Compose. In interviews, be ready to explain layers
-versus containers, namespaces versus cgroups, why PID 1 matters, and why instruction order changes
-build time.
+- **Use when** you deploy anything more than once or onto more than one machine: inference APIs, workers,
+  eval jobs, fine-tuning runs.
+- **Skip it** for a notebook on your laptop; serverless platforms that accept source or a zip build the image
+  for you.
+- **Measure:** image size, cached and uncached build time, pull time, and time from container start to ready;
+  watch each when a deploy feels slow.
+- **Day to day:** write Dockerfiles, debug with `docker exec`, `docker logs` and `docker history`, and run
+  the local stack with Compose.
+- **Interviews:** explain layers versus containers, namespaces versus cgroups, why PID 1 matters, and why
+  instruction order changes build time.
 
 ## Role lens
 - **Engineer:** Writes the multi-stage Dockerfile, pins the base image and lockfile, handles signals
@@ -228,6 +307,40 @@ dependencies) are shared across versions, so a node that pulled last week's imag
 this week's. Then attack the platform side: pre-pull images with a DaemonSet, keep a warm node pool,
 and use a registry in the same region. Finally separate pull time from model-load time in the
 measurements, because the second needs a startup probe and a weight cache rather than a smaller image.
+
+## Interview questions
+### What is the difference between a container and a virtual machine?
+- **A container is a host process** isolated by namespaces (what it sees) and cgroups (what it uses), sharing
+  the host kernel, so it starts in milliseconds.
+- **A VM boots its own kernel** on a hypervisor: stronger isolation, but gigabytes per image and boot times
+  of tens of seconds or more.
+- **So** containers suit your own services; untrusted code needs gVisor or a microVM.
+
+### A container restarts every few hours with exit code 137 and no traceback. How do you debug it?
+- **137 means SIGKILL.** Check `docker inspect` (or the pod status) for `OOMKilled`; if true, the cgroup
+  memory limit was exceeded.
+- **Correlate with workload:** model load or large batches usually drive the peak; measure real peak memory
+  and set the limit above it, or bound batch size.
+- **If not OOM,** look for a stop that hit the grace period because SIGTERM was ignored.
+
+### Why does instruction order in a Dockerfile change build time but not image size?
+- **The cache invalidates every layer after the first changed input,** so installing dependencies before
+  copying source lets a code change rebuild only the final cheap layers.
+- **Size is the sum of layers either way,** so swapping the two steps leaves the image essentially the same
+  size; only rebuild time changes.
+
+### When would you not bake model weights into the image?
+- **When images get large,** because multi-gigabyte layers make every new node pull for minutes and turn
+  autoscaling into an image-size problem.
+- **When weights change on a different cadence** from code, so a model update does not need a code release.
+- **Instead** load from object storage or a persistent volume with a node-local cache, keeping the image to
+  code and runtime.
+
+### Why is mounting the Docker socket into a CI job dangerous, and what do you use instead?
+- **The socket is root on the host:** anything that can talk to it can start a privileged container that
+  mounts the host filesystem.
+- **Use a daemonless or rootless builder** such as kaniko, Buildah or rootless BuildKit, which build OCI
+  images without a privileged daemon.
 
 ## Quiz
 ### Q: Why should a Dockerfile copy the dependency manifest and install before copying the application source?

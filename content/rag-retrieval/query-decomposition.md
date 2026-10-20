@@ -5,7 +5,7 @@ name: Query decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/multi-hop-retrieval
@@ -22,7 +22,8 @@ sources:
 
 ## TL;DR
 Query decomposition has an LLM split a compound question into focused, standalone sub-questions,
-retrieves for each (in parallel when independent) and answers from the merged evidence. Independent parts
+retrieves for each (in parallel when independent) and answers from the merged evidence or from
+per-sub-question answers. Independent parts
 fan out; dependent parts chain, which is multi-hop retrieval.
 
 ## Why it exists
@@ -107,12 +108,12 @@ flowchart TD
     PL --> A{"Atomic or compound?"}
     A -->|"atomic"| S["Single retrieval"]
     A -->|"compound"| D{"Sub-questions independent?"}
-    D -->|"yes"| F["Fan out: retrieve each sub-question in parallel, small k"]
-    D -->|"no, one needs another's answer"| MH["Sequential chain: multi-hop retrieval"]
-    F --> M["Merge: dedupe by chunk id, tag each chunk with its sub-questions"]
+    D -->|"yes"| F["Parallel retrieval per sub-question, small k"]
+    D -->|"no, one needs the other answer"| MH["Sequential multi-hop chain"]
+    F --> M["Dedupe by chunk id, tag facets"]
     M --> E{"Every facet has evidence?"}
-    E -->|"no"| N["Mark facet as insufficient evidence"]
-    E -->|"yes"| SY["Synthesis with original question and cited, tagged evidence"]
+    E -->|"no"| N["Mark facet: insufficient evidence"]
+    E -->|"yes"| SY["Synthesis: original question plus tagged evidence"]
     N --> SY
     S --> SY
     MH --> SY

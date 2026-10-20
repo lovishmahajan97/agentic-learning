@@ -5,7 +5,7 @@ name: Embedding dimension & normalization
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/similarity-search
@@ -308,6 +308,9 @@ picking the cheapest configuration that meets the recall target.
 ### When does Matryoshka truncation beat quantization, and when would you combine them?
 - **Truncation** fits when the model is MRL-trained, because the leading dimensions hold the most
   information; on an ordinary model it collapses recall.
+- **Truncation also cuts compute and fits store limits:** fewer dimensions means fewer multiply-adds per
+  comparison, and it brings a 3072-dimension model under pgvector's 2,000-dimension index limit without
+  any quantized index type.
 - **Quantization** works for any model and is orthogonal: it shrinks bytes per dimension instead of
   dimensions.
 - **Combine** them at very large scale, keeping full vectors on disk to rescore the top candidates.

@@ -24,7 +24,7 @@ sources:
 ## TL;DR
 A WebSocket upgrades one HTTP connection into a persistent two-way channel. Use it when the client must
 talk while the server streams (stop buttons, voice, mid-run approvals); you pay in per-connection state,
-hand-rolled auth and resume. One-way streaming: use SSE.
+hand-rolled auth and resume, and upgrade-aware load balancers. One-way streaming: use SSE.
 
 ## Why it exists
 - **HTTP is request then response.** Once the client has sent its body it cannot say anything else on
@@ -223,7 +223,7 @@ Uvicorn defaults, and an illustrative load balancer with a 60 s idle timeout.
 | Next server ping | within 20 s | `--ws-ping-interval` |
 | No pong arrives | up to a further 20 s | `--ws-ping-timeout` |
 | Server closes, handler gets `WebSocketDisconnect` | ≤ ~40 s | `finally` cancels the generation task |
-| Without pings, a silent socket | until the LB's 60 s idle cut, or never | model may stream to nobody the whole time |
+| Without pings | quiet socket: until the LB's 60 s idle cut; socket still being written to: until TCP retransmissions give up, often many minutes | model may stream to nobody the whole time |
 
 Pings every 20 s also keep a healthy-but-quiet socket under that 60 s idle timeout.
 
@@ -237,9 +237,11 @@ Pings every 20 s also keep a healthy-but-quiet socket under that 60 s idle timeo
 - **Tune pings below the shortest idle timeout.** Keep `--ws-ping-interval` well under the load balancer
   idle timeout and size `--ws-ping-timeout` for mobile networks. Monitor open sockets per process and
   time from last message to disconnect.
-- **Drain sockets on deploy.** On shutdown, close every socket with 1001; clients reconnect with
-  jittered backoff, sending their session id and last sequence number. Bound shutdown with uvicorn's
-  `--timeout-graceful-shutdown`. Monitor reconnect success rate during deploys.
+- **Drain sockets on deploy.** Track open sockets per process and close each with 1001 when the process
+  is told to stop (check which code your server sends if it closes them itself, since that varies by
+  implementation); clients reconnect with jittered backoff, sending their session id and last sequence
+  number. Bound shutdown with uvicorn's `--timeout-graceful-shutdown`. Monitor reconnect success rate
+  during deploys.
 - **One sender per connection.** Route generation output, pub/sub relays and heartbeats through one
   `asyncio.Queue` drained by a single task. Monitor queue depth per connection and "Cannot call send"
   errors.
@@ -333,8 +335,11 @@ product also needs voice or continuous client input.
 ### When would you not use WebSockets for an AI chat?
 - **When the client only listens,** which is most chat products: SSE keeps stateless HTTP, built-in
   `event:` and `id:` fields and `Last-Event-ID` resume.
-- **When stop is the only client input,** a cancel endpoint plus a Redis flag is less work than handshake
-  auth, origin checks, reconnect, resume and deploy draining.
+- **When the hosting path cannot hold upgraded connections,** for example a gateway without upgrade
+  support or a platform with a hard per-request timeout; check WebSocket support on every hop before
+  committing, because the fallback is a redesign.
+- **When you cannot afford per-connection state:** thousands of idle sockets cost memory and balancer
+  slots, and every deploy needs draining and client resume logic.
 
 ### What changes when you go from one uvicorn process to many behind a load balancer?
 - **The socket is pinned to one process,** so events produced elsewhere (a worker finishing a job,

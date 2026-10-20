@@ -5,7 +5,7 @@ name: Jupyter
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/pandas
   - python-for-ai/async-await
@@ -19,9 +19,9 @@ sources:
 ---
 
 ## TL;DR
-Jupyter runs code in cells against a long-lived kernel and saves code and outputs together in an
-`.ipynb` file: the fastest way to explore data and read model outputs. That persistent state also makes
-notebooks unreliable as evidence unless you restart and run all.
+Jupyter runs cells against a long-lived kernel and saves code with outputs in an `.ipynb` file: the
+fastest way to explore data and model outputs. The same state makes notebooks unreliable as production
+code, and as evidence until you restart and run all.
 
 ## Why it exists
 - **Much AI work is exploratory.** Look at 50 failing eval cases, try three prompt variants, plot score
@@ -83,7 +83,7 @@ The kernel's memory comes from the execution history, while the `.ipynb` stores 
 and saved outputs; Restart and Run All is what makes the two agree.
 
 ```mermaid
-flowchart LR
+flowchart TD
     F["Front end: JupyterLab, Notebook, VS Code"] -->|"execute request"| S["Jupyter Server"]
     S -->|"ZeroMQ messages"| K["Kernel process: ipykernel"]
     K --> M[("Variables and Out history in memory")]
@@ -134,7 +134,9 @@ import json, sys
 
 def check(path: str) -> list[str]:
     nb = json.load(open(path, encoding="utf-8"))
-    counts = [c.get("execution_count") for c in nb["cells"] if c["cell_type"] == "code"]
+    code = [c for c in nb["cells"]                  # skip empty cells: they never get a count
+            if c["cell_type"] == "code" and "".join(c["source"]).strip()]
+    counts = [c.get("execution_count") for c in code]
     ran = [n for n in counts if n is not None]
     problems = []
     if ran != list(range(1, len(ran) + 1)):

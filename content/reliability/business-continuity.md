@@ -5,7 +5,7 @@ name: Business continuity
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - reliability/disaster-recovery
   - reliability/fmea
@@ -22,58 +22,62 @@ sources:
 ---
 
 ## TL;DR
-Business continuity (BC) is the practice of keeping the organisation's critical functions running
-through a disruption, whatever its cause: a cloud outage, a vendor failure, a model deprecation, a
-security incident, or the one person who understands the prompts leaving. Disaster recovery is its
-technical subset. BC starts from a business impact analysis that ranks functions and sets tolerable
-downtime, then builds plans, workarounds, roles and rehearsals around that ranking, because during a
-real disruption nobody has time to decide what matters.
+Business continuity keeps critical functions running through any disruption: outages, vendor failures,
+model deprecations, incidents, key people leaving. Disaster recovery is its technical subset. It starts
+from a business impact analysis, because mid-disruption nobody has time to decide what matters.
 
 ## Why it exists
-Disaster recovery answers "how do we bring the system back". It does not answer the questions that
-decide whether the business survives the hour in between: which functions must keep working, who is
-allowed to declare the failover, how customers are told, what staff do by hand while systems are down,
-and what happens when the thing that failed is not your system but a supplier you cannot restore. A
-company that restores its database in forty minutes but spends six hours finding the person with the
-authority to approve the restore has a DR plan and no continuity.
-
-The naive alternative is to treat continuity as an IT problem and buy more redundancy. It fails for
-disruptions that redundancy cannot touch. A model provider deprecates the model your prompts were
-tuned on with ninety days' notice. A vendor changes its terms so your use case is no longer permitted.
-A regulator halts processing of a data category. A key engineer who holds the undocumented
-knowledge of why the system works leaves. None of these show up on an uptime dashboard, and all of
-them stop a business function just as thoroughly as a region outage.
-
-AI products concentrate these risks. Many run a core function on a single external model, a single
-embedding model that the whole index depends on, and a small number of people who understand the
-evaluation set. Enterprise buyers know this, which is why "describe your business continuity plan"
-and "what happens if your AI vendor is unavailable" are standard lines in security questionnaires,
-and why a credible answer is often a precondition for the deal.
+- **DR answers "how do we bring the system back", not the hour in between.** Which functions must keep
+  working, who may declare the failover, how customers are told, what staff do by hand, and what happens
+  when the failure is a supplier you cannot restore.
+- **A fast restore without authority is not continuity.** A company that restores its database in forty
+  minutes but spends six hours finding who may approve the restore has a DR plan and no continuity.
+- **More redundancy cannot touch many disruptions.** A provider deprecates your tuned model with ninety
+  days' notice; a vendor changes terms so your use case is no longer permitted; a regulator halts
+  processing of a data category; the engineer holding undocumented knowledge leaves. None show on an
+  uptime dashboard, and all stop a function as thoroughly as a region outage.
+- **AI products concentrate these risks.** Many run a core function on a single external model, a single
+  embedding model the whole index depends on, and a few people who understand the evaluation set.
+- **Buyers ask.** "Describe your business continuity plan" and "what happens if your AI vendor is
+  unavailable" are standard security-questionnaire lines, and a credible answer is often a precondition
+  for the deal.
 
 ## How it works
 ### Business impact analysis first
-The BIA is a ranked inventory of business functions, not systems. For each function record: what it
-does, who depends on it, the **maximum tolerable downtime** (how long before harm becomes
-unacceptable; some frameworks call it maximum acceptable outage), the resources and systems it needs,
-upstream suppliers, and the cost of an hour of disruption in money, compliance exposure and customer
-trust. RPO and RTO for each supporting system are *derived* from this, which is why a BIA done
-honestly often shrinks the list of things that need expensive recovery: most functions can wait a
-day, and a few cannot wait ten minutes.
+The BIA is a ranked inventory of business **functions, not systems**. For each function record:
+- what it does and who depends on it;
+- the **maximum tolerable downtime** (how long before harm becomes unacceptable; some frameworks call it
+  maximum acceptable outage);
+- the resources, systems and upstream suppliers it needs;
+- the cost of an hour of disruption in money, compliance exposure and customer trust.
 
-The derivation has one subtlety. Restoring the system is not the same as restoring the function: after
-the system is back, people still have to clear the backlog, re-enter work done by hand and verify the
-results. So the system RTO must leave room inside the tolerable downtime:
-`RTO + time to catch up and verify ≤ maximum tolerable downtime`. A function that can tolerate four
-hours and needs two hours of catch-up after any outage gets an RTO of two hours, not four.
+- **RPO and RTO for each supporting system are derived from this,** which is why an honest BIA often
+  shrinks the list needing expensive recovery: most functions can wait a day, a few cannot wait ten minutes.
+- **Restoring the system is not restoring the function.** People still clear the backlog, re-enter work
+  done by hand and verify results, so the system RTO must leave room:
+
+```
+RTO + time to catch up and verify ≤ maximum tolerable downtime
+```
+
+- **Example:** a function that tolerates four hours and needs two hours of catch-up gets an RTO of two
+  hours, not four.
 
 ### Threat and dependency mapping
-For each critical function, list how it can be disrupted and through which dependency: infrastructure
-(region, network), suppliers (model provider, vector database SaaS, identity provider), data
-(corruption, loss of access), people (key-person loss, mass unavailability), and external (legal,
-regulatory, reputational). The AI-specific entries are supplier concentration on one model vendor,
-model and API deprecation timelines, sudden pricing or quota changes, and the fact that prompts and
-eval sets are intellectual property that may live in one person's head or one unbacked-up notebook.
-FMEA is the structured tool for this step.
+For each critical function, list how it can be disrupted and through which dependency:
+
+| Category | Examples |
+|---|---|
+| Infrastructure | region, network |
+| Suppliers | model provider, vector database SaaS, identity provider |
+| Data | corruption, loss of access |
+| People | key-person loss, mass unavailability |
+| External | legal, regulatory, reputational |
+
+- **AI-specific entries:** supplier concentration on one model vendor, model and API deprecation
+  timelines, sudden pricing or quota changes, and prompts and eval sets as intellectual property that may
+  live in one person's head or one unbacked-up notebook.
+- **FMEA is the structured tool** for this step.
 
 ### Strategies per function, in a ladder
 Each critical function gets a sequence of fallbacks, cheapest and most automatic first:
@@ -87,100 +91,179 @@ Each critical function gets a sequence of fallbacks, cheapest and most automatic
    when, and the backlog plan is known.
 
 ### The three phases of an event
-A disruption runs through **response** (detect, contain, decide to activate, communicate), then
-**continuity** (operate on the chosen rung of the ladder for as long as needed) and then **recovery**
-(restore the primary path, work off the backlog, reconcile what was done manually or by the fallback
-back into the systems of record, and stand down). Plans are usually detailed about the first phase and
-vague about the last, yet the last is where data gets lost: tickets triaged on a spreadsheet that were
-never entered, or fallback-model answers that nobody re-checked.
+| Phase | What happens |
+|---|---|
+| **Response** | detect, contain, decide to activate, communicate |
+| **Continuity** | operate on the chosen rung of the ladder for as long as needed |
+| **Recovery** | restore the primary path, work off the backlog, reconcile manual or fallback work into the systems of record, stand down |
+
+- **Plans are detailed about response and vague about recovery,** yet recovery is where data gets lost:
+  tickets triaged on a spreadsheet never entered, fallback-model answers nobody re-checked.
 
 ### Plans, roles and communication
-The business continuity plan documents activation criteria (who may declare an event and on what
-evidence), roles with named deputies, a communication tree for staff, customers and regulators,
-decision authority during the event, and the recovery and return-to-normal steps. It is written for
-someone reading it at 3 a.m. with the usual experts unavailable, which is a different document from
-an architecture diagram.
+The business continuity plan documents:
+- **activation criteria:** who may declare an event and on what evidence;
+- **roles with named deputies** and decision authority during the event;
+- **a communication tree** for staff, customers and regulators;
+- **recovery and return-to-normal steps.**
+
+It is written for someone reading it at 3 a.m. with the usual experts unavailable, a different document
+from an architecture diagram.
 
 ### Testing and maintenance
-Plans decay. Tabletop exercises walk the team through a scenario on paper and surface missing
-decisions; functional drills actually execute the fallback (switch provider in production for an
-hour, process a day's work manually for a sample). Each exercise ends with recorded findings and
-owners. Plans are reviewed when the architecture, suppliers or staffing change, and at least annually.
-ISO 22301 formalises this lifecycle; regulated customers may ask for alignment with it.
+- **Plans decay.**
+- **Tabletop exercises** walk the team through a scenario on paper and surface missing decisions.
+- **Functional drills** actually execute the fallback: switch provider in production for an hour, process
+  a day's work manually for a sample.
+- **Each exercise ends with recorded findings and owners.**
+- **Review** when architecture, suppliers or staffing change, and at least annually. ISO 22301 formalises
+  this lifecycle; regulated customers may ask for alignment with it.
 
 ### Vendor exit as a continuity control
-For every critical supplier, know the exit: portable prompts and evals that have been run on a second
-model, an export path for the vector index and its embedding-model version, contract clauses on
-notice periods, and a tested procedure to switch. The exit plan is the BC answer to supplier failure,
-and it turns a model deprecation from a crisis into scheduled work.
+For every critical supplier, know the exit:
+- portable prompts and evals that have been run on a second model;
+- an export path for the vector index and its embedding-model version;
+- contract clauses on notice periods;
+- a tested procedure to switch.
 
-## Example
-A worked continuity plan for an AI support-triage function (figures illustrative).
+The exit plan is the BC answer to supplier failure, and it turns a model deprecation from a crisis into
+scheduled work.
 
-The BIA for a SaaS company lists "classify and route inbound support tickets" as a critical function:
-about 300 tickets per hour at peak, a contractual first-response time of four hours for enterprise
-customers, and a maximum tolerable downtime of two hours before SLA penalties start. Dependencies: one
-model provider for classification, a vector database SaaS for similar-ticket retrieval, the ticketing
-system, and two engineers who maintain the prompts and the 1,200-item eval set. Derived targets: RTO
-one hour for the triage service, RPO five minutes for the routing audit log.
+## Diagram
+The continuity ladder for one critical function: each rung activates only when the cheaper, more
+automatic one above it fails, and every path ends in a recovery phase that reconciles work.
 
-Threats recorded: provider outage or quota cut, provider model deprecation, vector SaaS outage, loss
+```mermaid
+flowchart TD
+    E["Disruption detected"] --> A["Automatic fallback: second provider"]
+    A -->|"works"| R["Recovery: restore, catch up, reconcile"]
+    A -->|"fails"| D["Degraded service: rules, banner"]
+    D -->|"backlog under threshold"| R
+    D -->|"backlog over threshold"| M["Manual workaround, named lead activates"]
+    M -->|"volume sustainable"| R
+    M -->|"cannot sustain"| S["Suspend and communicate"]
+    S --> R
+    R --> F["Record findings and owners"]
+```
+
+## Examples
+### Worked continuity plan for AI support triage
+Figures illustrative.
+
+**BIA entry.** A SaaS company lists "classify and route inbound support tickets" as critical:
+- about 300 tickets per hour at peak;
+- a contractual first-response time of four hours for enterprise customers;
+- maximum tolerable downtime of two hours before SLA penalties start;
+- dependencies: one model provider for classification, a vector database SaaS for similar-ticket
+  retrieval, the ticketing system, and two engineers who maintain the prompts and the 1,200-item eval set;
+- derived targets: RTO one hour for the triage service, RPO five minutes for the routing audit log.
+
+**Threats recorded:** provider outage or quota cut, provider model deprecation, vector SaaS outage, loss
 of both prompt maintainers, a prompt-injection incident that forces a halt.
 
-Ladder for a provider outage: at T+0 automatic fallback to a second provider using prompts already
-validated against the eval set with a recorded accuracy gap; if that also fails, at T+10 minutes the
-service degrades to keyword rules that route to a general queue with a banner telling agents triage
-is degraded; at T+30 minutes, if the backlog exceeds 150 tickets, the support lead activates the manual
-procedure in which two agents triage from a shared view, which the BIA shows can sustain roughly half
-of peak volume, so the backlog grows at about 150 tickets per hour and enterprise tickets are pulled
-first to protect the four-hour SLA. The catch-up arithmetic is why the RTO is one hour against a
-two-hour tolerable downtime: an hour at peak on the manual rung leaves roughly 150 untriaged tickets,
-and the restored service needs time to work them off and to have the manually routed tickets checked
-before the enterprise response clock runs out. Communication: the status page updates at T+15 minutes, enterprise
-customers with contractual notification clauses are emailed at T+60.
+**Ladder for a provider outage.**
 
-For deprecation risk: the second provider is exercised in production for one hour every month, and
-the eval set lives in the repository with two named owners plus a documented onboarding runbook. The
-plan is tabletop-tested twice a year, and last year's drill found the fallback provider's key had
-expired, which is now monitored.
+| Time | Rung | Detail |
+|---|---|---|
+| T+0 | automatic fallback | second provider, prompts already validated against the eval set with a recorded accuracy gap |
+| T+10 minutes | degraded service | if that also fails: keyword rules route to a general queue, with a banner telling agents triage is degraded |
+| T+15 minutes | communication | status page updates |
+| T+30 minutes | manual workaround | if backlog exceeds 150 tickets, the support lead activates it: two agents triage from a shared view |
+| T+60 | communication | enterprise customers with contractual notification clauses are emailed |
+
+- **Manual capacity:** the BIA shows two agents sustain roughly half of peak volume, so the backlog grows
+  at about 150 tickets per hour, and enterprise tickets are pulled first to protect the four-hour SLA.
+- **Why RTO is one hour against two hours of tolerable downtime:** an hour at peak on the manual rung
+  leaves roughly 150 untriaged tickets. The restored service needs time to work them off and to have the
+  manually routed tickets checked before the enterprise response clock runs out.
+
+**Deprecation and people risk.**
+- The second provider is exercised in production for one hour every month.
+- The eval set lives in the repository with two named owners plus a documented onboarding runbook.
+- The plan is tabletop-tested twice a year; last year's drill found the fallback provider's key had
+  expired, which is now monitored.
+
+### Deriving RTO and sizing the manual rung
+A small model of the arithmetic above, so the plan is recomputed when volume or staffing changes. The
+restored-service throughput of 600 tickets per hour is an illustrative assumption.
+
+```python
+def derived_rto_h(max_tolerable_downtime_h, catch_up_h):
+    return max_tolerable_downtime_h - catch_up_h      # RTO + catch-up <= MTD
+
+def backlog_after(hours, arrivals_per_h, capacity_per_h, start=0):
+    return max(0, start + (arrivals_per_h - capacity_per_h) * hours)
+
+def drain_hours(backlog, restored_per_h, arrivals_per_h):
+    spare = restored_per_h - arrivals_per_h
+    return float("inf") if spare <= 0 else backlog / spare
+
+peak, manual = 300, 150                               # manual mode sustains about half of peak
+left = backlog_after(1, peak, manual)                 # one hour on the manual rung
+print(left, drain_hours(left, restored_per_h=600, arrivals_per_h=peak))
+# 150 0.5   -> half an hour of catch-up, plus checking manual routes
+print(derived_rto_h(4, 2))
+# 2         -> a function tolerating 4 h with 2 h catch-up gets a 2 h RTO
+```
+
+- **If `drain_hours` returns infinity,** the restored service cannot outrun arrivals and the backlog plan
+  needs extra capacity, not a shorter RTO.
+
+## Production patterns
+- **Monthly live fallback exercise.** Route a slice of production traffic, or all of it for one hour, to
+  the second provider with its validated prompts. Monitor the eval-measured accuracy gap, fallback error
+  rate and credential expiry.
+- **Degraded mode behind a runtime flag.** Make each ladder rung switchable without a deploy, through a
+  feature-flag service or config store, and show the active rung in the UI. Monitor which rung is active
+  and for how long.
+- **Named activation roles with deputies.** Keep a one-page plan listing who may declare an event, their
+  deputies, and the evidence required, linked from the incident channel. Monitor time from detection to
+  activation in every drill.
+- **Vendor-exit checklist per critical supplier.** Record the second model's eval score, index export path
+  with embedding-model version, contract notice period and last tested switch date. Review it when a
+  deprecation notice arrives or quarterly.
+- **Reconciliation step in every recovery.** After stand-down, enter manually handled work into the system
+  of record and re-check fallback-model outputs on a sample. Monitor items still unreconciled.
 
 ## Trade-offs
-- A thorough BIA focuses spend on the functions that matter, but it takes real time from business
-  owners; it flips to a lightweight version for small teams whose entire product is one function.
-- Manual workarounds keep the function alive without any system, yet they sustain only a fraction of
-  volume; they are worth documenting when the function is critical and the volume is manageable.
-- Keeping a second model provider validated gives a real exit and fallback, at the cost of running
+- **Thorough BIA vs owner time.** It focuses spend on the functions that matter, but takes real time from
+  business owners; it flips to a lightweight version for small teams whose entire product is one function.
+- **Manual workarounds vs volume.** They keep the function alive without any system, yet sustain only a
+  fraction of volume; worth documenting when the function is critical and volume is manageable.
+- **Validated second provider vs eval cost.** It gives a real exit and fallback, at the cost of running
   evals twice and accepting behaviour differences; it stops paying when the function is non-critical.
-- Frequent drills keep plans honest but consume engineering and operations time; the balance tilts to
-  more drills as contractual penalties and regulatory exposure grow.
-- Detailed plans cover more scenarios but go stale faster; shorter plans with clear roles and a
-  decision tree survive turnover better than hundred-page binders.
+- **Frequent drills vs team time.** They keep plans honest but consume engineering and operations time;
+  the balance tilts to more drills as contractual penalties and regulatory exposure grow.
+- **Detailed vs short plans.** Detailed plans cover more scenarios but go stale faster; shorter plans with
+  clear roles and a decision tree survive turnover better than hundred-page binders.
 
 ## Pitfalls
-- Writing the plan for systems instead of functions, so the team restores the database while nobody
+- **Writing the plan for systems instead of functions.** The team restores the database while nobody
   handles the customers; the symptom is a "successful recovery" followed by churn and penalties.
-- Fallbacks that exist on paper only: the secondary provider was never run against the eval set, and
+- **Fallbacks that exist on paper only.** The secondary provider was never run against the eval set, and
   its first production use reveals a large accuracy drop or broken tool schemas.
-- Undefined activation authority, visible as an hour lost to "who can approve this" while the
-  backlog grows; name the roles and deputies in advance.
-- Single points of knowledge: one engineer understands the prompts and the eval set, and the plan
+- **Undefined activation authority.** Visible as an hour lost to "who can approve this" while the backlog
+  grows; name the roles and deputies in advance.
+- **Single points of knowledge.** One engineer understands the prompts and the eval set, and the plan
   silently assumes they are reachable. Key-person loss is a continuity event.
-- No recovery phase in the plan: work done manually during the event is never reconciled, visible
-  weeks later as tickets, orders or approvals that exist on paper or in a chat thread but not in the
-  system of record.
-- Ignoring supplier-side disruptions such as deprecations, quota cuts and terms changes because the
+- **No recovery phase in the plan.** Work done manually during the event is never reconciled, visible weeks
+  later as tickets, orders or approvals that exist on paper or in a chat thread but not in the system of
+  record.
+- **Ignoring supplier-side disruptions** such as deprecations, quota cuts and terms changes because the
   dashboard is green; the symptom is a ninety-day deadline nobody planned for.
 
 ## When to use
-Do a business impact analysis the moment an AI feature supports a function someone depends on
-contractually or operationally, and revisit it when you add a supplier, drop a human from the loop, or
-sign an enterprise customer with notification or recovery clauses. Keep the plan proportionate: a
-one-page ladder with named roles beats a binder nobody reads. Measure drill findings closed, time to
-activate the fallback, and the sustainable throughput of the manual mode, since those are the numbers
-auditors and customers will ask for. In day-to-day work this is the "what do we do if the provider is
-down for a day" conversation and the vendor-exit checklist. In interviews, the distinguishing point is
-that BC is function-first and includes people, suppliers and communication, while DR is the technical
-restore underneath it.
+- **Do a BIA** the moment an AI feature supports a function someone depends on contractually or
+  operationally.
+- **Revisit it** when you add a supplier, drop a human from the loop, or sign an enterprise customer with
+  notification or recovery clauses.
+- **Keep it proportionate:** a one-page ladder with named roles beats a binder nobody reads.
+- **Measure** drill findings closed, time to activate the fallback, and the sustainable throughput of the
+  manual mode, since auditors and customers will ask for those numbers.
+- **Day to day:** the "what do we do if the provider is down for a day" conversation and the vendor-exit
+  checklist.
+- **Interviews:** BC is function-first and includes people, suppliers and communication; DR is the
+  technical restore underneath it.
 
 ## Role lens
 - **Engineer:** Builds and exercises the automatic fallback tier, keeps the second provider's prompts
@@ -204,6 +287,35 @@ with the gap measured, canary the switch, and update the ladder so the retired m
 fallback. Communication to customers who contractually care about model changes happens on the
 plan's timeline. Without that preparation, the same notice becomes a ninety-day scramble and a
 silent quality drop.
+
+## Interview questions
+### How is business continuity different from disaster recovery?
+- **BC is function-first:** it keeps a business function running by any means, including manual work, a
+  different supplier or a communicated pause.
+- **DR is the technical subset** that restores systems; it does not decide who declares the event, how
+  customers are told, or what staff do by hand meanwhile.
+
+### A function tolerates two hours of downtime. How do you set the RTO of the system behind it?
+- **Subtract catch-up and verification:** `RTO + time to catch up and verify ≤ maximum tolerable downtime`.
+- **So with an hour of backlog work and checks,** the system RTO is one hour, not two.
+- **Recompute when volume grows,** because a bigger backlog lengthens catch-up.
+
+### Design the fallback ladder for an AI feature whose only provider goes down.
+- **Rung 1:** automatic switch to a second provider with prompts validated on the eval set.
+- **Rung 2:** degraded service decided in advance, such as rules or retrieval-only answers with a banner.
+- **Rung 3:** a documented manual workaround with a named lead; **rung 4:** suspend and communicate, with a
+  backlog plan.
+
+### When is a validated second model provider not worth it?
+- **When the function is non-critical** and can wait for the primary to return; running evals twice and
+  managing behaviour differences then costs more than the outage.
+- **It pays** once contractual penalties, enterprise deals or deprecation risk make a dated loss of the
+  model expensive.
+
+### What would you measure to show a customer your continuity plan works?
+- **Time to activate the fallback** in drills, and drill findings closed with owners.
+- **Sustainable throughput of the manual mode,** for example half of peak, and the resulting backlog growth.
+- **Last successful live fallback exercise date** and the measured accuracy gap of the second provider.
 
 ## Quiz
 ### Q: What is the relationship between business continuity and disaster recovery?

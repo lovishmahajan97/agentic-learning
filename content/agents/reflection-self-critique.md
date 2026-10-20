@@ -5,7 +5,7 @@ name: Reflection / self-critique
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - agents/agent-loop
   - agents/planning
@@ -22,92 +22,113 @@ sources:
 ---
 
 ## TL;DR
-Reflection is a generate–critique–revise loop: the agent produces an attempt, evaluates it against a
-goal or rubric, and tries again using what it learned. It pays off when the critique brings *new
-information*: a failing test, a tool error, a verifier's verdict, or a fresh context with a rubric.
-Pure "look again and fix your mistakes" with no new signal is unreliable and can turn right answers
-into wrong ones, so the design question is always where the critique's evidence comes from.
+Reflection is a generate–critique–revise loop. It pays off only when the critique brings new
+information (a failing test, a tool error, a verifier, a fresh rubric context); "look again" with no new
+signal can turn right answers wrong.
 
 ## Why it exists
-A single forward pass commits to an answer token by token with no chance to step back. For a short
-factual question that is fine. For code, long-form writing, multi-step tool use or anything with a
-checkable goal, first attempts have a known failure profile: they satisfy the surface of the request,
-skip an edge case, misread a tool result, or stop before the goal is met. Humans fix this by reviewing
-their own work; the agent equivalent is a second call whose job is to judge, not to produce.
-
-The naive alternative, "ask for the best answer and trust it", leaves the model's error rate exactly
-where it was. The next naive step, "ask the model to check its answer", is where people get burned.
-Without external evidence the model is re-rolling with a bias toward *changing* its answer because the
-prompt implies something is wrong, and studies of intrinsic self-correction on reasoning tasks found it
-often fails to help and sometimes hurts. The pattern earns its cost when the critique step sees
-something the generator did not: an execution result, a retrieved fact, a rubric applied in a clean
-context, or a different model. Reflexion, for example, showed large gains on coding benchmarks
-precisely because the reflection was grounded in execution: the agent ran unit tests (which it wrote
-itself, so the signal came from actually running code, not from rereading it) and carried the lesson
-into the next attempt as text. That is the mechanism to copy: feedback that is grounded, persisted, and fed forward.
+- **One forward pass cannot step back.** It commits token by token. Fine for a short factual question.
+- **First attempts have a known failure profile** on code, long-form writing, multi-step tool use or any
+  checkable goal: they satisfy the surface of the request, skip an edge case, misread a tool result, or
+  stop before the goal is met. Humans review their work; the agent equivalent is a second call whose job
+  is to judge, not produce.
+- **"Ask for the best answer and trust it"** leaves the error rate exactly where it was.
+- **"Ask the model to check its answer" is where people get burned.** Without external evidence the model
+  re-rolls with a bias toward *changing* its answer, because the prompt implies something is wrong.
+  Studies of intrinsic self-correction on reasoning tasks found it often fails to help and sometimes hurts.
+- **It earns its cost when the critique sees something new:** an execution result, a retrieved fact, a
+  rubric in a clean context, or a different model. Reflexion showed large coding-benchmark gains because
+  reflection was grounded in execution: the agent ran unit tests (which it wrote itself, so the signal came
+  from running code, not rereading it) and carried the lesson forward as text. Copy that: grounded,
+  persisted, fed forward.
 
 ## How it works
 ### The loop
 1. **Generate** an attempt from the task and any prior reflections.
-2. **Evaluate** the attempt. The evaluator may be (a) deterministic code, such as tests, schema
-   validation, a linter or a reconciliation check; (b) a tool-grounded critic that runs searches or
-   executes code to verify claims (the CRITIC approach); (c) an LLM critic with a rubric in a separate
-   context; or (d) the same model asked to reconsider, which is the weakest option.
-3. **Reflect** by turning the evaluation into a short, specific lesson: "the function failed on an
-   empty list because it indexes `[0]` without a guard". Reflexion stores these verbal lessons in
-   episodic memory and prepends them to the next attempt.
-4. **Revise** by generating again with the lesson in context, and stop when the evaluator passes, the
-   attempt stops changing, or the iteration budget runs out.
+2. **Evaluate** the attempt, with one of four evaluator kinds (strongest first):
+   - (a) deterministic code: tests, schema validation, a linter or a reconciliation check;
+   - (b) a tool-grounded critic that runs searches or executes code to verify claims (the CRITIC approach);
+   - (c) an LLM critic with a rubric in a separate context;
+   - (d) the same model asked to reconsider, the weakest option.
+3. **Reflect:** turn the evaluation into a short, specific lesson, such as "the function failed on an
+   empty list because it indexes `[0]` without a guard". Reflexion stores these verbal lessons in episodic
+   memory and prepends them to the next attempt.
+4. **Revise:** generate again with the lesson in context. Stop when the evaluator passes, the attempt
+   stops changing, or the iteration budget runs out.
 
 ### Three named variants, and what each feeds back
-- **Self-Refine** keeps one model in one task: generate, have the same model write feedback on its own
-  output, refine the output in place, repeat. No external signal enters, so its reported gains are on
-  tasks where a second look at the visible output suffices (style, readability, constraint coverage),
-  not on facts the model did not know.
-- **Reflexion** works *across attempts*: an evaluator (tests, an environment's success signal) scores a
-  whole trial, the model writes a verbal lesson, and the next trial starts fresh with the lessons
-  prepended. It regenerates rather than edits, which helps when the first attempt's approach was wrong.
-- **CRITIC** makes the critique itself use tools: to check a claim, the critic searches or runs code,
-  then revises using what it found. The new information arrives during critique rather than from a
-  pre-built test suite.
+| Variant | Mechanism | New information | Good for |
+|---|---|---|---|
+| **Self-Refine** | One model, one task: generate, write feedback on its own output, refine in place, repeat | None external | Tasks where a second look at visible output suffices: style, readability, constraint coverage; not facts the model did not know |
+| **Reflexion** | Across attempts: an evaluator (tests, an environment's success signal) scores a whole trial, the model writes a verbal lesson, the next trial starts fresh with lessons prepended | Outcome signal | Regenerates rather than edits, which helps when the first attempt's approach was wrong |
+| **CRITIC** | The critique itself uses tools: to check a claim, the critic searches or runs code, then revises | Arrives during critique, not from a pre-built test suite | Factual claims and computations |
 
 ### Why a separate critic context helps
-When the generator critiques its own output inside the same conversation, its context is saturated
-with the reasoning that produced the answer, and attention to that reasoning makes it likely to confirm
-it. A fresh call that sees only the task, the artifact and a rubric is a different computation: it has
-no prior reasoning to defend. Using a different model, or the same model with a role prompt and no
-history, is cheap and weakens that agreement bias; it does not remove it, since LLM judges are known to
-favour outputs that resemble their own, so measure critic-versus-human agreement on your task. Make the critic output structured: `{"pass": bool,
-"issues": [{"where": ..., "what": ..., "severity": ...}]}` *because* a free-text "looks good overall"
-cannot drive the revise step or a stopping rule.
+- **Same-conversation critique confirms itself.** The generator's context is saturated with the reasoning
+  that produced the answer, and attention to that reasoning makes confirmation likely.
+- **A fresh call is a different computation.** Seeing only the task, the artifact and a rubric, it has no
+  prior reasoning to defend.
+- **A different model, or the same model with a role prompt and no history,** is cheap and weakens that
+  agreement bias. It does not remove it: LLM judges are known to favour outputs that resemble their own,
+  so measure critic-versus-human agreement on your task.
+- **Make the critic output structured:** `{"pass": bool, "issues": [{"where": ..., "what": ..., "severity": ...}]}`,
+  *because* a free-text "looks good overall" cannot drive the revise step or a stopping rule.
 
 ### Why grounding matters most
-The evaluator's value is the information it adds. Tests and tool results are the gold standard
-*because* they are independent of the model's beliefs. A rubric-driven LLM critic adds a different
-viewpoint and catches omissions and format violations well, but it shares the generator's blind spots
-on facts. Intrinsic reconsideration adds nothing new, so expect it to help only on tasks where the
-first pass was sloppy rather than wrong, such as formatting, completeness against a checklist, or tone.
+The evaluator's value is the information it adds:
+- **Tests and tool results are the gold standard,** *because* they are independent of the model's beliefs.
+- **A rubric-driven LLM critic** adds a different viewpoint and catches omissions and format violations
+  well, but shares the generator's blind spots on facts.
+- **Intrinsic reconsideration adds nothing new.** Expect it to help only where the first pass was sloppy
+  rather than wrong: formatting, completeness against a checklist, or tone.
 
 ### Stopping and budgets
-Each iteration costs a generate call plus an evaluate call, and revisions are not monotone: attempt 3
-can be worse than attempt 2. Keep the best-scoring attempt, cap iterations (two or three is typical for
-writing, more for code with tests), and stop early when the critic passes or the diff between attempts
-is trivial. Log every attempt and critique, since this trace is what you will use to tune the rubric.
+- **Each iteration costs** a generate call plus an evaluate call.
+- **Revisions are not monotone:** attempt 3 can be worse than attempt 2, so keep the best-scoring attempt.
+- **Cap iterations:** two or three is typical for writing, more for code with tests.
+- **Stop early** when the critic passes or the diff between attempts is trivial.
+- **Log every attempt and critique,** since this trace is what you use to tune the rubric.
 
-Gate the loop on the evaluator, so you pay for revision only on failures. With a cheap deterministic
-check, expected model calls per task are roughly 1 + (1 − p₁)·(reflect + regenerate), where p₁ is the
-one-shot pass rate: at p₁ = 0.9 the loop costs about 20% extra on average and only touches the 10% that
-failed. An LLM critic, by contrast, runs on *every* task, so it adds at least one call even when the
-first attempt was already right; that is the case where reflection is most often not worth it.
+Gate the loop on the evaluator, so you pay for revision only on failures:
+
+```
+expected model calls per task ≈ 1 + (1 − p₁) · (reflect + regenerate)      p₁ = one-shot pass rate
+```
+
+- **With a cheap deterministic check** at p₁ = 0.9, the loop costs about 20% extra on average and only
+  touches the 10% that failed.
+- **An LLM critic runs on *every* task,** so it adds at least one call even when the first attempt was
+  already right; that is where reflection is most often not worth it.
 
 ### Where reflection sits in an agent
-Inside a step (revise a tool call after an error), at the end of a task (review the deliverable before
-returning it), and across episodes (carry lessons into the next task via memory). The cross-episode
-form is what turns reflection into learning without changing weights.
+| Scope | Example |
+|---|---|
+| Inside a step | Revise a tool call after an error |
+| End of a task | Review the deliverable before returning it |
+| Across episodes | Carry lessons into the next task via memory |
 
-## Example
-A test-grounded code-repair loop: generate, run `pytest`, convert failures into a reflection, revise
-with the reflection in context, keep the best attempt.
+The cross-episode form is what turns reflection into learning without changing weights.
+
+## Diagram
+Trace the evidence: the evaluator, not the model's opinion, decides whether to stop, and every failure
+becomes a short lesson fed into the next attempt while the best attempt so far is kept.
+
+```mermaid
+flowchart TD
+    T["Task plus lessons so far"] --> G["Generate attempt"]
+    G --> E{"Evaluator: tests, tools, rubric critic"}
+    E -->|"pass"| OUT["Return attempt"]
+    E -->|"fail"| K["Keep best score so far"]
+    K --> B{"Budget left?"}
+    B -->|"no"| BEST["Return best attempt"]
+    B -->|"yes"| R["Reflect: specific cause and fix"]
+    R -->|"append lesson"| T
+```
+
+## Examples
+### Test-grounded code repair with keep-best
+A test-grounded code-repair loop: generate, run `pytest`, convert failures into a reflection, revise with
+the reflection in context, keep the best attempt.
 
 ```python
 import pathlib, re, subprocess, sys, tempfile
@@ -143,42 +164,96 @@ def solve(task, tests, max_iters=4):
     return best[1], max_iters
 ```
 
-The reflection prompt is forbidden from rewriting code so the lesson stays short and specific, and the
-test output, not the model's opinion, decides whether to continue. Scoring by tests *passed* (rather than
-failures counted with `-x`, which stops at the first one) is what makes "keep the best" meaningful, and
-it ranks an attempt that does not even import below one that fails a single test.
+- **The reflection prompt may not rewrite code,** so the lesson stays short and specific.
+- **Test output, not the model's opinion,** decides whether to continue.
+- **Scoring by tests *passed*** (rather than failures counted with `-x`, which stops at the first one) is
+  what makes "keep the best" meaningful, and it ranks an attempt that does not even import below one that
+  fails a single test.
+
+### Cost calculator: gated loop vs always-on critic
+Runnable pure Python for the formula above. A gated loop pays only on failures; an LLM critic pays on
+every task.
+
+```python
+def gated_calls(p1, reflect=1, regenerate=1):
+    """Deterministic check first; model pays for reflection only on failures."""
+    return 1 + (1 - p1) * (reflect + regenerate)
+
+def critic_calls(p1, revise=1, recritique=1):
+    """LLM critic on every task, then revise and re-critique on failures."""
+    return 1 + 1 + (1 - p1) * (revise + recritique)
+
+for p1 in (0.5, 0.9, 0.98):
+    g, c = gated_calls(p1), critic_calls(p1)
+    print(f"p1={p1}: gated {g:.2f} calls (+{g-1:.0%}), always-on critic {c:.2f} calls (+{c-1:.0%})")
+# p1=0.5: gated 2.00 calls (+100%), always-on critic 3.00 calls (+200%)
+# p1=0.9: gated 1.20 calls (+20%), always-on critic 2.20 calls (+120%)
+# p1=0.98: gated 1.04 calls (+4%), always-on critic 2.04 calls (+104%)
+```
+
+### Worked scenario: "review your answer" made facts worse
+A summarisation team added a same-context "review and fix mistakes" pass (illustrative figures).
+
+| Version | Evaluator | Formatting | Claim support | Calls per summary |
+|---|---|---|---|---|
+| One shot | none | baseline | baseline | 1 |
+| Same-context self-review | (d) the model reconsidering | better | slightly worse | 2 |
+| Fresh-context claim checker plus section check, revise unsupported claims only, cap 2 | (c) plus (a) | better | better | 2 plus revisions only where needed |
+
+The fix was not more iterations; it was giving the critic the source document and a per-claim schema.
+
+## Production patterns
+- **Deterministic gate first.** Run tests, schema validation or reconciliation before any model critique,
+  and invoke reflection only on failure. Monitor one-shot pass rate p₁ and the share of tasks entering the
+  loop.
+- **Keep-best with a numeric score.** Score each attempt (tests passed, rubric points) and return the
+  maximum, not the last. Monitor how often the returned attempt is not the final one; a high rate means
+  revisions regress.
+- **Fresh-context rubric critic with measured agreement.** Run the critic as a separate call with only task,
+  artifact and rubric, ideally a different model, returning the structured issue schema. Before trusting
+  it, compare its verdicts with human labels on a sample of real outputs; monitor that agreement over time.
+- **Held-out checks against test gaming.** Show the generator some tests and keep others hidden for the
+  final gate, so special-casing visible inputs fails. Monitor the gap between visible and held-out pass
+  rates.
+- **Scoped, expiring lesson memory.** Store cross-episode lessons keyed by task type with a creation date,
+  retrieve only matching ones, and expire them. Monitor whether success on a task type improves after
+  lessons start applying.
 
 ## Trade-offs
-- Grounded reflection raises success rates on checkable tasks substantially, but each iteration adds a
-  critique call and an evaluator run on top of a fresh generation; for tasks that are usually right in
-  one shot, the extra cost is pure overhead.
-- A separate critic model reduces agreement bias, yet it adds latency and a second prompt to maintain;
-  when the generator is already strong and tasks are simple, the critic rarely changes the outcome.
-- Carrying lessons across episodes compounds improvement on recurring task types, but stale lessons
-  mislead on new task types unless the memory is scoped and expires.
-- Rubric-based LLM critique scales to tasks without tests, at the price of sharing the generator's
-  factual blind spots; pair it with tool-grounded checks for claims.
+- **Higher success vs per-iteration cost.** Grounded reflection raises success rates on checkable tasks
+  substantially, but each iteration adds a critique call and an evaluator run on top of a fresh generation;
+  for tasks usually right in one shot, the extra cost is pure overhead.
+- **Less agreement bias vs latency and upkeep.** A separate critic model reduces agreement bias, yet adds
+  latency and a second prompt to maintain; when the generator is strong and tasks are simple, the critic
+  rarely changes the outcome.
+- **Compounding lessons vs staleness.** Carrying lessons across episodes compounds improvement on recurring
+  task types, but stale lessons mislead on new task types unless memory is scoped and expires.
+- **Coverage vs shared blind spots.** Rubric-based LLM critique scales to tasks without tests, at the price
+  of sharing the generator's factual blind spots; pair it with tool-grounded checks for claims.
 
 ## Pitfalls
-- Asking the same context "are you sure?" with no new evidence; the symptom is correct answers being
-  changed to wrong ones and accuracy that drops with more iterations.
-- Letting the critic rewrite the artifact; the symptom is reflections that are longer than the work,
-  and a revise step that merely copies the critic's version with its own errors.
-- Unbounded loops that stop only on "pass"; the symptom is runaway cost on tasks the evaluator can
-  never satisfy, such as a test that is itself wrong.
-- Keeping only the last attempt; the symptom is returning attempt 4 when attempt 2 passed more tests.
-- Vague critic output ("could be improved"); the symptom is revisions that change style, not substance.
-- Letting the generator see and optimise against the exact tests; the symptom is code that special-cases
-  test inputs, passing the visible suite and failing held-out cases or production inputs.
+- **Asking the same context "are you sure?" with no new evidence.** Symptom: correct answers changed to
+  wrong ones and accuracy that drops with more iterations. Fix: add evidence or remove the step.
+- **Letting the critic rewrite the artifact.** Symptom: reflections longer than the work, and a revise step
+  that copies the critic's version with its own errors. Fix: the critic only names issues.
+- **Unbounded loops that stop only on "pass".** Symptom: runaway cost on tasks the evaluator can never
+  satisfy, such as a test that is itself wrong. Fix: an iteration cap.
+- **Keeping only the last attempt.** Symptom: returning attempt 4 when attempt 2 passed more tests. Fix:
+  keep-best.
+- **Vague critic output ("could be improved").** Symptom: revisions change style, not substance. Fix: the
+  structured issue schema.
+- **Letting the generator see and optimise against the exact tests.** Symptom: code that special-cases test
+  inputs, passing the visible suite and failing held-out cases or production inputs. Fix: held-out tests.
 
 ## When to use
-Use reflection when a cheap, trustworthy evaluator exists (tests, validators, reconciliations), when
-the deliverable is long and has a checklist, or when the same task type recurs so lessons can
-accumulate. Skip it for short factual answers and for tasks where no evaluator better than the
-generator exists. Measure accuracy per iteration, the fraction of revisions that improve the score, and
-cost per success. Day to day it appears as the "review before submit" step in coding agents and as
-rubric critics in content pipelines. In interviews, the strong answer distinguishes grounded from
-intrinsic self-correction and explains why the evidence source decides whether the loop helps.
+- **Use when** a cheap, trustworthy evaluator exists (tests, validators, reconciliations), the deliverable
+  is long and has a checklist, or the same task type recurs so lessons can accumulate.
+- **Skip** for short factual answers and for tasks where no evaluator better than the generator exists.
+- **Measure** accuracy per iteration, the fraction of revisions that improve the score, and cost per
+  success.
+- **On the job:** the "review before submit" step in coding agents and rubric critics in content pipelines.
+- **Interviews:** distinguish grounded from intrinsic self-correction and explain why the evidence source
+  decides whether the loop helps.
 
 ## Role lens
 - **Engineer:** Builds the evaluator, the structured critic prompt and the keep-best loop, and logs
@@ -201,6 +276,36 @@ source document and the summary, and ask it to verify each claim against the sou
 `{claim, supported, evidence_span}`. Add a deterministic check for required sections. Revise only the
 unsupported claims, keep the best-scoring draft, and cap at two iterations. Then measure claim-level
 support rate before and after rather than trusting that more iterations means better.
+
+## Interview questions
+### When does self-critique actually improve an LLM's output?
+- **When the critique adds information** the generator lacked: test results, tool or search output, a
+  rubric applied in a fresh context, or a different model.
+- **Intrinsic "check your answer"** in the same context mostly re-rolls with a bias toward change, so it
+  helps only sloppy-not-wrong properties such as formatting and checklist coverage.
+
+### Your coding agent's reflection loop returns worse code than its second attempt. How do you debug and fix it?
+- **Look at the trace of scores per attempt:** revisions are not monotone, so a last-attempt return loses
+  better earlier work.
+- **Fix:** score by tests passed (no `-x`), keep the best, cap iterations, and check whether lessons are
+  vague or whether the generator is overfitting visible tests.
+
+### When would you not add a reflection step?
+- **When one-shot accuracy is already high and no cheap evaluator exists,** since an always-on LLM critic
+  adds at least one call per task: at p₁ = 0.9 that is over 100% extra calls for a small gain.
+- **For short factual answers,** where reconsideration without evidence can only shuffle correct answers.
+
+### How do Self-Refine, Reflexion and CRITIC differ?
+- **Self-Refine** edits in place with the same model's feedback: no external signal.
+- **Reflexion** scores whole trials with an evaluator, writes verbal lessons and restarts with them
+  prepended, which helps when the approach itself was wrong.
+- **CRITIC** has the critic call tools (search, code) to verify claims during critique.
+
+### How would you validate an LLM critic before putting it in production?
+- **Label a sample of real outputs by hand** and measure critic-versus-human agreement, because judges
+  favour outputs resembling their own.
+- **Check its structured output drives decisions:** pass and fail rates, issue severity distribution, and
+  whether revisions guided by it raise a ground-truth metric, not just the critic's own score.
 
 ## Quiz
 ### Q: Which reflection setup is most likely to improve correctness on a reasoning or coding task?

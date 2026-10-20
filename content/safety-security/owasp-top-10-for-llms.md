@@ -5,7 +5,7 @@ name: OWASP Top 10 for LLMs
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - safety-security/prompt-injection
   - safety-security/excessive-agency
@@ -21,155 +21,214 @@ sources:
 ---
 
 ## TL;DR
-The OWASP Top 10 for LLM Applications lists the most consequential risk classes in systems that embed a
-language model, shaped like the web Top 10 so security teams, vendors and auditors share a vocabulary.
-Its value is the framing: the model is an untrusted component that follows instructions found in data,
-so every classic boundary (input validation, output encoding, least privilege, supply chain, resource
-limits) must be redrawn around the prompt. This lesson is the map; the deep lessons are elsewhere in
-this module.
+The OWASP Top 10 for LLM Applications names the most consequential LLM risk classes in a shared
+vocabulary. Its core framing: the model is an untrusted component that follows instructions in data, so
+every classic boundary must be redrawn around the prompt.
 
 ## Why it exists
-Security reviews run on checklists, and before 2023 there was no shared one for LLM features. Each review
-re-derived the threat model from scratch and missed different classes, and procurement questionnaires
-had nothing to ask. The web Top 10 was the obvious template but misses the point in one crucial place:
-web injection means data being interpreted as code because escaping was missing, and the fix is to
-separate the two syntactically. In an LLM there is no escaping. The model is designed to interpret text
-as instructions, so "sanitise your inputs" offers false assurance and a different mental model is needed.
-
-The project published v1.0 in August 2023 and v1.1 that October, then a restructured 2025 edition in late
-2024 that reflected what had actually gone wrong in deployed systems: agents with too much authority,
-retrieval pipelines leaking across users, system prompts treated as secrets, and cost blow-ups from
-unbounded usage. Because vendors, security questionnaires and increasingly regulators reference the list
-by item number, an engineer who cannot say what LLM01 or LLM06 means, and how their system addresses it,
-will struggle in an enterprise security review regardless of how good the system is.
+- **Security reviews run on checklists, and before 2023 there was none for LLM features.** Each review
+  re-derived the threat model from scratch and missed different classes, and procurement questionnaires
+  had nothing to ask.
+- **The web Top 10 misses the crucial point.** Web injection is data interpreted as code because escaping
+  was missing, fixed by separating the two syntactically. An LLM has no escaping: it is designed to treat
+  text as instructions, so "sanitise your inputs" offers false assurance.
+- **It tracks real failures.** v1.0 came in August 2023 and v1.1 that October; the restructured 2025 edition
+  (late 2024) reflected agents with too much authority, retrieval leaking across users, system prompts
+  treated as secrets, and cost blow-ups from unbounded usage.
+- **Item numbers are the lingua franca.** Vendors, questionnaires and increasingly regulators cite LLM01 or
+  LLM06; an engineer who cannot say what they mean, and how their system addresses them, struggles in an
+  enterprise security review regardless of how good the system is.
+- **Scope of this lesson:** it is the map; the classic boundaries (input validation, output encoding, least
+  privilege, supply chain, resource limits) each have deep lessons elsewhere in this module.
 
 ## How it works
-### The 2025 list, grouped by the boundary it concerns
+### The 2025 list, grouped by trust boundary
 The ten items are easier to remember as six trust boundaries than as a numbered list.
 
-**Instruction boundary: who gets to tell the model what to do.**
-- *LLM01 Prompt Injection.* Untrusted text, from the user (direct) or from documents, pages and tool
-  results (indirect), changes the model's behaviour. There is no reliable detector, so controls limit what
-  a hijacked model can do. Deep lesson: prompt injection.
-- *LLM07 System Prompt Leakage.* The system prompt will be extracted, so it must contain no secrets or
-  authority. Deep lesson: data leakage.
-
-**Data boundary: what the model can see and repeat.**
-- *LLM02 Sensitive Information Disclosure.* PII, secrets and other users' data in completions, logs or
-  training data. Deep lessons: data leakage, PII redaction, cross-tenant leakage.
-- *LLM08 Vector and Embedding Weaknesses.* Retrieval stores without access control, cross-tenant
-  retrieval, invertible embeddings, poisoned documents. Deep lessons: RAG poisoning, cross-tenant leakage.
-- *LLM04 Data and Model Poisoning.* Manipulated training, fine-tuning or retrieval data that implants
-  behaviour or bias. Deep lessons: supply-chain security, RAG poisoning.
-
-**Action boundary: what the model's output is allowed to cause.**
-- *LLM05 Improper Output Handling.* Treating completions as trusted: rendering them as HTML, passing them
-  to a shell or SQL engine, or deserialising them unchecked. The LLM version of output encoding. Deep
-  lesson: output validation.
-- *LLM06 Excessive Agency.* Too many tools, too much permission, too little oversight, so a mistaken or
-  injected model causes real damage. Deep lessons: excessive agency, tool privilege escalation.
-
-**Trust-in-output boundary.**
-- *LLM09 Misinformation.* Confident wrong answers, fabricated citations and insecure generated code
-  consumed without verification; the risk is in the workflow around the model as much as in the model.
-
-**Resource boundary.**
-- *LLM10 Unbounded Consumption.* No limits on tokens, requests, context length or tool loops, leading to
-  denial of service, denial of wallet, or model extraction through high-volume querying.
-
-**Build boundary.**
-- *LLM03 Supply Chain.* Compromised models, datasets, adapters and the packages that load them. Deep
-  lesson: supply-chain security for models and datasets.
+| Boundary | Item | What goes wrong | Deep lesson |
+|---|---|---|---|
+| **Instruction:** who tells the model what to do | *LLM01 Prompt Injection* | untrusted text from the user (direct) or documents, pages and tool results (indirect) changes behaviour; no reliable detector, so controls limit what a hijacked model can do | prompt injection |
+| | *LLM07 System Prompt Leakage* | the system prompt will be extracted, so it must hold no secrets or authority | data leakage |
+| **Data:** what the model can see and repeat | *LLM02 Sensitive Information Disclosure* | PII, secrets and other users' data in completions, logs or training data | data leakage, PII redaction, cross-tenant leakage |
+| | *LLM08 Vector and Embedding Weaknesses* | retrieval stores without access control, cross-tenant retrieval, invertible embeddings, poisoned documents | RAG poisoning, cross-tenant leakage |
+| | *LLM04 Data and Model Poisoning* | manipulated training, fine-tuning or retrieval data implants behaviour or bias | supply-chain security, RAG poisoning |
+| **Action:** what output may cause | *LLM05 Improper Output Handling* | completions treated as trusted: rendered as HTML, passed to a shell or SQL engine, deserialised unchecked; the LLM version of output encoding | output validation |
+| | *LLM06 Excessive Agency* | too many tools, too much permission, too little oversight, so a mistaken or injected model does real damage | excessive agency, tool privilege escalation |
+| **Trust in output** | *LLM09 Misinformation* | confident wrong answers, fabricated citations, insecure generated code consumed unverified; the risk is in the workflow as much as the model | |
+| **Resource** | *LLM10 Unbounded Consumption* | no limits on tokens, requests, context length or tool loops: denial of service, denial of wallet, model extraction by high-volume querying | |
+| **Build** | *LLM03 Supply Chain* | compromised models, datasets, adapters and the packages that load them | supply-chain security for models and datasets |
 
 ### Attacks cross rows, so read the matrix across
-Real incidents rarely sit in one item. A typical chain: an attacker plants instructions in a document
-that gets indexed (LLM04/LLM08); a user's question retrieves it and the model follows it (LLM01); the
-model writes a markdown image whose URL carries the user's data, and the chat client renders it (LLM05);
-the data reaches the attacker's server (LLM02). Four rows, one attack. The useful observation is that the
-cheapest reliable control is often in a different row from the one the incident gets filed under: you
-cannot reliably stop LLM01, but not rendering remote images (an LLM05 control) breaks this chain
-completely. That is why the list works best as a set of boundaries with layered controls, and why the
-action and resource boundaries, which do not depend on detecting the attack, carry most of the weight.
+A typical chain, four rows and one attack:
+1. An attacker plants instructions in a document that gets indexed (LLM04/LLM08).
+2. A user's question retrieves it and the model follows it (LLM01).
+3. The model writes a markdown image whose URL carries the user's data, and the client renders it (LLM05).
+4. The data reaches the attacker's server (LLM02).
+
+- **The cheapest reliable control is often in a different row** from the one the incident is filed under.
+  You cannot reliably stop LLM01, but not rendering remote images (an LLM05 control) breaks this chain
+  completely.
+- **So use the list as boundaries with layered controls.** The action and resource boundaries, which do not
+  depend on detecting the attack, carry most of the weight.
 
 ### What changed from v1.1 to 2025, and why it matters
-The 2023 list had Insecure Plugin Design, Model Denial of Service, Overreliance and Model Theft as
-separate items. In 2025, plugin design folded into Excessive Agency and Supply Chain, because the failure
-was authority and provenance rather than plugins specifically; Model DoS broadened into Unbounded
-Consumption to cover cost and extraction, absorbing Model Theft on the way; Overreliance became
-Misinformation; and two new items, System
-Prompt Leakage and Vector and Embedding Weaknesses, were added because RAG and agent deployments made
-them routine. The direction of travel is from "the model misbehaves" to "the system around the model
-grants it too much", which is also the direction your controls should take.
+| 2023 (v1.1) item | 2025 fate | Why |
+|---|---|---|
+| Insecure Plugin Design | folded into Excessive Agency and Supply Chain | the failure was authority and provenance, not plugins specifically |
+| Model Denial of Service | broadened into Unbounded Consumption | to cover cost and extraction |
+| Model Theft | absorbed into Unbounded Consumption | extraction is a consumption problem |
+| Overreliance | became Misinformation | |
+| (new) | System Prompt Leakage, Vector and Embedding Weaknesses | RAG and agent deployments made them routine |
+
+- **Direction of travel:** from "the model misbehaves" to "the system around the model grants it too much",
+  which is also the direction your controls should take.
 
 ### How to use the list
-It is a threat-modelling prompt, not a compliance standard. There is no certification and "OWASP
-compliant" has no formal meaning. Nor is the numbering your priority order: it reflects what is common
-across the industry, while your ranking should come from exposure and blast radius in your system. An
-internal summariser with no tools barely has an LLM06 problem; a customer-facing agent that can move money
-has little else. The practical use is a table with one row per item and three columns:
-how the risk manifests in *this* system, the control, and the evidence (a test, a config, a log). Items
-that do not apply get a one-line reason rather than a blank, because reviewers read blanks as gaps. OWASP
-has since published agentic-specific guidance under its agentic security initiative; the ten items above
-remain the baseline vocabulary. Two neighbouring frameworks answer different questions: MITRE ATLAS
-catalogues adversary tactics and techniques against ML systems, which is what red teams plan from, and
-the NIST AI Risk Management Framework describes the organisational process for governing AI risk. The
-OWASP list sits between them as the engineering checklist for one application.
+- **It is a threat-modelling prompt, not a compliance standard.** There is no certification, and "OWASP
+  compliant" has no formal meaning.
+- **The numbering is not your priority order.** It reflects what is common across the industry; rank by
+  exposure and blast radius in your system. An internal summariser with no tools barely has an LLM06
+  problem; a customer-facing agent that can move money has little else.
+- **Build a table:** one row per item, three columns: how the risk manifests in *this* system, the control,
+  and the evidence (a test, a config, a log).
+- **Never leave a blank.** Items that do not apply get a one-line reason, because reviewers read blanks as
+  gaps.
+- **Agentic guidance:** OWASP has since published agentic-specific guidance under its agentic security
+  initiative; the ten items remain the baseline vocabulary.
 
-## Example
-Threat-model a contract-review assistant: RAG over each customer's uploaded contracts, a tool that creates
-tickets in the customer's tracker, used by legal teams at 300 tenants. Walking the list produces concrete
-controls rather than abstractions.
+| Framework | Answers |
+|---|---|
+| MITRE ATLAS | adversary tactics and techniques against ML systems; what red teams plan from |
+| OWASP Top 10 for LLMs | the engineering checklist for one application |
+| NIST AI Risk Management Framework | the organisational process for governing AI risk |
 
-LLM01: contracts are untrusted content, so the model may read injected instructions inside them; the
-ticket tool is therefore gated by a confirmation step showing the structured title and body, and no
-network tools exist. LLM07: the system prompt holds formatting rules only; tenant and permissions come
-from the token. LLM02 and LLM08: retrieval filters on `tenant_id` inside the ANN query, traces are redacted
-before export, and a per-tenant canary test runs in CI. LLM04: the embedding model is pinned by hash and
-pulled from the internal registry; uploaded contracts are scanned for hidden text in white font and zero-
-width characters. LLM05: completions are rendered as plain text, never HTML; the ticket body is validated
-against a schema with a length cap. LLM06: the only write tool is `create_ticket`, scoped to the
-requesting user's tracker project. LLM09: every clause-level claim must carry a citation to a retrieved
-span, and a groundedness eval runs weekly. LLM10: illustrative limits of 8k input tokens, 2k output
-tokens, 60 requests per user per hour, a per-tenant monthly token budget, and a ten-step cap on the agent
-loop. LLM03: the base model, embedding model and reranker each have recorded hashes, signatures and an
-entry in the AI bill of materials. Each row now has a control and a piece of evidence a reviewer can ask
-for. Ranking them for this system: LLM01 with LLM06 first, because the one write path lands in 300
-customers' trackers and contracts are attacker-supplied by construction; LLM08 and LLM02 next, because a
-single missing filter exposes one customer's contracts to another; LLM10 and LLM03 after that. A chatbot
-over public documentation, by contrast, would rank LLM09 and LLM10 near the top and LLM06 near the bottom.
+## Diagram
+One injection chain crosses four rows; the cheapest reliable control (no remote image rendering) sits in a
+different row from the one the incident gets filed under.
+
+```mermaid
+flowchart TD
+    A["Attacker plants text in a document"] --> I["Indexed: LLM04, LLM08"]
+    I --> R["User query retrieves it"]
+    R --> M["Model follows it: LLM01"]
+    M --> O["Writes markdown image with data in URL"]
+    O --> C{"Client renders remote images?"}
+    C -->|"yes: LLM05 failure"| L["Data reaches attacker: LLM02"]
+    C -->|"no: LLM05 control"| S["Chain broken"]
+```
+
+## Examples
+### Threat-modelling a contract-review assistant
+RAG over each customer's uploaded contracts, a tool that creates tickets in the customer's tracker, used by
+legal teams at 300 tenants. Walking the list produces concrete controls rather than abstractions.
+
+| Item | Control in this system |
+|---|---|
+| LLM01 | contracts are untrusted, so the ticket tool is gated by a confirmation step showing the structured title and body; no network tools exist |
+| LLM07 | the system prompt holds formatting rules only; tenant and permissions come from the token |
+| LLM02, LLM08 | retrieval filters on `tenant_id` inside the ANN query, traces are redacted before export, a per-tenant canary test runs in CI |
+| LLM04 | the embedding model is pinned by hash and pulled from the internal registry; uploads are scanned for hidden text in white font and zero-width characters |
+| LLM05 | completions are rendered as plain text, never HTML; the ticket body is validated against a schema with a length cap |
+| LLM06 | the only write tool is `create_ticket`, scoped to the requesting user's tracker project |
+| LLM09 | every clause-level claim must cite a retrieved span; a groundedness eval runs weekly |
+| LLM10 | illustrative limits: 8k input tokens, 2k output tokens, 60 requests per user per hour, a per-tenant monthly token budget, a ten-step cap on the agent loop |
+| LLM03 | base model, embedding model and reranker each have recorded hashes, signatures and an AI bill of materials entry |
+
+Each row now has a control and a piece of evidence a reviewer can ask for. Ranking for this system:
+1. **LLM01 with LLM06 first,** because the one write path lands in 300 customers' trackers and contracts are
+   attacker-supplied by construction.
+2. **LLM08 and LLM02 next,** because a single missing filter exposes one customer's contracts to another.
+3. **LLM10 and LLM03 after that.**
+
+A chatbot over public documentation, by contrast, would rank LLM09 and LLM10 near the top and LLM06 near
+the bottom.
+
+### A control matrix that fails CI on gaps
+Keep the matrix in the repo next to the code and fail the build when a row is missing or lacks evidence.
+Pure Python, runnable; here it reports the rows still to write.
+
+```python
+ITEMS = [f"LLM{n:02d}" for n in range(1, 11)]
+
+MATRIX = {   # one row per item: how it shows up here, the control, the evidence
+    "LLM01": {"manifests": "injected text inside uploaded contracts",
+              "control": "ticket tool gated by confirmation; no network tools",
+              "evidence": "tests/redteam/test_injection_to_tool.py"},
+    "LLM06": {"manifests": "create_ticket writes into customer trackers",
+              "control": "only write tool, scoped to requester's project",
+              "evidence": "tools/registry.yaml scopes"},
+    "LLM07": {"manifests": "system prompt extraction",
+              "control": "prompt holds formatting rules only; authz from token",
+              "evidence": "tests/test_prompt_has_no_secrets.py"},
+    # an item that truly does not apply gets {"n/a": "<one-line reason>"}, never a blank
+}
+
+def gaps(matrix):
+    out = []
+    for item in ITEMS:
+        row = matrix.get(item)
+        if row is None:
+            out.append(f"{item}: no row (reviewers read blanks as gaps)")
+        elif "n/a" not in row and not all(row.get(k) for k in ("manifests", "control", "evidence")):
+            out.append(f"{item}: missing manifests/control/evidence")
+    return out
+
+for g in gaps(MATRIX):
+    print(g)       # in CI: sys.exit(1) if gaps(MATRIX) else 0
+```
+
+- **Version the matrix** with the edition it maps to (2025, not v1.1), so questionnaire answers line up with
+  the item numbers customers cite.
+
+## Production patterns
+- **Matrix-as-code in the repo.** Store the per-item matrix next to the service, require evidence links to
+  tests or configs, and run a gap check in CI. Make adding a tool or data source require a matrix diff in
+  code review. Monitor coverage (every item has a row) and freshness (rows touched when architecture changes).
+- **Red-team suite tagged by item.** Tag each adversarial test case with the item it exercises (LLM01,
+  LLM05, LLM06 and so on) and report pass rates per item on every release, so a regression shows up as
+  "LLM05 dropped" rather than a generic score.
+- **Boundary controls that do not need detection.** Plain-text or sanitised rendering for LLM05, scoped
+  typed tools and approval gates for LLM06, and token, request and loop caps for LLM10, enforced in code.
+  Monitor blocked renders, denied tool calls and limit hits.
+- **Questionnaire answer bank.** Keep a reviewed, item-numbered answer per control with its evidence, mapped
+  in both directions (item to control, control to items). FDEs reuse it per customer; track how often
+  answers need edits after an architecture change.
+- **Incident classification.** After every incident, tag every row the chain crossed and check which
+  row's evidence was missing. Track repeat incidents per row.
 
 ## Trade-offs
-- A shared checklist speeds reviews and questionnaires, but filled-in rows can substitute for thinking;
-  the list flips from asset to liability when teams answer "LLM01: we have a guardrail" and stop there.
-- Grouping risks by trust boundary makes controls reusable across items, yet a questionnaire will ask by
-  item number, so maintain the mapping in both directions.
-- The list evolves between editions, which keeps it relevant, but a control matrix written against v1.1
-  item numbers no longer lines up with 2025 references; version your matrix explicitly.
-- Covering all ten for a low-risk internal tool is more process than the risk warrants; scale the depth
-  of each row to blast radius, but still write the row.
+- **Shared checklist vs thinking.** It speeds reviews and questionnaires, but filled-in rows can substitute
+  for thinking. It flips from asset to liability when teams answer "LLM01: we have a guardrail" and stop.
+- **Grouping by boundary vs questionnaires.** Boundaries make controls reusable across items, yet a
+  questionnaire asks by item number, so maintain the mapping in both directions.
+- **An evolving list vs stable references.** New editions keep it relevant, but a matrix written against
+  v1.1 numbers no longer lines up with 2025 references; version your matrix explicitly.
+- **Full coverage vs low-risk tools.** Covering all ten for a low-risk internal tool is more process than the
+  risk warrants. Scale each row's depth to blast radius, but still write the row.
 
 ## Pitfalls
-- Treating "OWASP LLM Top 10 compliant" as a meaningful claim from a vendor; the symptom is an inability to
-  produce a per-item control and evidence table when asked.
-- Mapping LLM01 to an input classifier and declaring it solved; the symptom is a red-team finding that a
+- **Accepting "OWASP LLM Top 10 compliant" from a vendor.** Symptom: they cannot produce a per-item control
+  and evidence table when asked.
+- **Mapping LLM01 to an input classifier and declaring it solved.** Symptom: a red-team finding that a
   paraphrased injection reaches the tool layer unchanged.
-- Ignoring LLM10 because "the provider handles scaling"; the symptom is a month-end invoice several times
-  the forecast after a scripted client or a runaway agent loop.
-- Reading LLM05 as a model problem; the symptom is cross-site scripting or command execution from a
-  completion that was rendered or executed without validation, which no model change would have fixed.
-- Writing the matrix once at launch; the symptom is a new tool or data source shipped months later with
-  no row and no review.
-- Assessing each row in isolation; the symptom is every row marked "mitigated" while a red team chains an
-  injection through rendering into disclosure, because no single row owned the chain.
+- **Ignoring LLM10 because "the provider handles scaling".** Symptom: a month-end invoice several times the
+  forecast after a scripted client or a runaway agent loop.
+- **Reading LLM05 as a model problem.** Symptom: cross-site scripting or command execution from a completion
+  rendered or executed without validation, which no model change would have fixed.
+- **Writing the matrix once at launch.** Symptom: a new tool or data source ships months later with no row
+  and no review.
+- **Assessing each row in isolation.** Symptom: every row "mitigated" while a red team chains an injection
+  through rendering into disclosure, because no single row owned the chain.
 
 ## When to use
-Use the list at three moments: when designing a new LLM feature, as the skeleton of the threat model;
-before an enterprise security review or questionnaire, as the structure of your answers; and after any
-incident, to classify it and check which row's evidence was missing. Do not use it as a scoring scheme or
-a certification. Measure coverage (every item has a row with control and evidence), freshness (rows
-updated when the architecture changes), and red-team results per item. It shows up in interviews as "walk
-me through the OWASP LLM Top 10 for this design", where the strong answer groups items by boundary and
-names a concrete control and test for each rather than reciting the list.
+- **When designing a new LLM feature:** as the skeleton of the threat model.
+- **Before an enterprise security review or questionnaire:** as the structure of your answers.
+- **After any incident:** to classify it and check which row's evidence was missing.
+- **Avoid:** using it as a scoring scheme or a certification.
+- **Measure:** coverage (every item has a row with control and evidence), freshness (rows updated when the
+  architecture changes), and red-team results per item.
+- **Interviews:** "walk me through the OWASP LLM Top 10 for this design"; the strong answer groups items by
+  boundary and names a concrete control and test for each rather than reciting the list.
 
 ## Role lens
 - **Engineer:** Turns each applicable item into a test or configuration that can be pointed at as
@@ -193,6 +252,40 @@ rendered or executed (LLM05), what rate and token limits exist per tenant (LLM10
 and embeddings come from with hashes (LLM03). I would also ask which edition they mapped against, and for
 red-team or penetration-test reports that reference those items, since evidence rather than assertion is
 what the list is meant to elicit.
+
+## Interview questions
+### Why is prompt injection first on the list, and why can't it be fixed like SQL injection?
+- **It is the entry point** for most chains: untrusted text, direct or indirect, changes the model's behaviour.
+- **No syntactic separation exists:** SQL injection is fixed by keeping code and data in separate channels,
+  but a prompt is one channel by design, so controls must limit what a steered model can do.
+
+### Walk me through the Top 10 for a RAG agent that can create tickets for 300 tenants.
+- **Group by boundary:** instruction (LLM01, LLM07), data (LLM02, LLM04, LLM08), action (LLM05, LLM06),
+  output trust (LLM09), resources (LLM10), build (LLM03).
+- **Name a control and evidence per row,** for example tenant filter inside the ANN query with a canary test
+  for LLM08, plain-text rendering for LLM05, one scoped write tool with confirmation for LLM06.
+- **Rank by blast radius:** LLM01 with LLM06 first, because the write path reaches every tenant's tracker.
+
+### An incident was filed under LLM01. Why might the fix belong in a different row?
+- **LLM01 has no reliable detector,** so fixing it in place usually means another classifier that a
+  paraphrase bypasses.
+- **The chain crossed other rows:** if data left through a rendered image, an LLM05 control (no remote
+  images) breaks it completely; if a tool fired, LLM06 scoping and gates contain it.
+- **So classify the incident across every row it crossed** and fix the cheapest reliable link.
+
+### When is covering all ten items more process than it is worth?
+- **For a low-risk internal tool** with no write tools and no sensitive data, deep work on every row is
+  disproportionate.
+- **Still write every row,** with a one-line reason for items that do not apply, because reviewers read blanks
+  as gaps.
+- **Scale depth to blast radius:** a public-docs chatbot puts effort into LLM09 and LLM10, not LLM06.
+
+### What evidence would you expect a vendor to show for LLM10 Unbounded Consumption?
+- **Concrete limits** in config: input and output token caps, requests per user per hour, per-tenant token
+  budgets, and a step cap on agent loops.
+- **Monitoring:** alerts on spend and limit hits per tenant, so a scripted client or runaway loop surfaces
+  before the month-end invoice.
+- **Extraction defence:** rate limits and anomaly detection on high-volume querying.
 
 ## Quiz
 ### Q: Why does input sanitisation, which solves SQL injection, not solve prompt injection?

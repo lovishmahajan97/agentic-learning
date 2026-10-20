@@ -5,7 +5,7 @@ name: Distributed tracing across services
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - observability/tracing
   - observability/spans
@@ -21,41 +21,35 @@ sources:
 ---
 
 ## TL;DR
-One user turn in a production LLM system typically crosses several processes: an API gateway, an
-orchestrator, a retrieval service, a model gateway, tool servers, perhaps a queue. In-process span
-context dies at each boundary, so distributed tracing *propagates* the trace id and parent span id
-with every call (the W3C `traceparent` header for HTTP, message metadata for queues) and each service
-continues the same tree. Without it you get disconnected fragments and cannot attribute latency or
-failure to the hop that actually mattered.
+In-process span context dies at every service boundary, so distributed tracing *propagates* trace id and
+parent span id with each call (the W3C `traceparent` header, or queue message metadata). Without it, one
+LLM turn becomes disconnected fragments with unattributable latency.
 
 ## Why it exists
-A tracer keeps the "current span" in a context variable inside one process. The moment the
-orchestrator makes an HTTP call to the retrieval service, that context is gone: the retrieval service
-starts its own trace with a fresh id, and the model gateway behind it starts another. You now have
-three trees describing one request and nothing linking them except approximate timestamps and, if
-you are lucky, a user id.
-
-Correlating by timestamp and user fails under exactly the conditions that make you need tracing:
-concurrency (the same user has two tabs open), retries (the orchestrator called retrieval twice;
-which one fed the answer?), and asynchrony (an agent step was enqueued and executed 40 s later by a
-worker that handles messages from hundreds of requests). Grepping logs across five services for a
-request id is the usual fallback; it recovers the events but not the structure or the durations, and
-it only works if every service logs the same id, which is itself a propagation problem.
-
-LLM systems make the boundaries more numerous, not fewer. Putting model calls behind a gateway for
-key management and fallbacks, retrieval behind its own service, and tools behind MCP servers means a
-single answer can involve four or five hops before the third-party provider is even reached. If the
-trace stops at the first hop, the waterfall shows "orchestrator: 8.2 s" and nothing underneath, which
-is precisely the question you were trying to answer.
+- **One turn crosses many processes.** An API gateway, an orchestrator, a retrieval service, a model
+  gateway, tool servers, perhaps a queue. The tracer's "current span" lives in a context variable inside
+  one process.
+- **Context dies at the first HTTP call.** The retrieval service starts its own trace with a fresh id and
+  the model gateway behind it starts another: three trees for one request, linked only by approximate
+  timestamps and, if you are lucky, a user id.
+- **Correlating by timestamp and user fails exactly when you need it:** concurrency (the same user has two
+  tabs open), retries (retrieval was called twice; which fed the answer?), and asynchrony (an agent step
+  enqueued and run 40 s later by a worker handling hundreds of requests).
+- **Grepping logs for a request id across five services** recovers events but not structure or durations,
+  and only works if every service logs the same id, which is itself a propagation problem.
+- **LLM systems add hops.** Model calls behind a gateway (keys, fallbacks), retrieval behind its own
+  service, tools behind MCP servers: four or five hops before the provider is reached. If the trace stops
+  at the first hop, the waterfall shows "orchestrator: 8.2 s" and nothing underneath, precisely the
+  question you were asking.
 
 ## How it works
 ### Context propagation
-Propagation has two halves. On the calling side, the tracer *injects* the current span context into
-the outgoing request as metadata. On the receiving side, the server *extracts* that context and
-starts its server span as a child of the remote parent. Spans are still created locally and exported
-independently by each service; the backend reassembles the tree by trace id. Only the ids travel with
-the request, *because* the alternative, having services report to a central tracer synchronously,
-would put the tracing system on the latency path of every call.
+1. **Inject (caller):** the tracer writes the current span context into the outgoing request as metadata.
+2. **Extract (receiver):** the server reads it and starts its server span as a child of the remote parent.
+3. **Export independently:** each service still creates spans locally and exports them on its own; the
+   backend reassembles the tree by trace id.
+- **Only the ids travel,** *because* having services report synchronously to a central tracer would put
+  tracing on the latency path of every call.
 
 ### The wire format
 The W3C Trace Context standard defines the HTTP header most systems now use:
@@ -66,70 +60,87 @@ traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
           version        trace_id (32 hex)      parent span_id    flags (01 = sampled)
 ```
 
-A second header, `tracestate`, carries vendor-specific key-value pairs. Older systems used Zipkin's
-B3 headers; OpenTelemetry can inject and extract both, but every service on a path must agree,
-*because* a service that understands only B3 will ignore `traceparent` and start a new trace,
-silently cutting the chain.
+- **`tracestate`** is a second header for vendor-specific key-value pairs.
+- **Zipkin's B3 headers** were used by older systems. OpenTelemetry can inject and extract both, but every
+  service on a path must agree, *because* a B3-only service ignores `traceparent` and starts a new trace,
+  silently cutting the chain.
 
 ### Sampling decisions travel too
-The `01` flag says "this trace is being sampled". It is set at the root and honoured downstream so a
-trace is either complete or absent. If each service sampled independently at 10%, a five-hop trace
-would be complete one time in a hundred thousand. Tail-based sampling (decide after the whole trace
-has arrived, so every error and slow trace can be kept) is done in a collector that buffers spans by
-trace id. That only works if *every* span of a trace reaches the *same* collector instance, while
-services export independently to whatever instance their load balancer picks. The usual answer is two
-tiers: a first tier that routes spans by hashing the trace id (the OpenTelemetry Collector has a
-load-balancing exporter for this) and a second tier that buffers and decides. The buffer also needs a
-timeout, and spans arriving after the decision are dropped or kept inconsistently, which is one more
-reason to keep traces short.
+- **The `01` flag** says "this trace is being sampled". It is set at the root and honoured downstream, so
+  a trace is complete or absent.
+- **Independent sampling is ruinous:** at 10% per service, a five-hop trace would be complete one time in
+  a hundred thousand.
+- **Tail-based sampling** (decide after the whole trace arrives, keeping every error and slow trace) runs
+  in a collector that buffers spans by trace id. It only works if *every* span of a trace reaches the
+  *same* collector instance, while services export to whatever instance their load balancer picks.
+- **The usual answer is two tiers:** tier one routes spans by hashing the trace id (the OpenTelemetry
+  Collector has a load-balancing exporter for this); tier two buffers and decides.
+- **The buffer needs a timeout,** and spans arriving after the decision are dropped or kept
+  inconsistently: one more reason to keep traces short.
 
 ### Queues and asynchronous hops
-For a message queue there is no response to join on, so the context is injected into message headers
-or a metadata field of the payload. The consumer extracts it and starts a `CONSUMER` span. When a
-consumer processes a batch from many producers, strict parent-child does not fit; the batch span
-carries *links* to each message's producer span instead. For long gaps (an agent step scheduled for an
-hour later) teams usually still continue the trace but also record a durable execution id, *because*
-trace backends retain data for days while the workflow may live for weeks.
+- **No response to join on,** so context is injected into message headers or a payload metadata field.
+  The consumer extracts it and starts a `CONSUMER` span.
+- **Batches from many producers** do not fit strict parent-child; the batch span carries *links* to each
+  message's producer span.
+- **Long gaps** (an agent step scheduled an hour later): continue the trace but also record a durable
+  execution id, *because* trace backends retain data for days while the workflow may live for weeks.
 
 ### Where LLM systems break the chain
-- **Model and AI gateways.** A proxy in front of providers must extract the incoming context, inject
-  it on the outbound call, and emit its own span recording provider, model, retry and fallback
-  decisions. A gateway that does not is a black hole in every trace.
-- **Tool servers over MCP.** Tool calls leave the orchestrator's process. For HTTP-based transports,
-  standard header propagation applies if both sides are instrumented. MCP requests also carry a
-  `_meta` object intended for metadata, which implementations can use to pass trace context; whether
-  a given SDK does this automatically varies by version, so verify rather than assume.
-- **Third-party providers.** The provider will not continue your trace, so the client span is the
-  leaf. Record the provider's request identifier from the response headers (providers return one
-  under names such as `request-id` or `x-request-id`) as an attribute, *because* it is the only handle
-  their support team can use when you report a slow or failed call.
-- **Thread pools.** Not a network hop, but the same failure: Python does not copy context into
-  executor threads by default. asyncio tasks copy it at creation and `asyncio.to_thread` copies it,
-  but `loop.run_in_executor` and a bare `ThreadPoolExecutor.submit` do not. Wrap submitted callables
-  with `contextvars.copy_context().run` or use an instrumented executor.
+| Hop | What goes wrong | What to do |
+|---|---|---|
+| **Model and AI gateways** | a proxy that does not propagate is a black hole in every trace | extract incoming context, inject on the outbound call, emit its own span with provider, model, retry and fallback decisions |
+| **Tool servers over MCP** | tool calls leave the orchestrator's process | HTTP transports: standard header propagation if both sides are instrumented. MCP requests also carry a `_meta` object for metadata that can carry trace context; whether an SDK does this automatically varies by version, so verify |
+| **Third-party providers** | the provider will not continue your trace, so the client span is the leaf | record the provider's request id from response headers (names such as `request-id` or `x-request-id`), *because* it is the only handle their support team can use |
+| **Thread pools** | not a network hop, same failure: Python does not copy context into executor threads by default | asyncio tasks copy it at creation and `asyncio.to_thread` copies it; `loop.run_in_executor` and bare `ThreadPoolExecutor.submit` do not. Wrap callables with `contextvars.copy_context().run` or use an instrumented executor |
 
 ### The edge is a trust boundary
-A `traceparent` arriving from the public internet is untrusted input. A client can set the sampled
-flag on every request and force you to record (and pay to store) all of them, or reuse a trace id so
-unrelated requests merge into one tree. Public-facing services therefore usually start a fresh trace,
-optionally adding a *link* to the incoming context so a partner's trace can still be found, and honour
-incoming context only from known internal callers. The same reasoning applies to incoming baggage.
+- **A `traceparent` from the public internet is untrusted input.** A client can set the sampled flag on
+  every request and force you to record (and pay to store) all of them, or reuse a trace id so unrelated
+  requests merge into one tree.
+- **So public-facing services usually start a fresh trace,** optionally adding a *link* to the incoming
+  context so a partner's trace can still be found, and honour incoming context only from known internal
+  callers. The same applies to incoming baggage.
 
 ### Baggage: carrying more than ids
-W3C Baggage is a companion header for application-defined key-values (tenant, feature flag,
-experiment arm) that travel with the trace so a downstream service can tag its spans and logs with
-them. Use it sparingly: baggage is forwarded on *every* outbound call unless filtered, including calls
-to third-party APIs, so a tenant name or user email in baggage is a data leak by default.
+- **W3C Baggage** is a companion header for application key-values (tenant, feature flag, experiment arm)
+  that travel with the trace so downstream services can tag spans and logs.
+- **Use it sparingly:** baggage is forwarded on *every* outbound call unless filtered, including to
+  third-party APIs, so a tenant name or user email in baggage is a data leak by default.
 
 ### Clock skew
-Each service timestamps with its own clock. A child span that starts before its parent, or a negative
-network gap, is the symptom. Keep hosts under NTP or equivalent; most trace viewers do not correct for it.
+- **Each service timestamps with its own clock.** Symptom: a child starting before its parent, or a
+  negative network gap.
+- **Keep hosts under NTP or equivalent;** most trace viewers do not correct for it.
 
-## Example
-The same two primitives, `inject` and `extract`, cover HTTP and queues; only the carrier changes.
-Auto-instrumentation for FastAPI, httpx or requests performs exactly these calls for you; they are
-written out here so the mechanism is visible, including the queue hop where the carrier is a field in
-the message rather than an HTTP header.
+## Diagram
+One turn crossing three services and a queue: every hop injects context and the next extracts it, so all
+spans share one trace id; the provider is the leaf.
+
+```mermaid
+sequenceDiagram
+    participant G as API gateway
+    participant O as Orchestrator
+    participant R as Retrieval service
+    participant M as Model gateway
+    participant P as Provider
+    participant Q as Queue worker
+    G->>O: traceparent 00-T-g-01
+    O->>R: traceparent 00-T-o1-01
+    R-->>O: hits
+    O->>M: traceparent 00-T-o2-01
+    M->>P: no trace context continues
+    P-->>M: completion plus request-id
+    Note over M: record request-id on leaf span
+    O->>Q: message with trace carrier
+    Note over Q: extract then CONSUMER span
+```
+
+## Examples
+### Inject and extract over HTTP and a queue
+- **Same two primitives,** `inject` and `extract`, cover HTTP and queues; only the carrier changes.
+- **Auto-instrumentation** for FastAPI, httpx or requests performs exactly these calls; they are written
+  out here so the mechanism is visible, including the queue hop where the carrier is a message field.
 
 ```python
 from opentelemetry import trace
@@ -166,47 +177,95 @@ def enqueue_agent_step(queue, step: dict):
     queue.put({"step": step, "trace": carrier})   # consumer: extract(msg["trace"])
 ```
 
+### Runnable: why executor threads lose context
+Pure standard library. A bare `submit` runs in a thread whose context is empty; wrapping with
+`copy_context().run` carries the caller's values (and so the current span) across.
+
+```python
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+
+request_id = contextvars.ContextVar("request_id", default=None)
+
+def work():
+    return request_id.get()
+
+request_id.set("req-42")
+with ThreadPoolExecutor(max_workers=1) as pool:
+    lost = pool.submit(work).result()
+    kept = pool.submit(contextvars.copy_context().run, work).result()
+print(f"bare submit: {lost}   copied context: {kept}")
+# bare submit: None   copied context: req-42
+```
+
+### Worked numbers: independent vs propagated sampling
+Five hops, each keeping 10% of spans.
+
+| Strategy | Chance a trace is complete | At 1,000,000 turns a day |
+|---|---|---|
+| Each hop samples independently at 10% | 0.1^5 = 0.00001 | about 10 complete traces |
+| Root decides 10%, flag propagated | 0.1 | about 100,000 complete traces |
+| Tail sampling: all errors and slow turns plus 10% of the rest | 1.0 for every error and slow turn | every interesting turn kept |
+
+## Production patterns
+- **One propagator list, set fleet-wide.** Configure every service the same way, for example
+  `OTEL_PROPAGATORS=tracecontext,baggage` (add `b3` only during a migration). Monitor the fraction of
+  traces whose root is an edge service and whose leaf reaches the provider call, per path.
+- **Parent-based sampling everywhere below the root.** Use the SDK's parent-based sampler (for example
+  `OTEL_TRACES_SAMPLER=parentbased_traceidratio`) so only the root decides and every hop honours the flag.
+  Monitor completeness for your deepest paths.
+- **Two-tier collector for tail sampling.** Tier one uses the Collector's load-balancing exporter routed
+  by trace id; tier two runs the tail sampling processor with a decision wait sized to your longest
+  normal trace. Monitor late-arriving spans and collector memory.
+- **Reset context at the edge.** Public ingress starts a new root and links to any incoming
+  `traceparent`; only mTLS-authenticated or allowlisted internal callers are continued. Monitor trace
+  volume per client to catch abuse.
+- **Gateway spans with provider ids.** The model gateway emits a span per upstream attempt with provider,
+  model, fallback reason and the provider's request id. Monitor fallback rate and per-provider latency
+  from those spans.
+- **Baggage allowlist.** Strip baggage on egress to third parties and allow only named keys internally.
+  Monitor outbound headers in a staging egress proxy for unexpected baggage keys.
+
 ## Trade-offs
-- A standard header (W3C) interoperates with every vendor and language, but migrating a fleet that
-  already uses B3 means a period of dual propagation; vendor formats win only when a legacy system
+- **W3C standard vs legacy formats.** W3C interoperates with every vendor and language, but migrating a
+  fleet already on B3 means a period of dual propagation; vendor formats win only when a legacy system
   cannot be changed.
-- Head-based sampling keeps propagation trivial (one bit in the header) and needs no buffering, but
-  it drops slow and failed traces at the same rate as healthy ones; tail-based sampling keeps the
-  interesting traces at the cost of a collector tier that buffers every span.
-- Auto-instrumentation of HTTP clients and servers gives propagation for free, but it is invisible,
-  so when a hop silently loses context nobody knows where to look; manual inject and extract at
-  service boundaries is more work and far easier to audit.
-- Baggage lets every service tag spans and logs with tenant and experiment without changing APIs, but
-  it leaks to every downstream call by default; it flips to explicit API fields once third-party calls
-  are in the path.
+- **Head-based vs tail-based sampling.** Head-based keeps propagation trivial (one bit in the header) and
+  needs no buffering, but drops slow and failed traces at the same rate as healthy ones. Tail-based keeps
+  the interesting traces at the cost of a collector tier that buffers every span.
+- **Auto vs manual propagation.** Auto-instrumentation of HTTP clients and servers gives propagation for
+  free, but invisibly, so when a hop silently loses context nobody knows where to look. Manual inject and
+  extract at boundaries is more work and far easier to audit.
+- **Baggage vs explicit fields.** Baggage tags every service's spans and logs with tenant and experiment
+  without API changes, but leaks to every downstream call by default. It flips to explicit API fields once
+  third-party calls are in the path.
 
 ## Pitfalls
-- A gateway, load balancer or service mesh that strips unknown headers; the symptom is traces that
-  always end at the same hop, while the downstream service shows a matching single-span trace with a
-  fresh id.
-- Mixed propagators (one service on B3, another on W3C); the symptom is the same break but only on
-  some paths, which is maddening until you compare the header names each side expects.
-- Submitting work to executor threads without copying context; the symptom is orphan traces that
-  start milliseconds after a gap in the real trace.
-- Putting user identifiers or emails into baggage; the symptom is a security review finding them in
-  outbound headers to a third-party model provider.
-- Continuing whatever `traceparent` the public client sends; the symptom is trace volume and
-  storage cost that track one client's behaviour, or unrelated requests appearing in the same tree.
-- Each service sampling independently; the symptom is traces that are complete for short paths and
-  almost never complete for deep ones.
-- Treating a child-before-parent waterfall as evidence of a bug; the symptom is minutes lost before
-  someone checks the hosts' clocks.
+- **A gateway, load balancer or mesh that strips unknown headers.** Symptom: traces always end at the same
+  hop, while the downstream service shows a matching single-span trace with a fresh id.
+- **Mixed propagators (B3 on one service, W3C on another).** Symptom: the same break but only on some
+  paths, maddening until you compare the header names each side expects.
+- **Submitting work to executor threads without copying context.** Symptom: orphan traces that start
+  milliseconds after a gap in the real trace.
+- **User identifiers or emails in baggage.** Symptom: a security review finds them in outbound headers to
+  a third-party model provider.
+- **Continuing whatever `traceparent` the public client sends.** Symptom: trace volume and storage cost
+  that track one client's behaviour, or unrelated requests in the same tree.
+- **Each service sampling independently.** Symptom: traces complete for short paths and almost never
+  complete for deep ones.
+- **Treating a child-before-parent waterfall as a bug.** Symptom: minutes lost before someone checks the
+  hosts' clocks.
 
 ## When to use
-Propagate trace context across every internal process boundary from the start; the cost is a few
-lines or an auto-instrumentation package, and retrofitting it after you have a dozen services is slow
-and political. It becomes essential the moment a model gateway, retrieval service, tool server or
-queue enters the path, which describes almost every production LLM system. Do not expect propagation
-into third-party providers; capture their request ids instead. Measure the fraction of traces whose
-root is an edge service and whose leaf reaches the provider call, broken down by path; that number is
-your propagation health. In interviews, be ready to sketch the `traceparent` flow across three
-services and a queue, explain why the sampling flag must travel, and name the two places LLM systems
-usually lose the chain: the gateway and the tool server.
+- **Use from the start** across every internal process boundary; the cost is a few lines or an
+  auto-instrumentation package, and retrofitting after a dozen services is slow and political.
+- **Essential** the moment a model gateway, retrieval service, tool server or queue enters the path,
+  which describes almost every production LLM system.
+- **Do not expect** propagation into third-party providers; capture their request ids instead.
+- **Measure** the fraction of traces whose root is an edge service and whose leaf reaches the provider
+  call, by path: that is your propagation health.
+- **Interviews:** sketch the `traceparent` flow across three services and a queue, explain why the
+  sampling flag must travel, and name the two usual chain breakers: the gateway and the tool server.
 
 ## Role lens
 - **Engineer:** Adds inject and extract at every client and server boundary, instruments the queue
@@ -230,6 +289,36 @@ is where the missing 3–6 s will appear, most likely in the transport (connecti
 a connection-pool limit) rather than in tool execution. Add a span around the transport layer, record
 the tool request id for correlation, and confirm the fix by watching the fraction of orchestrator tool
 spans that have a server child climb towards 100%.
+
+## Interview questions
+### What travels in a `traceparent` header, and why only that?
+- **Contents:** version, the 32-hex trace id, the parent span id and flags, where `01` means sampled.
+- **Why only ids:** each service exports its own spans asynchronously and the backend joins them by
+  trace id, so tracing never sits on the request's latency path.
+
+### Your traces always stop at the model gateway. How do you debug it?
+- **Compare headers on both sides:** capture what the orchestrator sends and what the gateway receives;
+  a proxy or mesh stripping headers, or a B3-versus-W3C mismatch, is the usual cause.
+- **Check the gateway itself:** it must extract incoming context, emit its own span and inject on the
+  outbound call; look for a fresh single-span trace on the gateway with the same timing.
+
+### Why not just honour every incoming `traceparent`?
+- **It is untrusted input at the edge:** a client can force-sample every request, raising your storage
+  bill, or reuse trace ids so unrelated requests merge.
+- **Instead,** start a new root at public ingress and add a link to the incoming context, continuing
+  context only from known internal callers.
+
+### How do you run tail-based sampling when services export to many collector instances?
+- **Route by trace id first:** a load-balancing tier hashes the trace id so every span of a trace lands
+  on the same sampling instance.
+- **Then buffer and decide** with a timeout, keeping errors and slow traces; late spans are dropped or kept
+  inconsistently, so keep traces short.
+
+### How should a queue-based agent step that runs an hour later be traced?
+- **Carry context in the message** and start a `CONSUMER` span from it; use links when one worker batch
+  serves many producers.
+- **Also record a durable execution id,** because trace retention is days while the workflow can live for
+  weeks.
 
 ## Quiz
 ### Q: What does the sampled flag in `traceparent` prevent when every downstream service honours it?

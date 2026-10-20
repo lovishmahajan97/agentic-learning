@@ -5,7 +5,7 @@ name: Token / cost tracking
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - observability/monitoring
   - observability/spans
@@ -21,110 +21,128 @@ sources:
 ---
 
 ## TL;DR
-LLM spend is metered per token, priced differently for input, output and cached tokens, and varies
-by model, so the only way to know what a feature, tenant or agent run costs is to record the
-provider's reported usage on every call and multiply by the price in force at that moment. Track it
-at span level, roll it up by the dimensions you make decisions on, and alert on budgets; retries,
-agent loops and growing conversation history make cost non-linear in requests, so per-request
-averages mislead.
+LLM spend is metered per token and priced by token class and model, so record provider usage on every
+call, cost it at the price then in force, and roll up by decision dimensions. Retries, agent loops and
+history make averages mislead.
 
 ## Why it exists
-The invoice arrives monthly as one number per model. It cannot tell you that the summarisation
-feature costs three times the chat feature, that one tenant's agent workflow accounts for half of it,
-that a prompt change last Tuesday added 40% to input tokens, or that retries on an overloaded provider
-doubled the bill for a day. Every one of those is a decision you need to make during the month, and
-each requires attribution that only your own instrumentation can provide.
-
-The naive approach, "count requests and multiply by an average cost", fails because cost per request
-is not stable. Input and output tokens are priced differently (output is typically several times more
-expensive per token), and the ratio depends on the feature. Agent runs make a variable number of
-calls, with a long tail where one run loops for hundreds of steps. Conversations resend their history
-each turn, so the cost of turn *n* grows with *n*. Retrieval stuffs context. Retries and fallbacks are
-extra calls that never appear as extra user requests. Prompt caching changes the price of the same
-tokens depending on whether the prefix was recently seen.
-
-There is also a control problem: you want to stop a runaway agent or a misbehaving tenant before the
-money is spent, which requires knowing the cost of a run while it is still running. That means usage
-has to be recorded per call, attributed in real time and compared against budgets, not reconciled
-from an invoice weeks later.
+- **The invoice is one number per model per month.** It cannot tell you that summarisation costs three
+  times chat, that one tenant's agent workflow is half the bill, that last Tuesday's prompt change added
+  40% to input tokens, or that retries on an overloaded provider doubled the bill for a day. Each is a
+  decision you need during the month, and only your own instrumentation can attribute it.
+- **"Requests × average cost" fails because cost per request is not stable.** Input and output are priced
+  differently (output is typically several times more per token) and the ratio varies by feature. Agent
+  runs make a variable number of calls, with a long tail where one run loops for hundreds of steps.
+- **Hidden multipliers.** Conversations resend history, so turn *n* grows with *n*. Retrieval stuffs
+  context. Retries and fallbacks are extra calls that never appear as extra user requests. Prompt caching
+  changes the price of the same tokens depending on whether the prefix was recently seen.
+- **There is a control problem too.** Stopping a runaway agent or misbehaving tenant before the money is
+  spent needs the cost of a run while it is still running: usage recorded per call, attributed in real
+  time and compared with budgets, not reconciled from an invoice weeks later.
 
 ## How it works
 ### Where the numbers come from
-The authoritative token counts are in the provider's response: a `usage` object with input and output
-token counts and, on most providers, further fields for cached input tokens and, for reasoning
-models, reasoning tokens. Use these, not your own estimates, *because* tokenisers differ between model
-families and because the provider's count is what they bill. Two details trip people up. With
-streaming, usage arrives at the end of the stream or split across the first and last events, and some
-APIs include it only if the request asks for it. And providers differ on whether the headline input
-count includes cached tokens or reports them separately, so the formula for billable input must be
-written per provider after reading its documentation.
+- **Use the provider's `usage` object:** input and output token counts and, on most providers, fields for
+  cached input tokens and, for reasoning models, reasoning tokens.
+- **Not your own estimates,** *because* tokenisers differ between model families and the provider's count
+  is what they bill.
+- **Streaming trap:** usage arrives at the end of the stream or split across the first and last events,
+  and some APIs include it only if the request asks for it.
+- **Cached-token trap:** providers differ on whether the headline input count includes cached tokens or
+  reports them separately, so write the billable-input formula per provider after reading its docs.
 
 ### Estimating before the call
-Sometimes you need a number before spending: to enforce a per-request budget, to decide whether a
-context fits, or to route long inputs to a cheaper model. A provider-specific tokeniser (such as
-`tiktoken` for OpenAI models) or a provider's token-counting endpoint gives that estimate. Treat it
-as an estimate: it is used for gating, while the response usage is used for accounting.
+- **When you need a number before spending:** enforcing a per-request budget, deciding whether a context
+  fits, routing long inputs to a cheaper model.
+- **How:** a provider-specific tokeniser (such as `tiktoken` for OpenAI models) or a provider's
+  token-counting endpoint.
+- **Rule:** estimates are for gating; response usage is for accounting.
 
 ### Turning tokens into money
-Keep a versioned price table: for each model, prices per million tokens for input, output, cache
-write, cache read and any other class, each with an effective-from date, *because* prices change and
-models are deprecated, and recomputing last quarter's cost with this quarter's prices is simply wrong.
-Compute cost at ingest time and store the tokens, the computed cost and the price version used. Batch
-or discounted tiers are separate rows in the table, not a multiplier applied later.
+1. **Keep a versioned price table:** per model, prices per million tokens for input, output, cache write,
+   cache read and any other class, each with an effective-from date, *because* prices change, models are
+   deprecated, and recomputing last quarter with this quarter's prices is simply wrong.
+2. **Compute cost at ingest time** and store the tokens, the computed cost and the price version used.
+3. **Batch or discounted tiers are separate rows** in the table, not a multiplier applied later.
 
 ### Attribution dimensions
-Every usage record carries the dimensions you will later group by: model and provider, feature or
-route, prompt version, tenant, user (as an opaque id), conversation or session id, agent run id and
-step number, and whether the call was a retry or a fallback. Attach them as attributes on the
-generation span, and emit the same values into metrics with bounded labels only (model, route, tenant
-where the tenant count is small); the unbounded ones (user, conversation, run) live in the per-call
-records and the trace.
+- **Every usage record carries:** model and provider, feature or route, prompt version, tenant, user (as
+  an opaque id), conversation or session id, agent run id and step number, and whether the call was a
+  retry or fallback.
+- **Spans get all of them** as attributes on the generation span.
+- **Metrics get only bounded labels** (model, route, tenant where the tenant count is small); unbounded
+  ones (user, conversation, run) live in per-call records and the trace.
 
 ### Roll-ups that match decisions
-- **Per request** answers "is this feature priced sensibly".
-- **Per conversation** sums the turns and exposes the history-growth problem.
-- **Per agent run** sums every step, retry and tool-related call; its distribution, not its mean, is
-  what matters.
-- **Per tenant per day** feeds chargeback, quotas and anomaly alerts.
-- **Per successful task** divides total cost by completed tasks, which is the number product and
-  finance actually want and which charges retries and abandoned runs correctly.
+| Roll-up | Answers |
+|---|---|
+| **Per request** | is this feature priced sensibly |
+| **Per conversation** | sums the turns and exposes the history-growth problem |
+| **Per agent run** | sums every step, retry and tool-related call; its distribution, not its mean, matters |
+| **Per tenant per day** | chargeback, quotas and anomaly alerts |
+| **Per successful task** | total cost over completed tasks: the number product and finance want, and it charges retries and abandoned runs correctly |
 
 ### Why conversations are expensive: a worked example
-Suppose a system prompt plus tool definitions is 1,500 tokens and each turn adds about 300 user
-tokens and 400 assistant tokens. Turn *n* sends the system prompt, the *n* − 1 earlier exchanges and
-the new user message, so its input is 1,800 + 700 × (n − 1). Over a 20-turn conversation total input
-is 20 × 1,800 + 700 × (0 + 1 + … + 19) = 36,000 + 133,000 = 169,000 tokens, against only 8,000
-output tokens. The history term grows with the square of the turn count, the last turn alone sends
-about eight times the input of the first (15,100 versus 1,800 tokens), and input outnumbers output
-about twenty to one. At illustrative prices of 2 and 10 dollars per million input and output tokens,
-that is about 0.34 dollars of input against 0.08 of output: input dominates the bill even though each
-output token costs five times as much. This arithmetic is why prompt caching (the repeated prefix is
-billed at a discount) and history compaction exist, and why cost per conversation must be tracked
-separately from cost per turn.
+Assume a system prompt plus tool definitions of 1,500 tokens, and each turn adds about 300 user and 400
+assistant tokens.
+
+```
+input(turn n) = 1,800 + 700 × (n − 1)
+total input over 20 turns = 20 × 1,800 + 700 × (0 + 1 + … + 19) = 36,000 + 133,000 = 169,000
+total output over 20 turns = 20 × 400 = 8,000
+```
+
+- **The history term grows with the square of the turn count.** The last turn alone sends about eight
+  times the input of the first (15,100 versus 1,800 tokens).
+- **Input outnumbers output about twenty to one.**
+- **At illustrative prices** of 2 and 10 dollars per million input and output tokens: about 0.34 dollars
+  of input against 0.08 of output. Input dominates even though each output token costs five times as
+  much.
+- **So** prompt caching (the repeated prefix billed at a discount) and history compaction exist, and cost
+  per conversation must be tracked separately from cost per turn.
 
 ### Beyond text tokens
-Not every cost is a text token on the main model. Images and audio are converted to tokens by
-provider-specific rules (image cost typically depends on resolution), some server-side tools are billed
-per call on top of tokens, and embeddings, rerankers, guardrail classifiers and LLM-as-judge calls are
-separate metered calls that belong to the same feature. For a self-hosted model the meter is GPU time,
-so cost per token is derived: GPU cost per hour divided by tokens actually served per hour, which
-makes utilisation, not list price, the number that moves it. Each of these needs its own usage record
-and price row, or the feature's cost is understated by exactly the parts nobody thought of as "the
-LLM".
+- **Images and audio** become tokens by provider-specific rules (image cost typically depends on
+  resolution).
+- **Some server-side tools** are billed per call on top of tokens.
+- **Embeddings, rerankers, guardrail classifiers and LLM-as-judge calls** are separate metered calls that
+  belong to the same feature.
+- **Self-hosted models are metered in GPU time:** cost per token = GPU cost per hour ÷ tokens actually
+  served per hour, so utilisation, not list price, moves it.
+- **Each needs its own usage record and price row,** or the feature is understated by exactly the parts
+  nobody thought of as "the LLM".
 
 ### Budgets and enforcement
-With per-call records flowing, budgets become comparisons: soft alerts when a tenant or feature
-reaches a fraction of its daily budget, hard stops enforced at the gateway or in the agent loop when a
-run exceeds its token or dollar budget. The hard stop needs the running total synchronously, so keep
-it in the agent's state or a fast store rather than in the analytics warehouse.
+- **Soft alerts** when a tenant or feature reaches a fraction of its daily budget.
+- **Hard stops** at the gateway or in the agent loop when a run exceeds its token or dollar budget.
+- **The hard stop needs the running total synchronously,** so keep it in the agent's state or a fast
+  store, not the analytics warehouse.
 
-## Example
-A provider-neutral usage record costed against a dated price table. The prices are illustrative
-placeholders, not any vendor's list; load real ones from configuration. The key design choice is the
-neutral `usage` dict: each provider's SDK fields are mapped into it in one adapter, with
-`uncached_input` excluding cache reads and writes, so the formula never double counts cached tokens
-whatever a provider's headline input number includes. The two printed costs show the same 8,400-token
-prompt with and without a warm cache.
+## Diagram
+One call's usage becomes a costed, attributed record; the same record feeds the synchronous budget check
+and the asynchronous roll-ups.
+
+```mermaid
+flowchart TD
+    E["Pre-call estimate (tokeniser)"] -->|"gate"| C["Provider call"]
+    C --> U["Response usage by token class"]
+    U --> A["Provider adapter: neutral usage"]
+    P[("Dated price table")] --> K["Cost at ingest time"]
+    A --> K
+    K --> S["Span attributes and per-call record"]
+    S --> B{"Run or tenant over budget?"}
+    B -->|"yes"| H["Hard stop or alert"]
+    B -->|"no"| N["Continue run"]
+    S --> R[("Roll-ups: request, run, tenant, task")]
+```
+
+## Examples
+### A provider-neutral usage record with a dated price table
+- **Prices are illustrative placeholders,** not any vendor's list; load real ones from configuration.
+- **The key design choice is the neutral `usage` dict.** Each provider's SDK fields are mapped into it in
+  one adapter, with `uncached_input` excluding cache reads and writes, so the formula never double counts
+  cached tokens whatever a provider's headline input number includes.
+- **The two printed costs** show the same 8,400-token prompt with and without a warm cache.
 
 ```python
 from dataclasses import dataclass
@@ -165,48 +183,117 @@ print(f"warm cache: {cost_usd('example-model', warm):.4f} USD")   # 0.0008+0.001
 print(f"cold cache: {cost_usd('example-model', cold):.4f} USD")   # 0.0168+0.0030        = 0.0198
 ```
 
+### Runnable: conversation cost grows faster than turn count
+The worked example as a calculator. Doubling the conversation from 20 to 40 turns more than triples the
+input tokens.
+
+```python
+def conversation_tokens(turns, system=1500, user=300, assistant=400):
+    per_exchange = user + assistant
+    inputs = [system + user + per_exchange * (n - 1) for n in range(1, turns + 1)]
+    return inputs, assistant * turns
+
+def cost(inp, out, p_in=2.0, p_out=10.0):        # illustrative USD per million tokens
+    return inp * p_in / 1e6, out * p_out / 1e6
+
+inputs, out = conversation_tokens(20)
+c_in, c_out = cost(sum(inputs), out)
+print(f"first turn {inputs[0]}, last turn {inputs[-1]}, total input {sum(inputs)}, output {out}")
+print(f"input ${c_in:.3f} vs output ${c_out:.3f}; input/output tokens {sum(inputs) / out:.0f}x")
+for turns in (5, 10, 20, 40):
+    i, o = conversation_tokens(turns)
+    print(f"{turns:>2} turns: {sum(i):>7} input tokens, ${sum(cost(sum(i), o)):.3f}")
+```
+
+| Turns | Total input tokens | Total cost (illustrative prices) |
+|---|---|---|
+| 5 | 16,000 | $0.052 |
+| 10 | 49,500 | $0.139 |
+| 20 | 169,000 | $0.418 |
+| 40 | 618,000 | $1.396 |
+
+### Production snippet: provider adapters into the neutral schema
+Two providers report cache usage differently, which is exactly why the adapter exists. Field names are
+from the providers' documented usage objects at the time of writing; verify against current docs.
+
+```python
+def from_openai(u):        # chat completions usage: prompt_tokens INCLUDES cached tokens
+    cached = getattr(u.prompt_tokens_details, "cached_tokens", 0) or 0
+    return {"uncached_input": u.prompt_tokens - cached, "cache_read": cached,
+            "cache_write": 0, "output": u.completion_tokens}   # reasoning is inside output
+
+def from_anthropic(u):     # messages usage: input_tokens EXCLUDES cache reads and writes
+    return {"uncached_input": u.input_tokens,
+            "cache_read": u.cache_read_input_tokens or 0,
+            "cache_write": u.cache_creation_input_tokens or 0,
+            "output": u.output_tokens}
+```
+
+## Production patterns
+- **Ask for usage on every stream.** For OpenAI chat completions, pass
+  `stream_options={"include_usage": True}` and read usage from the final chunk; for Anthropic, combine the
+  usage reported at message start with the final delta. Monitor the count of zero-token records per route,
+  which should be zero.
+- **Monthly invoice reconciliation.** Sum computed cost per model and compare it with the provider
+  invoice. Monitor the gap: a small percentage is normal; more means missing calls (retries, judges,
+  embeddings) or a wrong price row.
+- **Per-run budget in the agent loop.** Keep a running token and dollar total in the run state, check it
+  before each step, and stop with a clear user message when exceeded. Monitor p99 cost per run and the
+  rate of budget stops per feature.
+- **Tenant quotas at the gateway.** Increment a per-tenant daily spend counter in a fast store as each
+  call is costed; alert at a fraction of the quota and reject at the limit. Monitor tenants above their
+  alert threshold each day.
+- **Cache effectiveness tracking.** Record cache-read and cache-write tokens separately and chart their
+  ratio per prompt version. Monitor a falling read-to-write ratio after a deploy; it usually means the
+  prefix stopped being byte-identical.
+- **Cost per successful task as the headline.** Divide feature cost by completed tasks (not requests) on
+  the weekly dashboard, and use it when comparing models. Monitor it for a week after any model switch.
+
 ## Trade-offs
-- Provider-reported usage is exact and is what you are billed for, but it is only available after
-  the call; tokeniser estimates are available before the call and are approximate, so use estimates
-  for gating and provider usage for accounting.
-- Storing one record per call gives full attribution and a replayable cost history, but at agent scale
-  that is many rows per user action; it flips to pre-aggregated roll-ups plus sampled raw records once
-  the per-call table outgrows the analytics budget.
-- Hard budget caps protect spend and stop runaway loops, but they fail a user mid-task; soft alerts
-  preserve the experience and risk the bill, so most teams cap per run and alert per tenant.
-- Switching to a cheaper model cuts cost per token immediately, but it can raise tokens per task (more
-  retries, longer outputs, more agent steps); cost per successful task is the only comparison that
+- **Provider usage vs tokeniser estimates.** Provider-reported usage is exact and what you are billed
+  for, but only available after the call; estimates are available before it and approximate. Use
+  estimates for gating and provider usage for accounting.
+- **One record per call vs storage.** Full attribution and a replayable cost history, but many rows per
+  user action at agent scale. It flips to pre-aggregated roll-ups plus sampled raw records once the
+  per-call table outgrows the analytics budget.
+- **Hard caps vs user experience.** Hard caps protect spend and stop runaway loops but fail a user
+  mid-task; soft alerts preserve the experience and risk the bill, so most teams cap per run and alert per
+  tenant.
+- **Cheaper model vs tokens per task.** It cuts cost per token immediately, but can raise tokens per task
+  (more retries, longer outputs, more agent steps); cost per successful task is the only comparison that
   settles it.
-- Prompt caching lowers input cost sharply for stable prefixes, but on some providers it adds a write
-  premium, and it only pays off when the prefix is reused within the cache window; tracking cache-read against cache-write
-  tokens tells you whether it is paying.
+- **Prompt caching vs write premium.** Caching lowers input cost sharply for stable prefixes, but on some
+  providers adds a write premium and only pays off when the prefix is reused within the cache window.
+  Tracking cache-read against cache-write tokens tells you whether it is paying.
 
 ## Pitfalls
-- Estimating cost with one provider's tokeniser for another provider's model; the symptom is a
-  persistent gap between your dashboard and the invoice that grows with volume.
-- Forgetting to request usage on streaming calls, or reading it from the wrong event; the symptom is
-  zero-token records for exactly the streaming routes.
-- Counting only the successful final call and not retries, fallbacks or judge calls; the symptom is a
-  dashboard that undercounts by the retry rate and never matches the invoice on bad-provider days.
-- Ignoring reasoning tokens; reasoning models bill their hidden reasoning as output tokens, so the
-  symptom is output-token counts and cost far above what the visible answer's length would suggest,
-  with no explanation unless reasoning tokens are recorded as their own field.
-- Recomputing historical cost with current prices after a price change; the symptom is last month's
-  cost "changing" in reports.
-- Reporting average cost per request for agent features; the symptom is a budget blown by a handful of
-  runs that looped, invisible in the mean.
-- Attributing tokens to a model but not to a feature or prompt version; the symptom is knowing the
-  total went up and being unable to say which deploy did it.
+- **One provider's tokeniser for another provider's model.** Symptom: a persistent gap between dashboard
+  and invoice that grows with volume.
+- **Not requesting usage on streaming calls, or reading the wrong event.** Symptom: zero-token records
+  for exactly the streaming routes.
+- **Counting only the successful final call.** Retries, fallbacks and judge calls are missing, so the
+  dashboard undercounts by the retry rate and never matches the invoice on bad-provider days.
+- **Ignoring reasoning tokens.** Reasoning models bill hidden reasoning as output tokens. Symptom: output
+  counts and cost far above what the visible answer's length suggests, unexplained unless reasoning tokens
+  are recorded as their own field.
+- **Recomputing historical cost with current prices.** Symptom: last month's cost "changing" in reports.
+- **Average cost per request for agent features.** Symptom: a budget blown by a handful of runs that
+  looped, invisible in the mean.
+- **Tokens attributed to a model but not a feature or prompt version.** Symptom: knowing the total went
+  up and being unable to say which deploy did it.
 
 ## When to use
-Instrument token usage from the first call you ship; the per-call record is cheap and impossible to
-backfill. Attribution by feature and tenant becomes necessary the moment there is more than one of
-either, and per-run budgets become necessary the moment an agent loop exists. Measure the gap between
-your computed cost and the provider invoice each month (a small percentage is normal; more means
-missing calls), cost per successful task per feature, and the p99 of cost per agent run. Day to day
-this is the first dashboard you check after a prompt, model or retrieval change. In interviews, expect
-to be asked how you would attribute an LLM bill to tenants, how caching changes the formula, and why
-conversation cost grows faster than turn count; the worked example above is the reasoning expected.
+- **Instrument usage from the first call you ship;** the per-call record is cheap and impossible to
+  backfill.
+- **Attribution by feature and tenant** becomes necessary once there is more than one of either; per-run
+  budgets once an agent loop exists.
+- **Measure** the monthly gap between computed cost and the provider invoice (a small percentage is
+  normal; more means missing calls), cost per successful task per feature, and the p99 of cost per agent
+  run.
+- **Day to day,** this is the first dashboard after a prompt, model or retrieval change.
+- **Interviews:** expect "how would you attribute an LLM bill to tenants", "how does caching change the
+  formula" and "why does conversation cost grow faster than turn count"; the worked example above is the
+  reasoning expected.
 
 ## Role lens
 - **Engineer:** Maps each provider's usage fields into one schema, records tokens and computed cost on
@@ -233,6 +320,38 @@ must have been recorded with provider usage split by token class, model, feature
 tenant, run id and retry flag, costed with the price in force that day and stored with the price
 version. Without the prompt-version and retry dimensions the question is unanswerable, which is the
 argument for recording them from the start.
+
+## Interview questions
+### Why use the provider's reported usage instead of counting tokens yourself?
+- **It is what you are billed for:** tokenisers differ between model families, and the provider also
+  reports cached and reasoning tokens your own count cannot see.
+- **Keep estimates for gating only:** a tokeniser or counting endpoint before the call to enforce budgets
+  or routing, then account with the response usage.
+
+### How would you attribute a shared LLM bill to tenants and features?
+- **Record every call** with usage by token class, model, feature, prompt version, tenant, run id and
+  retry flag, costed at ingest with a dated price row.
+- **Roll up per tenant per day and per feature,** including retries, judge calls, embeddings and
+  guardrails, then reconcile the total against the invoice each month.
+
+### Your cost dashboard is consistently 15% below the invoice. Where do you look?
+- **Missing calls:** retries, fallbacks, judge and guardrail calls, embeddings and rerankers that bypass
+  the wrapper.
+- **Missing token classes:** streaming routes without usage, reasoning tokens, cache writes, and
+  provider-specific rules for images or server-side tools.
+- **Wrong prices:** an outdated price row, or a batch tier applied as a multiplier rather than its own
+  row.
+
+### When would a cheaper model cost you more?
+- **When it needs more work per task:** more agent steps, retries, longer outputs or more human
+  escalations raise tokens per completed task.
+- **So compare cost per successful task,** over a representative eval set or a controlled rollout, not
+  price per token.
+
+### How do prompt caching and conversation length interact in cost?
+- **History makes input grow with the square of turn count,** so input dominates long conversations.
+- **Caching discounts the repeated prefix** only while it is byte-identical and reused within the cache
+  window; some providers charge a write premium, so track cache reads against writes to confirm it pays.
 
 ## Quiz
 ### Q: Why should cost be computed and stored at ingest time rather than recomputed from token counts when a report is run?

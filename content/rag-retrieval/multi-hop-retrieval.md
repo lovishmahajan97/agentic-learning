@@ -5,7 +5,7 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/agentic-rag
@@ -64,11 +64,11 @@ State: the original question, the evidence gathered so far, and a hop counter.
 
 Why all three stop conditions, because each alone fails:
 
-| Condition alone | Failure |
-|---|---|
-| Planner "done" signal | the model may loop or stop early |
-| Hop cap | wastes hops on questions answered at hop one |
-| No-progress detection | needed to catch a planner that keeps issuing the same query |
+| Condition | What it covers | Failure if used alone |
+|---|---|---|
+| Planner "done" signal | ends solved questions early | the model may loop or stop early |
+| Hop cap | guarantees termination, bounds cost | wastes hops on questions answered at hop one |
+| No-progress detection | catches a planner that keeps issuing the same query | does not end a solved question, and does not bound a chain that keeps finding new but useless passages |
 
 ### Three named formulations
 | Name | Mechanism | Why it helps |

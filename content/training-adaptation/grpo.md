@@ -5,7 +5,7 @@ name: GRPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/rlhf
   - training-adaptation/dpo
@@ -85,6 +85,7 @@ L_clip  = mean over tokens of  min( ratio_t · Â_i ,  clip(ratio_t, 1−ε, 1+�
 |---|---|---|
 | Reward | one per response, spread to all its tokens | a process reward model scores each reasoning step |
 | Token advantage | the response's Â_i | normalised sum of step rewards from that point on |
+| Credit assignment | coarse: every token shares the outcome | more precise, per reasoning step |
 | Cost | needs only a final-answer check | needs a step-level scorer: expensive and itself hackable |
 | Used by | most open reasoning recipes since DeepSeekMath | described in DeepSeekMath |
 
@@ -121,22 +122,23 @@ Which normalisation and clipping you use is a real design choice, not a detail: 
 differ in it is comparing different algorithms.
 
 ## Diagram
-One GRPO iteration: the group of samples replaces the critic, and the verifier's rewards are
-standardised within the group before the clipped update.
+One GRPO iteration: the old policy samples a group of G responses (often 8 to 16), and the group of
+samples replaces the critic. Rewards are standardised within the group (minus the group mean, divided
+by the group std) before the clipped update on new-over-old token ratios.
 
 ```mermaid
 flowchart TD
-    Q["Prompt q"] --> OLD["Old policy samples G responses, often 8 to 16"]
-    OLD --> VR["Verifier or reward model scores each response"]
+    Q["Prompt q"] --> OLD["Old policy samples G responses"]
+    OLD --> VR["Verifier scores each response"]
     VR --> Z{"All rewards equal?"}
     Z -->|"yes: zero advantage"| DROP["Filter group, no gradient"]
-    Z -->|"no"| ADV["Advantage: reward minus group mean, divided by group std"]
-    ADV -->|"same advantage on every token"| CL["Clipped surrogate on token ratios, new over old"]
+    Z -->|"no"| ADV["Group-standardised advantage"]
+    ADV -->|"same advantage on every token"| CL["Clipped surrogate loss"]
     REF["Frozen reference"] -->|"per-token KL in the loss"| CL
-    CL --> UP["1 to 4 gradient steps on the batch"]
+    CL --> UP["1 to 4 gradient steps"]
     UP --> NEW["Updated policy"]
     NEW -->|"becomes old policy"| OLD
-    NEW -.->|"every few dozen steps"| HO{"Held-out verifier accuracy rising with reward?"}
+    NEW -.->|"every few dozen steps"| HO{"Held-out accuracy rising too?"}
     HO -.->|"no: reward hacking"| RW["Fix reward, roll back"]
 ```
 
@@ -215,9 +217,9 @@ for k in (1, 2, 4, 6, 7):
   checkpoint, score them, and drop prompts solved 0/G or G/G. Monitor the share of zero-advantage groups
   per step and re-curate as the policy improves, because solved prompts accumulate.
 - **Generate rollouts with a fast inference engine.** Trainers such as TRL's `GRPOTrainer` (with
-  `GRPOConfig(num_generations=..., use_vllm=True)`) or OpenRLHF hand sampling to vLLM. Monitor the
-  probability ratio at the first gradient step on fresh samples; values far from 1 mean the sampler and
-  trainer disagree.
+  `GRPOConfig(num_generations=..., use_vllm=True)`) or OpenRLHF hand sampling to vLLM. If π_old comes
+  from the sampler's log-probs, monitor the ratio at the first gradient step on fresh samples; values far
+  from 1 mean the sampler and trainer disagree.
 - **Unit-test the reward function like production code.** Keep a suite of known hacks (empty reasoning
   tags, hard-coded test outputs, answers that fool a lax parser) and assert they score zero. Log each
   reward component separately per step so a format term cannot hide a falling accuracy term.
@@ -311,7 +313,8 @@ task.
 - **When you have no reward you trust:** with a learned reward model GRPO overoptimises just as PPO does.
 - **When a few thousand demonstrations or preference pairs already solve it**, because the sampling loop
   is the most expensive post-training stage after pre-training.
-- **When the task has no checker**, since verifiable rewards exist only for tasks you can test.
+- **When the starting policy almost never succeeds:** every group is all-zero, so there is no gradient;
+  SFT on demonstrations or an easier curriculum has to come first.
 
 ### Training reward climbs and mean response length doubles, but held-out accuracy is flat. Diagnose.
 - **Paying for length with nothing to show:** outcome rewards select for long reasoning only when it

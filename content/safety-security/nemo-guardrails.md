@@ -5,7 +5,7 @@ name: NeMo Guardrails
 kind: tool
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - safety-security/input-output-guardrails
   - safety-security/llama-guard
@@ -21,94 +21,117 @@ sources:
 ---
 
 ## TL;DR
-NeMo Guardrails is NVIDIA's open-source toolkit that sits between your application and the LLM and runs
-programmable "rails" at five points: input, dialogue flow, retrieved chunks, tool execution, and output.
-Rails are declared in Colang and YAML rather than scattered through code, and dialogue rails map free
-text to canonical intents via an embedding index of example utterances (plus a short LLM call by
-default), so policy becomes explicit flows. It orchestrates classifiers such as Llama Guard and Presidio
-rather than being one.
+NeMo Guardrails is NVIDIA's open-source toolkit that runs programmable "rails" around an LLM at five
+points: input, dialogue, retrieval, tool execution and output. Rails are declared in Colang and YAML, and
+it orchestrates classifiers like Llama Guard rather than being one.
 
 ## Why it exists
-Teams that add guardrails by hand end up with the same shape: an if-statement before the model call, a
-regex after it, an extra "is this on topic?" LLM call somewhere in the middle, and each new rule from
-legal or product touches the generation path again. There is no single place where the policy lives, no
-way to swap a rule per customer without a deploy, and no way to test the rules as a unit. Worse, the two
-obvious primitives are each wrong alone: pure LLM self-checks are expensive, slow and attackable by the
-same injection they are meant to catch, while pure string rules cannot understand language.
-
-NeMo Guardrails was built around a third primitive. Reduce the user message to a "canonical form" (an
-intent such as `user ask about competitors` defined by a few example utterances), then decide what
-happens next with an explicit flow. The reduction uses an embedding index of the examples, either alone
-or to ground a short, temperature-zero LLM classification; either way the flow branches on a discrete
-intent the team can read and test, and free-form generation is reserved for the steps that need it.
-Around that core it provides a pipeline to compose the other checks, moderation models, PII
-detection, jailbreak heuristics and fact-checks, from configuration, so the policy for one deployment is a
-directory of files rather than a diff across the codebase.
+- **Hand-rolled guardrails converge on the same mess:** an if-statement before the model call, a regex
+  after it, an extra "is this on topic?" LLM call in the middle, and every new rule from legal or product
+  touching the generation path again.
+- **No single home for the policy:** no way to swap a rule per customer without a deploy, and no way to test
+  the rules as a unit.
+- **Both obvious primitives are wrong alone.** Pure LLM self-checks are expensive, slow and attackable by the
+  same injection they are meant to catch; pure string rules cannot understand language.
+- **A third primitive: canonical forms.** Reduce the user message to an intent such as
+  `user ask about competitors`, defined by a few example utterances, then decide what happens with an
+  explicit flow. The flow branches on a discrete intent the team can read and test, and free-form
+  generation is reserved for steps that need it.
+- **Composition from configuration.** Moderation models, PII detection, jailbreak heuristics and fact-checks
+  plug in as rails, so one deployment's policy is a directory of files rather than a diff across the
+  codebase.
 
 ## How it works
 ### The pipeline
-A `RailsConfig` is loaded from a directory containing `config.yml` (which models to use, which rails are
-enabled, their options), optional `prompts.yml` (templates for LLM-based checks) and one or more Colang
-files. `LLMRails(config).generate(messages=...)` then runs the request through the stages in order:
-1. **Input rails** inspect or transform the user message: self-check against a prompt, jailbreak
-   heuristics, sensitive-data detection via Presidio, a Llama Guard call, or your own action. A rail can
-   stop the request with a fixed response.
-2. **Dialog rails** map the message to a canonical form and execute matching flows, which may answer
-   directly with a predefined bot message, call an action, or hand off to the LLM.
-3. **Retrieval rails** run over chunks fetched for RAG before they enter the prompt, so poisoned or
-   sensitive context can be dropped.
-4. **Execution rails** wrap actions and tool calls with checks on their inputs and outputs.
-5. **Output rails** inspect the generated reply: self-check, fact-checking against the retrieved context,
-   hallucination checks, PII masking, moderation.
+A `RailsConfig` is loaded from a directory with `config.yml` (models, enabled rails, their options),
+optional `prompts.yml` (templates for LLM-based checks) and one or more Colang files.
+`LLMRails(config).generate(messages=...)` runs the request through five stages in order:
+
+| # | Rail | What it does |
+|---|---|---|
+| 1 | **Input rails** | inspect or transform the user message: self-check against a prompt, jailbreak heuristics, sensitive-data detection via Presidio, a Llama Guard call, or your own action; can stop the request with a fixed response |
+| 2 | **Dialog rails** | map the message to a canonical form and run matching flows: answer with a predefined bot message, call an action, or hand off to the LLM |
+| 3 | **Retrieval rails** | run over RAG chunks before they enter the prompt, so poisoned or sensitive context can be dropped |
+| 4 | **Execution rails** | wrap actions and tool calls with checks on their inputs and outputs |
+| 5 | **Output rails** | inspect the reply: self-check, fact-checking against retrieved context, hallucination checks, PII masking, moderation |
 
 ### Canonical forms and embeddings
-In Colang 1.0 you write `define user ask about competitors` followed by example utterances. At startup
-those utterances are embedded with a small sentence-embedding model (configurable; the default is
-`all-MiniLM-L6-v2`) and indexed. At runtime the incoming message is embedded and the nearest examples
-are retrieved. What happens next depends on configuration. By default the toolkit puts those nearest
-examples into a few-shot prompt and asks the LLM, at temperature zero, to emit the canonical form; the
-embeddings narrow the candidates, the LLM makes the call. With `embeddings_only: true` under
-`rails.dialog.user_messages`, the nearest neighbour's intent is used directly and no LLM is involved; an
-optional `embeddings_only_similarity_threshold` sends weak matches back to the LLM path (or to a fixed
-`embeddings_only_fallback_intent`). The design choice is deliberate: policy branches on a discrete intent
-the team can read and test, not on free text, and the expensive model is consulted only for the
-ambiguous middle, or not at all if you accept the recall limits of pure similarity.
+1. **Define:** in Colang 1.0, `define user ask about competitors` followed by example utterances.
+2. **Index at startup:** utterances are embedded with a small sentence-embedding model (configurable; the
+   default is `all-MiniLM-L6-v2`).
+3. **Match at runtime:** the incoming message is embedded and the nearest examples are retrieved.
+4. **Decide the intent,** depending on configuration:
+   - **Default:** the nearest examples go into a few-shot prompt and the LLM, at temperature zero, emits the
+     canonical form. Embeddings narrow the candidates; the LLM makes the call.
+   - **`embeddings_only: true`** under `rails.dialog.user_messages`: the nearest neighbour's intent is used
+     directly, no LLM involved.
+   - **`embeddings_only_similarity_threshold`:** weak matches go back to the LLM path, or to a fixed
+     `embeddings_only_fallback_intent`.
+
+- **The design choice is deliberate:** policy branches on a readable, testable intent, not free text, and
+  the expensive model is consulted only for the ambiguous middle, or not at all if you accept the recall
+  limits of pure similarity.
 
 ### The default dialogue loop and what it costs
-With dialog rails on, a Colang 1.0 turn follows the three-step loop from the paper, and each step is a
-potential LLM call: (1) **generate the user intent** (the canonical form, above); (2) **decide the next
-step**: if a flow matches that intent, the flow dictates the bot intent, otherwise the LLM predicts the bot
-canonical form from similar flow examples; (3) **generate the bot message**: a predefined message if the
-bot intent has one, otherwise the LLM writes it, with retrieved chunks if a knowledge base is configured.
-Add one call for each LLM-based input rail and output rail, and a single turn can cost four or five model
-calls before any retry. Every lever in the configuration removes one of them: `embeddings_only` removes
-step 1, a matching flow removes step 2, a predefined message removes step 3, and the `single_call` dialog
-option asks the LLM for all three in one prompt (falling back to separate calls if parsing fails).
-Configurations that use only input and output rails, with no user canonical forms, largely skip the loop
-and call the main model once for the answer. This is why "NeMo adds latency" has no fixed answer: it
-depends entirely on which of these calls your config leaves in, and you should count them rather than
-guess.
+With dialog rails on, a Colang 1.0 turn follows the paper's three-step loop; each step is a potential LLM
+call.
+
+| Step | What happens | Lever that removes the call |
+|---|---|---|
+| (1) **Generate the user intent** | the canonical form, as above | `embeddings_only` removes step 1 |
+| (2) **Decide the next step** | a matching flow dictates the bot intent; otherwise the LLM predicts the bot canonical form from similar flow examples | a matching flow removes step 2 |
+| (3) **Generate the bot message** | predefined message if the bot intent has one; otherwise the LLM writes it, with retrieved chunks if a knowledge base is configured | a predefined message removes step 3 |
+
+- **Add one call per LLM-based input and output rail,** and a single turn can cost four or five model calls
+  before any retry.
+- **`single_call`:** this dialog option asks the LLM for all three steps in one prompt, falling back to
+  separate calls if parsing fails.
+- **Input and output rails only, no user canonical forms:** largely skips the loop and calls the main model
+  once for the answer.
+- **So "NeMo adds latency" has no fixed answer.** It depends on which calls your config leaves in; count
+  them rather than guess.
 
 ### Flows
-`define flow` blocks sequence user and bot canonical forms: when `user ask about competitors` matches,
-`bot refuse competitor talk` fires with a predefined message and no LLM generation at all. Flows can call
-Python actions registered with the runtime, branch on their results, and continue multi-turn
-conversations. Colang 2.0 generalises this into an event-driven language with parallel flows; most
-published examples and many integrations still use 1.0 syntax, and the two are not interchangeable.
+- **`define flow` blocks sequence user and bot canonical forms.** When `user ask about competitors` matches,
+  `bot refuse competitor talk` fires with a predefined message and no LLM generation at all.
+- **Flows can call Python actions** registered with the runtime, branch on their results, and continue
+  multi-turn conversations.
+- **Colang 2.0** generalises this into an event-driven language with parallel flows. Most published
+  examples and many integrations still use 1.0 syntax, and the two are not interchangeable.
 
 ### How it compares
-Llama Guard and similar models answer one question, "is this content unsafe?"; NeMo Guardrails decides
-what to check, in what order, and what to do with the answer, and can host Llama Guard as a rail.
-Output-validation libraries such as Guardrails AI or Pydantic-based validators focus on the structure of
-a single completion. Hand-rolled middleware gives you the same power with no framework dependency, at the
-cost of rebuilding configuration, testing and the intent matcher yourself. NVIDIA also ships hosted
-NemoGuard microservices for content safety, topic control and jailbreak detection that plug in as rails.
+| Option | Scope | Trade |
+|---|---|---|
+| Llama Guard and similar models | answer one question: "is this content unsafe?" | NeMo can host them as a rail |
+| NeMo Guardrails | decides what to check, in what order, and what to do with the answer | framework and DSL in the request path |
+| Output-validation libraries (Guardrails AI, Pydantic validators) | structure of a single completion | not conversation policy |
+| Hand-rolled middleware | same power, no framework dependency | you rebuild configuration, testing and the intent matcher |
+| NVIDIA NemoGuard microservices | hosted content safety, topic control, jailbreak detection | plug in as rails |
 
-## Example
-A minimal configuration: a topical rail that deflects competitor questions without calling the LLM, plus
-LLM-based self-checks on input and output. The `embeddings_only` block is what keeps intent matching off
-the LLM; without it the same flow still fires, but after a short classification call. The self-check
-rails need their prompts defined in `prompts.yml`; the snippet shows the input one.
+## Diagram
+A request passes five rail stages; the dialog stage is where a matched intent plus a predefined message
+can answer with no LLM call at all.
+
+```mermaid
+flowchart TD
+    U["User message"] --> I["Input rails: self-check, Presidio, Llama Guard"]
+    I -->|"blocked"| F["Fixed response"]
+    I --> D{"Dialog rail: intent match above threshold?"}
+    D -->|"yes"| P["Flow: predefined bot message"]
+    D -->|"no"| L["LLM intent, next step, generation"]
+    R[("Retrieval rails filter chunks")] --> L
+    L --> X["Execution rails wrap tool calls"]
+    X --> O["Output rails: self-check, PII mask"]
+    P --> O
+    O --> A["Reply"]
+```
+
+## Examples
+### A topical rail plus self-checks
+A topical rail deflects competitor questions without calling the LLM, plus LLM-based self-checks on input
+and output. The `embeddings_only` block keeps intent matching off the LLM; without it the same flow still
+fires, but after a short classification call. Self-check rails need prompts in `prompts.yml`; the snippet
+shows the input one.
 
 ```yaml
 # config/config.yml
@@ -161,56 +184,103 @@ print(res["content"])    # -> "I can only help with questions about our own prod
 rails.explain().print_llm_calls_summary()   # count the model calls this turn actually made
 ```
 
-The competitor question is embedded, matched above threshold to the canonical form, and answered by the
-flow, so the main model is called once for the input self-check and not at all for the answer. A question
-about your own product passes the input self-check, falls below the similarity threshold, gets its intent
-from a classification call, is generated by the main model, then passes the output self-check before
-returning. Note that the self-check rails are themselves LLM calls on the `main` model unless you
-configure a separate model for them. Count the calls rather than reasoning about them: for the competitor
-question the summary should show the input self-check and nothing for intent or generation; whether the
-output self-check also runs on a predefined bot message depends on version and configuration, which is
-exactly the kind of thing the summary settles. For the product question, expect input check, intent
-classification, next-step and message generation (or one combined call with `single_call`), and output
-check.
+### Counting the calls per question
+The self-check rails are themselves LLM calls on the `main` model unless you configure a separate model.
+
+| Question | Path | Expected calls in the summary |
+|---|---|---|
+| Competitor question | embedded, matched above threshold, answered by the flow | input self-check only; nothing for intent or generation |
+| Own-product question | passes input check, falls below threshold, intent from a classification call, generated by the main model | input check, intent classification, next-step and message generation (or one combined call with `single_call`), output check |
+
+- **Output check on a predefined message?** Whether the output self-check also runs on a predefined bot
+  message depends on version and configuration, which is exactly what the summary settles.
+- **Count, do not reason.** The `explain()` summary is the source of truth for latency and cost per turn.
+
+### A deterministic output rail as a custom action
+For checks that must never miss and need no language understanding (an account-number format, a blocked
+term list), write a Python action and call it from an output flow instead of an LLM self-check.
+
+```python
+# config/actions.py
+import re
+from typing import Optional
+from nemoguardrails.actions import action
+
+ACCOUNT = re.compile(r"\b\d{8,12}\b")     # this bank's account-number format
+
+@action(is_system_action=True)
+async def check_no_account_number(context: Optional[dict] = None) -> bool:
+    bot_message = (context or {}).get("bot_message", "")
+    return not ACCOUNT.search(bot_message)
+
+# config/rails.co  (Colang 1.0)
+# define bot inform cannot share account number
+#   "I can't share account numbers here. Please check the secure banking app."
+# define flow check account numbers
+#   $ok = execute check_no_account_number
+#   if not $ok
+#     bot inform cannot share account number
+#     stop
+#
+# config.yml:  rails: output: flows: [check account numbers]
+```
+
+- **Zero model calls:** the rail is a regex, so it adds microseconds, not a round-trip, and its behaviour is
+  unit-testable without an LLM.
+
+## Production patterns
+- **Config directory under version control with its own CI.** Keep each deployment's `config.yml`,
+  `prompts.yml` and Colang files in a repo, and run an adversarial set (block rate) and a benign set
+  (false-refusal rate) per rail on every change. Monitor both rates per rail per release.
+- **Per-customer policy directories.** Load a different `RailsConfig` path per tenant or product surface,
+  promoted through the same review as code. Monitor which config version served each request, via logs.
+- **Embeddings-only intents for high-volume topical control.** Turn on `embeddings_only` with a tuned
+  `embeddings_only_similarity_threshold`, add a few dozen examples per intent (including other supported
+  languages), and let weak matches fall back to the LLM. Monitor fallback rate and false matches on the
+  benign set.
+- **Separate, smaller model for LLM-based checks.** Do not run self-check rails on the same model and
+  account as main generation; assign them a smaller model per the toolkit's per-task model configuration.
+  Monitor self-check latency and how often checker and generator are jailbroken together in red-team runs.
+- **Call budget per turn.** Record the `explain()` LLM-call summary in staging for representative turns and
+  alert when the median calls per turn rises after a config change. Track time to first token per stage.
 
 ## Trade-offs
-- Declaring rails in configuration makes policy reviewable and swappable per customer, but it adds a
-  framework, a domain-specific language and a runtime in the request path; for a single simple check a
-  few lines of middleware are cheaper.
-- Embeddings-only intent matching is fast and deterministic, yet it only knows the example utterances it
-  was given; coverage of paraphrases and other languages depends entirely on the examples, and widening
-  them raises false matches. The default LLM-assisted path generalises better at the price of a model
-  call per turn.
-- LLM self-check rails are flexible and need no training, but each adds a model call to latency and cost
-  and shares the main model's vulnerability to injection; use a separate, smaller model for them and
-  reserve them for checks that cannot be done otherwise.
-- Predefined bot messages for sensitive topics are safe and auditable, but they feel robotic; the flip
-  point is when product metrics show users abandoning after canned deflections.
+- **Declarative rails vs a framework in the path.** Policy becomes reviewable and swappable per customer, but
+  you add a framework, a DSL and a runtime to the request path. For a single simple check, a few lines of
+  middleware are cheaper.
+- **Embeddings-only matching vs generalisation.** It is fast and deterministic, yet only knows its example
+  utterances: paraphrase and language coverage depend entirely on them, and widening them raises false
+  matches. The default LLM-assisted path generalises better at the price of a model call per turn.
+- **LLM self-checks vs cost and attack surface.** Flexible and training-free, but each adds a model call and
+  shares the main model's vulnerability to injection. Use a separate, smaller model and reserve them for
+  checks that cannot be done otherwise.
+- **Predefined bot messages vs user experience.** Safe and auditable but robotic. The flip point is when
+  product metrics show users abandoning after canned deflections.
 
 ## Pitfalls
-- Writing canonical-form examples so broadly that unrelated questions match; the symptom is a sudden rise
-  in refusals on ordinary queries after a rail was added.
-- Running the self-check rails on the same model and account as main generation; the symptom is a
-  jailbreak that disables both the answer and its checker in one prompt.
-- Treating topical rails as a security boundary; the symptom is a red-team report showing the forbidden
-  topic reached by paraphrase or in another language.
-- Mixing Colang 1.0 and 2.0 syntax, or copying an example written for the other version; the symptom is
-  flows that silently never fire.
-- Enabling dialog rails on a product that only needed input and output checks; the symptom is time to
-  first token rising by several model round-trips, visible as extra intent and next-step calls in the
-  `explain()` summary.
-- Shipping rails without an evaluation set; the symptom is nobody being able to say what the false-refusal
-  rate is when a customer complains.
+- **Over-broad canonical-form examples.** Symptom: a sudden rise in refusals on ordinary queries after a rail
+  was added.
+- **Self-check rails on the same model and account as generation.** Symptom: one jailbreak prompt disables
+  both the answer and its checker.
+- **Topical rails as a security boundary.** Symptom: a red-team report reaching the forbidden topic by
+  paraphrase or in another language.
+- **Mixing Colang 1.0 and 2.0 syntax,** or copying an example for the other version. Symptom: flows that
+  silently never fire.
+- **Dialog rails on a product that needed only input and output checks.** Symptom: time to first token rises
+  by several model round-trips, visible as extra intent and next-step calls in the `explain()` summary.
+- **Shipping rails without an evaluation set.** Symptom: nobody can say what the false-refusal rate is when
+  a customer complains.
 
 ## When to use
-Use NeMo Guardrails when you need several kinds of checks composed around a conversational product,
-especially topical control, and when policy must differ per deployment or be readable by non-engineers.
-Skip it when you need one moderation call or one schema validation; call the classifier or validator
-directly. Before relying on it, build two test sets, adversarial and benign, and measure block rate on the
-first and false-refusal rate on the second for each rail, then track added latency per stage in
-production. It shows up in day-to-day work as a config directory under version control with its own CI;
-in interviews, the expected depth is explaining the five rail types, why intent matching uses embeddings,
-and what the toolkit does not do.
+- **Use when:** you need several kinds of checks composed around a conversational product, especially
+  topical control, and policy must differ per deployment or be readable by non-engineers.
+- **Skip when:** you need one moderation call or one schema validation; call the classifier or validator
+  directly.
+- **Before relying on it:** build adversarial and benign test sets, measure block rate on the first and
+  false-refusal rate on the second for each rail, then track added latency per stage in production.
+- **Day to day:** a config directory under version control with its own CI.
+- **Interviews:** explain the five rail types, why intent matching uses embeddings, and what the toolkit
+  does not do.
 
 ## Role lens
 - **Engineer:** Writes the Colang flows and Python actions, keeps the adversarial and benign test suites
@@ -238,6 +308,39 @@ the reply constitutes a recommendation to buy or sell, accepting the extra call 
 cost of a miss is high. A retrieval rail drops any chunk not tagged as a product document. I would then
 measure false-refusal rate on benign product questions and block rate on an adversarial set in both
 English and the bank's other supported languages.
+
+## Interview questions
+### What are the five rail types in NeMo Guardrails, and why separate them?
+- **Input, dialog, retrieval, execution and output,** each at a different point: the user message, intent and
+  flow, RAG chunks, tool calls, and the reply.
+- **Separating them** puts each check where it has the data it needs and lets you enable, order and test
+  them independently from configuration.
+
+### After adding a topical rail, ordinary questions started getting refused. How do you debug it?
+- **Suspect over-broad examples:** a canonical form's utterances are close in embedding space to normal
+  queries, so they match above threshold.
+- **Check with `explain()`** which intent matched, then narrow the examples, raise the similarity threshold,
+  or add contrasting intents.
+- **Prove the fix** with the benign set's false-refusal rate and the adversarial set's block rate.
+
+### Why does "NeMo adds latency" have no fixed answer?
+- **Each turn can make up to four or five model calls:** user intent, next step, bot message, plus one per
+  LLM-based input and output rail.
+- **Config removes them:** `embeddings_only`, matching flows, predefined messages, `single_call`, or input and
+  output rails only.
+- **So count calls** with the `explain()` summary rather than guessing.
+
+### When would you not use NeMo Guardrails?
+- **When you need one check:** a single moderation call or one schema validation is cheaper as direct code
+  than a framework, a DSL and a runtime in the request path.
+- **When rails would be mistaken for security:** topical rails are bypassed by paraphrase; injection still
+  needs architectural controls such as scoped tools.
+
+### How would you keep an account number out of every reply, and why not use an LLM self-check?
+- **Deterministic output rail:** a custom action with a regex or Presidio recogniser for the bank's format,
+  masking or blocking before the reply returns.
+- **Not an LLM check,** because pattern detection needs no language understanding, must never miss, and
+  should add no model call or injection surface.
 
 ## Quiz
 ### Q: What role do the example utterances under `define user ask about competitors` play at runtime?

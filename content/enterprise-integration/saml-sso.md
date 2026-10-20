@@ -5,7 +5,7 @@ name: SAML SSO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - enterprise-integration/sso-iam-integration
   - enterprise-integration/scim-provisioning
@@ -20,91 +20,117 @@ sources:
 ---
 
 ## TL;DR
-SAML 2.0 lets a customer's identity provider tell your application, in a signed XML assertion delivered
-through the user's browser, who the user is and what attributes they have. It predates OIDC and remains
-mandatory for many enterprises. The protocol is simple; safe implementation is not, because XML signature
-handling is subtle, so you use a maintained library and still validate audience, recipient, time window,
-request correlation and replay yourself.
+SAML 2.0 lets a customer's IdP vouch for a user with a signed XML assertion sent through the browser,
+and many enterprises still mandate it. XML signatures are subtle: use a maintained library and still
+check audience, recipient, time, correlation and replay.
 
 ## Why it exists
-Before SAML, every web application kept its own passwords, and cross-domain single sign-on meant cookies
-that browsers would not share between companies. Enterprises needed a way for their directory (Active
-Directory, later Okta or Entra ID) to vouch for a user to an outside application without that application
-ever seeing a password. SAML, standardized in its 2.0 form in 2005, solved it with signed XML statements
-passed through the browser, so the IdP and the service provider (SP) never need a direct network
-connection, which suited firewalled corporate networks.
-
-The naive alternatives do not work. Sharing the customer's LDAP with the vendor exposes credentials and
-violates every security policy. Passing a username in a URL parameter is trivially forged. Even "signed
-XML" is not enough by itself: early implementations verified that *a* signature in the document was valid
-and then read the user from a *different*, unsigned element, letting attackers impersonate anyone. SAML
-SSO is therefore both a protocol and a checklist of validations that a vendor must get exactly right.
+- **Every app kept its own passwords.** Cross-domain single sign-on meant cookies that browsers would not
+  share between companies.
+- **Enterprises wanted their directory to vouch for users.** Active Directory, later Okta or Entra ID,
+  needed to assert identity to an outside app without that app ever seeing a password.
+- **SAML solved it through the browser.** Standardized in its 2.0 form in 2005, it passes signed XML
+  statements via the browser, so the IdP and the service provider (SP) never need a direct network
+  connection, which suited firewalled corporate networks.
+- **The naive alternatives fail.** Sharing the customer's LDAP exposes credentials and violates every
+  security policy. A username in a URL parameter is trivially forged.
+- **Even "signed XML" is not enough.** Early implementations verified that *a* signature was valid, then
+  read the user from a *different*, unsigned element, letting attackers impersonate anyone. SAML SSO is a
+  protocol plus a checklist of validations that must be exactly right.
 
 ## How it works
 ### Setup: metadata exchange
-The SP and IdP exchange metadata once per customer. The SP publishes its entity ID (a unique URI) and
-Assertion Consumer Service (ACS) URL; the IdP publishes its entity ID, SSO URL and signing certificate.
-You store the IdP's certificate per tenant, *because* that certificate is the only thing that makes an
-assertion trustworthy.
+Exchanged once per customer:
+
+| Party | Publishes |
+|---|---|
+| SP (you) | Entity ID (a unique URI) and Assertion Consumer Service (ACS) URL |
+| IdP | Entity ID, SSO URL and signing certificate |
+
+- **Store the IdP's certificate per tenant**, *because* it is the only thing that makes an assertion trustworthy.
 
 ### SP-initiated flow
-1. The user opens your app; home realm discovery finds their tenant.
-2. You redirect the browser to the IdP's SSO URL with an `AuthnRequest` (HTTP-Redirect binding: deflated,
-   base64, in the query string) containing a fresh request ID and your entity ID. Save the ID.
-3. The IdP authenticates the user (password, MFA, conditional access).
-4. The IdP returns an HTML form that auto-POSTs a base64 `SAMLResponse` to your ACS URL (HTTP-POST
-   binding, *because* assertions are too large for a URL).
-5. You validate and create a session.
+1. **Discover the tenant.** The user opens your app; home realm discovery finds their tenant.
+2. **Send an `AuthnRequest`.** Redirect the browser to the IdP's SSO URL (HTTP-Redirect binding: deflated,
+   base64, in the query string) with a fresh request ID and your entity ID. Save the ID.
+3. **The IdP authenticates** the user (password, MFA, conditional access).
+4. **The IdP posts back.** It returns an HTML form that auto-POSTs a base64 `SAMLResponse` to your ACS URL
+   (HTTP-POST binding, *because* assertions are too large for a URL).
+5. **You validate and create a session.**
 
 ### What the assertion contains
-- `Issuer`: the IdP entity ID.
-- `Subject/NameID`: the user identifier, in a format such as persistent, email or unspecified.
-- `SubjectConfirmationData`: `Recipient` (your ACS URL), `NotOnOrAfter`, `InResponseTo` (your request ID).
-- `Conditions`: `NotBefore`, `NotOnOrAfter`, `AudienceRestriction` (your entity ID).
-- `AttributeStatement`: email, name, groups, roles.
-- An XML digital signature over the assertion, the response, or both.
+| Element | Holds |
+|---|---|
+| `Issuer` | The IdP entity ID |
+| `Subject/NameID` | The user identifier, in a format such as persistent, email or unspecified |
+| `SubjectConfirmationData` | `Recipient` (your ACS URL), `NotOnOrAfter`, `InResponseTo` (your request ID) |
+| `Conditions` | `NotBefore`, `NotOnOrAfter`, `AudienceRestriction` (your entity ID) |
+| `AttributeStatement` | Email, name, groups, roles |
+| Signature | An XML digital signature over the assertion, the response, or both |
 
 ### The validation checklist
 Each check exists *because* skipping it enables a known attack:
-- Verify the signature with the tenant's stored certificate, require signing, and read every value **from
-  the element that the signature covers**; otherwise signature-wrapping attacks insert a forged unsigned
-  assertion next to a genuine signed one.
-- `Issuer` matches the tenant's IdP, preventing one customer's IdP from asserting into another's workspace.
-- `Audience` equals your entity ID, so an assertion minted for another SP cannot be replayed at you.
-- `Recipient` equals your ACS URL and the time window holds with small clock skew.
-- `InResponseTo` matches a request ID that *this browser session* started, and assertion IDs are recorded
-  until expiry to reject replays. Binding to the session, not to a global set of pending IDs, matters
-  *because* otherwise an attacker can start a login, then feed their own valid response into a victim's
-  browser and sign the victim in as the attacker (login CSRF).
-- If you accept IdP-initiated SSO (no `AuthnRequest`, so no `InResponseTo`), you lose request correlation;
-  many teams disable it or accept it only with strict replay caching.
+
+| Check | Attack it stops |
+|---|---|
+| Verify the signature with the tenant's stored certificate, require signing, and read every value **from the element the signature covers** | Signature wrapping: a forged unsigned assertion inserted next to a genuine signed one |
+| `Issuer` matches the tenant's IdP | One customer's IdP asserting into another's workspace |
+| `Audience` equals your entity ID | An assertion minted for another SP replayed at you |
+| `Recipient` equals your ACS URL; time window holds with small clock skew | Misdirected or stale assertions |
+| `InResponseTo` matches a request ID that *this browser session* started; assertion IDs recorded until expiry | Replay, and login CSRF |
+
+- **Why bind to the session, not a global set of pending IDs:** otherwise an attacker can start a login,
+  feed their own valid response into a victim's browser, and sign the victim in as the attacker.
+- **IdP-initiated SSO** (no `AuthnRequest`, so no `InResponseTo`) loses request correlation; many teams
+  disable it or accept it only with strict replay caching.
 
 ### Parsing, encryption, RelayState and logout
 - **Parse defensively.** The response is attacker-controlled bytes until the signature checks out, and it is
   parsed *before* that check. Disable DTDs and external entity resolution, *because* otherwise an XXE payload
   can make your server read local files or call internal URLs during parsing.
 - **Read text nodes carefully.** In 2018 several SAML libraries were found to read only the first text node
-  of an element. An attacker who legitimately held `ana@acme.com.evil.com` at the IdP could insert a comment
-  into their own signed assertion, `<NameID>ana@acme.com<!---->.evil.com</NameID>`; the signature still
-  verified (canonicalization drops comments) but the SP read the user as `ana@acme.com`. Use a library version that has fixed this,
-  and read the full canonicalized text.
-- **Encrypted assertions.** The IdP can encrypt the assertion to the SP's public key so the browser cannot read
-  the attributes. You decrypt, then verify the signature on the decrypted assertion; encryption hides data but
-  does not authenticate it, so it never replaces the signature checks.
-- **RelayState.** The opaque value the SP sends with the request and gets back with the response, usually the
-  page to return to. Treat it as untrusted and accept only relative paths or an allow-list, *because*
-  redirecting to whatever it contains turns your login into an open redirect.
-- **Logout.** SAML Single Logout exists but depends on every party's front-channel redirects succeeding, and
-  is unreliable in practice. Do not rely on it for revocation; use short sessions and SCIM deactivation.
+  of an element:
+  - an attacker who legitimately held `ana@acme.com.evil.com` at the IdP inserted a comment into their own
+    signed assertion, `<NameID>ana@acme.com<!---->.evil.com</NameID>`;
+  - the signature still verified (canonicalization drops comments) but the SP read the user as `ana@acme.com`;
+  - use a library version that has fixed this, and read the full canonicalized text.
+- **Encrypted assertions.** The IdP can encrypt to the SP's public key so the browser cannot read the
+  attributes. Decrypt, then verify the signature on the decrypted assertion; encryption hides data but does
+  not authenticate it, so it never replaces the signature checks.
+- **RelayState.** The opaque value the SP sends with the request and gets back, usually the page to return
+  to. Treat it as untrusted and accept only relative paths or an allow-list, *because* redirecting to
+  whatever it contains turns your login into an open redirect.
+- **Logout.** SAML Single Logout depends on every party's front-channel redirects succeeding and is
+  unreliable in practice. Do not rely on it for revocation; use short sessions and SCIM deactivation.
 
 ### Certificates
-IdP signing certificates expire and rotate. Support two active certificates per tenant during rotation,
-*because* a single hard-coded certificate turns a routine rotation into an outage for that customer.
+- **Support two active certificates per tenant during rotation**, *because* IdP signing certificates expire
+  and rotate, and a single hard-coded certificate turns a routine rotation into an outage for that customer.
 
-## Example
-Post-decoding validation of a SAML response using `signxml` for the signature and `lxml` for reading. The
-key design point is that all values are read from `signed`, the element the verifier returns, never from
-the raw document.
+## Diagram
+SP-initiated login: the request ID you save in step 2 is what `InResponseTo` must match at the end.
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant S as Your app (SP)
+    participant I as Customer IdP
+    U->>S: Open app
+    Note over S: Home realm discovery, save request ID in session
+    S->>U: Redirect with AuthnRequest
+    U->>I: AuthnRequest via HTTP-Redirect
+    Note over I: Password, MFA, conditional access
+    I->>U: Auto-POST form with SAMLResponse
+    U->>S: POST SAMLResponse to ACS URL
+    Note over S: Verify signature, read only signed element
+    Note over S: Issuer, Audience, Recipient, time, InResponseTo, replay
+    S->>U: Session cookie and safe RelayState redirect
+```
+
+## Examples
+### Validating a decoded response with `signxml` and `lxml`
+The key design point: all values are read from `signed`, the element the verifier returns, never from the
+raw document.
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -145,42 +171,106 @@ def consume(xml: bytes, tenant: dict, pending_ids: set, seen_ids: set) -> dict:
     return {"name_id": a.findtext("saml:Subject/saml:NameID", namespaces=NS), "attrs": attrs}
 ```
 
-In production, prefer a full SAML library per framework (it also handles encrypted assertions and
-metadata), but this checklist is what you should be able to point to in its configuration.
+- **In production, prefer a full SAML library per framework.** It also handles encrypted assertions and
+  metadata, but this checklist is what you should be able to point to in its configuration.
+
+### RelayState allow-list and an expiring replay cache
+Pure standard library, runnable on Python 3.10+. Both are small, and both are commonly missing.
+
+```python
+from urllib.parse import urlsplit
+
+def safe_relay_state(rs: str | None, default: str = "/") -> str:
+    """Accept only same-site relative paths; anything else falls back to the home page."""
+    if not rs or "\\" in rs or rs.startswith("//") or not rs.startswith("/"):
+        return default
+    parts = urlsplit(rs)
+    return default if parts.scheme or parts.netloc else rs
+
+class ReplayCache:
+    """Remember assertion IDs until their NotOnOrAfter; reject a second use."""
+    def __init__(self):
+        self.seen: dict[str, float] = {}
+    def first_use(self, assertion_id: str, not_on_or_after: float, now: float) -> bool:
+        self.seen = {k: exp for k, exp in self.seen.items() if exp > now}   # expire old IDs
+        if assertion_id in self.seen:
+            return False
+        self.seen[assertion_id] = not_on_or_after
+        return True
+
+for rs in ["/reports/42?tab=q3", "https://evil.example", "//evil.example", "/\\evil.example", None]:
+    print(repr(rs), "->", safe_relay_state(rs))          # only the first survives
+
+cache = ReplayCache()
+print(cache.first_use("_a1", not_on_or_after=1300, now=1000))   # True: first use
+print(cache.first_use("_a1", not_on_or_after=1300, now=1200))   # False: replay inside window
+```
+
+### Worked scenario: the negative test matrix
+Every row is a tampered response your ACS endpoint must reject; run them in CI per library upgrade.
+
+| Tampered response | Expected rejection |
+|---|---|
+| Genuine signed assertion plus a forged unsigned one | Only the signed element is read; exactly one assertion allowed |
+| Valid assertion for another SP | Wrong audience |
+| Valid assertion from another tenant's IdP | Wrong issuer or signature (different stored certificate) |
+| `NotOnOrAfter` 10 minutes in the past, skew 2 minutes | Outside validity window |
+| `InResponseTo` started in a different browser session | Unsolicited response |
+| Same assertion posted twice | Replayed assertion |
+| Comment injected into NameID | Library reads full canonicalized text, user unchanged |
+| DOCTYPE with an external entity | Parser refuses DTDs |
+
+## Production patterns
+- **Two-certificate rotation with expiry alerts.** Store up to two IdP certificates per tenant, accept
+  either, and alert well ahead (for example 30 days) of each expiry date captured from metadata. Monitor
+  signature failures per tenant on rotation days.
+- **Shared replay cache with TTL.** Keep seen assertion IDs in a store every app node shares, for example
+  Redis `SET saml:<ID> 1 NX EX <seconds until NotOnOrAfter>`; a failed `NX` means replay. Monitor replay
+  rejections, which should be near zero.
+- **Clock discipline on every node.** Run NTP everywhere and keep skew allowance small (2 minutes in the
+  example). Monitor "not yet valid" errors by node; one node's spike means its clock drifted.
+- **Hardened parser configuration.** Parse with DTDs and external entities disabled (for `lxml`, a parser
+  created with entity resolution and network access turned off), before any signature work. Monitor parse
+  failures as a security signal.
+- **Login failures by reason, per tenant.** Emit a reason code (audience, signature, expiry, recipient,
+  unsolicited, replay) for each rejection so FDEs can tell a customer metadata mistake from an attack.
 
 ## Trade-offs
-- SAML works with nearly every enterprise IdP and corporate policy, but XML signatures, canonicalization and
-  certificate handling make it harder to implement safely than OIDC; prefer OIDC when the customer allows it.
-- Browser-mediated delivery needs no network path from the IdP to you, which suits locked-down networks,
-  but it is only for interactive web login; API and agent calls still need OAuth tokens.
-- IdP-initiated SSO gives users a convenient tile in their portal, but removes `InResponseTo` correlation and
-  widens replay and login-CSRF risk; enable it only with strict replay caching and short validity.
-- Persistent opaque NameIDs survive email changes, while email NameIDs are easy to map but change; the
-  choice flips if the customer cannot emit a persistent identifier.
+- **Ubiquity vs implementation risk.** SAML works with nearly every enterprise IdP and corporate policy, but
+  XML signatures, canonicalization and certificate handling make it harder to implement safely than OIDC.
+  Prefer OIDC when the customer allows it.
+- **Browser delivery vs scope.** It needs no network path from the IdP to you, which suits locked-down
+  networks, but it is only for interactive web login; API and agent calls still need OAuth tokens.
+- **IdP-initiated convenience vs risk.** A tile in the user's portal is convenient, but it removes
+  `InResponseTo` correlation and widens replay and login-CSRF risk. Enable it only with strict replay caching
+  and short validity.
+- **Persistent vs email NameIDs.** Persistent opaque NameIDs survive email changes; email NameIDs are easy to
+  map but change. The choice flips if the customer cannot emit a persistent identifier.
 
 ## Pitfalls
-- Reading the user from the raw document after checking that some signature verifies; the symptom is a
-  pen tester logging in as an arbitrary user with a modified response.
-- Not checking audience or issuer per tenant; the symptom is an assertion from one customer's IdP being
-  accepted for another customer's workspace.
-- Hard-coding one IdP certificate; the symptom is a single customer's logins failing on the day their IdP
-  rotates its signing certificate.
-- Skipping replay protection; the symptom is a captured `SAMLResponse` from browser history granting a new
+- **Reading the user from the raw document** after checking that some signature verifies. Symptom: a pen
+  tester logs in as an arbitrary user with a modified response.
+- **No per-tenant audience or issuer check.** Symptom: an assertion from one customer's IdP is accepted for
+  another customer's workspace.
+- **One hard-coded IdP certificate.** Symptom: a single customer's logins fail on the day their IdP rotates
+  its signing certificate.
+- **Skipping replay protection.** Symptom: a captured `SAMLResponse` from browser history grants a new
   session hours later within a lax validity window.
-- Parsing the response with DTDs and external entities enabled; the symptom is a pen-test finding that the
-  ACS endpoint fetched an attacker-supplied URL or echoed local file contents in an error.
-- Following `RelayState` to any URL; the symptom is phishing links that pass through your genuine login page
-  and land on an attacker's site.
-- Server clock drift; the symptom is intermittent "assertion not yet valid" errors that appear only on some
-  application nodes.
+- **DTDs and external entities enabled.** Symptom: a pen-test finding that the ACS endpoint fetched an
+  attacker-supplied URL or echoed local file contents in an error.
+- **Following `RelayState` to any URL.** Symptom: phishing links pass through your genuine login page and
+  land on an attacker's site.
+- **Server clock drift.** Symptom: intermittent "assertion not yet valid" errors on only some application nodes.
 
 ## When to use
-Implement SAML when customers require it, which in practice means most larger enterprise deals; offer OIDC
-alongside for those who can use it. Never hand-roll XML signature verification; use a maintained library and
-verify its configuration against the checklist above. Measure login failures by reason (audience, signature,
-expiry) per tenant, and alert ahead of IdP certificate expiry dates captured from metadata. In interviews,
-being able to walk the SP-initiated flow and explain signature wrapping and audience checks is the expected
-depth for anyone shipping B2B software.
+- **Use when** customers require it, which in practice means most larger enterprise deals; offer OIDC
+  alongside for those who can use it.
+- **Never hand-roll** XML signature verification; use a maintained library and verify its configuration
+  against the checklist above.
+- **Measure:** login failures by reason (audience, signature, expiry) per tenant, and alert ahead of IdP
+  certificate expiry dates captured from metadata.
+- **Interviews:** walk the SP-initiated flow and explain signature wrapping and audience checks; that is the
+  expected depth for anyone shipping B2B software.
 
 ## Role lens
 - **Engineer:** Configures the SAML library per tenant, stores certificates and entity IDs, enforces replay
@@ -199,6 +289,38 @@ intact so verification still passes. A document-wide XPath may then read the for
 read every value only from the element the verifier reports as signed, require that exactly one assertion
 exists and that it is the signed one, and use a maintained library with signature wrapping defenses.
 Then still check issuer, audience, recipient, time window and InResponseTo.
+
+## Interview questions
+### Walk me through an SP-initiated SAML login.
+- **Discovery and request:** home realm discovery picks the tenant, then the SP redirects with an
+  `AuthnRequest` carrying a fresh ID it saves in the browser session.
+- **IdP and response:** the IdP authenticates (MFA, conditional access) and auto-POSTs a signed
+  `SAMLResponse` to the ACS URL.
+- **Validation:** signature from the signed element only, then issuer, audience, recipient, time window,
+  `InResponseTo` and replay, then a local session.
+
+### One customer's SAML logins all started failing this morning. How do you debug it?
+- **Read the rejection reason** for that tenant: a signature failure on one tenant usually means the IdP
+  rotated its signing certificate.
+- **Confirm with a SAML tracer** on a test account and compare the certificate in the response with the one
+  stored.
+- **Fix and prevent:** add the new certificate as a second active one, and alert on expiry dates from metadata.
+
+### Would you enable IdP-initiated SSO? Why or why not?
+- **Benefit:** users get a tile in their IdP portal, which some customers insist on.
+- **Cost:** no `AuthnRequest` means no `InResponseTo`, so replay and login CSRF are easier.
+- **If enabled:** strict shared replay cache, short validity, and a fixed landing page instead of an
+  arbitrary RelayState.
+
+### Why does encryption of the assertion not replace signature checks?
+- **Encryption hides attributes from the browser**, but anyone with the SP's public key can encrypt, so it
+  proves nothing about who produced the assertion.
+- **So decrypt, then verify the signature** on the decrypted assertion, and run every other check as normal.
+
+### How do you make replay protection work behind a load balancer with many app nodes?
+- **Use a shared store**, because a per-node in-memory set lets a replay succeed on a different node.
+- **Key by assertion ID with a TTL** until its `NotOnOrAfter`, using an atomic set-if-absent so two nodes
+  cannot both accept it.
 
 ## Quiz
 ### Q: Why does the SAML HTTP-POST binding deliver the response through the user's browser?

@@ -5,7 +5,7 @@ name: Feature stores (hybrid ML only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/train-test-leakage
   - data-architecture/training-data-pipelines
@@ -20,120 +20,142 @@ sources:
 ---
 
 ## TL;DR
-Caveat first: feature stores matter only in hybrid systems that train and serve classical ML models
-(ranking, fraud, churn, routing classifiers) alongside LLM components; pure LLM-application roles can skim
-this and move on. A feature store is the layer that computes model input features once, serves the same
-values to training (historically, point-in-time correct) and to inference (now, at low latency), and
-versions their definitions, because training/serving skew and time leakage are the two bugs that quietly
-ruin tabular models.
+Caveat first: this matters only for hybrid systems serving classical ML models beside LLMs. A feature store
+computes features once, serves them point-in-time correct to training and fresh to inference, and versions
+definitions, preventing training/serving skew and time leakage.
 
 ## Why it exists
-A fraud model needs "number of transactions by this card in the last hour" and "customer's average order
-value over 90 days". Those features are computed in two places: a batch SQL job that builds the training
-set from the warehouse, and a service that computes them at request time from a cache or production
-database. The two implementations drift. The batch job counts refunds; the service does not. The batch job
-uses UTC day boundaries; the service uses local time. The model learns from one definition and is scored
-with another, and accuracy in production is lower than in evaluation for reasons nobody can see. This is
-**training/serving skew**, and it is the first problem a feature store removes by making the definition
-singular.
-
-The second problem is subtler. When you build a training set by joining labels to features, the join
-must use the feature values *as they were at the moment each label's event happened*. Join to today's
-values and the model learns from the future: the "90-day average" for a transaction last March includes
-orders from April. Offline metrics look excellent, production is worse, and the gap is **time leakage**.
-Doing this join correctly by hand across dozens of features with different update cadences is where most
-hand-rolled pipelines go wrong.
-
-The naive alternative is a shared feature library plus a cache. It fixes definition drift but not
-leakage, does not store history, and gives no answer to "which feature version did model v12 train on".
-The feature store adds a historical store, point-in-time joins, versioned definitions and an online
-serving path, which is the minimum set that solves both problems.
+- **Caveat: hybrid systems only.** Feature stores matter in systems that train and serve classical ML models
+  (ranking, fraud, churn, routing classifiers) alongside LLM components. Pure LLM-application roles can skim
+  this and move on.
+- **Two implementations drift (training/serving skew).** A fraud model needs "transactions by this card in
+  the last hour" and "customer's average order value over 90 days". A batch SQL job computes them for the
+  training set; a service computes them at request time.
+- **The two silently disagree.** The batch job counts refunds, the service does not; the batch job uses UTC
+  day boundaries, the service local time. The model learns one definition and is scored with another, so
+  production accuracy is lower than in evaluation for reasons nobody can see.
+- **Joins to today's values leak the future (time leakage).** Training rows must join features *as they
+  were when each label's event happened*. Join to today's values and the "90-day average" for a transaction
+  last March includes orders from April. Offline metrics look excellent, production is worse.
+- **Hand-rolled joins go wrong at scale.** Doing this join correctly by hand across dozens of features with
+  different update cadences is where most hand-rolled pipelines fail.
+- **A shared library plus a cache is not enough.** It fixes definition drift but not leakage, stores no
+  history, and cannot say "which feature version did model v12 train on". The feature store adds a historical
+  store, point-in-time joins, versioned definitions and an online serving path: the minimum set that solves
+  both problems.
 
 ## How it works
 ### Entities, features and feature views
-A feature is a named, typed value attached to an **entity** (a customer id, a card id, a merchant id)
-with an **event timestamp** saying when the value became true. Features are grouped into **feature
-views** (Feast's term; other systems say feature groups or tables): a set of features for one entity
-computed by one transformation from one source, with a TTL that says how long a value stays valid. The
-definition lives in code under version control, *because* it must be the single source of truth for
-both the batch and the serving path.
+- **A feature** is a named, typed value attached to an **entity** (a customer id, a card id, a merchant id)
+  with an **event timestamp** saying when the value became true.
+- **A feature view** (Feast's term; other systems say feature groups or tables) is a set of features for one
+  entity, computed by one transformation from one source, with a TTL saying how long a value stays valid.
+- **The definition lives in code under version control,** *because* it must be the single source of truth
+  for both the batch and the serving path.
 
 ### The offline store
-Historical feature values, keyed by entity and event timestamp, in the warehouse or lakehouse. It is
-append-only by design: a new value for a customer is a new row with a later timestamp, not an overwrite,
-*because* training needs every past value to reconstruct what was known at any given moment.
+- **Historical feature values,** keyed by entity and event timestamp, in the warehouse or lakehouse.
+- **Append-only by design:** a new value is a new row with a later timestamp, not an overwrite, *because*
+  training needs every past value to reconstruct what was known at any given moment.
 
 ### The point-in-time join
-Given a label table with `(entity_id, label_timestamp, label)`, the training set is built by, for each
-row, selecting from each feature view the latest value with `event_timestamp <= label_timestamp` and
-`label_timestamp - event_timestamp <= ttl`. If no value qualifies, the feature is null, which is the
-honest answer: at that time the model would not have known it. This "as-of" join is the core algorithm
-and is the reason the offline store keeps history. Feast exposes it as `get_historical_features`.
+Given a label table with `(entity_id, label_timestamp, label)`, for each row and each feature view:
+1. Select the latest value with `event_timestamp <= label_timestamp`.
+2. Require `label_timestamp - event_timestamp <= ttl`.
+3. If no value qualifies, the feature is null: the honest answer, since at that time the model would not have
+   known it.
+
+- **This "as-of" join is the core algorithm** and the reason the offline store keeps history. Feast exposes
+  it as `get_historical_features`.
 
 ### The boundary must match what serving sees
-The `<=` in the join is a decision, not a detail. Suppose the feature is "transactions by this card in
-the last hour" and the label is attached to a transaction at 14:00:00. If the feature pipeline has
-already counted that transaction in a value stamped 14:00:00, an inclusive join hands the model a count
-that includes the very event being scored. At serving time the scorer runs *before* the transaction is
-recorded, so it never sees itself in the count. The training and serving views then differ by exactly
-one, systematically, which is leakage that looks like a rounding error. Choose strict or inclusive
-comparison, and any allowance for ingestion delay, to reproduce what the online path can know at
-decision time.
+The `<=` in the join is a decision, not a detail.
+
+| Step | Training (inclusive join) | Serving |
+|---|---|---|
+| Feature | transactions by this card in the last hour | same |
+| Label event | a transaction at 14:00:00 | the same transaction, being scored |
+| What the count includes | the pipeline already counted it in a value stamped 14:00:00 | the scorer runs *before* the transaction is recorded, so never itself |
+| Result | count includes the very event being scored | count is exactly one lower, systematically |
+
+- **This is leakage that looks like a rounding error.** Choose strict or inclusive comparison, and any
+  allowance for ingestion delay, to reproduce what the online path can know at decision time.
 
 ### Backfills
-A new feature is useless for training until it has history. A *backfill* runs the feature's
-transformation over historical source data to populate the offline store as if the feature had always
-existed, which is possible only if the sources are themselves historical (an event log or a snapshot
-table). If the feature reads a mutable production table that keeps only current state, history cannot be
-reconstructed; the only honest options are to start logging the feature now and wait until enough
-labelled history accumulates, or to accept a training set where the feature is null before its launch
-date. This is why feature sources should be append-only events wherever possible.
+- **A new feature is useless for training until it has history.** A *backfill* runs the transformation over
+  historical source data to populate the offline store as if the feature had always existed.
+- **Only possible with historical sources** (an event log or a snapshot table).
+- **If the source is a mutable table keeping only current state,** history cannot be reconstructed. The
+  honest options: start logging the feature now and wait for enough labelled history, or accept a training
+  set where the feature is null before its launch date.
+- **So feature sources should be append-only events** wherever possible.
 
 ### The online store
-A low-latency key-value store (Redis, DynamoDB, Bigtable and similar) holding only the latest value per
-entity per feature view. Serving reads it with a single lookup per entity. It is populated by
-**materialization**: a scheduled job copies the latest values from the offline store into the online
-store, so both paths see the same computed numbers. For features that must be fresher than the
-materialization cadence (counts in the last minute), a streaming path writes to both stores from the
-event stream.
+- **A low-latency key-value store** (Redis, DynamoDB, Bigtable and similar) holding only the latest value per
+  entity per feature view. Serving reads it with a single lookup per entity.
+- **Populated by materialization:** a scheduled job copies the latest values from the offline store into the
+  online store, so both paths see the same computed numbers.
+- **A streaming path** writes to both stores from the event stream for features that must be fresher than the
+  materialization cadence (counts in the last minute).
 
 ### Why one definition serves both paths
-The transformation is written once and executed in the batch engine for history and in the materializer
-or stream processor for serving. Skew is prevented structurally rather than by code review, *because*
-there is no second implementation to drift. Where a transformation depends on the request payload, two
-options exist: run the same transformation code in both paths at request time and at training time
-(Feast's on-demand feature views work this way), or log the values actually served so they can be reused
-as training features later, closing the loop. Logging is the safer of the two when the request-time
-inputs cannot be reconstructed from history.
+- **Written once, executed twice:** in the batch engine for history, and in the materializer or stream
+  processor for serving. Skew is prevented structurally rather than by code review, *because* there is no
+  second implementation to drift.
+- **Request-payload features have two options.** Run the same transformation code at request time and at
+  training time (Feast's on-demand feature views work this way), or log the values actually served and reuse
+  them as training features later, closing the loop.
+- **Logging is safer** when the request-time inputs cannot be reconstructed from history.
 
 ### Versioning and lineage
-Feature view definitions are versioned; a model's training run records which versions and which offline
-snapshot it used, which plugs directly into provenance. Changing a feature's semantics means a new
-version, and both versions can be served during a model migration. Feature statistics (null rates,
-distributions) computed at materialization are what drift monitoring compares against.
+- **Feature view definitions are versioned,** and a training run records which versions and which offline
+  snapshot it used, which plugs directly into provenance.
+- **Changing semantics means a new version;** both versions can be served during a model migration.
+- **Statistics computed at materialization** (null rates, distributions) are what drift monitoring compares
+  against.
 
 ### Where it sits in a hybrid AI system
-Typical hybrid shapes: a classical ranking or routing model decides which documents or which LLM an
-agent should use; a fraud or risk score gates whether an LLM-generated action executes; a churn model
-decides which users get an LLM-drafted outreach. The features for those models come from a feature store;
-the LLM gets the score or the decision, not the features. Embeddings also appear as features in these
-models (a user or item embedding fed to a ranker); the embedding model's version is then part of the
-feature view's definition, so changing it is a new feature version and a retrain, for the same reason it
-forces a re-index in retrieval. If your system has none of these models, the
-analogous concerns (consistent metadata between ingestion and query time, versioned transformations)
-are handled by the ingestion contract and embedding versioning, not by a feature store.
+- **Typical shapes:** a ranking or routing model decides which documents or which LLM an agent should use; a
+  fraud or risk score gates whether an LLM-generated action executes; a churn model decides which users get
+  an LLM-drafted outreach.
+- **The LLM gets the score or the decision,** not the features, which come from the feature store.
+- **Embeddings as features:** a user or item embedding fed to a ranker makes the embedding model's version
+  part of the feature view's definition. Changing it is a new feature version and a retrain, for the same
+  reason it forces a re-index in retrieval.
+- **No such models?** Then the analogous concerns (consistent metadata between ingestion and query time,
+  versioned transformations) are handled by the ingestion contract and embedding versioning, not a feature
+  store.
 
 ### Products
-Feast is the common open-source option (definitions in Python, pluggable offline and online stores).
-Managed or commercial options include Tecton, the Databricks feature store, Amazon SageMaker Feature
-Store, Vertex AI Feature Store and Hopsworks; this market consolidates and renames products often, so
-check current offerings. The differences are mostly in streaming support, transformation execution and
-how tightly they integrate with a given platform; the concepts above are shared.
+- **Feast** is the common open-source option (definitions in Python, pluggable offline and online stores).
+- **Managed or commercial:** Tecton, the Databricks feature store, Amazon SageMaker Feature Store, Vertex AI
+  Feature Store and Hopsworks. This market consolidates and renames products often, so check current
+  offerings.
+- **Differences** are mostly in streaming support, transformation execution and platform integration; the
+  concepts above are shared.
 
-## Example
-A point-in-time join in pure Python, contrasted with the leaking "join to the latest value" that
-hand-rolled pipelines usually do. Feature rows are `(entity, event_time, value)`; labels are
-`(entity, label_time)`.
+## Diagram
+One definition feeds both paths: history for point-in-time training joins, latest values for serving.
+
+```mermaid
+flowchart TD
+    DEF["Feature view definition in code"] --> BATCH["Batch transform over event log"]
+    DEF --> STREAM["Stream transform for fresh features"]
+    BATCH --> OFF[("Offline store: full history")]
+    STREAM --> OFF
+    STREAM --> ON[("Online store: latest value")]
+    OFF -->|"materialize latest"| ON
+    LBL["Labels with timestamps"] --> PIT["Point-in-time join"]
+    OFF --> PIT
+    PIT --> TRAIN["Training set"]
+    ON -->|"one lookup per entity"| SERVE["Model scoring"]
+    SERVE -.->|"log served values"| OFF
+```
+
+## Examples
+### Point-in-time join versus the leaky latest-value join
+Pure Python, contrasted with the "join to the latest value" that hand-rolled pipelines usually do. Feature
+rows are `(entity, event_time, value)`; labels are `(entity, label_time)`.
 
 ```python
 from bisect import bisect_right
@@ -173,46 +195,112 @@ The March label trained with the leaky join would see a value that only became t
 on such rows learns relationships that cannot exist at inference time, which is exactly why offline
 metrics overstate production performance.
 
+### Production snippet: the same feature in Feast
+One definition, applied with `feast apply`, then used for both a point-in-time training set and online
+serving. The entity dataframe must carry an `event_timestamp` column, which is the label time for the as-of
+join.
+
+```python
+from datetime import datetime, timedelta, timezone
+import pandas as pd
+from feast import Entity, FeatureStore, FeatureView, Field, FileSource
+from feast.types import Float32
+
+customer = Entity(name="customer", join_keys=["customer_id"])
+orders = FileSource(path="data/customer_orders.parquet", timestamp_field="event_timestamp")
+customer_orders = FeatureView(
+    name="customer_orders", entities=[customer], ttl=timedelta(days=120),
+    schema=[Field(name="avg_order_value_90d", dtype=Float32)], source=orders,
+)
+
+store = FeatureStore(repo_path=".")
+labels = pd.DataFrame({"customer_id": [1001, 1001],
+                       "event_timestamp": pd.to_datetime(["2024-03-10", "2024-04-20"], utc=True)})
+train_df = store.get_historical_features(            # point-in-time correct, TTL applied
+    entity_df=labels, features=["customer_orders:avg_order_value_90d"]).to_df()
+
+store.materialize_incremental(end_date=datetime.now(timezone.utc))   # offline -> online
+online = store.get_online_features(features=["customer_orders:avg_order_value_90d"],
+                                   entity_rows=[{"customer_id": 1001}]).to_dict()
+```
+
+### Worked scenario: the 0.95-offline, 0.80-production fraud model
+Logging served features and comparing them with batch values for the same entities and timestamps
+(illustrative findings):
+
+| Check | Finding | Class of bug | Fix |
+|---|---|---|---|
+| How the training set was built | labels joined to current values | time leakage | rebuild with a point-in-time join |
+| Refund handling | batch counts refunds, service does not | skew | one definition in the feature view |
+| Day boundaries | batch UTC, service local time | skew | one definition, UTC event time |
+| Last-hour count at the label event | logged serving values sit one below training values | inclusive-join leakage | strict comparison at the boundary |
+
+- **After the rebuild the offline score drops** toward production, which is the point: the evaluation now
+  measures the model production actually runs.
+
+## Production patterns
+- **Feature definitions as reviewed code.** Use from the first shared feature. Keep feature views in a repo,
+  run `feast apply` (or the managed store's equivalent) from CI, and require a new version for any semantic
+  change. Monitor the fraction of model features with a single definition.
+- **Scheduled incremental materialization.** Use for every online feature view. Run
+  `materialize_incremental` on a cadence shorter than the feature's freshness requirement. Monitor feature
+  freshness at serve time (now minus the served value's event timestamp) and materialization job failures.
+- **Streaming push for second-level freshness.** Use only for features like last-minute counts. Write from the
+  stream processor into both stores (Feast offers a push source for this). Monitor stream lag, because it
+  becomes the feature's staleness.
+- **Served-feature logging and skew checks.** Use for every model in production. Log the feature vector with
+  each prediction asynchronously (sample at high traffic), then join to batch-recomputed values for the same
+  entity and timestamp. Monitor per-feature mismatch rate; a constant offset of one points at the join
+  boundary.
+- **TTL on every feature view.** Use always. Set `ttl` to the longest staleness the model can tolerate, so
+  dormant entities get nulls instead of year-old values. Monitor null rate per feature at training and serve
+  time; a jump means a source stopped producing.
+- **Offline/online metric gap as the headline alert.** Use for every hybrid model. Track the difference
+  between offline evaluation and production metrics per model version; skew or leakage shows up here first.
+
 ## Trade-offs
-- A feature store removes skew and leakage by construction, but it is another platform to run and a new
-  workflow for data scientists; below a handful of models, a shared transformation library plus a
-  careful as-of join in SQL is a reasonable interim.
-- Materializing to an online store gives millisecond lookups but bounds freshness by the materialization
-  cadence; features that must reflect the last few seconds need the streaming path, which costs more
-  to operate.
-- Append-only history makes point-in-time joins possible but grows storage without bound; partition by
-  time and expire beyond the longest TTL any model needs.
-- Managed stores integrate tightly with their platform and reduce operational work, but lock the feature
-  layer to that platform; Feast keeps portability at the cost of assembling the pieces yourself.
-- Logging served features for later training closes the loop on online-only transformations, but adds a
-  write per prediction to a path that was read-only; make it asynchronous and sample when traffic is high.
+- **Skew-proof by construction vs another platform.** A feature store removes skew and leakage by
+  construction, but it is another platform to run and a new workflow for data scientists. Below a handful of
+  models, a shared transformation library plus a careful as-of join in SQL is a reasonable interim.
+- **Millisecond lookups vs bounded freshness.** Materializing to an online store gives millisecond lookups
+  but bounds freshness by the materialization cadence. Features that must reflect the last few seconds need
+  the streaming path, which costs more to operate.
+- **Point-in-time joins vs unbounded storage.** Append-only history makes point-in-time joins possible but
+  grows storage without bound; partition by time and expire beyond the longest TTL any model needs.
+- **Managed integration vs lock-in.** Managed stores integrate tightly with their platform and reduce
+  operational work, but lock the feature layer to that platform; Feast keeps portability at the cost of
+  assembling the pieces yourself.
+- **Closed loop vs write per prediction.** Logging served features closes the loop on online-only
+  transformations, but adds a write per prediction to a read-only path; make it asynchronous and sample when
+  traffic is high.
 
 ## Pitfalls
-- Joining labels to current feature values; the symptom is offline evaluation far better than production,
-  with no bug anywhere in the model code.
-- Two implementations of the same feature for batch and serving; the symptom is a production accuracy
-  drop that disappears when the serving values are logged and compared against the batch ones.
-- Setting no TTL on a feature view; the symptom is a model happily consuming a value computed a year ago
-  for a dormant entity as if it were current.
-- Mixing event time and ingestion time; the symptom is subtle leakage when late-arriving events get
-  stamped with when they were loaded rather than when they happened.
-- Adopting a feature store for an LLM-only application; the symptom is an expensive platform holding
-  document metadata that the ingestion pipeline already handled.
-- Not recording feature view versions in the model's provenance; the symptom is being unable to tell
-  why model v12 and v13 disagree after a feature definition changed.
-- An inclusive as-of join on a feature that counts the label event itself; the symptom is a feature that
-  is suspiciously predictive offline and whose logged serving values sit consistently one below the
-  training values.
+- **Joining labels to current feature values.** Symptom: offline evaluation far better than production, with
+  no bug anywhere in the model code. Fix: point-in-time join.
+- **Two implementations of the same feature for batch and serving.** Symptom: a production accuracy drop that
+  disappears when the serving values are logged and compared against the batch ones. Fix: one definition.
+- **Setting no TTL on a feature view.** Symptom: a model happily consuming a value computed a year ago for a
+  dormant entity as if it were current.
+- **Mixing event time and ingestion time.** Symptom: subtle leakage when late-arriving events get stamped with
+  when they were loaded rather than when they happened.
+- **Adopting a feature store for an LLM-only application.** Symptom: an expensive platform holding document
+  metadata that the ingestion pipeline already handled.
+- **Not recording feature view versions in the model's provenance.** Symptom: being unable to tell why model
+  v12 and v13 disagree after a feature definition changed.
+- **An inclusive as-of join on a feature that counts the label event itself.** Symptom: a feature that is
+  suspiciously predictive offline and whose logged serving values sit consistently one below the training
+  values.
 
 ## When to use
-Reach for a feature store when the system trains and serves more than a couple of classical models that
-share features, when any feature is computed from time-varying history, or when training/serving skew
-has already been observed. Do not reach for it when the only models are LLMs consuming retrieved text;
-there the equivalent discipline lives in ingestion contracts and embedding versioning. Measure: the gap
-between offline and online metrics (skew or leakage shows up here first), feature freshness at serve
-time, and the fraction of features with a single definition. In interviews for hybrid roles, expect to
-explain the point-in-time join and why the online and offline stores must be fed from one definition;
-for LLM-application roles, expect at most to say why you do not need one.
+- **Use when** the system trains and serves more than a couple of classical models that share features, when
+  any feature is computed from time-varying history, or when training/serving skew has already been observed.
+- **Avoid when** the only models are LLMs consuming retrieved text; there the equivalent discipline lives in
+  ingestion contracts and embedding versioning.
+- **Measure:** the gap between offline and online metrics (skew or leakage shows up here first), feature
+  freshness at serve time, and the fraction of features with a single definition.
+- **Interviews:** for hybrid roles, expect to explain the point-in-time join and why the online and offline
+  stores must be fed from one definition; for LLM-application roles, expect at most to say why you do not
+  need one.
 
 ## Role lens
 - **Engineer:** Writes feature views as code, implements the as-of join or uses the store's historical
@@ -235,6 +323,36 @@ inputs it never saw in training. Both are fixed by a single feature definition f
 with history and an online store by materialization, which is what a feature store provides. An LLM
 explanation layer would add cost and would explain decisions made on wrong inputs; it belongs, if at all,
 after the inputs are right.
+
+## Interview questions
+### What is training/serving skew, and how does a feature store prevent it?
+- **Definition:** the model is trained on features computed one way and scored on features computed another,
+  such as refunds counted in batch but not in the service.
+- **Prevention is structural:** one feature view definition executes in the batch engine and in the
+  materializer or stream processor, so there is no second implementation to drift.
+
+### Walk me through building a leakage-free training set for a churn model.
+- **Start from labels** with entity id and label timestamp.
+- **As-of join each feature view:** latest value with event time at or before the label time, within the TTL,
+  null otherwise.
+- **Check the boundary:** decide strict or inclusive comparison to match what serving can know at decision
+  time, and use event time, not ingestion time.
+
+### Would you add a feature store to a pure RAG assistant?
+- **No:** with no classical model to train and serve, there is no skew or point-in-time problem to solve.
+- **Use instead** an ingestion contract for metadata consistency and embedding versioning for transformation
+  versions; a feature store would hold document metadata the ingestion pipeline already handles.
+
+### A new feature looks valuable, but its source is a table that keeps only current state. What do you do?
+- **You cannot backfill it honestly,** because past values were overwritten.
+- **Options:** start logging the feature now and wait for labelled history, or train with the feature null
+  before its launch date; then move the source to append-only events.
+
+### How do you choose a materialization cadence, and what do you monitor?
+- **Cadence follows the freshness the model needs:** hourly or daily for slow features; anything needing the
+  last few seconds goes through the streaming path instead.
+- **Monitor** serve-time freshness, materialization failures, null rates, and the offline-versus-online
+  metric gap per model version.
 
 ## Quiz
 ### Q: What does a point-in-time join guarantee when building a training set?

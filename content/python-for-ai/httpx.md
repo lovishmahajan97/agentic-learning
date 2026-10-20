@@ -5,7 +5,7 @@ name: httpx
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-await
@@ -227,9 +227,9 @@ llm = AsyncOpenAI(http_client=http, timeout=120.0, max_retries=2)   # SDK settin
 ## Pitfalls
 - **Sizing `max_connections` for short calls, then routing long streams through it.** With the same short
   pool timeout, the symptom is bursts of `PoolTimeout` during spikes while the upstream reports normal
-  latency.
+  latency. Fix: a separate client for streams, sized by Little's law.
 - **A new `AsyncClient` per request.** Every call repeats the TLS handshake. Symptom: higher latency plus
-  "too many open files" or ephemeral-port exhaustion under load.
+  "too many open files" or ephemeral-port exhaustion under load. Fix: one shared client per upstream.
 - **Keeping the 5 s default read timeout for LLM calls.** Long prompts or reasoning models delay the first
   byte. Symptom: `ReadTimeout` only on big inputs while small ones succeed.
 - **Assuming the read timeout caps total duration.** A slowly trickling stream runs far past your budget.
@@ -238,6 +238,7 @@ llm = AsyncOpenAI(http_client=http, timeout=120.0, max_retries=2)   # SDK settin
   Symptom: rate-limit errors surfacing straight to users.
 - **Abandoning a `client.send(request, stream=True)` response without `aclose()`.** For example on an
   early `break` or exception, connections leak. Symptom: `PoolTimeout` after a period of normal traffic.
+  Fix: prefer `async with client.stream(...)`, or close in a `finally`.
 
 ## When to use
 - **Use when:** Python code makes HTTP calls in an AI system: direct calls to model servers, tool APIs,

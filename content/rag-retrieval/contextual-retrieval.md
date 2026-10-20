@@ -5,7 +5,7 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/parent-document-retrieval
@@ -194,8 +194,9 @@ for doc, chunks in ((20_000, 50), (40_000, 100), (80_000, 200)):
 #  80000 tokens, 200 chunks: uncached 16,100,000  cached 1,792,000  (9.0x less)
 ```
 
-- **Doubling the document roughly quadruples the cost** (148,000 → 496,000 → 1,792,000), because chunks and
-  document length both double: the "roughly document length squared" growth.
+- **Doubling the document more than triples the cost** (148,000 → 496,000 → 1,792,000, about 3.4× then
+  3.6×), because chunks and document length both double; the ratio approaches 4× as the cached-read term
+  dominates, the "roughly document length squared" growth.
 - **So split long documents into sections** and contextualise each against its section.
 
 ## Production patterns
@@ -308,8 +309,9 @@ baseline.
 - **Uncached:** 50 × (20,000 + 500) ≈ 1,025,000 full-price input tokens.
 - **Cached, using the quoted ratios** (write about 1.25×, read about 0.1×): about 148,000 full-price
   equivalents, roughly 7× less.
-- **Growth:** doubling the document and its chunks roughly quadruples cost (148,000 → 496,000), so split
-  long documents into sections and contextualise against the section.
+- **Growth:** doubling the document and its chunks more than triples cost (148,000 → 496,000, heading
+  toward 4× as reads dominate), so split long documents into sections and contextualise against the
+  section.
 
 ### Your ingestion bill came in close to the uncached estimate even with caching on. Why?
 - **The fan-out raced the cache write:** firing all chunk calls in parallel before the first call wrote

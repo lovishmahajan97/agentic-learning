@@ -5,7 +5,7 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/chunk-overlap
@@ -81,8 +81,8 @@ retrieval and auto-merging retrievers in common frameworks.
   the cost of an LLM pass over the whole corpus at indexing time.
 - **Multi-vector (late interaction):** the finest match unit is the token. ColBERT-style models keep one
   vector per token and score a passage by summing, over query tokens, each one's best match among
-  passage tokens. The return unit stays the passage: decoupling at its limit, paid for with one vector
-  per token instead of one per chunk.
+  passage tokens. The return unit stays the passage: decoupling at its limit, because matching sees fine
+  detail without a separate parent lookup, paid for with one vector per token instead of one per chunk.
 
 ### Making the small unit self-sufficient
 - **"The cap is twelve months of fees" embeds well only if the vector knows *which* cap.**
@@ -195,9 +195,11 @@ print(auto_merge(child_hits, children_of))
 | 500-token passages | 8 | balanced default for mixed question types |
 | 2,000-token sections | 2 | full context; one wrong parent wastes half the budget |
 
-A legal-search team on 1,024-token chunks saw the clause with the liability cap rank fourth. Moving to
-sentence matching with clause-level return put it first, while prompts stayed bounded because parents
-are clauses, not whole contracts.
+- **Applied to a legal-search case (illustrative):** on 1,024-token chunks the clause holding the
+  liability cap ranks fourth, behind chunks about liability in general.
+- **The expected fix:** sentence matching with clause-level return sharpens the match on the cap, while
+  prompts stay bounded because parents are clauses, not whole contracts. Confirm the gain with
+  parent-level recall@k on a golden set rather than assuming it.
 
 ## Production patterns
 - **Parent-document retriever** — when pointed questions rank diluted chunks above the precise one, use

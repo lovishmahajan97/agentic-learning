@@ -5,7 +5,7 @@ name: Zero-shot prompting
 kind: pattern
 difficulty: intro
 est_minutes: 10
-status: reviewed
+status: crisp
 related:
   - prompting/few-shot
   - prompting/chain-of-thought
@@ -23,86 +23,113 @@ sources:
 ---
 
 ## TL;DR
-Zero-shot prompting describes the task in words and includes no demonstrations. It works because
-instruction tuning trained the model on hundreds to thousands of tasks phrased as instructions, so a clearly
-described new task is in distribution even though the model never saw an example of it. It is the
-default starting point: the shortest prompt, no example-induced bias, easiest to maintain. It fails where
-the specification cannot be written down precisely, which is exactly where examples earn their tokens.
+Zero-shot prompting describes the task in words with no demonstrations. Instruction tuning makes a clearly
+described new task in distribution, so it is the default start: shortest prompt, no example bias. It fails
+where the specification cannot be written down precisely.
 
 ## Why it exists
-Before large language models, every task needed its own labelled dataset and its own trained model.
-Pre-trained LMs changed that in two steps. First, in-context learning: a large enough model could pick up
-a task from a few demonstrations in the prompt, with no weight updates. Second, instruction tuning:
-fine-tuning on a broad mix of tasks, each described by a natural-language instruction, produced models
-that could follow instructions for tasks absent from the tuning set. The term is borrowed from classical
-ML, where "zero-shot" meant classifying into categories never seen in training; in prompting it means the
-model gets the description and nothing else.
-
-Why does this matter beyond convenience? Because the description is the whole specification. Whatever
-the instruction leaves open, the model resolves with its prior, the most probable interpretation across
-everyone who ever asked something similar, which is rarely yours. The naive version of zero-shot, "just
-describe it", therefore produces outputs that are plausible, generic and inconsistent across runs. The
-disciplined version treats the instruction as a spec: enumerate the output space, define the labels, fix
-the format, state the edge-case rules. Only when a precise description still fails do you pay for
-demonstrations, and the zero-shot attempt tells you which cases those demonstrations must cover.
+- **Every task used to need its own model.** Before large language models, each task needed its own
+  labelled dataset and trained model. Pre-trained LMs changed that in two steps.
+- **Step 1, in-context learning.** A large enough model could pick up a task from a few demonstrations in
+  the prompt, with no weight updates.
+- **Step 2, instruction tuning.** Fine-tuning on a broad mix of tasks (hundreds to thousands), each
+  described by a natural-language instruction, produced models that follow instructions for tasks absent
+  from the tuning set. The term comes from classical ML, where "zero-shot" meant classifying into
+  categories never seen in training; here the model gets the description and nothing else.
+- **The description is the whole specification.** Whatever it leaves open, the model resolves with its
+  prior, the most probable interpretation across everyone who asked something similar. Naive "just
+  describe it" gives outputs that are plausible, generic and inconsistent across runs.
+- **The disciplined version is a spec.** Enumerate the output space, define the labels, fix the format,
+  state the edge-case rules. Pay for demonstrations only when a precise description still fails; the
+  zero-shot attempt tells you which cases they must cover.
 
 ## How it works
 ### What instruction tuning changed
-A base model estimates P(next token | text). Instruction tuning adds a supervised stage on (instruction,
-input, output) triples spanning many task families with varied phrasings, usually followed by preference
-training. The effect is that an instruction acts as a conditioning signal that selects a behaviour, and
-the ability to generalise to unseen instructions improves with model size and with the number and
-diversity of tuning tasks (the original FLAN study found the benefit only at larger scales; small
-models could even get worse on unseen tasks). That is the mechanism behind zero-shot: your instruction is close enough, in
-the model's representation, to tasks it was tuned on. It also explains the main failure mode: a base
-model without that stage will continue your instruction as text rather than execute it.
+1. **A base model estimates P(next token | text).**
+2. **Instruction tuning adds a supervised stage** on (instruction, input, output) triples spanning many
+   task families with varied phrasings, usually followed by preference training.
+3. **The instruction becomes a conditioning signal** that selects a behaviour. Generalisation to unseen
+   instructions improves with model size and the number and diversity of tuning tasks.
+- **Scale matters.** The original FLAN study found the benefit only at larger scales; small models could
+  even get worse on unseen tasks.
+- **Why it works:** your instruction is close enough, in the model's representation, to tasks it was
+  tuned on.
+- **Main failure mode:** a base model without that stage continues your instruction as text rather than
+  executing it.
 
 ### Anatomy of a zero-shot instruction
 Each clause narrows the distribution and removes a specific class of error:
-1. The task verb and object, stated once: "classify the ticket", "extract every line item".
-2. The input, delimited, so the model can tell data from instruction.
-3. The output space, enumerated: the labels, with a one-line definition each, so the model cannot invent
-   synonyms and so boundary cases are resolved the same way each time.
-4. The format: a schema, tags or a fixed template, so code can parse the response.
-5. Edge rules: what to do when the input is empty, off-topic or fits two labels.
+1. **Task verb and object**, stated once: "classify the ticket", "extract every line item".
+2. **The input, delimited**, so the model can tell data from instruction.
+3. **The output space, enumerated**: the labels with a one-line definition each, so the model cannot invent
+   synonyms and boundary cases resolve the same way each time.
+4. **The format**: a schema, tags or a fixed template, so code can parse the response.
+5. **Edge rules**: what to do when the input is empty, off-topic or fits two labels.
 
 ### Labels are interpreted by their names
-With no demonstrations the model reads each label as a word. "positive" and "negative" carry their own
-meaning; "P1" or "tier_b" do not. Internal codes need definitions or the model will map them by surface
-similarity. The same applies to quantities: "short" is a prior, "under 50 words" is a spec.
+- **Names carry meaning.** With no demonstrations the model reads each label as a word: "positive" and
+  "negative" carry their own meaning; "P1" or "tier_b" do not.
+- **Internal codes need definitions**, or the model maps them by surface similarity.
+- **Quantities too:** "short" is a prior, "under 50 words" is a spec.
 
 ### Closing the output space, and leaving an exit
-A format clause in words lowers the rate of malformed output; a structured-output mode with an enum of
-labels makes membership in the set a guarantee, because decoding cannot emit anything else. That fixes
-the *form* of the answer and nothing about its correctness, and it has a side effect worth knowing:
-with no permitted way to say "none of these", every off-topic or ambiguous input is forced into some
-label. Include an explicit escape label (`other`, `unclear`) with a definition, and track how often it is
-used; a rising rate is an early signal that traffic has drifted away from what the description covers.
+| Mechanism | What it guarantees |
+|---|---|
+| Format clause in words | Lowers the rate of malformed output |
+| Structured-output mode with an enum of labels | Membership in the set, because decoding cannot emit anything else |
+| Neither | Correctness: both fix only the *form* of the answer |
+
+- **Closed sets force a label.** With no permitted way to say "none of these", every off-topic or
+  ambiguous input is forced into some label.
+- **Add an escape label** (`other`, `unclear`) with a definition, and track how often it is used. A rising
+  rate is an early signal that traffic has drifted away from what the description covers.
 
 ### Zero-shot reasoning
-Appending a reasoning trigger such as "think step by step before answering" makes the model emit
-intermediate tokens without any demonstration of reasoning, which helps on multi-step problems. Models
-with built-in reasoning do this on their own; whether the trigger still helps is model-dependent and must
-be measured rather than assumed.
+- **A trigger adds reasoning tokens.** Appending "think step by step before answering" makes the model emit
+  intermediate tokens without any demonstration of reasoning, which helps on multi-step problems.
+- **Reasoning models already do it.** Whether the trigger still helps is model-dependent and must be
+  measured rather than assumed.
 
 ### Sampling and variance
-Zero-shot outputs are samples. Where the API exposes a temperature, lowering it narrows the spread for
-classification; some current model families no longer accept sampling parameters at all and expose an
-effort setting instead. Either way, consistency across repeated runs of the same input is the cheapest
-diagnostic you have: inputs that humans label consistently but the model does not are the ones a
-description has failed to pin down.
+- **Outputs are samples.** Where the API exposes a temperature, lowering it narrows the spread for
+  classification.
+- **Not every API has one.** Some current model families no longer accept sampling parameters at all and
+  expose an effort setting instead.
+- **Run-to-run consistency is the cheapest diagnostic.** Inputs humans label consistently but the model
+  does not are the ones the description has failed to pin down.
 
 ### Where it breaks
-Formatting conventions that are easier to show than to say, subjective boundaries ("urgent"),
-domain-specific style, and tasks with intricate output structure. The symptom is variance that persists
-after the instruction is already precise. At that point more words will not help; demonstrations will.
+- **Hard cases:** formatting conventions easier to show than to say, subjective boundaries ("urgent"),
+  domain-specific style, and intricate output structure.
+- **Symptom:** variance that persists after the instruction is already precise. More words will not help
+  then; demonstrations will.
 
-## Example
-A consistency probe. The instruction enumerates and defines the labels, fixes the format and adds a
-tie-break rule; each ticket is then classified five times. Unanimous and correct means the description is
-adequate for that case; split votes mean an ambiguity the description did not settle; unanimous and wrong
-means your definition disagrees with the model's reading, so fix the definition; `FORMAT_ERROR` means
-the format clause is weak, which structured outputs would make a hard guarantee.
+## Diagram
+Start with a precise description, probe consistency, and let the failure pattern decide the next move:
+fix the definition, add examples, or leave prompting.
+
+```mermaid
+flowchart TD
+    A["Write spec: task, labels, format, edge rules"] --> B["Run each case several times"]
+    B --> C{"Result per case?"}
+    C -->|"unanimous and correct"| D["Description is adequate"]
+    C -->|"unanimous and wrong"| E["Fix the label definition"]
+    C -->|"split votes"| F["Add a rule for the ambiguity"]
+    C -->|"format errors"| G["Structured output with enum"]
+    E --> B
+    F --> B
+    F -->|"still split after rule"| H["Few-shot examples for those cases"]
+    C -->|"knowledge or capability gap"| I["Retrieval or fine-tuning"]
+```
+
+## Examples
+### Consistency probe
+The instruction enumerates and defines the labels, fixes the format and adds a tie-break rule; each ticket
+is then classified five times.
+- **Unanimous and correct:** the description is adequate for that case.
+- **Split votes:** an ambiguity the description did not settle.
+- **Unanimous and wrong:** your definition disagrees with the model's reading, so fix the definition.
+- **`FORMAT_ERROR`:** the format clause is weak, which structured outputs would make a hard guarantee.
 
 ```python
 import anthropic, json, collections
@@ -142,42 +169,101 @@ for ticket, expected in EVAL:
     print(f"{expected:<16} {dict(votes)}{flag}")
 ```
 
+### Closing the label set with a forced tool call
+A production variant: instead of a format clause in words, force a tool call whose input schema has an
+enum, so the label is always one of the set, `other` included as the exit.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5-5"
+LABELS = ["billing", "bug", "feature_request", "other"]
+
+TOOL = {"name": "record_label",
+        "description": "Record the single best label for the support ticket.",
+        "input_schema": {"type": "object",
+                         "properties": {"label": {"type": "string", "enum": LABELS}},
+                         "required": ["label"]}}
+
+def classify(ticket):
+    r = client.messages.create(
+        model=MODEL, max_tokens=256, tools=[TOOL],
+        tool_choice={"type": "tool", "name": "record_label"},     # the model must call it
+        messages=[{"role": "user", "content": f"<ticket>{ticket}</ticket>"}])
+    call = next(b for b in r.content if b.type == "tool_use")
+    return call.input["label"]                                   # still validate against LABELS
+```
+
+- **Form is now near-guaranteed; correctness is not.** Keep the definitions and the consistency probe.
+- **Watch the `other` rate.** A jump from a steady baseline after a launch means new traffic the
+  description does not cover.
+
+### Worked scenario: reading a probe of 40 tickets
+Five samples each, illustrative counts.
+
+| Probe outcome | Tickets | Action |
+|---|---|---|
+| Unanimous and correct | 31 | None: zero-shot is enough |
+| Split votes, all "bug vs feature_request" | 5 | Add one rule: a missing capability is a feature request |
+| Unanimous and wrong (refunds labelled `other`) | 3 | Definition bug: add refunds to billing explicitly |
+| `FORMAT_ERROR` in some samples | 1 | Switch to the forced-tool version |
+
+After the two definition edits, a rerun shows 2 tickets still split. Only those justify few-shot
+examples, chosen from exactly that boundary.
+
+## Production patterns
+- **Zero-shot baseline first.** For every new task, ship the precise zero-shot spec to the eval before
+  writing any example, and record its score. Every later technique (few-shot, CoT, fine-tuning) must beat
+  that number to earn its tokens.
+- **Schema-constrained labels with an exit.** Use the provider's structured-output or forced tool call
+  with an enum that includes `other` or `unclear`, then validate in code. Monitor the escape-label rate per
+  day as a drift alarm.
+- **Consistency sampling in the eval.** Run each eval case several times (for example 5) and report the
+  unanimity rate alongside accuracy. Cases that split are the backlog for rules or examples.
+- **Definitions owned by domain experts.** Keep label names and one-line definitions in a reviewed config
+  file, not buried in prompt prose, so subject-matter experts can change boundaries. Track which
+  definition version each prediction used.
+- **Re-baseline on model change.** Zero-shot prompts port well, but instruction-following quality differs;
+  rerun the baseline before switching models, especially to smaller ones.
+
 ## Trade-offs
-- The shortest prompt and the lowest cost per call, against total reliance on the model's prior; this
-  flips the moment the task's conventions are idiosyncratic to your domain and no description captures
-  them.
-- No demonstration-induced bias (order, label frequency, copied phrasing), against no calibration to your
-  label distribution either; on a skewed distribution the model's own prior for each label decides the
-  hard cases.
-- Easiest to port across models because it contains no model-tuned examples, but the most exposed to
-  differences in instruction-following quality; smaller or older models often need examples where a
-  frontier model does not.
-- Fast iteration on wording, against a hard ceiling: once the description is precise and the eval still
-  fails on consistently labelled cases, more words will not help and examples or fine-tuning will.
+- **Shortest and cheapest vs reliance on the prior.** The lowest cost per call comes with total reliance on
+  the model's prior; this flips the moment the task's conventions are idiosyncratic to your domain and no
+  description captures them.
+- **No demonstration bias vs no calibration.** There is no order, label-frequency or copied-phrasing bias,
+  but no calibration to your label distribution either; on a skewed distribution the model's own prior for
+  each label decides the hard cases.
+- **Portable vs exposed to model quality.** It ports easily because it contains no model-tuned examples,
+  but it is the most exposed to differences in instruction-following; smaller or older models often need
+  examples where a frontier model does not.
+- **Fast iteration vs a hard ceiling.** Once the description is precise and the eval still fails on
+  consistently labelled cases, more words will not help and examples or fine-tuning will.
 
 ## Pitfalls
-- Leaving the label set implicit; the symptom is outputs that are near-synonyms of your labels
-  ("payment" instead of "billing") that break downstream code.
-- Assuming the model knows internal conventions such as ticket priority codes or your date format; the
-  symptom is confident, plausible, wrong formats.
-- Judging a prompt on a single run; the symptom is a prompt that "worked yesterday", because each output
-  is a sample from a distribution.
-- Compensating for ambiguity with ever more rules; the symptom is a forty-rule instruction where three
+- **Leaving the label set implicit.** Symptom: near-synonyms of your labels ("payment" instead of
+  "billing") that break downstream code.
+- **Assuming the model knows internal conventions** such as ticket priority codes or your date format.
+  Symptom: confident, plausible, wrong formats.
+- **Judging a prompt on a single run.** Symptom: a prompt that "worked yesterday", because each output is a
+  sample from a distribution.
+- **Compensating for ambiguity with ever more rules.** Symptom: a forty-rule instruction where three
   demonstrations would have settled the boundary, and rules that now contradict each other.
-- Closing the label set with no escape label; the symptom is off-topic or garbled inputs confidently
-  filed under whichever real label is nearest, inflating that label's counts downstream.
-- Using a base, non-instruction-tuned model zero-shot; the symptom is the model continuing or
-  paraphrasing your instruction instead of executing it.
+- **Closing the label set with no escape label.** Symptom: off-topic or garbled inputs confidently filed
+  under the nearest real label, inflating that label's counts downstream.
+- **Using a base, non-instruction-tuned model zero-shot.** Symptom: the model continues or paraphrases your
+  instruction instead of executing it.
 
 ## When to use
-Start every task zero-shot and make the description precise before doing anything else; the zero-shot
-eval is the baseline every later technique must beat. Stay zero-shot when the task is well described by
-words, when outputs should vary (creative or exploratory tasks), when cost per call matters, or when you
-expect to swap models. Move to few-shot when consistency on the eval plateaus on cases humans label the
-same way, and to retrieval or fine-tuning when the failures are knowledge or capability gaps. Measure
-accuracy or rubric score, format compliance and run-to-run consistency. In interviews, the signal is
-knowing why zero-shot works at all (instruction tuning) and being able to say which failure pattern
-justifies spending tokens on examples.
+- **Start here, always.** Make the description precise before anything else; the zero-shot eval is the
+  baseline every later technique must beat.
+- **Stay zero-shot when** the task is well described by words, outputs should vary (creative or
+  exploratory tasks), cost per call matters, or you expect to swap models.
+- **Move on when** consistency plateaus on cases humans label the same way (few-shot), or failures are
+  knowledge or capability gaps (retrieval or fine-tuning).
+- **Measure:** accuracy or rubric score, format compliance and run-to-run consistency.
+- **Interviews:** know why zero-shot works at all (instruction tuning) and which failure pattern justifies
+  spending tokens on examples.
 
 ## Role lens
 - **Engineer:** Writes the zero-shot spec first, runs the consistency probe, and only adds examples for
@@ -199,6 +285,38 @@ samples per item to separate inconsistency from consistent disagreement. If the 
 and the sarcasm cases are still inconsistent, that is the point where a handful of demonstrations earns
 its place, chosen from exactly those failure types, with balanced labels, and measured against the
 zero-shot baseline rather than assumed to help.
+
+## Interview questions
+### What is zero-shot prompting, and why does it work on tasks the model never saw?
+- **Definition:** the prompt describes the task in words and includes no demonstrations.
+- **Why it works:** instruction tuning trained the model on many tasks phrased as instructions, so a clear
+  description of a new task maps to a behaviour it already learned to select.
+- **Limit:** a base model without that stage continues the instruction as text instead of executing it.
+
+### Your zero-shot classifier returns "payment issue" for some billing tickets. What do you change?
+- **Close the output space.** Enumerate the allowed labels with a one-line definition each, because the
+  model invents synonyms when nothing says the set is closed.
+- **Make it a guarantee.** Use structured output or a forced tool call with an enum, then validate in code.
+- **Add an exit.** Include `other` so ambiguous inputs are not forced into the nearest real label.
+
+### When would you leave zero-shot for few-shot, and when would you not?
+- **Leave it when** the description is already precise and inputs humans agree on still split across runs:
+  the boundary is easier to show than to describe.
+- **Do not leave it when** failures are knowledge gaps (examples cannot add missing facts) or when outputs
+  should be varied, since examples pull outputs toward their phrasing.
+
+### How would you monitor a zero-shot classifier after launch?
+- **Escape-label rate over time.** A rising `other` or `unclear` share signals traffic drifting away from
+  what the description covers.
+- **Format or parse-failure rate**, which should be near zero with schema-constrained output.
+- **Periodic consistency samples:** rerun a slice several times and watch the unanimity rate, plus spot
+  accuracy against fresh human labels.
+
+### Does "think step by step" still help zero-shot on modern models?
+- **It adds intermediate tokens**, giving multi-step problems more sequential computation without any
+  demonstration.
+- **It is model-dependent.** Models with built-in reasoning already do this, so measure the gain on your
+  eval rather than assuming it, and weigh it against the extra output tokens.
 
 ## Quiz
 ### Q: Why can an instruction-tuned model perform a task it never saw during training, given only a description?

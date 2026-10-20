@@ -5,7 +5,7 @@ name: Multi-region architecture
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - reliability/high-availability
   - reliability/disaster-recovery
@@ -23,34 +23,27 @@ sources:
 ---
 
 ## TL;DR
-A multi-region architecture runs a system in two or more geographically separate cloud regions to
-survive a whole-region outage, cut latency for distant users, and satisfy data-residency rules. The
-hard part is not duplicating compute but deciding where each piece of state lives and how it is
-replicated: synchronous replication taxes every write with a cross-region round trip, asynchronous
-replication loses recent writes on failover. Start multi-AZ in one region; go multi-region only for
-a reason you can name.
+Multi-region runs a system in several cloud regions to survive region loss, cut latency and meet
+residency rules. The hard part is state: synchronous replication taxes every write, asynchronous loses
+recent writes. Start multi-AZ; go multi-region for a named reason.
 
 ## Why it exists
-A single region, even spread across availability zones, shares a control plane, a set of regional
-services and a blast radius. Regional incidents are rare but they do happen, they take down every zone
-at once, and the first thing a customer's procurement team asks after one is "what is your multi-region
-story". Redundancy inside the region cannot answer that, because it is correlated failure by design.
-
-Physics is the second reason. Light in fibre travels roughly 200,000 km/s, about 5 ms per 1,000 km one
-way, so a user 6,000 km from your only region pays at least ~60 ms of round trip before any work
-happens, and in practice more after routing. For a chat product whose time-to-first-token budget is a
-few hundred milliseconds, that is a visible slice.
-
-Law is the third. Data-residency obligations require that certain customers' data is stored and
-processed inside a jurisdiction, and for an AI product "processed" includes the prompt sent to the
-model, so the inference endpoint must also be in-region.
-
-AI systems add a fourth, practical reason: model providers publish quotas and model availability per
-region. A second region can double your effective rate limit and give you a place to run when one
-region's capacity for a given model is exhausted. The naive approach, "deploy the same Terraform to
-two regions and put DNS in front", fails the moment two regions both accept writes to the same
-record, or a failover promotes a replica that is seconds behind. Compute is easy to duplicate; truth
-is not.
+- **A region is one blast radius.** Even spread across availability zones, it shares a control plane and
+  regional services. Regional incidents are rare but take down every zone at once, and in-region
+  redundancy cannot help, because it is correlated failure by design. Procurement teams ask "what is
+  your multi-region story" right after one.
+- **Physics.** Light in fibre travels roughly 200,000 km/s, about 5 ms per 1,000 km one way. A user
+  6,000 km from your only region pays at least ~60 ms of round trip before any work, more after routing,
+  a visible slice of a chat product's time-to-first-token budget of a few hundred milliseconds.
+- **Law.** Data-residency obligations require some customers' data to be stored and processed in a
+  jurisdiction. For AI, "processed" includes the prompt sent to the model, so the inference endpoint
+  must be in-region too.
+- **Provider quotas.** Model providers publish quotas and model availability per region. A second region
+  can double your effective rate limit and give you somewhere to run when one region's capacity for a
+  model is exhausted.
+- **"Same Terraform in two regions behind DNS" fails** the moment two regions accept writes to the same
+  record, or a failover promotes a replica that is seconds behind. Compute is easy to duplicate; truth
+  is not.
 
 ## How it works
 ### Three topologies, in rising cost
@@ -66,118 +59,192 @@ is not.
    with conflict resolution. Choose it only for data that is genuinely written from everywhere.
 
 ### State is the whole problem
-A write replicated **synchronously** is durable in both regions before the client gets an
-acknowledgement, so failover loses nothing (RPO ≈ 0), *but* every write now waits a cross-region
-round trip, commonly tens of milliseconds within a continent and ~100 ms or more across an ocean
-(illustrative orders of magnitude). A write replicated **asynchronously** returns immediately, and the
-replica trails by a lag that is usually sub-second but spikes under load; failover during a spike
-loses that window. PACELC names the trade honestly: under a partition you choose availability or
-consistency, and even without one you choose latency or consistency.
+| Replication | When the client gets its ack | Failover loss | Cost |
+|---|---|---|---|
+| **Synchronous** | after the write is durable in both regions | nothing (RPO ≈ 0) | every write waits a cross-region round trip: tens of ms within a continent, ~100 ms or more across an ocean (illustrative orders of magnitude) |
+| **Asynchronous** | immediately | the replica's lag, usually sub-second but spiking under load | failover during a spike loses that window |
 
-For partitioned active-active, the mechanics are: route each request to the tenant's home region;
-replicate asynchronously to the others; on failover, promote the replica, re-home the tenant, and
-accept the lag as lost writes to reconcile later. For shared active-active, conflicts must be resolved
-with per-key ownership, CRDTs for data that merges naturally (counters, sets), or last-writer-wins
-where losing an update is tolerable. Helland's advice still holds: design entities so that each
-transaction touches one entity in one place.
+- **PACELC names the trade honestly:** under a partition you choose availability or consistency, and
+  even without one you choose latency or consistency.
+
+### Mechanics per topology
+- **Partitioned active-active:**
+  1. Route each request to the tenant's home region.
+  2. Replicate asynchronously to the others.
+  3. On failover, promote the replica and re-home the tenant.
+  4. Accept the lag as lost writes to reconcile later.
+- **Shared active-active:** resolve conflicts with per-key ownership, CRDTs for data that merges
+  naturally (counters, sets), or last-writer-wins where losing an update is tolerable.
+- **Helland's advice still holds:** design entities so each transaction touches one entity in one place.
 
 ### Routing and failover
-Latency-based or geo DNS sends users to the nearest healthy region, but DNS answers are cached and
-clients routinely ignore short TTLs, so DNS failover takes minutes. Anycast global load balancers move
-traffic in seconds and are preferred where available. The dangerous moment is the decision itself:
-automatic failover of a *database* on a flaky health signal produces split brain, two primaries both
-accepting writes. Mature teams automate stateless failover and keep data-tier failover behind a
-human-confirmed runbook step or a strict fencing mechanism.
+- **Geo or latency DNS is slow to fail over.** DNS answers are cached and clients routinely ignore short
+  TTLs, so DNS failover takes minutes.
+- **Anycast global load balancers move traffic in seconds** and are preferred where available.
+- **The dangerous moment is the decision.** Automatic database failover on a flaky health signal causes
+  split brain: two primaries both accepting writes.
+- **Mature teams automate stateless failover** and keep data-tier failover behind a human-confirmed
+  runbook step or a strict fencing mechanism.
 
-The failover path must also be **statically stable**: it must work using only what already runs in
-the surviving region. A runbook that needs the failed region's CI/CD system, its secrets manager, a
-DNS or IAM change routed through a control plane hosted there, or a container registry that only
-exists there, fails exactly when it is needed. The same logic favours pre-provisioned capacity over
-"scale up on failover", *because* during a regional event every other customer of that cloud is
-calling the same scaling APIs in the same surviving regions at the same moment.
+### Static stability
+- **The failover path must work using only what already runs in the surviving region.** A runbook that
+  needs the failed region's CI/CD system, its secrets manager, a DNS or IAM change routed through a
+  control plane hosted there, or a registry that only exists there, fails exactly when needed.
+- **Pre-provision capacity rather than "scale up on failover",** *because* during a regional event every
+  other customer of that cloud calls the same scaling APIs in the same surviving regions at once.
 
 ### Capacity is part of the design
-If two regions each run at 70% utilisation and one dies, the survivor needs 140%. Either run each
-region at or below 50% (paying for idle capacity) or plan explicit load shedding on failover:
-which tenants and which workloads keep running. The same arithmetic applies to provider quotas, which
-do not move with your traffic.
+- **Failover moves demand, not capacity.** Two regions at 70% utilisation leave a survivor needing 140%.
+- **Two options:** run each region at or below 50% (paying for idle capacity), or plan explicit load
+  shedding on failover: which tenants and which workloads keep running.
+- **Provider quotas follow the same arithmetic** and do not move with your traffic.
 
 ### What is different for AI systems
-- Model availability and rollout timing vary by region; the same model name may not be live in both
+- **Model availability and rollout timing vary by region;** the same model name may not be live in both
   regions on the same day, so pin versions and test in both.
-- Embeddings must come from the same model and version in every region, or a replicated vector index
-  becomes incoherent. Replicate the index artefact or the source documents plus a rebuild pipeline,
-  and know how long rebuild takes.
-- Prefix caches and KV caches are per-server; a failed-over region starts cold and pays higher
+- **Embeddings must come from the same model and version in every region,** or a replicated vector index
+  becomes incoherent. Replicate the index artefact or the source documents plus a rebuild pipeline, and
+  know how long rebuild takes.
+- **Prefix caches and KV caches are per-server;** a failed-over region starts cold and pays higher
   time-to-first-token until warm.
-- Residency pins both storage and inference: a residency-bound tenant whose home region fails must
+- **Residency pins both storage and inference:** a residency-bound tenant whose home region fails must
   *degrade in place*, not be served from a foreign region.
-- Long-running agent runs in flight die with the region unless their progress is checkpointed in a
-  replicated store, which is why durable execution and multi-region go together.
+- **In-flight agent runs die with the region** unless progress is checkpointed in a replicated store,
+  which is why durable execution and multi-region go together.
 
-## Example
-A worked failover for a two-region, tenant-partitioned agent platform (all numbers illustrative).
+## Diagram
+Partitioned active-active: each tenant's writes go to its home region, replicas trail asynchronously,
+and failover promotes a replica only after a human or fencing confirms the region is gone.
 
-Setup: regions `us-east` and `eu-west`, each with a full stateless tier, a Postgres primary for its
-home tenants and an async replica of the other region's tenants with typical lag under 2 s. Agent
-checkpoints live in the same database. Each region runs at about 40% of capacity. The provider quota
-is 1,000 requests per minute per region, and EU tenants are residency-bound.
+```mermaid
+flowchart TD
+    U["User request"] --> G["Global load balancer"]
+    G -->|"US tenant"| US["us-east stateless tier"]
+    G -->|"EU tenant"| EU["eu-west stateless tier"]
+    US --> PUS[("Primary: US tenants")]
+    EU --> PEU[("Primary: EU tenants")]
+    PUS -.->|"async, lag under 2 s"| RUS[("Replica of US in eu-west")]
+    PEU -.->|"async"| REU[("Replica of EU in us-east")]
+    G -->|"us-east unhealthy"| H{"Region loss confirmed?"}
+    H -->|"yes, fenced"| RUS
+    H -->|"no"| W["Keep primary, investigate checks"]
+```
 
-Incident: `us-east` becomes unreachable. The global load balancer marks it unhealthy after ~60 s of
-failed checks and routes all users to `eu-west`. The on-call engineer confirms the region, not the
-checks, is the problem and runs the promotion step; `eu-west`'s replica of US tenants becomes primary
-at T+6 min. Writes that `us-east` accepted in its last ~2 s before the loss never replicated: the RPO
-for US tenants is about 2 s. Those writes are stranded in `us-east` until it returns; clients that
-hold their idempotency keys can safely resubmit now, and anything else is reconciled from
-`us-east`'s log at failback. Agent runs that were mid-step in `us-east` resume in `eu-west` from their last
-checkpoint, re-executing only the interrupted step.
+## Examples
+### Worked failover: two-region, tenant-partitioned agent platform
+All numbers illustrative.
 
-Capacity: `eu-west` now carries both regions' traffic, 40% + 40% = 80% of one region, so compute
-holds. The provider quota does not: EU's 1,000 rpm must now cover roughly double the demand, so the
-platform sheds batch summarisation jobs first and keeps interactive chat. EU tenants are unaffected
-and remained in-region throughout. Had the failure gone the other way, residency-bound EU tenants
-would have been placed in a read-only degraded mode rather than served from `us-east`.
+**Setup.**
+- Regions `us-east` and `eu-west`, each with a full stateless tier, a Postgres primary for its home
+  tenants and an async replica of the other region's tenants, typical lag under 2 s.
+- Agent checkpoints live in the same database; each region runs at about 40% of capacity.
+- Provider quota is 1,000 requests per minute per region; EU tenants are residency-bound.
 
-Failback: when `us-east` returns, replication is reversed, the reconciliation log is replayed, and
-US tenants are re-homed during a low-traffic window after the replica catches up.
+**Timeline when `us-east` becomes unreachable.**
+
+| Time | Event |
+|---|---|
+| T+~60 s | global load balancer marks `us-east` unhealthy after failed checks and routes all users to `eu-west` |
+| T+few min | on-call confirms the region, not the checks, is the problem and runs the promotion step |
+| T+6 min | `eu-west`'s replica of US tenants becomes primary |
+| after | agent runs mid-step in `us-east` resume in `eu-west` from their last checkpoint, re-executing only the interrupted step |
+
+- **Data loss:** writes `us-east` accepted in its last ~2 s never replicated, so the RPO for US tenants
+  is about 2 s. They stay stranded in `us-east` until it returns; clients holding their idempotency keys
+  can safely resubmit now, and the rest is reconciled from `us-east`'s log at failback.
+- **Compute holds:** `eu-west` carries both regions' traffic, 40% + 40% = 80% of one region.
+- **Quota does not:** EU's 1,000 rpm must cover roughly double the demand, so the platform sheds batch
+  summarisation jobs first and keeps interactive chat.
+- **EU tenants are unaffected** and stayed in-region throughout. Had the failure gone the other way,
+  residency-bound EU tenants would be put in a read-only degraded mode rather than served from `us-east`.
+- **Failback:** when `us-east` returns, replication is reversed, the reconciliation log is replayed, and
+  US tenants are re-homed in a low-traffic window after the replica catches up.
+
+### Failover capacity and data-loss calculator
+A pre-incident check you can run in a design review: does the survivor hold, what must be shed, and how
+many writes a given lag puts at risk. Inputs are illustrative.
+
+```python
+def failover_check(utils, demand_rpm, quota_rpm, failed, writes_per_s, lag_s):
+    survivor_util = sum(utils.values())                 # survivor absorbs all load
+    total_demand = sum(demand_rpm.values())
+    survivor = next(r for r in utils if r != failed)
+    shed_rpm = max(0, total_demand - quota_rpm[survivor])
+    at_risk = writes_per_s[failed] * lag_s              # unreplicated writes in the lag window
+    return survivor_util, shed_rpm, at_risk
+
+utils = {"us-east": 0.40, "eu-west": 0.40}
+demand = {"us-east": 900, "eu-west": 900}
+quota = {"us-east": 1000, "eu-west": 1000}
+print(failover_check(utils, demand, quota, "us-east", {"us-east": 50, "eu-west": 40}, lag_s=2))
+# (0.8, 800, 100): compute fits at 80%, shed 800 rpm of batch work, ~100 writes to reconcile
+
+utils = {"us-east": 0.70, "eu-west": 0.70}
+print(failover_check(utils, demand, quota, "us-east", {"us-east": 50, "eu-west": 40}, lag_s=2)[0])
+# 1.4: the survivor would need 140% of its capacity, so shed load or run regions at 50% or less
+```
+
+- **Use the lag tail, not the mean,** for `lag_s`: the p99 lag during peak is your real RPO.
+
+## Production patterns
+- **Home-region routing table.** Store each tenant's home region in a small replicated config and route
+  at the edge on it; re-homing is a data change, not a deploy. Monitor requests served outside their
+  home region, which should be zero outside a failover.
+- **Region-tagged idempotency keys.** Include the originating region in idempotency keys so writes
+  replayed after failover deduplicate against the reconciliation log. Monitor duplicates rejected during
+  failback.
+- **Human-confirmed data-tier promotion.** Automate stateless traffic shifting at the global load
+  balancer, but put database promotion behind a runbook step with fencing of the old primary. Monitor
+  time from alert to promotion in every drill.
+- **Statically stable failover kit.** Keep CI/CD runners, secrets, container images and model access
+  already provisioned in every region; test by cutting the source region off, not by draining it
+  politely. Monitor runbook steps that depend on another region.
+- **Replication lag as a distribution.** Alert on p99 replica lag per store (database, vector index,
+  prompt registry, flags), because the tail is the data you lose. Track it alongside survivor
+  utilisation and per-region provider quota headroom.
 
 ## Trade-offs
-- Region loss survival and lower latency for distant users, paid for with duplicated infrastructure and
-  idle headroom; it stops paying off when all users and regulators sit in one geography.
-- Synchronous replication gives zero data loss but taxes every write with a cross-region round trip;
-  flip to asynchronous when write latency is user-visible and a few seconds of loss is survivable.
-- Partitioned active-active avoids write conflicts but makes cross-tenant features (global search,
-  shared workspaces) hard; shared active-active enables them at the price of conflict resolution.
-- Automatic failover shortens outages but risks split brain on false positives; manual data-tier
-  promotion is slower and safer, and becomes the better choice as the data's value rises.
-- A second region doubles provider quota and model-availability options, yet model and prompt
-  behaviour must now be validated in two places, doubling the eval and rollout work.
+- **Survival and latency vs cost.** Region loss survival and lower latency for distant users are paid for
+  with duplicated infrastructure and idle headroom; it stops paying off when all users and regulators sit
+  in one geography.
+- **Synchronous vs asynchronous replication.** Synchronous gives zero data loss but taxes every write
+  with a cross-region round trip; flip to asynchronous when write latency is user-visible and a few
+  seconds of loss is survivable.
+- **Partitioned vs shared active-active.** Partitioned avoids write conflicts but makes cross-tenant
+  features (global search, shared workspaces) hard; shared enables them at the price of conflict
+  resolution.
+- **Automatic vs manual failover.** Automatic shortens outages but risks split brain on false positives;
+  manual data-tier promotion is slower and safer, and becomes the better choice as the data's value rises.
+- **More quota vs more validation.** A second region doubles provider quota and model-availability
+  options, yet model and prompt behaviour must be validated in two places, doubling eval and rollout work.
 
 ## Pitfalls
-- A standby region that was never failed over to: expired credentials, missing secrets, a model not
-  enabled in that region. The symptom is discovering it during the real incident.
-- Replicating the database but not the vector index, prompt registry or feature flags, so the
-  failed-over region answers from stale or empty retrieval and behaves differently.
-- Assuming DNS TTLs are honoured; traffic keeps arriving at the dead region for minutes after
+- **A standby region never failed over to.** Expired credentials, missing secrets, a model not enabled in
+  that region; the symptom is discovering it during the real incident.
+- **Replicating the database but not the rest.** Without the vector index, prompt registry or feature
+  flags, the failed-over region answers from stale or empty retrieval and behaves differently.
+- **Assuming DNS TTLs are honoured.** Traffic keeps arriving at the dead region for minutes after
   "failover" and users see errors you believe are impossible.
-- Treating replication lag as zero: dashboards show success, but customers report lost messages or
+- **Treating replication lag as zero.** Dashboards show success, but customers report lost messages or
   duplicated agent actions from the seconds before failover.
-- Sizing each region for its own load; after failover the survivor overloads and a regional outage
+- **Sizing each region for its own load.** After failover the survivor overloads and a regional outage
   becomes a global one, visible as a second wave of errors minutes after the first.
-- A failover procedure with a hidden dependency on the failed region (its CI/CD runner, secrets store
-  or registry); drills that only fail over while the source region is healthy never reveal it, so the
+- **A failover procedure with a hidden dependency on the failed region.** Its CI/CD runner, secrets store
+  or registry; drills that only fail over while the source region is healthy never reveal it, so the
   symptom is a runbook step that hangs during the real event.
 
 ## When to use
-Go multi-region when you can name the driver: a contractual requirement to survive region loss, a
-latency budget that one region cannot meet for a material user base, a residency rule, or provider
-quota you cannot obtain in one region. Otherwise multi-AZ plus a tested disaster-recovery plan is
-cheaper and usually adequate. If you do go, start with partitioned active-active and asynchronous
-replication, and reserve synchronous or globally consistent stores for the few records that truly
-need them. Measure replication lag (as a distribution, since its tail is your real RPO), failover time
-and survivor utilisation, and rehearse failover on a schedule, ideally by cutting the source region
-off rather than politely draining it. In interviews, the signal of depth is talking about where writes are owned and what is
-lost on failover, not about load balancers.
+- **Use when you can name the driver:** a contractual requirement to survive region loss, a latency
+  budget one region cannot meet for a material user base, a residency rule, or provider quota you cannot
+  obtain in one region.
+- **Avoid otherwise:** multi-AZ plus a tested disaster-recovery plan is cheaper and usually adequate.
+- **Start with** partitioned active-active and asynchronous replication; reserve synchronous or globally
+  consistent stores for the few records that truly need them.
+- **Measure:** replication lag as a distribution (its tail is your real RPO), failover time and survivor
+  utilisation. Rehearse failover on a schedule, ideally by cutting the source region off rather than
+  politely draining it.
+- **Interviews:** depth shows in talking about where writes are owned and what is lost on failover, not
+  about load balancers.
 
 ## Role lens
 - **Engineer:** Makes every service region-aware (home-region routing, region-tagged idempotency keys,
@@ -201,6 +268,37 @@ asynchronously with sub-second lag, publish the measured RPO, and make the clien
 few seconds of lost writes can be replayed. Partition tenants by home region to avoid write conflicts,
 pin residency-bound tenants to degrade in place, and rehearse the failover so the numbers are measured
 rather than promised.
+
+## Interview questions
+### Why is multi-AZ not enough for some products, and why is multi-region not the default?
+- **Multi-AZ shares a region's control plane and services,** so a regional incident takes every zone down
+  together; it cannot answer a contractual region-loss requirement.
+- **Multi-region is not the default** because it duplicates infrastructure, needs idle headroom and forces
+  hard state decisions. Use it for a named driver: region-loss survival, latency, residency or quota.
+
+### Design a two-region setup for a stateful agent platform. Where do writes go?
+- **Partition by tenant:** each tenant has one home region that owns its writes, so there are no
+  cross-region write conflicts.
+- **Replicate asynchronously** to the other region, checkpoint agent runs in the replicated store, and
+  make clients idempotent so lost-window writes can be replayed.
+- **Pin residency-bound tenants** so they degrade in place rather than fail over abroad.
+
+### Should database failover across regions be automatic?
+- **Usually not fully.** A false-positive health signal can promote the replica while the old primary
+  still writes, producing split brain.
+- **Automate stateless traffic shifting** in seconds, and gate data-tier promotion on human confirmation
+  or strict fencing; the slower path is worth it as data value rises.
+
+### After a regional failover the surviving region fell over too. What happened and how do you prevent it?
+- **Likely capacity:** at 70% each, the survivor needed 140%; or provider quota could not cover doubled
+  demand.
+- **Prevent it** by running regions at or below 50%, or with a pre-agreed shedding plan (batch jobs first),
+  pre-provisioned rather than scale-on-failover capacity, and quota headroom per region.
+
+### Your replica lag is usually 200 ms. What RPO do you promise?
+- **Not 200 ms.** Lag spikes under load, and failover tends to happen under stress, so the tail matters.
+- **Measure lag as a distribution** at peak and publish the p99 or worse as the RPO, then rehearse failover
+  to confirm it.
 
 ## Quiz
 ### Q: In a partitioned active-active design, why does each tenant have a single home region for writes?

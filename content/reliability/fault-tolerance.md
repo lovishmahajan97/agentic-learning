@@ -5,7 +5,7 @@ name: Fault tolerance
 kind: concept
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - reliability/high-availability
   - reliability/circuit-breakers
@@ -23,61 +23,61 @@ sources:
 ---
 
 ## TL;DR
-Fault tolerance is a system's ability to keep delivering correct, or explicitly degraded, service while
-some of its components are failing. It combines redundancy with mechanisms that contain a fault before
-it becomes a user-visible failure: timeouts, bounded retries, idempotency, circuit breakers, bulkheads,
-fallbacks and replicated state. The design question is never "how do we avoid faults" but "which faults
-do we tolerate, how do we detect them, and what does the system do in the window before recovery".
+Fault tolerance keeps a system delivering correct, or explicitly degraded, service while components
+fail, using timeouts, bounded retries, idempotency, breakers, bulkheads, fallbacks and replicated state.
+The question is which faults you tolerate, how you detect them, and what happens before recovery.
 
 ## Why it exists
-Components fail at rates that cannot be engineered away. A fleet of 1,000 disks with a 1% annual
-failure rate loses about ten a year; a service making 10 million remote calls a day at a 0.01% failure
-rate sees a thousand failures daily. Distributed systems add a failure mode local code never has: a
-remote call can be lost on the way out, lost on the way back, or merely slow, and the caller cannot
-tell which. Jim Gray's analysis of Tandem outages found software and operations, not hardware, were the
-dominant causes, which is why "buy better hardware" never solved the problem.
-
-The naive alternative is `try: call() except: call()`. It fails in three ways. It retries faults that
-retrying cannot fix (bad input, auth errors), it duplicates side effects when the first call actually
-succeeded but the reply was lost, and under a real outage it multiplies load on the thing that is
-already struggling, turning a partial failure into a total one. Retries without timeouts, budgets and
-idempotency are not fault tolerance; they are fault amplification.
-
-Agentic AI systems make this urgent. A 20-step agent whose steps each succeed 99% of the time finishes
-cleanly only 0.99²⁰ ≈ 82% of the time. Most of the 18% are transient: a 429 from the provider, a tool
-timeout, a malformed JSON response. Converting those into successes, without double-charging a card or
-sending an email twice, is precisely the fault-tolerance toolkit applied to LLM calls and tools.
+- **Components fail at rates you cannot engineer away.** A fleet of 1,000 disks with a 1% annual failure
+  rate loses about ten a year; 10 million remote calls a day at a 0.01% failure rate is a thousand
+  failures daily.
+- **Remote calls fail ambiguously.** A request can be lost on the way out, lost on the way back, or merely
+  slow, and the caller cannot tell which. Local code never has this failure mode.
+- **Better hardware never solved it.** Jim Gray's analysis of Tandem outages found software and
+  operations, not hardware, were the dominant causes.
+- **The naive `try: call() except: call()` amplifies faults.** It retries what retrying cannot fix (bad
+  input, auth errors), duplicates side effects when the first call succeeded but the reply was lost, and
+  multiplies load on a struggling dependency, turning a partial failure into a total one.
+- **Agents make it urgent.** A 20-step agent at 99% per step finishes cleanly only 0.99²⁰ ≈ 82% of the
+  time. Most of the 18% are transient (a 429, a tool timeout, malformed JSON) and are recoverable without
+  double-charging a card or sending an email twice.
 
 ## How it works
 ### Vocabulary that keeps designs honest
-Avižienis et al. separate **fault** (the underlying defect: a bug, a dead NIC, a provider incident),
-**error** (the incorrect internal state it produces: a timed-out call, a null field) and **failure**
-(the service no longer doing what it promised, as seen by users). Fault tolerance is the set of
-mechanisms that stop the chain between error and failure. Naming which link you are breaking is the
-difference between a design and a hope.
+Avižienis et al. separate three links in a chain:
+
+| Term | Meaning | Example |
+|---|---|---|
+| **Fault** | the underlying defect | a bug, a dead NIC, a provider incident |
+| **Error** | the incorrect internal state it produces | a timed-out call, a null field |
+| **Failure** | the service no longer doing what it promised, as users see it | a wrong or missing answer |
+
+- **Fault tolerance stops the chain between error and failure.** Naming which link you are breaking is
+  the difference between a design and a hope.
 
 ### Choose the fault model first
-You tolerate what you design for. **Crash-stop**: a node dies and stays dead. **Crash-recovery**: it
-comes back with or without its state, so you must handle duplicate work. **Omission and timing**: a
-message or reply is lost or late, which is why every remote call needs a timeout, because "slow" is
-indistinguishable from "dead" from the outside. **Byzantine** (arbitrary): a component returns
-well-formed but wrong output, or different answers to different callers. Classic systems rarely
-engineer against Byzantine faults because masking them is expensive: Byzantine agreement needs
-3f + 1 replicas to tolerate f faulty ones, against 2f + 1 for crash faults. An LLM returning a
-confident, schema-valid, wrong tool argument is not malicious, so strictly it is a value fault, but it
-has the Byzantine property that matters: nothing about the reply looks broken. That is why output
-validation against ground truth and approval gates belong in the same toolbox as retries.
+You tolerate what you design for.
+- **Crash-stop:** a node dies and stays dead.
+- **Crash-recovery:** it comes back with or without its state, so you must handle duplicate work.
+- **Omission and timing:** a message or reply is lost or late. Every remote call needs a timeout,
+  because "slow" is indistinguishable from "dead" from the outside.
+- **Byzantine (arbitrary):** a component returns well-formed but wrong output, or different answers to
+  different callers. Classic systems rarely engineer against it because masking is expensive: Byzantine
+  agreement needs 3f + 1 replicas to tolerate f faulty ones, against 2f + 1 for crash faults.
+- **LLM value faults look Byzantine.** A confident, schema-valid, wrong tool argument is not malicious,
+  so strictly it is a value fault, but nothing about the reply looks broken. That is why output
+  validation against ground truth and approval gates belong next to retries.
 
 ### Masking versus recovery
-There are two ways to stop an error becoming a failure. **Masking** hides it entirely: a replica
-answers instead, or several components vote and the majority wins (N-modular redundancy; for LLMs,
-sampling several answers and taking the consensus is the same idea, and it only helps when the
-samples' errors are independent). **Recovery** lets the error happen and then repairs state, in one of
-two directions. *Backward* recovery returns to a known-good earlier state and redoes the work:
-checkpoint and restart, transaction rollback, replaying a workflow from its history. *Forward*
-recovery moves to a new correct state without undoing: a compensating action (refund the charge,
-retract the email), or a degraded answer. Side effects in the outside world usually cannot be rolled
-back, which is why agent tools that act on real systems need forward recovery designed in.
+- **Masking hides the error entirely.** A replica answers instead, or several components vote and the
+  majority wins (N-modular redundancy). Sampling several LLM answers and taking the consensus is the same
+  idea, and it only helps when the samples' errors are independent.
+- **Backward recovery** returns to a known-good earlier state and redoes the work: checkpoint and
+  restart, transaction rollback, replaying a workflow from its history.
+- **Forward recovery** moves to a new correct state without undoing: a compensating action (refund the
+  charge, retract the email) or a degraded answer.
+- **Real-world side effects usually cannot be rolled back,** so agent tools that act on real systems
+  need forward recovery designed in.
 
 ### The toolbox, in the order you apply it
 1. **Timeouts**, *because* a hung call holds a thread, a connection and often a GPU slot; nothing else
@@ -85,8 +85,8 @@ back, which is why agent tools that act on real systems need forward recovery de
    per hop in isolation.
 2. **Bounded retries with backoff and jitter**, *because* transient faults (429, 503, connection reset)
    usually clear within seconds, and jitter prevents every client from retrying in lockstep. Retry only
-   transient classes, cap attempts, and give retries a budget (the SRE book's rule of thumb: retries
-   should be a small fraction, around 10%, of total requests) so an outage cannot double your load.
+   transient classes, cap attempts, and give retries a budget (SRE book rule of thumb: around 10% of
+   total requests) so an outage cannot double your load.
 3. **Idempotency**, *because* retries are only safe if a repeated operation has the same effect as one.
    A pure completion call is naturally idempotent apart from billing; a tool that sends money is not,
    and needs an idempotency key the receiver deduplicates on.
@@ -101,24 +101,48 @@ back, which is why agent tools that act on real systems need forward recovery de
    quorum writes and leader election keep the truth alive when a node holding it dies.
 
 ### Fail-fast, fail-safe, fail-operational
-A fail-fast component reports an error immediately rather than hanging, which protects callers'
-budgets. A fail-safe system moves to a safe state on fault, such as an agent refusing to act when its
-policy check is unavailable. A fail-operational system continues full service through the fault
-through redundancy. Most AI features should be fail-fast internally and fail-safe at action boundaries.
+| Style | Behaviour on fault | Protects |
+|---|---|---|
+| **Fail-fast** | reports an error immediately rather than hanging | callers' latency budgets |
+| **Fail-safe** | moves to a safe state, e.g. an agent refusing to act when its policy check is unavailable | users and the outside world |
+| **Fail-operational** | continues full service through redundancy | availability |
+
+- **Default for AI features:** fail-fast internally and fail-safe at action boundaries.
 
 ### Detection and its own failure mode
-Heartbeats, health checks and error-rate thresholds detect faults, but every detector has false
-positives. Declaring a slow primary dead and promoting a replica while the old one is still writing
-produces split brain. Fencing tokens or a single arbiter prevent two nodes from both believing they
-lead. Detection thresholds are therefore a trade between failover speed and the risk of acting on a
-wrong diagnosis.
+- **Every detector has false positives.** Heartbeats, health checks and error-rate thresholds detect
+  faults, but can be wrong.
+- **A wrong diagnosis causes split brain.** Declaring a slow primary dead and promoting a replica while
+  the old one is still writing leaves two writers.
+- **Fencing tokens or a single arbiter** prevent two nodes from both believing they lead.
+- **So thresholds trade failover speed** against the risk of acting on a wrong diagnosis.
 
-## Example
+## Diagram
+A fault is contained at each layer before it can become a user-visible failure; the dotted path is the
+degraded answer.
+
+```mermaid
+flowchart TD
+    R["Request"] --> T["Deadline and per-attempt timeout"]
+    T --> C["Call dependency"]
+    C -->|"success"| OK["Correct answer"]
+    C -->|"error"| K{"Transient class?"}
+    K -->|"no: bad input, auth"| E["Fail fast with typed error"]
+    K -->|"yes: 408, 429, 5xx"| B{"Attempts and budget left?"}
+    B -->|"yes"| J["Jittered backoff or Retry-After"]
+    J --> C
+    B -->|"no"| F["Fallback: smaller model or cache"]
+    F -.->|"tagged as degraded"| D["Degraded answer"]
+```
+
+## Examples
+### A tolerant provider call
 A provider call wrapped in tools 1, 2 and 6 from the list: an overall deadline, per-attempt timeout,
 retries only on transient statuses, full-jitter backoff that honours `Retry-After`, and a fallback that
-degrades instead of failing. It assumes the call itself has no side effects, so repeating it is safe
-(tool 3 satisfied by construction); the breaker and bulkhead (4 and 5) sit around this function, not
-inside it.
+degrades instead of failing.
+
+It assumes the call itself has no side effects, so repeating it is safe (tool 3 satisfied by
+construction); the breaker and bulkhead (4 and 5) sit around this function, not inside it.
 
 ```python
 import random, time
@@ -150,55 +174,89 @@ def tolerant_complete(primary, fallback, req, *, budget_s=45, attempt_timeout_s=
     return fallback(req, timeout_s=remaining)          # smaller model, cached answer, or a typed "unavailable"
 ```
 
-Why three attempts and not ten? If transient failures are independent at 5% per call, one attempt
-succeeds 95% of the time, two 99.75%, three 1 − 0.05³ ≈ 99.99%; a fourth adds almost nothing. That
-arithmetic only holds while failures are independent. During a real provider outage they are
-perfectly correlated, every attempt fails, and the loop's only effect is to triple the load on the
-provider and spend the user's budget, which is why the deadline, the breaker around this function and
-the fallback matter more than the attempt count.
+- **Why three attempts, not ten?** With independent transient failures at 5% per call, one attempt
+  succeeds 95% of the time, two 99.75%, three 1 − 0.05³ ≈ 99.99%; a fourth adds almost nothing.
+- **That arithmetic only holds while failures are independent.** In a real provider outage they are
+  perfectly correlated, every attempt fails, and the loop only triples the load on the provider and spends
+  the user's budget. The deadline, the breaker around this function and the fallback matter more.
+- **Tag the fallback result** (a header or a field) so the UI and metrics know the answer came from the
+  degraded path, and export the retry count to see a provider wobble before it becomes an outage.
+- **For side-effecting tool calls,** add an idempotency key to `req` before the first attempt, never
+  inside the loop.
 
-In production the `fallback` result should be tagged (a header or a field) so the UI and your metrics
-know the answer came from the degraded path, and the retry count should be exported so you can see a
-provider wobble before it becomes an outage. For tool calls with side effects, add an idempotency key
-to `req` before the first attempt, never inside the loop.
+### Worked scenario: nested retries during an outage
+Three layers each retry "a few times" with no shared budget: the SDK (3 attempts), the service (3) and
+the browser client (3). The provider starts failing every call.
+
+| Layer | Attempts per call from above | Calls reaching the provider per user action |
+|---|---|---|
+| Client | 3 | 3 |
+| Service | 3 per client attempt | 9 |
+| SDK | 3 per service attempt | 27 |
+
+- **One user action becomes 27 provider calls,** so request volume spikes several-fold exactly when the
+  provider is weakest.
+- **Fix:** retry at one layer only (usually the one closest to the dependency), disable SDK retries or
+  pass a shared deadline down, and cap retries with a budget of around 10% of requests.
+
+## Production patterns
+- **One shared client wrapper.** Every team imports the same provider and tool client that applies the
+  deadline, transient-only retries with full jitter and `Retry-After` handling. Monitor attempts per
+  request and retry ratio per dependency.
+- **Retry budget, not just a retry count.** Track retries as a fraction of requests over a short window
+  and stop retrying when it passes about 10%, so an outage cannot double load. Monitor the budget
+  exhaustion rate as an early outage signal.
+- **Idempotency key minted before the first attempt.** Generate one key per intended action (for example
+  a UUID stored with the agent step) and send it on every attempt; the receiver stores it with a unique
+  constraint and returns the first result on repeats. Monitor duplicate-rejected counts.
+- **Read-after-timeout for side-effecting tools.** Classify a timeout on a write as "unknown outcome" and
+  query the target system for the key before retrying. Monitor the share of timeouts that turned out to
+  have succeeded.
+- **Labelled degradation ladder.** Define per operation: primary model, smaller model, cached answer,
+  typed "unavailable", and tag responses with which rung served them. Monitor fallback share and run
+  chaos tests that force each rung.
 
 ## Trade-offs
-- Retries raise success rates for transient faults but add load exactly when the dependency is weakest;
-  the balance flips to "stop retrying" once the error rate suggests a real outage, which is the breaker's job.
-- Redundant replicas tolerate crash faults but cost double and introduce consistency problems; for
-  rarely used or cheap-to-recompute state, a fast restore beats a live replica.
-- Fail-safe defaults protect users when a policy or guard service is down, but they turn a guard outage
-  into a feature outage; fail-open is acceptable only for guards whose absence is low-risk.
-- Tight timeouts free resources quickly but cut off legitimately slow responses such as long generations;
-  the right value comes from the latency distribution, and streaming changes what "timeout" should mean.
-- Fallback models keep the product available but change answer quality and behaviour; if customers
-  depend on consistency, the fallback must be labelled and measured separately in evals.
-- Masking by voting (several replicas or several sampled LLM answers) hides value faults but multiplies
-  cost and latency by N; it pays only when errors are independent and a wrong answer is expensive, and
-  it buys nothing when every sample shares the same misleading context.
+- **Retries vs load.** Retries raise success rates for transient faults but add load exactly when the
+  dependency is weakest; the balance flips to "stop retrying" once the error rate suggests a real outage,
+  which is the breaker's job.
+- **Replicas vs restore.** Redundant replicas tolerate crash faults but cost double and add consistency
+  problems; for rarely used or cheap-to-recompute state, a fast restore beats a live replica.
+- **Fail-safe vs feature availability.** Fail-safe defaults protect users when a policy or guard service
+  is down, but turn a guard outage into a feature outage; fail-open is acceptable only for guards whose
+  absence is low-risk.
+- **Tight vs loose timeouts.** Tight timeouts free resources quickly but cut off legitimately slow
+  responses such as long generations; the value comes from the latency distribution, and streaming
+  changes what "timeout" should mean.
+- **Fallback models vs consistency.** They keep the product available but change answer quality and
+  behaviour; if customers depend on consistency, label the fallback and measure it separately in evals.
+- **Voting vs cost.** Masking by voting (several replicas or several sampled LLM answers) hides value
+  faults but multiplies cost and latency by N; it pays only when errors are independent and a wrong
+  answer is expensive, and buys nothing when every sample shares the same misleading context.
 
 ## Pitfalls
-- Retrying non-idempotent tool calls after a timeout: the first call succeeded, the reply was lost, and
-  the symptom is duplicate emails, tickets or charges that correlate with provider latency spikes.
-- Nested retries across layers (SDK retries × service retries × client retries) that multiply into tens
+- **Retrying non-idempotent tool calls after a timeout.** The first call succeeded and the reply was
+  lost; the symptom is duplicate emails, tickets or charges that correlate with provider latency spikes.
+- **Nested retries across layers.** SDK retries × service retries × client retries multiply into tens
   of attempts per user action; visible as request volume spiking several-fold during an incident.
-- Timeouts that add up: five sequential hops each with a 30 s timeout cannot meet a 30 s end-to-end
+- **Timeouts that add up.** Five sequential hops each with a 30 s timeout cannot meet a 30 s end-to-end
   promise, so users see failures even though every hop "met its timeout".
-- Treating any exception as transient, so bad prompts or revoked API keys are retried for minutes;
-  the symptom is latency without errors in logs until the budget finally expires.
-- Fallbacks that were never exercised: the secondary provider's key expired or its tool schema drifted,
-  discovered only during the primary's outage. Chaos tests exist for this.
+- **Treating any exception as transient.** Bad prompts or revoked API keys are retried for minutes; the
+  symptom is latency without errors in logs until the budget finally expires.
+- **Fallbacks that were never exercised.** The secondary provider's key expired or its tool schema
+  drifted, discovered only during the primary's outage. Chaos tests exist for this.
 
 ## When to use
-Every remote call needs the first three tools (timeout, bounded jittered retry on transient classes,
-idempotency for anything with side effects); that is baseline, not a design choice. Add breakers and
-bulkheads when a dependency's failure can starve shared resources, and define a fallback for every
-user-facing operation where "nothing" is worse than "something degraded". Do not add fault tolerance
-you cannot observe: export attempt counts, breaker state and fallback usage, or you will not know the
-system is quietly running on its backup path. In day-to-day work it shows up as the client wrapper
-everyone imports and the FMEA row that says what happens when each dependency fails. In interviews,
-the expected depth is explaining why retries need budgets and idempotency, and walking a fault from
-detection to degraded response.
+- **Baseline for every remote call:** timeout, bounded jittered retry on transient classes, and
+  idempotency for anything with side effects. That is not a design choice.
+- **Add breakers and bulkheads** when a dependency's failure can starve shared resources.
+- **Define a fallback** for every user-facing operation where "nothing" is worse than "something degraded".
+- **Do not add tolerance you cannot observe.** Export attempt counts, breaker state and fallback usage,
+  or you will not know the system is quietly running on its backup path.
+- **Day to day:** the client wrapper everyone imports and the FMEA row saying what happens when each
+  dependency fails.
+- **Interviews:** explain why retries need budgets and idempotency, and walk a fault from detection to
+  degraded response.
 
 ## Role lens
 - **Engineer:** Owns the shared provider and tool client: deadlines, jittered retries on transient
@@ -221,6 +279,35 @@ side-effecting tools as "unknown outcome" and reconcile (read-after-timeout) rat
 retry. The 30 s timeout should be derived from the ERP's actual latency distribution so it does not
 trip on normal slow paths. Finally, an approval gate or a daily reconciliation report catches the
 cases that still slip through, and the duplicate rate becomes a tracked metric.
+
+## Interview questions
+### What is the difference between a fault, an error and a failure, and why does it matter?
+- **Fault** is the defect (a bug, a dead NIC), **error** the bad internal state it causes (a timed-out
+  call), **failure** the user-visible broken promise.
+- **It matters because** each mechanism breaks a specific link: a retry turns an error back into success,
+  a fallback stops an error becoming a failure. Naming the link keeps the design honest.
+
+### Why is a plain retry loop dangerous, and what makes retries safe?
+- **Danger:** it retries unfixable errors, duplicates side effects when only the reply was lost, and
+  multiplies load during an outage.
+- **Safe retries need:** transient-only classification, capped attempts with jittered backoff, a shared
+  deadline, a retry budget, and idempotency for anything with side effects.
+
+### During a provider incident your request volume to it tripled. How do you find and fix the cause?
+- **Look for nested retries:** compare user actions to provider calls per layer; 3 × 3 × 3 gives 27.
+- **Fix:** retry in one layer only, propagate a deadline, add a retry budget, and put a circuit breaker
+  around the dependency so it fails fast once errors persist.
+
+### When would you choose fail-safe over fail-open for a guard service?
+- **Fail-safe** (block the action) when the guard protects money, data or safety: an agent should refuse
+  to act when its policy check is down.
+- **Fail-open** only when the guard's absence is low-risk, because fail-safe turns a guard outage into a
+  feature outage.
+
+### How many retries would you configure for a call with a 5% transient failure rate?
+- **About three:** success goes 95%, 99.75%, then about 99.99%; a fourth adds almost nothing.
+- **Caveat:** that assumes independent failures. In a real outage they are correlated, so the deadline,
+  breaker and fallback matter more than the count.
 
 ## Quiz
 ### Q: Why must retries be combined with idempotency rather than used alone?

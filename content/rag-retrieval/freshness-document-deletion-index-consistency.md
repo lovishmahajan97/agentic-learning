@@ -5,7 +5,7 @@ name: Freshness, document deletion and index consistency
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/embedding-pipelines
   - rag-retrieval/metadata-filtering
@@ -301,7 +301,8 @@ The lesson: the slowest term owns the lag, so measure each term before tuning th
 - **Treating a replacement as unrelated to what it supersedes.** Symptom: answers alternate between old and
   new policy depending on phrasing, both cited as current. Fix: `superseded_by` metadata and a default filter.
 - **Confusing chunk-level `indexed_at` with document-level `modified_at` in recency filters.** Symptom: a
-  re-indexed old document is treated as "new" by date-sorted retrieval.
+  re-indexed old document is treated as "new" by date-sorted retrieval. Fix: store the source's
+  `modified_at` or `effective_from` on every chunk and sort or decay on that.
 
 ## When to use
 Every production index needs a freshness tier, a deletion contract and a reconciliation loop; what changes

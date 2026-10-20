@@ -20,9 +20,9 @@ sources:
 ---
 
 ## TL;DR
-Server-Sent Events is a one-way text streaming format in a normal `text/event-stream` HTTP response:
-`field: value` lines, blank line between events. Typed events and resumable ids make it the default for
-LLM token streams.
+Server-Sent Events is one-way text streaming in a normal `text/event-stream` HTTP response: `field: value`
+lines, a blank line ending each event. Typed events, plus browsers reconnecting with `Last-Event-ID`, make
+it the default for LLM token streams.
 
 ## Why it exists
 - **Bytes are not messages.** `StreamingResponse` gets bytes out early, but a chat client must tell a
@@ -251,7 +251,7 @@ one tool call.
 | Setup | What happens at t = 60 s | Outcome |
 |---|---|---|
 | No keepalive | proxy sees no bytes, closes the stream | client reconnects; without a buffer, a second billed run |
-| `: ping` every 15 s | idle timer reset four times before t = 60 s | stream survives the tool call |
+| `: ping` every 15 s | idle timer last reset at t = 45 s, so it never reaches 60 s | stream survives the tool call |
 | Ping + per-run buffer | drop on mobile instead, reconnect with `Last-Event-ID: 42` | events 43+ replayed, no second run |
 
 ## Production patterns
@@ -356,13 +356,13 @@ rather than inside the request's generator, and the response generator becomes a
 - **Otherwise stay on SSE,** because it avoids sticky stateful connections and upgrade-aware
   infrastructure.
 
-### A user reports a second charge after their phone dropped mid-answer. What went wrong in the design?
-- **The reconnect restarted generation.** `EventSource` reconnects automatically, but without a per-run
-  buffer the server treats the new GET as a fresh run.
-- **Or a finished run was never closed.** Closing the response without a `done` event makes the browser
-  reconnect every few seconds.
-- **Fix:** run generation in a worker, buffer events by run id with a TTL, replay after `Last-Event-ID`,
-  and answer reconnects for completed runs with 204.
+### A per-run replay buffer sounds expensive. How big does it get, and how do you bound it?
+- **Do the arithmetic first.** Illustratively, a 2,000-token answer sent as one event per token at about
+  60 bytes per event is roughly 120 KB per run, so 1,000 runs buffered at once is about 120 MB of Redis.
+- **Bound it by time.** `EXPIRE` each run's list a few minutes after `done`, because a reconnect only
+  ever needs the tail of a live or just-finished run, not history.
+- **Shrink the event count if needed.** Coalesce token deltas into small time batches (tens of
+  milliseconds) before buffering, which users do not notice, and monitor Redis memory and replay length.
 
 ## Quiz
 ### Q: What does a line beginning with a colon mean in an SSE stream?

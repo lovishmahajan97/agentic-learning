@@ -5,7 +5,7 @@ name: Labeling sessions
 kind: practice
 difficulty: intro
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - customer-data-evaluation/golden-dataset-creation-with-client-smes
   - customer-data-evaluation/sme-review-and-annotation-guidelines
@@ -16,40 +16,41 @@ related:
 ---
 
 ## TL;DR
-A labeling session is a scheduled, facilitated block where a customer's SMEs label eval data together:
-a short calibration, independent labelling, then structured discussion of disagreements whose outcomes
-are written into the guideline. Sessions exist because asynchronous "please label when you can" requests
-to busy experts stall, and because tacit rules surface only when experts explain disagreements live. The
-facilitator's job is throughput and decisions, while protecting label independence.
+A scheduled, facilitated block where customer SMEs calibrate, label independently, then resolve
+disagreements into written guideline rules. Async requests to busy experts stall, and tacit rules surface
+only live. The facilitator drives throughput and decisions while protecting label independence.
 
 ## Why it exists
-SMEs are the bottleneck of every customer evaluation. They are senior, booked, and labelling is not their
-job. The default approach, sharing a spreadsheet or a labelling-tool link with a deadline, produces a
-predictable curve: a burst of labels on day one, then a long tail, with the hardest items skipped
-because nobody is there to answer "what do you mean by this category?" Weeks pass, and the eval set the
-pilot depends on is half done and labelled by whoever had time.
-
-Asynchronous labelling also loses the most valuable output of expert labelling, which is not the labels
-themselves but the rules they reveal. When two adjusters disagree on a claim and explain why in the same
-room, you learn the unwritten exception that decides it, and you can write it down while the policy
-owner is present. In async mode that disagreement shows up weeks later as two numbers in a column.
-
-Finally, sessions create accountability that a link cannot: a recurring calendar slot with a sponsor's
-backing is a commitment the customer's managers can plan around. The naive alternative, a single long
-workshop, fails too, because fatigue degrades label quality after an hour or two, and a single session
-leaves no room to fix the guideline between rounds.
+- **SMEs are the bottleneck of every customer evaluation.** They are senior, booked, and labelling is not
+  their job.
+- **Async links stall on a predictable curve.** A shared spreadsheet or tool link with a deadline gets a
+  burst of labels on day one, then a long tail, with the hardest items skipped because nobody is there to
+  answer "what do you mean by this category?" Weeks pass, and the eval set is half done and labelled by
+  whoever had time.
+- **Async loses the most valuable output: the rules.** When two adjusters disagree on a claim and explain
+  why in the same room, you learn the unwritten exception and write it down while the policy owner is
+  present. Async, that disagreement shows up weeks later as two numbers in a column.
+- **Sessions create accountability a link cannot.** A recurring calendar slot with a sponsor's backing is
+  a commitment the customer's managers can plan around.
+- **One long workshop fails too,** because fatigue degrades label quality after an hour or two, and a
+  single session leaves no room to fix the guideline between rounds.
 
 ## How it works
 ### Before the session
-1. **Prepare the batch.** Select items from the sampled pool and size it from capacity, not ambition.
-   Label capacity is reviewers × labelling minutes ÷ minutes per label; every reviewer also labels the
-   gold checks, and a double-label fraction d costs d extra labels per item, so
-   `items ≈ (capacity − reviewers × gold_checks) / (1 + d)`. Measure minutes per label in the first
-   session rather than guessing, and shuffle strata through the batch so fatigue late in the session does
-   not fall on one segment. Include a few previously adjudicated "gold check" items to detect drift in
-   individual reviewers.
-2. **Pre-load the tool.** Whatever the tool (Label Studio, Argilla, the customer's own platform or a
-   controlled spreadsheet), it must open on the item, show the guideline beside it and capture label,
+1. **Prepare the batch: size it from capacity, not ambition.**
+
+   ```
+   capacity (labels) = reviewers × labelling minutes ÷ minutes per label
+   every reviewer also labels the gold checks
+   a double-label fraction d costs d extra labels per item
+   ```
+
+   So `items ≈ (capacity − reviewers × gold_checks) / (1 + d)`.
+   - **Measure minutes per label in the first session** rather than guessing.
+   - **Shuffle strata through the batch,** so fatigue late in the session does not fall on one segment.
+   - **Include a few previously adjudicated "gold check" items** to detect drift in individual reviewers.
+2. **Pre-load the tool.** Whatever it is (Label Studio, Argilla, the customer's own platform or a
+   controlled spreadsheet), it must open on the item, show the guideline beside it, and capture label,
    rationale and reviewer. Fiddling with access during the session wastes the scarcest time.
 3. **Clear access.** Confirm every SME can open the data in the environment governance allows, the day
    before, not at minute one.
@@ -57,89 +58,144 @@ leaves no room to fix the guideline between rounds.
 
 ### During the session
 1. **Warm-up calibration (10–15 minutes).** Everyone labels the same handful of items silently, then
-   reveals. This re-anchors reviewers to the guideline *because* standards drift between sessions.
+   reveals. This re-anchors reviewers to the guideline, because standards drift between sessions.
 2. **Independent labelling (the bulk).** Reviewers work alone on assigned items, with a fraction
-   double-assigned for agreement. No discussion yet, *because* talking first turns the loudest opinion
-   into the label.
-3. **Disagreement review.** The facilitator shows double-labelled items where reviewers split, asks each
-   to explain, and drives to one of three outcomes: a guideline clarification, an escalation to the
-   policy owner, or "genuinely ambiguous" (flagged and excluded from scoring).
-4. **Decision log.** Each outcome is written into the guideline changelog on the spot, with the item IDs
-   it affects, so relabelling can be targeted later.
+   double-assigned for agreement. No discussion yet, because talking first turns the loudest opinion into
+   the label.
+3. **Disagreement review.** The facilitator shows double-labelled items where reviewers split, asks each to
+   explain, and drives to one of three outcomes:
+   - a guideline clarification;
+   - an escalation to the policy owner;
+   - "genuinely ambiguous" (flagged and excluded from scoring).
+4. **Decision log.** Each outcome goes into the guideline changelog on the spot, with the item IDs it
+   affects, so relabelling can be targeted later.
 
 ### After the session
-Adjudicate remaining splits, relabel items affected by guideline changes, recompute agreement, and send
-the sponsor a short note: items labelled, agreement, decisions made, open questions. That note is what
-keeps the next session on the calendar. Read one session's agreement with care: on 30 doubles, 80%
-agreement carries roughly ±14 points (√(0.8·0.2/30) ≈ 0.073), so a drop from 83% to 77% between
-sessions is noise. Track agreement pooled over a rolling window of sessions, and per reviewer pair,
-before concluding that a guideline or a reviewer has drifted. The same logic applies to gold checks:
-one miss in three is weak evidence on its own and becomes a signal only when it repeats.
+- **Close the loop:** adjudicate remaining splits, relabel items affected by guideline changes, recompute
+  agreement.
+- **Send the sponsor a short note:** items labelled, agreement, decisions made, open questions. That note
+  is what keeps the next session on the calendar.
+- **Read one session's agreement with care.** On 30 doubles, 80% agreement carries roughly ±14 points
+  (√(0.8·0.2/30) ≈ 0.073), so a drop from 83% to 77% between sessions is noise.
+- **Pool before concluding drift:** track agreement over a rolling window of sessions, and per reviewer
+  pair, before concluding a guideline or a reviewer has drifted.
+- **Same logic for gold checks:** one miss in three is weak evidence on its own and becomes a signal only
+  when it repeats.
 
 ### Facilitation choices
-Keep sessions to about 60–90 minutes, *because* label quality decays with fatigue. Have an engineer
-present to answer "what is the system actually seeing?" questions. Do not show model outputs as
-pre-labels in calibration batches; pre-labels anchor reviewers, and if you use them later to save time,
-measure how often reviewers change them.
+- **Keep sessions to about 60–90 minutes,** because label quality decays with fatigue.
+- **Have an engineer present** to answer "what is the system actually seeing?" questions.
+- **No model pre-labels in calibration batches,** because pre-labels anchor reviewers; if you use them later
+  to save time, measure how often reviewers change them.
 
-## Example
-A 90-minute weekly session for a contract-review pilot with three in-house lawyers (all timings and rates
-illustrative).
+## Diagram
+One session in order: the silent calibration and independent labelling protect independence, and only
+afterwards do splits become logged decisions that feed the next session.
 
-**Prep:** 120 clause-extraction outputs are loaded, 30 of them assigned to two lawyers each, plus 3 gold
-check items from last week's adjudication. Access was tested the previous afternoon; one lawyer's
-account lacked permission and was fixed then.
+```mermaid
+flowchart TD
+    P["Prep: batch, gold checks, access tested"] --> C["Silent calibration, then reveal"]
+    C --> I["Independent labelling, some doubled"]
+    I --> D{"Doubles that split"}
+    D -->|"guideline unclear"| G["Clarify guideline"]
+    D -->|"policy gap"| E["Escalate to policy owner"]
+    D -->|"truly ambiguous"| X["Flag, exclude from scoring"]
+    G --> L["Decision log with item IDs"]
+    E --> L
+    X --> L
+    L --> N["Sponsor note and relabel queue"]
+    N -.->|"next week"| P
+```
 
-**0–15 min, calibration:** all three label 5 clauses silently. On one, a limitation-of-liability clause
-with a carve-out for confidentiality breaches, two mark "cap correctly extracted" and one marks "fail,
-carve-out omitted". The guideline did not say whether carve-outs are part of the cap. The general counsel
-(present for this slot) rules that carve-outs must be extracted, and the facilitator adds rule L4 and an
-example.
+## Examples
+### Batch sizing and how much one session's agreement tells you
+Plug in last session's measured minutes per label; the interval shows why single-session agreement is noisy.
 
-**15–65 min, independent labelling:** last week's session measured a little under a minute per label,
-so capacity is 3 lawyers × 50 minutes ≈ 159 labels. Taking off 3 gold checks per lawyer leaves 150,
-and with a 25% double-label fraction that is 150 / 1.25 = 120 items: 90 labelled once and 30 labelled
-twice. Each lawyer completes about 53 labels, with no slack, which is why the batch was not padded.
+```python
+import math
 
-**65–85 min, disagreement review:** 6 of the 30 double-labelled items split. Four trace to the meaning of
-"auto-renewal" when notice periods differ; this becomes an escalation for the general counsel, due before
-next week. Two are slips by the same lawyer, who also missed one of the three gold-check items; any one of those
-signals alone would be weak, but together they justify a second look at that lawyer's batch.
+def batch_size(reviewers, minutes, min_per_label, gold_checks, d):
+    """items = (capacity - reviewers * gold_checks) / (1 + d), capacity in labels."""
+    capacity = reviewers * minutes / min_per_label
+    return math.floor((capacity - reviewers * gold_checks) / (1 + d))
 
-**85–90 min, wrap:** the facilitator reads back two decisions and one open question. The follow-up note
-reports 120 items labelled, 24 of 30 doubles in agreement (80%, a wide interval at this size, so it
-is reported next to the four-week pooled figure), rule L4 added, 9 earlier items flagged for relabel
-under L4.
+def agreement_halfwidth(p, n_doubles, z=1.96):
+    return z * math.sqrt(p * (1 - p) / n_doubles)
+
+items = batch_size(reviewers=3, minutes=50, min_per_label=0.943, gold_checks=3, d=0.25)
+print(items, round(items * 0.25))                 # 120 items, 30 of them double-labelled
+print(round(agreement_halfwidth(0.8, 30), 3))     # 0.143: one session, about +/-14 points
+print(round(agreement_halfwidth(0.8, 120), 3))    # 0.072: four sessions pooled, about +/-7
+print(round(1 - 0.9 ** 3, 2))                     # 0.27: a 90%-accurate reviewer misses >=1 of 3 gold checks
+```
+
+### Worked session: contract-review pilot (timings and rates illustrative)
+A 90-minute weekly session with three in-house lawyers.
+
+**Prep:** 120 clause-extraction outputs loaded, 30 of them assigned to two lawyers each, plus 3 gold check
+items from last week's adjudication. Access was tested the previous afternoon; one lawyer's account lacked
+permission and was fixed then.
+
+| Slot | What happens | Outcome |
+|---|---|---|
+| 0–15 min, calibration | All three label 5 clauses silently. On a limitation-of-liability clause with a carve-out for confidentiality breaches, two mark "cap correctly extracted", one marks "fail, carve-out omitted" | The guideline was silent on carve-outs; the general counsel (present for this slot) rules they must be extracted; rule L4 and an example added |
+| 15–65 min, independent labelling | Last week measured a little under a minute per label: 3 lawyers × 50 minutes ≈ 159 labels; minus 3 gold checks per lawyer leaves 150; at a 25% double-label fraction, 150 / 1.25 = 120 items | 90 labelled once, 30 twice; each lawyer completes about 53 labels with no slack, which is why the batch was not padded |
+| 65–85 min, disagreement review | 6 of the 30 doubles split | Four trace to "auto-renewal" when notice periods differ: escalated to the general counsel, due before next week. Two are slips by one lawyer, who also missed one of the three gold checks |
+| 85–90 min, wrap | Facilitator reads back two decisions and one open question | Follow-up note sent |
+
+- **The slips:** any one of those signals alone would be weak, but together they justify a second look at
+  that lawyer's batch.
+- **The note reports:** 120 items labelled, 24 of 30 doubles in agreement (80%, a wide interval at this
+  size, so it is reported next to the four-week pooled figure), rule L4 added, 9 earlier items flagged for
+  relabel under L4.
+
+## Production patterns
+- **Sponsor-owned recurring slot.** Have the business sponsor send a weekly 60–90 minute series to the
+  SMEs, so it reads as their manager's priority rather than a vendor request. Monitor attendance and items
+  labelled per session, and raise a drop with the sponsor the same week.
+- **Pre-flight access check.** The day before, each SME opens one test item in the tool inside the allowed
+  environment and confirms it with the facilitator. Monitor minutes lost to access or tooling in each
+  session; the target is zero.
+- **Rotating gold checks.** Draw about three adjudicated items per reviewer per session from a pool, so
+  nobody sees the same check twice in a row. Track per-reviewer gold accuracy over a rolling window, and
+  act on repeated misses rather than single ones.
+- **Decision log that generates relabel work.** Each changelog entry records the rule id, date, deciding
+  person and affected item IDs, and the tool or a script turns it into a relabel queue. Monitor open
+  relabel items and decisions that are still waiting on an escalation.
+- **Pooled agreement report.** After each session, publish agreement for that session and pooled over the
+  last four, per reviewer pair, and for the first versus second half of the session. Shorten sessions when
+  the second half is consistently worse.
 
 ## Trade-offs
-- Live sessions get decisions and throughput, but demand synchronous calendars; when SMEs are across
-  time zones, run async labelling with a short live disagreement review instead.
-- Having the policy owner attend resolves splits immediately, but their presence can make reviewers defer
-  to them; have them join only for the disagreement segment.
-- Pre-labelling with model outputs can raise throughput substantially, but anchors reviewers toward the model; use it
-  only after calibration, and track the change rate to detect rubber-stamping.
-- Longer sessions label more per calendar booking, but quality drops with fatigue; when gold-check
+- **Live sessions vs calendars.** They get decisions and throughput but demand synchronous time; when SMEs
+  are across time zones, run async labelling with a short live disagreement review instead.
+- **Policy owner in the room vs deference.** Splits resolve immediately, but reviewers may defer to them;
+  have them join only for the disagreement segment.
+- **Pre-labelling vs anchoring.** Model outputs as pre-labels can raise throughput substantially, but anchor
+  reviewers toward the model; use them only after calibration, and track the change rate to detect
+  rubber-stamping.
+- **Longer sessions vs fatigue.** More labels per calendar booking, but quality drops; when gold-check
   accuracy falls in the second half, shorten the session.
 
 ## Pitfalls
-- Spending the first twenty minutes on access and tool problems; the symptom is a session that labels a
-  third of its planned batch and a sponsor questioning the time.
-- Discussing items before reviewers commit labels; the symptom is near-perfect agreement in session that
-  is not reproduced when the same reviewers label alone.
-- Making decisions without writing them down; the symptom is the same disagreement being debated again
-  two sessions later.
-- Not sending a summary to the sponsor; the symptom is SMEs being pulled into other work and sessions
+- **Spending the first twenty minutes on access and tool problems.** Symptom: the session labels a third of
+  its planned batch and the sponsor questions the time.
+- **Discussing items before reviewers commit labels.** Symptom: near-perfect agreement in session that is
+  not reproduced when the same reviewers label alone.
+- **Making decisions without writing them down.** Symptom: the same disagreement is debated again two
+  sessions later.
+- **Not sending a summary to the sponsor.** Symptom: SMEs get pulled into other work and sessions are
   quietly cancelled.
-- Ignoring gold-check items; the symptom is one reviewer's labels drifting for weeks unnoticed and
-  dragging down agreement.
+- **Ignoring gold-check items.** Symptom: one reviewer's labels drift for weeks unnoticed and drag down agreement.
 
 ## When to use
-Run labeling sessions whenever SME labels are on the critical path of a pilot: building the golden set,
-calibrating an LLM judge, or reviewing a new failure category. A weekly recurring slot is usually better
-than an occasional workshop because it allows guideline fixes between rounds. Pure async labelling is
-fine for stable, well-calibrated tasks with high agreement. Measure items per session, agreement on
-doubles, gold-check accuracy, unsure rate and decisions logged. In interviews, describe how you keep
-labels independent while still extracting rules from disagreement.
+- **Use when** SME labels are on the critical path of a pilot: building the golden set, calibrating an LLM
+  judge, or reviewing a new failure category.
+- **Prefer a weekly recurring slot** over an occasional workshop, because it allows guideline fixes
+  between rounds.
+- **Pure async labelling is fine** for stable, well-calibrated tasks with high agreement.
+- **Measure** items per session, agreement on doubles, gold-check accuracy, unsure rate and decisions logged.
+- **Interviews:** describe how you keep labels independent while still extracting rules from disagreement.
 
 ## Role lens
 - **Engineer:** Prepares batches, gold checks and double assignments, makes sure the tool captures
@@ -160,6 +216,40 @@ I would check gold-check accuracy per reviewer to find an individual drifting, l
 sections are cited in recent disagreements to find uncovered cases, and compare agreement in the first
 versus second half of sessions for fatigue. Fixes would be a longer warm-up calibration, guideline
 sections plus examples for the new case types, and shorter sessions if quality decays late.
+
+## Interview questions
+### Why run facilitated labelling sessions instead of sending SMEs a labelling link?
+- **Throughput:** async requests to busy experts produce a day-one burst and a long tail, with the hardest
+  items skipped because nobody can answer questions.
+- **Rules:** disagreements explained live reveal unwritten exceptions that can be decided while the policy
+  owner is present; async, they arrive weeks later as two numbers in a column.
+- **Commitment:** a sponsor-backed recurring slot is something managers plan around.
+
+### How do you size the batch for a 90-minute session with three SMEs?
+- **Capacity first:** reviewers × labelling minutes ÷ measured minutes per label, leaving time for
+  calibration and disagreement review (about 50 labelling minutes in a 90-minute slot).
+- **Subtract gold checks and divide by 1 + d:** with three reviewers, 3 gold checks each and d = 0.25,
+  about 159 labels become 120 items.
+- **Do not pad:** an overfilled batch leaves the hardest items unlabelled at the end.
+
+### One reviewer missed one of three gold checks this week. What do you do?
+- **Treat it as weak evidence:** even a 90%-accurate reviewer misses at least one of three about 27% of the time.
+- **Look for a second signal:** repeated misses over a rolling window, or slips on double-labelled items in
+  the same session.
+- **If signals agree,** review that reviewer's batch and recalibrate together on the items concerned,
+  rather than discarding their labels wholesale.
+
+### How do you extract rules from disagreements without destroying label independence?
+- **Order matters:** silent calibration and independent labelling come first, and labels are committed
+  before any discussion.
+- **Discuss only the splits afterwards,** asking each reviewer to explain, and log the outcome against item IDs.
+- **Relabel from the log,** so the rule changes later labels without anyone editing their original
+  judgement in the moment.
+
+### When would you not run live sessions?
+- **Stable, well-calibrated tasks** with high agreement can go async, because there are few new rules to surface.
+- **SMEs across time zones:** label async, then hold a short live disagreement review.
+- **Very small batches** may not justify a slot, but keep the decision log and agreement checks either way.
 
 ## Quiz
 ### Q: Why start each labeling session with a short silent calibration on shared items?

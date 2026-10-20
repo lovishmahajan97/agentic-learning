@@ -5,7 +5,7 @@ name: Model integration
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/ai-gateway
   - system-design/model-selection
@@ -18,80 +18,106 @@ related:
 ---
 
 ## TL;DR
-Model integration is the work of putting a different model behind a delivered system: a new provider,
-a fine-tuned adapter, or the model a customer mandates (their own cloud deployment or an on-prem open-
-weight model). A model is not a drop-in part: prompts, tool-call formats, tokenizers, context limits,
-error semantics and quotas all differ. So integration means a normalising adapter, a capability check,
-re-tuned prompts, and the customer's eval suite as the gate before traffic moves.
+Putting a different model behind a delivered system: a new provider, fine-tuned adapter or
+customer-mandated model. Models are not drop-in parts, so it takes an adapter, a capability check,
+re-tuned prompts and the customer's eval suite as the gate.
 
 ## Why it exists
-In customer work the model is often not your choice. A bank requires inference inside its own cloud
-tenancy, so you must use the models its cloud offers. A defence customer is air-gapped, so it is an
-open-weight model on its GPUs. Another customer has already negotiated an enterprise agreement with a
-different provider. And your own fine-tuning pipeline produces a new adapter every few months. Each
-time, the same application has to run on a model it was not built against.
-
-The naive approach is to change the endpoint and model name in config and run a smoke test. It fails in
-ways a smoke test does not catch. The prompt was tuned against the old model's habits, so instructions
-the old model followed reliably are now followed loosely. Tool calls come back in a different structure,
-or the model emits arguments as a JSON string instead of an object. The new tokenizer counts the same
-text as more tokens, so a context budget that fit now truncates retrieved documents. A self-hosted
-model served with the wrong chat template produces outputs that look plausible but are measurably worse,
-with no error anywhere. A "max tokens" parameter means something different. Rate-limit errors carry a
-different status code, so the retry logic treats them as fatal.
-
-None of these crash in a smoke test; they show up as quality loss on the customer's traffic weeks later.
-Integration has to make differences explicit and measure their effect.
+- **In customer work the model is often not your choice.** A bank requires inference inside its own cloud
+  tenancy, so you use the models its cloud offers. An air-gapped defence customer means an open-weight
+  model on its GPUs. Another customer already has an enterprise agreement with a different provider. Your
+  own fine-tuning pipeline ships a new adapter every few months.
+- **The same application must run on a model it was not built against.** Prompts, tool-call formats,
+  tokenizers, context limits, error semantics and quotas all differ.
+- **"Change the endpoint and model name, run a smoke test" fails silently.** Instructions the old model
+  followed reliably are followed loosely; tool calls arrive in a different structure, or arguments as a
+  JSON string instead of an object; a new tokenizer counts more tokens, so retrieved documents get
+  truncated.
+- **More silent breaks.** A self-hosted model with the wrong chat template looks plausible but is
+  measurably worse, with no error anywhere. A "max tokens" parameter means something different.
+  Rate-limit errors carry a different status code, so retry logic treats them as fatal.
+- **None of these crash a smoke test.** They show up as quality loss on the customer's traffic weeks
+  later, so integration has to make differences explicit and measure their effect.
 
 ## How it works
 ### 1. Normalise behind an adapter
-The application talks to one internal interface: messages in; text, tool calls, usage, finish reason
-and a typed error out. Each provider or serving stack gets an adapter that maps to and from it. Because
-the application depends on the interface, not the vendor SDK, swapping models changes one adapter and a
-config entry instead of every call site. Gateways and libraries (an AI gateway, LiteLLM and similar)
-give you much of this mapping, but you still own the contract and its tests.
+- **One internal interface:** messages in; text, tool calls, usage, finish reason and a typed error out.
+- **One adapter per provider or serving stack** maps to and from it.
+- **Why:** the application depends on the interface, not the vendor SDK, so swapping models changes one
+  adapter and a config entry instead of every call site.
+- **Gateways help but do not own the contract.** An AI gateway, LiteLLM and similar give you much of the
+  mapping, but you still own the contract and its tests.
 
 ### 2. Declare capabilities, check them at startup
-Models differ in context window, maximum output, tool calling, parallel tool calls, schema-constrained
-output, vision input and streaming events. Record these per model in a capability entry and have the
-application check what it needs when it loads its config, so "this deployment needs strict JSON schema
-and the configured model does not support it" fails at deploy time rather than in production.
+- **Models differ in** context window, maximum output, tool calling, parallel tool calls,
+  schema-constrained output, vision input and streaming events.
+- **Record these per model in a capability entry** and check what the application needs when it loads
+  config.
+- **So the failure moves to deploy time:** "this deployment needs strict JSON schema and the configured
+  model does not support it" fails at deploy, not in production.
 
 ### 3. Recompute budgets with the right tokenizer
-Context budgeting (how many retrieved chunks fit, when to compact history) must use the target model's
-tokenizer or token-counting endpoint. The same text can tokenize to noticeably different counts across
-model families, and that difference is the whole safety margin.
+- **Use the target model's tokenizer or token-counting endpoint** for context budgeting: how many
+  retrieved chunks fit, when to compact history.
+- **Why:** the same text can tokenize to noticeably different counts across model families, and that
+  difference is the whole safety margin.
 
 ### 4. Get the serving details right for self-hosted models
-Use the model's own chat template (from its tokenizer config), the correct stop tokens and the
-recommended sampling defaults. Template mismatches degrade quality silently, so a template unit test that
-renders a known conversation and compares it with the expected string is worth having.
+- **Use the model's own chat template** (from its tokenizer config), the correct stop tokens and the
+  recommended sampling defaults.
+- **Template mismatches degrade quality silently**, so keep a template unit test that renders a known
+  conversation and compares it with the expected string.
 
 ### 5. Port the prompts, do not copy them
-Treat prompts as model-specific artifacts, versioned per model in the prompt registry. Run the
-customer's regression suite, read the failures, adjust instructions and examples, and repeat. Expect
-format and refusal behaviour to need the most work.
+1. **Treat prompts as model-specific artifacts**, versioned per model in the prompt registry.
+2. **Run the customer's regression suite** and read the failures.
+3. **Adjust instructions and examples**, and repeat.
+- **Expect format and refusal behaviour** to need the most work.
 
 ### 6. Map errors and quotas
-Translate each provider's errors into your own taxonomy (rate limited, overloaded, context too long,
-content filtered, invalid request, auth) so retries, fallbacks and alerts behave the same on every model.
-Size concurrency to the customer's quota on their deployment, which is often lower than yours. Map
-parameters, not just responses: an output limit can be required on one API and optional on another,
-and on reasoning models it may also have to cover hidden reasoning tokens, so a limit copied from a
-non-reasoning model can truncate answers.
+- **Translate errors into your own taxonomy:** rate limited, overloaded, context too long, content
+  filtered, invalid request, auth. Then retries, fallbacks and alerts behave the same on every model.
+- **Size concurrency to the customer's quota** on their deployment, which is often lower than yours.
+- **Map parameters, not just responses.** An output limit can be required on one API and optional on
+  another. On reasoning models it may also have to cover hidden reasoning tokens, so a limit copied from a
+  non-reasoning model can truncate answers.
 
 ### 7. Pin versions and gate the switch
-Configure an exact model version or snapshot, not a moving alias, so the model cannot change under you.
-Then: adapter contract tests, the customer's regression suite, shadow mode on their traffic, and a
-per-tenant routing switch with the old model as fallback. Register what was deployed (model id, version,
-adapter, prompt version) so incidents can be traced to a specific combination.
+1. **Configure an exact model version or snapshot**, not a moving alias, so the model cannot change under
+   you.
+2. **Adapter contract tests.**
+3. **The customer's regression suite.**
+4. **Shadow mode on their traffic.**
+5. **A per-tenant routing switch** with the old model as fallback.
+6. **Register what was deployed** (model id, version, adapter, prompt version) so incidents can be traced
+   to a specific combination.
 
-A **fallback model is an integrated model too**. If the router fails over from the primary to a second
-model during an outage, that second model needs its own capability entry, ported prompt and suite run.
-Failing over to an unported model turns an availability incident into a quality incident that is harder
-to see.
+### Fallback models are integrations too
+- **If the router fails over** from the primary to a second model during an outage, that second model
+  needs its own capability entry, ported prompt and suite run.
+- **Otherwise** failing over to an unported model turns an availability incident into a quality incident
+  that is harder to see.
 
-## Example
+## Diagram
+A model change passes mechanical checks first, then quality gates on the customer's own data, before the
+per-tenant switch moves traffic.
+
+```mermaid
+flowchart TD
+    N["New or mandated model"] --> A["Write adapter + contract tests"]
+    A --> C{"Capabilities meet deployment needs?"}
+    C -->|"no"| X["Fail at deploy time"]
+    C -->|"yes"| T["Recompute budgets, fix chat template"]
+    T --> P["Port prompts against regression suite"]
+    P --> S["Shadow on customer traffic"]
+    S --> R{"Paired flips acceptable?"}
+    R -->|"no"| P
+    R -->|"yes"| W["Per-tenant switch, old model as fallback"]
+    W --> REG[("Register model, version, prompt")]
+```
+
+## Examples
+### Two adapters into one internal Completion
 Two adapters mapping raw response shapes (as plain dicts, the way they arrive over HTTP) into one
 internal `Completion`. The two shapes differ in exactly the ways that break naive integrations: where tool
 calls live, whether arguments are a JSON string or an object, and what the finish reasons are called.
@@ -127,52 +153,112 @@ def from_anthropic_messages(r: dict) -> Completion:
                       r["usage"]["input_tokens"], r["usage"]["output_tokens"])
 ```
 
-The application branches only on `finish == "length"` or `"tool_use"`. Without the mapping, code that
-checks `finish_reason == "length"` silently never fires on a provider that says `max_tokens`, so
-truncated answers are shipped as complete. (Field names follow these two public APIs at the time of
-writing. Both adapters raise on an unknown finish value, which is the strict choice: providers add values
-over time, and defaulting an unknown one to "stop" is how truncation or refusals go unnoticed.)
+- **The application branches only on `finish == "length"` or `"tool_use"`.**
+- **Without the mapping**, code that checks `finish_reason == "length"` silently never fires on a provider
+  that says `max_tokens`, so truncated answers are shipped as complete.
+- **Field names** follow these two public APIs at the time of writing.
+- **Unknown finish values raise**, the strict choice: providers add values over time, and defaulting an
+  unknown one to "stop" is how truncation or refusals go unnoticed.
 
-Now the budget arithmetic that the adapter cannot fix. A deployment packs a 32,000-token window as:
-system prompt 1,500 + history 4,000 + 10 retrieved chunks × 2,000 = 25,500 input tokens, plus 4,000
-reserved for output, leaving a 2,500-token margin. Suppose the new model's tokenizer counts this
-customer's text 15% higher (illustrative; measure it on their documents, since the ratio depends on
-language and content). Input becomes about 29,300, plus 4,000 output reserved, about 33,300: over the
-window. Depending on the stack, requests now fail with a context-length error, or a packer that trusts the
-old counts silently drops the last two chunks. The second is worse, because it shows up only as lower
-answer quality on long, document-heavy questions, which is exactly where the customer's hard cases are.
+### Worked budget: the tokenizer shift the adapter cannot fix
+A deployment packs a 32,000-token window:
+
+| Item | Old model (tokens) | New tokenizer, +15% (illustrative) |
+|---|---|---|
+| System prompt | 1,500 | ≈ 1,725 |
+| History | 4,000 | ≈ 4,600 |
+| 10 retrieved chunks × 2,000 | 20,000 | ≈ 23,000 |
+| **Input total** | **25,500** | **about 29,300** |
+| Output reserved | 4,000 | 4,000 |
+| **Total vs window** | 29,500: a 2,500-token margin | about 33,300: over the window |
+
+- **Measure the ratio** on the customer's documents, since it depends on language and content.
+- **Two failure modes.** Depending on the stack, requests fail with a context-length error, or a packer
+  that trusts the old counts silently drops the last two chunks.
+- **The silent one is worse.** It shows up only as lower answer quality on long, document-heavy questions,
+  exactly where the customer's hard cases are.
+
+### Startup capability check and budget recompute
+Fail at deploy when a model lacks a needed feature, and recompute how many chunks fit with the measured
+token ratio instead of trusting old counts.
+
+```python
+CAPS = {
+    "hosted-model-2025-01": {"context": 128_000, "strict_json": True, "parallel_tools": True},
+    "open-model-v2":        {"context": 32_000, "strict_json": False, "parallel_tools": False},
+}
+
+def check_caps(model, min_context, features):
+    c = CAPS[model]
+    missing = [f for f in features if not c.get(f)]
+    if c["context"] < min_context:
+        missing.append(f"context<{min_context}")
+    if missing:
+        raise RuntimeError(f"{model} lacks {missing}: refusing to deploy")
+
+def chunks_that_fit(window, reserve_out, system, history, chunk, ratio=1.0):
+    free = window - reserve_out - round((system + history) * ratio)
+    return max(0, free // round(chunk * ratio))
+
+check_caps("hosted-model-2025-01", 32_000, ["strict_json"])                  # passes
+print(chunks_that_fit(32_000, 4_000, 1_500, 4_000, 2_000))              # 11 (10 used, margin kept)
+print(chunks_that_fit(32_000, 4_000, 1_500, 4_000, 2_000, ratio=1.15))  # 9: pack 9, deliberately
+check_caps("open-model-v2", 32_000, ["strict_json"])   # RuntimeError: lacks ['strict_json']
+```
+
+## Production patterns
+- **Gateway with pinned model aliases** — when several providers or tenants are in play. Map internal
+  names to exact provider versions in one place (for example LiteLLM proxy's `model_list` config) and pin
+  the gateway's own version. Monitor per-model error rates and keep contract tests for tool calls and
+  streaming on every gateway upgrade.
+- **Chat-template golden test** — for every self-hosted model. Render a fixed conversation with the
+  tokenizer's `apply_chat_template(messages, tokenize=False, add_generation_prompt=True)` (Hugging Face
+  Transformers) and compare it with the expected string in CI. Monitor that the test runs on every model
+  or tokenizer upgrade.
+- **Count tokens with the target model** — whenever budgets change. Use the target family's tokenizer or
+  the provider's token-counting endpoint, and store a measured token ratio per customer corpus. Monitor
+  context-length errors and the number of chunks packed per request.
+- **Typed error taxonomy with per-class retry policy** — on every adapter. Map provider status codes and
+  error types (rate limited, overloaded, context too long, filtered, invalid, auth) to one enum and attach
+  retry and fallback rules to the enum, not the vendor code. Monitor retries on non-retryable classes:
+  the target is zero.
+- **Fallback models in the suite** — whenever a router can fail over. Run the customer's regression suite
+  on every configured fallback, with its own ported prompt, before enabling it. Monitor quality metrics
+  tagged by serving model so a failover dip is visible.
 
 ## Trade-offs
-- A normalising adapter makes models swappable, but a lowest-common-denominator interface hides features
-  only one model has; expose such features as optional capabilities rather than dropping them.
-- Using a gateway or library saves mapping work, but adds a dependency whose own updates can change
+- **Normalising adapter vs model-specific features.** Models become swappable, but a
+  lowest-common-denominator interface hides features only one model has; expose those as optional
+  capabilities rather than dropping them.
+- **Gateway or library vs own code.** It saves mapping work, but adds a dependency whose updates can change
   behaviour; pin its version and keep your contract tests, especially for tool calls and streaming.
-- Pinning exact model versions gives stable behaviour, but you must plan migrations before the provider
-  retires them; aliases avoid that work only when unannounced behaviour changes are acceptable.
-- The customer's mandated model satisfies their data and procurement rules, but may score lower; show the
-  measured gap on their suite so the trade-off is their informed decision, not a surprise.
+- **Pinned versions vs aliases.** Pinning gives stable behaviour, but you must plan migrations before the
+  provider retires them; aliases avoid that work only when unannounced behaviour changes are acceptable.
+- **Customer-mandated model vs quality.** It satisfies their data and procurement rules but may score
+  lower; show the measured gap on their suite so the trade-off is their informed decision, not a surprise.
 
 ## Pitfalls
-- Reusing the old prompt unchanged; the symptom is a sudden rise in format and instruction-following
+- **Reusing the old prompt unchanged.** Symptom: a sudden rise in format and instruction-following
   failures on the regression suite with no code change.
-- Counting tokens with the wrong tokenizer; the symptom is context-length errors or silently truncated
+- **Counting tokens with the wrong tokenizer.** Symptom: context-length errors or silently truncated
   retrieved documents on long requests.
-- Serving an open-weight model with the wrong chat template; the symptom is outputs that look fluent but
-  score clearly below the model's expected quality, with no errors logged.
-- Configuring a moving alias instead of a pinned version; the symptom is a quality or format change on a
-  date when nothing was deployed.
-- Configuring a fallback model that was never run against the customer's suite; the symptom is a quality
-  dip and format failures that coincide exactly with the primary provider's outage window.
-- Not mapping provider errors; the symptom is retries hammering a model on non-retryable errors, or
-  giving up immediately on rate limits.
+- **Serving an open-weight model with the wrong chat template.** Symptom: fluent outputs that score
+  clearly below the model's expected quality, with no errors logged.
+- **A moving alias instead of a pinned version.** Symptom: a quality or format change on a date when
+  nothing was deployed.
+- **A fallback model never run against the customer's suite.** Symptom: a quality dip and format failures
+  that coincide exactly with the primary provider's outage window.
+- **Not mapping provider errors.** Symptom: retries hammering a model on non-retryable errors, or giving
+  up immediately on rate limits.
 
 ## When to use
-Treat every model change as an integration project: a new provider, a customer-mandated deployment, a
-fine-tuned adapter, or a version bump of the same model. Scale the effort to the size of the change: a
-version bump may need only the regression suite and shadow; a new model family needs the adapter,
-capability entry, tokenizer, prompt porting and errors. Measure paired flips on the customer suite,
-format-failure rate, latency, cost and error rates. In interviews, listing the non-obvious differences
-(templates, tokenizers, tool-call formats, error semantics) shows hands-on experience.
+- **Treat every model change as an integration project:** a new provider, a customer-mandated deployment,
+  a fine-tuned adapter, or a version bump of the same model.
+- **Scale the effort to the change.** A version bump may need only the regression suite and shadow; a new
+  model family needs the adapter, capability entry, tokenizer, prompt porting and errors.
+- **Measure:** paired flips on the customer suite, format-failure rate, latency, cost and error rates.
+- **Interviews:** listing the non-obvious differences (templates, tokenizers, tool-call formats, error
+  semantics) shows hands-on experience.
 
 ## Role lens
 - **Engineer:** Writes the adapter and its contract tests, maps errors and tool-call formats, fixes chat
@@ -192,6 +278,37 @@ budgets use the new tokenizer so documents are not being truncated. Then samplin
 output. Only after those are clean would I attribute the remaining drop to the model, and then port the
 prompt by reading failures, and if needed consider a larger model or a fine-tuned adapter. Throughout I
 compare paired flips against the old model on the same suite.
+
+## Interview questions
+### Why is swapping the model name in config not a safe model migration?
+- **Models differ beyond quality:** tool-call formats, tokenizers, chat templates, output-limit semantics,
+  error codes and quotas.
+- **None of these crash a smoke test.** They appear as silent quality loss: truncated context, unparsed
+  tool calls, retries treating rate limits as fatal.
+- **So** migrate through an adapter, capability check, prompt port and the customer's suite.
+
+### How would you design the internal model interface for a multi-provider product?
+- **Messages in; text, tool calls, usage, finish reason and a typed error out**, with one adapter per
+  provider or serving stack.
+- **Normalise finish reasons and argument types** (JSON string vs object), and raise on unknown values.
+- **Expose model-only features as optional capabilities** declared in a registry and checked at startup.
+
+### After a failover during a provider outage, complaints about bad answers spike. What went wrong?
+- **The fallback model was never integrated.** No ported prompt, capability entry or suite run, so an
+  availability incident became a quality incident.
+- **Fix:** treat every configured fallback as a full integration and tag quality metrics by serving model.
+
+### When would you accept a moving model alias instead of a pinned version?
+- **Only when unannounced behaviour changes are acceptable**, such as internal prototypes without a gated
+  eval.
+- **For customer deployments, pin**, because an alias can change the model under a validated deployment;
+  plan migrations before the provider retires the pinned version.
+
+### A new tokenizer counts your customer's text 15% higher. What do you change?
+- **Recompute the budget** with the target tokenizer: in a 32,000-token window with 4,000 reserved for
+  output, 10 chunks of 2,000 no longer fit with 5,500 of system and history; 9 do.
+- **Pack deliberately** rather than letting the server error or truncate silently, and monitor chunks per
+  request and context-length errors.
 
 ## Quiz
 ### Q: Why should context budgeting use the target model's own tokenizer?

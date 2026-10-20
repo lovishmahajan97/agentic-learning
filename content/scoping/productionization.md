@@ -5,7 +5,7 @@ name: Productionization
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - scoping/pilot-to-production-plan
   - scoping/rapid-prototyping-poc
@@ -18,75 +18,72 @@ related:
 ---
 
 ## TL;DR
-Productionization turns a prototype that works on the happy path into a system that keeps working under
-real traffic, bad inputs, provider outages, model changes, adversaries and audits. The model call is
-usually a small fraction of the work; the rest is reliability, evaluation gates, observability, security,
-cost control and operational ownership. Plan it as a risk-ordered list of hardening work, not a final
-polish step.
+Productionization turns a happy-path prototype into a system that survives real traffic, bad inputs,
+outages, model changes, adversaries and audits. The model call is a small part; plan reliability, eval
+gates, observability, security, cost and ownership as risk-ordered hardening.
 
 ## Why it exists
-A prototype is built to answer a question quickly, so it makes every assumption that saves time: one user,
-clean inputs, a provider that always responds, a prompt edited by hand, no adversary, unlimited budget,
-the builder watching the output. Each assumption is fine for a PoC and false in production.
-
-Consider what changes. Inputs arrive from thousands of users, so the long tail of strange inputs, which
-the PoC sample barely touched, becomes a daily occurrence. Concurrency hits provider rate limits. The
-provider has partial outages, returns malformed JSON, or slows down at peak. The model version behind an
-alias changes, or is deprecated on a schedule you do not control, and quality shifts silently. Users paste
-documents containing instructions that try to hijack the system. Someone asks why the system gave a
-particular answer last Tuesday, and there is no record. The monthly inference bill arrives at several
-times the estimate because a retry loop or a few heavy users consumed it.
-
-The naive approach is to "just deploy the prototype" and fix problems as they appear. That works for
-deterministic code with good tests; for an LLM system it means problems appear as quality degradation that
-nobody detects, cost overruns, or a security incident, all discovered by users. The opposite approach,
-waiting until everything is perfect, never ships. Productionization is the disciplined middle: enumerate
-the failure sources, harden against the ones that matter most for this use case, and make the rest
-observable.
+- **A prototype makes every time-saving assumption.** One user, clean inputs, a provider that always
+  responds, a prompt edited by hand, no adversary, unlimited budget, the builder watching the output. Each
+  is fine for a PoC and false in production.
+- **Production breaks each assumption.** Thousands of users make the long tail of strange inputs, which the
+  PoC sample barely touched, a daily occurrence. Concurrency hits provider rate limits. Providers have
+  partial outages, return malformed JSON, or slow down at peak.
+- **Things change underneath you.** The model behind an alias changes, or is deprecated on a schedule you do
+  not control, and quality shifts silently. Users paste documents with instructions that try to hijack the
+  system. Someone asks why it answered that way last Tuesday, and there is no record. The monthly bill
+  arrives at several times the estimate because a retry loop or a few heavy users consumed it.
+- **"Just deploy the prototype" fails for LLMs.** Fixing problems as they appear works for deterministic code
+  with good tests; here problems show up as undetected quality degradation, cost overruns or a security
+  incident, all discovered by users.
+- **Waiting for perfect never ships.** Productionization is the disciplined middle: enumerate failure
+  sources, harden against the ones that matter most for this use case, and make the rest observable.
 
 ## How it works
-Organize the work by what can go wrong, *because* that makes gaps visible and lets you prioritize by risk.
+Organize the work by what can go wrong, because that makes gaps visible and lets you prioritize by risk.
 
 ### 1. Reliability of the model call
-Set explicit timeouts, *because* a hung provider call otherwise holds a worker indefinitely. Retry only
-transient errors (timeouts, rate limits, server errors) with exponential backoff and jitter, and cap total
-attempts, *because* unbounded retries multiply cost and load during an outage. Validate structured output
-against a schema and handle failure; a schema failure is a middle case, since outputs are sampled and one
-bounded re-try (or a repair prompt) often succeeds, but count it separately so a prompt regression is not
-hidden by retries. Define a fallback: a secondary model, a cached answer, or a graceful
-"cannot answer, routing to a person".
+- **Explicit timeouts,** because a hung provider call otherwise holds a worker indefinitely.
+- **Retry only transient errors** (timeouts, rate limits, server errors) with exponential backoff and jitter,
+  and cap total attempts, because unbounded retries multiply cost and load during an outage.
+- **Validate structured output against a schema** and handle failure. A schema failure is a middle case:
+  outputs are sampled, so one bounded re-try (or a repair prompt) often succeeds, but count it separately so
+  a prompt regression is not hidden by retries.
+- **Define a fallback:** a secondary model, a cached answer, or a graceful "cannot answer, routing to a
+  person".
 
-Two retry details decide whether this helps or hurts during an incident. First, retries multiply across
-layers: if your code makes 3 attempts, the gateway in front of the provider makes 3, and the SDK
-underneath also retries by default (many do), one user request can become up to 27 provider calls just
-when the provider is struggling. Pick one layer to own retries and turn the others off or down, and add
-a circuit breaker so that when most recent calls are failing, new requests go straight to the fallback
-instead of each discovering the outage separately. Second, retries must fit the caller's deadline:
-attempts × timeout + total backoff is the worst-case latency, and it should be below whatever the user
-or upstream service will wait. And only retry what is safe to repeat: re-sending a classification is
-harmless, but re-running a tool call that sends an email or files a refund duplicates it unless the
-action carries an idempotency key.
+Two retry details decide whether this helps or hurts during an incident:
+
+| Detail | Problem | Fix |
+|---|---|---|
+| **Retries multiply across layers** | 3 attempts in your code × 3 in the gateway × SDK retries by default (many do) = up to 27 provider calls per user request, just when the provider is struggling | one layer owns retries, others off or down; add a circuit breaker so when most recent calls fail, new requests go straight to the fallback instead of each discovering the outage |
+| **Retries must fit the deadline** | worst case = attempts × timeout + total backoff | keep it below what the user or upstream service will wait |
+
+- **Only retry what is safe to repeat.** Re-sending a classification is harmless; re-running a tool call that
+  sends an email or files a refund duplicates it unless the action carries an idempotency key.
 
 ### 2. Quality as a release gate
-Turn the PoC eval set into a regression suite that runs on every change to prompts, models, retrieval or
-tools. Version prompts and pin model versions where the provider allows, *because* an unpinned alias can
-change behavior with no deployment on your side. Roll out changes through canary or shadow traffic.
+- **Regression suite:** the PoC eval set runs on every change to prompts, models, retrieval or tools.
+- **Version prompts and pin model versions** where the provider allows, because an unpinned alias can change
+  behavior with no deployment on your side.
+- **Roll out changes** through canary or shadow traffic.
 
 ### 3. Observability
-Trace each request end to end: inputs, retrieved context, prompt version, model, outputs, latency, token
-counts and cost, tied to a request ID. Without traces, debugging a bad answer means guessing. Monitor
-latency percentiles, error rates, cost per request, and online quality signals such as user feedback or
-sampled human review.
+- **Trace each request end to end:** inputs, retrieved context, prompt version, model, outputs, latency,
+  token counts and cost, tied to a request ID. Without traces, debugging a bad answer means guessing.
+- **Monitor** latency percentiles, error rates, cost per request, and online quality signals such as user
+  feedback or sampled human review.
 
 ### 4. Security and data handling
-Authenticate users and enforce authorization on retrieved data and tool calls with the user's own
-permissions, *because* the model will happily summarize documents the user should not see. Treat retrieved
-and user-supplied text as untrusted input that may contain prompt injection. Decide what gets logged, how
-PII is redacted, and how long data is kept.
+- **Authorize with the user's own permissions** on retrieved data and tool calls, because the model will
+  happily summarize documents the user should not see.
+- **Treat retrieved and user-supplied text as untrusted** input that may contain prompt injection.
+- **Decide logging policy:** what gets logged, how PII is redacted, and how long data is kept.
 
 ### 5. Cost and capacity
-Set per-user and per-tenant quotas, maximum input and output tokens, and budget alerts. Estimate cost at
-expected volume, *because* PoC cost per call times production volume is often the first surprise:
+- **Set limits:** per-user and per-tenant quotas, maximum input and output tokens, and budget alerts.
+- **Estimate cost at expected volume,** because PoC cost per call times production volume is often the first
+  surprise:
 
 ```
 monthly cost ≈ requests/month × (tokens_in × price_in + tokens_out × price_out) × (1 + retry rate)
@@ -94,21 +91,43 @@ in-flight requests ≈ arrival rate × mean latency          (Little's law)
 tokens/minute ≈ requests/minute × (tokens_in + tokens_out)
 ```
 
-The last two lines are what you check against provider rate limits, which are usually set per minute in
-both requests and tokens. At an illustrative 20 requests/second with 6 seconds of latency, about 120
-calls are in flight at once, and at 3,500 tokens each the system consumes over 4 million tokens per
-minute; a PoC that never ran more than one call at a time tells you nothing about whether that fits your
-quota tier. Long outputs dominate latency (they are generated token by token) and usually cost more per
-token than input, so capping output length is often the strongest cost and latency lever.
+- **Check the last two lines against provider rate limits,** which are usually set per minute in both
+  requests and tokens.
+- **Worked numbers (illustrative):** 20 requests/second with 6 seconds of latency is about 120 calls in
+  flight; at 3,500 tokens each that is over 4 million tokens per minute. A PoC that never ran more than one
+  call at a time tells you nothing about whether that fits your quota tier.
+- **Cap output length.** Long outputs dominate latency (generated token by token) and usually cost more per
+  token than input, so this is often the strongest cost and latency lever.
 
 ### 6. Operations and ownership
-Define SLOs, write runbooks for known failure modes (provider outage, quality regression, cost spike),
-set up on-call, and name the owning team. Plan for model deprecation, *because* the model you shipped on
-has a finite lifetime.
+- **Define SLOs,** write runbooks for known failure modes (provider outage, quality regression, cost spike),
+  set up on-call, and name the owning team.
+- **Plan for model deprecation,** because the model you shipped on has a finite lifetime.
 
-## Example
-The same model call in prototype form and productionized form. The provider call is abstracted; the
-hardening around it is the point.
+## Diagram
+One request through the hardened path: authorization and limits first, a circuit breaker before the
+provider, bounded retries, schema validation, and a trace on every exit including the human fallback.
+
+```mermaid
+flowchart TD
+    U["User request"] --> AZ["Authorize with user permissions"]
+    AZ --> Q["Quota and input size limits"]
+    Q --> CB{"Circuit breaker open?"}
+    CB -->|"yes"| FB["Fallback: human queue or cached"]
+    CB -->|"no"| M["Model call, pinned version, timeout"]
+    M -->|"transient error, attempts left"| BO["Backoff with jitter"]
+    BO --> M
+    M -->|"attempts exhausted"| FB
+    M --> V{"Output matches schema?"}
+    V -->|"no, bounded re-try"| M
+    V -->|"yes"| R["Response"]
+    R --> T[("Trace: prompt, model, tokens, cost")]
+    FB --> T
+```
+
+## Examples
+### The same call, prototype vs productionized
+The provider call is abstracted; the hardening around it is the point.
 
 ```python
 import json, logging, random, time, uuid
@@ -152,49 +171,109 @@ def production(ticket: str, user_id: str, max_attempts: int = 3) -> Triage | Non
     return None                                                   # caller routes to manual queue
 ```
 
-Each added line answers a production question the prototype ignored: what if it hangs, rate-limits,
-returns broken output, or costs too much, and how will we debug it next week? Note the worst case it
-implies: three 15-second timeouts plus up to 2 and 4 seconds of backoff is about 51 seconds before the
-human fallback. That is acceptable for a background triage queue and far too long for a chat reply,
-where you would cut attempts, shorten the timeout, or pass a single overall deadline through the loop.
-What it deliberately omits, a circuit breaker and cost quotas, belongs in a shared gateway rather than in
-every call site.
+- **Each added line answers a production question** the prototype ignored: what if it hangs, rate-limits,
+  returns broken output, or costs too much, and how will we debug it next week?
+- **Worst case it implies:** three 15-second timeouts plus up to 2 and 4 seconds of backoff is about 51
+  seconds before the human fallback.
+- **Fit to the path:** acceptable for a background triage queue, far too long for a chat reply, where you
+  would cut attempts, shorten the timeout, or pass a single overall deadline through the loop.
+- **Deliberately omitted:** a circuit breaker and cost quotas belong in a shared gateway rather than in every
+  call site.
+
+### Capacity, cost and retry-budget calculator
+Run this before launch with your own volumes and your provider's current prices and quota tier.
+
+```python
+def capacity(rps, latency_s, tokens_in, tokens_out, price_in_per_m, price_out_per_m,
+             retry_rate=0.0, days=30):
+    in_flight = rps * latency_s                                   # Little's law
+    tpm = rps * 60 * (tokens_in + tokens_out)                     # check against the quota tier
+    per_req = (tokens_in * price_in_per_m + tokens_out * price_out_per_m) / 1e6
+    monthly = rps * 86_400 * days * per_req * (1 + retry_rate)
+    return in_flight, tpm, monthly
+
+def worst_case_latency(attempts, timeout_s, backoffs_s):
+    return attempts * timeout_s + sum(backoffs_s)
+
+def retry_amplification(attempts_per_layer):
+    calls = 1
+    for a in attempts_per_layer:
+        calls *= a
+    return calls
+
+# Illustrative prices in dollars per million tokens, not any provider's list price.
+inflight, tpm, monthly = capacity(rps=20, latency_s=6, tokens_in=3_000, tokens_out=500,
+                                  price_in_per_m=3, price_out_per_m=15, retry_rate=0.05)
+print(f"in flight {inflight:.0f}, tokens/min {tpm / 1e6:.1f}M, monthly ${monthly:,.0f}")
+# in flight 120, tokens/min 4.2M, monthly $898,128  (if 20 rps were sustained around the clock)
+print("worst case before fallback:", worst_case_latency(3, 15, [2, 4]), "s")   # 51 s
+print("app x gateway x SDK retries:", retry_amplification([3, 3, 3]), "calls")  # 27
+```
+
+| Lever | Effect on the numbers above |
+|---|---|
+| Halve output tokens (500 → 250) | cuts per-request cost by about 23% here ($0.0165 to $0.01275), since output is priced 5× input in this example, and shortens latency |
+| One retry layer instead of three | worst-case calls per request from 27 to 3 |
+| Shorter latency | fewer calls in flight for the same traffic, by Little's law |
+
+## Production patterns
+- **One retry owner, everything else off** — always. How: retry in the gateway or the app, not both, and set
+  the SDK's own retry count to zero or one (for example the OpenAI and Anthropic Python clients accept
+  `max_retries`). Monitor: provider calls per user request, which should sit near 1 in steady state; a multiple during
+  incidents means retries are stacking.
+- **Shared LLM gateway** — once more than one service calls models. How: one internal service owns timeouts,
+  circuit breaking, per-tenant quotas, token caps, model pinning and cost attribution, so call sites stay
+  thin. Monitor: breaker state, quota rejections, and cost per tenant per day.
+- **Eval regression gate in CI** — on every prompt, model, retrieval or tool change. How: a fast suite (a few
+  hundred cases) blocks the merge if the score drops past a set margin; the full suite runs nightly. Monitor:
+  gate run time and how often it is bypassed.
+- **Canary on model or prompt changes** — for any change that alters outputs. How: route a small share of
+  traffic to the new version, compare error rate, latency, cost and sampled quality against the old one,
+  then widen. Monitor: the per-version deltas, with automatic rollback on a guardrail breach.
+- **Idempotency keys on side-effecting tools** — for email, ticket or refund actions. How: derive a key from
+  the request ID and action, and have the tool reject a repeat key. Monitor: duplicate-key rejections, which
+  should line up with timeout spikes.
+- **Deprecation calendar** — from launch day. How: record the pinned model's announced retirement date and
+  schedule a migration eval well before it. Monitor: days remaining on every pinned model in production.
 
 ## Trade-offs
-- Retries improve success rates during transient faults, but they add latency and cost and can amplify an
-  outage; this flips toward fewer retries when the call sits on a latency-critical user path.
-- Pinning model versions gives reproducible behavior, but it forces planned migrations before
-  deprecation dates; floating aliases avoid that work at the price of unannounced behavior change.
-- Logging full prompts and outputs makes debugging and audits far easier, but it creates a store of
-  sensitive data; redact or sample when the inputs contain regulated or personal data.
-- A fallback to a human or a simpler path keeps service available, but it needs staffing and a queue;
-  for low-stakes features, returning a clear error may be the cheaper fallback.
-- Strict regression gates prevent quality backsliding, but a slow or flaky eval suite will be bypassed;
-  keep the gating suite fast and run the expensive one nightly.
+- **Retries vs latency and load.** They improve success rates during transient faults, but add latency and
+  cost and can amplify an outage; this flips toward fewer retries when the call sits on a latency-critical
+  user path.
+- **Pinned versions vs migration work.** Pinning gives reproducible behavior but forces planned migrations
+  before deprecation dates; floating aliases avoid that work at the price of unannounced behavior change.
+- **Full logging vs sensitive data.** Logging full prompts and outputs makes debugging and audits far easier,
+  but creates a store of sensitive data; redact or sample when inputs contain regulated or personal data.
+- **Human fallback vs staffing.** A fallback to a human or a simpler path keeps service available, but needs
+  staffing and a queue; for low-stakes features, returning a clear error may be the cheaper fallback.
+- **Strict gates vs bypass.** Strict regression gates prevent quality backsliding, but a slow or flaky eval
+  suite will be bypassed; keep the gating suite fast and run the expensive one nightly.
 
 ## Pitfalls
-- Deploying the prototype as-is because it worked in the pilot; the symptom is the first provider outage
+- **Deploying the prototype as-is** because it worked in the pilot; the symptom is the first provider outage
   taking the feature down with hung requests and no fallback.
-- Retrying every error, including invalid requests and content refusals; the symptom is a cost spike and
+- **Retrying every error,** including invalid requests and content refusals; the symptom is a cost spike and
   rate-limit errors during incidents, as retries pile onto an overloaded provider.
-- Using an unpinned model alias with no regression suite; the symptom is a quality drop users report weeks
+- **An unpinned model alias with no regression suite;** the symptom is a quality drop users report weeks
   before anyone on the team notices.
-- Retrieving with a service account instead of the end user's permissions; the symptom is a user receiving
-  content from documents they cannot open directly.
-- No per-request traces or cost attribution; the symptom is a large bill or a bad answer that nobody can
+- **Retrieving with a service account** instead of the end user's permissions; the symptom is a user
+  receiving content from documents they cannot open directly.
+- **No per-request traces or cost attribution;** the symptom is a large bill or a bad answer that nobody can
   explain or reproduce.
-- Stacked retries in application code, gateway and SDK; the symptom is provider call volume several times
+- **Stacked retries in application code, gateway and SDK;** the symptom is provider call volume several times
   the request volume during an incident, with rate-limit errors that persist after the provider recovers.
-- Retrying side-effecting tool calls without idempotency keys; the symptom is duplicate emails, tickets
+- **Retrying side-effecting tool calls without idempotency keys;** the symptom is duplicate emails, tickets
   or refunds that line up with timeout spikes in the traces.
 
 ## When to use
-Start productionization when a pilot shows the system is worth running, and scope it by risk: a
-customer-facing, regulated or tool-using system needs every section above; an internal summarizer with
-easy fallback may need only timeouts, quotas, basic tracing and a regression set. Begin with the items
-whose failure is silent (quality regression, data exposure, cost), *because* loud failures get fixed
-anyway. Measure readiness with a checklist reviewed at a deployment readiness review, and track error
-rate, latency percentiles, cost per request and sampled quality after launch.
+- **Start** when a pilot shows the system is worth running, and scope it by risk.
+- **Full treatment:** a customer-facing, regulated or tool-using system needs every section above.
+- **Light treatment:** an internal summarizer with easy fallback may need only timeouts, quotas, basic
+  tracing and a regression set.
+- **Silent failures first** (quality regression, data exposure, cost), because loud failures get fixed
+  anyway.
+- **Measure:** readiness with a checklist reviewed at a deployment readiness review; after launch track error
+  rate, latency percentiles, cost per request and sampled quality.
 
 ## Role lens
 - **Engineer:** Adds timeouts, scoped retries, schema validation, fallbacks, tracing and cost logging
@@ -214,6 +293,38 @@ turn the pilot's eval examples into a regression suite and pin the model version
 become visible. Third, add request tracing, with redaction, plus cost logging. Fourth, timeouts, scoped
 retries, schema validation and a fallback. Then quotas, runbooks, on-call and an owner. Roll out by canary
 so remaining gaps surface on a small population first.
+
+## Interview questions
+### What does productionizing an LLM feature involve beyond deploying the model call?
+- **Reliability:** timeouts, transient-only bounded retries, schema validation and a fallback.
+- **Quality and visibility:** a regression gate, pinned model versions, canary rollout and end-to-end traces
+  with tokens and cost.
+- **Safety and operations:** user-scoped authorization, injection-aware handling, quotas, SLOs, runbooks,
+  on-call, an owner and a deprecation plan.
+
+### During a provider incident your call volume to the provider tripled while user traffic was flat. Why?
+- **Stacked retries:** app, gateway and SDK each retrying multiplies calls, up to 27 per request with three
+  attempts at three layers.
+- **Fix:** one layer owns retries, others set low or off, plus a circuit breaker that sends new requests to
+  the fallback once most recent calls fail, so the provider can recover.
+
+### How would you set the retry and timeout budget for a chat reply versus a background job?
+- **Compute worst case:** attempts × timeout + total backoff; three 15-second timeouts plus 2 and 4 seconds
+  of backoff is about 51 seconds.
+- **Background triage** can absorb that; a chat reply cannot, so cut attempts, shorten the timeout, or pass
+  one overall deadline through the loop.
+
+### Estimate whether a launch at 20 requests per second fits your provider quota.
+- **Little's law:** 20 per second × 6 seconds latency is about 120 calls in flight.
+- **Tokens per minute:** 1,200 requests per minute × 3,500 tokens is about 4.2 million, which you compare with
+  the tier's per-minute request and token limits; capping output length is the strongest lever if it does not
+  fit.
+
+### When would you pin a model version, and when would a floating alias be acceptable?
+- **Pin** when behavior must be reproducible and gated by a regression suite, because an alias can change
+  quality with no deploy on your side.
+- **Accept an alias** only for low-stakes features with a fast eval running on a schedule, and plan migrations
+  either way, because pinned snapshots carry deprecation dates.
 
 ## Quiz
 ### Q: Why should retries be limited to transient errors such as timeouts and rate limits?

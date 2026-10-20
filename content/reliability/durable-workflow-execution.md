@@ -5,7 +5,7 @@ name: Durable workflow execution
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-and-checkpoint-stores
@@ -22,98 +22,123 @@ sources:
 ---
 
 ## TL;DR
-Durable workflow execution makes a long, multi-step process survive crashes, deploys and
-days-long waits by persisting its progress as an append-only event history and replaying that history
-to resume exactly where it stopped. The orchestration code must be deterministic so replay is faithful;
-every side effect lives in a retried, idempotent *activity*. It replaces hand-built state machines in
-database columns and cron jobs, and it is the natural runtime for agent loops whose steps are slow,
-flaky and expensive to redo.
+Durable workflow execution persists a multi-step process as an append-only event history and replays
+it to resume after crashes, deploys and days-long waits. Orchestration code stays deterministic; side
+effects live in retried, idempotent activities. It suits slow, flaky, expensive agent loops.
 
 ## Why it exists
-Real processes span time and systems: draft a reply with a model, wait for a human to approve, send
-it, poll a vendor for confirmation, retry tomorrow if the vendor is down. A worker running that as one
-function dies halfway during a deploy, and the process is simply lost: the draft was made and paid
-for, the approval request was sent, nobody knows which step completed.
-
-The naive fix is a `status` column plus a cron job that scans for stuck rows and a retry loop around
-each step. Every team builds this once, and it grows the same bugs: steps that run twice because the
-status update raced with the crash, timers reimplemented as polling, "waiting for approval" rows that
-nobody sweeps, a state machine spread across three services with no single place to see where a
-process is, and no way to change the logic while thousands of processes are mid-flight. Message
-queues help with retries but not with the orchestration: a queue cannot express "wait 48 hours, then
-if no signal arrived, escalate".
-
-Agentic systems make this acute. An agent run is a loop of model calls and tool calls, each of which
-can take seconds to minutes, fail transiently, and cost real money. Re-running the whole loop after a
-crash duplicates tool side effects and token spend; abandoning it loses the user's work. Durable
-execution exists so that a crash at step 14 of 20 resumes at step 14 with steps 1 to 13 already
-decided, without re-calling the model for any of them.
+- **Real processes span time and systems.** Draft a reply with a model, wait for a human to approve,
+  send it, poll a vendor for confirmation, retry tomorrow if the vendor is down.
+- **One long function loses the process.** A worker dies halfway during a deploy: the draft was made and
+  paid for, the approval request was sent, and nobody knows which step completed.
+- **The hand-built fix grows the same bugs.** A `status` column plus a cron job that scans for stuck rows
+  and a retry loop around each step gives: steps that run twice because the status update raced with the
+  crash, timers reimplemented as polling, "waiting for approval" rows nobody sweeps, a state machine spread
+  across three services, and no way to change logic while thousands of processes are mid-flight.
+- **Queues give retries, not orchestration.** A queue cannot express "wait 48 hours, then if no signal
+  arrived, escalate".
+- **Agents make it acute.** Each model or tool call can take seconds to minutes, fail transiently and cost
+  real money. Re-running the loop duplicates side effects and token spend; abandoning it loses the user's
+  work. Durable execution resumes a crash at step 14 of 20 at step 14, with steps 1 to 13 decided and no
+  model re-calls.
 
 ## How it works
 ### The core idea: event sourcing applied to a program's execution
-A durable workflow engine (Temporal and its predecessor Cadence, AWS Step Functions, Azure Durable
-Functions, Restate, Inngest, DBOS and others differ in surface but share this model) records every
-decision a workflow makes as an event: "activity X scheduled", "activity X completed with result R",
-"timer T started", "signal S received". The history lives in a durable store. Workflow code never
-holds state that matters only in memory; its memory is reconstructible from the history.
+- **Every decision becomes an event.** A durable workflow engine records "activity X scheduled",
+  "activity X completed with result R", "timer T started", "signal S received" in a durable store.
+- **Many engines, one model.** Temporal and its predecessor Cadence, AWS Step Functions, Azure Durable
+  Functions, Restate, Inngest, DBOS and others differ in surface but share it.
+- **Memory is reconstructible.** Workflow code never holds state that matters only in memory; it can be
+  rebuilt from the history.
 
 ### Replay
-When a worker crashes or is redeployed, another worker picks up the workflow by re-executing its code
-from the beginning *against the recorded history*. Each time the code reaches a step whose result is
-already in the history, the engine returns the recorded result instead of running the step again.
-The code therefore reaches the same point it was at, with identical local variables, and continues
-with the first step that has no recorded outcome. This is why workflow code must be
-**deterministic**: no wall-clock reads, random numbers, direct network or database calls, or
-iteration over unordered maps inside the workflow function, *because* a different decision during
-replay would diverge from history and the engine would have to fail the workflow. Engines provide
-deterministic substitutes (`workflow.now()`, seeded random, versioned patches).
+1. A worker crashes or is redeployed; another worker picks up the workflow.
+2. It re-executes the workflow code from the beginning *against the recorded history*.
+3. Each step whose result is already in the history gets the recorded result instead of running again.
+4. The code reaches the same point with identical local variables, then continues with the first step
+   that has no recorded outcome.
+
+- **Hence determinism.** No wall-clock reads, random numbers, direct network or database calls, or
+  iteration over unordered maps inside the workflow function, *because* a different decision during replay
+  would diverge from history and the engine would have to fail the workflow.
+- **Engines provide deterministic substitutes:** `workflow.now()`, seeded random, versioned patches.
 
 ### Activities: where the real world lives
-Anything non-deterministic or side-effecting, including every LLM call, tool call, HTTP request and
-database write, is an **activity**. Activities run outside the replay machinery, have timeouts and a
-retry policy, and their *results* are what gets recorded. The engine guarantees an activity is
-retried until it succeeds or the policy gives up, and that its result is never recomputed on replay.
-What the engine cannot guarantee is that an activity ran exactly once: a worker can complete the side
-effect and crash before reporting, and the retry runs it again. Activities must therefore be
-**idempotent**, with a key derived from the workflow and step identity, which is the same
-exactly-once limitation that applies to every distributed system.
+- **Everything non-deterministic or side-effecting is an activity:** every LLM call, tool call, HTTP
+  request and database write.
+- **Activities run outside the replay machinery,** with timeouts and a retry policy, and their *results*
+  are what gets recorded.
+- **The engine guarantees** an activity is retried until it succeeds or the policy gives up, and that its
+  result is never recomputed on replay.
+- **It cannot guarantee exactly once.** A worker can complete the side effect and crash before reporting,
+  and the retry runs it again.
+- **So activities must be idempotent,** with a key derived from the workflow and step identity: the same
+  exactly-once limitation that applies to every distributed system.
 
 ### Durable timers, signals and queries
-`sleep(30 days)` in a workflow is an event, not a blocked thread: the worker is free, and any worker
-can resume the workflow when the timer fires, across deploys. **Signals** deliver external input, such
-as a human approval or a webhook, into a running workflow; **queries** read its current state without
-affecting history. Together they replace the cron-plus-polling pattern with code that reads as a
-straight-line program.
+| Primitive | What it does |
+|---|---|
+| **Timer** | `sleep(30 days)` is an event, not a blocked thread; the worker is free and any worker resumes the workflow when it fires, across deploys |
+| **Signal** | delivers external input, such as a human approval or a webhook, into a running workflow |
+| **Query** | reads current state without affecting history |
+
+- **Together they replace cron-plus-polling** with code that reads as a straight-line program.
 
 ### Task queues and workers
-Workflows and activities are dispatched through named task queues; workers poll them. This gives
-natural bulkheads (GPU-bound activities on one queue, email on another), per-queue concurrency limits
-that act as backpressure, and **heartbeats** for long activities so a dead worker is detected and its
-activity rescheduled rather than waiting for the full timeout.
+Workflows and activities are dispatched through named task queues that workers poll. This gives:
+- **natural bulkheads:** GPU-bound activities on one queue, email on another;
+- **per-queue concurrency limits** that act as backpressure;
+- **heartbeats** for long activities, so a dead worker is detected and its activity rescheduled rather
+  than waiting for the full timeout.
 
 ### Living with long-running code
-Because deploying new workflow code while old histories exist can break replay, engines offer
-**versioning** primitives: a patch marker that lets new code take the old branch for histories
-recorded before the change. Very long or unbounded loops, like an agent that may take thousands of
-steps, use **continue-as-new**, which closes the current history and starts a fresh one carrying
-forward only the needed state, *because* replaying a history of millions of events is slow and
-memory-hungry.
+- **Versioning.** Deploying new workflow code while old histories exist can break replay, so engines offer
+  a patch marker that lets new code take the old branch for histories recorded before the change.
+- **Continue-as-new.** Very long or unbounded loops, like an agent that may take thousands of steps, close
+  the current history and start a fresh one carrying only the needed state, *because* replaying millions
+  of events is slow and memory-hungry.
 
 ### Failure and compensation
-When an activity exhausts its retry policy, the engine raises an error *inside the workflow code*,
-where ordinary control flow decides what happens next. That makes the saga pattern a `try`/`except`:
-record a compensating action after each step that succeeds (cancel the booking, refund the charge,
-retract the draft) and run them in reverse order if a later step fails for good. Compensations are
-activities too, so they are retried and must be idempotent. This is forward recovery: the external
-world cannot be rolled back, only corrected, so the workflow encodes how to correct it.
+- **Exhausted retries raise an error inside workflow code,** where ordinary control flow decides what
+  happens next.
+- **So the saga pattern is a `try`/`except`:** record a compensating action after each step that succeeds
+  (cancel the booking, refund the charge, retract the draft) and run them in reverse order if a later step
+  fails for good.
+- **Compensations are activities too,** so they are retried and must be idempotent.
+- **This is forward recovery:** the external world cannot be rolled back, only corrected, so the workflow
+  encodes how to correct it.
 
 ### Compared with the alternatives
-A saga implemented by hand gives compensation but not resumption; a queue gives retries but not
-orchestration; a declarative state-machine service (Step Functions style) gives durability with
-JSON-defined states, which is excellent for fixed pipelines and awkward for branching agent logic.
-The code-first engines trade that simplicity for ordinary programs with determinism rules.
+| Approach | Gives | Lacks |
+|---|---|---|
+| Hand-built saga | compensation | resumption |
+| Queue | retries | orchestration |
+| Declarative state machine (Step Functions style) | durability with JSON-defined states; excellent for fixed pipelines | awkward for branching agent logic |
+| Code-first engine | ordinary programs | simplicity: determinism rules apply |
 
-## Example
+## Diagram
+A worker restart mid-run: replay returns recorded results for finished steps, so only the step with no
+recorded outcome really executes.
+
+```mermaid
+sequenceDiagram
+    participant W1 as Worker 1
+    participant H as History store
+    participant W2 as Worker 2
+    participant M as Model API
+    W1->>M: draft_reply activity
+    M-->>W1: draft text
+    W1->>H: append ActivityTaskCompleted and TimerStarted
+    Note over W1: redeployed, process dies
+    W2->>H: load history, replay run from top
+    H-->>W2: recorded draft, no model call
+    Note over W2: waits on timer or approve signal
+    W2->>H: append WorkflowExecutionSignaled
+    W2->>W2: run send_reply activity for real
+```
+
+## Examples
+### A Temporal-style approval workflow
 A Temporal-style workflow (Python SDK conventions; check names against the current docs) in which the
 LLM call and the send are activities, and the approval wait is a durable timer plus signal. A crash
 after `draft_reply` completes resumes at the wait without calling the model again.
@@ -160,14 +185,16 @@ class TicketReplyWorkflow:
         return "sent"
 ```
 
-Notice what is *not* in the workflow: no `datetime.now()`, no HTTP, no database. Those would be
-re-executed on replay. The model is called inside an activity precisely because it is
-non-deterministic; its recorded result is what the replayed workflow sees. The idempotency key comes
-from the workflow and step identity rather than the ticket, *because* a ticket may legitimately get a
-second reply from a later workflow, while a retry of this step must never send twice.
+- **Notice what is *not* in the workflow:** no `datetime.now()`, no HTTP, no database. Those would be
+  re-executed on replay.
+- **The model is called inside an activity** precisely because it is non-deterministic; its recorded
+  result is what the replayed workflow sees.
+- **The idempotency key comes from workflow and step identity, not the ticket,** *because* a ticket may
+  legitimately get a second reply from a later workflow, while a retry of this step must never send twice.
 
-Trace one run. The reviewer is slow, and the worker is redeployed on day one. The history so far (simplified; real Temporal histories also
-interleave workflow-task and activity-started events):
+### Trace one run through a redeploy
+The reviewer is slow, and the worker is redeployed on day one. The history so far (simplified; real
+Temporal histories also interleave workflow-task and activity-started events):
 
 ```
 1 WorkflowExecutionStarted  ticket_id="T-812"
@@ -176,52 +203,123 @@ interleave workflow-task and activity-started events):
 4 TimerStarted              2 days   (from wait_condition's timeout)
 ```
 
-A new worker picks the workflow up and runs `run()` from the top. At `execute_activity(draft_reply)`
-the engine finds events 2 and 3 and returns the recorded draft without calling the model; at
-`wait_condition` it finds the timer and simply waits. The `approve` signal arrives on day two and is
-appended as a `WorkflowExecutionSignaled` event; the condition is now true, so the code schedules `send_reply`, which
-has no recorded result and therefore really runs. One model call in total, however many times the
-workers restarted.
+1. A new worker picks the workflow up and runs `run()` from the top.
+2. At `execute_activity(draft_reply)` the engine finds events 2 and 3 and returns the recorded draft
+   without calling the model.
+3. At `wait_condition` it finds the timer and simply waits.
+4. The `approve` signal arrives on day two and is appended as a `WorkflowExecutionSignaled` event; the
+   condition is now true.
+5. The code schedules `send_reply`, which has no recorded result and therefore really runs.
+
+- **One model call in total,** however many times the workers restarted.
+
+### A toy replay engine you can run
+Plain Python, no engine: a context records each step's result and, on replay, returns it instead of
+executing. It shows why steps before the crash cost nothing the second time, and how a code change
+surfaces as a non-determinism error.
+
+```python
+class Crash(Exception):
+    pass
+
+class Ctx:
+    def __init__(self, history):
+        self.history, self.pos, self.executed = history, 0, []
+
+    def activity(self, name, fn):
+        if self.pos < len(self.history):                  # replay: return the recorded result
+            recorded, result = self.history[self.pos]
+            if recorded != name:
+                raise RuntimeError(f"non-determinism: history has {recorded}, code asked {name}")
+        else:                                             # new step: really run it, then record
+            result = fn()
+            self.executed.append(name)
+            self.history.append((name, result))
+        self.pos += 1
+        return result
+
+def research(ctx, topic, crash_after=None):
+    notes = []
+    for i in range(4):
+        notes.append(ctx.activity(f"step{i}", lambda i=i: f"{topic}-note{i}"))
+        if crash_after == i:
+            raise Crash()
+    return notes
+
+history = []                                              # stands in for the durable store
+try:
+    research(Ctx(history), "kv", crash_after=1)
+except Crash:
+    pass
+ctx = Ctx(history)
+print(research(ctx, "kv"), ctx.executed)
+# ['kv-note0', 'kv-note1', 'kv-note2', 'kv-note3'] ['step2', 'step3']
+```
+
+- **Only `step2` and `step3` ran after the crash;** the first two returned recorded results.
+- **Rename a step and replay fails loudly,** which is why real engines need versioning patches.
+
+## Production patterns
+- **Model and tools in activities, decisions in the workflow.** Enforce it in code review and keep
+  workflow modules free of network clients; Temporal's Python SDK runs workflows in a sandbox that blocks
+  many non-deterministic calls. Alert on non-determinism errors after every deploy.
+- **Non-retryable errors and bounded retries.** Set a retry policy with a maximum attempts or expiry and
+  list validation and auth error types as non-retryable (Temporal's `RetryPolicy` accepts
+  `non_retryable_error_types`). Monitor retry counts per activity type and workflows open longer than
+  their expected duration.
+- **Heartbeats on long model calls.** Call `activity.heartbeat()` periodically inside multi-minute
+  activities and set a `heartbeat_timeout` well below the `start_to_close_timeout`, so a dead worker's
+  activity is rescheduled quickly. Monitor heartbeat timeouts per worker pool.
+- **Task-queue bulkheads.** Route GPU-bound inference activities to their own task queue with a worker
+  concurrency limit, and email or tool activities to another. Monitor queue backlog and schedule-to-start
+  latency per queue, which is the backpressure signal.
+- **Continue-as-new on a step budget.** For agent loops, count steps in workflow state and call
+  continue-as-new every few hundred steps, carrying only the needed state. Monitor history size and
+  replay latency.
+- **References, not payloads.** Store full documents and long transcripts in blob storage and pass keys
+  between activities, keeping history small. Monitor per-event payload size.
 
 ## Trade-offs
-- Crash-proof resumption and readable straight-line orchestration, in exchange for determinism rules
-  that are easy to violate; the trade pays off once a process has more than two steps or waits on
-  humans or timers.
-- Every step's inputs and outputs are persisted, giving a complete audit trail, but large payloads
+- **Crash-proof resumption vs determinism rules.** You get readable straight-line orchestration in
+  exchange for rules that are easy to violate; the trade pays off once a process has more than two steps
+  or waits on humans or timers.
+- **Full audit trail vs history bloat.** Every step's inputs and outputs are persisted, but large payloads
   (full documents, long transcripts) bloat history; pass references to blob storage instead.
-- Activity retries lift success rates, yet retrying an LLM activity re-spends tokens and may produce
-  a different answer; make the activity idempotent on its own cache or accept the cost knowingly.
-- Workflow versioning lets you change logic under running instances, but each patch is permanent
-  complexity until old histories drain; short-lived workflows can skip it, multi-week ones cannot.
-- Declarative state-machine services need no determinism discipline and integrate natively with cloud
-  services; they become painful when the branching is data-dependent, as in agent loops.
+- **Activity retries vs token spend.** Retries lift success rates, yet retrying an LLM activity re-spends
+  tokens and may produce a different answer; make the activity idempotent on its own cache or accept the
+  cost knowingly.
+- **Versioning vs permanent complexity.** It lets you change logic under running instances, but each
+  patch stays until old histories drain; short-lived workflows can skip it, multi-week ones cannot.
+- **Declarative state machines vs branching.** They need no determinism discipline and integrate natively
+  with cloud services, but become painful when branching is data-dependent, as in agent loops.
 
 ## Pitfalls
-- Calling the model or a tool directly from workflow code; it works in tests and then replays into a
+- **Calling the model or a tool directly from workflow code.** It works in tests, then replays into a
   second real call, visible as duplicated emails or doubled token bills after a worker restart.
-- Non-deterministic workflow code (`time.time()`, `uuid4()`, dict iteration order, reading config at
+- **Non-deterministic workflow code** (`time.time()`, `uuid4()`, dict iteration order, reading config at
   runtime), which surfaces as workflows failing with non-determinism errors only after a deploy.
-- Activities without idempotency keys, so an at-least-once retry after a crash performs the side
-  effect twice; the symptom is duplicates that correlate with deploys and worker restarts.
-- Unbounded agent loops in one history, discovered as slowly growing replay latency and memory until
+- **Activities without idempotency keys.** An at-least-once retry after a crash performs the side effect
+  twice; the symptom is duplicates that correlate with deploys and worker restarts.
+- **Unbounded agent loops in one history.** Discovered as slowly growing replay latency and memory until
   the workflow stalls; use continue-as-new on a step budget.
-- Retry policies left at defaults that retry forever, so an activity that fails on bad input
-  (a non-retryable error) keeps retrying for days; the symptom is workflows that never fail and never
-  finish. Mark validation and auth errors non-retryable and set a maximum attempts or expiry.
-- Missing heartbeats on long activities, so a dead worker's multi-minute inference is not rescheduled
+- **Retry policies left at defaults that retry forever.** An activity failing on bad input (a
+  non-retryable error) keeps retrying for days; workflows never fail and never finish. Mark validation and
+  auth errors non-retryable and set a maximum attempts or expiry.
+- **Missing heartbeats on long activities.** A dead worker's multi-minute inference is not rescheduled
   until the full timeout expires, inflating latency on every infrastructure hiccup.
 
 ## When to use
-Reach for durable execution when a process spans more than one side-effecting step, waits on timers
-or humans, or must survive deploys mid-flight: approvals, multi-step agent tasks, document pipelines,
-onboarding flows, anything the business would describe as "a case". Do not use it for a single
-request-response call or for pure data transformations where a queue and an idempotent consumer are
-enough. Measure workflow completion rate, time spent in each activity, retry counts per activity type
-and history size, and alert on non-determinism errors after deploys. In day-to-day work the pattern
-shows up as the discipline "model and tools in activities, decisions in the workflow". The
-agent-reliability module covers checkpoint stores and agent-specific recovery; this lesson is the
-general runtime they rest on. In interviews, explaining replay and why determinism follows from it
-is the expected depth.
+- **Use when** a process spans more than one side-effecting step, waits on timers or humans, or must
+  survive deploys mid-flight: approvals, multi-step agent tasks, document pipelines, onboarding flows,
+  anything the business would describe as "a case".
+- **Avoid for** a single request-response call or pure data transformations, where a queue and an
+  idempotent consumer are enough.
+- **Measure** workflow completion rate, time in each activity, retry counts per activity type and history
+  size; alert on non-determinism errors after deploys.
+- **Day to day:** the discipline "model and tools in activities, decisions in the workflow". The
+  agent-reliability module covers checkpoint stores and agent-specific recovery; this lesson is the
+  general runtime they rest on.
+- **Interviews:** explaining replay and why determinism follows from it is the expected depth.
 
 ## Role lens
 - **Engineer:** Writes activities for every model and tool call with timeouts, retries and idempotency
@@ -245,6 +343,36 @@ so no tokens are re-spent and no tools re-run, and only the interrupted step is 
 still needs an idempotency key, because the crash could have happened after the side effect and
 before the result was recorded. The team should also move the loop under a step budget with
 continue-as-new and add heartbeats to long model calls.
+
+## Interview questions
+### What is durable execution, and how does it differ from a job queue with retries?
+- **Durable execution** records every step's result in an event history and resumes by replaying it, so a
+  crash continues from the interrupted step.
+- **A queue with retries** is at-least-once for the whole job, so a crash re-runs every earlier model and
+  tool call; it also cannot express waits like "48 hours, then escalate".
+
+### Why can't workflow code call `datetime.now()` or the model directly?
+- **Recovery re-executes the code against history.** A different clock value or model answer would take a
+  different branch, the history would no longer match, and the engine would fail the workflow.
+- **So** use the engine's deterministic substitutes for time and randomness, and put every model call in an
+  activity whose recorded result replay returns.
+
+### After a deploy, workflows started failing with non-determinism errors. What happened and how do you fix it?
+- **Likely cause:** the new code changed the order or set of steps for histories recorded under the old
+  code, or added a non-deterministic call.
+- **Fix:** guard the change with a versioning patch so old histories take the old branch, remove the
+  non-deterministic call, and replay recorded production histories against new code in CI before deploying.
+
+### When would you pick a declarative state machine over a code-first engine?
+- **Fixed pipelines** with few data-dependent branches, where JSON-defined states, no determinism
+  discipline and native cloud integrations win.
+- **Not for agent loops,** whose branching depends on model output; a code-first engine expresses that as
+  ordinary control flow.
+
+### An agent workflow runs thousands of steps and replay is getting slow. What do you change?
+- **Continue-as-new on a step budget:** close the history and start a fresh one carrying only needed state.
+- **Shrink payloads:** store transcripts and documents in blob storage and pass references.
+- **Monitor history size and replay latency** so the budget is set from data, not guessed.
 
 ## Quiz
 ### Q: Why must durable workflow code be deterministic?

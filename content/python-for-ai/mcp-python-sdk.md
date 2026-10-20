@@ -5,7 +5,7 @@ name: MCP Python SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -230,7 +230,7 @@ A stateful Streamable HTTP server goes from 1 replica to 3 behind a round-robin 
 | 1 | 100% | Works |
 | 3, round-robin | roughly 1 in 3 | Intermittent "session not found" or 4xx errors on about two-thirds of follow-ups |
 | 3, sticky on session ID header | 100% | Works, but a replica restart drops its sessions |
-| 3, `stateless_http=True` | Not needed | Works; server-initiated messages that need a live session are gone |
+| 3, `stateless_http=True` | Not needed: no session to find | Works; server-initiated messages that need a live session are gone |
 
 ## Production patterns
 - **Keep stdout clean on stdio.** Configure `logging` to `sys.stderr` at startup, log through `ctx` for
@@ -266,16 +266,18 @@ A stateful Streamable HTTP server goes from 1 replica to 3 behind a round-robin 
 
 ## Pitfalls
 - **`print()` in a stdio server.** stdout is the protocol channel. Symptom: the host reports parse errors
-  or the server "disconnects" right after a log line.
+  or the server "disconnects" right after a log line. Fix: log to stderr or through `ctx`.
 - **Docstrings written for humans, not models.** The model picks tools from these descriptions. Symptom:
   the wrong tool chosen, or a destructive tool called without the intended precondition.
 - **Vague exceptions for expected failures.** FastMCP catches a tool's exception and returns it as an
   `isError` result carrying its message, so `raise Exception("failed")` gives the model nothing to act on.
   Symptom: the same bad call retried in a loop. Fix: say what was wrong and what to do instead.
 - **Blocking calls inside async tools.** Sync database drivers or `time.sleep` stall the whole server.
-  Symptom: every tool times out whenever one slow call is in flight.
+  Symptom: every tool times out whenever one slow call is in flight. Fix: use an async driver and
+  `await asyncio.sleep`, or push sync work to a thread with `anyio.to_thread.run_sync`.
 - **Stateful Streamable HTTP behind a round-robin load balancer.** Requests land on a process that never
   saw the session. Symptom: intermittent "session not found" or 4xx errors that vanish with one replica.
+  Fix: sticky routing on the session ID header, or `stateless_http=True`.
 - **No authentication or origin checks on Streamable HTTP.** Symptom: discovering that anything that can
   reach the port can invoke your tools.
 

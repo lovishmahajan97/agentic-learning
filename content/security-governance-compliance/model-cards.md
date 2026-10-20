@@ -5,7 +5,7 @@ name: Model cards
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - security-governance-compliance/model-governance
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
@@ -21,77 +21,96 @@ sources:
 ---
 
 ## TL;DR
-A model card is a short, structured document that travels with a model and states what it is for, what
-it is not for, how it was evaluated (broken down by the conditions that matter), and where it fails. It
-exists because a model's behaviour cannot be inferred from its weights or API, so the people deploying,
-approving and auditing it need the builder's knowledge written down, versioned, and tied to the exact
-artifact it describes.
+A model card is a short, versioned document that travels with a model: what it is for and not for, how
+it was evaluated per condition that matters, and where it fails. Deployers need it because behaviour
+cannot be read from weights.
 
 ## Why it exists
-A trained model is an opaque function. Someone downstream, another team, a customer, a regulator, has
-to decide whether it is safe to use for *their* purpose, and the only people who know the relevant
-facts (what data it saw, which populations it was tested on, where accuracy drops) are the builders.
-Without a written record, that knowledge lives in a notebook and a Slack thread and leaves with the
-engineer who trained it.
-
-The classic failure is silent scope creep. A classifier evaluated on adult English support tickets gets
-reused for a medical triage queue, or a summarizer tested on news is pointed at legal contracts. Nothing
-in the API tells the second team the model was never measured there. A single headline metric ("94%
-accuracy") makes this worse, because an aggregate can hide a subgroup where the model is much worse.
-
-The naive alternative, "the README describes the model", fails in three ways: it is unstructured, so
-critical sections (out-of-scope uses, disaggregated results) are simply absent; it is not tied to a
-version, so it describes last quarter's model; and it is written for users of the code, not for the
-reviewer who must approve a deployment. Mitchell et al. proposed model cards to fix exactly this: a
-fixed set of headings that forces the builder to answer the questions a deployer will ask. Regulation has
-since made the same demand: the EU AI Act requires technical documentation for high-risk systems and
-documentation that general-purpose model providers must pass to downstream providers.
+- **A trained model is an opaque function.** Another team, a customer or a regulator must decide whether
+  it is safe for *their* purpose, and only the builders know the facts: what data it saw, which
+  populations it was tested on, where accuracy drops.
+- **Unwritten knowledge leaves with the engineer.** Without a record it lives in a notebook and a Slack
+  thread.
+- **The classic failure is silent scope creep.** A classifier evaluated on adult English support tickets
+  is reused for a medical triage queue; a summarizer tested on news is pointed at legal contracts. Nothing
+  in the API says the model was never measured there. A headline metric ("94% accuracy") makes it worse,
+  because an aggregate can hide a subgroup where the model is much worse.
+- **"The README describes the model" fails three ways.** It is unstructured, so out-of-scope uses and
+  disaggregated results are simply absent; it is not tied to a version, so it describes last quarter's
+  model; and it is written for code users, not for the reviewer approving a deployment.
+- **Model cards force the deployer's questions.** Mitchell et al. proposed a fixed set of headings for
+  exactly this. Regulation now makes the same demand: the EU AI Act requires technical documentation for
+  high-risk systems, and documentation general-purpose model providers must pass to downstream providers.
 
 ## How it works
 ### The sections and why each exists
 The original proposal has nine sections; most production templates keep their spirit:
-1. **Model details**: owner, version, date, architecture, licence, contact. Exists *because* a card
-   that cannot be tied to one artifact and one accountable owner is unauditable.
-2. **Intended use and out-of-scope uses**: the primary use cases and users, and explicitly what the
-   model must not be used for. The out-of-scope list is the most valuable line in the card *because* it
-   is the only defence against reuse in a context nobody tested.
-3. **Factors**: the conditions along which performance is expected to vary: demographic groups,
-   languages, input channels, document types, device or sensor.
-4. **Metrics**: which metrics, why those, and the decision thresholds used, *because* "accuracy" means
+
+1. **Model details.** Owner, version, date, architecture, licence, contact. Exists *because* a card that
+   cannot be tied to one artifact and one accountable owner is unauditable.
+2. **Intended use and out-of-scope uses.** Primary use cases and users, and explicitly what the model must
+   not be used for. The out-of-scope list is the most valuable line in the card *because* it is the only
+   defence against reuse in a context nobody tested.
+3. **Factors.** Conditions along which performance is expected to vary: demographic groups, languages,
+   input channels, document types, device or sensor.
+4. **Metrics.** Which metrics, why those, and the decision thresholds used, *because* "accuracy" means
    nothing without knowing whether false positives or false negatives cost more.
-5. **Evaluation data** and 6. **Training data**: provenance, size, collection period, preprocessing,
-   known gaps. For third-party foundation models you often only know what the provider discloses; say so.
-7. **Quantitative analyses**: results *disaggregated* by the factors, with uncertainty where possible.
+5. **Evaluation data** and 6. **Training data.** Provenance, size, collection period, preprocessing,
+   known gaps. For third-party foundation models you often know only what the provider discloses; say so.
+7. **Quantitative analyses.** Results *disaggregated* by the factors, with uncertainty where possible.
    This is the core idea: an aggregate number averages away the subgroup that gets hurt.
-8. **Ethical considerations**: sensitive data, risks to people, mitigations applied.
-9. **Caveats and recommendations**: known failure modes and what a deployer must add (human review,
+8. **Ethical considerations.** Sensitive data, risks to people, mitigations applied.
+9. **Caveats and recommendations.** Known failure modes and what a deployer must add (human review,
    guardrails, monitoring).
 
 ### Model card vs system card vs datasheet
-A **datasheet** (Gebru et al.) documents a dataset: motivation, composition, collection, consent,
-recommended uses. A **model card** documents one model. A **system card** documents a deployed system:
-the model plus prompts, retrieval, tools, guardrails and human oversight. For most LLM applications the
-system card is what matters, *because* the same foundation model behaves very differently behind
-different prompts, tools and filters, and the risk lives in the composition. A good practice is a chain:
-the provider's model card, your fine-tune's card that references it, and a system card per deployment.
+| Document | Describes | Typical contents |
+|---|---|---|
+| **Datasheet** (Gebru et al.) | One dataset | Motivation, composition, collection, consent, recommended uses |
+| **Model card** | One model | The nine sections above |
+| **System card** | A deployed system | Model plus prompts, retrieval, tools, guardrails, human oversight |
+
+- **For most LLM applications the system card is what matters,** *because* the same foundation model
+  behaves very differently behind different prompts, tools and filters, and the risk lives in the
+  composition.
+- **Build a chain.** The provider's model card, your fine-tune's card that references it, and a system
+  card per deployment.
 
 ### Making it a living artifact
-A card written once at launch rots. The mechanism that keeps it honest is automation:
-- Store the card next to the model in the registry, keyed by the immutable version (or weights hash),
-  so promoting a version without a card is a failed check, *because* a card that can drift from its
-  artifact is worse than none: it lends false authority to the wrong model.
-- Generate the quantitative section from the evaluation pipeline, not by hand, so the numbers in the
-  card are the numbers that gated the release.
-- Require human-written sections (intended use, out-of-scope, caveats) to be reviewed when the eval
-  set, training data or intended use changes, and record who signed them, *because* intent is the one
+A card written once at launch rots. Automation keeps it honest:
+- **Key it to the immutable version.** Store the card next to the model in the registry, keyed by version
+  or weights hash, so promoting a version without a card is a failed check, *because* a card that can
+  drift from its artifact is worse than none: it lends false authority to the wrong model.
+- **Generate the numbers.** Write the quantitative section from the evaluation pipeline, not by hand, so
+  the card's numbers are the numbers that gated the release.
+- **Review the human sections on change.** Intended use, out-of-scope and caveats are re-reviewed when the
+  eval set, training data or intended use changes, with the signer recorded, *because* intent is the one
   thing a pipeline cannot measure.
-- Make the gate fail on *missing* evidence, not only on bad evidence: a declared factor with no slice, or
-  a slice too small to be meaningful, blocks release just as a low score does. Otherwise the cheapest way
-  to pass is to not measure.
-- Keep machine-readable metadata (Hugging Face model cards put YAML front matter above Markdown) so the
-  inventory can query licence, task and owner across all models.
+- **Fail on missing evidence, not only bad evidence.** A declared factor with no slice, or a slice too
+  small to mean anything, blocks release just as a low score does. Otherwise the cheapest way to pass is
+  to not measure.
+- **Keep machine-readable metadata.** Hugging Face model cards put YAML front matter above Markdown, so
+  the inventory can query licence, task and owner across all models.
 
-## Example
+## Diagram
+Follow a model version from training to promotion: the gate passes only when the card exists, every
+declared factor has a big enough slice, and the human sections are signed.
+
+```mermaid
+flowchart TD
+    T["Train or fine-tune version"] --> E["Eval pipeline on frozen set"]
+    E -->|"scores per slice with n"| G["Card generator"]
+    H["Human sections: intended use, out-of-scope, caveats"] --> G
+    G --> C[("Card in registry, keyed by version")]
+    C --> Q{"Release gate"}
+    Q -->|"slice below threshold"| B["Blocked or scope narrowed"]
+    Q -->|"slice too small or unmeasured"| B
+    Q -->|"all slices pass and signed"| P["Promote version"]
+    B -->|"fix or add out-of-scope line"| H
+```
+
+## Examples
+### Release gate that writes the card's quantitative section
 A team fine-tunes a small model to route insurance claims emails into 12 queues. The release pipeline
 writes the quantitative section from eval results, and a gate refuses promotion when any factor slice
 falls below the threshold the card declares.
@@ -128,48 +147,80 @@ if failing or too_small or untested:
     raise SystemExit("Release blocked: a slice is below threshold, under-sampled, or unmeasured")
 ```
 
-Why the aggregate hides the problem: if production traffic is roughly 60% web form, 31% email, 8% broker
-portal and 1% fax, the traffic-weighted score is about 0.6 × 0.91 + 0.31 × 0.89 + 0.08 × 0.78 +
-0.01 × 0.88 ≈ 0.89 (F1 does not decompose exactly by slice, but the order of magnitude holds). The
-headline clears 0.85 comfortably, while broker-portal claims, which are a small share of traffic but all
-come from one class of customer, get a router measurably worse than everyone else's. The card surfaces it, and the team either fixes it or ships with "broker portal
-out of scope" written down.
+### Worked numbers: why the aggregate hides the problem
+Assume production traffic splits as below (scores from the eval run above).
 
-The gate also refuses two kinds of false comfort. `fax_scan` scores 0.88, but on 40 examples that number
-is noise: for an accuracy-like metric near 0.8, the standard error at n = 100 is already
-√(0.8 × 0.2 / 100) ≈ 0.04, so a 95% interval is about ±0.08, and at n = 40 it is wider still. And
-`language_variant` is declared as a factor with no slice at all; a declared factor that was never measured
-is a silent gap, not a pass. Both become caveats a reviewer must read, instead of numbers that look fine.
+| Channel | Share of traffic | Macro-F1 | Contribution |
+|---|---|---|---|
+| Web form | 60% | 0.91 | 0.6 × 0.91 |
+| Email | 31% | 0.89 | 0.31 × 0.89 |
+| Broker portal | 8% | 0.78 | 0.08 × 0.78 |
+| Fax | 1% | 0.88 | 0.01 × 0.88 |
+| **Traffic-weighted** | | **≈ 0.89** | clears 0.85 comfortably |
+
+- **The headline passes, a customer class fails.** F1 does not decompose exactly by slice, but the order
+  of magnitude holds. Broker-portal claims are a small share of traffic but all come from one class of
+  customer, who gets a router measurably worse than everyone else's.
+- **The card surfaces it.** The team either fixes it or ships with "broker portal out of scope" written
+  down.
+- **Small slices are noise.** `fax_scan` scores 0.88, but on 40 examples that means little. For an
+  accuracy-like metric near 0.8 the standard error at n = 100 is already √(0.8 × 0.2 / 100) ≈ 0.04, so a
+  95% interval is about ±0.08; at n = 40 it is wider still.
+- **Unmeasured is not passed.** `language_variant` is declared as a factor with no slice at all. Both it
+  and the fax slice become caveats a reviewer must read, instead of numbers that look fine.
+
+## Production patterns
+- **Card as a registry promotion check.** When models live in a registry (MLflow, SageMaker, Vertex),
+  attach the card as an artifact of the exact model version and make the promotion job fail if it is
+  missing or its version field differs. Monitor promotions blocked for missing cards.
+- **Eval run ID inside the card.** Have the eval job write its run ID and eval-set hash into the card's
+  quantitative section, so any number can be reproduced from a stored run. Monitor cards whose run ID no
+  longer resolves to a stored run.
+- **Owners on the human-written sections.** Keep cards in the repo and use a CODEOWNERS entry so changes to
+  intended use or out-of-scope need approval from the named product owner. Track review age against the
+  last change to training data or eval set.
+- **Front-matter metadata for the inventory.** Fill the Hugging Face model card YAML fields such as
+  `license`, `pipeline_tag` and `base_model`, plus your own owner and risk tier, then index them nightly.
+  Monitor coverage: share of inventory entries with a current card.
+- **Provider card plus your system card.** For a vendor model, store the provider's card link and retrieval
+  date with the model version you call, and re-check it whenever the provider ships a new version. Alert
+  when the model version in traffic differs from the one your system card references.
 
 ## Trade-offs
-- A strict template gives comparability across hundreds of models, but invites box-ticking; it flips
-  to a liability when reviewers accept boilerplate instead of reading the out-of-scope list.
-- Disaggregated metrics expose hidden failures but need labelled slices; when slice sizes are tiny the
-  numbers are noisy, so report counts and intervals or the card becomes misleadingly precise.
-- Publishing detailed cards builds customer and regulator trust, but can reveal competitive or
-  security-relevant details; split into a public card and an internal annex when that matters.
-- Automating cards from the pipeline keeps numbers current, but generated text cannot state intent;
-  the human-written sections still need an owner and a review trigger.
+- **Strict template vs box-ticking.** A fixed template gives comparability across hundreds of models but
+  invites boilerplate; it becomes a liability when reviewers accept boilerplate instead of reading the
+  out-of-scope list.
+- **Disaggregated metrics vs noise.** Slices expose hidden failures but need labelled slices. When slice
+  sizes are tiny the numbers are noisy, so report counts and intervals or the card becomes misleadingly
+  precise.
+- **Public detail vs exposure.** Detailed cards build customer and regulator trust, but can reveal
+  competitive or security-relevant details; split into a public card and an internal annex when that
+  matters.
+- **Automation vs intent.** Generating cards from the pipeline keeps numbers current, but generated text
+  cannot state intent; the human-written sections still need an owner and a review trigger.
 
 ## Pitfalls
-- Writing the card after launch from memory; the symptom is numbers in the card that nobody can
-  reproduce from any stored eval run.
-- Reporting only the aggregate metric; the symptom is a complaint from one customer segment that the
-  card's headline number says should not exist.
-- Documenting the base model but not the system; the symptom is an audit question about the guardrails
-  or retrieval sources that no document answers.
-- Leaving out-of-scope uses empty or generic ("do not use for illegal purposes"); the symptom is the
-  model quietly appearing in a second product with a different risk profile.
-- Not versioning the card with the model; the symptom is a card describing a model three versions old.
+- **Writing the card after launch from memory.** Symptom: numbers in the card that nobody can reproduce
+  from any stored eval run. Fix: generate them from the gating eval run.
+- **Reporting only the aggregate metric.** Symptom: a complaint from one customer segment that the
+  headline number says should not exist. Fix: disaggregate by every declared factor.
+- **Documenting the base model but not the system.** Symptom: an audit question about guardrails or
+  retrieval sources that no document answers. Fix: a system card per deployment.
+- **Empty or generic out-of-scope uses ("do not use for illegal purposes").** Symptom: the model quietly
+  appears in a second product with a different risk profile. Fix: name the concrete uses you never tested.
+- **Not versioning the card with the model.** Symptom: a card describing a model three versions old. Fix:
+  key the card to the version and gate promotion on it.
 
 ## When to use
-Write one for every model or AI system that another team, a customer or an approver relies on, and make
-it a release gate rather than a wiki page. Depth should scale with risk: a low-risk internal tagger needs
-a half-page card, while a system in an employment, credit or health decision needs full disaggregated
-evaluation, data provenance and a system card. For third-party models, collect the provider's card and
-write your own system card on top. Measure card health by coverage (share of inventory entries with a
-current card) and staleness (versions shipped without a card update). In interviews, the strong signal is
-knowing that out-of-scope uses and disaggregated results are the point, not the formatting.
+- **Use when:** any model or AI system that another team, a customer or an approver relies on. Make it a
+  release gate rather than a wiki page.
+- **Scale depth with risk:** a low-risk internal tagger needs a half-page card; a system in an employment,
+  credit or health decision needs full disaggregated evaluation, data provenance and a system card.
+- **Third-party models:** collect the provider's card and write your own system card on top.
+- **Measure:** coverage (share of inventory entries with a current card) and staleness (versions shipped
+  without a card update).
+- **Interviews:** the strong signal is knowing that out-of-scope uses and disaggregated results are the
+  point, not the formatting.
 
 ## Role lens
 - **Engineer:** Wires the eval pipeline to write the card's quantitative section and adds a registry check
@@ -190,6 +241,39 @@ references the vendor card and adds intended use (answering policy questions, no
 decisions), out-of-scope uses, groundedness and refusal results on our own HR question set broken down by
 policy area and language, known failure modes such as stale documents, and the human escalation path. It
 must be versioned with the prompt and index, because changing either changes behaviour.
+
+## Interview questions
+### What is a model card, and why is a good README not enough?
+- **Definition:** a structured, versioned document tied to one model artifact: details, intended and
+  out-of-scope uses, factors, metrics, data, disaggregated results, ethics and caveats.
+- **Why not a README:** it is unstructured, so the out-of-scope list and slice results are usually
+  missing, and it is not tied to a version, so it drifts from the model actually deployed.
+
+### Your model scores 0.92 overall but a customer segment complains it is bad for them. How do you investigate?
+- **Slice the eval by that segment's factors** (channel, language, document type) and report n with each
+  score; the aggregate weights slices by frequency, so a small segment barely moves it.
+- **Check whether the segment was ever measured.** If its slice is missing or tiny, the card should say
+  "untested", and the gate should have blocked on it.
+- **Then decide:** fix with targeted data, or narrow intended use and write the exclusion into the card.
+
+### How small is too small for a slice in the card?
+- **Use the standard error.** Near 0.8 accuracy, n = 100 gives about ±0.08 at 95%, so differences
+  smaller than that are noise.
+- **Set a minimum n per slice** (the example uses 200) and treat smaller slices as caveats, not passes.
+- **Report counts and intervals** next to every number so readers can judge precision themselves.
+
+### When would you write a system card instead of, or as well as, a model card?
+- **Whenever a model is composed with prompts, retrieval, tools or filters,** because the risk lives in
+  the composition and the same base model behaves very differently behind each one.
+- **For a vendor LLM** you cannot write its model card; you collect the provider's and write a system card
+  per deployment that references it.
+- **Version the system card with the prompt and index,** since changing either changes behaviour.
+
+### How do you stop model cards going stale across hundreds of models?
+- **Make the card a promotion gate** keyed to the immutable version, so no card means no release.
+- **Generate the numbers from the gating eval run** and require re-review of human sections when data,
+  eval set or intended use change.
+- **Measure coverage and staleness** across the inventory and report them to the governance owner.
 
 ## Quiz
 ### Q: Which model card section most directly prevents a model being reused in a context it was never tested in?

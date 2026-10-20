@@ -5,7 +5,7 @@ name: Drift
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - llmops-platform/model-monitoring
   - llmops-platform/golden-dataset-strategy
@@ -23,128 +23,133 @@ sources:
 ---
 
 ## TL;DR
-A system validated on one distribution is deployed into a world that keeps moving. Drift is any change
-between the conditions you validated under and the ones you now serve: inputs change (data drift), the
-right answer for an input changes (concept drift), or, specific to LLM applications, the model, prompt,
-corpus, embedder or judge changes underneath an unchanged system. Detection compares traffic windows
-against a reference; the decision is always whether the shift changed outcomes, and what to re-validate.
+Drift is any change between the conditions you validated under and the ones you serve: inputs, the right
+answer, or (in LLM apps) the model, prompt, corpus, embedder or judge. Detect it against a reference
+window; act only if outcomes changed.
 
 ## Why it exists
-Every evaluation is a snapshot. A golden set, a canary and an offline benchmark all say "the system
-behaved acceptably on *this* distribution at *this* time". Nothing in that statement survives a change
-in either variable. Users start asking about a product launched after the corpus was indexed. A new
-customer segment writes in a language the prompt was never tuned on. A regulation changes, so the
-correct answer to "can I return this?" flips while the question text does not. The vendor retrains the
-model behind the alias you call. Each of these quietly moves production away from the thing you
-validated, and none of them raises an error.
-
-The naive responses fail in predictable ways. "We'll re-run the golden set weekly" catches regressions
-on old questions, not failures on new ones, because the golden set is frozen on the old distribution.
-"We'll watch the quality metric" is right in spirit but late in practice: judged quality needs enough
-samples to be significant and labels arrive days later, so a drift that began on Monday shows up as a
-quality alert the following week. "We'll retrain or re-index on a schedule" is a cost with no
-diagnosis: it fixes some drifts, cannot fix others (a prompt that is now wrong), and tells you nothing
-about which one you had.
-
-Drift as a concept exists to separate three questions that get conflated: *what* moved (inputs,
-outcomes, or a component of the system), *how* it moved (abrupt, gradual, seasonal) and *whether it
-matters* (did the shift change the error rate on the slice it affected). Only the third question
-justifies action, but you cannot answer it without the first two.
+- **Every evaluation is a snapshot.** A golden set, a canary and a benchmark all say "acceptable on
+  *this* distribution at *this* time"; nothing in that survives a change in either variable.
+- **The world moves quietly.** Users ask about a product launched after indexing; a new segment writes in
+  an untuned language; a regulation flips the right answer to "can I return this?" while the question
+  text does not; the vendor retrains the model behind your alias. None raises an error.
+- **Naive responses fail predictably.**
+  - "Re-run the golden set weekly" catches regressions on old questions, not failures on new ones, because
+    the set is frozen on the old distribution.
+  - "Watch the quality metric" is right in spirit but late: judged quality needs enough samples and labels
+    arrive days later, so Monday's drift alerts the following week.
+  - "Retrain or re-index on a schedule" is cost without diagnosis: it fixes some drifts, cannot fix others
+    (a prompt that is now wrong), and tells you nothing about which you had.
+- **The concept separates three questions:** *what* moved (inputs, outcomes, or a component), *how* it
+  moved (abrupt, gradual, seasonal), and *whether it matters* (did the error rate change on the affected
+  slice). Only the third justifies action, but you cannot answer it without the first two.
 
 ## How it works
 ### The statistical vocabulary
-Treat the system as a function from inputs **X** to outputs **Y**, validated on data drawn from a
-joint distribution P(X, Y). Drift is any change in that joint distribution, and it is useful to name
-which factor moved:
+Treat the system as a function from inputs **X** to outputs **Y**, validated on data from a joint
+distribution P(X, Y). Drift is any change in it; name which factor moved:
 
-- **Covariate shift (data / input drift):** P(X) changes, P(Y|X) does not. The questions are different,
-  but each question still has the same right answer. A support bot starts receiving shipping
-  questions instead of billing questions. The system may still be correct; it may also now be
-  operating in a region it was never validated on.
-- **Prior / label shift:** P(Y) changes while P(X|Y) stays put. The mix of correct outcomes moves. A fraud classifier sees
-  fraud go from 1% to 3% of traffic; thresholds tuned for the old base rate are now wrong even if the
-  model's scores are unchanged.
-- **Concept drift:** P(Y|X) changes. The same input now has a different correct output. Policy
-  changes, price changes, a new law, a renamed product. This is the dangerous one because it is
-  invisible in the inputs: the questions look identical, and only ground truth reveals the change.
-- **Prediction / output drift:** the distribution of what the system *emits* changes. Observable on
-  every request without labels, which makes it the cheapest early-warning signal, but ambiguous: it
-  happens under any of the three above and also when the system itself changes.
+| Type | What changes | Example | Visible without labels? |
+|---|---|---|---|
+| **Covariate shift** (data / input drift) | P(X); P(Y\|X) stays | support bot gets shipping instead of billing questions; may be correct, but outside validated territory | yes |
+| **Prior / label shift** | P(Y); P(X\|Y) stays | fraud goes from 1% to 3% of traffic; thresholds tuned for the old base rate are wrong even if scores are unchanged | partly |
+| **Concept drift** | P(Y\|X) | policy, price, law or product name changes; same input, new correct output | no: the dangerous one, only ground truth reveals it |
+| **Prediction / output drift** | what the system emits | output length or refusal mix moves | yes: cheapest early warning, but ambiguous (happens under all of the above and when the system changes) |
 
-For a generative system Y is free text, so read it as "the correct behaviour": label shift then means,
-for example, that the share of requests whose right response is "escalate to a human" or "refuse" has
-moved, which matters because prompts and thresholds were tuned for the old mix.
+- **For generative systems Y is "the correct behaviour".** Label shift then means, for example, the share
+  of requests whose right response is "escalate to a human" or "refuse" has moved, which matters because
+  prompts and thresholds were tuned for the old mix.
 
-Drift also has a shape (the Gama et al. taxonomy): **sudden** (a release, a provider update),
-**gradual** (new segment ramping up), **incremental** (slow vocabulary change) and **recurring**
-(seasonality: tax season, Black Friday). The shape decides the detector: a sudden shift needs a short
-window and a change-point test; a gradual one needs a long window and a trend test; a recurring one
-needs a baseline from the same season, not last week.
+### Drift shape decides the detector (Gama et al. taxonomy)
+| Shape | Typical cause | Detector |
+|---|---|---|
+| **Sudden** | a release, a provider update | short window and a change-point test |
+| **Gradual** | new segment ramping up | long window and a trend test |
+| **Incremental** | slow vocabulary change | long window and a trend test |
+| **Recurring** | seasonality: tax season, Black Friday | baseline from the same season, not last week |
 
 ### What drifts in an LLM application that did not drift in classic ML
-In classic ML the model was yours and frozen; only the world moved. In LLM systems the components move
-too, and each is a separate drift source with its own detector and fix:
+In classic ML the model was yours and frozen; only the world moved. In LLM systems components move too,
+each with its own detector and fix:
 
-- **Upstream model drift:** a provider updates the model behind an alias, or changes a default. Same
-  prompt, different behaviour across *all* tenants at one timestamp. Detected by proxy metrics
-  shifting globally at once and by the response's reported model id. Fixed by pinning snapshots and
-  treating upgrades as releases.
-- **Prompt and configuration drift:** someone edits the system prompt, a tool description, or a
-  temperature without going through the release path. Detected by hashing the resolved bundle on every
-  request and alerting when the hash changes without a deploy.
-- **Knowledge / corpus drift:** the RAG index falls behind the world (stale prices, retired policies).
-  Inputs and model are unchanged; answers are confidently out of date. Detected by document age at
-  retrieval time and by groundedness checks against the *current* source of truth, not the index.
-- **Embedding drift:** the embedder is upgraded but the index was built with the old one; query and
-  document vectors no longer live in the same space. Detected by a collapse in retrieval scores on a
-  fixed probe set. Fixed by versioning embeddings with the index and re-indexing together.
-- **Judge drift:** the LLM-as-a-judge is itself an alias that gets updated; every quality series steps
-  on the day the judge changed. Detected by re-scoring a fixed, human-labelled calibration set on a
-  schedule.
-- **Feedback-loop drift:** users adapt to the system (they learn which phrasings work) and the
-  system's outputs enter its own corpus or training data. Slow and self-reinforcing; detected only by
-  comparing against held-out, never-served data.
+| Source | What happens | Detect by | Fix |
+|---|---|---|---|
+| **Upstream model** | provider updates the model behind an alias or changes a default; same prompt, new behaviour across *all* tenants at one timestamp | proxies shifting globally at once; the response's reported model id | pin snapshots; treat upgrades as releases |
+| **Prompt / configuration** | someone edits the system prompt, a tool description or temperature outside the release path | hash the resolved bundle per request; alert on hash change without a deploy | route edits through releases |
+| **Knowledge / corpus** | RAG index falls behind (stale prices, retired policies); answers confidently out of date | document age at retrieval; groundedness against the *current* source of truth, not the index | refresh the corpus |
+| **Embedding** | embedder upgraded but index built with the old one; vectors no longer share a space | collapse in retrieval scores on a fixed probe set | version embeddings with the index; re-index together |
+| **Judge** | the LLM-as-a-judge alias updates; every quality series steps that day | re-score a fixed, human-labelled calibration set on a schedule | re-calibrate and pin |
+| **Feedback loop** | users learn which phrasings work; outputs enter the system's own corpus or training data | only by comparing against held-out, never-served data | keep held-out data |
 
 ### Detecting it
-Detection is always a comparison between a **reference window** (the traffic you validated on, or the
-same period last cycle) and a **current window**, per feature and per slice:
+Detection compares a **reference window** (the validated traffic, or the same period last cycle) with a
+**current window**, per feature and per slice:
 
-1. Choose the signal. For categorical features (intent, language, tenant, tool called, finish reason)
-   use the bucket distribution. For numeric ones (input length, retrieval score, latency) bucket them
-   or use the empirical CDF. For free text, embed it and compare the embedding clouds.
-2. Pick a statistic. **PSI** (population stability index) for bucketed distributions:
-   `PSI = Σ_b (cur_b − ref_b) · ln(cur_b / ref_b)`, a symmetric, interpretable number where 0 means
-   identical. The credit-risk rule of thumb treats under 0.1 as stable, 0.1–0.25 as worth a look, and
-   above 0.25 as a real shift; those cut-offs are convention, not theory, and should be re-derived from
-   your own history. **KS test** for continuous features. **Jensen–Shannon divergence** when you want
-   a bounded, symmetric measure. For embeddings, the **classifier two-sample test**: train a classifier
-   to tell reference from current; an AUC near 0.5 means indistinguishable, and the classifier's most
-   confident "current" examples show *what* moved, which a single divergence number never does.
-3. Control for noise. Require minimum window sizes, compare like with like (same weekday, same
-   season), and slice by tenant and intent, because a global PSI of 0.03 can hide one tenant at 0.6.
-4. Separate "the world moved" from "the system moved". Re-run a **frozen probe set** (a fixed slice of
-   the golden set with known-good outputs) on a schedule and whenever an alert fires. It is a control:
-   its inputs never change, so if its scores move, a component changed (model, prompt, embedder, judge);
-   if it is stable while production metrics move, the world changed. This one check halves most drift
-   investigations.
-5. Separate "moved" from "broke". A detected shift raises priority for the slow signals: route more of
-   that slice to judging and human review, and check whether error rate on it changed. Input drift
-   with stable outcomes is information, not an incident. Concept drift can only be confirmed by
-   labels, so the detector's job is to decide where to spend them.
+1. **Choose the signal.**
+   - Categorical features (intent, language, tenant, tool called, finish reason): bucket distribution.
+   - Numeric (input length, retrieval score, latency): buckets or the empirical CDF.
+   - Free text: embed it and compare the embedding clouds.
+2. **Pick a statistic.**
+   - **PSI** (population stability index) for buckets: `PSI = Σ_b (cur_b − ref_b) · ln(cur_b / ref_b)`, a
+     symmetric, interpretable number where 0 means identical.
+   - **PSI cut-offs (credit-risk rule of thumb):** under 0.1 stable, 0.1–0.25 worth a look, above 0.25 a
+     real shift. Convention, not theory: re-derive them from your own history.
+   - **KS test** for continuous features; **Jensen–Shannon divergence** for a bounded, symmetric measure.
+   - **Classifier two-sample test** for embeddings: train a classifier to tell reference from current. AUC
+     near 0.5 means indistinguishable, and its most confident "current" examples show *what* moved, which
+     a single divergence number never does.
+3. **Control for noise.** Minimum window sizes, like-with-like comparisons (same weekday, same season),
+   and slicing by tenant and intent, because a global PSI of 0.03 can hide one tenant at 0.6.
+4. **Separate "the world moved" from "the system moved".** Re-run a **frozen probe set** (a fixed slice of
+   the golden set with known-good outputs) on a schedule and whenever an alert fires. Its inputs never
+   change, so if its scores move, a component changed (model, prompt, embedder, judge); if it holds while
+   production moves, the world changed. This one check halves most drift investigations.
+5. **Separate "moved" from "broke".** A shift raises priority for slow signals: route more of that slice to
+   judging and human review and check whether its error rate changed. Input drift with stable outcomes is
+   information, not an incident. Concept drift is confirmed only by labels, so the detector decides where
+   to spend them.
 
 ### Responding
-Each drift type has a different fix, which is why diagnosis comes first: new inputs → extend the
-golden set and prompt coverage; concept drift → update the corpus, policy text or labels, then
-re-validate; upstream model change → pin, evaluate, canary; embedding mismatch → re-index; judge shift
-→ re-calibrate and pin. Retraining is the answer to one of these, not to all of them. Whatever the
-fix, the reference window moves forward afterwards, because the newly validated distribution is the
-new baseline.
+Diagnosis comes first because each type has a different fix:
 
-## Example
+| Diagnosis | Fix |
+|---|---|
+| New inputs | extend the golden set and prompt coverage |
+| Concept drift | update the corpus, policy text or labels, then re-validate |
+| Upstream model change | pin, evaluate, canary |
+| Embedding mismatch | re-index |
+| Judge shift | re-calibrate and pin |
+
+- **Retraining fixes one of these, not all of them.**
+- **Move the reference window forward after the fix**, because the newly validated distribution is the
+  new baseline.
+
+## Diagram
+The frozen probe set is the first fork: it tells you whether to inspect components or the world, and only
+a change in outcomes turns a shift into work.
+
+```mermaid
+flowchart TD
+    A["Drift alert on a slice"] --> P["Re-run frozen probe set"]
+    P -->|"probe scores moved"| S["System changed"]
+    S --> K["Check model id, bundle hash, embedder, judge"]
+    K --> F1["Pin, re-index or re-calibrate"]
+    P -->|"probe stable"| W["World changed"]
+    W --> L["Judge and review more of the slice"]
+    L --> O{"Error rate changed?"}
+    O -->|"no"| I["Information: advance reference window"]
+    O -->|"yes"| F2["Update corpus, prompt, golden set"]
+    F1 --> V["Re-validate, advance reference"]
+    F2 --> V
+```
+
+## Examples
+### PSI on intent mix and a classifier two-sample test on embeddings
 Two detectors on one week of support-assistant traffic: PSI on the intent mix, and a classifier
-two-sample test on input embeddings. The intent shift is real but moderate; the embedding test on a
-synthetic shift shows what a clearly separable week looks like (AUC ≈ 0.87–0.88) versus an unshifted
-one (≈ 0.5 on the same code, give or take cross-validation noise).
+two-sample test on input embeddings.
+- **The intent shift** is real but moderate.
+- **The embedding test on a synthetic shift** shows what a clearly separable week looks like (AUC ≈
+  0.87–0.88) versus an unshifted one (≈ 0.5 on the same code, give or take cross-validation noise).
 
 ```python
 import numpy as np
@@ -177,51 +182,111 @@ print(f"embedding drift AUC = {embedding_drift_auc(ref_emb, cur_emb):.2f}")   # 
 # Ceiling for a linear separator: Phi(0.6*sqrt(8)/sqrt(2)) = Phi(1.2) ~ 0.885
 ```
 
-Reading the PSI by hand: the returns bucket contributes (0.33 − 0.20) · ln(1.65) ≈ 0.065, billing
-(0.22 − 0.30) · ln(0.733) ≈ 0.025, shipping ≈ 0.011, the two unchanged buckets 0. The total of ≈ 0.10
-says the mix moved noticeably; whether it matters depends on whether the returns slice, now a third of
-traffic, was well covered by the prompt and golden set.
+Reading the PSI by hand:
+
+| Bucket | ref → cur | Contribution |
+|---|---|---|
+| returns | 0.20 → 0.33 | (0.33 − 0.20) · ln(1.65) ≈ 0.065 |
+| billing | 0.30 → 0.22 | (0.22 − 0.30) · ln(0.733) ≈ 0.025 |
+| shipping | 0.25 → 0.20 | ≈ 0.011 |
+| account, other | unchanged | 0 |
+| **Total** | | **≈ 0.10** |
+
+- **Interpretation:** the mix moved noticeably; whether it matters depends on whether the returns slice,
+  now a third of traffic, was well covered by the prompt and golden set.
+
+### Catching configuration drift with a bundle hash
+Pure Python: hash the *resolved* bundle on every request and flag any hash that no deploy produced. This
+catches prompt and parameter edits that bypassed the release path.
+
+```python
+import hashlib, json
+
+def bundle_hash(bundle: dict) -> str:
+    canon = json.dumps(bundle, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canon.encode()).hexdigest()[:12]
+
+released = {"model": "m-2026-05", "prompt": "Answer using the policy docs.", "temperature": 0.2}
+deployed_hashes = {bundle_hash(released)}           # written by the release pipeline
+
+def check_request(resolved: dict):                 # None if the hash came from a deploy
+    h = bundle_hash(resolved)
+    return None if h in deployed_hashes else f"config drift: hash {h} not from any deploy"
+
+print(check_request(dict(released)))                           # None
+print(check_request({**released, "temperature": 0.7}))         # flagged: someone edited a default
+```
+
+### Worked triage: three alerts, three different fixes
+Illustrative week for a support assistant; the probe set splits each case in one step.
+
+| Alert | Frozen probe set | Other evidence | Diagnosis | Fix |
+|---|---|---|---|---|
+| Refusal rate up on every tenant at 02:00 | dropped | reported model id changed | upstream model drift | pin snapshot, evaluate, canary |
+| Retrieval scores down, citations irrelevant | dropped on retrieval probes | embedder upgraded last night | embedding drift | re-index with the new embedder, or revert it |
+| Returns intent up to 33% (PSI 0.10) | stable | judged error rate on returns unchanged | covariate shift, harmless | add returns cases to the golden set, advance reference |
+
+## Production patterns
+- **Resolved-bundle hash on every trace.** Compute a hash over model id, prompt text, tool schemas and
+  decoding parameters at request time and attach it to the trace; alert when a hash appears that the
+  release pipeline did not record. Monitor distinct hashes per environment per day.
+- **Scheduled frozen probe set.** Run a fixed set of a few dozen to a few hundred golden cases (size is
+  illustrative) daily and on every drift alert, through the full production path. Monitor probe scores as
+  their own time series; any move without a deploy means a component changed.
+- **Slice-level PSI with smoothing.** Compute PSI per tenant and intent with an epsilon or a pooled
+  "other" bucket so new categories do not produce infinities, and rank slices by score instead of
+  alerting on each. Monitor the top-ranked slices weekly and the count of unseen categories.
+- **Seasonal reference windows.** For recurring traffic, compare against the same weekday or the same
+  period last cycle (month-end, tax season) rather than the previous week. Monitor alert recurrence: an
+  alert that fires every Monday means the baseline is wrong.
+- **Embedding version stamped on the index.** Store the embedder id in index metadata and check it at
+  query time, refusing or alerting on a mismatch, so an embedder upgrade cannot silently query an old
+  index. Monitor mean top-k retrieval score on a fixed probe query set.
+- **Library-backed drift reports.** Tools such as Evidently compute per-column drift tests (PSI, KS,
+  Jensen–Shannon and others) between a reference and current dataset; run them as a scheduled job on
+  logged features. Monitor the share of drifted columns per slice, not a single global flag.
 
 ## Trade-offs
-- Label-free detectors (PSI, embedding tests, output proxies) are cheap and immediate but cannot see
-  concept drift; the moment ground truth lags by weeks, you need both, and the detectors decide where
-  the scarce labels go.
-- Short windows catch sudden shifts fast but alert on noise; long windows are stable but late. Running
-  both, with different thresholds, is usually cheaper than tuning one window to do both jobs.
-- Fine slicing exposes per-tenant drift that aggregates hide, yet each slice shrinks the sample and
-  multiplies alert series; beyond a few dozen slices, rank slices by drift score rather than alerting
-  on each.
-- Pinning every component (model snapshot, embedder, judge) makes drift attributable and removes a
-  whole class of surprises, at the price of a scheduled upgrade burden and the risk of running on a
-  model the provider is about to retire.
-- Moving the reference window forward after each validated change keeps detectors relevant, but if
-  you move it without validating you quietly normalise the drift you were supposed to catch.
+- **Label-free detectors: cheap and immediate vs blind to concept drift.** PSI, embedding tests and
+  output proxies cannot see it; once ground truth lags by weeks you need both, and the detectors decide
+  where scarce labels go.
+- **Short vs long windows.** Short windows catch sudden shifts fast but alert on noise; long windows are
+  stable but late. Running both with different thresholds is usually cheaper than tuning one to do both.
+- **Fine slicing: exposes hidden drift vs shrinking samples.** Each slice multiplies alert series; beyond a
+  few dozen slices, rank slices by drift score rather than alerting on each.
+- **Pinning every component: attributable vs upgrade burden.** Pinning the snapshot, embedder and judge
+  removes a class of surprises, at the price of scheduled upgrades and the risk of running on a model the
+  provider is about to retire.
+- **Advancing the reference window: relevant vs normalised drift.** It keeps detectors relevant, but
+  moving it without validating quietly normalises the drift you were supposed to catch.
 
 ## Pitfalls
-- Treating a drift alert as a defect; the symptom is a team retraining or re-prompting in response to
-  an input shift whose outcomes were fine, and a worse system afterwards.
-- Comparing this week against last week during seasonal traffic; the symptom is a recurring alert
-  every Monday or every month-end that everyone has learned to ignore, which then masks a real shift.
-- Monitoring inputs and outputs but not the components; the symptom is a global step change in every
-  metric with no deploy in the log, traced days later to a provider alias update or a judge upgrade.
-- Upgrading the embedding model without re-indexing; the symptom is retrieval scores collapsing on
-  the fixed probe set and answers that cite irrelevant documents, while the model itself is unchanged.
-- Letting the golden set stay frozen while traffic moves; the symptom is a green eval suite alongside
-  rising complaints from a segment that has no representation in it.
-- Running a PSI with empty buckets and no smoothing; the symptom is infinite or NaN scores that crash
-  the job or get silently clipped, hiding exactly the new categories that signal drift.
+- **Treating a drift alert as a defect.** Symptom: retraining or re-prompting for an input shift whose
+  outcomes were fine, and a worse system afterwards. Fix: check outcomes on the slice first.
+- **Comparing week over week during seasonal traffic.** Symptom: a recurring alert every Monday or
+  month-end that everyone ignores, which then masks a real shift. Fix: seasonal baselines.
+- **Monitoring inputs and outputs but not components.** Symptom: a global step change with no deploy in
+  the log, traced days later to a provider alias update or judge upgrade. Fix: model id and bundle hash.
+- **Upgrading the embedding model without re-indexing.** Symptom: retrieval scores collapse on the probe
+  set and answers cite irrelevant documents while the model is unchanged. Fix: version and re-index
+  together.
+- **Letting the golden set stay frozen while traffic moves.** Symptom: a green eval suite alongside rising
+  complaints from a segment with no representation in it. Fix: feed confirmed shifts into the set.
+- **PSI with empty buckets and no smoothing.** Symptom: infinite or NaN scores that crash the job or get
+  silently clipped, hiding exactly the new categories that signal drift. Fix: epsilon smoothing.
 
 ## When to use
-Drift detection belongs in any system that will run for longer than its validation data stays
-representative, which is every production system. Start with the cheap signals on day one: intent and
-language mix, input length, output proxies, and a hash of the resolved bundle so configuration drift
-is caught instantly. Add embedding-based input drift once you have a few thousand requests per window,
-and judge re-calibration once you rely on an LLM judge. Measure drift per slice and feed each
-confirmed shift back into the golden set, because the shift that moved production is exactly the
-distribution your next evaluation must contain. In interviews, the expected answer distinguishes
-covariate shift from concept drift, explains why the LLM-specific sources (model, prompt, corpus,
-embedder, judge) need pinning and hashing, and insists that a detected shift is a question about
-outcomes, not an answer.
+- **Every production system needs it**, because every system runs longer than its validation data stays
+  representative.
+- **Day one:** intent and language mix, input length, output proxies, and a hash of the resolved bundle so
+  configuration drift is caught instantly.
+- **Later:** embedding-based input drift once you have a few thousand requests per window; judge
+  re-calibration once you rely on an LLM judge.
+- **Measure per slice and feed back:** each confirmed shift goes into the golden set, because the shift
+  that moved production is exactly the distribution your next evaluation must contain.
+- **Interviews:** distinguish covariate shift from concept drift, explain why model, prompt, corpus,
+  embedder and judge need pinning and hashing, and insist a detected shift is a question about outcomes,
+  not an answer.
 
 ## Role lens
 - **Engineer:** Implements the window comparisons, bundle hashing and slice-level PSI jobs, and wires a
@@ -248,6 +313,43 @@ or a renamed field; inputs can look statistically identical while the mapping ch
 prompt and golden-set updates plus re-validation. Finally run the classifier two-sample test on
 document embeddings, because a layout change can be invisible to length and field-mix buckets while
 being obvious in embedding space.
+
+## Interview questions
+### Explain covariate shift versus concept drift with an LLM example, and why the difference matters.
+- **Covariate shift:** the questions change but each still has the same right answer, for example a
+  support bot suddenly receiving mostly returns questions. Detectable from inputs alone.
+- **Concept drift:** the same question has a new right answer, for example a return window shortened by
+  policy. Inputs look identical, so only labels or a current source of truth reveal it.
+- **Why it matters:** the fixes differ (extend coverage versus update corpus, policy text and labels),
+  and only one can be caught without labels.
+
+### Every quality metric dropped overnight across all tenants and nobody deployed. What do you check?
+- **Re-run the frozen probe set:** if it dropped too, a component changed, not the world.
+- **Then check components in order:** the model id reported in responses (alias update), the resolved
+  bundle hash (an out-of-band prompt edit), the embedder version on the index, and the judge model.
+- **A global, single-timestamp step** is the signature of an upstream change rather than a user-mix change.
+
+### Your intent PSI is 0.12 for one tenant. Do you retrain, re-prompt or do nothing?
+- **None yet.** PSI says inputs moved, not that outcomes got worse; acting on it alone can make the system
+  worse.
+- **Spend labels on the slice:** route more of that tenant to judging and human review and compare its
+  error rate with the reference window.
+- **Act only if outcomes changed;** if they did not, add the new cases to the golden set and advance the
+  reference.
+
+### When would you use a classifier two-sample test instead of PSI?
+- **For high-dimensional inputs** such as text embeddings, where bucketing is meaningless.
+- **When you need to know what moved:** the classifier's most confident "current" examples are the new
+  kind of traffic, which a single divergence number never shows.
+- **Cost:** it needs a few thousand embeddings per window and a training run, so it is a scheduled job
+  rather than a per-request check.
+
+### What does pinning every component cost, and when would you not pin?
+- **Gain:** drift becomes attributable, because only the world can move a pinned system.
+- **Cost:** a scheduled upgrade burden and the risk of running on a snapshot the provider is about to
+  retire.
+- **Exception:** a low-stakes internal tool may track a provider alias deliberately, with the frozen probe
+  set and response model id as the safety net.
 
 ## Quiz
 ### Q: Which kind of drift cannot be detected by any statistic computed on inputs and outputs alone?

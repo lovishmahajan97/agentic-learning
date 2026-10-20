@@ -5,7 +5,7 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -21,9 +21,9 @@ sources:
 ---
 
 ## TL;DR
-Small chunks match queries best; larger sections answer best. Parent-document retrieval indexes small
-child chunks linked to larger parents, searches the children and hands the generator the parents: the
-recall of small chunks with the context of big ones, paid for in tokens.
+Small chunks match best because they embed as sharp keys; sections answer best because they hold the
+definitions, table headers and caveats. Parent-document retrieval searches small children and hands the
+generator their linked parents: small-chunk recall with big-chunk context, paid for in tokens.
 
 ## Why it exists
 - **One chunk size is wrong in both directions.** "The limit is 50 requests per minute." alone is an
@@ -100,18 +100,18 @@ Pick by question type, and measure: the rules rank parents differently on the sa
 - **They compose:** contextualised children for matching, parents for answering.
 
 ## Diagram
-Two stores, one join: children are searched, parents are fetched by id, and citations point back at the
-matched child spans.
+Two stores, one join: children are searched, hits are grouped and scored per parent (max, count or
+fraction), parents are fetched by id, and citations point back at the matched child spans.
 
 ```mermaid
-flowchart LR
+flowchart TD
     D["Document"] -->|"split at headings, size cap"| P["Parent sections"]
     P -->|"split into small chunks"| C["Children with heading path"]
     C -->|"embed children only"| V[("Vector index of children")]
     P -->|"store by parent_id, not embedded"| KV[("Parent store")]
     Q["Query"] -->|"over-fetch, k about 20"| V
-    V --> G["Group hits by parent_id, score by max, count or fraction"]
-    G --> B["Dedupe and fill token budget, top-n parents"]
+    V --> G["Group hits by parent_id and score"]
+    G --> B["Dedupe, fill token budget"]
     B -->|"look up parent_id"| KV
     KV --> GEN["Generator gets parent text"]
     G -.->|"matched child spans"| CIT["Citations and highlights"]
@@ -195,7 +195,8 @@ Illustrative, using the manual above with a 6,000-token evidence budget:
 ## Production patterns
 - **Use the framework retriever when it fits.** LangChain's `ParentDocumentRetriever` takes a child
   splitter, an optional parent splitter, a vector store for children and a document store for parents;
-  LlamaIndex ships sentence-window and auto-merging retrievers. Monitor unique parents per query and
+  LlamaIndex offers `SentenceWindowNodeParser` (paired with a metadata-replacement postprocessor that
+  swaps in the window) and `AutoMergingRetriever`. Monitor unique parents per query and
   tokens per request after adopting either.
 - **Heading-path children.** Embed `heading path + child` and store the bare child for citation, as in
   `ingest` above. Measure child recall@k on queries that name a product or plan, the slice this fixes.

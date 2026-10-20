@@ -5,7 +5,7 @@ name: Task-specific acceptance criteria
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -323,7 +323,7 @@ I would get the support lead to sign the list, encode every check as a grader, a
 
 ### A gate keeps blocking on a slice of 40 items. What do you do?
 - **Check whether the floor is resolvable:** at 85% on 40 items the 95% interval is roughly ±11
-  points, so the gate is reacting to noise as often as to regressions.
+  points, so ordinary run-to-run noise can push a healthy slice under the floor.
 - **Grow the slice** toward about 200 items for ±5 points, or loosen the floor to what the slice can
   resolve.
 - **Confirm the threshold's origin:** it should come from the downstream cost of errors and the

@@ -5,7 +5,7 @@ name: Llama Guard
 kind: tool
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - safety-security/content-moderation
   - safety-security/input-output-guardrails
@@ -19,83 +19,122 @@ sources:
 ---
 
 ## TL;DR
-Llama Guard is Meta's family of open-weight content-safety classifiers, made by fine-tuning a Llama model
-to read a safety policy, a user prompt and optionally the assistant's reply, and generate `safe` or
-`unsafe` plus the violated category codes. Because the policy is text in the prompt rather than a fixed
-label head, categories can be edited without retraining. It is a moderation model, not a prompt-injection,
-PII or hallucination detector, and every check costs a full LLM forward pass.
+Llama Guard is Meta's open-weight content-safety classifier: a fine-tuned Llama that reads a policy and a
+conversation and generates `safe` or `unsafe` plus category codes. The policy is editable prompt text;
+it does not detect injection, PII or hallucination.
 
 ## Why it exists
-Content moderation predates LLM chat, but the existing options fit badly. Hosted moderation endpoints
-mean sending every prompt and reply to a third party, with a taxonomy you cannot change: a medical
-assistant needs "specialised advice" allowed while a children's product needs far stricter lines, and a
-fixed classifier head cannot express either. Keyword and regex filters fail on paraphrase and on any
-language other than the one they were written for. And chat has a property plain text moderation
-ignores: the same assistant sentence, "here is how you do it", is harmless after one question and
-dangerous after another, so the reply has to be judged in the context of the prompt.
-
-The naive alternative is to ask the main model "is this safe?" That is the model currently being
-attacked, it was never evaluated as a classifier, its verdicts are uncalibrated prose, and it is the most
-expensive model you run. A separate, smaller model trained specifically to classify against a written
-policy, producing a parseable verdict and a usable probability, runs on cheaper hardware, stays stable
-when the main model is swapped, and can be evaluated on its own precision and recall. That is the gap
-Llama Guard fills, and releasing the weights means it runs inside your own boundary.
+- **Existing moderation fits chat badly.** Hosted endpoints mean sending every prompt and reply to a third
+  party, with a taxonomy you cannot change: a medical assistant needs "specialised advice" allowed, a
+  children's product needs far stricter lines, and a fixed classifier head can express neither.
+- **Keyword and regex filters fail** on paraphrase and on any language other than the one they were written
+  for.
+- **Replies must be judged in context.** "Here is how you do it" is harmless after one question and
+  dangerous after another; plain text moderation ignores the prompt.
+- **Asking the main model "is this safe?" is the naive fix, and it fails.** That model is the one being
+  attacked, was never evaluated as a classifier, gives uncalibrated prose verdicts, and is the most
+  expensive model you run.
+- **A separate, smaller classifier trained against a written policy** gives a parseable verdict and a usable
+  probability, runs on cheaper hardware, stays stable when the main model is swapped, and can be evaluated
+  on its own precision and recall. Open weights mean it runs inside your own boundary.
 
 ## How it works
 ### The prompt is the policy
-Each request is a prompt with three parts: an instruction ("check if there is unsafe content in the
-following conversation according to our safety policy"), a block of categories with short descriptions,
-and the conversation. The model is asked to assess only the last message, which lets the same model
-serve as an input rail (last message is the user's) and an output rail (last message is the assistant's,
-judged with the user's prompt in view). The Hugging Face chat template assembles all of this, so in code
-you pass a list of role/content messages.
+Each request is a prompt with three parts:
+1. **An instruction:** "check if there is unsafe content in the following conversation according to our
+   safety policy".
+2. **A block of categories** with short descriptions.
+3. **The conversation.**
+
+- **Only the last message is assessed,** so one model serves as an input rail (last message is the user's)
+  and an output rail (last message is the assistant's, judged with the user's prompt in view).
+- **The Hugging Face chat template assembles all of this,** so in code you pass a list of role/content
+  messages.
 
 ### The output is generated, not predicted by a head
-The model generates text: `safe`, or `unsafe` on the first line and a comma-separated list such as
-`S2,S9` on the second. The token that spells `safe` or `unsafe` is effectively the decision, so the
-probability the model assigns to `unsafe` at that position is a confidence score; the original paper
-evaluates with that probability, and you can threshold it to trade precision against recall instead of
-taking the argmax. Find that position rather than assuming it is the first generated token: depending on
-version and chat template, the model may emit whitespace or newline tokens before the verdict, and reading
-the logits one step too early scores a newline. Renormalising over just the two verdict tokens gives
-`p_unsafe = exp(z_unsafe) / (exp(z_unsafe) + exp(z_safe))`, where `z` are the logits at that position;
-that is the number you threshold.
-This is also why fine-tuning worked: the training data was conversations labelled with exactly this
-output format against exactly this prompt structure.
+- **Format:** `safe`, or `unsafe` on the first line and a comma-separated list such as `S2,S9` on the second.
+- **The verdict token is the decision,** so the probability of `unsafe` at that position is a confidence
+  score. The original paper evaluates with it, and you can threshold it to trade precision against recall
+  instead of taking the argmax.
+- **Find that position; do not assume it is the first generated token.** Depending on version and chat
+  template, whitespace or newline tokens may come first, and reading logits one step early scores a newline.
+- **Renormalise over the two verdict tokens** (`z` are the logits at that position); this is what you
+  threshold:
+
+```
+p_unsafe = exp(z_unsafe) / (exp(z_unsafe) + exp(z_safe))
+```
+
+- **This is also why fine-tuning worked:** training data was conversations labelled in exactly this output
+  format against exactly this prompt structure.
 
 ### Taxonomy and versions
-The first release in December 2023 was a Llama 2 7B fine-tune with six categories of its own. Later
-versions adopted the MLCommons hazard taxonomy: Llama Guard 2 (Llama 3 8B based) used S1 to S11, and
-Llama Guard 3 (an 8B model built on Llama 3.1, plus a 1B text model and an 11B vision model built on
-Llama 3.2) uses S1 to S14: violent
-crimes, non-violent crimes, sex-related crimes, child sexual exploitation, defamation, specialised advice,
-privacy, intellectual property, indiscriminate weapons, hate, suicide and self-harm, sexual content,
-elections, and code-interpreter abuse. A larger multimodal Llama Guard 4 followed in 2025. Because the
-categories are prompt text, you can drop ones you do not want enforced, reword descriptions, or add a
-category zero-shot, either by building the prompt string yourself or through the options some versions'
-chat templates expose for excluding or replacing categories; the paper shows this works to a degree, with accuracy on novel categories improving
-when you fine-tune on a few hundred examples.
+| Version | Base | Categories |
+|---|---|---|
+| Llama Guard (December 2023) | Llama 2 7B fine-tune | six categories of its own |
+| Llama Guard 2 | Llama 3 8B | MLCommons hazard taxonomy, S1 to S11 |
+| Llama Guard 3 | 8B on Llama 3.1, plus a 1B text model and an 11B vision model on Llama 3.2 | S1 to S14 |
+| Llama Guard 4 | larger, multimodal (2025) | |
+
+- **Llama Guard 3's S1 to S14:** violent crimes, non-violent crimes, sex-related crimes, child sexual
+  exploitation, defamation, specialised advice, privacy, intellectual property, indiscriminate weapons,
+  hate, suicide and self-harm, sexual content, elections, and code-interpreter abuse.
+- **Categories are prompt text,** so you can drop ones you do not want enforced, reword descriptions, or add
+  one zero-shot: build the prompt string yourself, or use the options some versions' chat templates expose
+  for excluding or replacing categories.
+- **Zero-shot categories work to a degree;** the paper shows accuracy on novel categories improves when you
+  fine-tune on a few hundred examples.
 
 ### Deployment shape
-Two checks per turn: the input check can run in parallel with main-model generation and cancel or replace
-the answer if the prompt is unsafe; the output check runs on the finished reply, or on chunks if you
-stream, at the cost of possibly retracting text already shown. The policy block is identical across
-requests, so prefix caching in the serving engine removes most of its prefill cost, and generation is
-only a handful of tokens. The 1B variant exists for latency- or cost-constrained paths and is noticeably
-weaker; measure on your own data before choosing it.
+1. **Input check** runs in parallel with main-model generation and cancels or replaces the answer if the
+   prompt is unsafe.
+2. **Output check** runs on the finished reply, or on chunks if you stream, at the cost of possibly
+   retracting text already shown.
+
+- **Cheap prefill:** the policy block is identical across requests, so prefix caching in the serving engine
+  removes most of its cost, and generation is only a handful of tokens.
+- **The 1B variant** exists for latency- or cost-constrained paths and is noticeably weaker; measure on your
+  own data before choosing it.
 
 ### How it compares
-Hosted moderation APIs (OpenAI, Azure AI Content Safety) are free or cheap and need no GPUs, but the data
-leaves your boundary and the taxonomy is theirs. ShieldGemma and Granite Guardian are open alternatives
-with similar policy-in-prompt designs, Granite Guardian adding RAG-specific checks such as groundedness.
-Meta's Prompt Guard is a small classifier for jailbreak and injection text, which Llama Guard does not
-attempt. NeMo Guardrails is an orchestration layer that can call Llama Guard as one rail among several.
+| Option | Shape | When it fits |
+|---|---|---|
+| Hosted moderation APIs (OpenAI, Azure AI Content Safety) | free or cheap, no GPUs | data may leave your boundary and their taxonomy fits |
+| ShieldGemma, Granite Guardian | open, similar policy-in-prompt designs; Granite Guardian adds RAG checks such as groundedness | open-weight alternatives |
+| Meta's Prompt Guard | small classifier for jailbreak and injection text | the job Llama Guard does not attempt |
+| NeMo Guardrails | orchestration layer | calls Llama Guard as one rail among several |
 
-## Example
-Moderating a user message and then the assistant's reply in context, returning both the generated verdict
-and the probability of `unsafe` at the position where the verdict token is generated. The model is gated
-on the Hub, so the licence must be accepted first. If `unsafe` tokenises to more than one piece, the code
-compares the first pieces of the two words, which is where the decision is made.
+## Diagram
+One model, two rails: the input rail judges the user's message, the output rail judges the reply with the
+question in view, and each thresholds `p_unsafe` separately.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Chat API
+    participant G as Llama Guard
+    participant M as Main model
+    U->>A: message
+    par input rail
+        A->>G: policy + user message
+    and generation
+        A->>M: generate reply
+    end
+    G-->>A: p_unsafe for input
+    Note over A: above input threshold, cancel and refuse
+    M-->>A: reply
+    A->>G: policy + user message + reply
+    G-->>A: p_unsafe for output
+    A-->>U: reply or safe fallback
+```
+
+## Examples
+### Scoring a prompt and a reply
+Moderates a user message, then the assistant's reply in context, returning the generated verdict and the
+probability of `unsafe` at the position where the verdict token is generated.
+- **Gated model:** the licence must be accepted on the Hub first.
+- **Multi-piece tokens:** if `unsafe` tokenises to more than one piece, the code compares the first pieces
+  of the two words, which is where the decision is made.
 
 ```python
 import torch
@@ -129,46 +168,91 @@ reply = {"role": "assistant", "content": "I can't help with that. If it's your o
 print(moderate([user, reply]))                   # output rail: the reply is judged given the question
 ```
 
-The input call should come back `unsafe` with a non-violent-crimes code (S2); the output call should come
-back `safe`, because the refusal is judged in context. Thresholding `p_unsafe` rather than parsing the text
-lets you run the rails at different strictness: suppose a labelled sample of 500 of your own prompts shows
-that blocking at `p_unsafe > 0.5` catches 46 of 50 truly unsafe ones while wrongly blocking 9 of 450 benign
-ones (illustrative numbers). Dropping to 0.2 might catch 49 and wrongly block 30. Which point is right is a
-product decision about the cost of a miss versus a false refusal, and you can only make it with the score,
-not with the argmax verdict.
+- **Expected:** the input call comes back `unsafe` with a non-violent-crimes code (S2); the output call
+  comes back `safe`, because the refusal is judged in context.
+
+### Choosing a threshold per rail
+Thresholding `p_unsafe` rather than parsing the text lets the rails run at different strictness. Suppose a
+labelled sample of 500 of your own prompts (50 truly unsafe, 450 benign; illustrative numbers):
+
+| Threshold | Unsafe caught | Benign wrongly blocked | Precision | Recall |
+|---|---|---|---|---|
+| `p_unsafe > 0.5` | 46 of 50 | 9 of 450 (2%) | 0.84 | 0.92 |
+| 0.2 | 49 of 50 | 30 of 450 (6.7%) | 0.62 | 0.98 |
+
+- **Which point is right is a product decision** about the cost of a miss versus a false refusal, and you
+  can only make it with the score, not with the argmax verdict.
+
+A sweep over your own labelled sample, pure Python:
+
+```python
+def sweep(scored, thresholds=(0.2, 0.5, 0.8)):
+    """scored: list of (p_unsafe, is_unsafe) from a labelled sample of your own traffic."""
+    pos = sum(1 for _, y in scored if y)
+    neg = len(scored) - pos
+    for t in thresholds:
+        tp = sum(1 for p, y in scored if p > t and y)
+        fp = sum(1 for p, y in scored if p > t and not y)
+        prec = tp / (tp + fp) if tp + fp else float("nan")
+        print(f"t={t}: recall {tp}/{pos} = {tp/pos:.2f}, precision {prec:.2f}, "
+              f"false blocks {fp}/{neg} = {fp/neg:.1%}")
+
+# tiny synthetic sample; use a few hundred real, labelled prompts per rail
+sample = [(0.97, True), (0.81, True), (0.45, True), (0.12, True),
+          (0.66, False), (0.31, False), (0.08, False), (0.03, False), (0.02, False)]
+sweep(sample)
+```
+
+## Production patterns
+- **Self-hosted guard endpoint with prefix caching.** Serve the guard model behind an internal endpoint in
+  an engine with prefix caching (vLLM's `--enable-prefix-caching`, for example), so the identical policy
+  block is prefilled once. Request token log-probabilities to compute `p_unsafe` server-side. Monitor guard
+  p95 latency and prefix-cache hit rate.
+- **Parallel input rail with cancellation.** Start main-model generation and the input check together;
+  if the check crosses its threshold, cancel the generation and return a fixed refusal. Monitor added
+  latency per turn (target: near zero for the input rail) and cancellation counts.
+- **Per-rail, per-surface thresholds in config.** Keep thresholds and enforced categories in versioned
+  config per product surface, chosen from a labelled sweep. Monitor block rate per category; a sudden shift
+  usually means a traffic change or a model upgrade.
+- **Shadow mode before enforcing.** Run a new version, threshold or custom category in log-only mode on live
+  traffic, review disagreements with the current setup, then switch to enforce. Track disagreement rate.
+- **Cascade for cost.** Use the 1B model as a pre-filter and escalate uncertain or flagged cases to the 8B
+  model, rather than replacing it, when false negatives are costly. Monitor recall of the cascade against a
+  labelled set.
 
 ## Trade-offs
-- Running the classifier yourself keeps prompts inside your boundary and lets you edit the policy, but it
-  costs a GPU-resident 8B model and operational ownership; a hosted moderation API flips the choice when
-  data residency is not a constraint and the vendor taxonomy fits.
-- Policy-in-prompt customisation is free, but zero-shot categories are measurably weaker than trained
-  ones; if a custom category carries real risk, budget for labelled data and a fine-tune.
-- A generated verdict with a first-token probability gives a tunable threshold, but the probability is not
-  calibrated for your distribution; without a labelled sample you cannot choose the threshold sensibly.
-- The 1B model cuts latency and cost several-fold, yet its recall on subtle cases is lower; it suits a
-  pre-filter before the 8B model, not a replacement, when false negatives are costly.
+- **Self-hosting vs a hosted API.** Prompts stay inside your boundary and the policy is editable, but you pay
+  for a GPU-resident 8B model and operational ownership. A hosted moderation API wins when data residency is
+  not a constraint and the vendor taxonomy fits.
+- **Free policy customisation vs accuracy.** Zero-shot categories are measurably weaker than trained ones; if
+  a custom category carries real risk, budget for labelled data and a fine-tune.
+- **Tunable threshold vs calibration.** A generated verdict with a first-token probability gives a knob, but
+  the probability is not calibrated for your distribution; without a labelled sample you cannot choose the
+  threshold sensibly.
+- **1B speed vs recall.** The 1B model cuts latency and cost several-fold, yet recall on subtle cases is
+  lower. It suits a pre-filter before the 8B model, not a replacement, when false negatives are costly.
 
 ## Pitfalls
-- Deploying Llama Guard as the prompt-injection defence; the symptom is injected instructions in retrieved
-  documents passing straight through because they contain nothing the hazard taxonomy recognises.
-- Checking only the input; the symptom is a benign question producing a harmful answer that nothing
-  inspected.
-- Taking the argmax verdict without looking at the probability; the symptom is a product that is either too
-  strict or too lax with no knob to adjust.
-- Upgrading versions without re-running the evaluation set; the symptom is a shift in refusal rate because
-  category definitions changed between taxonomies.
-- Assuming the policy categories mean what your legal or trust team means by the same words; the symptom
-  is "specialised advice" blocking the core use case of a finance or medical product.
+- **Using Llama Guard as the prompt-injection defence.** Symptom: injected instructions in retrieved
+  documents pass straight through, because they contain nothing the hazard taxonomy recognises.
+- **Checking only the input.** Symptom: a benign question produces a harmful answer that nothing inspected.
+- **Taking the argmax verdict and ignoring the probability.** Symptom: a product that is too strict or too
+  lax with no knob to adjust.
+- **Upgrading versions without re-running the eval set.** Symptom: a shift in refusal rate because category
+  definitions changed between taxonomies.
+- **Assuming categories mean what your legal or trust team means.** Symptom: "specialised advice" blocks the
+  core use case of a finance or medical product.
 
 ## When to use
-Reach for Llama Guard when you need content-safety classification of prompts and replies inside your own
-infrastructure, with a taxonomy you can edit, and you can afford an extra model call per check. Do not use
-it alone for injection, PII, topical control or groundedness; pair it with the dedicated tools for those.
-Before launch, build a labelled set of a few hundred examples from your own traffic covering each category
-you enforce, measure precision and recall at several thresholds for the input and output rails separately,
-and pick thresholds per rail. In day-to-day work it is a service behind the chat endpoint with its own
-dashboards for block rate and latency; in interviews the expected depth is explaining why a generative
-classifier with policy in the prompt is customisable and how you would get a score out of it.
+- **Use when:** you need content-safety classification of prompts and replies inside your own
+  infrastructure, with an editable taxonomy, and can afford an extra model call per check.
+- **Avoid alone for:** injection, PII, topical control or groundedness; pair it with the dedicated tools.
+- **Before launch:** build a labelled set of a few hundred examples from your own traffic covering each
+  enforced category, measure precision and recall at several thresholds for each rail separately, and pick
+  thresholds per rail.
+- **Day to day:** a service behind the chat endpoint with its own dashboards for block rate and latency.
+- **Interviews:** explain why a generative classifier with policy in the prompt is customisable and how you
+  would get a score out of it.
 
 ## Role lens
 - **Engineer:** Serves the model behind an internal endpoint with prefix caching, wires input and output
@@ -193,6 +277,37 @@ match the charity's clinical guidance and validate on a labelled set built with 
 the default wording encodes a general policy, not theirs. It falls short in that it cannot judge tone or
 appropriateness of supportive content, it is not a crisis detector, and it will miss harmful content
 phrased outside its training distribution; those need domain-specific classifiers and human review.
+
+## Interview questions
+### Why use a separate classifier like Llama Guard instead of asking the main model whether a message is safe?
+- **The main model is the one under attack,** was never evaluated as a classifier, and gives uncalibrated
+  prose verdicts at the highest cost per call.
+- **A dedicated guard** returns a parseable verdict and a probability, runs on cheaper hardware, survives
+  main-model swaps, and has its own measurable precision and recall.
+
+### Your Llama Guard deployment blocks legitimate questions in a medical product. How do you fix it?
+- **Find the category:** block logs with codes will likely show specialised advice (or similar) firing on the
+  core use case.
+- **Edit the policy text:** drop or reword that category for this surface, since categories are prompt text.
+- **Re-tune the threshold** on a labelled sample from this product, and run the change in shadow mode first.
+
+### How do you get a confidence score out of a model that generates text?
+- **Locate the verdict token,** skipping any leading whitespace or newline tokens.
+- **Renormalise** its logits over `safe` and `unsafe` to get `p_unsafe`, then threshold per rail from a
+  labelled precision/recall sweep.
+
+### When would you choose a hosted moderation API over self-hosting Llama Guard?
+- **Choose hosted** when data residency allows sending prompts out, the vendor taxonomy fits, and you do not
+  want to run a GPU-resident model.
+- **Self-host** when data must stay inside your boundary or you need custom or reworded categories.
+- **Either way,** neither covers injection, PII or groundedness; those need separate controls.
+
+### What does a production guard add to each chat turn, and how do you keep it small?
+- **Two calls per turn:** input and output checks, each a full forward pass over the policy plus the
+  conversation, generating only a few tokens.
+- **Keep it small:** run the input check in parallel with generation, enable prefix caching so the fixed
+  policy block is not re-prefilled, and use the 1B model as a pre-filter where recall allows.
+- **Watch:** guard p95 latency, cache hit rate and block rate per category.
 
 ## Quiz
 ### Q: Why can Llama Guard's categories be changed without retraining the model?

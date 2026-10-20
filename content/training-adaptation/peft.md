@@ -5,7 +5,7 @@ name: PEFT (LoRA, QLoRA)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/quantization
@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 PEFT freezes the base model and trains a small set of extra parameters. LoRA learns each weight update as
-two thin matrices; QLoRA also stores the frozen base in 4-bit, so a fine-tune fits one GPU and yields
-swappable adapters.
+two thin matrices; QLoRA also stores the frozen base in 4-bit, so the job fits one consumer GPU, keeps most of full
+fine-tuning's quality, and yields swappable adapters.
 
 ## Why it exists
 - **Full fine-tuning does not fit.** Updating every weight of a 7B model needs on the order of 100 GB of
@@ -38,8 +38,8 @@ swappable adapters.
   variants cheaply, and rollback means moving tens of gigabytes.
 - **The update has low intrinsic rank.** The *change* a fine-tune makes to a pretrained matrix lives
   mostly in a small subspace, so you can parametrize ΔW directly in that subspace and train only it.
-- **LoRA beats earlier PEFT on serving cost.** Adapter layers between blocks add inference latency;
-  learned "virtual tokens" (prefix and prompt tuning) eat context. LoRA's update has exactly the shape of
+- **LoRA beats earlier PEFT on serving cost.** Earlier methods work, but adapter layers between blocks
+  add inference latency and learned "virtual tokens" (prefix and prompt tuning) eat context. LoRA's update has exactly the shape of
   the original matrix, so it folds back in and inference cost is unchanged, while keeping most of full
   fine-tuning's quality.
 
@@ -133,7 +133,7 @@ The input feeds two paths: the frozen base matrix and the trainable low-rank pai
 get gradients; after training the update is either merged into W₀ or kept as a swappable adapter.
 
 ```mermaid
-flowchart LR
+flowchart TD
     X["Input x"] --> W["Frozen W0: bf16 in LoRA, NF4 in QLoRA"]
     X --> A["A: r x k, trainable, small random init"]
     A --> B["B: d x r, trainable, starts at zero"]
@@ -195,9 +195,9 @@ def ft_memory_gb(params_b, method, trainable_frac=0.006):
 for size in (7, 8, 70):
     row = {m: round(ft_memory_gb(size, m), 1) for m in ("full", "lora", "qlora")}
     print(size, "B:", row, "GB before activations")
-# 7 B:  {'full': 112.0, 'lora': 14.7, 'qlora': 4.2}
-# 8 B:  {'full': 128.0, 'lora': 16.8, 'qlora': 4.8}
-# 70 B: {'full': 1120.0, 'lora': 146.7, 'qlora': 41.7}
+# 7 B: {'full': 112.0, 'lora': 14.7, 'qlora': 4.2} GB before activations
+# 8 B: {'full': 128.0, 'lora': 16.8, 'qlora': 4.8} GB before activations
+# 70 B: {'full': 1120.0, 'lora': 146.7, 'qlora': 41.7} GB before activations
 ```
 
 Reading the output (the 0.5 bytes per weight ignores scale overhead, so real NF4 bases run a little
@@ -243,7 +243,7 @@ larger):
 
 ## Pitfalls
 - **Copying a full fine-tuning learning rate (≈1e-5).** LoRA parameters are tiny and need a larger LR.
-  Symptom: training loss barely moves across epochs.
+  Symptom: training loss barely moves across epochs. Fix: start in the 1e-4 to 2e-4 range.
 - **Adapting only `q_proj` and `v_proj` because an old tutorial did.** Tasks needing new knowledge or
   formats underfit. Symptom: good style, wrong facts. Fix: target the MLP projections too.
 - **Merging a QLoRA adapter into a bf16 base without re-evaluation.** The adapter compensated for a

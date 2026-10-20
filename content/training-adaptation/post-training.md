@@ -5,7 +5,7 @@ name: Post-training
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/pre-training
   - training-adaptation/supervised-fine-tuning
@@ -45,7 +45,7 @@ pre-training compute but decides almost everything users experience.
 | Stage | Signal | Teaches | Limit |
 |---|---|---|---|
 | 1. SFT | demonstrations | chat template, persona, "answer the question" | can only imitate |
-| 2. Preference optimisation | comparisons | quality, tone, refusals | needs a policy that already produces plausible answers |
+| 2. Preference optimisation | comparisons | quality, tone, refusals | only reranks answers the SFT policy already produces; cannot discover behaviours that need many attempts |
 | 3. RL on verifiable rewards | programmatic checks | multi-step reasoning, exact formats | only for checkable tasks |
 
 The stages are ordered because each one needs the behaviour the previous one installed.
@@ -122,21 +122,23 @@ The expensive part is the data: demonstrations and comparisons written or review
 evaluation sets that tell you whether a round helped.
 
 ## Diagram
-Read it top to bottom: each stage consumes a different signal, every checkpoint passes an eval gate,
-and fresh on-policy data from the new model feeds the next round.
+Read it top to bottom: each stage consumes a different signal, and each round ends at an eval gate
+(format, win rate, refusals on harmful and benign sets, length, capability delta). A failed or
+unfinished round samples the new model and feeds fresh on-policy comparisons back into stage 2, with a
+KL leash to the reference model.
 
 ```mermaid
 flowchart TD
-    B["Base model"] --> SFT["Stage 1: SFT on demonstrations"]
-    H["People and teacher models"] -->|"prompt-response pairs"| SFT
-    SFT --> PO["Stage 2: preference optimisation, RLHF or DPO"]
-    J["Raters, reward model or AI judge"] -->|"ranked comparisons"| PO
-    PO --> RL["Stage 3: RL on verifiable rewards, GRPO"]
-    V["Programs: tests, schema checks"] -->|"reward 0 or 1"| RL
-    RL --> G{"Eval gate: format, win rate, refusals, length, capability delta"}
+    B["Base model"] --> SFT["Stage 1: SFT"]
+    H["People and teacher models"] -->|"demonstrations"| SFT
+    SFT --> PO["Stage 2: RLHF or DPO"]
+    J["Raters, reward model, AI judge"] -->|"ranked comparisons"| PO
+    PO --> RL["Stage 3: RL, e.g. GRPO"]
+    V["Programs: tests, schema checks"] -->|"verifiable reward"| RL
+    RL --> G{"Eval gate"}
     G -->|"pass"| S["Ship assistant"]
-    G -->|"fail or next round"| N["Sample new model, collect fresh comparisons"]
-    N -->|"on-policy data, KL leash to reference"| PO
+    G -->|"fail or next round"| N["Sample new model, rank again"]
+    N -->|"on-policy pairs"| PO
 ```
 
 ## Examples
@@ -242,11 +244,14 @@ DPO trainer) consume.
 - **Preference training before SFT into the target format.** Both responses in every pair are
   off-distribution, so the loss moves without the behaviour improving. Fix: SFT first.
 - **Reusing stale comparison data across rounds.** The pairs describe an old model's errors, so
-  training-distribution win rates rise while real-user complaints do not change.
+  training-distribution win rates rise while real-user complaints do not change. Fix: sample each round's
+  comparisons from the current checkpoint.
 - **Measuring only the preference metric.** A model can win more comparisons while losing points on
-  reasoning or coding benchmarks: catastrophic forgetting hiding behind a good-looking number.
-- **Optimising the reward that is easy to compute.** Symptom: outputs that satisfy the schema or the judge
-  yet are useless to the person reading them.
+  reasoning or coding benchmarks: catastrophic forgetting hiding behind a good-looking number. Fix: gate
+  on a general capability suite too.
+- **Optimising the reward that is easy to compute rather than the one that matters.** Symptom: outputs
+  that satisfy the schema or the judge yet are useless to the person reading them. Fix: audit a sample of
+  high-reward outputs by hand each round.
 - **Measuring refusals only on harmful prompts.** Symptom: the model passes the safety set yet declines
   ordinary requests that merely mention a sensitive word. Fix: track refusal rate on a benign borderline
   set too.

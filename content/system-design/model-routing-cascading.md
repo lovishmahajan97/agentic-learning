@@ -5,7 +5,7 @@ name: Model routing / cascading
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - system-design/model-selection
   - system-design/slm-vs-llm-trade-offs
@@ -231,8 +231,10 @@ route instead.
   straight to small and high-confidence hard ones straight to large; cascade only the middle band of
   router scores. Monitor the share of traffic in each band and per-band judged quality.
 - **Deterministic baseline slice.** Serve a few per cent of requests on the strong model regardless of
-  route, chosen by a stable hash of the request id (for example `sha256(request_id) % 100 < 3`, not
-  Python's per-process salted `hash()`) so it is replayable. Monitor the quality gap between the slice and the routed traffic, per route.
+  route, chosen by a stable hash so it is replayable: for example
+  `int(hashlib.sha256(conv_id.encode()).hexdigest(), 16) % 100 < 3`, not Python's per-process salted
+  `hash()`. Hashing the conversation id keeps a whole conversation on one model. Monitor the quality gap
+  between the slice and the routed traffic, per route.
 - **Escalation-rate budget.** Alert when the escalation rate over a rolling window leaves its normal band,
   and cap large-model spend per hour so a small-model regression cannot become an unbounded bill. Monitor
   escalation rate, large-model 429s and cost per successful task.

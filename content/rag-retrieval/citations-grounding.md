@@ -5,7 +5,7 @@ name: Citations / grounding
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/citation-correctness
   - rag-retrieval/lost-in-the-middle
@@ -230,8 +230,9 @@ print(resolve_span("partial refunds are prorated", chunk))                  # No
   "used to" support the claim after a document edit.
 - **No abstention path.** The model attaches the nearest citation to parametric knowledge; symptom:
   citations that are topically related but do not state the claimed fact.
-- **Checking only that citation IDs exist.** Symptom: evals show high "citation rate" while human
-  reviewers still find many unsupported sentences.
+- **Checking only that citation IDs exist, not that the cited text supports the claim.** Symptom: evals
+  show high "citation rate" while human reviewers still find many unsupported sentences. Fix: quote
+  checks in code plus a sampled entailment audit.
 - **Long, numerous chunks burying the evidence mid-context.** Symptom: citation accuracy drops as top-k
   grows even though retrieval recall goes up.
 - **Citing whole documents rather than chunks or spans.** Symptom: a near-perfect automated citation score

@@ -5,7 +5,7 @@ name: Chunking strategies (fixed, recursive, semantic)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/chunk-overlap
   - rag-retrieval/retrieval-granularity
@@ -194,8 +194,11 @@ print([round(1 - s, 2) for s in sims], cuts)       # [0.19, 0.22, 0.66, 0.2, 0.2
 print([len(g) for g in group([f"s{i}" for i in range(1, 7)], cuts)])   # [3, 3]
 ```
 
-Because the cut is a percentile of this document's own distances, swapping the embedding model shifts
-every similarity but still places the boundary at the largest drop.
+- **Why relative helps:** the cut is a percentile of this document's own distances, so a model swap that
+  shifts every similarity up or down still places the boundary at the largest drop, as long as that drop
+  stays the largest.
+- **What it costs:** a pure percentile rule always cuts somewhere, even inside a single-topic document,
+  so pair it with a minimum chunk size as well as the hard cap.
 
 ### Worked scenario: the wrong-subsystem answers
 | Symptom | Cause | Fix |
@@ -311,8 +314,10 @@ known, measuring recall@k before and after rather than eyeballing results.
 ### Retrieval quality dropped after someone changed chunk size from 500 to 1,000 tokens. How do you debug it?
 - **Confirm with the golden set:** compare recall@k and answer quality at both sizes on the same questions,
   holding the embedder and retriever constant.
-- **Inspect misses:** larger chunks blur vectors, so factoid queries now match broader sections that rank
-  below shorter, more specific ones.
+- **Check the encoder limit first:** if the embedder caps input at 512 tokens, 1,000-token chunks are
+  truncated silently and their second halves are unretrievable; the token-count histogram shows it.
+- **Inspect misses:** a larger chunk mixes the answer with other topics, so its blurrier vector ranks
+  below shorter, more specific chunks for factoid queries.
 - **Fix options:** revert, route by query type, or index small spans and return the parent section so match
   size and context size are decoupled.
 

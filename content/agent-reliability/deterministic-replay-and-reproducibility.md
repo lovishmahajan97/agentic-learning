@@ -5,7 +5,7 @@ name: Deterministic replay & reproducibility
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/structured-event-streams
@@ -21,103 +21,128 @@ sources:
 ---
 
 ## TL;DR
-You cannot reproduce an agent run by rerunning it: the model samples, providers change, tools return
-live data, and one different token changes every later step. Reproducibility therefore comes in three
-grades: exact replay from a recording of every non-deterministic boundary, best-effort re-execution with
-pinned model, seed and temperature, and statistical reproduction over many runs. Design the runtime so the
-orchestration logic is deterministic and every effect is recorded, and the first grade is always
-available.
+Rerunning an agent does not reproduce it: models sample, providers change, tools return live data.
+Reproducibility has three grades: exact replay from recorded effects, best-effort re-execution with pinned
+settings, and statistical reproduction. Deterministic orchestration plus recorded effects keeps exact
+replay always available.
 
 ## Why it exists
-A run fails at 03:00: the agent called the wrong tool at step 7 and corrupted a record. The engineer
-reruns the same task in the morning and it works. There is no bug to fix because there is no failure to
-look at. This happens because an agent run is a chain of decisions, each conditioned on everything before
-it, and several links in the chain are not functions of their inputs: the model's sampled output, the
-provider's silently updated weights or serving stack, the tool that returned today's data instead of last
-night's, the clock, the random id generator. Change one token at step 2 and step 7 may not happen at all.
-
-The naive alternative is "set temperature to 0 and rerun". It fails for reasons worth knowing. Greedy
-decoding removes sampling noise but not numerical noise: floating-point reductions on GPUs are
-order-dependent, batching puts your request next to different neighbours, and kernels get updated, so the
-argmax can flip on near-tied logits. Hosted providers additionally move alias model names to new
-snapshots, and even a dated snapshot can see serving-stack changes. And
-none of this touches the tools, which are the bigger source of divergence in practice.
-
-Durable workflow engines solved the same problem for ordinary distributed code by splitting it into
-deterministic orchestration and recorded effects. Agents inherit that solution: record every effect,
-replay the recording, and the orchestration reproduces the exact trajectory, step for step, on any
-machine, with no model call at all.
+- **The failure you cannot see.** A run fails at 03:00: the agent called the wrong tool at step 7 and
+  corrupted a record. The engineer reruns the task in the morning and it works. There is no bug to fix
+  because there is no failure to look at.
+- **Several links in the chain are not functions of their inputs:** the model's sampled output, the
+  provider's silently updated weights or serving stack, a tool returning today's data instead of last
+  night's, the clock, the random id generator. Each decision is conditioned on everything before it, so
+  change one token at step 2 and step 7 may not happen at all.
+- **"Temperature 0 and rerun" fails.** Greedy decoding removes sampling noise but not numerical noise:
+  GPU floating-point reductions are order-dependent, batching puts your request next to different
+  neighbours, and kernels get updated, so the argmax can flip on near-tied logits.
+- **Providers and tools move too.** Hosted providers move alias model names to new snapshots, and even a
+  dated snapshot can see serving-stack changes. None of this touches the tools, which are the bigger source
+  of divergence in practice.
+- **Durable workflow engines already solved it** by splitting code into deterministic orchestration and
+  recorded effects. Agents inherit that: record every effect, replay the recording, and the orchestration
+  reproduces the exact trajectory, step for step, on any machine, with no model call at all.
 
 ## How it works
 ### Classify everything as orchestration or effect
-Orchestration is the code that decides what to do next given the history: assembling the prompt, parsing
-the tool call, checking the policy, choosing the next step. It must be a pure function of the recorded
-history. Effects are everything whose output is not a function of its inputs from the orchestrator's point
-of view: LLM calls, tool calls, `time.now()`, `random()`, `uuid4()`, environment reads. Each effect goes
-through one interface.
+| | Orchestration | Effects |
+|---|---|---|
+| What | Code that decides what to do next given the history: assembling the prompt, parsing the tool call, checking the policy, choosing the next step | Anything whose output is not a function of its inputs from the orchestrator's view: LLM calls, tool calls, `time.now()`, `random()`, `uuid4()`, environment reads |
+| Rule | Must be a pure function of the recorded history | Each goes through one interface |
 
 ### Record mode
-The runtime runs normally. Every effect request is written to the run's event stream before execution with
-its sequence number and an input hash; its output is written after. The LLM request event stores the model
-identifier, the full parameters and a reference to the exact prompt; the response event stores the exact
-text and tool calls. Tool events store arguments and results by reference. Clock and random draws are
-recorded too, *because* a timestamp in a prompt or a generated id in an argument is enough to make the
-next step differ.
+1. **The runtime runs normally.**
+2. **Every effect request is written to the run's event stream before execution,** with its sequence number
+   and an input hash; its output is written after.
+3. **LLM events:** the request stores the model identifier, the full parameters and a reference to the exact
+   prompt; the response stores the exact text and tool calls.
+4. **Tool events** store arguments and results by reference.
+5. **Clock and random draws are recorded too,** *because* a timestamp in a prompt or a generated id in an
+   argument is enough to make the next step differ.
 
 ### Replay mode
-The orchestrator runs again from the initial input, but the effect interface is switched to serve from the
-recording: the nth effect request returns the nth recorded output, after checking that the request matches
-what was recorded (same effect type and input hash). No model is called; no tool runs. Because
-orchestration is deterministic, it issues exactly the same sequence of requests, and the run reproduces
-step by step. You can set breakpoints, inspect the prompt the model saw at step 7, and see why its answer
-led to the wrong tool.
+- **Same orchestrator, recorded effects.** It runs again from the initial input, but the effect interface
+  serves from the recording: the nth effect request returns the nth recorded output, after checking the
+  request matches (same effect type and input hash).
+- **No model is called; no tool runs.** Because orchestration is deterministic, it issues exactly the same
+  sequence of requests, and the run reproduces step by step.
+- **You can debug the past:** set breakpoints, inspect the prompt the model saw at step 7, and see why its
+  answer led to the wrong tool.
 
-The match check is the crucial safety feature. If the orchestrator issues a request that does not match
-the recording, the code has changed in a way that alters the trajectory; the replayer raises a
-non-determinism error rather than silently serving a mismatched answer. This is the same rule durable
-workflow engines enforce: code versions and recordings go together, so the runtime records a code version
-with each run and replays against the same version.
+### The match check is the safety feature
+- **A mismatched request means the code changed** in a way that alters the trajectory. The replayer raises a
+  non-determinism error rather than silently serving a mismatched answer.
+- **Durable workflow engines enforce the same rule:** code versions and recordings go together, so the
+  runtime records a code version with each run and replays against the same version.
 
-Matching by position ("the nth effect") works for a sequential loop and breaks for parallel tool calls,
-whose results arrive in a different order each run. Key each effect by its logical identity instead,
-such as `(step, call_id)` for tool calls and `(step, "llm")` for the model call, and have the replayer
-look up by key. Arrival order then stops mattering, and the orchestrator must merge parallel results in a
-deterministic order (by `call_id`, not by completion time) or replay will still diverge.
+### Parallel calls need keys, not positions
+- **Position matching ("the nth effect") breaks for parallel tool calls,** whose results arrive in a
+  different order each run.
+- **Key each effect by logical identity:** `(step, call_id)` for tool calls and `(step, "llm")` for the model
+  call, and have the replayer look up by key. Arrival order then stops mattering.
+- **Merge deterministically:** the orchestrator must merge parallel results in a fixed order (by `call_id`,
+  not by completion time), or replay will still diverge.
 
 ### Fork: replay to a point, then go live
-To test a fix, replay the recording up to step k, then switch the effect interface back to live for steps
-after k. Everything up to the divergence is identical, so the comparison isolates the change. This is what
-"time travel" means in checkpoint-based frameworks: load the state at a checkpoint, optionally edit it,
-continue live. "Live" should mean live model and sandboxed or faked side-effecting tools, *because* a fork
-of an incident run that refunds a real customer a second time turns debugging into a new incident.
+1. **Replay the recording up to step k,** then switch the effect interface back to live for steps after k.
+2. **Everything up to the divergence is identical,** so the comparison isolates the change.
+3. **This is "time travel"** in checkpoint-based frameworks: load the state at a checkpoint, optionally
+   edit it, continue live.
+4. **"Live" means live model and sandboxed or faked side-effecting tools,** *because* a fork of an incident
+   run that refunds a real customer a second time turns debugging into a new incident.
 
 ### The three grades of reproducibility
-1. **Exact replay** (recording). Always achievable if the recording is complete. It reproduces the past;
-   it cannot tell you what the model would do now.
-2. **Best-effort re-execution.** Pin the model version where the provider exposes one, set temperature 0
-   or a fixed seed, pin tool data with snapshots or fakes, and freeze the clock. Some providers expose a
-   seed parameter and a fingerprint of the serving configuration, documented as best-effort rather than
-   guaranteed; self-hosted engines can get closer with fixed batch composition and kernels, but "close" is
-   the honest claim. Use it to ask "does the model still make this mistake", not to prove anything
-   bit-exact.
-3. **Statistical reproduction.** Accept non-determinism and measure it: run the task N times, report the
-   pass rate with an interval, and compare distributions before and after a change. This is the only grade
-   that answers "did my fix help" for a stochastic system. Budget N from the effect size: to show that a
-   10% failure rate fell to 5% with a standard two-proportion test (5% significance, 80% power) takes
-   roughly 430 runs per arm, which is why forking from step k matters for long agents: each of those runs
-   then pays only for the divergent tail, not the whole trajectory.
+| Grade | How | What it answers | Limit |
+|---|---|---|---|
+| 1. **Exact replay** (recording) | Serve every effect from the recording | What happened, exactly | Reproduces the past; cannot say what the model would do now |
+| 2. **Best-effort re-execution** | Pin the model version where exposed, temperature 0 or a fixed seed, tool snapshots or fakes, frozen clock | "Does the model still make this mistake?" | Not bit-exact; "close" is the honest claim |
+| 3. **Statistical reproduction** | Run the task N times, report pass rate with an interval, compare distributions | "Did my fix help?" for a stochastic system | Costs N runs per task |
+
+- **Grade 2 details.** Some providers expose a seed parameter and a fingerprint of the serving
+  configuration, documented as best-effort rather than guaranteed; self-hosted engines get closer with
+  fixed batch composition and kernels.
+- **Grade 3 budget.** Pick N from the effect size: showing a 10% failure rate fell to 5% with a standard
+  two-proportion test (5% significance, 80% power) takes roughly 430 runs per arm.
+- **That is why forking matters for long agents:** each of those runs pays only for the divergent tail
+  from step k, not the whole trajectory.
 
 ### What the recording must contain
-The checklist, in the order people forget it: model id and parameters, exact prompt text or a hash
-resolving to it, the exact response including tool-call JSON, every tool's arguments and result, clock
-reads, random draws, environment variables that reach prompts, and the code version. Miss one and replay
-diverges at the first step that touches it.
+In the order people forget it; miss one and replay diverges at the first step that touches it:
+1. Model id and parameters.
+2. Exact prompt text, or a hash resolving to it.
+3. The exact response, including tool-call JSON.
+4. Every tool's arguments and result.
+5. Clock reads and random draws.
+6. Environment variables that reach prompts.
+7. The code version.
 
-## Example
+## Diagram
+Every non-deterministic call passes one effect interface; the mode decides whether it goes live, is
+served from the recording, or is refused because the request no longer matches.
+
+```mermaid
+flowchart TD
+    O["Orchestrator: pure, deterministic"] -->|"llm, tool, clock, random"| E{"Effect interface mode"}
+    E -->|"record"| L["Call live service"]
+    L --> R[("Recording: key and output")]
+    E -->|"replay"| K{"Request key matches recording?"}
+    K -->|"yes"| S["Serve recorded output"]
+    K -->|"no"| N["Raise non-determinism error"]
+    R --> K
+    E -->|"fork after step k"| F["Live model, sandboxed tools"]
+    S --> O
+    F --> O
+```
+
+## Examples
+### Effect recorder and replayer
 An effect recorder/replayer wrapped around an agent loop. In `record` mode it logs every boundary; in
 `replay` mode it serves recorded outputs and refuses to continue if the orchestrator asks for something
-different. The loop runs tool calls sequentially, so matching by position is enough; with parallel calls
-the lookup would be by `(step, call_id)` as described above.
+different.
+
+- **Sequential loop:** tool calls run one at a time, so matching by position is enough; with parallel calls
+  the lookup would be by `(step, call_id)` as described above.
 
 ```python
 import hashlib, json
@@ -163,46 +188,121 @@ def agent(task: str, fx: Effects, max_steps: int = 8) -> str:
 #   answer = agent(task, Effects("replay", log, live={}))   -> identical trajectory, step by step
 ```
 
+### Record, replay and a refused replay (runnable)
+Uses `Effects`, `NonDeterminismError` and `agent` from the block above, with fake live services. A changed
+input makes the first LLM request hash differently, so replay refuses instead of inventing a run.
+
+```python
+def fake_llm(model, messages, temperature):
+    if messages[-1]["role"] == "user":
+        return {"text": "", "tool_calls": [{"name": "lookup", "arguments": {"id": "o-7"}}]}
+    return {"text": "Order o-7 shipped."}
+
+live = {"clock": lambda: "2026-10-19T03:00", "llm": fake_llm,
+        "tool": lambda name, arguments: {"status": "shipped"}}
+
+log = []
+print(agent("Where is o-7?", Effects("record", log, live)))       # Order o-7 shipped.
+print([r["kind"] for r in log])                                   # ['clock', 'llm', 'tool', 'llm']
+print(agent("Where is o-7?", Effects("replay", log, live={})))    # same answer, nothing called
+
+try:                                                              # input (or code) changed
+    agent("Where is o-8?", Effects("replay", log, live={}))
+except NonDeterminismError as e:
+    print("refused:", e)                                          # effect #1: recorded llm/..., got llm/...
+```
+
+### Budgeting N for the statistical grade
+A standard two-proportion sample-size formula, stdlib only. It reproduces the "roughly 430 runs per arm"
+figure and shows why small improvements are expensive to prove.
+
+```python
+from math import ceil, sqrt
+from statistics import NormalDist
+
+def runs_per_arm(p_before: float, p_after: float, alpha=0.05, power=0.80) -> int:
+    """Two-proportion z-test sample size (two-sided), per arm."""
+    z_a = NormalDist().inv_cdf(1 - alpha / 2)
+    z_b = NormalDist().inv_cdf(power)
+    p_bar = (p_before + p_after) / 2
+    num = (z_a * sqrt(2 * p_bar * (1 - p_bar))
+           + z_b * sqrt(p_before * (1 - p_before) + p_after * (1 - p_after))) ** 2
+    return ceil(num / (p_before - p_after) ** 2)
+
+print(runs_per_arm(0.10, 0.05))   # 435
+print(runs_per_arm(0.10, 0.02))   # 138
+print(runs_per_arm(0.10, 0.08))   # 3213
+```
+
+| Failure rate before → after | Runs per arm | With a 12-step agent forked at step 7 |
+|---|---|---|
+| 10% → 5% | 435 | each run pays for 6 live steps, not 12 |
+| 10% → 2% | 138 | a cheap confirmation |
+| 10% → 8% | 3,213 | consider whether the gain is worth proving |
+
+## Production patterns
+- **Record by default from the event stream.** When: every production run. How: route LLM, tool, clock and
+  random calls through one effect interface that appends request and response events; most of this is the
+  stream you keep for resumption and audit. Monitor: replay coverage, the fraction of runs that replay
+  without a non-determinism error.
+- **Stamp the code version on every run.** When: any runtime whose code changes while recordings live on.
+  How: store the deploy's commit SHA with the run and refuse or warn when replaying against a different
+  version; Temporal's workflow versioning and patching APIs exist for exactly this. Monitor: replays
+  attempted across versions.
+- **Replay tests in CI.** When: changing orchestration code. How: replay a fixed set of recorded production
+  runs against the new code and fail the build on non-determinism errors (Temporal, for example, ships a
+  replayer for workflow histories). Monitor: which recordings break and at which step.
+- **Sandboxed forks.** When: testing a fix from an incident recording. How: fork mode swaps side-effecting
+  tools for fakes or a staging backend while the model goes live. Monitor: any fork that reaches a
+  production endpoint, which should be zero.
+- **Pinned model snapshots with a re-pin schedule.** When: evals and reproductions must be comparable. How:
+  use dated model identifiers rather than aliases and put the deprecation date on the calendar. Monitor:
+  divergence rate of best-effort re-execution after each provider change.
+- **Recordings under retention.** When: recordings contain customer content. How: keep payloads by
+  reference in a blob store with lifecycle rules and per-record delete, so the event history survives
+  data-protection deletions. Monitor: unresolved references in recordings you still need.
+
 ## Trade-offs
-- Exact replay is cheap to run and perfectly faithful to the past, but it can only reproduce what was
-  recorded; the moment you change the prompt or the code before the failing step, you are in re-execution
-  territory with its uncertainty.
-- Recording every effect including clock and random draws makes replay watertight but imposes discipline:
-  any developer who calls `datetime.now()` directly inside orchestration breaks replay, and the error
-  appears weeks later on an old recording.
-- Pinning model versions gives stability for reproduction and evals, but pinned versions get deprecated and
-  a pinned model drifts away from the one users get; schedule the re-pinning rather than discovering it.
-- Statistical reproduction answers the right question for stochastic systems but costs N runs per task;
-  for expensive multi-step agents, replay-then-fork from the step before the failure cuts the cost to the
-  divergent tail.
+- **Exact replay vs relevance.** It is cheap to run and perfectly faithful to the past, but it only
+  reproduces what was recorded; once you change the prompt or code before the failing step, you are in
+  re-execution territory with its uncertainty.
+- **Watertight recording vs discipline.** Recording clock and random draws makes replay watertight but any
+  developer who calls `datetime.now()` directly inside orchestration breaks replay, and the error appears
+  weeks later on an old recording.
+- **Pinned models vs drift.** Pinning gives stability for reproduction and evals, but pinned versions get
+  deprecated and drift away from the one users get; schedule the re-pinning rather than discovering it.
+- **Statistical reproduction vs cost.** It answers the right question for stochastic systems but costs N
+  runs per task; for expensive multi-step agents, replay-then-fork from the step before the failure cuts
+  the cost to the divergent tail.
 
 ## Pitfalls
-- Believing temperature 0 means deterministic; the symptom is a "reproduction" that diverges at step 3 with
-  no code change and a team debugging a phantom.
-- Recording the prompt template name but not its exact text or hash; the symptom is a replay that silently
-  uses today's template and produces a different trajectory from the one in the incident.
-- Calling the model inside orchestration without going through the effect interface, for example a helper
-  that "just summarizes" tool output; the symptom is a non-determinism error on replay pointing at a step
-  that looks pure.
-- Changing code and replaying an old recording without a version check; the symptom is a mismatched
-  response served to a different request, producing a run that never happened.
-- Treating a single successful rerun as proof a bug is fixed; the symptom is the bug returning in
-  production at roughly its old rate.
-- Tools with live side effects running during replay; the symptom is the incident reproduction creating a
+- **Believing temperature 0 means deterministic.** Symptom: a "reproduction" that diverges at step 3 with no
+  code change and a team debugging a phantom.
+- **Recording the prompt template name but not its exact text or hash.** Symptom: a replay that silently
+  uses today's template and produces a different trajectory from the incident's.
+- **Calling the model inside orchestration without the effect interface,** for example a helper that "just
+  summarizes" tool output. Symptom: a non-determinism error on replay pointing at a step that looks pure.
+- **Replaying an old recording on changed code without a version check.** Symptom: a mismatched response
+  served to a different request, producing a run that never happened.
+- **Treating a single successful rerun as proof a bug is fixed.** Symptom: the bug returns in production at
+  roughly its old rate.
+- **Tools with live side effects running during replay.** Symptom: the incident reproduction creates a
   second real ticket.
-- Replaying parallel tool calls by arrival position; the symptom is non-determinism errors that appear
-  only on runs with parallel calls and vanish when the same task runs sequentially.
-- Keeping recordings under no retention policy; the symptom is a data-protection deletion request that
-  cannot be honoured because customer content sits in years of replay logs.
+- **Replaying parallel tool calls by arrival position.** Symptom: non-determinism errors only on runs with
+  parallel calls, vanishing when the same task runs sequentially.
+- **Recordings under no retention policy.** Symptom: a data-protection deletion request that cannot be
+  honoured because customer content sits in years of replay logs.
 
 ## When to use
-Record every production run by default; the event stream you already keep for resumption and audit is
-most of the recording, and the extra cost is clock and random draws. Reach for exact replay first in any
-incident, because it is free and faithful, then fork from the step before the divergence to test a fix,
-then run the statistical grade to confirm the fix across N runs before shipping. Measure replay coverage
-(fraction of runs that replay without a non-determinism error), the divergence rate of best-effort
-re-execution, and the run count needed to detect the improvement you care about. In interviews, the
-strong answer distinguishes the three grades and explains why orchestration must be pure.
+- **Record every production run by default;** the event stream you already keep for resumption and audit
+  is most of the recording, and the extra cost is clock and random draws.
+- **In any incident, reach for exact replay first,** because it is free and faithful; then fork from the
+  step before the divergence to test a fix; then run the statistical grade across N runs before shipping.
+- **Measure** replay coverage (fraction of runs that replay without a non-determinism error), the
+  divergence rate of best-effort re-execution, and the run count needed to detect the improvement you care
+  about.
+- **Interviews:** the strong answer distinguishes the three grades and explains why orchestration must be
+  pure.
 
 ## Role lens
 - **Engineer:** Routes every LLM, tool, clock and random call through one effect interface and keeps
@@ -226,6 +326,40 @@ non-determinism error at that point, which tells you the fork has to start earli
 single success proves little, so run the task N times with the fix and compare the failure rate to the
 baseline with a confidence interval. Finally, record the code version with the fix so future replays of
 this recording warn that it predates the change.
+
+## Interview questions
+### Why must orchestration code be deterministic for replay to work?
+- **Replay re-executes the orchestrator** and serves effects from the recording; it only reproduces the run
+  if the orchestrator issues exactly the same requests in the same order.
+- **Hidden non-determinism breaks that:** a direct `datetime.now()`, a `uuid4()` in an argument or an
+  unrecorded model call changes a request hash and the replay diverges.
+- **So the rule is:** orchestration is a pure function of recorded history, and every effect goes through
+  one interface.
+
+### Replay works for sequential runs but fails with non-determinism errors on runs with parallel tool calls. Why?
+- **Position matching:** the replayer serves "the nth effect", but parallel results arrive in a different
+  order each run, so the nth request no longer matches the nth recording.
+- **Fix the lookup:** key effects by logical identity, `(step, call_id)` for tools and `(step, "llm")` for
+  the model.
+- **Fix the merge:** combine parallel results in a fixed order such as by `call_id`, not completion time.
+
+### Is temperature 0 with a fixed seed enough for reproducible evals?
+- **No, it is best-effort:** GPU reductions are order-dependent, batch neighbours change, kernels update and
+  near-tied logits can flip.
+- **Providers and tools also move:** alias names point to new snapshots and live tools return new data.
+- **Use it for** "does the model still make this mistake"; use recordings for exact answers and repeated
+  runs for rate questions.
+
+### How many runs do you need to show a fix cut failures from 10% to 5%?
+- **Roughly 430 per arm** with a two-proportion test at 5% significance and 80% power.
+- **Effect size dominates:** 10% to 2% needs about 140, while 10% to 8% needs over 3,000.
+- **Make runs cheaper:** fork from the step before the failure so each run pays only for the divergent tail.
+
+### When would you not bother with full effect recording?
+- **Short, side-effect-free tasks** where rerunning is cheap and an incident has no lasting consequence.
+- **Even then keep the cheap part:** model id, prompt hash and code version, because without them you
+  cannot tell whether the model or the prompt changed.
+- **Any agent with side effects or regulated data** should record by default; the stream already exists.
 
 ## Quiz
 ### Q: Why does setting temperature to 0 not guarantee a reproducible agent run?

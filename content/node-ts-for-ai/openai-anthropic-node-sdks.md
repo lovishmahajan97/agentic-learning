@@ -5,7 +5,7 @@ name: OpenAI / Anthropic Node SDKs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/api-clients-with-retries-and-circuit-breakers
   - node-ts-for-ai/abortcontroller-and-cancellation
@@ -21,124 +21,138 @@ sources:
 ---
 
 ## TL;DR
-`openai` and `@anthropic-ai/sdk` are typed, generated clients over each provider's REST API with the
-same bones: a client that reads the key from the environment, resource methods that return typed
-objects, automatic retries with backoff on transient failures, millisecond timeouts, `AbortSignal`
-support, streaming as async iterables, and typed error classes. They differ where the APIs differ:
-message and tool-call shapes, how tool results are sent back, explicit versus automatic prompt
-caching. Learn the shared mechanics once, then the two wire shapes.
+`openai` and `@anthropic-ai/sdk` are generated, typed clients with the same bones: env-read keys,
+retries with backoff, millisecond timeouts, `AbortSignal`, async-iterable streams and typed errors. They
+differ in message and tool-call shapes and in explicit versus automatic prompt caching.
 
 ## Why it exists
-Calling a model is one HTTPS POST, and the temptation is to write it with `fetch`. That works for a
-demo and fails in production in predictable ways. The provider returns 429 or 529 under load and the
-hand-rolled call either gives up or retries immediately and makes the overload worse. A streamed
-response arrives as server-sent events with several event types that must be parsed, re-assembled
-into content blocks and matched to a stop reason; a hand-written parser handles the text case and
-silently drops the tool-call case. A tool call arrives with a JSON schema contract that TypeScript
-cannot see, so arguments are cast rather than checked. Timeouts, request IDs for support tickets,
-rate-limit headers, pagination of file and batch endpoints and the exact error taxonomy are all left
-to each caller to rediscover.
-
-The SDKs exist to make those behaviours uniform and typed. Both are generated from the provider's API
-specification, which is *why* every request and response has a TypeScript type that matches the
-wire exactly and why the type changes when the API does. Both wrap the transport with the same
-production defaults: retries on connection errors and on 408, 409, 429 and 5xx responses with
-exponential backoff that honours `retry-after`, a default timeout of 10 minutes, and per-request
-overrides. The naive alternative, a thin wrapper of your own, ends up re-implementing a worse version
-of exactly this. The reason to understand the SDKs rather than just call them is that their defaults
-interact with yours: an outer retry loop around the SDK's inner retries multiplies attempts, a proxy
-timeout shorter than the SDK's makes the SDK's retries invisible, and a stream you forget to abort on
-client disconnect keeps billing.
+- **A hand-rolled `fetch` fails in predictable ways.** Under load the provider returns 429 or 529, and the
+  call either gives up or retries immediately and worsens the overload. Timeouts, request IDs for support
+  tickets, rate-limit headers, pagination of file and batch endpoints and the error taxonomy are left to
+  every caller to rediscover.
+- **Streams are harder than they look.** Server-sent events carry several event types that must be parsed,
+  re-assembled into content blocks and matched to a stop reason. A hand-written parser handles text and
+  silently drops tool calls.
+- **Tool arguments arrive with a JSON schema contract TypeScript cannot see**, so they get cast rather
+  than checked.
+- **The SDKs make these behaviours uniform and typed.** Both are generated from the provider's API
+  specification, *which is why* every request and response type matches the wire exactly and changes when
+  the API does. A thin wrapper of your own re-implements a worse version of this.
+- **Their defaults interact with yours.** An outer retry loop multiplies attempts; a proxy timeout shorter
+  than the SDK's hides its retries; a stream not aborted on client disconnect keeps billing.
 
 ## How it works
 ### Shared client mechanics
-`new OpenAI()` reads `OPENAI_API_KEY`; `new Anthropic()` reads `ANTHROPIC_API_KEY`. Both accept
-`apiKey`, `baseURL`, `timeout` (milliseconds, unlike the Python SDKs' seconds), `maxRetries` (default
-2, so up to three attempts), `defaultHeaders` and a custom `fetch`, and both run on supported Node LTS
-releases (check the `engines` field of the version you install), Bun, Deno and edge runtimes because
-they use the global `fetch`. Every method takes an optional second argument of request
-options: `{ timeout, maxRetries, signal, headers }`. The `signal` is an ordinary `AbortSignal`, so the
-cancellation lesson applies unchanged: aborting rejects the promise with `APIUserAbortError` and
-closes the socket, which stops further generation (tokens already produced are still billed). Retries
-are counted per request, and a timeout is retried, so the worst-case wall clock is roughly
-`timeout × (maxRetries + 1)` plus the backoff sleeps; size proxy and handler timeouts from that
-number, not from `timeout` alone. One asymmetry: for non-streaming requests with a large
-`max_tokens`, the Anthropic SDK raises its default timeout on its own, and very large output caps
-effectively require streaming, *because* a single HTTP response that takes many minutes to arrive
-is exactly what proxies and load balancers kill.
+| Setting | Behaviour |
+|---|---|
+| API key | `new OpenAI()` reads `OPENAI_API_KEY`; `new Anthropic()` reads `ANTHROPIC_API_KEY`; or pass `apiKey` |
+| Other options | `baseURL`, `timeout`, `maxRetries`, `defaultHeaders`, a custom `fetch` |
+| `timeout` | Milliseconds (unlike the Python SDKs' seconds); default 10 minutes |
+| `maxRetries` | Default 2, so up to three attempts |
+| Retries on | Connection errors and 408, 409, 429 and 5xx, with exponential backoff that honours `retry-after` |
+| Runtimes | Supported Node LTS releases (check the `engines` field of your version), Bun, Deno and edge runtimes, because they use the global `fetch` |
+| Per request | Optional second argument `{ timeout, maxRetries, signal, headers }` |
 
-Both expose typed errors under the default export: `APIError` with a numeric `status`, and subclasses
-such as `BadRequestError` (400), `AuthenticationError` (401), `RateLimitError` (429),
-`InternalServerError` (5xx), `APIConnectionError` and `APIConnectionTimeoutError`. Check with
-`instanceof` from most specific to least, never by matching message text. Each response carries the
-provider's request ID (`_request_id` on objects returned by non-streaming calls, `request_id` on
-Anthropic's `MessageStream` helper) for support tickets, and `.withResponse()`
-returns `{ data, response }` so you can read rate-limit headers from the raw `Response`.
+- **Cancellation is a plain `AbortSignal`.** Aborting rejects with `APIUserAbortError` and closes the socket,
+  stopping further generation; tokens already produced are still billed.
+- **Worst-case wall clock is `timeout × (maxRetries + 1)` plus backoff sleeps**, because retries are counted
+  per request and a timeout is retried. Size proxy and handler timeouts from that, not from `timeout` alone.
+- **Anthropic asymmetry.** For non-streaming requests with a large `max_tokens`, the Anthropic SDK raises
+  its default timeout itself, and very large output caps effectively require streaming, *because* an HTTP
+  response that takes many minutes is exactly what proxies and load balancers kill.
+
+### Typed errors and request IDs
+- **Hierarchy under the default export:** `APIError` with a numeric `status`, and subclasses such as
+  `BadRequestError` (400), `AuthenticationError` (401), `RateLimitError` (429), `InternalServerError` (5xx),
+  `APIConnectionError` and `APIConnectionTimeoutError`.
+- **Check with `instanceof`, most specific first**, never by matching message text.
+- **Request IDs** for support tickets: `_request_id` on objects returned by non-streaming calls,
+  `request_id` on Anthropic's `MessageStream` helper.
+- **Raw response:** `.withResponse()` returns `{ data, response }` so you can read rate-limit headers.
 
 ### Requests and responses
-OpenAI has two chat surfaces. Chat Completions (`client.chat.completions.create`) takes `messages`
-with `system`, `user`, `assistant` and `tool` roles and returns `choices[0].message` with `content`
-and optional `tool_calls`; the newer Responses API (`client.responses.create`) takes `input` and
-returns a list of typed `output` items with `output_text` as a convenience, and can keep
-conversation state server-side: pass `previous_response_id` instead of resending history. Responses
-are stored by default unless you set `store: false`, which is a data-retention decision, not just a
-convenience. Anthropic has one: `client.messages.create` takes a top-level `system`
-string or blocks, a `messages` array of `user` / `assistant` turns, a required `max_tokens`, and returns
-`content` as an array of blocks (`text`, `tool_use`, `thinking`) with a `stop_reason`
-(`end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `pause_turn`, `refusal`, and new values as the
-API grows, so keep a default branch). The block array is the structural difference to
-internalise: Anthropic responses are always lists, so code narrows on `block.type`, whereas Chat
-Completions responses are a single message with optional fields. Usage is `prompt_tokens` /
-`completion_tokens` on Chat Completions (`input_tokens` / `output_tokens` on the Responses API) and `input_tokens` / `output_tokens` (plus cache read and creation
-counts) on Anthropic; normalise early if you log cost.
+| | OpenAI Chat Completions | OpenAI Responses API | Anthropic Messages |
+|---|---|---|---|
+| Call | `client.chat.completions.create` | `client.responses.create` | `client.messages.create` |
+| Input | `messages` with `system`, `user`, `assistant`, `tool` roles | `input` | top-level `system` string or blocks, `messages` of `user` / `assistant` turns, required `max_tokens` |
+| Output | `choices[0].message` with `content` and optional `tool_calls` | typed `output` items, `output_text` convenience | `content` array of blocks (`text`, `tool_use`, `thinking`) plus `stop_reason` |
+| Usage | `prompt_tokens` / `completion_tokens` | `input_tokens` / `output_tokens` | `input_tokens` / `output_tokens` plus cache read and creation counts |
+
+- **Responses API state.** It can keep conversation state server-side: pass `previous_response_id` instead
+  of resending history. Responses are stored by default unless you set `store: false`, a data-retention
+  decision, not just a convenience.
+- **Anthropic stop reasons:** `end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `pause_turn`,
+  `refusal`, and new values as the API grows, so keep a default branch.
+- **The structural difference to internalise.** Anthropic responses are always lists, so code narrows on
+  `block.type`; Chat Completions returns a single message with optional fields.
+- **Normalise usage early** if you log cost.
 
 ### Streaming
-Both stream as async iterables. OpenAI returns a stream when `stream: true` is set: Chat Completions
-yields chunks whose `choices[0].delta.content` you concatenate, with usage in a final chunk when
-`stream_options: { include_usage: true }` is set; tool calls arrive as `delta.tool_calls[]` fragments
-keyed by `index`, whose `function.arguments` strings you must concatenate per index before parsing
-(or use the `client.chat.completions.stream()` helper, whose `finalChatCompletion()` does it for you); the Responses API yields named events such as
-`response.output_text.delta`. Anthropic's `client.messages.stream()` returns a helper that is both an
-iterable of raw events (`content_block_start`, `content_block_delta` with `text_delta` or
-`input_json_delta`, `message_delta`, `message_stop`) and an emitter with `.on("text", …)`, and whose
-`.finalMessage()` resolves the complete, typed `Message` once the stream ends, so one call feeds the
-user and your logs. The helper exists *because* tool-call arguments arrive as JSON fragments across many
-events; accumulating them correctly is exactly the code you do not want to write per service.
+- **OpenAI Chat Completions** returns a stream when `stream: true` is set. Concatenate
+  `choices[0].delta.content`; usage arrives in a final chunk when `stream_options: { include_usage: true }`
+  is set.
+- **OpenAI tool calls in a stream** arrive as `delta.tool_calls[]` fragments keyed by `index`; concatenate
+  each index's `function.arguments` strings before parsing, or use the `client.chat.completions.stream()`
+  helper, whose `finalChatCompletion()` does it for you.
+- **OpenAI Responses API** yields named events such as `response.output_text.delta`.
+- **Anthropic `client.messages.stream()`** returns a helper that is both an iterable of raw events
+  (`content_block_start`, `content_block_delta` with `text_delta` or `input_json_delta`, `message_delta`,
+  `message_stop`) and an emitter with `.on("text", …)`.
+- **`.finalMessage()`** resolves the complete, typed `Message` once the stream ends, so one call feeds the
+  user and your logs. The helper exists *because* tool-call arguments arrive as JSON fragments across many
+  events, which is exactly the code you do not want to write per service.
 
 ### Tools and structured output: the two wire shapes
-OpenAI Chat Completions defines a tool as `{ type: "function", function: { name, description,
-parameters, strict } }`; the model answers with `tool_calls[]`, each carrying an `id` and
-`function.arguments` as a JSON *string* you must `JSON.parse`, and the result goes back as a message
-with `role: "tool"` and `tool_call_id`. Anthropic defines `{ name, description, input_schema }`; the
-model answers with `tool_use` content blocks whose `input` is already an object, and results go back
-inside a `user` message as `tool_result` blocks keyed by `tool_use_id`, all results for one turn in one
-message. Both SDKs ship Zod helpers that derive the schema and validate the arguments: OpenAI's
-`zodFunction` and `zodResponseFormat` from `openai/helpers/zod` with a `parse` method that returns
-`message.parsed`, and Anthropic's `betaZodTool` with `client.beta.messages.toolRunner`, which also runs
-the call-tool-append-repeat loop for you. Structured output is `response_format` with a JSON schema
-and `strict: true` on OpenAI (`text.format` on the Responses API), and an `output_config.format` JSON
-schema on Anthropic in current SDK versions; in both cases keep your own `safeParse` on the result, as
-the schema-validation lesson argues.
+- **OpenAI.** Chat Completions defines a tool as `{ type: "function", function: { name, description, parameters, strict } }`;
+  the model answers with `tool_calls[]`, each carrying an `id` and `function.arguments` as a JSON *string*
+  you must `JSON.parse`. The result goes back as a message with `role: "tool"` and `tool_call_id`.
+- **Anthropic.** It defines `{ name, description, input_schema }`; the model answers with `tool_use` content
+  blocks whose `input` is already an object. Results go back inside a `user` message as `tool_result` blocks
+  keyed by `tool_use_id`, all results for one turn in one message.
+- **Zod helpers.** OpenAI has `zodFunction` and `zodResponseFormat` from `openai/helpers/zod`, with a
+  `parse` method that returns `message.parsed`. Anthropic has `betaZodTool` with
+  `client.beta.messages.toolRunner`, which also runs the call-tool-append-repeat loop for you.
+- **Structured output.** OpenAI: `response_format` with a JSON schema and `strict: true` (`text.format` on
+  the Responses API). Anthropic: an `output_config.format` JSON schema in current SDK versions. In both, keep
+  your own `safeParse` on the result, as the schema-validation lesson argues.
 
 ### Caching, batching, platforms
-Anthropic prompt caching is opt-in: place `cache_control: { type: "ephemeral" }` on the last stable
-block (system prompt, tool list), or in recent API versions set a top-level `cache_control` that marks
-the last cacheable block for you, and verify with `usage.cache_read_input_tokens`. Any byte change
-before the breakpoint invalidates it, and a prefix below the model's minimum cacheable length is not
-cached at all. OpenAI caches long, repeated prefixes automatically and reports it in
-`usage.prompt_tokens_details.cached_tokens`, so the lever there is prompt ordering rather than
-annotations. Both offer a batch endpoint for offline work at a discount and a files API; Anthropic has
-`messages.countTokens`, while OpenAI estimates usually come from a tokenizer library such as
-`tiktoken` (check whether your API version also offers a counting endpoint). For cloud platforms, OpenAI ships an
-`AzureOpenAI` client, and Anthropic ships `@anthropic-ai/bedrock-sdk` and `@anthropic-ai/vertex-sdk`
-with the same `messages` surface behind platform credentials.
+- **Anthropic caching is opt-in.** Place `cache_control: { type: "ephemeral" }` on the last stable block
+  (system prompt, tool list), or in recent API versions set a top-level `cache_control` that marks the last
+  cacheable block for you. Verify with `usage.cache_read_input_tokens`.
+- **It is fragile by design.** Any byte change before the breakpoint invalidates it, and a prefix below the
+  model's minimum cacheable length is not cached at all.
+- **OpenAI caches long, repeated prefixes automatically** and reports it in
+  `usage.prompt_tokens_details.cached_tokens`, so the lever is prompt ordering, not annotations.
+- **Batch and files.** Both offer a batch endpoint for offline work at a discount and a files API.
+- **Token counting.** Anthropic has `messages.countTokens`; OpenAI estimates usually come from a tokenizer
+  library such as `tiktoken` (check whether your API version also offers a counting endpoint).
+- **Cloud platforms.** OpenAI ships an `AzureOpenAI` client; Anthropic ships `@anthropic-ai/bedrock-sdk` and
+  `@anthropic-ai/vertex-sdk` with the same `messages` surface behind platform credentials.
 
-## Example
-One narrow `ModelClient` interface with two adapters. Each streams tokens to stdout, returns the full
-text with normalised usage, relies on the SDK's retries rather than its own, and accepts an
-`AbortSignal` so a disconnected client stops generation. `isRetryable` is what an outer circuit breaker
-would consult, using the typed errors instead of message text. A second block then shows the one
-thing the adapters hide: the tool-call round trip on the wire in each shape.
+## Diagram
+What one SDK call does on failure: retryable errors back off and retry until `maxRetries` is spent, then
+surface as a typed error; aborts and 4xx errors surface at once.
+
+```mermaid
+flowchart TD
+    C["client call with options"] --> A["Send attempt"]
+    A --> R{"Response?"}
+    R -->|"2xx"| OK["Typed result or stream"]
+    R -->|"abort signal"| AB["APIUserAbortError"]
+    R -->|"400, 401 and other 4xx"| E4["Typed error, no retry"]
+    R -->|"408, 409, 429, 5xx, timeout, conn error"| L{"Retries left?"}
+    L -->|"yes"| B["Backoff, honour retry-after"]
+    B --> A
+    L -->|"no"| ER["RateLimitError, InternalServerError and similar"]
+```
+
+## Examples
+### Two adapters behind one interface
+One narrow `ModelClient` interface with two adapters. Each streams tokens to stdout, returns the full text
+with normalised usage, relies on the SDK's retries rather than its own, and accepts an `AbortSignal` so a
+disconnected client stops generation. `isRetryable` is what an outer circuit breaker would consult, using
+typed errors instead of message text.
 
 ```ts
 import Anthropic from "@anthropic-ai/sdk";
@@ -191,6 +205,9 @@ export function isRetryable(err: unknown): boolean {      // abort and 4xx error
 }
 ```
 
+### The tool-call round trip on the wire
+The one thing the adapters hide: the four objects of a tool round trip, in each shape.
+
 ```jsonc
 // OpenAI Chat Completions: the model's turn, then yours. arguments is a STRING.
 { "role": "assistant", "content": null, "tool_calls": [{ "id": "call_1", "type": "function",
@@ -205,58 +222,111 @@ export function isRetryable(err: unknown): boolean {      // abort and 4xx error
     { "type": "tool_result", "tool_use_id": "toolu_1", "content": "{\"status\":\"shipped\"}" }] }
 ```
 
-Everything a tool-calling adapter does follows from these four objects: parse or do not parse the
-arguments, echo the assistant turn back unchanged, and key the result by the call's id. If the model
-made two calls, OpenAI expects two `tool` messages and Anthropic expects both `tool_result` blocks
-in the same single user message.
+- **Everything a tool adapter does follows from these four objects:** parse or do not parse the arguments,
+  echo the assistant turn back unchanged, and key the result by the call's id.
+- **Two calls in one turn:** OpenAI expects two `tool` messages; Anthropic expects both `tool_result`
+  blocks in the same single user message.
+
+### Worked scenario: worst-case latency of one call
+With the adapters' settings, `timeout: 60_000` and `maxRetries: 3`, during a provider outage where every
+attempt times out:
+
+| Quantity | Value |
+|---|---|
+| Attempts | `maxRetries + 1` = 4 |
+| Time in attempts | 4 × 60 s = 240 s |
+| Plus backoff sleeps | a few seconds more, longer if `retry-after` says so |
+| A 60 s proxy timeout in front | the user sees a 504 after the first attempt while the SDK keeps retrying |
+| Outer retry loop of 3 attempts on top | up to 12 requests and about 12 minutes for one click |
+
+- **Fix:** pick one retry layer, set the proxy and handler timeouts above `timeout × (maxRetries + 1)`, and
+  pass the request's `AbortSignal` so a user who gives up also stops the chain.
+
+### Reading request IDs and rate-limit headers
+`.withResponse()` exposes the raw `Response`, which carries the provider's rate-limit headers.
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+const { data: msg, response } = await client.messages
+  .create({ model: "claude-opus-5-5", max_tokens: 256, messages: [{ role: "user", content: "ping" }] })
+  .withResponse();
+console.log({
+  requestId: msg._request_id,                                               // quote this in support tickets
+  requestsRemaining: response.headers.get("anthropic-ratelimit-requests-remaining"),
+});
+```
+
+## Production patterns
+- **One retry layer only.** When the call already runs inside a queue with redelivery or your own retry
+  and breaker, construct the client with `maxRetries: 0`; otherwise keep the SDK's retries and remove the
+  outer loop. Monitor requests per user action and retry counts during provider incidents.
+- **Timeouts sized from the retry budget.** Set handler and proxy timeouts above `timeout × (maxRetries + 1)`
+  plus backoff, and stream any generation with a large `max_tokens`. Watch for 504s and
+  `APIConnectionTimeoutError` that appear only on long answers.
+- **Log request IDs and usage on every call.** Record `_request_id` (or `stream.request_id`), normalised
+  input and output tokens, and cache counts in one structured log line. Monitor cost per route, and keep
+  the ID so support tickets can be traced.
+- **Verify caching with counters.** For Anthropic, alert when `usage.cache_read_input_tokens` is zero on a
+  route that sets `cache_control`; for OpenAI, track `usage.prompt_tokens_details.cached_tokens`. Keep
+  timestamps and per-user data after the stable prefix.
+- **Back off from rate-limit headers.** Read the provider's remaining-request and remaining-token headers via
+  `.withResponse()` (for OpenAI, the `x-ratelimit-remaining-requests` family) and slow a worker pool before
+  hitting 429s. Monitor the 429 rate per API key.
+- **Same surface on cloud platforms.** When a customer must stay inside their cloud, swap the client for
+  `AzureOpenAI`, `@anthropic-ai/bedrock-sdk` or `@anthropic-ai/vertex-sdk` behind the same `ModelClient`
+  interface. Monitor per-platform latency and error rates separately.
 
 ## Trade-offs
-- Built-in retries make transient failures invisible, which is what you want until you wrap the call in
-  your own retry or a queue with redelivery; then attempts multiply and you should set `maxRetries: 0`
-  in one of the layers.
-- Generated types track the API exactly, so upgrades surface breaking changes at compile time; the
-  flip side is that a minor SDK bump can rename a type and force a same-day fix across the codebase.
-- The streaming helpers accumulate tool arguments and expose the final message for free, but they
-  buffer the whole response in memory; for very long outputs you may prefer the raw event iterable.
-- Explicit cache breakpoints (Anthropic) give control and a verifiable hit counter at the cost of
-  discipline about prompt ordering; automatic caching (OpenAI) needs no annotations but gives less
+- **Built-in retries vs multiplied attempts.** Transient failures become invisible, which is what you want
+  until you wrap the call in your own retry or a queue with redelivery; then attempts multiply and you should
+  set `maxRetries: 0` in one of the layers.
+- **Generated types vs upgrade churn.** Types track the API exactly, so upgrades surface breaking changes at
+  compile time; the flip side is that a minor SDK bump can rename a type and force a same-day fix across
+  the codebase.
+- **Streaming helpers vs memory.** They accumulate tool arguments and expose the final message for free,
+  but buffer the whole response in memory; for very long outputs you may prefer the raw event iterable.
+- **Explicit vs automatic caching.** Anthropic's breakpoints give control and a verifiable hit counter at the
+  cost of discipline about prompt ordering; OpenAI's automatic caching needs no annotations but gives less
   control over what is cached.
-- Using a provider's Zod helper couples your tool definitions to that SDK; a shared schema module
+- **Provider Zod helpers vs portability.** They couple tool definitions to that SDK; a shared schema module
   converted per provider keeps the option of a second provider open.
 
 ## Pitfalls
-- Matching on `error.message` strings instead of `instanceof` and `status`; the symptom is retry logic
-  that stops working after an SDK or API wording change.
-- Passing the timeout in seconds as in Python; the symptom is every request timing out after a few
-  milliseconds and being retried twice (three attempts) before failing.
-- Forgetting the `signal` on streaming calls; the symptom is completions still running, and billing,
-  long after the HTTP client disconnected.
-- Treating `function.arguments` as an object on OpenAI, or `input` as a string on Anthropic; the
-  symptom is a `TypeError` or `[object Object]` inside a tool.
-- Putting text before the `tool_result` blocks, sending them in the wrong role, or letting another
-  turn come between the `tool_use` and its result; the symptom is a 400 saying `tool_use` ids were
-  found without `tool_result` blocks immediately after. Splitting parallel results across messages is
-  a quieter mistake that discourages the model from parallel tool calls.
-- Reading `response.content[0].text` on Anthropic without narrowing; the symptom is a compile error at
-  best, and at worst a runtime `undefined` when the first block is `tool_use` or `thinking`.
-- Omitting `max_tokens` on Anthropic or setting it too low; the symptom is a 400 on the former and
-  truncated JSON with `stop_reason: "max_tokens"` on the latter.
-- Sending a non-streaming request with a very large `max_tokens` through a proxy with a short idle
-  timeout; the symptom is 504s or `APIConnectionTimeoutError` on long answers only, followed by
-  retries that may pay for the same long generation again. Stream long generations.
-- Verifying caching by vibes; the symptom is a system prompt with a timestamp in it, a cache hit rate
-  of zero and a bill that never drops.
+- **Matching on `error.message` strings instead of `instanceof` and `status`.** Symptom: retry logic stops
+  working after an SDK or API wording change.
+- **Passing the timeout in seconds as in Python.** Symptom: every request times out after a few
+  milliseconds and is retried twice (three attempts) before failing.
+- **Forgetting the `signal` on streaming calls.** Symptom: completions keep running, and billing, long after
+  the HTTP client disconnected.
+- **Treating `function.arguments` as an object on OpenAI, or `input` as a string on Anthropic.** Symptom: a
+  `TypeError` or `[object Object]` inside a tool.
+- **Text before the `tool_result` blocks, the wrong role, or another turn between the `tool_use` and its
+  result.** Symptom: a 400 saying `tool_use` ids were found without `tool_result` blocks immediately after.
+  Splitting parallel results across messages is a quieter mistake that discourages parallel tool calls.
+- **Reading `response.content[0].text` on Anthropic without narrowing.** Symptom: a compile error at best,
+  and at worst a runtime `undefined` when the first block is `tool_use` or `thinking`.
+- **Omitting `max_tokens` on Anthropic or setting it too low.** Symptom: a 400 on the former and truncated
+  JSON with `stop_reason: "max_tokens"` on the latter.
+- **A non-streaming request with a very large `max_tokens` through a proxy with a short idle timeout.**
+  Symptom: 504s or `APIConnectionTimeoutError` on long answers only, then retries that may pay for the same
+  long generation again. Stream long generations.
+- **Verifying caching by vibes.** Symptom: a system prompt with a timestamp in it, a cache hit rate of zero
+  and a bill that never drops.
 
 ## When to use
-Use the native SDK whenever you commit to a provider and want its full surface: streaming helpers,
-tool runners, batch and files endpoints, explicit caching, platform clients for Azure, Bedrock or
-Vertex. Wrap it behind a narrow interface of your own so tests can inject a fake and a second provider
-can be added later, and keep the SDK's retries while deciding explicitly where your own retries, queue
-redelivery and circuit breaker sit. Reach for a unification layer such as the Vercel AI SDK when
-multi-provider or browser streaming is the primary requirement. Measure tokens and cost per request
-from `usage`, p95 time to first token, retry counts, and cache hit rate. Interviews probe the tool-call
-round trip in both shapes, what the SDK retries and what it does not, and how a cancelled request
-actually stops.
+- **Use the native SDK** whenever you commit to a provider and want its full surface: streaming helpers,
+  tool runners, batch and files endpoints, explicit caching, platform clients for Azure, Bedrock or Vertex.
+- **Wrap it behind a narrow interface** so tests can inject a fake and a second provider can be added
+  later. Keep the SDK's retries while deciding explicitly where your own retries, queue redelivery and
+  circuit breaker sit.
+- **Reach for a unification layer** such as the Vercel AI SDK when multi-provider or browser streaming is
+  the primary requirement.
+- **Measure** tokens and cost per request from `usage`, p95 time to first token, retry counts, and cache
+  hit rate.
+- **Interviews** probe the tool-call round trip in both shapes, what the SDK retries and what it does not,
+  and how a cancelled request actually stops.
 
 ## Role lens
 - **Engineer:** Configures clients with explicit timeouts and retries, writes adapters that normalise
@@ -278,6 +348,38 @@ wrapper, or keep the SDK's retries and remove the outer loop, treating a thrown 
 `InternalServerError` as a signal to shed load or fail fast. Whichever you choose, set the handler and
 proxy timeouts from `timeout × (retries + 1)`, pass an `AbortSignal` so a disconnected user stops the
 chain, and record the request ID from the response for the inevitable support ticket.
+
+## Interview questions
+### Why use the provider SDK instead of a plain `fetch` to the API?
+- **The SDK carries production defaults:** retries on connection errors and 408, 409, 429 and 5xx with
+  backoff honouring `retry-after`, timeouts, request IDs and a typed error hierarchy.
+- **Generated types match the wire**, so an API change shows up at compile time.
+- **Streaming helpers** reassemble tool-call fragments into a final typed message, the part hand-written
+  parsers usually drop.
+
+### A tool-calling request to Anthropic returns a 400 about `tool_use` ids without `tool_result` blocks. How do you debug it?
+- **Check the turn after the assistant's `tool_use`:** it must be a `user` message whose content starts with
+  the `tool_result` blocks, keyed by `tool_use_id`.
+- **Common causes:** text placed before the results, a result sent with the wrong role, another turn in
+  between, or parallel results split across messages.
+- **Also check** that the assistant turn was echoed back unchanged, including its text block.
+
+### How does cancellation actually stop a streamed completion, and what is still billed?
+- **Mechanism:** passing `signal` as a request option; aborting rejects with `APIUserAbortError` and closes
+  the socket, so the provider stops generating.
+- **Billing:** tokens already produced are still billed, so abort promptly on client disconnect.
+
+### When would you choose OpenAI's Responses API over Chat Completions?
+- **Choose Responses** for typed `output` items, named stream events and server-side state via
+  `previous_response_id` instead of resending history.
+- **Mind retention:** responses are stored by default unless `store: false`, a data-retention decision.
+- **Keep Chat Completions** when existing code and tooling depend on the `messages` / `choices` shape.
+
+### Your Anthropic bill did not drop after adding prompt caching. What do you check?
+- **The counter first:** `usage.cache_read_input_tokens` near zero means no hits.
+- **Then the prefix:** any byte change before the breakpoint, such as a timestamp in the system prompt,
+  invalidates it, and a prefix below the minimum cacheable length is never cached.
+- **Fix:** move variable content after the `cache_control` breakpoint and alert on the hit rate.
 
 ## Quiz
 ### Q: What is the key structural difference between a tool call in OpenAI Chat Completions and in Anthropic Messages?

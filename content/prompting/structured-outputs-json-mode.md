@@ -5,7 +5,7 @@ name: Structured outputs / JSON mode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - prompting/function-tool-calling
   - prompting/prompt-templates
@@ -21,100 +21,117 @@ sources:
 ---
 
 ## TL;DR
-Downstream code needs a parseable object with known keys and types, but a language model emits free
-text. JSON mode guarantees syntactically valid JSON; structured outputs go further and guarantee
-conformance to a schema you supply, by constraining which tokens the model may emit at each step. This
-removes a class of parse failures, not a class of wrong answers: schema-valid output can still be wrong,
-so semantic validation and evals remain your job.
+JSON mode guarantees parseable JSON; structured outputs guarantee conformance to your schema by masking
+invalid tokens during decoding. This removes parse failures, not wrong answers, so semantic validation
+and evals remain your job.
 
 ## Why it exists
-Most production LLM calls are not chat. They extract fields from a document, classify a ticket, route a
-request, or produce arguments for another system, and the result is consumed by code. The prompt-only
-approach, "respond only with JSON matching this shape", works most of the time, and "most" is the
-problem. The model wraps the object in markdown fences, adds a closing sentence, uses single quotes,
-returns `"42"` where an integer was expected, drops a field it could not find, or invents a key. A 1%
-failure rate on 100,000 calls a day is 1,000 crashes or silently dropped records a day.
-
-The usual mitigations are weak. Regex extraction of the first `{...}` block is brittle. A
-validate-and-retry loop doubles cost and latency on the failing tail and still fails when the model
-repeats the mistake. Few-shot examples help but cannot promise anything.
-
-The decisive observation is that the model produces its output one token at a time by sampling from a
-probability distribution that your serving layer controls. If you can forbid tokens that would break the
-required format before sampling, invalid output cannot be produced at all. JSON mode applies that idea
-to the grammar of JSON; structured outputs apply it to your specific schema.
+- **Code consumes most LLM output.** Production calls extract fields, classify tickets, route requests
+  or produce arguments for another system. Downstream code needs a parseable object with known keys and
+  types, but a language model emits free text.
+- **"Respond only with JSON" works most of the time, and "most" is the problem.** The model wraps the
+  object in markdown fences, adds a closing sentence, uses single quotes, returns `"42"` where an integer
+  was expected, drops a field or invents a key. A 1% failure rate on 100,000 calls a day is 1,000 crashes
+  or silently dropped records a day.
+- **The usual mitigations are weak.** Regex extraction of the first `{...}` block is brittle. A
+  validate-and-retry loop doubles cost and latency on the failing tail and still fails when the model
+  repeats the mistake. Few-shot examples help but promise nothing.
+- **The decisive observation.** The model samples one token at a time from a distribution your serving
+  layer controls. Forbid tokens that would break the format before sampling, and invalid output cannot be
+  produced. JSON mode applies this to JSON's grammar; structured outputs apply it to your schema.
 
 ## How it works
 ### Three levels of guarantee
-1. **Prompting** ("return JSON with these keys"): no guarantee, only a strong tendency.
-2. **JSON mode** (the name comes from OpenAI's `response_format` option; other providers offer
-   equivalents): the output is guaranteed to parse as JSON. Keys, types and required fields are not
-   enforced, so `{"result": "I could not find the invoice"}` is a valid answer to a request for
-   `{"invoice_id", "total"}`.
-3. **Schema-constrained output** (structured outputs, strict mode): the output is guaranteed to validate
-   against the JSON Schema you pass with the request.
+| Level | Guarantee | Gap |
+|---|---|---|
+| **Prompting** ("return JSON with these keys") | none, only a strong tendency | everything |
+| **JSON mode** (name from OpenAI's `response_format` option; other providers have equivalents) | output parses as JSON | keys, types and required fields not enforced: `{"result": "I could not find the invoice"}` is valid for a request for `{"invoice_id", "total"}` |
+| **Schema-constrained output** (structured outputs, strict mode) | output validates against the JSON Schema you pass | values can still be wrong |
 
 ### Constrained decoding
-At each generation step the model produces a logit for every token in the vocabulary. The server
-compiles your schema into a grammar and, from the grammar, a state machine over *tokens* rather than
-characters, which is the hard part because a single token can span several characters and several
-grammar transitions (this is the contribution of Willard and Louf's guided-generation work). At each
-step the state machine yields the set of tokens that keep the output valid; every other token's logit is
-set to negative infinity before sampling. The model still chooses among the allowed tokens according to
-its own probabilities, so it decides the *content*, while the mask decides the *form*. Compilation is
-paid once per new schema and cached by the provider, so the first request with a schema is slower than
-the rest. The serving module covers the implementation inside open-source engines.
+1. **Compile.** The server compiles your schema into a grammar and, from it, a state machine over
+   *tokens* rather than characters. This is the hard part, because one token can span several characters
+   and several grammar transitions (the contribution of Willard and Louf's guided-generation work).
+2. **Mask.** At each step the model produces a logit for every vocabulary token; the state machine yields
+   the tokens that keep the output valid, and every other logit is set to negative infinity.
+3. **Sample.** The model chooses among allowed tokens by its own probabilities, so it decides the
+   *content* while the mask decides the *form*.
+4. **Cache.** Compilation is paid once per new schema and cached by the provider, so the first request
+   with a schema is slower than the rest. The serving module covers open-source engine internals.
 
-A concrete step: the schema says `severity` is one of `low`, `medium`, `high`, and the output so far
-is `{"evidence": ["..."], "severity": "`. The automaton now allows only tokens that begin one of those
-three strings (`low`, `med`, `high`, `h`, ...). If the model's top choice was `crit` (for "critical"),
-that token is masked, the remaining probability is renormalised over the allowed tokens, and the model
-emits whichever allowed value it found most plausible. That is the key consequence: **the mask can
-force an answer but cannot make the model abstain unless the schema has a way to say so**. If the
-document contains no total and `total` is a required number, the model must still write some number.
-Nullable fields and explicit `unknown` or `other` enum values are the escape hatches that keep a
-forced format from turning into forced fabrication.
+### A concrete step, and the abstention problem
+- **Setup:** `severity` is one of `low`, `medium`, `high`; the output so far is
+  `{"evidence": ["..."], "severity": "`.
+- **Mask:** only tokens that begin one of those three strings survive (`low`, `med`, `high`, `h`, ...).
+- **Effect:** if the model's top choice was `crit` (for "critical"), it is masked, probability is
+  renormalised over the allowed tokens, and the model emits whichever allowed value it found most
+  plausible.
+- **Key consequence: the mask can force an answer but cannot make the model abstain unless the schema has
+  a way to say so.** If the document has no total and `total` is a required number, the model still
+  writes some number.
+- **Escape hatches:** nullable fields and explicit `unknown` or `other` enum values keep a forced format
+  from turning into forced fabrication.
 
 ### Why masking beats rejection sampling
-Generate-validate-retry spends a full generation on each failure and offers no bound on attempts.
-Masking makes invalid output impossible in a single pass and costs almost nothing per step, because the
-allowed-token set is computed from the automaton state, not by re-running the model.
+- **Generate-validate-retry** spends a full generation on each failure and has no bound on attempts.
+- **Masking** makes invalid output impossible in a single pass at almost no cost per step, because the
+  allowed-token set comes from the automaton state, not from re-running the model.
 
 ### Schema limits
-Providers accept a subset of JSON Schema. Typical rules: every object needs `additionalProperties:
-false` and a `required` list; enums, `anyOf` and references are supported; recursion, numeric bounds
-(`minimum`, `maximum`) and string length constraints often are not, and the SDKs strip those and
-validate them client-side after the response. Treat the provider's list as the contract and keep your
-own validation for anything it cannot express.
+- **Providers accept a subset of JSON Schema.** Typical rules: every object needs
+  `additionalProperties: false` and a `required` list; enums, `anyOf` and references are usually
+  supported.
+- **Often not:** recursion, numeric bounds (`minimum`, `maximum`) and string length constraints. SDKs
+  strip those and validate them client-side after the response.
+- **Treat the provider's list as the contract** and keep your own validation for anything it cannot
+  express.
 
 ### Field order is prompt engineering
-Generation is left to right, so a field that appears earlier is produced before, and conditions, a field
-that appears later. Putting an `evidence` or `reasoning` field before the `label` field lets the model
-commit to the answer after it has written its justification; putting the label first produces a label
-followed by a rationalisation. This is chain-of-thought expressed as schema layout, and it is often the
-most effective lever once the format is fixed. The effect is smaller on models run with extended or
-adaptive thinking, which reason in a separate block before the first output token, but it costs nothing
-and still helps when that reasoning is short. Where the task needs long free reasoning, reason first in
-an unconstrained step (or with extended thinking) and extract in a second, constrained call.
+- **Generation is left to right**, so an earlier field is produced before, and conditions, a later one.
+- **Put `evidence` or `reasoning` before `label`.** The model commits after writing its justification;
+  label first produces a label followed by a rationalisation. This is chain-of-thought as schema layout,
+  often the most effective lever once the format is fixed.
+- **Smaller effect with extended or adaptive thinking**, which reasons in a separate block before the
+  first output token, but it costs nothing and helps when that reasoning is short.
+- **For long free reasoning:** reason first in an unconstrained step (or with extended thinking), then
+  extract in a second, constrained call.
 
 ### Tool calling as structured output
-Before native structured outputs, the standard trick was to define a tool whose input schema is the
-object you want and force the model to call it. It still has a place: when the model should choose among
-several output shapes, one tool per shape expresses the choice naturally, and strict tool schemas give
-the same conformance guarantee for arguments. For a single fixed shape, native structured output is the
-cleaner mechanism.
+- **The older trick:** define a tool whose input schema is the object you want and force the model to
+  call it.
+- **Still useful when** the model should choose among several output shapes: one tool per shape expresses
+  the choice, and strict tool schemas give the same conformance guarantee for arguments.
+- **For a single fixed shape**, native structured output is cleaner.
 
 ### What you still own
-Three things survive the guarantee. A `max_tokens` stop truncates the JSON mid-object, so check the stop
-reason before parsing. A safety refusal may not match the schema. And schema-valid values can be wrong:
-a hallucinated but well-formed email address passes every check, which is why fields for data that may
-be absent should be nullable rather than required.
+- **Truncation:** a `max_tokens` stop cuts the JSON mid-object, so check the stop reason before parsing.
+- **Refusals:** a safety refusal may not match the schema.
+- **Wrong but valid values:** a hallucinated, well-formed email address passes every check, which is why
+  fields for possibly absent data should be nullable rather than required.
 
-## Example
-A ticket triage call with a Pydantic model as the schema. The `evidence` field comes first so the label
-is conditioned on quoted justification, `customer_tier` is nullable so the model is not forced to invent
-one, the stop reason is checked before the parsed object is trusted, and a semantic rule the schema
-cannot express is enforced in code.
+## Diagram
+The schema is compiled once; then every decoding step is mask, sample, advance. Validation of truth
+happens after, in your code.
+
+```mermaid
+flowchart TD
+    S["JSON Schema"] --> G["Compile to token automaton"]
+    G --> L["Model logits for next token"]
+    L --> M["Mask tokens that break schema"]
+    M --> P["Sample among allowed tokens"]
+    P --> A["Advance automaton state"]
+    A -->|"object not closed"| L
+    A -->|"done or max_tokens"| R{"Stop reason end_turn?"}
+    R -->|"no"| X["Reject: truncated or refusal"]
+    R -->|"yes"| V["Parse, then semantic checks"]
+    V --> E["Golden-set eval for correctness"]
+```
+
+## Examples
+### Ticket triage with a Pydantic schema
+The `evidence` field comes first so the label is conditioned on quoted justification; `customer_tier` is
+nullable so the model is not forced to invent one; the stop reason is checked before the parsed object is
+trusted; a semantic rule the schema cannot express is enforced in code.
 
 ```python
 from enum import Enum
@@ -154,47 +171,102 @@ print(triage("Checkout returns 500 for every EU customer since 09:00 UTC. We are
 #        severity=<Severity.high: 'high'>, customer_tier='enterprise', needs_human=True)  (illustrative)
 ```
 
+### The token mask in miniature (runnable)
+A toy next-token step for the `severity` enum. The logits are made up; the mechanism is the real one:
+disallowed tokens get zero probability and the rest is renormalised.
+
+```python
+import math
+
+ENUM = ["low", "medium", "high"]                       # schema: severity is one of these
+logits = {"crit": 3.1, "high": 2.4, "h": 0.9, "med": 1.0, "low": 0.2, "none": 1.5}
+
+def softmax(d):
+    z = sum(math.exp(v) for v in d.values())
+    return {k: round(math.exp(v) / z, 3) for k, v in d.items()}
+
+def allowed(prefix, vocab):
+    """A token is allowed if prefix + token still starts some enum value."""
+    return [t for t in vocab if any(v.startswith(prefix + t) for v in ENUM)]
+
+print("unmasked:", softmax(logits))   # crit 0.503, high 0.25, none 0.102, ...
+ok = allowed("", logits)
+print("masked:  ", softmax({t: logits[t] for t in ok}))   # high 0.633, med 0.156, h 0.141, low 0.07
+# The model wanted "crit" or "none"; the mask forces a valid enum value. Without an "unknown"
+# value in the enum, abstaining is impossible.
+```
+
+### Worked numbers: why "most of the time" is not enough
+Illustrative daily volume of 100,000 extraction calls.
+
+| Approach | Parse failures per day | What happens to them |
+|---|---|---|
+| Prompt-only JSON at 1% failure | 1,000 | crashes or silently dropped records |
+| Prompt-only + one retry | fewer, never zero | each retry costs a full extra generation and latency; repeats of the same mistake still fail |
+| Schema-constrained output | 0 from format (truncation still possible) | remaining failures are `max_tokens` stops and refusals, caught by the stop-reason check |
+
+The remaining risk moves from format to content, which is what the golden-set eval measures.
+
+## Production patterns
+- **Schema as a versioned contract.** Keep the Pydantic or Zod model next to the prompt in the same
+  version bundle and log its version on each trace, because a schema change changes behaviour. Monitor
+  accuracy per schema version on the golden set.
+- **Stop-reason gate before parsing.** Treat anything other than a normal end of turn as unusable: retry
+  with a larger `max_tokens` on truncation, route refusals to a fallback. Monitor truncation and refusal
+  rates per route; parse failures should be zero.
+- **Escape values for absent data.** Make optional fields nullable and add `unknown` or `other` to
+  enums, then add blank and off-topic documents to the golden set. Monitor the rate of `unknown`; a
+  jump means inputs changed, zero on blank inputs means the escape hatch is not being used.
+- **Client-side validation of stripped constraints.** Express bounds the provider cannot enforce in your
+  model (for example Pydantic `Field(ge=0)`) and validate after the response, so out-of-range values fail
+  loudly instead of reaching the database.
+- **Reason-then-extract for hard cases.** When the golden set drops after switching, make an
+  unconstrained reasoning call (or use extended thinking) and a second, constrained extraction call.
+  Monitor the added latency and tokens against the accuracy gain.
+
 ## Trade-offs
-- Guaranteed parseability costs expressiveness; it flips when the task is a summary or an explanation,
-  where a schema with one free-text field adds nothing and a plain response is better.
-- Constraining the token distribution can shift quality on reasoning-heavy tasks; if a golden-set eval
-  drops after switching, reason in an unconstrained step first and extract in a second constrained call.
-- Schema compilation adds latency to the first request with a new schema; negligible for a few stable
-  schemas, material when schemas are generated per user or per request.
-- Tool-call-as-output lets the model pick among several shapes but mixes "take an action" semantics with
-  "produce a result"; native output format is simpler when there is exactly one shape.
-- JSON mode alone is cheap and portable across providers but enforces nothing about keys or types; fine
-  for a prototype, not for a production contract that other services depend on.
-- Strict schemas forbid extra keys, so the model cannot volunteer useful information; add an explicit
-  `notes` field if that matters, and version the schema because changing it changes behaviour.
+- **Parseability vs expressiveness.** It flips for summaries and explanations, where a schema with one
+  free-text field adds nothing and a plain response is better.
+- **Constrained tokens vs reasoning quality.** Constraining the distribution can shift quality on
+  reasoning-heavy tasks; if a golden-set eval drops after switching, reason unconstrained first and
+  extract in a second constrained call.
+- **Compilation latency vs schema churn.** Negligible for a few stable schemas, material when schemas are
+  generated per user or per request.
+- **Tool-call-as-output vs native format.** Tools let the model pick among several shapes but mix "take an
+  action" with "produce a result"; native output format is simpler for exactly one shape.
+- **JSON mode portability vs enforcement.** Cheap and portable across providers but enforces nothing about
+  keys or types; fine for a prototype, not for a contract other services depend on.
+- **Strictness vs volunteered information.** Strict schemas forbid extra keys; add an explicit `notes`
+  field if that matters, and version the schema because changing it changes behaviour.
 
 ## Pitfalls
-- Parsing without checking the stop reason; the symptom is `JSONDecodeError` only on long inputs, where
+- **Parsing without checking the stop reason.** Symptom: `JSONDecodeError` only on long inputs, where
   `max_tokens` truncated the object.
-- Marking fields required when the data is often absent; the symptom is plausible invented values
-  (emails, dates, ids) that pass validation and corrupt the database.
-- Putting the label before the reasoning field; the symptom is accuracy below the old chain-of-thought
-  prompt even though parse failures went to zero.
-- Relying on `minimum`, `maxLength` or regex patterns the provider does not enforce; the symptom is
+- **Required fields for often-absent data.** Symptom: plausible invented values (emails, dates, ids) that
+  pass validation and corrupt the database.
+- **Label before the reasoning field.** Symptom: accuracy below the old chain-of-thought prompt even
+  though parse failures went to zero.
+- **Relying on `minimum`, `maxLength` or regex patterns the provider does not enforce.** Symptom:
   out-of-range values that passed server-side and were never checked client-side.
-- Treating "valid" as "correct" and dropping the eval; the symptom is silent mislabeling discovered by a
+- **Treating "valid" as "correct" and dropping the eval.** Symptom: silent mislabeling discovered by a
   downstream team weeks later.
-- No escape value in a required enum or number field; the symptom is confident labels or figures
-  on inputs that do not contain the information, visible when you feed the golden set blank or
-  off-topic documents.
-- Enums with overlapping or too many categories; the symptom is near-identical tickets receiving different
-  labels, visible as low agreement on paraphrased test cases.
-- Prompt text that contradicts the schema (asking for markdown while forcing JSON); the symptom is fences
-  and formatting characters appearing inside string fields.
+- **No escape value in a required enum or number field.** Symptom: confident labels or figures on inputs
+  lacking the information, visible when you feed the golden set blank or off-topic documents.
+- **Overlapping or too many enum categories.** Symptom: near-identical tickets get different labels,
+  visible as low agreement on paraphrased test cases.
+- **Prompt text contradicting the schema** (asking for markdown while forcing JSON). Symptom: fences and
+  formatting characters inside string fields.
 
 ## When to use
-Use schema-constrained output whenever code consumes the result: extraction, classification, routing,
-tool arguments, and eval judges that return scores. Use plain JSON mode only for prototypes or when the
-provider offers nothing stronger. Avoid both for user-facing prose and for open-ended generation, and
-avoid schemas that are deeply nested or recursive, since providers reject them and the model handles them
-poorly anyway. Measure the parse failure rate (it should be zero), semantic accuracy against a golden
-set before and after the switch, and the latency and token delta. In interviews, the expected depth is:
-how constrained decoding works, why it guarantees form and not truth, and why field order matters.
+- **Use schema-constrained output** whenever code consumes the result: extraction, classification,
+  routing, tool arguments, and eval judges that return scores.
+- **Use plain JSON mode** only for prototypes or when the provider offers nothing stronger.
+- **Avoid both** for user-facing prose and open-ended generation, and avoid deeply nested or recursive
+  schemas, since providers reject them and the model handles them poorly anyway.
+- **Measure:** parse failure rate (should be zero), semantic accuracy on a golden set before and after
+  the switch, and the latency and token delta.
+- **Interviews:** how constrained decoding works, why it guarantees form and not truth, and why field
+  order matters.
 
 ## Role lens
 - **Engineer:** Defines the Pydantic or Zod model, uses the SDK parse helper, checks stop reasons, adds
@@ -215,6 +287,39 @@ wording the old prompt used, and the loss of extended reasoning on hard cases. T
 evidence or reasoning field ahead of the label, check the enum names and descriptions, and for hard
 cases split into an unconstrained reasoning call followed by a constrained extraction. Re-run the golden
 set per category rather than in aggregate, and keep the schema versioned so the change is attributable.
+
+## Interview questions
+### What is the difference between JSON mode and structured outputs?
+- **JSON mode** guarantees the output parses as JSON, but not its keys, types or required fields.
+- **Structured outputs** compile your JSON Schema into a token automaton and mask invalid tokens at each
+  step, so the output validates against the schema.
+- **Neither guarantees truth.** The model still chooses the content among allowed tokens.
+
+### Your extraction pipeline writes invented email addresses into the CRM. What went wrong?
+- **The field was required.** Constrained decoding cannot abstain unless the schema allows it, so when
+  the document had no email the model still produced a well-formed one.
+- **Fix the schema:** make it nullable (or add an explicit unknown value) and add documents without
+  emails to the golden set.
+- **Add a semantic check**, such as requiring the email to appear verbatim in the source text.
+
+### When would you not use schema-constrained output?
+- **User-facing prose and open-ended generation**, where a single free-text field adds nothing.
+- **Reasoning-heavy tasks where the eval drops**, unless you split into an unconstrained reasoning step
+  and a constrained extraction step.
+- **Schemas generated per request**, where compilation latency on every first use becomes material.
+
+### Parse failures are zero after the switch, but a few responses still fail. Why?
+- **Truncation:** the response hit `max_tokens` mid-object; with thinking enabled, thinking tokens count
+  against the same cap.
+- **Refusals:** a safety refusal may not match the schema.
+- **Fix:** check the stop reason before parsing, raise the cap or shorten the schema, and track both rates
+  per route.
+
+### How does field order in a schema affect accuracy?
+- **Earlier fields condition later ones**, because generation is left to right.
+- **Evidence or reasoning before the label** gives chain-of-thought in schema form; label first produces
+  a commitment followed by a rationalisation.
+- **Measure it:** compare per-category accuracy on the golden set with both orders before shipping.
 
 ## Quiz
 ### Q: What does schema-constrained decoding actually guarantee?

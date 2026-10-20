@@ -5,7 +5,7 @@ name: Lost-in-the-middle
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - model-internals/context-window
   - model-internals/attention-mechanism

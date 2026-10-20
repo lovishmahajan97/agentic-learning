@@ -5,7 +5,7 @@ name: Redis caching
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/redis
   - serving-inference/caching
@@ -104,16 +104,16 @@ stampede that can multiply provider spend and trip rate limits. Defences, cheape
    `SET lock:key token NX PX 30000`.
 4. **Serve stale while one request refreshes.**
 
-The lock needs three details to be correct:
+The lock needs three details to be correct, plus one rule that keeps it available:
 - **`NX` makes the take atomic,** *because* check-then-set in two commands lets two workers both see "no
   lock".
 - **The expiry** means a crashed holder cannot block forever.
 - **Release is compare-and-delete:** delete the lock only if it still holds *your* random token (a small
   Lua script), *because* a holder slower than the lock's expiry would otherwise delete the next holder's
   lock and re-open the stampede.
-- **Losers poll, then fall through.** They poll `GET` for the value with a short sleep up to a deadline,
-  then call the model themselves. A lock that makes waiters fail when the holder dies trades a cost
-  problem for an availability one.
+- **Availability rule: losers poll, then fall through.** They poll `GET` for the value with a short sleep
+  up to a deadline, then call the model themselves, *because* a lock that makes waiters fail when the
+  holder dies trades a cost problem for an availability one.
 
 ### Memory and eviction
 - **Set `maxmemory` and an eviction policy.**
@@ -132,7 +132,7 @@ waits for the holder), calls the model and stores with a jittered TTL, and a Red
 
 ```mermaid
 flowchart TD
-    R["Request"] --> K["Build key: version, tenant, SHA-256 of canonical input"]
+    R["Request"] --> K["Build versioned tenant-scoped SHA-256 key"]
     K --> G{"GET key"}
     G -->|"hit"| H["Return cached value"]
     G -->|"Redis error"| M["Call the model directly"]
@@ -229,6 +229,12 @@ async def get_or_compute(r, key: str, compute, ttl: int, wait_s: float = 5.0):
     return await compute()                                     # holder died or is slow: fall through
 ```
 
+- **Values are strings or bytes.** `compute()` must return something Redis can store, and a hit comes
+  back as bytes unless the client was built with `decode_responses=True`, so serialise and decode
+  consistently on both paths.
+- **Redis errors are not caught here,** to keep the lock logic readable; in production wrap these calls
+  fail-open as in the first example.
+
 ### Worked numbers: is the cache worth it?
 Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
 
@@ -244,9 +250,10 @@ Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
 - **Versioned namespaces per data class.** When prompts, models or indexes change, keep the version in
   the key prefix (`llm:v3:{tenant}:{sha}`) and bump it in the same deploy as the change. Monitor the hit
   rate of the new namespace climbing back up after a bump.
-- **Fail-open client with tight timeouts.** On every cache read, give the client a short timeout
-  (`socket_timeout=0.2` as in the example) and catch `RedisError`, so a slow Redis degrades to a miss.
-  Monitor cache error counts and p99 cache latency alongside endpoint latency.
+- **Fail-open client with tight timeouts.** Give the client short read and connect timeouts
+  (`socket_timeout=0.2` as in the example, plus `socket_connect_timeout`, which is a separate setting whose
+  default is seconds in recent redis-py) and catch `RedisError`, so a slow or unreachable Redis degrades
+  to a miss. Monitor cache error counts and p99 cache latency alongside endpoint latency.
 - **Dedicated cache instance with an LRU policy.** When the cache would share Redis with sessions or
   rate limits, give it its own instance with `maxmemory` set and `maxmemory-policy allkeys-lru`. Monitor
   `evicted_keys` and `used_memory` from `INFO`.
@@ -349,7 +356,8 @@ add a hit metric per namespace to confirm savings survive.
   hit rate stays near 2% and you are paying to store keys nobody reads.
 
 ### Redis goes down during peak traffic. What should your FastAPI service do, and what do you monitor?
-- **Fail open:** a short client timeout (`socket_timeout=0.2` in the example) and a caught `RedisError` turn
+- **Fail open:** short read and connect timeouts (`socket_timeout=0.2` in the example, plus
+  `socket_connect_timeout` so reconnect attempts to a dead host do not hang) and a caught `RedisError` turn
   every cache call into a miss, so users see slower answers, not errors.
 - **Expect the cost to move to the provider:** at a 60% hit rate, model calls rise from 400,000 to 1,000,000
   a month in the worked numbers above, which can trip provider rate limits.

@@ -5,7 +5,7 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - evals/golden-dataset
   - evals/llm-as-a-judge
@@ -335,13 +335,13 @@ per-slice interval that says whether six points at that n is signal at all.
 - **Store the full trajectory and enforce budgets** on steps, tokens and wall-clock time, so a looping
   agent is a recorded failure rather than a hung CI job.
 
-### A nightly score dropped 4 points with an empty diff. How do you debug it?
-- **Check the manifest for aliases:** a model recorded as `latest` may have resolved to a new snapshot;
-  pin dated snapshots so this is attributable.
-- **Compare against the noise floor:** if the baseline flips about as many items against itself, the
-  drop may be sampling noise from temperature or server-side nondeterminism.
-- **Check the error count:** a provider outage that times out hard items should show as errors, not as a
-  quality change.
+### The model is nondeterministic even at temperature 0. How do you set a gate that is not just noise?
+- **Measure the noise floor:** run the unchanged baseline twice and count items that flip; a candidate
+  that flips no more items than that has not been shown to do anything.
+- **Sample where it matters:** *k* samples per item on release runs, with the cache keyed on sample
+  index so the *k* outputs are distinct, because more items do not shrink per-item sampling variance.
+- **Keep the floor current:** re-measure whenever the model snapshot or provider changes, and quarantine
+  items that flip with no change into a tracked list that reports but does not block.
 
 ### Why use a Wilson interval rather than p ± 1.96·SE for per-slice scores?
 - **Small slices hit the edges:** at 10/10 the normal approximation reports 100% ± 0, which is false

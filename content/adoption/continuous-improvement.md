@@ -5,7 +5,7 @@ name: Continuous improvement
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - evals/error-analysis
   - evals/regression-tests
@@ -18,86 +18,117 @@ related:
 ---
 
 ## TL;DR
-Continuous improvement is the operating loop that turns production evidence into measured fixes. You
-observe failures, classify them, prioritise by frequency × severity, fix at the cheapest layer that
-works, capture the cases in a regression suite, gate the release, and confirm online that the failure
-bucket shrank. It exists because an AI system's quality degrades or stalls by default, and ad-hoc prompt
-tweaks fix one complaint while silently breaking others.
+Continuous improvement is the operating loop that turns production evidence into measured fixes:
+classify failures, prioritise them, fix at the cheapest layer, encode cases in a regression suite, gate
+the release and confirm online that the bucket shrank.
 
 ## Why it exists
-A system that passed acceptance on launch day keeps meeting inputs nobody tested. New users phrase things
-differently, the knowledge base changes, the vendor updates the model behind an alias, and the business
-adds products the prompts never mention. Quality does not stay where acceptance left it. It drifts, and
-users quietly route around a tool they stop trusting.
-
-The naive response is reactive patching. A complaint arrives, someone edits the prompt until that example
-works, and the change ships. That fails in three ways. First, LLM behaviour is coupled: an instruction
-added to fix French users' replies can change tone or format for everyone else, and without a regression
-suite nobody notices until the next complaint. Second, the loudest stakeholder's anecdote gets fixed
-before the failure that hits two hundred users a week, because nothing measures frequency. Third, nobody
-can say whether the system is getting better overall. The team is busy but the acceptance rate is flat.
-
-Continuous improvement replaces that with a loop that has a measurable input (classified failures), a
-measurable gate (no regression on a frozen suite) and a measurable output (the targeted bucket shrinks
-in production). It is the plan-do-check-act cycle from quality management, with test-driven bug fixing
-as the "check" step, adapted to systems whose outputs are probabilistic and whose dependencies change
-underneath them.
+- **Quality does not stay where acceptance left it.** New users phrase things differently, the knowledge
+  base changes, the vendor updates the model behind an alias, and the business adds products the prompts
+  never mention. Quality drifts, and users quietly route around a tool they stop trusting.
+- **Reactive patching breaks things silently.** A complaint arrives, someone edits the prompt until that
+  example works, and it ships. LLM behaviour is coupled: an instruction added to fix French users'
+  replies can change tone or format for everyone else, and without a regression suite nobody notices
+  until the next complaint.
+- **Nothing measures frequency.** The loudest stakeholder's anecdote gets fixed before the failure that
+  hits two hundred users a week.
+- **Nobody can say whether it is getting better.** The team is busy but the acceptance rate is flat.
+- **The loop makes every stage measurable:** an input (classified failures), a gate (no regression on a
+  frozen suite) and an output (the targeted bucket shrinks in production). It is plan-do-check-act, with
+  test-driven bug fixing as the "check" step, adapted to probabilistic outputs and shifting dependencies.
 
 ## How it works
 ### 1. Observe
-Pull signals from several sources, because each sees different failures: disposition events from usage
-analytics (regenerations, heavy edits, abandons), explicit feedback, escalations to humans, trace-level
-errors (tool failures, timeouts, empty retrievals), incidents, and periodic human review of a random
-sample. The random sample matters *because* every other source is biased toward failures that users
-notice and bother to report.
+Pull signals from several sources, because each sees different failures:
+- **Disposition events** from usage analytics (regenerations, heavy edits, abandons) and explicit feedback.
+- **Escalations** to humans and **incidents**.
+- **Trace-level errors:** tool failures, timeouts, empty retrievals.
+- **Periodic human review of a random sample.** It matters *because* every other source is biased toward
+  failures that users notice and bother to report.
 
 ### 2. Classify
-Group failures into a stable taxonomy through error analysis: read real traces and name the failure
-modes ("cited superseded policy", "wrong language", "tool called with wrong account ID"). Use an LLM
-classifier to scale the labelling once the categories are stable, and spot-check it. Counts per bucket
-per week are the input to everything that follows.
+- **Build a stable taxonomy through error analysis:** read real traces and name the failure modes ("cited
+  superseded policy", "wrong language", "tool called with wrong account ID").
+- **Scale with an LLM classifier** once the categories are stable, and spot-check it.
+- **Counts per bucket per week** are the input to everything that follows.
 
 ### 3. Prioritise
-A simple score is weekly count × severity ÷ effort, with a hard override: anything that is harmful,
-non-compliant or loses money gets fixed first regardless of its score. Use the override *because* a
-pure frequency score will always rank a frequent cosmetic issue above a rare one that ends the contract.
+- **Score:** weekly count × severity ÷ effort.
+- **Hard override:** anything harmful, non-compliant or money-losing is fixed first regardless of score,
+  *because* a pure frequency score will always rank a frequent cosmetic issue above a rare one that ends
+  the contract.
 
 ### 4. Fix at the cheapest layer that works
-Diagnose which layer owns the failure before touching anything. In rough order of cost: UX or training
-(the user asked for something out of scope), prompt or instructions, retrieval and data (wrong, stale or
-missing documents), tools and integrations, guardrails, model choice, and fine-tuning. Many "model
-failures" turn out to be retrieval or data failures, and a prompt cannot fix a document that is not in
-the index.
+Diagnose which layer owns the failure before touching anything. In rough order of cost:
+
+| Order | Layer | Typical failure it owns |
+|---|---|---|
+| 1 | UX or training | The user asked for something out of scope |
+| 2 | Prompt or instructions | Wrong format, tone, language |
+| 3 | Retrieval and data | Wrong, stale or missing documents |
+| 4 | Tools and integrations | Wrong arguments, failing calls |
+| 5 | Guardrails | Policy-violating output |
+| 6 | Model choice | Capability gap |
+| 7 | Fine-tuning | Persistent behaviour the above cannot fix |
+
+- **Many "model failures" are retrieval or data failures,** and a prompt cannot fix a document that is not
+  in the index.
 
 ### 5. Encode before you fix
-Add the failing production cases, de-identified as needed, to the regression suite *before* changing the
-system. This proves the suite catches the failure, and keeps it caught after later changes.
+- **Add the failing production cases,** de-identified as needed, to the regression suite *before* changing
+  the system.
+- **Why first:** it proves the suite catches the failure, and keeps it caught after later changes.
 
 ### 6. Gate, release, verify
-Run the full frozen suite on the candidate. Require improvement on the targeted slice and no regression
-beyond noise on every other slice. "Noise" needs a number, for two reasons. Slices are small, so a pass
-rate over *n* cases has a standard error of about `sqrt(p(1−p)/n)`; and LLM outputs and LLM judges vary
-between runs even on identical inputs. Because baseline and candidate run on the *same* cases, compare
-them paired: count cases that flipped pass→fail (*b*) and fail→pass (*c*). McNemar's test treats
-`(b − c)² / (b + c)` above about 3.84 as a change unlikely to be chance at the 5% level (with only a
-handful of flips, use the exact binomial version instead). For flaky
-cases, run each several times and score the majority, or the gate will block and pass at random.
-
-Ship behind a canary or shadow deployment, then check online that the bucket shrank. Use a *rate* (failures
-per 1,000 conversations) compared with the bucket's own pre-release weeks, not a raw count, because
-traffic growth makes a fixed bucket look bigger. Version every prompt, retrieval config and model, so a
-change in production metrics can be attributed to a specific release.
+1. **Run the full frozen suite on the candidate.** Require improvement on the targeted slice and no
+   regression beyond noise on every other slice.
+2. **Give "noise" a number,** for two reasons: slices are small, so a pass rate over *n* cases has a
+   standard error of about `sqrt(p(1−p)/n)`; and LLM outputs and LLM judges vary between runs even on
+   identical inputs.
+3. **Compare paired,** because baseline and candidate run on the *same* cases. Count cases that flipped
+   pass→fail (*b*) and fail→pass (*c*). McNemar's test treats `(b − c)² / (b + c)` above about 3.84 as a
+   change unlikely to be chance at the 5% level. With only a handful of flips, use the exact binomial
+   version instead.
+4. **Handle flaky cases** by running each several times and scoring the majority, or the gate will block
+   and pass at random.
+5. **Ship behind a canary or shadow deployment,** then check online that the bucket shrank.
+6. **Use a *rate*** (failures per 1,000 conversations) compared with the bucket's own pre-release weeks,
+   not a raw count, because traffic growth makes a fixed bucket look bigger.
+7. **Version every prompt, retrieval config and model,** so a change in production metrics can be
+   attributed to a specific release.
 
 ### 7. Run it on a cadence
-A weekly triage and a fixed release train keep the loop moving without turning every complaint into an
-emergency. External changes go through the same gate: a vendor model update, a re-indexed knowledge base,
-or a new user group. Close the loop with reporters ("you flagged X, fixed in release 14"), because
-visible responses keep feedback rates up.
+- **Weekly triage and a fixed release train** keep the loop moving without turning every complaint into
+  an emergency.
+- **External changes go through the same gate:** a vendor model update, a re-indexed knowledge base, or a
+  new user group.
+- **Close the loop with reporters** ("you flagged X, fixed in release 14"), because visible responses keep
+  feedback rates up.
 
-## Example
-A weekly triage and release gate for a support assistant. Bucket counts come from classified production
-feedback. The ranking applies the severity override, and the gate compares per-slice pass rates on the
-same frozen regression suite.
+## Diagram
+The loop has a measured input, a measured gate and a measured output; anything that fails the gate goes
+back to the fix step, not to production.
+
+```mermaid
+flowchart TD
+    O["Observe: feedback, traces, random sample"] --> C["Classify into failure buckets"]
+    C --> P["Prioritise: count x severity / effort"]
+    P --> L["Pick cheapest layer that owns it"]
+    L --> E["Encode cases in regression suite"]
+    E --> F["Implement fix"]
+    F --> G{"Paired gate: target up, no slice down?"}
+    G -->|"no"| F
+    G -->|"yes"| K["Canary or shadow release"]
+    K --> V{"Bucket rate per 1,000 fell?"}
+    V -->|"no"| L
+    V -->|"yes"| R["Close loop with reporters"]
+    R --> O
+```
+
+## Examples
+### Weekly triage and release gate in Python
+Bucket counts come from classified production feedback. The ranking applies the severity override, and
+the gate compares per-slice pass rates on the same frozen regression suite.
 
 ```python
 from dataclasses import dataclass
@@ -134,39 +165,105 @@ cand = {"refunds": 0.97, "billing": 0.94, "french": 0.84, "shipping": 0.95}
 print(release_ok(base, cand, "refunds"))   # False: french fell 4 points, beyond tolerance
 ```
 
-The refund guardrail goes first despite the lowest score. The candidate fixes refunds but is blocked,
-because the fix cost the French slice four points. That is exactly the regression that
-reactive patching would have shipped.
+- **The refund guardrail goes first** despite the lowest score.
+- **The candidate fixes refunds but is blocked,** because the fix cost the French slice four points. That
+  is exactly the regression reactive patching would have shipped.
 
-Is four points real or noise? Suppose (illustratively) the French slice has 250 cases: 0.88 → 0.84 is
-ten net cases. Paired, say 13 flipped pass→fail and 3 fail→pass: `(13 − 3)² / 16 ≈ 6.3`, above 3.84, so
-block. Had the slice held 25 cases, four points would be one case, and the right response is to rerun or
-grow the slice, not to trust a fixed 2-point tolerance. In this scenario the cause was that the new
-refund instruction ("always state the policy in English legal terms") overrode the language rule, which
-the trace of a flipped case shows directly.
+### Worked scenario: is the French drop real?
+Illustrative numbers for the blocked release above.
+
+| Question | Answer |
+|---|---|
+| Slice size | 250 cases, so 0.88 → 0.84 is ten net cases |
+| Paired flips | 13 pass→fail, 3 fail→pass |
+| McNemar statistic | `(13 − 3)² / 16 ≈ 6.3`, above 3.84, so block |
+| Same four points on a 25-case slice | one case: rerun or grow the slice, do not trust a fixed 2-point tolerance |
+| Root cause from a flipped case's trace | the new refund instruction ("always state the policy in English legal terms") overrode the language rule |
+
+### A paired gate that handles few flips
+The fixed tolerance above is a simplification. This gate uses the flips directly and the exact binomial
+test, which stays valid when flips are few.
+
+```python
+from math import comb
+
+def mcnemar(b, c):
+    """b = pass->fail flips, c = fail->pass flips, same cases, baseline vs candidate."""
+    n = b + c
+    if n == 0:
+        return 0.0, 1.0
+    chi2 = (b - c) ** 2 / n
+    k = min(b, c)                                   # exact two-sided binomial test
+    p_exact = min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n)
+    return chi2, p_exact
+
+def slice_gate(b, c, alpha=0.05):
+    chi2, p = mcnemar(b, c)
+    regressed = b > c and p < alpha
+    return ("block" if regressed else "pass"), round(chi2, 2), round(p, 3)
+
+print(slice_gate(13, 3))    # ('block', 6.25, 0.021)  french slice, 250 cases
+print(slice_gate(2, 1))     # ('pass', 0.33, 1.0)     one net case
+print(slice_gate(4, 0))     # ('pass', 4.0, 0.125)    chi-square says block, exact test says not proven
+```
+
+## Production patterns
+- **Paired gate on a frozen suite** — for every candidate prompt, retrieval or model change, run baseline
+  and candidate on the same cases in CI and gate on per-slice flips (exact test when flips are few), not
+  on the average. Monitor flips per slice and regression escapes per release.
+- **Repeat flaky cases and score the majority** — when a case passes and fails across identical runs, mark
+  it flaky, run it an odd number of times and take the majority. Monitor the share of flaky cases; a
+  rising share means the judge or the prompt is unstable.
+- **Canary with a bucket-rate check** — route a small share of traffic to the candidate, then compare the
+  targeted bucket's failures per 1,000 conversations with its own pre-release weeks. Monitor that rate and
+  roll back if it does not fall.
+- **Version stamps on every trace** — record prompt version, retrieval or index version and model
+  identifier on each request, so a production shift can be attributed to a release. Monitor metrics
+  grouped by release, not by calendar week.
+- **Treat vendor and data changes as releases** — where the provider offers dated model snapshots, pin one
+  instead of a floating alias, and run the full suite before moving; do the same before swapping a
+  re-indexed knowledge base. Monitor suite results per snapshot.
+- **Random-sample review alongside reported failures** — review a fixed number of random conversations
+  each week to catch failures users never report. Monitor the share of buckets discovered only by the
+  sample.
 
 ## Trade-offs
-- A fast release train shortens time-to-fix but makes attribution harder; batch fewer changes per release when you need to know which change moved the metric.
-- Fixing at the prompt layer is quick and cheap, but it accumulates brittle instructions; once the same bucket returns after several prompt fixes, move the fix to retrieval, tools or fine-tuning.
-- A growing regression suite catches more, but it gets slower and costlier to run with an LLM judge; prune duplicate and obsolete cases, and tier the suite into fast and full runs.
-- Fixing one customer's failure in shared prompts helps everyone but risks others' behaviour; when the failure is truly customer-specific, put the fix in that customer's configuration and suite.
+- **Fast release train vs attribution.** It shortens time-to-fix but makes attribution harder; batch fewer
+  changes per release when you need to know which change moved the metric.
+- **Prompt-layer fixes vs brittleness.** They are quick and cheap but accumulate brittle instructions; once
+  the same bucket returns after several prompt fixes, move the fix to retrieval, tools or fine-tuning.
+- **Growing suite vs cost.** It catches more but gets slower and costlier with an LLM judge; prune
+  duplicate and obsolete cases, and tier the suite into fast and full runs.
+- **Shared fix vs isolation.** Fixing one customer's failure in shared prompts helps everyone but risks
+  others' behaviour; when the failure is truly customer-specific, put the fix in that customer's
+  configuration and suite.
 
 ## Pitfalls
-- Whack-a-mole prompt edits without a suite: the symptom is complaints you already fixed reappearing a few releases later.
-- Prioritising by who complained loudest: the dashboard shows a large, steady bucket that has gone untouched for weeks while small anecdotes get fixed.
-- Overfitting to the regression suite: offline pass rates climb every release while production acceptance and edit rates stay flat.
-- Tracking bucket counts instead of rates: a fixed failure appears to "come back" in the month traffic doubles, while its rate per 1,000 conversations is still down.
-- A gate that ignores run-to-run variance: the same candidate passes on Monday and fails on Tuesday, and the team learns to rerun until green.
-- Unversioned changes: production quality shifts and nobody can tell whether the prompt edit, the re-index or the vendor's model update caused it.
-- Feedback that disappears into a backlog: feedback volume drops over time because users learn that reporting changes nothing.
+- **Whack-a-mole prompt edits without a suite.** Symptom: complaints you already fixed reappear a few
+  releases later. Fix: encode before you fix.
+- **Prioritising by who complained loudest.** The dashboard shows a large, steady bucket untouched for
+  weeks while small anecdotes get fixed.
+- **Overfitting to the regression suite.** Offline pass rates climb every release while production
+  acceptance and edit rates stay flat.
+- **Tracking bucket counts instead of rates.** A fixed failure appears to "come back" the month traffic
+  doubles, while its rate per 1,000 conversations is still down.
+- **A gate that ignores run-to-run variance.** The same candidate passes Monday and fails Tuesday, and the
+  team learns to rerun until green.
+- **Unversioned changes.** Production quality shifts and nobody can tell whether the prompt edit, the
+  re-index or the vendor's model update caused it.
+- **Feedback that disappears into a backlog.** Feedback volume drops because users learn that reporting
+  changes nothing.
 
 ## When to use
-Run this loop for any AI system in production with real users, starting in hypercare and continuing for
-the system's life. The cadence can slow as the failure buckets shrink, but it should not stop, because
-inputs and dependencies keep changing. It is less useful during early prototyping, when the design itself
-is still moving and a frozen suite would freeze the wrong behaviour. Measure the loop itself: weekly
-failure rate by bucket, time from report to fix, regression escapes per release, and production
-acceptance trend. In interviews, describe the loop end to end and stress the gate and the online check.
+- **Use when** an AI system is in production with real users, starting in hypercare and continuing for
+  the system's life.
+- **Slow the cadence, never stop it,** as failure buckets shrink, because inputs and dependencies keep
+  changing.
+- **Avoid when** prototyping early: the design is still moving and a frozen suite would freeze the wrong
+  behaviour.
+- **Measure the loop itself:** weekly failure rate by bucket, time from report to fix, regression escapes
+  per release, and production acceptance trend.
+- **Interviews:** describe the loop end to end and stress the gate and the online check.
 
 ## Role lens
 - **Engineer:** Writes the classifier and the gate, adds failing cases to the suite before each fix, and
@@ -186,6 +283,41 @@ failure taxonomy, add representative cases rather than only complained-about one
 prompt patches have accumulated into conflicting instructions. Then I would prioritise by measured bucket
 frequency and severity. Each release would be validated by an online check that the targeted bucket
 shrank, not only by offline pass rate.
+
+## Interview questions
+### What does continuous improvement mean for an LLM system, and why is reactive prompt patching not enough?
+- **Definition:** a loop of observe, classify, prioritise, fix at the cheapest layer, encode, gate and
+  verify online, run on a cadence.
+- **Why patching fails:** LLM behaviour is coupled, so a fix for one complaint can break other slices;
+  nothing measures frequency; and nobody can say whether quality is improving overall.
+
+### A fix passed the gate, but two weeks later the targeted bucket is no smaller in production. How do you debug it?
+- **Check the measurement first:** compare the bucket's rate per 1,000 conversations with its pre-release
+  weeks, not raw counts, and confirm the classifier still labels the bucket the same way.
+- **Check the release:** confirm via version stamps on traces that the new prompt or config is actually
+  serving the affected traffic.
+- **Check coverage:** read fresh failures in the bucket; if they differ from the encoded cases, the suite
+  captured a sub-pattern and the fix belongs at another layer, often retrieval.
+
+### When would you move a fix out of the prompt, and what does that cost?
+- **Move it when** the same bucket returns after several prompt fixes, or when the root cause is data, a
+  missing document or a tool, because a prompt cannot fix a document that is not in the index.
+- **The cost:** retrieval, tool or fine-tuning changes take longer and need wider regression runs.
+- **Customer-specific failures** go into that customer's configuration and suite rather than shared prompts.
+
+### Your French slice has 40 cases and dropped five points. Do you block the release?
+- **Five points on 40 cases is two cases.** The standard error at a pass rate near 0.88 is about
+  sqrt(0.88 × 0.12 / 40) ≈ 0.05, so the drop is about one standard error.
+- **Use the paired flips:** with a handful of flips, the exact binomial test rarely shows significance, so
+  rerun flaky cases, grow the slice and read the flipped traces.
+- **Block anyway if** a flipped case is a severity-5 failure, because the severity override applies to
+  gates too.
+
+### The vendor updated the model behind the alias you call. What should your process do?
+- **Treat it as a release:** run the full frozen suite and compare per slice against the previous model.
+- **Prefer pinned snapshots** where the provider offers them, so the update happens when you choose.
+- **Watch online bucket rates** after the switch, because vendor changes are one of the main sources of
+  silent drift.
 
 ## Quiz
 ### Q: Why add the failing production cases to the regression suite before implementing the fix?

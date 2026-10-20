@@ -5,7 +5,7 @@ name: Incident severity & escalation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - delivery-ownership/production-debugging
   - delivery-ownership/root-cause-analysis-and-postmortems
@@ -20,138 +20,217 @@ sources:
 ---
 
 ## TL;DR
-A severity scale classifies an incident by its impact on users and the business, not by its cause or how
-hard it is to fix, so that response speed, who gets woken up and how often stakeholders hear from you
-are decided in advance rather than argued about mid-incident. Escalation rules say when to pull in more
-expertise (functional) or more authority (hierarchical). AI systems need extra criteria for quality and
-safety incidents that throw no errors.
+A severity scale classifies incidents by impact, not cause, so response speed, paging and update cadence
+are decided in advance. Escalation rules add expertise or authority. AI systems need extra criteria for
+quality and safety incidents that throw no errors.
 
 ## Why it exists
-Without agreed severity levels, every incident starts with a negotiation. One engineer thinks a 5% error
-rate is a shrug; another pages the VP. Small issues wake people at 3 a.m. and burn out on-call, while
-serious ones sit in a ticket queue because the person who noticed did not feel entitled to raise the
-alarm. Customers get updates erratically, and the contractual clock in an SLA runs while people debate.
-
-The naive alternative, "use judgement", fails under exactly the conditions incidents create: stress,
-partial information, and someone senior asking whether it is really that bad. Classifying by cause
-("it's just a config bug") fails too, because cause is unknown at the start and the same root cause can
-be trivial or catastrophic depending on how many users it reaches.
-
-AI products add a twist. A conventional outage is loud: errors spike, health checks fail. An AI
-incident is often silent: the service returns HTTP 200 with fluent, wrong, or unsafe content. If severity
-criteria only mention availability and latency, a model that starts giving incorrect medical dosage
-information, or leaking one tenant's documents into another's answers, may not register as an incident
-at all.
+- **Without levels, every incident starts with a negotiation.** One engineer thinks a 5% error rate is a
+  shrug; another pages the VP.
+- **Both directions fail.** Small issues wake people at 3 a.m. and burn out on-call, while serious ones
+  sit in a ticket queue because whoever noticed did not feel entitled to raise the alarm. Customers get
+  updates erratically, and the contractual clock in an SLA runs while people debate.
+- **"Use judgement" fails under incident conditions:** stress, partial information, and someone senior
+  asking whether it is really that bad.
+- **Classifying by cause fails too** ("it's just a config bug"), because cause is unknown at the start and
+  the same root cause can be trivial or catastrophic depending on how many users it reaches.
+- **AI incidents are often silent.** A conventional outage is loud: errors spike, health checks fail. An
+  AI incident returns HTTP 200 with fluent, wrong, or unsafe content. If criteria only mention
+  availability and latency, a model giving incorrect medical dosage information, or leaking one tenant's
+  documents into another's answers, may not register as an incident at all.
 
 ## How it works
 ### Severity is defined by impact
 A typical scale has four or five levels. The exact criteria are organisation-specific; a common shape:
-- **SEV1 / critical:** broad user-facing outage or degradation of a core function, data exposure or
-  security breach, safety harm, or legal or regulatory exposure. All hands, leadership informed.
-- **SEV2 / major:** significant degradation for a meaningful share of users or a key customer, with no
-  workaround. Urgent, paged response.
-- **SEV3 / minor:** limited impact or a workaround exists. Handled in working hours by the owning team.
-- **SEV4 / low:** cosmetic or internal-only. Goes to the backlog.
-Criteria are written as observable facts (fraction of requests or tenants affected, whether data crossed
-a tenant boundary, whether a contractual SLA is at risk) *because* responders must classify within
-minutes, with incomplete information.
+
+| Level | Impact | Response |
+|---|---|---|
+| **SEV1 / critical** | Broad user-facing outage or degradation of a core function, data exposure or security breach, safety harm, or legal or regulatory exposure | All hands, leadership informed |
+| **SEV2 / major** | Significant degradation for a meaningful share of users or a key customer, with no workaround | Urgent, paged response |
+| **SEV3 / minor** | Limited impact or a workaround exists | Working hours, owning team |
+| **SEV4 / low** | Cosmetic or internal-only | Backlog |
+
+- **Write criteria as observable facts:** fraction of requests or tenants affected, whether data crossed a
+  tenant boundary, whether a contractual SLA is at risk.
+- **Why observable:** responders must classify within minutes, with incomplete information.
 
 ### AI-specific criteria
-Add impact criteria that are about content, not uptime: unsafe or harmful outputs reaching users; cross-
-tenant or PII leakage, including through prompt injection; an agent taking unauthorised or irreversible
-actions; a measured quality metric (groundedness, task success) falling past a defined threshold;
-a provider model change or outage affecting all traffic. A single confirmed data-exposure case can
-justify the top severity even if it touched one user, because the harm is not proportional to volume.
+Add impact criteria about content, not uptime:
+- **Unsafe or harmful outputs** reaching users.
+- **Cross-tenant or PII leakage**, including through prompt injection.
+- **An agent taking unauthorised or irreversible actions.**
+- **A measured quality metric** (groundedness, task success) falling past a defined threshold.
+- **A provider model change or outage** affecting all traffic.
+- **One case can be enough.** A single confirmed data-exposure case can justify the top severity even if
+  it touched one user, because the harm is not proportional to volume.
 
 ### Declare early, adjust freely
-Teams are told to declare at the higher plausible severity and downgrade as facts arrive, *because*
-under-declaring delays response while over-declaring costs only some attention. Severity is not a verdict
-on anyone; it is a routing decision and should change as the picture changes. The asymmetry applies to a
-human declaring a suspected incident, not to automated alert thresholds: a page that fires on noise has a
-real cost, because people learn to ignore it, so alerts should be tuned for precision while declaration
-stays biased high.
+- **Declare at the higher plausible severity and downgrade as facts arrive**, *because* under-declaring
+  delays response while over-declaring costs only some attention.
+- **Severity is not a verdict on anyone.** It is a routing decision and should change as the picture
+  changes.
+- **The asymmetry is for humans, not alerts.** It applies to a human declaring a suspected incident, not
+  to automated alert thresholds. A page that fires on noise has a real cost, because people learn to
+  ignore it, so tune alerts for precision while declaration stays biased high.
 
 ### Severity is not priority
-Severity measures impact; priority is the order in which work gets done, and it also weighs urgency
-(is the harm growing or stable?) and available effort. A SEV3 with a workaround can still be top of the
-queue because the workaround expires tomorrow. Customer contracts usually define their own ticket
-priorities (P1 to P4 or similar) with response targets, so the policy must map them explicitly to
-internal severities; otherwise a customer's P1 lands as an internal SEV3 and the SLA clock runs out
-while both sides think the other is on it. A related line to draw: a defect becomes an *incident* when it
-needs a coordinated response now, not when it is merely a bug in the backlog.
+- **Severity measures impact; priority is work order.** Priority also weighs urgency (is the harm growing
+  or stable?) and available effort.
+- **Example:** a SEV3 with a workaround can still top the queue because the workaround expires tomorrow.
+- **Map customer priorities explicitly.** Contracts usually define their own ticket priorities (P1 to P4
+  or similar) with response targets. Without an explicit mapping to internal severities, a customer's P1
+  lands as an internal SEV3 and the SLA clock runs out while both sides think the other is on it.
+- **Bug vs incident:** a defect becomes an *incident* when it needs a coordinated response now, not when
+  it is merely a bug in the backlog.
 
 ### Severity drives the response
-Each level maps to: who is paged, a target time to acknowledge and to mitigate, whether an incident
-commander is assigned, the update cadence for stakeholders and customers, and whether a postmortem is
-mandatory. The commander coordinates and decides; others investigate, communicate, or scribe. Splitting
-these roles stops the person debugging from also fielding questions from executives.
+Each level maps to:
+1. who is paged;
+2. a target time to acknowledge and to mitigate;
+3. whether an incident commander is assigned;
+4. the update cadence for stakeholders and customers;
+5. whether a postmortem is mandatory.
+
+- **Split the roles.** The commander coordinates and decides; others investigate, communicate, or scribe.
+  This stops the person debugging from also fielding questions from executives.
 
 ### Two kinds of escalation
-- **Functional escalation** brings in expertise or ownership: the retrieval team, the platform on-call,
-  the model provider's support with request IDs and timestamps. Trigger: the current responders cannot
-  make progress or the fault is in someone else's component.
-- **Hierarchical escalation** brings in authority: a decision to take a feature offline, notify customers
-  or regulators, spend money, or override a customer's change freeze. Trigger: the needed decision is above
-  the responder's remit.
-Both should also be **time-based**: if a SEV2 is not mitigated within the policy's window, it escalates
-automatically, so no one has to judge whether asking for help is admitting failure.
+| | Functional escalation | Hierarchical escalation |
+|---|---|---|
+| **Brings in** | Expertise or ownership: the retrieval team, the platform on-call, the model provider's support with request IDs and timestamps | Authority: a decision to take a feature offline, notify customers or regulators, spend money, or override a customer's change freeze |
+| **Trigger** | Current responders cannot make progress, or the fault is in someone else's component | The needed decision is above the responder's remit |
 
-## Example
+- **Make both time-based.** If a SEV2 is not mitigated within the policy's window, it escalates
+  automatically, so no one has to judge whether asking for help is admitting failure.
+
+## Diagram
+Impact facts, not cause, pick the level; new facts can move it either way at any time.
+
+```mermaid
+flowchart TD
+    D["Signal or report"] --> Q1{"Data exposure, safety harm or legal risk?"}
+    Q1 -->|"yes"| S1["SEV1: all hands, leadership"]
+    Q1 -->|"no"| Q2{"Key customer or broad share degraded, no workaround?"}
+    Q2 -->|"yes"| S2["SEV2: page, commander"]
+    Q2 -->|"no"| Q3{"Cosmetic or internal only?"}
+    Q3 -->|"no"| S3["SEV3: owning team, work hours"]
+    Q3 -->|"yes"| S4["SEV4: backlog"]
+    S2 -->|"not mitigated in window"| E["Auto-escalate to manager"]
+    S3 -.->|"new impact facts"| Q1
+```
+
+## Examples
+### Worked timeline: severity changes as facts arrive
 An illustrative policy (the targets are examples, not a standard) and a timeline for an enterprise RAG
 assistant.
 
-Policy excerpt: SEV2 = a key customer or more than 5% of requests degraded with no workaround; page
+**Policy excerpt:** SEV2 = a key customer or more than 5% of requests degraded with no workaround; page
 on-call, acknowledge within 15 minutes, updates every 30 minutes, escalate to engineering manager if not
 mitigated in 60 minutes. Any confirmed cross-tenant data exposure = SEV1.
 
-- **09:10** Alert: 4% of responses fail JSON schema validation (later traced to a provider model alias
-  moving to a newer snapshot). Failures fall back to a generic answer. On-call declares SEV3: workaround exists, small share.
-- **09:25** Scoping shows all failures are from one enterprise tenant whose prompts use a tool schema the
-  new snapshot handles differently; for them, 60% of requests fail. That tenant is a named account with an
-  SLA. Upgraded to SEV2; incident commander assigned; account team informed.
-- **09:40** Functional escalation: ticket to the provider with ten request IDs. Mitigation: pin that
-  tenant to the previous model snapshot.
-- **09:55** Failure rate back to baseline. Customer update sent. Incident stays open at SEV3 until the
-  schema is made compatible with the new snapshot.
-- **10:30** During review, an engineer notices one fallback answer contained a document title from a
-  different tenant's cache. Re-declared SEV1 immediately: security on-call paged, leadership and legal
-  informed, cache disabled.
+| Time | What happened | Severity |
+|---|---|---|
+| **09:10** | Alert: 4% of responses fail JSON schema validation (later traced to a provider model alias moving to a newer snapshot). Failures fall back to a generic answer. Workaround exists, small share. | SEV3 |
+| **09:25** | Scoping: all failures are from one enterprise tenant whose prompts use a tool schema the new snapshot handles differently; for them, 60% of requests fail. That tenant is a named account with an SLA. Incident commander assigned; account team informed. | SEV2 |
+| **09:40** | Functional escalation: ticket to the provider with ten request IDs. Mitigation: pin that tenant to the previous model snapshot. | SEV2 |
+| **09:55** | Failure rate back to baseline. Customer update sent. Stays open until the schema is made compatible with the new snapshot. | SEV3 |
+| **10:30** | During review, an engineer notices one fallback answer contained a document title from a different tenant's cache. Security on-call paged, leadership and legal informed, cache disabled. | SEV1 |
 
-The severity changed three times (SEV3, SEV2, SEV3, SEV1), each time because new facts about impact arrived, not because the cause
-changed.
+The severity changed three times (SEV3, SEV2, SEV3, SEV1), each time because new facts about impact
+arrived, not because the cause changed.
+
+### The policy as code (runnable)
+Encoding the excerpt makes the rule testable and keeps cause out of the inputs. Pure Python.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Impact:
+    share_of_requests_degraded: float   # 0.0-1.0, across all traffic
+    key_customer_degraded: bool         # a named account with an SLA
+    workaround_exists: bool
+    cross_tenant_exposure: bool = False
+    unsafe_output_reached_user: bool = False
+    cosmetic_only: bool = False
+
+def classify(i: Impact) -> str:
+    """Illustrative policy: impact facts in, severity out. Cause is not an input."""
+    if i.cross_tenant_exposure or i.unsafe_output_reached_user:
+        return "SEV1"                               # harm is not proportional to volume
+    if (i.key_customer_degraded or i.share_of_requests_degraded > 0.05) and not i.workaround_exists:
+        return "SEV2"
+    if i.cosmetic_only:
+        return "SEV4"
+    return "SEV3"
+
+def needs_escalation(sev: str, minutes_unmitigated: int) -> bool:
+    return sev == "SEV2" and minutes_unmitigated >= 60   # time-based, from the policy excerpt
+
+print(classify(Impact(0.04, False, True)))                     # SEV3 at 09:10
+print(classify(Impact(0.04, True, False)))                     # SEV2 at 09:25
+print(classify(Impact(0.0, False, True)))                      # SEV3 at 09:55
+print(classify(Impact(0.0, False, True, cross_tenant_exposure=True)))  # SEV1 at 10:30
+print(needs_escalation("SEV2", 45), needs_escalation("SEV2", 60))      # False True
+```
+
+## Production patterns
+- **Severity matrix in the runbook header.** When: before the first incident. How: a one-screen table of
+  observable criteria per level, with paging target, acknowledge and mitigate targets, update cadence and
+  postmortem requirement. Monitor: how often severity was disputed or changed during incidents.
+- **Customer priority mapping.** When: any enterprise contract. How: a written table mapping each
+  contractual priority (P1 to P4) to an internal severity and on-call rotation, stored with the SLA.
+  Monitor: customer P1s acknowledged inside the contractual target.
+- **Content-level alerts.** When: any AI feature in production. How: page on online quality or safety
+  signals (groundedness score dropping past a threshold, cross-tenant document IDs in a response,
+  guardrail block rate spiking), not only on errors and latency. Monitor: alert precision, so pages stay
+  trusted.
+- **Timer-driven escalation.** When: SEV1 and SEV2. How: the paging or incident tool escalates
+  automatically if the incident is not acknowledged or mitigated within the policy window, and the
+  commander can defer with a stated reason. Monitor: time to acknowledge and time to mitigate by severity.
+- **Per-tenant kill switches.** When: multi-tenant AI products. How: flags that pin one tenant to a
+  previous model snapshot, disable a cache or retrieval path, or switch a feature off without a deploy.
+  Monitor: time from declaration to first mitigation.
 
 ## Trade-offs
-- Low thresholds catch real incidents early but page people for noise; they flip toward higher thresholds
-  when on-call fatigue causes alerts to be ignored, which is worse than a slower page.
-- Detailed severity criteria reduce argument but take time to apply under pressure; keep the top levels
-  simple and observable, and put nuance in the lower levels.
-- Automatic time-based escalation removes social friction but can pull managers into incidents that are
-  nearly resolved; allow the commander to acknowledge and defer with a stated reason.
-- Treating quality degradations as incidents protects users but requires a trustworthy online quality
-  metric; without one, quality incidents generate false alarms and are quietly ignored.
+- **Low thresholds vs on-call fatigue.** Low thresholds catch real incidents early but page people for
+  noise. They flip toward higher thresholds when fatigue causes alerts to be ignored, which is worse than
+  a slower page.
+- **Detailed criteria vs speed.** Detailed criteria reduce argument but take time to apply under pressure.
+  Keep the top levels simple and observable, and put nuance in the lower levels.
+- **Automatic escalation vs interruptions.** Time-based escalation removes social friction but can pull
+  managers into incidents that are nearly resolved. Allow the commander to acknowledge and defer with a
+  stated reason.
+- **Quality incidents vs false alarms.** Treating quality degradations as incidents protects users but
+  requires a trustworthy online quality metric. Without one, quality incidents generate false alarms and
+  are quietly ignored.
 
 ## Pitfalls
-- Defining severity only by uptime and error rate; the symptom is a harmful or wrong-answer episode that
-  ran for days because every dashboard stayed green.
-- Classifying by suspected cause rather than impact; the symptom is "it's only a config change" incidents
-  that turn out to affect every tenant.
-- Reluctance to declare or escalate for fear of blame; the symptom is incidents first heard about from
-  customers or account managers rather than from monitoring or on-call.
-- One person acting as commander, debugger and communicator; the symptom is customer updates that stop
-  for an hour exactly when the incident is worst.
-- Escalating to a model provider without request IDs, timestamps and a minimal reproduction; the symptom
-  is a support ticket that sits unanswered while you wait.
-- Severity inflation, where everything urgent-sounding is declared SEV1 and never downgraded; the
-  symptom is SEV1 pages that no longer mobilise anyone and a postmortem backlog nobody can clear.
+- **Defining severity only by uptime and error rate.** Symptom: a harmful or wrong-answer episode that ran
+  for days because every dashboard stayed green. Fix: add content-level criteria.
+- **Classifying by suspected cause.** Symptom: "it's only a config change" incidents that turn out to
+  affect every tenant. Fix: classify by impact.
+- **Reluctance to declare or escalate for fear of blame.** Symptom: incidents first heard about from
+  customers or account managers rather than from monitoring or on-call. Fix: declare high, blameless
+  culture, time-based escalation.
+- **One person as commander, debugger and communicator.** Symptom: customer updates that stop for an hour
+  exactly when the incident is worst. Fix: split roles.
+- **Escalating to a model provider without request IDs, timestamps and a minimal reproduction.** Symptom:
+  a support ticket that sits unanswered while you wait. Fix: attach the evidence.
+- **Severity inflation.** Everything urgent-sounding is declared SEV1 and never downgraded. Symptom: SEV1
+  pages that no longer mobilise anyone and a postmortem backlog nobody can clear. Fix: downgrade as facts
+  arrive.
 
 ## When to use
-Every team running a production service needs a written severity scale and escalation policy before the
-first incident, agreed with support, account management and, for enterprise deals, aligned with the SLA's
-priority definitions. Revisit it after each postmortem that revealed a classification dispute. For AI
-systems, add content-level criteria and the online signals that detect them. Measure time to declare,
-time to acknowledge and time to mitigate by severity, and how often severity changed during incidents.
-In interviews, expect "how would you classify a hallucination that reached one customer?" and answer by
-impact and harm, not by error rate.
+- **Use when:** any team runs a production service. Write the scale and escalation policy before the
+  first incident, agreed with support and account management and, for enterprise deals, aligned with the
+  SLA's priority definitions.
+- **Revisit:** after each postmortem that revealed a classification dispute. For AI systems, add
+  content-level criteria and the online signals that detect them.
+- **Measure:** time to declare, time to acknowledge and time to mitigate by severity, and how often
+  severity changed during incidents.
+- **Interviews:** expect "how would you classify a hallucination that reached one customer?" and answer by
+  impact and harm, not by error rate.
 
 ## Role lens
 - **Engineer:** Writes alerts that map to severity criteria, carries the pager, and knows how to pin a
@@ -170,6 +249,37 @@ who simply did not notice. I would page security and the owning team, assign a c
 trace, and mitigate fast, for example by disabling the retrieval path or the cache involved. Hierarchical
 escalation covers customer and possibly regulatory notification. If investigation shows the user did
 have access, we downgrade; declaring high and downgrading is cheaper than the reverse.
+
+## Interview questions
+### Why define severity by impact rather than by cause?
+- **Cause is unknown at the start.** Responders must classify in minutes, and impact (share of requests,
+  tenants affected, data crossing a boundary) is observable early.
+- **The same cause scales differently.** A config bug can be trivial for one internal user or catastrophic
+  for every tenant, so cause cannot set the response.
+
+### An enterprise customer files a P1, but your on-call classifies it SEV3. What went wrong and how do you fix it?
+- **The mapping is missing.** Contract priorities and internal severities are separate scales, so without
+  an explicit table the SLA clock runs while each side assumes the other is acting.
+- **Fix:** write the P1-to-P4 mapping into the escalation policy, route customer P1s to the paged rotation,
+  and review disputed cases in the next postmortem.
+
+### When would you not page someone for a quality drop?
+- **When the online metric is untrustworthy.** A noisy groundedness score that fires on normal variation
+  teaches people to ignore pages, which is worse than a slower page.
+- **When a workaround holds and harm is stable**, it is a SEV3 for working hours, not a 3 a.m. page.
+- **Do page** when the drop crosses a validated threshold or involves unsafe content or data exposure.
+
+### How would you classify a hallucination that reached one customer?
+- **By harm, not count.** A wrong cosmetic detail is SEV3 or SEV4; a wrong medical dosage or a wrong
+  contractual commitment can justify SEV1 or SEV2 even for one user.
+- **Then check reach.** Search traces for the same pattern, because one report often means many unnoticed
+  cases.
+
+### What numbers would you track to know your severity policy works?
+- **Time to declare, acknowledge and mitigate**, broken down by severity.
+- **Severity changes per incident** and disputed classifications, which point to unclear criteria.
+- **Share of incidents first reported by customers** rather than monitoring, which reveals detection gaps,
+  especially for silent AI failures.
 
 ## Quiz
 ### Q: What should primarily determine an incident's severity level?

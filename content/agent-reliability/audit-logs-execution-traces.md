@@ -5,7 +5,7 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - agent-reliability/structured-event-streams
   - agent-reliability/deterministic-replay-and-reproducibility
@@ -21,27 +21,25 @@ sources:
 ---
 
 ## TL;DR
-An execution trace answers "what did the agent do and why" for engineers debugging a run; an audit log
-answers "who did what with whose authority" for security, compliance and incident response. They share
-the same facts, best derived from one event stream, but differ in what they must contain, how long they
-live, who can read them and whether they may ever be altered. Build both on purpose, not one as an
-afterthought of the other.
+A trace tells engineers what the agent did and why; an audit log tells security and compliance who did
+what with whose authority. Both derive from one event stream but differ in contents, retention, access
+and mutability, so build both on purpose.
 
 ## Why it exists
-An agent refunds a customer 4,000 instead of 40. The questions arrive in a fixed order. Which user asked
-for it? What did the model see when it decided? Which tool ran, with what arguments, under which
-credential? Was it approved, and by whom? Could it happen again? Ordinary application logs answer none of
-these well: they are unstructured, scattered across services, missing the prompt, and routinely rotated
-after a week. The model's decision is non-deterministic and depends on the full context, so without the
-exact prompt and tool results the failure is not reproducible, and without the policy decision and
-credential it is not attributable.
-
-The naive fix is "log everything to stdout". It fails because logging everything means logging PII,
-secrets and customer documents into a system with no access control, because free text cannot be queried
-("show me every refund over 1,000 in the last 30 days where approval was skipped"), and because a log that
-engineers can edit is not evidence. Debugging and accountability have different needs. The trace wants rich
-payloads, timings and sampling; the audit log wants completeness, immutability and long retention. One
-artifact cannot be both without being bad at one of them.
+- **Incidents ask a fixed set of questions.** An agent refunds a customer 4,000 instead of 40. Which user
+  asked? What did the model see when it decided? Which tool ran, with what arguments, under which
+  credential? Was it approved, and by whom? Could it happen again?
+- **Ordinary application logs answer none of them well:** unstructured, scattered across services, missing
+  the prompt, and routinely rotated after a week.
+- **Without the exact context, failures are irreproducible and unattributable.** The model's decision is
+  non-deterministic and depends on the full context; without the prompt and tool results you cannot
+  reproduce it, and without the policy decision and credential you cannot attribute it.
+- **"Log everything to stdout" fails three ways.** It logs PII, secrets and customer documents into a
+  system with no access control; free text cannot be queried ("show me every refund over 1,000 in the last
+  30 days where approval was skipped"); and a log that engineers can edit is not evidence.
+- **Debugging and accountability need different artifacts.** The trace wants rich payloads, timings and
+  sampling; the audit log wants completeness, immutability and long retention. One artifact cannot be both
+  without being bad at one of them.
 
 ## How it works
 ### Execution trace
@@ -55,21 +53,22 @@ run (trace root)
    +- tool.call   name=refund, args_ref=..., permission=ask, approval_id=..., ok=true
 ```
 
-Each span carries attributes: the model identifier, the prompt template version or content hash, token
-counts, parameters, latency, cache hits, tool name, error class. OpenTelemetry's generative-AI semantic
-conventions define attribute names for many of these (they are still evolving, so pin the version you
-adopt), and tools such as Langfuse, LangSmith and Phoenix render the tree. Span inputs and outputs are
-attached as references to a blob store, *because* a trace of a long run with inline payloads is megabytes
-and the tracing backend is the wrong place for customer data. Traces are sampled under load; keeping 100%
-of failed or escalated runs and a fraction of successful ones is a common policy. That policy requires
-*tail-based* sampling: the keep-or-drop decision is made after the run ends, by a collector that buffers
-its spans, *because* head-based sampling decides at the root span, before anyone knows the run will fail,
-and so drops failures at the same rate as successes.
+- **Span attributes:** model identifier, prompt template version or content hash, token counts,
+  parameters, latency, cache hits, tool name, error class.
+- **Standard names exist but move.** OpenTelemetry's generative-AI semantic conventions define attribute
+  names for many of these; they are still evolving, so pin the version you adopt. Langfuse, LangSmith and
+  Phoenix render the tree.
+- **Payloads by reference.** Span inputs and outputs are references to a blob store, *because* a long run's
+  trace with inline payloads is megabytes and the tracing backend is the wrong place for customer data.
+- **Sampling under load.** A common policy keeps 100% of failed or escalated runs and a fraction of
+  successful ones.
+- **That policy needs tail-based sampling.** A collector buffers a run's spans and decides after it ends,
+  *because* head-based sampling decides at the root span, before anyone knows the run will fail, and so
+  drops failures at the same rate as successes.
 
 ### Audit log
 An audit record is written at each authority-bearing moment: a permission decision, an approval, a
-side-effecting tool execution, a credential issuance, a human override. The record is small and
-fixed-shape:
+side-effecting tool execution, a credential issuance, a human override. It is small and fixed-shape:
 
 ```
 ts, run_id, step_id, actor (user), principal (agent identity),
@@ -78,49 +77,73 @@ policy_version, decision (allow|ask|deny), approval_id, credential_id,
 phase (authorized | completed), outcome (ok | error class), prev_hash, hash
 ```
 
-Each design choice has a reason. It stores an `args_hash` and a reference rather than the arguments
-themselves, so the log can be retained for years without holding the content, while the referenced payload
-can be deleted on schedule. The hash must be keyed (an HMAC with a secret held outside the log), *because*
-arguments are often low-entropy (a customer id and an amount) and a plain SHA-256 of them can be recovered
-by enumerating candidates; a keyed hash is pseudonymous data, not anonymous, so keep `actor` and `target`
-as internal ids rather than names or emails. It is append-only in a separate store with narrower write permissions than the
-application, *because* the whole point is that the people and systems being audited cannot edit it.
-`prev_hash` and `hash` chain the records so deletion or modification is detectable; this is cheap and
-turns the log into evidence, provided the latest hash is periodically anchored somewhere the writer cannot
-touch (a WORM bucket, a separate account, a signed checkpoint), because anyone able to rewrite every row
-could also recompute the whole chain. It is complete, never sampled, *because* "we dropped that one" is not an
-acceptable answer in an incident review. And it is queryable by actor, action, target and time, which
-means a table with indexes, not a text file.
+| Design choice | Because |
+|---|---|
+| Store `args_hash` and a reference, not the arguments | The log can be retained for years without holding the content, while the referenced payload is deleted on schedule |
+| The hash is keyed (an HMAC with a secret held outside the log) | Arguments are often low-entropy (a customer id and an amount), and a plain SHA-256 of them can be recovered by enumerating candidates |
+| Keep `actor` and `target` as internal ids, not names or emails | A keyed hash is pseudonymous data, not anonymous |
+| Append-only, in a separate store with narrower write permissions than the application | The people and systems being audited must not be able to edit it |
+| `prev_hash` and `hash` chain the records | Deletion or modification becomes detectable; this is cheap and turns the log into evidence |
+| Anchor the latest hash periodically somewhere the writer cannot touch (a WORM bucket, a separate account, a signed checkpoint) | Anyone able to rewrite every row could also recompute the whole chain |
+| Complete, never sampled | "We dropped that one" is not an acceptable answer in an incident review |
+| Queryable by actor, action, target and time | That means a table with indexes, not a text file |
 
-Two write-ordering rules follow from "complete". The authorization record is written *before* the
-side effect and the outcome record after, *because* a crash in between must leave evidence that an
-action was authorized and may have run; an outcome-only log loses exactly the actions that crashed
-mid-flight, which are the ones an investigation cares about. And for side-effecting tools the audit
-write fails closed: if the audit store is unavailable the tool does not run. That costs availability, so
-read-only tools are often allowed to proceed with a buffered record, but an unrecorded refund is worse
-than a delayed one.
+### Write ordering follows from "complete"
+1. **Authorization record before the side effect, outcome record after,** *because* a crash in between must
+   leave evidence that an action was authorized and may have run. An outcome-only log loses exactly the
+   actions that crashed mid-flight, which are the ones an investigation cares about.
+2. **Side-effecting tools fail closed on audit:** if the audit store is unavailable, the tool does not run.
+   - That costs availability, so read-only tools are often allowed to proceed with a buffered record.
+   - But an unrecorded refund is worse than a delayed one.
 
 ### One source, two sinks
-Both artifacts are projections of the run's event stream. `tool.call.permission`, `tool.call.result`,
-`input.received` and credential events feed the audit sink; every event with timing feeds the trace sink.
-Deriving both from the stream, rather than instrumenting twice, guarantees they agree on what happened
-and share the `run_id` that lets an investigator jump from an audit row to the full trace.
+- **Both artifacts are projections of the run's event stream.** `tool.call.permission`,
+  `tool.call.result`, `input.received` and credential events feed the audit sink; every event with timing
+  feeds the trace sink.
+- **Deriving both, rather than instrumenting twice,** guarantees they agree on what happened and share the
+  `run_id` that lets an investigator jump from an audit row to the full trace.
 
 ### What to capture at the decision point
-The expensive-to-recover items are the ones to capture eagerly: the exact prompt (or its hash plus a
-registry version that resolves to the exact text), the model identifier, the tool results that preceded
-the decision, and the policy version. Everything else can be reconstructed; these cannot.
+Capture eagerly the items that are expensive to recover; everything else can be reconstructed:
+- **The exact prompt,** or its hash plus a registry version that resolves to the exact text.
+- **The model identifier.**
+- **The tool results that preceded the decision.**
+- **The policy version.**
 
 ### Retention and access
-Traces: short retention, engineer access, sampled. Audit: long retention set by the regulated domain you
-operate in, restricted access, complete. Redaction rules differ too: a trace may be scrubbed of PII at
-ingestion; an audit log should never have contained it.
+| | Trace | Audit log |
+|---|---|---|
+| Retention | Short | Long, set by the regulated domain you operate in |
+| Access | Engineers | Restricted |
+| Coverage | Sampled | Complete |
+| PII | May be scrubbed at ingestion | Should never have contained it |
 
-## Example
+## Diagram
+One tool call produces both artifacts: the audit rows bracket the effect and are written fail-closed,
+while the span collects timings and references.
+
+```mermaid
+flowchart TD
+    C["Tool call requested"] --> P["Policy check: allow, ask, deny"]
+    P --> A1["Audit row: phase authorized"]
+    A1 -->|"audit write failed"| X["Do not run, fail closed"]
+    A1 -->|"written"| R["Run tool"]
+    R --> A2["Audit row: phase completed"]
+    A1 --> AS[("Append-only hash-chained store")]
+    A2 --> AS
+    AS -.->|"periodic head hash"| W[("WORM anchor")]
+    R --> SP["Trace span: timings, refs"]
+    SP --> TB[("Tracing backend, tail-sampled")]
+```
+
+## Examples
+### A tool wrapper that writes both
 A tool-execution wrapper that emits a trace span and append-only, hash-chained audit records from the
-same call: one for the decision before anything runs, one for the outcome after. Arguments are hashed
-into the audit rows and stored by reference for the trace. (In a stream-based runtime both would be
-projections of the run's events; the direct writes keep the example short.)
+same call: one for the decision before anything runs, one for the outcome after.
+
+- **Arguments** are hashed into the audit rows and stored by reference for the trace.
+- **In a stream-based runtime** both would be projections of the run's events; the direct writes keep the
+  example short.
 
 ```python
 import hashlib, hmac, json, os, time
@@ -171,44 +194,117 @@ def run_tool(name, args, *, ctx, policy, tools, blobs, audit: AuditLog):
         return result
 ```
 
+### Verifying the chain and the anchor (runnable, stdlib only)
+Editing one row breaks the chain; recomputing every hash repairs the chain but no longer matches the
+externally anchored head, which is why the anchor matters.
+
+```python
+import hashlib, json
+
+def _h(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
+
+def append(chain: list, **rec) -> None:
+    rec["prev_hash"] = chain[-1]["hash"] if chain else "0" * 64
+    rec["hash"] = _h(rec)
+    chain.append(rec)
+
+def verify(chain: list, anchored_head: str) -> str:
+    prev = "0" * 64
+    for i, rec in enumerate(chain):
+        body = {k: v for k, v in rec.items() if k != "hash"}
+        if rec["prev_hash"] != prev or _h(body) != rec["hash"]:
+            return f"broken at row {i}"
+        prev = rec["hash"]
+    return "ok" if prev == anchored_head else "head does not match anchor"
+
+log = []
+append(log, run_id="r9", action="refund", phase="authorized", decision="allow", target="o-77")
+append(log, run_id="r9", action="refund", phase="completed", outcome="ok", target="o-77")
+anchor = log[-1]["hash"]                     # copied to a store the writer cannot touch
+
+print(verify(log, anchor))                   # ok
+log[0]["decision"] = "ask"                   # someone edits a row
+print(verify(log, anchor))                   # broken at row 0
+for i, rec in enumerate(log):                # attacker recomputes the whole chain
+    rec["prev_hash"] = log[i - 1]["hash"] if i else "0" * 64
+    rec["hash"] = _h({k: v for k, v in rec.items() if k != "hash"})
+print(verify(log, anchor))                   # head does not match anchor
+```
+
+### Worked incident: the 4,000 refund that should have been 40
+Each standard question is answered by a specific field, and the shared `run_id` connects them.
+
+| Question | Where the answer comes from |
+|---|---|
+| Which user asked? | Audit row `actor`, with `principal` naming the agent identity |
+| Was it authorized, and by what? | Audit row `decision`, `policy_version`, `approval_id` (phase `authorized`) |
+| Did it actually run? | Matching `completed` row with `outcome`; an `authorized` row alone means "may have run" |
+| What did the model see? | Trace span `prompt_ref` and the preceding tool results, resolved from the blob store |
+| Model or prompt change? | Span model identifier and prompt registry version against the previous release |
+| Could it happen again? | Query the audit table for refunds over 1,000 in the last 30 days where approval was skipped |
+
+## Production patterns
+- **Tail-based sampling in the collector.** When: trace volume forces sampling. How: the OpenTelemetry
+  Collector's tail-sampling processor with one policy that keeps every trace with error status and a
+  probabilistic policy for the rest. Monitor: trace coverage of failed runs, which should be 100%.
+- **Insert-only audit role in a separate store.** When: from the first side-effecting tool. How: the agent's
+  writer role gets `INSERT` (and `SELECT` for the last hash) on the audit table, with no `UPDATE` or
+  `DELETE`, in a database or account the application team does not administer. Monitor: grants on that
+  table in access reviews.
+- **External anchoring of the head hash.** When: the log must serve as evidence. How: write the latest hash
+  every few minutes to write-once storage, such as an S3 bucket with Object Lock in compliance mode, or a
+  separate account. Monitor: age of the newest anchor and nightly chain verification results.
+- **Fail-closed audit for side effects.** When: tools move money, send messages or delete data. How: the
+  `authorized` write must succeed before the tool runs; read-only tools buffer and retry instead. Monitor:
+  audit write p95 latency on the critical path and the count of tool runs refused for audit unavailability.
+- **One identifier everywhere.** When: always. How: put `run_id` (and `step_id`) on every span as an
+  attribute and in every audit row, so a single query jumps between sinks. Monitor: audit rows whose
+  `run_id` has no trace, which reveal effects that bypassed the runtime.
+- **Blob retention from investigation windows.** When: payloads are stored by reference. How: lifecycle
+  rules on the blob store set from the longest investigation you must support, with per-record delete for
+  data-protection requests. Monitor: references in audit rows that no longer resolve.
+
 ## Trade-offs
-- Deriving both artifacts from the event stream guarantees they agree, but it means the audit log is only
-  as complete as the stream; any effect that bypasses the runtime (a tool that calls another service
-  directly) is invisible to both.
-- Hash-chaining makes tampering detectable at almost no cost, yet it serializes writes per chain; shard
-  the chain per run or per day when write volume is high.
-- Sampling traces controls cost, but a bug that only appears in sampled-out runs is a bug you cannot see;
-  keep failed, denied and escalated runs at 100%.
-- Storing payloads by reference keeps audit rows PII-free and traces small, but an investigation older than
-  the blob retention window has hashes and no content; set blob retention from the longest investigation
-  window you must support, not from storage cost alone.
+- **One stream, two sinks vs coverage.** Deriving both artifacts from the event stream guarantees they
+  agree, but the audit log is only as complete as the stream; an effect that bypasses the runtime (a tool
+  that calls another service directly) is invisible to both.
+- **Hash chaining vs write throughput.** It makes tampering detectable at almost no cost, yet serializes
+  writes per chain; shard the chain per run or per day when write volume is high.
+- **Sampling vs visibility.** Sampling traces controls cost, but a bug that only appears in sampled-out
+  runs is a bug you cannot see; keep failed, denied and escalated runs at 100%.
+- **References vs long investigations.** Storing payloads by reference keeps audit rows PII-free and traces
+  small, but an investigation older than the blob retention window has hashes and no content; set blob
+  retention from the longest investigation window you must support, not from storage cost alone.
 
 ## Pitfalls
-- Treating the trace as the audit log; the symptom is an auditor asking for a complete record of refunds
-  and being told the tracing backend samples at 10% and retains for 14 days.
-- Writing audit records from the application with the same database role that can delete them; the symptom
-  is an incident review where the question "could this have been edited" has no good answer.
-- Logging the full prompt and tool outputs into a shared log platform; the symptom is a data-protection
-  request that requires purging customer content from a system that has no per-record delete.
-- Missing the prompt version at the decision point; the symptom is a reproduction attempt that cannot tell
+- **Treating the trace as the audit log.** Symptom: an auditor asks for a complete record of refunds and is
+  told the tracing backend samples at 10% and retains for 14 days.
+- **Writing audit records with a role that can delete them.** Symptom: an incident review where "could this
+  have been edited" has no good answer.
+- **Logging full prompts and tool outputs into a shared log platform.** Symptom: a data-protection request
+  that requires purging customer content from a system with no per-record delete.
+- **Missing the prompt version at the decision point.** Symptom: a reproduction attempt that cannot tell
   whether the model changed or the prompt did.
-- Audit entries that record the action but not the authority; the symptom is "the agent did X" with no way
-  to say which user asked, which policy allowed it, or who approved it.
-- Separate run identifiers in the trace and the audit log; the symptom is an investigator manually matching
+- **Recording the action but not the authority.** Symptom: "the agent did X" with no way to say which user
+  asked, which policy allowed it, or who approved it.
+- **Separate run identifiers in trace and audit log.** Symptom: an investigator manually matching
   timestamps between two systems.
-- Writing the audit record only after the tool returns; the symptom is an effect visible in the target
-  system (a refund, an email) with no audit row, traced to a worker that crashed mid-call.
-- Head-based trace sampling with a "keep all failures" policy on paper; the symptom is that failed runs
-  are missing from the tracing backend at the same rate as successful ones.
+- **Writing the audit record only after the tool returns.** Symptom: an effect visible in the target system
+  (a refund, an email) with no audit row, traced to a worker that crashed mid-call.
+- **Head-based sampling with a "keep all failures" policy on paper.** Symptom: failed runs missing from the
+  tracing backend at the same rate as successful ones.
 
 ## When to use
-Every agent that acts on behalf of a user needs the trace from the first week, because it is how you
-debug anything, and needs the audit log before the first side-effecting tool reaches production, because
-retrofitting immutability onto a log that already exists is painful. Decide retention, access and
-redaction per sink up front and measure: trace coverage of failed runs (target 100%), audit write latency
-on the critical path, and time-to-answer for the standard incident questions. In interviews, the
-distinction to draw is intent: traces serve engineers and are sampled and short-lived; audit logs serve
-accountability and must be complete, attributable and tamper-evident.
+- **Trace from the first week** for every agent that acts on behalf of a user, because it is how you debug
+  anything.
+- **Audit log before the first side-effecting tool reaches production,** because retrofitting immutability
+  onto a log that already exists is painful.
+- **Decide retention, access and redaction per sink up front.**
+- **Measure** trace coverage of failed runs (target 100%), audit write latency on the critical path, and
+  time-to-answer for the standard incident questions.
+- **Interviews:** the distinction is intent. Traces serve engineers and are sampled and short-lived; audit
+  logs serve accountability and must be complete, attributable and tamper-evident.
 
 ## Role lens
 - **Engineer:** Instruments steps and tool calls as spans, derives audit rows from permission and result
@@ -232,6 +328,41 @@ exact template text kept in the prompt registry (not PII) and the policy that al
 customer-specific inputs remain verifiable against a candidate by recomputing the keyed hash even after
 the content is purged. To prove integrity, recompute the chain and compare it with the externally anchored
 head hashes. The identifiers are shared, so a row leads to the trace while it exists.
+
+## Interview questions
+### What is the difference between an execution trace and an audit log?
+- **Different readers:** traces serve engineers debugging "what did the agent do and why"; audit logs serve
+  security, compliance and incident response asking "who did what with whose authority".
+- **Different properties:** traces are rich, sampled and short-lived; audit logs are small, complete,
+  append-only, tamper-evident and long-lived.
+- **Same facts:** both should be projections of one event stream sharing `run_id`, so they never disagree.
+
+### A refund appears in the payments system but there is no audit row. How did that happen, and how do you prevent it?
+- **Likely cause:** the audit record was written only after the tool returned, and the worker crashed
+  mid-call; or the tool reached the payment service outside the runtime.
+- **Prevent the first:** write an `authorized` row before the effect and a `completed` row after, and make
+  the authorized write fail closed for side-effecting tools.
+- **Detect the second:** reconcile the payment system's records against audit rows by target id.
+
+### Why is a plain SHA-256 of the arguments not good enough in an audit row?
+- **Low entropy:** arguments like a customer id and an amount can be enumerated, so a plain hash can be
+  reversed by guessing candidates.
+- **Use a keyed HMAC** with the secret held outside the log; the hash still proves which arguments were
+  used when checked against a candidate.
+- **It is still pseudonymous,** so keep actor and target as internal ids, not names or emails.
+
+### Why not just sample audit records like traces to save cost?
+- **Completeness is the product:** "we dropped that one" is not an acceptable answer in an incident review.
+- **Audit rows are small and fixed-shape,** so keeping all of them is cheap compared with payload-heavy
+  traces.
+- **Save cost on traces instead,** with tail-based sampling that keeps every failed, denied or escalated
+  run.
+
+### Your hash chain verifies cleanly. Does that prove nobody tampered with the log?
+- **Not on its own:** anyone who can rewrite every row can recompute the entire chain.
+- **Anchor the head hash** periodically in storage the writer cannot touch, such as a WORM bucket or a
+  separate account, and verify against it.
+- **Restrict the writer** to insert-only, so editing requires a different, audited credential.
 
 ## Quiz
 ### Q: What most distinguishes an audit log from an execution trace?

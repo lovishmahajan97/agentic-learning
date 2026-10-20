@@ -5,7 +5,7 @@ name: Knowledge graphs
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/graphrag
   - rag-retrieval/multi-hop-retrieval
@@ -23,7 +23,7 @@ sources:
 
 ## TL;DR
 A knowledge graph stores facts as typed entities and typed relationships under a schema. In RAG it
-answers joins, counts and exact constraints that vector search cannot. The hard part is building it:
+complements vector search, answering joins, counts and exact constraints that similarity cannot. The hard part is building it:
 extraction, entity resolution, schema design and sync.
 
 ## Why it exists
@@ -91,11 +91,12 @@ Either way the unit is a fact like `(Service:payments)-[:DEPENDS_ON]->(Database:
   back by deleting its edges.
 
 ## Diagram
-Construction on the left keeps the graph true; retrieval on the right turns a relational question into a
-bounded traversal whose per-hop provenance becomes the citation trail.
+Construction (systems of record and documents through entity resolution, kept current by change feeds)
+keeps the graph true; retrieval turns a relational question into a bounded traversal whose per-hop
+provenance becomes the citation trail.
 
 ```mermaid
-flowchart LR
+flowchart TD
     SR["Systems of record: CMDB, HR, CRM"] -->|"deterministic mapping"| ER["Entity resolution: IDs, names, review"]
     TX["Documents"] -->|"LLM extraction into schema"| ER
     ER --> KG[("Knowledge graph: typed nodes, temporal edges, provenance")]
@@ -164,12 +165,13 @@ driver = GraphDatabase.driver(os.environ["NEO4J_URI"],
                               auth=(os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]))
 
 EXPOSED = """
-MATCH (:CVE {id: $cve})-[:AFFECTS]->(l:Library)
+MATCH (:CVE {id: $cve})-[a:AFFECTS]->(l:Library)
 MATCH p = (s:Service)-[:USES|DEPENDS_ON*1..6]->(l)
+WHERE all(x IN relationships(p) WHERE x.valid_to IS NULL OR x.valid_to > datetime())
 MATCH (c:Customer)-[r:SUBSCRIBES]->(s)
 WHERE r.valid_to IS NULL OR r.valid_to > datetime()
 RETURN DISTINCT c.name AS customer, s.name AS service,
-       [x IN relationships(p) | x.source_doc] AS provenance
+       [a.source_doc] + [x IN relationships(p) | x.source_doc] + [r.source_doc] AS provenance
 LIMIT $limit
 """
 
@@ -274,7 +276,7 @@ types in the extraction schema, and better still, load ownership from the projec
 - **Fix:** put `valid_from` and `valid_to` on the relationship, close the old edge instead of deleting it,
   default queries to currently valid, and alert on entities with more than one current owner.
 
-### Would you use a graph database or Postgres for this?
+### Would you store a dependency and ownership graph in a graph database or in Postgres?
 - **Postgres** when joins are shallow and fixed, such as a three-hop query, or variable length is bounded:
   recursive CTEs with cycle handling cover reporting chains and similar cases without a new system.
 - **A graph database** when deep variable-length traversal is the core workload, such as
