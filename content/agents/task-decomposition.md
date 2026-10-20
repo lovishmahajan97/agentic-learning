@@ -5,6 +5,7 @@ name: Task decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agents/planning
   - agents/multi-agent-patterns
@@ -43,9 +44,11 @@ amount of distinct work in context.
 Decomposition changes the economics. Five vendor-research subtasks run in parallel with small
 contexts; a comparison step reads five structured summaries instead of five raw web dumps; a writing
 step receives a comparison table rather than everything that was ever retrieved. Each piece can be
-checked, cached, retried or handed to a cheaper model. Research on decomposed prompting showed that
-splitting problems into sub-problems the model can solve reliably outperforms asking for the whole
-answer at once, and the same logic carries from arithmetic word problems to multi-hour agent tasks.
+checked, cached, retried or handed to a cheaper model. Least-to-most and decomposed prompting showed
+that splitting problems into sub-problems the model can solve reliably beats asking for the whole answer
+at once on compositional benchmarks (symbolic manipulation, compositional generalisation, math word
+problems). Those papers test short reasoning tasks; applying the same logic to long agent tasks is
+standard engineering practice rather than something they measured.
 
 ## How it works
 ### Three dimensions of a decomposition
@@ -134,7 +137,9 @@ print(final["recommend"]["text"])
 ```
 
 The four research subtasks run in one wave, `compare` runs when all four finish, and `recommend` sees
-only the comparison table, never the raw research.
+only the comparison table, never the raw research. Wave scheduling is the simplest correct executor, but
+a ready node waits for the slowest node of the previous wave; on uneven graphs, start each node as soon
+as its own dependencies finish (one task per node awaiting its parents) to cut wall-clock time.
 
 ## Trade-offs
 - Smaller subtasks improve accuracy and verifiability per piece, but every extra subtask adds a call,

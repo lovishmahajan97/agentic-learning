@@ -5,6 +5,7 @@ name: Pagination, rate limits & API quotas
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - backend-fundamentals/rest-graphql-api-design
   - backend-fundamentals/api-and-sdk-integration
@@ -98,8 +99,9 @@ request carries thousands of tokens. Some providers debit the token budget at ad
 
 Signal clearly: respond `429 Too Many Requests` (RFC 6585) with `Retry-After` in seconds or as an HTTP
 date, and publish remaining budget in headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`,
-`X-RateLimit-Reset` by convention; an IETF draft standardises `RateLimit-*` equivalents) so clients can
-throttle before they hit 429. As a consumer: honour `Retry-After`, back off exponentially with jitter,
+`X-RateLimit-Reset` by convention; an IETF httpapi draft, still evolving, standardises `RateLimit` and
+`RateLimit-Policy` fields, and earlier drafts used `RateLimit-Limit`/`-Remaining`/`-Reset`) so clients
+can throttle before they hit 429. As a consumer: honour `Retry-After`, back off exponentially with jitter,
 cap concurrency with a semaphore, and keep a client-side token bucket sized to the limit you know you
 have so you queue locally instead of burning retries.
 
@@ -158,6 +160,8 @@ class TokenBucket:
         self.rate, self.capacity = rate_per_sec, capacity
         self.tokens, self.last = capacity, time.monotonic()
     async def acquire(self, n: float) -> None:
+        if n > self.capacity:
+            raise ValueError("request larger than bucket capacity would wait forever")
         while True:
             now = time.monotonic()
             self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate); self.last = now
@@ -228,7 +232,8 @@ the burst produces 429s within seconds. The batch is 20 million tokens, so 100 m
 best. Redesign: queue the batch and drain it through a client-side token bucket sized to TPM (counting
 the prompt estimate plus `max_tokens`), bound concurrency, honour `Retry-After` with jittered backoff,
 give each tenant a quota so one customer cannot consume the whole budget, shrink the prompt (retrieval
-instead of whole documents, prefix caching where the provider supports it), and ask for a quota
+instead of whole documents; prompt caching cuts cost and latency, and on some providers cached tokens
+also stop counting against the input-token limit), and ask for a quota
 increase or spread load across regions or providers before launch. If the provider offers an
 asynchronous batch endpoint with separate limits, route offline jobs there. Then watch the 429 rate and
 queue wait time.

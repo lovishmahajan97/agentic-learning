@@ -5,7 +5,7 @@ name: Tokenization (BPE, SentencePiece)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - model-internals/embeddings
   - model-internals/context-window
@@ -32,8 +32,8 @@ behaviours.
 ## Why it exists
 A language model needs a fixed, finite set of symbols: an embedding row for each and a softmax over all
 of them at every step. Three ways to define the symbols were tried, and two fail. Characters or raw bytes
-give a tiny vocabulary (256 for bytes) and nothing is ever unknown, but a sequence becomes four to five
-times longer than in words, which multiplies attention cost and forces the model to spend capacity
+give a tiny vocabulary (256 for bytes) and nothing is ever unknown, but English text becomes roughly
+four times longer than with a subword tokenizer, which multiplies attention cost and forces the model to spend capacity
 learning spelling before it can learn meaning; each token carries very little information. Whole words
 give short, meaningful sequences but an unbounded vocabulary: every typo, URL, identifier, number and new
 coinage is a new word, the embedding table explodes, and anything unseen at inference becomes an
@@ -74,8 +74,10 @@ symbols map to ids. Decoding is concatenation; with byte-level BPE the bytes are
 SentencePiece (Kudo and Richardson) is a library and model format rather than a single algorithm, and it
 differs from GPT-style BPE in how it sees text. It operates on the raw Unicode stream with whitespace
 treated as a normal character (the `▁` symbol, U+2581), so it needs no language-specific pre-tokenizer
-and works unchanged for Chinese, Japanese or Thai, which have no spaces. Decoding is lossless: join the
-pieces and replace `▁` with a space. It applies Unicode normalization (NFKC by default), offers a
+and works unchanged for Chinese, Japanese or Thai, which have no spaces. Decoding is lossless with
+respect to the *normalized* text: join the pieces and replace `▁` with a space. It applies Unicode
+normalization (NFKC-based by default, which folds full-width characters and ligatures, so
+`decode(encode(x))` can differ from `x`), offers a
 `byte_fallback` option so unknown characters decompose into bytes, and ships as one self-contained model
 file, so there is no separate regex to keep in sync. It trains either BPE or the unigram model. Llama 1
 and 2, T5 and Mistral used SentencePiece models; Llama 3 moved to a tiktoken-style byte-level BPE with a
@@ -89,8 +91,9 @@ independent (found with the Viterbi algorithm). Then iteratively remove the toke
 corpus likelihood least until the vocabulary reaches its target size. Because it is probabilistic, it can
 sample alternative segmentations during training as a form of data augmentation (subword
 regularization), and its pieces tend to align more with morphology. WordPiece, used by BERT, is a BPE
-variant that picks merges by likelihood gain rather than raw count and marks word-internal pieces with
-`##`.
+variant that picks merges by likelihood gain rather than raw count (a pair scores high when it occurs
+together more often than its parts' frequencies predict), marks word-internal pieces with `##`, and
+encodes by greedy longest-match from the left rather than by replaying merges.
 
 ### Consequences you will meet
 - **Cost and context are counted in tokens.** English prose runs around four characters or three
@@ -182,6 +185,9 @@ for OpenAI models, `AutoTokenizer.from_pretrained(name)(text).input_ids` for ope
   the symptom is a loss spike in the first steps of fine-tuning.
 - Asking the model for character-level work (letter counts, exact string reversal, regex-like
   validation); the symptom is confident, inconsistent answers that no prompt reliably fixes.
+- Streaming output by decoding each token id on its own; a multi-byte UTF-8 character (accented
+  letters, CJK, emoji) can span two byte-level tokens, so the symptom is `�` replacement characters in
+  streamed text that disappear when the full response is decoded at once. Buffer incomplete bytes.
 - Mismatched chat-template special tokens between training and serving; the symptom is a fine-tuned
   model that ignores its system prompt or never emits a stop token.
 

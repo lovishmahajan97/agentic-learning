@@ -4,8 +4,8 @@ module: reliability
 name: Disaster recovery (RPO / RTO)
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - reliability/business-continuity
   - reliability/high-availability
@@ -63,7 +63,18 @@ Both numbers follow from the mechanism:
   replication: approximately zero, at the cost described in multi-region.
 - RTO is a **sum**: time to detect, time to decide, time to provision or promote, time to restore
   data and replay logs, time to re-point traffic, time to verify. Teams who only measure the restore
-  step are usually off by an hour of detection and decision.
+  step are usually off by an hour of detection and decision. Log replay is the term people forget:
+  point-in-time recovery restores the last base snapshot and then re-applies every logged change since
+  it, so a weekly base backup with continuous logs has a tiny RPO and a long, growing replay time.
+  Base-backup frequency is therefore an RTO lever, while log-shipping frequency is an RPO lever.
+
+For logical disasters (a bad migration, a bug quietly corrupting rows, ransomware that encrypts
+slowly) a third number matters: **time to detect**. You can only restore to a point you still have,
+so backup and log retention must exceed the longest plausible time before anyone notices. Corruption
+found after ten days with seven days of retention is unrecoverable regardless of RPO. And restoring
+to before the bad event discards the good writes made after it, so recovery from logical damage is
+usually a *selective* restore into a side database followed by repairing the affected rows, not a
+wholesale rollback.
 
 ### The four strategies
 Named roughly as the AWS guidance does, in rising cost and falling RPO/RTO:
@@ -83,6 +94,9 @@ Named roughly as the AWS guidance does, in rising cost and falling RPO/RTO:
   second.
 - **Immutable, isolated backups**: object-lock or vault policies, a separate account with separate
   credentials, *because* a disaster that includes a compromised identity must not reach the backup.
+- **Copies separated by medium and place**, often summarised as the 3-2-1 rule: three copies, on two
+  different kinds of storage, one off-site; for cloud systems, read "off-site" as another region *and*
+  another account.
 - **Infrastructure as code** so the DR environment can be created, not hand-built, during the worst
   hour of the year.
 - **Restore drills** on a schedule, timed, with the resulting RTA and RPA recorded. The drill also
@@ -110,7 +124,8 @@ documents in versioned object storage, prompts and configs in git, one fine-tune
 
 Current plan: nightly Postgres snapshot copied cross-region, no index snapshot, adapter stored only on
 the training machine. Worst-case RPO is 24 hours, failing the 15-minute target. Estimated RTO: detect
-and decide 30 min, provision from infrastructure code 20 min, restore 500 GB snapshot roughly 45 min,
+and decide 30 min, provision from infrastructure code 20 min, restore 500 GB snapshot roughly 45 min
+(no logs to replay, which is why the RPO is so bad),
 rebuild the index by re-embedding 2M × 500 = 1 billion tokens, which at provider rate limits in the
 low millions of tokens per minute is on the order of eight hours, then verify 15 min. Total about
 10 hours, failing RTO, and the adapter is unrecoverable.
@@ -119,8 +134,13 @@ Revised plan: enable continuous WAL archiving to the DR region with a one-minute
 (RPO about 1 minute, meets 15), snapshot the vector index to the DR region every six hours (an index
 restore of roughly 20 minutes replaces the eight-hour rebuild; index RPO of 6 h is acceptable because
 documents since then can be incrementally re-embedded in the background), copy the adapter and its
-training manifest to artefact storage in both regions. New RTO estimate: 30 + 20 + 45 + 20 + 15 ≈ 130
-minutes, inside 4 hours, with a quarterly timed drill to replace the estimates with actuals.
+training manifest to artefact storage in both regions. Point-in-time recovery now adds a log-replay
+step: with the nightly base snapshot kept, up to a day of WAL must be re-applied after the restore,
+estimated here at 15 minutes for this write volume (measure it; replay speed depends on write rate,
+not database size). New RTO estimate: 30 detect + 20 provision + 45 restore + 15 replay + 20 index +
+15 verify ≈ 145 minutes, inside 4 hours, with a quarterly timed drill to replace the estimates with
+actuals. Retention is set to 35 days of snapshots and logs because the team's worst past case of
+silent corruption took two weeks to notice.
 
 ## Trade-offs
 - Shorter RPO means more frequent or continuous replication, which costs bandwidth, storage and
@@ -145,6 +165,8 @@ minutes, inside 4 hours, with a quarterly timed drill to replace the estimates w
   key or one wrong Terraform destroy removes both.
 - Measuring RTO as the restore step only, forgetting detection, decision and traffic cut-over; the
   drill shows two hours where the plan said thirty minutes.
+- Retention shorter than the time it takes to notice logical corruption; the symptom is a bug report
+  about bad data whose first bad write is older than the oldest backup.
 
 ## When to use
 Every production system needs a DR plan; the choice is which strategy tier, and that follows from the

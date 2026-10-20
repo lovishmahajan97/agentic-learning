@@ -5,7 +5,7 @@ name: GRPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/rlhf
   - training-adaptation/dpo
@@ -69,8 +69,10 @@ The same Â_i is assigned to every token of response i, because the reward is fo
 and nothing finer-grained is known. This replaces the value model with two numbers per prompt. It is
 cheap, nearly unbiased (the group mean includes the sample's own reward, a small bias that a
 leave-one-out baseline such as RLOO removes), and has the "difficulty-adaptive" property described
-above. Dividing by the standard deviation is a separate choice that up-weights prompts with few
-successes, which is debated (see below). A group with
+above. Dividing by the standard deviation is a separate choice: for a 0/1 reward the group's spread is
+smallest when the pass rate is near 0 or near 1, so the division up-weights prompts the model almost
+always fails or almost always solves relative to ones it solves half the time. Whether that is
+desirable is debated (see below). A group with
 all-equal rewards has zero variance and contributes nothing; implementations add a small epsilon to
 the denominator and often filter such prompts out of the batch.
 
@@ -85,7 +87,18 @@ L_clip  = mean over tokens of  min( ratio_t · Â_i ,  clip(ratio_t, 1−ε, 1+�
 The ratio compares the policy being updated to the one that generated the samples, and the clip
 removes the gradient incentive to move any token's probability ratio beyond about 1±ε in one update. This lets
 the same batch of samples be reused for a few gradient steps without the policy running away from the
-data, which is the whole point of PPO-style methods over plain policy gradient.
+data, which is the whole point of PPO-style methods over plain policy gradient. Note the edge case: if
+each batch of samples is used for exactly one gradient step, π_θ equals π_old at that step, every ratio
+is 1, the clip never binds, and GRPO reduces to REINFORCE with a group-mean baseline (plus the KL
+term). The clip only
+earns its keep when samples are reused.
+
+### Outcome versus process rewards
+The default is *outcome supervision*: one reward per response, spread to all its tokens. DeepSeekMath
+also described *process supervision*, where a process reward model scores each reasoning step and a
+token's advantage is the normalised sum of the step rewards from that point on. Process rewards
+assign credit more precisely, but need a step-level scorer, which is expensive to build and itself
+hackable; most open reasoning recipes since have used outcome rewards from verifiers.
 
 ### The KL term
 Instead of folding the KL penalty into the reward as PPO does, GRPO adds it directly to the loss:
@@ -109,9 +122,13 @@ try alternatives succeed more often on hard problems, so the policy is pushed to
 length tends to grow during training as a result, which is a feature when it buys accuracy and a cost
 when it does not. A known subtlety is that averaging the loss per response over its own length (as in
 the original formulation) interacts with length: wrong long responses are penalised less per token than
-wrong short ones, which can bias the model toward verbosity on failures. Later work proposed removing
-the length and standard-deviation normalisations for this reason; which normalisation you use is a
-real design choice, not a detail.
+wrong short ones, which can bias the model toward verbosity on failures. Dr. GRPO proposed removing
+both the per-response length normalisation and the standard-deviation division for this reason.
+DAPO kept the group baseline but changed several other pieces: a token-level average across the whole
+group, a higher upper clip bound so rare useful tokens can grow, dynamic sampling that drops
+all-correct and all-wrong groups and refills the batch, and a penalty for overlong responses. Which
+normalisation and clipping you use is a real design choice, not a detail, and comparing GRPO runs that
+differ in it is comparing different algorithms.
 
 ## Example
 Group advantages and the GRPO loss for one prompt with eight sampled responses. Rewards come from a
@@ -135,7 +152,8 @@ def grpo_loss(logp_new, logp_old, logp_ref, adv, mask):
     lr = logp_ref - logp_new                                        # log(pi_ref / pi_theta)
     kl = torch.exp(lr) - lr - 1                                     # non-negative per-token estimator
     per_tok = -(surr - beta * kl)
-    return (per_tok * mask).sum() / mask.sum()                      # token-mean over the group
+    return (per_tok * mask).sum() / mask.sum()   # token-mean over the group (DAPO-style); the original
+                                                 # averages per response first, then over responses
 
 T = 12
 logp_old = -torch.rand(G, T) * 3

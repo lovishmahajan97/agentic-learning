@@ -5,6 +5,7 @@ name: REST / GraphQL API design
 kind: decision
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - backend-fundamentals/api-versioning-and-backward-compatibility
   - backend-fundamentals/pagination-rate-limits-api-quotas
@@ -72,11 +73,14 @@ A schema in SDL declares types and fields and three roots: `Query`, `Mutation`, 
 client sends a query naming exactly the fields it wants; the server executes it by calling a resolver
 per field, walking the tree. Because resolvers run per field and per parent object, a list of 100
 conversations each resolving `lastMessage` naively issues 101 database queries; the standard fix is a
-per-request DataLoader that batches and caches lookups. Everything travels as `POST` to one endpoint,
-so HTTP caching does not apply unless you adopt persisted queries over `GET`. Errors are returned
-alongside partial data in an `errors` array with a 200 status, which clients must inspect. Because
+per-request DataLoader that batches and caches lookups. In practice almost everything travels as
+`POST` to one endpoint, so HTTP caching does not apply unless you send queries (typically persisted
+ones) over `GET`. Field errors are returned alongside partial data in an `errors` array, conventionally
+with a 200 status, so clients must inspect the body; the GraphQL-over-HTTP spec lets servers using the
+`application/graphql-response+json` media type answer 4xx when a request fails before execution. Because
 clients author queries, the server must enforce depth and cost limits, *because* an unbounded nested
-query is a denial-of-service vector. Subscriptions stream over WebSockets.
+query is a denial-of-service vector. The spec does not fix a transport for subscriptions; most
+servers use WebSockets (the `graphql-ws` protocol), and SSE is a common alternative.
 
 ### The decision
 Ask who the clients are and how many shapes they need. One product UI with screens assembled from a
@@ -114,6 +118,7 @@ async def create_summary(body: SummarizeRequest, response: Response):
 async def get_summary(job_id: str):
     job = JOBS.get(job_id)
     if job is None:
+        # FastAPI wraps this as {"detail": {...}}; a real service maps errors to RFC 9457 in a handler
         raise HTTPException(status_code=404, detail={"type": "not_found", "job_id": job_id})
     return job                                       # 200 whether queued or done; status is in the body
 
@@ -135,7 +140,8 @@ type Subscription { summaryUpdated(id: ID!): Summary! }
 - REST gets HTTP caching, retry-safety by method and tooling for free, but a screen needing five
   resources costs five round trips; this flips to GraphQL when client-side shape variety dominates.
 - GraphQL gives clients exact shapes and one evolving schema, but you give up HTTP caching, must
-  defend against expensive queries and must batch resolvers; it flips back to REST for public APIs.
+  defend against expensive queries and must batch resolvers; it usually flips back to REST for public
+  APIs, where caching and per-endpoint limits matter (GitHub and Shopify are notable GraphQL exceptions).
 - Returning `202` and a job resource keeps requests short and proxy-friendly, but clients must poll
   or subscribe, which costs more code than one long request when jobs are reliably under a few seconds.
 - A single error envelope and strict status codes make clients simple, but they force you to decide

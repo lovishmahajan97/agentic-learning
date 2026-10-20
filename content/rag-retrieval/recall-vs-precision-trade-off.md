@@ -5,6 +5,7 @@ name: Recall vs precision trade-off
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - ml-fundamentals/precision-recall-f1
   - rag-retrieval/reranking
@@ -39,8 +40,8 @@ language model with a finite context and a known weakness: with many passages, a
 one drops when it sits in the middle of the prompt (the "lost in the middle" result), and passages that
 look similar but conflict (an old version of a policy next to the new one) can steer the answer wrong.
 So precision is not just a cost concern; it affects correctness. At the same time recall is a hard
-floor: a RAG system cannot be more accurate than the fraction of questions whose evidence reached the
-prompt. The naive fix, "just retrieve more and let the model sort it out", therefore converts a recall
+floor: barring answers the model already knows from pretraining, a RAG system cannot be more accurate
+than the fraction of questions whose evidence reached the prompt. The naive fix, "just retrieve more and let the model sort it out", therefore converts a recall
 problem into a precision problem instead of solving either. The way out is to recognise that cheap
 retrievers and expensive rerankers have different cost-per-candidate profiles, and to let each one
 optimise the metric it is good at.
@@ -69,7 +70,8 @@ the generator reads the prompt in order.
 ### Why both numbers hurt a generator
 Recall failure is unrecoverable downstream: no prompt engineering retrieves a passage that is absent.
 Precision failure is partially recoverable, because the model can ignore noise, but only partially. Three
-costs are concrete. Tokens: k chunks of 300 tokens each is 300k tokens of input per call. Position: the
+costs are concrete. Tokens: k chunks of 300 tokens each is 300 × k input tokens per call (15,000 at
+k = 50). Position: the
 relevant passage lands at an arbitrary position among distractors, and position matters. Distractors:
 near-duplicates and stale versions are exactly the items a similarity search ranks highly, so the noise is
 not random noise; it is the most confusable material in the corpus.
@@ -130,7 +132,7 @@ for k in (5, 20, 50):
 print("stage2", 5, evaluate(stage2, 5))
 ```
 
-Illustrative output for the first question: dense top-5 finds `sla-table` and `credit-defs` but not
+Illustrative output for the first question: stage-1 top-5 finds `sla-table` and `credit-defs` but not
 `credit-exclusions`, whose text says "service credits shall not apply" without the word SLA, so
 precision@5 = 0.4 and recall@5 = 0.67. Hybrid top-50 catches all three (recall 1.0) at precision 0.06.
 Reranking those 50 and keeping 5 puts all three in the top-5: recall 1.0, precision 0.6, and the prompt
@@ -141,7 +143,7 @@ recall@50 for stage 1 and precision@5 for stage 2 as separate dashboards.
 - A larger k raises recall but costs tokens, latency and position sensitivity; it stops paying once the
   recall curve has flattened, and it flips to harmful when distractors outnumber evidence.
 - A reranker buys precision at the cost of a forward pass per candidate pair, typically tens to hundreds
-  of milliseconds for 50–100 pairs; it is not worth it when stage 1 is already precise or latency is tight.
+  of milliseconds for 50–100 pairs on a GPU and more on CPU; it is not worth it when stage 1 is already precise or latency is tight.
 - A relevance threshold raises precision and lets the system say "no evidence", but similarity scores are
   not calibrated across queries, so a fixed cut-off that works for one query returns nothing for another.
 - Smaller chunks raise precision per hit and sharpen embeddings, but a multi-part answer then needs several
@@ -198,7 +200,8 @@ in the candidate set.
 - [ ] Vector databases cannot return more than a few results per query
 - [ ] Rerankers improve recall by finding documents the first stage missed
 > A cross-encoder scores each (query, passage) pair with a full forward pass, so it is only affordable on
-> the candidates stage 1 already found; it reorders them for precision and cannot add anything to recall.
+> the candidates stage 1 already found; it reorders them for precision, which can raise recall@5, but it can never lift recall above what the
+> candidate list already had (recall@50 here).
 
 ### Q: Recall@50 is 0.92 but recall@5 is 0.55 on your golden set. Which change addresses the gap most directly?
 - [ ] Switching to smaller chunks

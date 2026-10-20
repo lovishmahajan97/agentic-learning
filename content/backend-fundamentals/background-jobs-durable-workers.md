@@ -5,6 +5,7 @@ name: Background jobs / durable workers
 kind: pattern
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - backend-fundamentals/message-queues
   - backend-fundamentals/redis
@@ -120,8 +121,9 @@ The first two detect a stalled worker fleet; the last two detect a failing depen
 ## Example
 A PostgreSQL-backed worker in Python using psycopg 3. The claim reclaims expired leases, the handler is
 required to be idempotent, retryable failures are rescheduled with jittered backoff, and permanent
-failures go to `dead` without burning attempts. Heartbeating is omitted for brevity; for jobs longer than
-the five-minute lease, extend `lease_until` from a timer thread.
+failures go to `dead` without burning attempts. Every finishing update is guarded by `locked_by`, so a
+worker whose lease expired and was taken over cannot overwrite the new holder's outcome. Heartbeating is
+omitted for brevity; for jobs longer than the five-minute lease, extend `lease_until` from a timer thread.
 
 ```python
 import random, time, uuid, psycopg
@@ -132,9 +134,11 @@ UPDATE jobs SET state='running', locked_by=%s, attempts=attempts+1,
                 lease_until=now() + interval '5 minutes'
 WHERE id = (SELECT id FROM jobs
             WHERE (state='queued' AND run_at <= now())
-               OR (state='running' AND lease_until < now())   -- orphaned by a dead worker
-            ORDER BY run_at FOR UPDATE SKIP LOCKED LIMIT 1)
+               OR (state='running' AND lease_until < now()    -- orphaned by a dead worker
+                   AND attempts < 5)                          -- crash-loopers left for a sweeper
+            ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED)
 RETURNING id, type, payload, attempts"""
+DONE = " WHERE id=%s AND locked_by=%s"     # fence: only the current lease holder may finish
 
 def backoff(attempt):                      # 2, 4, 8 ... s, capped, with jitter
     return min(2 ** attempt, 300) * (0.5 + random.random())
@@ -154,16 +158,16 @@ def run_one(conn):
     job_id, kind, payload, attempts = row
     try:
         HANDLERS[kind](job_id, payload)
-        conn.execute("UPDATE jobs SET state='succeeded', finished_at=now() WHERE id=%s", (job_id,))
+        conn.execute("UPDATE jobs SET state='succeeded', finished_at=now()" + DONE, (job_id, WORKER))
     except RetryableError as e:
         if attempts >= 5:
-            conn.execute("UPDATE jobs SET state='dead', error=%s WHERE id=%s", (str(e), job_id))
+            conn.execute("UPDATE jobs SET state='dead', error=%s" + DONE, (str(e), job_id, WORKER))
         else:
             conn.execute("UPDATE jobs SET state='queued', error=%s, "
-                         "run_at=now() + %s * interval '1 second' WHERE id=%s",
-                         (str(e), backoff(attempts), job_id))
+                         "run_at=now() + %s * interval '1 second'" + DONE,
+                         (str(e), backoff(attempts), job_id, WORKER))
     except Exception as e:                 # permanent: straight to dead, keep it inspectable
-        conn.execute("UPDATE jobs SET state='dead', error=%s WHERE id=%s", (str(e), job_id))
+        conn.execute("UPDATE jobs SET state='dead', error=%s" + DONE, (str(e), job_id, WORKER))
     conn.commit()
     return True
 
@@ -174,12 +178,15 @@ with psycopg.connect(DSN) as conn:
 ```
 
 `load_chunks`, `embed`, `vectors`, `RetryableError` and `DSN` belong to the application. A partial index
-on `(run_at) WHERE state IN ('queued','running')` keeps the claim fast as the table grows.
+on `(run_at) WHERE state IN ('queued','running')` keeps the claim fast as the table grows. The
+`attempts < 5` guard on orphan reclaim matters because a job that kills its worker (an out-of-memory
+crash on one huge document) never reaches the `except` branches; without the guard it is reclaimed
+forever, and a small periodic sweeper should move such rows to `dead`.
 
 ## Trade-offs
 - A job table in the main database gains transactional enqueue and zero new infrastructure, but pays
-  polling and row churn; it flips toward Redis or a broker when throughput reaches thousands of jobs per
-  second or when hundreds of idle workers poll.
+  polling and row churn; it flips toward Redis or a broker when throughput reaches (as an order of
+  magnitude) thousands of jobs per second, or when hundreds of idle workers poll.
 - Redis-backed queues gain blocking pops and millisecond pickup, but lose jobs if persistence is off or
   lagging; acceptable for cache warming, unacceptable for billing or customer-visible work.
 - A long lease simplifies the worker, but delays recovery after a crash; a short lease with heartbeats
@@ -236,7 +243,8 @@ loses or duplicates work, and explain each mechanism's role.
 **A:** Make the job a row inserted in the same transaction as the upload record, so a job exists exactly
 when a document does. Workers claim with an atomic update using `FOR UPDATE SKIP LOCKED` that sets a
 lease; on deploy, workers receive SIGTERM, stop claiming and either finish or let the lease expire, after
-which a new worker reclaims the row, so nothing is lost. Duplication is handled inside the handler: each
+which a new worker reclaims the row, so nothing is lost. Guard every completion update with the lease
+holder's id so a pre-empted worker cannot overwrite the new holder's result. Duplication is handled inside the handler: each
 chunk's vector is upserted by chunk id and skipped if present, so a re-run after an expired lease resumes
 rather than repeats, and the twenty-minute job costs only the unfinished chunks. Heartbeat the lease
 while embedding so a slow but healthy worker is not pre-empted, with a maximum duration as a guard.

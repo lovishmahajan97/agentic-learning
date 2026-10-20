@@ -5,7 +5,7 @@ name: Classification
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/regression
   - ml-fundamentals/loss-functions
@@ -49,12 +49,18 @@ classifier exposes it. Classification formalises the split: estimate P(class | i
 ## How it works
 ### From features to scores
 A linear classifier computes z = Wx + b: one score per class, from a weight vector per class. Logistic
-regression is the binary case with one logit and p = σ(z) = 1/(1 + e^(−z)). For K classes the softmax
+regression is the binary case with one logit and p = σ(z) = 1/(1 + e^(−z)). Inverting the sigmoid shows
+what the logit means: z = log(p / (1 − p)), the log-odds. A weight is therefore "change in log-odds per
+unit of this feature", and the decision boundary p = 0.5 is the hyperplane wᵀx + b = 0, which is why a
+linear classifier can only separate classes that a flat boundary can split. For K classes the softmax
 p_k = exp(z_k) / Σ_j exp(z_j) turns K logits into a distribution that sums to one. A neural network
 replaces the raw features x with learned features and keeps the same final linear layer; in a
 transformer the "LM head" is exactly this, a linear map from the hidden state to vocabulary-sized logits
 followed by softmax. Tree ensembles partition the feature space instead of drawing linear boundaries,
 and k-nearest-neighbours votes among similar training points, but all of them end with a score per class.
+These are *discriminative* models: they estimate P(y | x) directly. *Generative* classifiers such as
+naive Bayes model P(x | y) and P(y) and apply Bayes' rule; they need less data when their independence
+assumptions roughly hold, but usually lose once data is plentiful.
 
 ### The loss
 Training minimises cross-entropy, −log p_y, the negative log probability assigned to the true class. It
@@ -146,7 +152,9 @@ for tau in (0.5, 1 / 11):
 - Vague or overlapping class definitions; the symptom is low inter-annotator agreement and a confusion
   matrix whose errors concentrate between the same two classes, a ceiling no model can break.
 - Training on a rebalanced dataset and deploying on the natural distribution; the symptom is systematic
-  over-prediction of the minority class and miscalibrated probabilities.
+  over-prediction of the minority class and miscalibrated probabilities. If only the class priors
+  changed, add log(π_prod / π_train) to each class's softmax logit (for a single binary logit, the
+  log of the ratio of prior odds) to undo the shift.
 
 ## When to use
 Reach for classification whenever the output is a choice from a fixed set and you can state what each

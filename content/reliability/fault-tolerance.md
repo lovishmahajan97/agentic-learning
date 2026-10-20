@@ -4,8 +4,8 @@ module: reliability
 name: Fault tolerance
 kind: concept
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - reliability/high-availability
   - reliability/circuit-breakers
@@ -60,10 +60,24 @@ difference between a design and a hope.
 You tolerate what you design for. **Crash-stop**: a node dies and stays dead. **Crash-recovery**: it
 comes back with or without its state, so you must handle duplicate work. **Omission and timing**: a
 message or reply is lost or late, which is why every remote call needs a timeout, because "slow" is
-indistinguishable from "dead" from the outside. **Byzantine**: a component returns well-formed but wrong
-output. Classic systems rarely engineer against Byzantine faults, but an LLM returning a confident,
-schema-valid, wrong tool argument is exactly that, which is why output validation and approval gates
-belong in the same toolbox.
+indistinguishable from "dead" from the outside. **Byzantine** (arbitrary): a component returns
+well-formed but wrong output, or different answers to different callers. Classic systems rarely
+engineer against Byzantine faults because masking them is expensive: Byzantine agreement needs
+3f + 1 replicas to tolerate f faulty ones, against 2f + 1 for crash faults. An LLM returning a
+confident, schema-valid, wrong tool argument is not malicious, so strictly it is a value fault, but it
+has the Byzantine property that matters: nothing about the reply looks broken. That is why output
+validation against ground truth and approval gates belong in the same toolbox as retries.
+
+### Masking versus recovery
+There are two ways to stop an error becoming a failure. **Masking** hides it entirely: a replica
+answers instead, or several components vote and the majority wins (N-modular redundancy; for LLMs,
+sampling several answers and taking the consensus is the same idea, and it only helps when the
+samples' errors are independent). **Recovery** lets the error happen and then repairs state, in one of
+two directions. *Backward* recovery returns to a known-good earlier state and redoes the work:
+checkpoint and restart, transaction rollback, replaying a workflow from its history. *Forward*
+recovery moves to a new correct state without undoing: a compensating action (refund the charge,
+retract the email), or a degraded answer. Side effects in the outside world usually cannot be rolled
+back, which is why agent tools that act on real systems need forward recovery designed in.
 
 ### The toolbox, in the order you apply it
 1. **Timeouts**, *because* a hung call holds a thread, a connection and often a GPU slot; nothing else
@@ -132,9 +146,16 @@ def tolerant_complete(primary, fallback, req, *, budget_s=45, attempt_timeout_s=
                 break
             time.sleep(sleep)
     # primary exhausted or budget spent: degrade visibly rather than fail
-    remaining = max(1.0, deadline - time.monotonic())
+    remaining = max(1.0, deadline - time.monotonic())  # floor: may overrun the budget by up to 1 s
     return fallback(req, timeout_s=remaining)          # smaller model, cached answer, or a typed "unavailable"
 ```
+
+Why three attempts and not ten? If transient failures are independent at 5% per call, one attempt
+succeeds 95% of the time, two 99.75%, three 1 − 0.05³ ≈ 99.99%; a fourth adds almost nothing. That
+arithmetic only holds while failures are independent. During a real provider outage they are
+perfectly correlated, every attempt fails, and the loop's only effect is to triple the load on the
+provider and spend the user's budget, which is why the deadline, the breaker around this function and
+the fallback matter more than the attempt count.
 
 In production the `fallback` result should be tagged (a header or a field) so the UI and your metrics
 know the answer came from the degraded path, and the retry count should be exported so you can see a
@@ -152,6 +173,9 @@ to `req` before the first attempt, never inside the loop.
   the right value comes from the latency distribution, and streaming changes what "timeout" should mean.
 - Fallback models keep the product available but change answer quality and behaviour; if customers
   depend on consistency, the fallback must be labelled and measured separately in evals.
+- Masking by voting (several replicas or several sampled LLM answers) hides value faults but multiplies
+  cost and latency by N; it pays only when errors are independent and a wrong answer is expensive, and
+  it buys nothing when every sample shares the same misleading context.
 
 ## Pitfalls
 - Retrying non-idempotent tool calls after a timeout: the first call succeeded, the reply was lost, and
@@ -220,5 +244,5 @@ cases that still slip through, and the duplicate rate becomes a tracked metric.
 - [ ] Omission, because the correct answer was omitted
 - [x] Byzantine, because the component produced well-formed but incorrect output that passes shallow checks
 - [ ] Timing, because the model answered too quickly to have reasoned
-> Byzantine faults are wrong-but-plausible outputs from a component that has not crashed. They are
-> caught by validation against ground truth and by approval gates, not by retries or timeouts.
+> Byzantine (arbitrary) faults are wrong-but-plausible outputs from a component that has not crashed.
+> They are caught by validation against ground truth and by approval gates, not by retries or timeouts.

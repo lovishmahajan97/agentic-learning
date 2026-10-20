@@ -5,7 +5,7 @@ name: Distributed training (data / tensor / pipeline parallelism, FSDP, DeepSpee
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/pre-training
   - training-adaptation/gradient-checkpointing
@@ -96,8 +96,10 @@ links, typically at degree 2–8.
 Assign contiguous groups of layers to stages on different GPUs and split the batch into m micro-batches
 that stream through so stages work concurrently (GPipe). The idle fraction, the bubble, is roughly
 `(p−1)/(m+p−1)` for p stages: four stages with sixteen micro-batches idle about 16% of the time, with
-four micro-batches about 43%. The 1F1B schedule interleaves forward and backward to cap how many
-micro-batches' activations are alive at once. Only stage-boundary activations cross GPUs, once per
+four micro-batches about 43%. The 1F1B schedule interleaves forward and backward so each stage holds
+at most about p micro-batches' activations instead of all m; it does not shrink the bubble by itself.
+The interleaved variant (Megatron) gives each GPU several non-contiguous chunks of layers, which divides
+the bubble by the number of chunks at the price of more stage-to-stage messages. Only stage-boundary activations cross GPUs, once per
 micro-batch, so pipeline parallelism tolerates slower inter-node links. Its costs are the bubble, stage
 imbalance, and the engineering of partitioning a model.
 
@@ -113,7 +115,25 @@ add pipeline parallelism rather than stretching tensor parallelism across the ne
 ### What the frameworks provide
 PyTorch ships DDP, FSDP (and the newer `fully_shard` FSDP2 API), the `torchrun` launcher and the NCCL
 backend. DeepSpeed provides ZeRO stages 1–3, offloading and a pipeline engine behind a JSON config, and
-plugs into the Hugging Face Trainer and Accelerate. Megatron-LM/Megatron-Core implements tensor,
+plugs into the Hugging Face Trainer and Accelerate. A ZeRO-3 run with optimizer offload is a few lines:
+
+```json
+{
+  "bf16": {"enabled": true},
+  "zero_optimization": {
+    "stage": 3,
+    "overlap_comm": true,
+    "offload_optimizer": {"device": "cpu"},
+    "stage3_gather_16bit_weights_on_model_save": true
+  },
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 16
+}
+```
+
+At stage 3, FSDP `FULL_SHARD` and ZeRO-3 shard the same things and communicate the same way, so the
+choice is mostly about the stack: FSDP is native PyTorch and tracks its newest features, DeepSpeed has
+the more mature CPU/NVMe offload and a single config that people already know how to read. Megatron-LM/Megatron-Core implements tensor,
 pipeline and sequence parallelism for pretraining. Accelerate and Axolotl expose FSDP or DeepSpeed as
 configuration so the training script does not change.
 
@@ -154,8 +174,11 @@ for step in range(10):
     loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
     if rank == 0: print(step, round(loss.item(), 4))
 dist.destroy_process_group()
-# Per GPU the sharded bf16 weights are ~14 GB / 8 ≈ 1.75 GB; the all-gather of one decoder block
-# plus its activations is what actually sets peak memory.
+# Per-GPU budget, roughly: Qwen2.5-7B is ~7.6B params. With everything in bf16 (weights, grads,
+# two AdamW moments = 8 bytes/param) that is ~61 GB of state / 8 ranks ≈ 7.6 GB per GPU; with fp32
+# master weights and moments it is the 16-byte budget, ~15 GB per GPU. On top sit one gathered block
+# (~233M params ≈ 0.47 GB in bf16, two with prefetch), checkpointed block inputs and one live block's
+# activations. Note every rank first loads the full 15 GB on CPU: 8 × 15 GB of host RAM.
 ```
 
 ## Trade-offs

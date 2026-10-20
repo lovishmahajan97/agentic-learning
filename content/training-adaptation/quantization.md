@@ -5,7 +5,7 @@ name: Quantization (INT8/INT4, GPTQ, AWQ, GGUF)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/peft
   - training-adaptation/pruning
@@ -40,8 +40,9 @@ bytes of weights divided by memory bandwidth. Halve the bytes and small-batch de
 speed, with no change to the maths. Quantization is a bandwidth optimisation wearing a compression costume.
 
 The naive alternatives both fail. "Train a smaller model instead" loses more quality than quantizing a
-bigger one: across many reported comparisons a 4-bit model with twice the parameters beats a 16-bit model
-of half the size at the same memory footprint. "Just cast to int8 with one scale per tensor" fails because
+bigger one: at a fixed memory budget, a 4-bit model with roughly four times the parameters generally
+beats the 16-bit model that fills the same bytes, which is the core finding of the k-bit inference
+scaling-law work (Dettmers & Zettlemoyer) and the reason 4-bit became the default for local models. "Just cast to int8 with one scale per tensor" fails because
 of outliers: transformers past a few billion parameters develop a handful of activation channels with
 magnitudes tens of times larger than the rest, and one such value sets the scale for the whole tensor, so
 everything else rounds to zero or one level. Every modern method is a strategy for handling that range

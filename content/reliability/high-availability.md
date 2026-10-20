@@ -4,8 +4,8 @@ module: reliability
 name: High availability
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - reliability/fault-tolerance
   - reliability/multi-region-architecture
@@ -66,6 +66,13 @@ failures) compose as `A = 1 − (1 − A₁)(1 − A₂)…`, so two 99% replica
 is wildly optimistic whenever failures are correlated, and they usually are: both replicas run the same
 code, received the same deploy, sit in the same zone, and call the same provider.
 
+A third formula explains where the effort should go. For a single component,
+`A = MTBF / (MTBF + MTTR)`: mean time between failures over the whole cycle including mean time to
+repair. A component that fails once a month (MTBF ≈ 730 h) and takes 45 minutes to recover is about
+99.9% available; cutting recovery to 4.5 minutes makes it about 99.99% without failing any less often.
+That is the arithmetic behind HA's emphasis on fast detection and automatic failover: making failures
+rare is hard and slow, making them short is engineering you control.
+
 ### Removing single points of failure
 - **Stateless service tier.** Run at least two instances behind a load balancer, spread across
   availability zones. Statelessness matters *because* it makes any instance interchangeable; session
@@ -84,7 +91,11 @@ dead node. Checks must test the ability to serve, not just the ability to answer
 whose GPU is wedged will happily return 200 from `/health` while every real request times out. The
 standard split is a cheap *liveness* probe (restart me) and a *readiness* probe that reflects
 dependencies and warm-up (send me traffic). Readiness is what keeps a freshly started model server,
-still loading weights, out of rotation.
+still loading weights, out of rotation. The dependency part needs care: readiness should reflect what
+*this* instance can fix by being removed. If every replica's readiness checks the same shared model
+provider, a provider blip marks the whole fleet unready at once and the load balancer has nowhere to
+send traffic, turning a degraded dependency into a total outage. Shared dependencies belong in
+circuit breakers and fallbacks, not in the probe that removes instances.
 
 ### Failover and its hidden costs
 **Active-passive** keeps a standby that takes over; failover costs detection time plus warm-up, and a
@@ -93,6 +104,15 @@ useful. **Active-active** has every node serving all the time, so a failure mere
 and it doubles as proof that the second node actually works. In both cases in-flight work is lost:
 a streaming generation dies with its node, so clients need retry logic and, for long agent runs,
 durable checkpoints.
+
+### Stateful failover is where HA gets hard
+Stateless replicas are interchangeable; a database primary is not. Promoting a replica raises two
+questions the stateless tier never asks. **What is lost?** An asynchronous replica trails the primary,
+so promotion discards whatever had not yet replicated; a synchronous replica loses nothing but adds a
+round trip to every commit. **Is the old primary really dead?** If it was only slow or partitioned and
+keeps accepting writes after the promotion, you have two primaries (split brain). Managed databases
+solve this with a single arbiter and fencing, which is a large part of what you pay them for; a
+self-built failover script that promotes on a missed heartbeat usually does not.
 
 ### Change as the biggest availability risk
 Because changes cause most outages, HA includes the deployment process: rolling updates that drain
@@ -155,6 +175,9 @@ is exactly where the next engineering dollar should go. If the two providers sha
   gateway, two databases on one deploy pipeline. The symptom is "redundant" components failing together.
 - Health checks that test the process, not the service; the node stays in rotation while every real
   request fails, and the load balancer keeps sending it traffic.
+- The opposite error: readiness probes that include a shared dependency such as the model provider or
+  database, so one dependency hiccup marks every replica unready together and the load balancer
+  returns errors from an empty pool even though your own code was fine.
 - No headroom: N replicas each at 80% load, so losing one overloads the rest and the "failover" is a
   cascading failure. Visible as a second outage minutes after the first node died.
 - Promising an SLA above the provider's: the math makes it impossible, and the symptom is a chronic

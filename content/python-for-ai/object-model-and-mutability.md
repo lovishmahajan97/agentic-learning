@@ -5,6 +5,7 @@ name: Object model and mutability
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/dataclasses
   - python-for-ai/memory-and-performance-profiling
@@ -76,7 +77,8 @@ time, and stored on the function object, which is why a mutable default is share
 A list of lists built with `[[0] * 3] * 3` holds three references to one inner list; changing
 `grid[0][0]` changes every row. Shallow copies (`list(x)`, `x[:]`, `dict.copy()`, `copy.copy`)
 create a new outer container that references the *same* inner objects. `copy.deepcopy` recurses, at
-O(size) cost, and cannot copy things like locks, sockets or SDK clients. Class attributes are shared
+O(size) cost, and fails on objects that cannot be copied or pickled, such as locks and sockets, and
+therefore on most SDK clients that hold them. Class attributes are shared
 by all instances: `class Agent: history = []` is one list for every agent; the per-instance version
 must be created in `__init__`.
 
@@ -134,8 +136,8 @@ def per_tenant_ok(tenant: str) -> dict:
     return cfg
 
 a = [1, 2]; b = a; c = a[:]
-b.append(3)
-print(a is b, a == c, c)                        # True False [1, 2]  (c is a shallow copy)
+b += [3]                                        # list.__iadd__ mutates the shared list in place
+print(a is b, a, c)                             # True [1, 2, 3] [1, 2]  (c is a shallow copy)
 s = "x"; t = s; s += "y"                        # str is immutable: += rebinds s only
 print(t)                                        # x
 grid = [[0] * 2] * 2; grid[0][0] = 9            # both rows are the same inner list
@@ -220,7 +222,7 @@ small structure that actually changes and makes the sharing impossible rather th
 > created and only the assigned name moves. Mutable types implement in-place augmentation and all
 > references observe it.
 
-### Q: After `row = emb[0]; row /= row.sum()` with a NumPy array `emb`, what happened to `emb`?
+### Q: After `row = emb[0]; row /= row.sum()` with a float32 NumPy embedding matrix `emb`, what happened to `emb`?
 - [ ] Nothing; indexing returns an independent copy of the row
 - [x] Its first row was modified, because basic indexing returns a view sharing the same buffer
 - [ ] It was converted to a float array but its values are unchanged

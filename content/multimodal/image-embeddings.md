@@ -5,7 +5,7 @@ name: Image embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - multimodal/clip
   - multimodal/vision-language-models
@@ -54,7 +54,10 @@ common failure:
   fast, but the space is organised around the training label set. Images that share a label cluster;
   distinctions the labels never made (which brand, which colour variant) are weak.
 - **Self-supervised visual encoders** (DINO, DINOv2): trained to make different augmentations of the
-  same image agree, with no text and no labels. They produce strong *visual* similarity, including dense
+  same image agree, with no text and no labels. A student network sees small crops, a teacher (a moving
+  average of the student's weights) sees larger crops of the same image, and the student is trained to
+  match the teacher's output, so the features must encode what survives cropping, colour jitter and
+  scale changes: object identity and shape rather than pixels. They produce strong *visual* similarity, including dense
   per-patch features useful for localisation, but they cannot be queried with text.
 - **Contrastive image-text encoders** (CLIP, SigLIP, OpenCLIP): trained to match images to captions.
   Their image vectors live in a space shared with text vectors, so one index serves both "find images
@@ -86,12 +89,26 @@ different ranges is the modality gap: in contrastive models, all image vectors o
 space and all text vectors another, so cross-modal similarities are systematically lower than
 within-modal ones. Tune separate thresholds per query direction on labelled examples.
 
+### When the off-the-shelf geometry is wrong
+If your notion of "similar" is not what any pretrained objective rewarded (same SKU across colourways,
+same defect type across parts), no threshold will fix it, because the neighbours themselves are wrong.
+The usual escalation is: re-rank top-k candidates with metadata or a VLM; train a small linear or MLP
+adapter on frozen embeddings using labelled positive and negative pairs (cheap, and the base index can
+be re-projected without re-encoding images); or fine-tune the encoder with a contrastive or triplet loss
+on your pairs, which moves the space most but forces a full re-embed and risks forgetting general
+features. Start from the cheapest step and measure recall@k on held-out pairs after each one.
+
 ### Where embeddings go
 Each vector is stored with an identifier and metadata in a vector index; an approximate nearest-neighbour
 structure (HNSW or IVF) makes search sublinear. The same practices as text embeddings apply: record the
 model name and version with every vector, because vectors from two checkpoints are not comparable and a
 model upgrade means a full re-index; keep the preprocessing (resize, crop, colour conversion) identical
 at index and query time, because it is part of the model.
+
+Storage is simple arithmetic: `n_images × dim × bytes_per_value`. Ten million 768-d float32 vectors are
+10⁷ × 768 × 4 ≈ 31 GB before index overhead; float16 halves that, int8 scalar quantisation quarters it,
+and binary or product quantisation shrink it further at a recall cost you measure, typically recovered by
+re-scoring the top candidates with full-precision vectors.
 
 ## Example
 Embed a folder of images with a CLIP checkpoint via sentence-transformers, which accepts PIL images

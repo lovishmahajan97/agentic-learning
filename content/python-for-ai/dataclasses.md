@@ -5,6 +5,7 @@ name: dataclasses
 kind: concept
 difficulty: intro
 est_minutes: 13
+status: fact-checked
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
@@ -70,7 +71,10 @@ name, creates a field. It then synthesizes methods and attaches them to the clas
 ### Defaults and `field()`
 `x: list[str] = []` is rejected with `ValueError: mutable default ... use default_factory`,
 because a class-level default is evaluated once and would be shared by every instance; the module
-checks for this explicitly since the aliasing bug is otherwise silent. `field(default_factory=list)`
+checks for this explicitly since the aliasing bug is otherwise silent. The check is a heuristic,
+not a guarantee: it rejects defaults whose type is unhashable (`list`, `dict`, `set`; before 3.11
+exactly those three), so a mutable but hashable object, such as an instance of an ordinary class,
+passes and is shared. `field(default_factory=list)`
 calls the factory per instance. `field()` also controls participation: `repr=False` hides large
 payloads from logs, `compare=False` excludes a timestamp from equality, `init=False` marks a
 derived field set in `__post_init__`.
@@ -153,11 +157,13 @@ unhashable type`, because a frozen dataclass's hash is built from its fields and
 - `order=True` gives sorting for free, but it compares fields positionally in declaration order,
   which is rarely the ordering you actually mean for a domain object.
 - `asdict` is convenient for logging and serialization, yet it deep-copies the whole tree; for large
-  nested records a hand-written `to_dict` or `vars(obj)` is cheaper.
+  nested records a hand-written `to_dict` (or `vars(obj)`, on non-slotted classes) is cheaper.
 
 ## Pitfalls
-- Using a mutable default via `field(default=[])` or a class attribute on a non-dataclass base; the
-  symptom is one instance's appended notes showing up in every other instance.
+- Assuming the mutable-default check catches everything; `field(default=[])` is rejected like
+  `= []`, but `field(default=RetryPolicy())` (a hashable object of an ordinary class) or an
+  unannotated class attribute on a base class is silently shared, and the symptom is one instance's
+  changes showing up in every other instance.
 - Adding `__eq__` by hand or setting `eq=True` on a mutable class and then using instances as dict
   keys; the symptom is `TypeError: unhashable type` or, with `unsafe_hash`, items vanishing from
   sets after mutation.
@@ -174,7 +180,9 @@ intermediate results, agent steps, cache keys, test fixtures. Prefer `frozen=Tru
 shared across tasks or used as a key, and `slots=True` for anything created in large numbers
 (retrieved chunks, token events). Switch to Pydantic when the data crosses a trust boundary or
 needs a schema, and to `NamedTuple` only when tuple unpacking is genuinely the interface. Measure
-memory with `tracemalloc` when instance counts reach the millions; slots often halve the footprint.
+memory with `tracemalloc` when instance counts reach the millions; slots remove the per-instance
+`__dict__`, which can be a large share of a small record's footprint, though the saving is smaller
+on 3.11+ where instance dicts are stored more compactly, so measure rather than assume.
 Day to day, dataclasses are the default container for anything with more than two fields; in
 interviews, expect to explain `default_factory`, when `__hash__` is generated and why, and the line
 between dataclasses and Pydantic.

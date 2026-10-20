@@ -5,7 +5,7 @@ name: Reference architectures
 kind: pattern
 difficulty: intro
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - system-design/ai-solution-architecture
   - system-design/rag-architecture
@@ -92,8 +92,24 @@ Evaluation harness and golden set, tracing with cost per call, a prompt and mode
 control layer. They are drawn once in each reference so that no team can claim they were optional.
 
 ### How to apply one
-Match the problem to a shape by its interaction pattern (batch, request-response, long-running) and
-its risk class (information versus action). Start from the blueprint, then record each deviation as an
+Match the problem to a shape by asking a short sequence of questions, in this order *because* each one
+removes shapes the later ones would otherwise have to rule out:
+
+1. **Does the system act, or only inform?** Actions (writes to a system of record, money, messages
+   sent) put an approval gate and a validation contract on the path regardless of shape.
+2. **Can the steps be enumerated in advance?** Yes → workflow (shape 4), possibly with extraction or
+   retrieval nodes. No → agent (shape 3), with step budgets.
+3. **Is the input a stream of items or a person waiting?** Items → batch extraction (shape 2) with a
+   review queue. A person → interactive, so a latency budget and streaming.
+4. **Must answers be grounded in a corpus the model has not seen?** Yes → retrieval (shape 1).
+5. **Does state persist across sessions?** Yes → add memory (shape 5).
+6. **Is more than one team or product calling models?** Yes → the platform layer (shape 6) belongs
+   underneath all of them.
+
+Real systems are compositions: most production assistants are a workflow whose nodes include a
+retrieval step and an extraction step, behind the platform layer. Cloud providers and vendors also
+publish reference architectures; they are useful inputs, but they tend to put the vendor's product in
+every box, so extract the shape and keep the component names abstract. Start from the blueprint, then record each deviation as an
 ADR with the reason: "no reranker because the corpus is 400 documents and recall is already above the
 bar" is a fine decision; silence is not. Use the component list as the review checklist and the
 variation points as the agenda for the design discussion. Revisit the catalogue when a system fails in
@@ -108,11 +124,14 @@ have slipped twice this quarter" over the resulting data plus contracts.
 
 Job (a) is shape 2, the extraction pipeline. Components: mail connector → queue → parser for PDF
 attachments → model call with a JSON schema of about ten fields → validation (PO number must exist in
-the ERP, dates must be in the future) → confidence from a second cheap check → anything below the
-threshold goes to a review queue; everything else writes to the ERP with provenance. Default NFRs:
+the ERP, dates must be in the future) → confidence from a second, independent check (for example the
+model's PO number must also match a regex pass over the raw text, and the supplier on the PO must
+match the sender's domain) → anything that fails a check or disagrees goes to a review queue; everything else writes to the ERP with provenance. Default NFRs:
 processing within 15 minutes, zero silent writes of invalid data, cost dominated by attachment pages.
-Variation point taken: start with a general model and collect labels from the review queue, then
-evaluate a small fine-tuned model once a few thousand reviewed examples exist.
+Variation point taken: start with a general model, route *every* item to review for the first weeks,
+and lower the review rate only as the measured precision on reviewed items stays above the bar; the
+review queue is simultaneously the safety net and the labelling pipeline. Evaluate a small fine-tuned
+model once a few thousand reviewed examples exist.
 
 Job (b) is shape 1 plus a structured-data tool, not an agent: the questions are answerable by a
 retrieval step over contracts and a parameterised SQL query over the extracted table, so a two-node
@@ -124,7 +143,8 @@ question-answer pairs for (b).
 
 ## Trade-offs
 - A shared blueprint speeds design and review, but it biases teams toward the known shape; a genuinely
-  new problem may need a new reference, and forcing it into an old one hides the novelty.
+  new problem may need a new reference, and forcing it into an old one hides the novelty. The signal
+  that the catalogue needs a new entry is the same unblessed deviation recurring across teams.
 - Rich references with many mandatory components raise the quality floor, but they also raise the
   cost of a prototype; keep a lighter "exploration" variant and insist on the full shape only at the
   production gate.

@@ -5,6 +5,7 @@ name: Drift
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - llmops-platform/model-monitoring
   - llmops-platform/golden-dataset-strategy
@@ -60,7 +61,7 @@ which factor moved:
   but each question still has the same right answer. A support bot starts receiving shipping
   questions instead of billing questions. The system may still be correct; it may also now be
   operating in a region it was never validated on.
-- **Prior / label shift:** P(Y) changes. The mix of correct outcomes moves. A fraud classifier sees
+- **Prior / label shift:** P(Y) changes while P(X|Y) stays put. The mix of correct outcomes moves. A fraud classifier sees
   fraud go from 1% to 3% of traffic; thresholds tuned for the old base rate are now wrong even if the
   model's scores are unchanged.
 - **Concept drift:** P(Y|X) changes. The same input now has a different correct output. Policy
@@ -133,8 +134,8 @@ new baseline.
 ## Example
 Two detectors on one week of support-assistant traffic: PSI on the intent mix, and a classifier
 two-sample test on input embeddings. The intent shift is real but moderate; the embedding test on a
-synthetic shift shows what a clearly separable week looks like (AUC ≈ 0.88) versus an unshifted one
-(≈ 0.49 on the same code).
+synthetic shift shows what a clearly separable week looks like (AUC ≈ 0.87–0.88) versus an unshifted
+one (≈ 0.5 on the same code, give or take cross-validation noise).
 
 ```python
 import numpy as np
@@ -163,7 +164,8 @@ def embedding_drift_auc(ref_emb, cur_emb):
 rng = np.random.default_rng(0)
 ref_emb = rng.normal(0, 1, (2000, 64))
 cur_emb = rng.normal(0, 1, (2000, 64)); cur_emb[:, :8] += 0.6   # shift along a few directions
-print(f"embedding drift AUC = {embedding_drift_auc(ref_emb, cur_emb):.2f}")   # ~0.88
+print(f"embedding drift AUC = {embedding_drift_auc(ref_emb, cur_emb):.2f}")   # ~0.87-0.88
+# Ceiling for a linear separator: Phi(0.6*sqrt(8)/sqrt(2)) = Phi(1.2) ~ 0.885
 ```
 
 Reading the PSI by hand: the returns bucket contributes (0.33 − 0.20) · ln(1.65) ≈ 0.065, billing
@@ -224,8 +226,9 @@ outcomes, not an answer.
 **Q:** A claims-extraction system's accuracy on its monthly human-reviewed sample fell from 94% to 87%.
 Input-length and field-mix PSIs are below 0.05, and no deploy happened. Walk through how you would find
 the cause and what you would do for each possibility.
-**A:** Stable input statistics rule out the obvious covariate shift, so look at the components and at
-concept drift. Check the model id reported in responses and the bundle hash per request: if the
+**A:** First confirm the drop is real: on a review sample of a few hundred cases, seven points is
+well outside sampling noise, but on fifty it may not be. Stable input statistics then rule out the
+obvious covariate shift, so look at the components and at concept drift. Check the model id reported in responses and the bundle hash per request: if the
 provider alias moved, every tenant's proxies will have stepped at one timestamp, and the fix is to pin
 the previous snapshot, evaluate the new one and canary it. Check the judge or review process: if the
 reviewers' guidelines changed, the "drop" is a measurement change. Then test for concept drift: pull

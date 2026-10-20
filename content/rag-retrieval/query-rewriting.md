@@ -5,6 +5,7 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/hyde
@@ -109,7 +110,13 @@ def rewrite(history, query):
     key = hashlib.sha256((history[-2000:] + "\n" + query).encode()).hexdigest()
     if key not in _cache:
         raw = llm(REWRITE_PROMPT.format(history=history[-2000:], query=query))
-        _cache[key] = json.loads(raw)
+        try:                                       # validate: never trust the format
+            plan = json.loads(raw)
+            qs = [q for q in plan["queries"] if isinstance(q, str)][:3]
+            plan = {"queries": qs, "needs_retrieval": plan["needs_retrieval"] is not False}
+        except (ValueError, KeyError, TypeError):
+            plan = {"queries": [], "needs_retrieval": True}   # fall back to the original query
+        _cache[key] = plan
     return _cache[key]
 
 def rrf(ranked_lists, c=60):

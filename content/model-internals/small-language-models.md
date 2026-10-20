@@ -5,7 +5,7 @@ name: Small language models (SLMs)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - model-internals/scaling-laws
   - model-internals/hallucination
@@ -73,6 +73,12 @@ scale, because reasoning-like composition benefits from more sequential layers.
   answers are nearly right; or the student is trained on teacher-generated outputs (sequence-level
   distillation). Reasoning distillation fine-tunes a small model on long chain-of-thought traces from a
   reasoning model and transfers a surprising share of the capability.
+- **Pruning from a larger model.** Instead of training from scratch, remove whole layers, attention
+  heads or FFN channels from a trained larger model, chosen by an importance score measured on calibration
+  data, then recover quality with a short distillation run against the original. Work such as
+  Sheared-LLaMA and NVIDIA's Minitron used this route because the starting weights already encode much of
+  what the small model must learn, so far fewer training tokens are needed than for a model of the same
+  size trained from random initialisation.
 - **Post-training.** The same supervised fine-tuning and preference tuning as large models, with less
   headroom: a small model follows complex, multi-constraint instructions less reliably.
 

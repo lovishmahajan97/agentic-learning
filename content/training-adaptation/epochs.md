@@ -5,6 +5,7 @@ name: Epochs
 kind: concept
 difficulty: intro
 est_minutes: 11
+status: fact-checked
 related:
   - training-adaptation/learning-rate
   - training-adaptation/overfitting
@@ -78,7 +79,7 @@ steps, and per-epoch evaluation is the only granularity that is not noise.
 ### Why the number matters so much in fine-tuning
 A pretrained model is a strong prior; each pass over a small instruction set moves it further from that
 prior and toward the specifics of those rows. Illustrative arithmetic: 1,000 examples at batch 8 give 125
-steps per epoch; three epochs are 375 steps and a 3% warmup is eleven steps. Common practice for
+steps per epoch; three epochs are 375 steps and a 3% warmup is about eleven steps (frameworks round 11.25 differently). Common practice for
 supervised fine-tuning is a small number of epochs, with the count rising only for tiny sets where each
 epoch is a few steps, but the actual control is total steps × learning rate judged against the
 validation curve, not a magic integer.

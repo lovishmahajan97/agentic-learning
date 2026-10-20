@@ -5,7 +5,7 @@ name: Perplexity
 kind: metric
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/loss-functions
   - model-internals/tokenization
@@ -60,10 +60,20 @@ and read off the probability of the token that actually came next. One forward p
 probabilities, and no sampling is involved, so temperature plays no role unless you deliberately rescale
 the logits.
 
+### Why it has a floor
+Cross-entropy decomposes as `H(P, Q) = H(P) + KL(P ‖ Q)`, where P is the true distribution of the text and
+Q is the model. H(P) is the inherent unpredictability of the text itself, which no model can remove; KL is
+the model's excess surprise. So perplexity can never fall below e^H(P), the gap between two models on the
+same text is a difference in KL, and gains get harder as you approach the floor. This is the same quantity
+as the irreducible term E in scaling-law fits. It also makes perplexity a compression rate: with
+arithmetic coding, a model at 1.0 bits per byte could store the text in about one bit per byte, which is
+why "language modelling is compression" is a literal statement rather than a metaphor.
+
 ### Reading the number
 Perplexity is a geometric mean of inverse probabilities, which means a handful of very surprising tokens
-dominate it. A rare proper noun, a typo or a number the model could not have known contributes far more
-than hundreds of easy function words. That sensitivity is useful when you want to detect distribution shift
+dominate it. Four tokens each predicted at 0.5 give a perplexity of exactly 2; change one of them to 0.01
+and perplexity jumps to about 5.3. A rare proper noun, a typo or a number the model could not have known
+contributes far more than hundreds of easy function words. That sensitivity is useful when you want to detect distribution shift
 and a nuisance when you want to compare two similar models, so always evaluate on enough text that the
 estimate is stable. As an order of magnitude, modern models on clean English prose sit in the single digits
 to low teens depending on tokenizer and domain, code is lower, and random strings are far higher; treat
@@ -103,7 +113,10 @@ with every number.
 4. **Data work.** Filtering documents whose perplexity under a reference model is far outside the normal
    range, flagging anomalous or adversarial prompts, and checking contamination: a suspiciously low
    perplexity on a benchmark's test set suggests the model has seen it.
-5. **Domain fit.** Among candidate base models, the one with the lowest bits per byte on a sample of your
+5. **Likelihood scoring.** Many multiple-choice benchmarks are scored by comparing the (length-normalised)
+   log-probability the model assigns to each answer option given the question, which is perplexity
+   restricted to the answer tokens. Normalisation matters: unnormalised sums favour short options.
+6. **Domain fit.** Among candidate base models, the one with the lowest bits per byte on a sample of your
    corpus is a reasonable first filter before expensive task evals.
 
 ## Example

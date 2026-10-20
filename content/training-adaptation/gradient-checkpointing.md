@@ -5,7 +5,7 @@ name: Gradient checkpointing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/checkpointing
   - training-adaptation/peft
@@ -45,7 +45,9 @@ For a 7B-class model (h = 4096, a = 32, 32 layers) at s = 4096, b = 1: the linea
 FlashAttention removes the s² term by never materialising the score matrix, which leaves ~18 GB, and that
 figure doubles at 8k. A QLoRA run whose weights plus adapter plus optimizer state fit in 6 GB still
 cannot fit on a 24 GB card at 8k context because of activations alone (all figures illustrative, from
-the formula above).
+the formula above). The constant 34 was derived for a GPT-style block with a 4h-wide GELU MLP and dropout;
+a Llama-style SwiGLU MLP or a dropout-free recipe changes it somewhat, so use the formula for orders of
+magnitude, not for a precise budget.
 
 The naive alternatives all fail on this shape of problem. Gradient accumulation shrinks the micro-batch,
 but you are already at b = 1. Shortening the sequence changes the task you are training for. A bigger GPU
@@ -110,10 +112,13 @@ is usually slower than simply recomputing. With FSDP, checkpoint per block *insi
 that recomputation does not trigger extra parameter all-gathers.
 
 ## Example
-A residual MLP stack with and without checkpointing. Weights and gradients are identical in both runs
-(about 6 GB in fp32 for this configuration), so the entire difference in peak memory is activations: the
-checkpointed run keeps only each block's `[tokens, d]` input and rebuilds the `4·d`-wide hidden and GELU
-tensors during backward.
+A residual MLP stack with and without checkpointing. Work the budget out before running it. Each block has
+8·d² ≈ 33.5M parameters at d = 2048, so 24 blocks are ~805M parameters: ~3.2 GB of fp32 weights and, by the
+end of backward, ~3.2 GB of gradients. Without checkpointing, autograd keeps per block the `[4096, 2048]`
+input (for the first Linear's weight gradient), the `[4096, 8192]` pre-GELU tensor (for GELU's derivative)
+and the `[4096, 8192]` GELU output (for the second Linear): 9 × 4096 × 2048 × 4 bytes ≈ 0.3 GB per block,
+~7.2 GB for 24 blocks, all alive at the start of backward. With checkpointing only the 24 block inputs
+survive (~0.8 GB), and one block's 0.3 GB is rebuilt at a time.
 
 ```python
 import torch, torch.nn as nn
@@ -145,8 +150,9 @@ def peak_gb(ckpt, d=2048, n=24, tokens=4096):
 
 for flag in (False, True):
     print(f"checkpointing={flag}: peak {peak_gb(flag):.1f} GB")
-# Expect the checkpointed peak to be roughly half; raise `tokens` and the gap widens, because
-# stored activations grow with tokens while the weight/gradient share stays fixed.
+# Rough expectation: ~10-11 GB without (weights + all activations) vs ~7 GB with (weights +
+# gradients + block inputs + one live block). Double `tokens` and the unchecked peak grows by ~7 GB
+# while the checkpointed one grows by about 1 GB: activations scale with tokens, weights do not.
 # Hugging Face equivalent: model.gradient_checkpointing_enable(
 #     gradient_checkpointing_kwargs={"use_reentrant": False})
 ```

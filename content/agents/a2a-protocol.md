@@ -5,6 +5,7 @@ name: A2A protocol (Agent2Agent)
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -87,9 +88,10 @@ JSON-RPC 2.0, both support SSE streaming, and both lean on OAuth for HTTP securi
 skills transfer.
 
 ## Example
-A minimal client with `httpx`: read the Agent Card, pick a skill, send a message, poll until the task
-reaches a terminal state, and handle `input-required`. Field names follow the 0.2-era JSON-RPC
-binding; check the version in the card before relying on them.
+A minimal client with `httpx`: read the Agent Card, send a message, handle the case where the agent
+answers directly without a task, poll until the task reaches a terminal state, and loop through any
+`input-required` turns. Method and field names follow the 0.2/0.3-era JSON-RPC binding (later
+revisions rename some of them); check `protocolVersion` in the card before relying on them.
 
 ```python
 import httpx, time, uuid
@@ -98,7 +100,7 @@ BASE = "https://billing-agent.example.com"
 TOKEN = "..."                                             # obtained per the card's securitySchemes
 card = httpx.get(f"{BASE}/.well-known/agent-card.json").json()
 print(card["name"], "skills:", [s["id"] for s in card["skills"]])
-assert card["capabilities"].get("streaming") is not None
+can_stream = card.get("capabilities", {}).get("streaming", False)  # if True, prefer message/stream
 
 def rpc(method, params):
     r = httpx.post(card["url"], timeout=30,
@@ -111,21 +113,28 @@ def rpc(method, params):
         raise RuntimeError(body["error"])
     return body["result"]
 
-def user_message(text, task_id=None):
+def user_message(text, task_id=None, context_id=None):
     msg = {"role": "user", "messageId": str(uuid.uuid4()),
            "parts": [{"kind": "text", "text": text}]}
     if task_id:
-        msg["taskId"] = task_id                          # continue the same task
+        msg["taskId"], msg["contextId"] = task_id, context_id  # continue the same task
     return {"message": msg}
 
 task = rpc("message/send", user_message("Refund invoice INV-2291, duplicate charge"))
-while task["status"]["state"] in ("submitted", "working"):
-    time.sleep(2)
-    task = rpc("tasks/get", {"id": task["id"]})
-if task["status"]["state"] == "input-required":
-    question = task["status"]["message"]["parts"][0]["text"]   # e.g. "Which card ending?"
-    task = rpc("message/send", user_message("Card ending 4242", task_id=task["id"]))
-print(task["status"]["state"], [a.get("name") for a in task.get("artifacts", [])])
+if task.get("kind") == "message":                        # answered directly, no task created
+    raise SystemExit(task["parts"][0]["text"])
+while True:
+    state = task["status"]["state"]
+    if state in ("submitted", "working"):
+        time.sleep(2)
+        task = rpc("tasks/get", {"id": task["id"]})
+    elif state == "input-required":
+        question = task["status"]["message"]["parts"][0]["text"]  # e.g. "Which card ending?"
+        answer = input(question + " ")                   # surface it to the human
+        task = rpc("message/send", user_message(answer, task["id"], task["contextId"]))
+    else:                                                # completed, failed, canceled, rejected...
+        break
+print(state, [a.get("name") for a in task.get("artifacts", [])])
 ```
 
 A real client would use `message/stream` to receive status and artifact events incrementally instead

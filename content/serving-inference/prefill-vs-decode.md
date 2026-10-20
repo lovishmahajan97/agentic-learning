@@ -5,7 +5,7 @@ name: Prefill vs decode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - model-internals/kv-cache
   - serving-inference/ttft
@@ -36,8 +36,8 @@ and must be produced sequentially. Same weights, same layers, radically differen
 Why does that matter enough to deserve its own lesson? Because a GPU's efficiency depends almost entirely
 on the shape of the work. A matmul over 2,000 prompt tokens reads each weight once and uses it 2,000
 times; the arithmetic units are saturated. A decode step over one token reads the same weights and uses
-each once; the GPU spends the step waiting on memory. The result is that prefill of a 2,000-token prompt
-can take about as long as a dozen or so decode steps, not 2,000 of them (with the illustrative numbers
+each once; the GPU spends the step waiting on memory. The result is that prefill of a 4,000-token prompt
+takes about as long as a dozen or so decode steps, not 4,000 of them (with the illustrative numbers
 below: ~70 ms of compute-bound prefill against ~5.5 ms per bandwidth-bound step), and that a faster GPU
 helps prefill a lot and decode barely at all.
 
@@ -65,7 +65,10 @@ the GPU must read all weights plus the entire KV cache of the request, and the u
 FLOPs per byte. Step time is therefore approximately `(weight_bytes + cache_bytes) / bandwidth`, and
 TPOT is almost independent of prompt length except through the cache-read term. Batching *B* requests
 reads the weights once for *B* tokens, which is why continuous batching is the throughput lever for decode
-and irrelevant for prefill.
+and irrelevant for prefill. The amortization is only partial, though: every request's KV cache is its own
+and must still be read separately, so the cache term grows linearly with *B* and context length, and at
+large batches of long contexts it, not the weights, sets the step time. That is why decode at scale is
+limited by cache bytes (GQA, cache quantization) as much as by weight bytes.
 
 ### Why they interfere
 Both phases run on the same GPU inside the same iteration. If the scheduler admits a 10k-token prompt
@@ -163,15 +166,19 @@ expectation for any serving question.
 **Q:** A document-summarization service has 15k-token prompts and 300-token outputs. A chat assistant has
 300-token prompts and 1,500-token outputs. Both run on identical GPUs. Which hardware upgrade would help
 each, which scheduling settings differ, and how should the two be billed relative to each other?
-**A:** Summarization is prefill-dominated: 15k tokens of compute-bound matmul per request, so TTFT is the
-pain and more FLOPs per GPU would help directly; prefix caching helps only if documents share prefixes,
-which they usually do not. Chat is decode-dominated: 1,500 bandwidth-bound steps per request, so more
+**A:** Summarization is prefill-dominated: 15k tokens of compute-bound matmul per request (for an 8B
+model, 2 × 8e9 × 15,000 ≈ 240 TFLOPs, a few hundred milliseconds on one GPU), so TTFT is the pain and more
+FLOPs per GPU would help directly; prefix caching helps only if documents share prefixes, which they
+usually do not. Chat is decode-dominated: 1,500 bandwidth-bound steps per request, so more
 bandwidth and more memory for larger batches help, and FLOPs do not. Scheduling: summarization benefits
 from chunked prefill so that its long prompts do not stall other users, and from a higher per-iteration
 token budget; chat wants a large `max_num_seqs`, decode-friendly scheduling and possibly speculative
-decoding. Billing: the chat request occupies the GPU for seconds of decode versus the summarizer's tens
-of milliseconds of prefill, so output tokens must be priced several times higher than input tokens, which
-is exactly what public API price lists do.
+decoding. Billing: compare cost per token, not per request. With the illustrative figures from
+the example, a prefill token costs ~70 ms / 4,000 ≈ 0.02 ms of GPU time, while a decode token costs a share
+of a ~7 ms step, ≈ 0.2 ms even when 32 users share each step: roughly an order of magnitude more. So
+input and output tokens must be metered and priced separately, with output well above input, which is
+the shape of public API price lists. A blended per-token price would undercharge the chat product and
+overcharge the summarizer.
 
 ## Quiz
 ### Q: Why is the decode phase memory-bandwidth-bound while prefill is compute-bound?

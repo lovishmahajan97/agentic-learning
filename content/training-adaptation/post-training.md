@@ -4,8 +4,8 @@ module: training-adaptation
 name: Post-training
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - training-adaptation/pre-training
   - training-adaptation/supervised-fine-tuning
@@ -73,10 +73,26 @@ are mostly shaped.
 For tasks with a checkable answer, such as maths with a known result, code with unit tests, or output
 that must parse as JSON, the reward can be computed by a program rather than learned from humans.
 The model samples many attempts per prompt, is rewarded for the correct ones, and is pushed toward
-whatever reasoning got it there. GRPO is the common algorithm because it needs no value model. This is
-the stage that produces long chain-of-thought reasoning behaviour in recent models, and it is the most
-expensive post-training stage, because generating many long samples per prompt dominates the cost,
+whatever reasoning got it there. GRPO is the common algorithm in open recipes because it needs no value
+model. This is the stage credited with the long chain-of-thought behaviour of reasoning models such as
+DeepSeek-R1, and it is usually the most expensive post-training stage, because generating many long samples per prompt dominates the cost,
 though it remains orders of magnitude below pre-training.
+
+### Where the signal comes from
+Each stage can be fed by three sources, and the mix is the main cost lever:
+- **People.** Demonstrations and comparisons from annotators or domain experts. Highest trust, slowest,
+  and the only source that can define what "good" means for a new domain.
+- **Stronger models.** A larger model writes the SFT responses (distillation through data) or acts as
+  the judge that ranks pairs (RL from AI feedback, LLM-as-a-judge). Cheap and scalable, but the student
+  inherits the teacher's blind spots and the judge's biases, such as preferring longer answers, so a
+  human-labelled slice is kept to calibrate it.
+- **Programs.** Verifiers, schema validators, unit tests. Free per sample and impossible to flatter, but
+  they exist only for checkable tasks and they reward exactly what they check, gaps included.
+
+A common bridge between the stages is *rejection sampling*: sample several responses from the current
+model, keep the ones a reward model, judge or verifier scores highest, and SFT on them. It reuses the
+cheap SFT machinery while still learning from a quality signal, which is why many recipes run it before
+or instead of full RL.
 
 ### The recurring design constraints
 - **A reference model and a KL leash.** Nearly every stage after SFT penalises distance from the previous
@@ -87,7 +103,8 @@ though it remains orders of magnitude below pre-training.
   the policy moves.
 - **Evaluation per stage.** Each stage has its own failure modes (forgetting after SFT, verbosity after
   preference training, reward hacking after RL), so each gets its own gates: capability benchmarks to
-  check nothing was lost, preference win rates, and task-specific checks.
+  check nothing was lost (the loss is often called the *alignment tax*), preference win rates, and
+  task-specific checks.
 - **Safety and policy.** Refusal behaviour, handling of sensitive topics and tool-use permissions are
   trained in with targeted SFT data and preference pairs, then red-teamed, because a model that is
   helpful but unsafe cannot ship.
@@ -134,6 +151,9 @@ is the one that dominates the budget.
 - Training safety and refusals in makes the model safer by default but raises over-refusal on benign
   edge cases; the right balance depends on the deployment's audience and whether external guardrails
   exist.
+- Model-written data and AI judges cut labelling cost dramatically, but cap the student near the
+  teacher's quality; the saving flips into a liability when the domain is one the teacher handles
+  poorly, which only a human-labelled audit slice will reveal.
 
 ## Pitfalls
 - Running preference training on a model that has not been SFT'd into the target format; the symptom
@@ -146,6 +166,9 @@ is the one that dominates the budget.
   number.
 - Optimising a reward that is easy to compute rather than the one that matters; the symptom is
   outputs that satisfy the schema or the judge yet are useless to the person reading them.
+- Shipping a refusal policy measured only on harmful prompts; the symptom is a model that passes the
+  safety set yet declines ordinary requests that merely mention a sensitive word, so track the refusal
+  rate on a benign borderline set alongside it.
 
 ## When to use
 You post-train when prompting and retrieval cannot give you the behaviour: a consistent house format
@@ -153,8 +176,11 @@ that must hold on every response, a refusal or escalation policy that must be re
 that prompting keeps drifting from, or a multi-step skill that needs reward-driven practice. Start with
 SFT because it is cheap and diagnostic; add preference optimisation when the failure is "fluent but
 worse than it should be"; add verifiable-reward RL only when you can write a trustworthy reward
-function. Measure before and after every stage with both task metrics and a general capability
-suite. In interviews, be ready to name the three stages, say what signal each consumes, and explain why
+function. Measure before and after every stage: format or schema compliance rate, win rate against the
+previous checkpoint on held-out prompts, refusal rate on both harmful and benign borderline sets, mean
+response length, and the delta on a general capability suite. A stage that wins on its own metric but
+moves the capability suite down is not a win. If an existing instruct model plus prompting already
+passes these gates, post-training it yourself is a maintenance liability, not an asset. In interviews, be ready to name the three stages, say what signal each consumes, and explain why
 the ordering is not arbitrary.
 
 ## Role lens

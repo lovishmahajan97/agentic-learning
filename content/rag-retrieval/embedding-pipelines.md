@@ -5,6 +5,7 @@ name: Embedding pipelines
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/embedding-models
@@ -65,9 +66,14 @@ incident: "search got worse and nobody changed anything".
 
 ### Idempotency through content-addressed ids
 The central trick is `chunk_id = hash(model_version, doc_id, chunk_index, chunk_text)`. Re-running the
-pipeline on an unchanged document finds every id already present and embeds nothing. An edited paragraph
-changes the text of one or two chunks, so only those get new ids and new embeddings; the old ids become
-stale and are deleted. Because the model version is part of the hash, a model upgrade naturally produces
+pipeline on an unchanged document finds every id already present and embeds nothing. An edit that
+changes the text of one or two chunks without changing how many chunks precede them gives only those
+chunks new ids and new embeddings; the old ids become stale and are deleted. Because `chunk_index` is in
+the hash, an edit that inserts or removes a chunk shifts the index of every later chunk and re-embeds
+all of them. If such edits are common, keep an embedding cache keyed by `hash(model_version,
+chunk_text)` so moved-but-unchanged text is not sent to the model again, or drop the index from the id
+and store it as a field (then disambiguate identical chunks within one document, such as repeated
+boilerplate). Because the model version is part of the hash, a model upgrade naturally produces
 a complete new set of ids, which makes the migration a normal run rather than a special case. LangChain's
 indexing API and LlamaIndex's ingestion pipeline implement this same idea with a record manager or
 docstore that maps document ids to content hashes.
@@ -83,8 +89,9 @@ it side by side, flip the query service, drop the old one; it doubles storage du
 clean and reversible. In place: store `model` on every record and filter on it at query time while the
 backfill runs; cheaper but easy to get wrong. Estimate the backfill before choosing: chunks × average
 tokens gives total tokens, and as an illustrative order of magnitude a million 300-token chunks is 300
-million tokens, which at typical hosted embedding prices costs tens of dollars; the real constraint is
-usually the API rate limit, which turns that into hours, or GPU throughput for a self-hosted model.
+million tokens, which at hosted embedding prices of cents per million tokens (vendor- and
+time-dependent) costs on the order of dollars to tens of dollars; the real constraint is usually the
+API rate limit, which turns that into hours, or GPU throughput for a self-hosted model.
 
 ### Batch versus streaming
 A nightly batch is enough for slowly changing corpora. When users notice staleness, run the same
@@ -94,7 +101,8 @@ both modes is what keeps the two paths identical.
 ### Query-time parity
 Put the embedding call, prefix logic and normalization in one module imported by both the indexer and the
 query service. Add a "golden vector" test: embed a fixed sentence and compare against a stored vector
-with a tight tolerance, so a silent model change behind a hosted endpoint or a dependency bump fails CI
+with a tolerance that is tight but allows the tiny run-to-run noise some hosted endpoints show (compare
+cosine to the stored vector rather than requiring exact equality), so a silent model change behind a hosted endpoint or a dependency bump fails CI
 instead of degrading production.
 
 ## Example
@@ -104,10 +112,10 @@ changed chunks are embedded, stale chunks are removed after the new ones are liv
 is part of every id.
 
 ```python
-import hashlib, time
+import hashlib, random, time
 from itertools import islice
 
-MODEL = "text-embedding-3-small@2024-01"      # pinned; part of every chunk's identity
+MODEL = "text-embedding-3-small/v1"           # our own pinned label; part of every chunk's identity
 class RateLimited(Exception): ...             # raised by embed_fn on HTTP 429
 
 def chunk_id(doc_id, idx, text):
@@ -123,7 +131,7 @@ def embed_with_retry(embed_fn, texts, tries=5):
         try:
             return embed_fn(texts)                # returns unit-norm vectors, prefix already applied
         except RateLimited:
-            time.sleep(min(2 ** attempt, 30))     # exponential backoff, capped
+            time.sleep(min(2 ** attempt, 30) * random.uniform(0.5, 1.0))  # capped backoff + jitter
     raise RuntimeError("embedding failed after retries")
 
 def index_document(doc_id, chunks, store, embed_fn, batch_size=64):
@@ -156,7 +164,8 @@ def index_document(doc_id, chunks, store, embed_fn, batch_size=64):
 
 ## Pitfalls
 - Non-deterministic chunking, for example a splitter whose boundaries depend on library version or on
-  randomness; symptom: every run re-embeds everything and the index grows with no new documents.
+  randomness; symptom: every run re-embeds everything, so the cost of a re-run on an unchanged corpus
+  never drops toward zero (and, if reconciliation fails, the index grows with no new documents).
 - The query service embeds with a different model, version or prefix than the indexer; symptom: recall
   collapses after a deploy that "only touched the API".
 - Deletions never propagated to the index; symptom: answers cite documents that were removed weeks ago.

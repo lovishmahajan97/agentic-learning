@@ -5,6 +5,7 @@ name: AbortController & cancellation
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
   - node-ts-for-ai/streams-and-backpressure
@@ -21,7 +22,8 @@ sources:
 Promises cannot be cancelled, so JavaScript cancels cooperatively: an `AbortController` owns an
 `AbortSignal`, the signal is passed down to every operation that should stop together, and calling
 `abort()` makes `fetch`, timers, streams and your own code reject with an `AbortError`. In AI services
-this is what stops a model from generating billed tokens after the user closed the tab, and what
+this is how you stop paying for generation after the user closed the tab (to the extent the provider
+stops on disconnect), and what
 turns a 30-second timeout into a real stop rather than a promise you merely stopped waiting for.
 
 ## Why it exists
@@ -51,17 +53,19 @@ The split is deliberate: the controller stays with the owner who may cancel, whi
 can only be observed, is handed to everyone else. A callee cannot abort its caller's work by accident.
 
 ### How built-in APIs consume it
-- `fetch(url, { signal })` rejects with the reason and destroys the socket; with a streaming body,
-  reading from `response.body` also rejects. The TCP close tells the provider to stop generating.
+- `fetch(url, { signal })` rejects with `signal.reason` and closes the connection; with a streaming
+  body, reading from `response.body` also rejects. The closed connection is how the provider learns to
+  stop; most stop generating on disconnect, but confirm for yours.
 - `setTimeout` from `node:timers/promises` takes `{ signal }` and rejects early when aborted.
 - `events.once(emitter, 'name', { signal })` stops waiting.
 - Streams: `stream.addAbortSignal(signal, stream)` and `pipeline(..., { signal })` destroy the chain.
 - Child processes, `fs` promises, `readline` and most newer APIs accept a signal.
-- Provider SDKs (OpenAI, Anthropic, the Vercel AI SDK) pass a `signal` option through to the request.
+- Provider SDKs accept a signal and pass it to the request: the OpenAI and Anthropic Node SDKs take a
+  `signal` request option, the Vercel AI SDK calls it `abortSignal`.
 
 ### Composing signals
 `AbortSignal.timeout(ms)` returns a signal that aborts with a `TimeoutError` after the delay.
-`AbortSignal.any([a, b])` (available in current Node releases) returns a signal that aborts when any
+`AbortSignal.any([a, b])` (Node 20.3 and later) returns a signal that aborts when any
 input aborts, carrying that input's reason. Together they express the common case in one line: "stop
 when the client disconnects *or* after 30 s *or* when the parent agent step is cancelled". Before
 `any` existed the same was done by hand with listeners that forward one abort to another controller.
@@ -79,7 +83,9 @@ Three idioms cover nearly everything:
 
 ### Distinguishing abort from failure
 An abort surfaces as a rejection whose `name` is `'AbortError'` (or `'TimeoutError'` for the timeout
-signal), and `signal.reason` tells you *why*. This matters for the retry layer: a provider 503 should
+signal), and `signal.reason` tells you *why*. That holds only if you abort with the default reason or
+an `AbortError`-named `DOMException`: `fetch` and streams reject with whatever reason you pass, so
+`abort(new Error("bye"))` produces a rejection named plain `Error`. This matters for the retry layer: a provider 503 should
 be retried, a client disconnect must not be, and a timeout may be retried against a different provider.
 Code that treats every rejection as a failure will retry cancelled calls and bill tokens for a user
 who already left. Check `signal.aborted` (or `error.name`) before classifying.
@@ -103,7 +109,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 function requestSignal(req: IncomingMessage, res: ServerResponse, timeoutMs: number) {
   const client = new AbortController();
-  res.once("close", () => client.abort(new Error("client disconnected")));
+  // fetch rejects with this exact reason, so keep its name "AbortError" (not a plain Error)
+  res.once("close", () => client.abort(new DOMException("client disconnected", "AbortError")));
   return AbortSignal.any([client.signal, AbortSignal.timeout(timeoutMs)]);
 }
 
@@ -111,18 +118,20 @@ async function streamModel(prompt: string, signal: AbortSignal, onToken: (t: str
   const res = await fetch("https://provider.example/v1/stream", {
     method: "POST", body: JSON.stringify({ prompt, stream: true }), signal,
   });
-  for await (const chunk of res.body!) {          // rejects with AbortError when the signal fires
+  const dec = new TextDecoder();                  // stream: true keeps split UTF-8 characters intact
+  for await (const chunk of res.body!) {          // rejects with signal.reason when the signal fires
     signal.throwIfAborted();                       // also stop between chunks if parsing is slow
-    onToken(Buffer.from(chunk).toString("utf8"));
+    onToken(dec.decode(chunk, { stream: true }));
   }
 }
 
 async function withResource<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
   const conn = { release() { console.log("released"); } };
-  const onAbort = () => conn.release();
-  signal.addEventListener("abort", onAbort, { once: true });
+  let released = false;                          // abort and finally both fire on cancellation
+  const release = () => { if (!released) { released = true; conn.release(); } };
+  signal.addEventListener("abort", release, { once: true });
   try { return await fn(); }
-  finally { signal.removeEventListener("abort", onAbort); conn.release(); }
+  finally { signal.removeEventListener("abort", release); release(); }
 }
 
 export async function handler(req: IncomingMessage, res: ServerResponse) {
@@ -133,7 +142,10 @@ export async function handler(req: IncomingMessage, res: ServerResponse) {
   } catch (e: unknown) {
     const name = (e as { name?: string }).name;
     if (name === "AbortError") return;                       // user left: no retry, no error log
-    if (name === "TimeoutError") { res.statusCode = 504; return res.end("provider timeout"); }
+    if (name === "TimeoutError") {                          // headers may be sent once tokens flowed
+      if (!res.headersSent) res.statusCode = 504;
+      return res.end("\n[provider timeout]");
+    }
     throw e;                                                 // genuine failure: let the error layer classify it
   }
 }
@@ -144,9 +156,9 @@ void sleep;                                                  // sleep(ms, undefi
 - Cooperative cancellation is safe (cleanup runs where resources live) but only as good as the weakest
   link: one function that ignores the signal keeps the work alive, so coverage is a discipline, not a
   feature.
-- Aborting a model stream stops billing from that moment, but tokens already generated are paid for,
-  and some providers bill a minimum; cancelling very early buys the most and very late buys almost
-  nothing.
+- Aborting a model stream stops further output tokens on providers that cancel on disconnect, but the
+  full prompt and every token already generated are still billed; cancelling very early saves the most
+  output spend and very late saves almost nothing.
 - Aborting mid-tool-call can leave external state half-done (an email sent, a row inserted); for
   side-effecting tools prefer to cancel *before* the call or make the tool idempotent rather than
   cutting it off.

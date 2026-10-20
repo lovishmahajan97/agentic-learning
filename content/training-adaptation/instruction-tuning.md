@@ -5,7 +5,7 @@ name: Instruction tuning
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/post-training
@@ -61,11 +61,17 @@ because the model must not key on the exact wording; it has to learn the intent.
 Experiments across the FLAN line found that adding more *tasks* improves held-out performance more
 than adding more examples of the same tasks, and that gains saturate quickly per task. The mechanism
 is that each task teaches the model one more point in "instruction space", and generalisation is
-interpolation between those points. As a rule of thumb from those ablations, a mixture of hundreds of tasks
-capped at a few thousand examples each generalises better than a handful of tasks with a hundred
-thousand each. The same logic says that mixtures should be *balanced*:
-sample tasks roughly in proportion to their size but cap the large ones, so a giant dataset does not
+interpolation between those points. The direction of those ablations is consistent: past a modest
+number of examples per task, a new task is worth more than more rows of an old one. The same logic says
+that mixtures should be *balanced*: sample tasks roughly in proportion to their size but cap the large
+ones (examples-proportional mixing with a cap, as the FLAN work did), so a giant dataset does not
 dominate the gradient.
+
+### Mixing prompt formats, not just tasks
+The same task can be presented zero-shot (instruction only), few-shot (instruction plus worked
+examples) or with a chain-of-thought answer. Later FLAN work found that training on a mix of these
+formats improved results in both zero-shot and few-shot use compared with training on a single format. The reason is the same as for templates: the model should learn the intent, not one
+surface layout of the prompt.
 
 ### Where the instructions come from
 - **Converted benchmarks.** Public NLP datasets re-templated; cheap, broad, but academic in style.
@@ -137,6 +143,12 @@ for ex in data[:3]:
 # (instruction masked, output supervised). Hold out whole tasks, not rows, to measure generalisation.
 ```
 
+Why the cap matters, in numbers: suppose the real mixture has three tasks with 500,000, 20,000 and
+2,000 examples. Sampling in proportion to size gives them about 96%, 4% and 0.4% of the gradient, so the
+model is effectively single-task. Capping each at 10,000 before mixing gives 10,000 / 10,000 / 2,000,
+or about 45%, 45% and 9%; the large task loses examples it did not need, and the small one becomes
+visible. The cap is a knob you tune by watching per-task held-out scores, not a constant.
+
 Holding out entire tasks is the evaluation that matters: if the model handles a task family it never
 saw in training, the instruction-following skill transferred; if it only handles seen tasks, you have a
 multi-task model, not an instruction-following one.
@@ -154,6 +166,8 @@ multi-task model, not an instruction-following one.
 ## Pitfalls
 - Using one template per task; the symptom is a model that follows training phrasings exactly and
   fails when a user words the same request differently.
+- Training only on zero-shot prompts; the symptom is a model that gets confused or copies the format of
+  the examples when a user pastes a few demonstrations into the prompt.
 - Letting one huge dataset dominate the mixture; the symptom is a model that is excellent at that task
   and has quietly regressed on everything else, visible only if you evaluate per task family.
 - Evaluating on held-out rows of seen tasks and calling it generalisation; the number looks great and

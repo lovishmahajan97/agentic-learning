@@ -5,7 +5,7 @@ name: Speculative decoding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - model-internals/kv-cache
   - model-internals/sampling-strategies
@@ -66,7 +66,18 @@ The accept rule is a form of rejection sampling. Where the draft puts too little
 (`q < p`), it is always accepted when drafted and the shortfall is made up by the residual on
 rejections; where the draft puts too much (`q > p`), it is accepted only a fraction `p/q` of the time.
 Summed over cases, the probability of emitting each token equals `p(x)` exactly, which is what makes the
-method lossless rather than an approximation. Under greedy decoding the rule collapses to "accept while
+method lossless rather than an approximation. The one-line proof: the chance a drafted token is accepted
+is `α = Σ_x q(x)·min(1, p(x)/q(x)) = Σ_x min(p(x), q(x))`, and the residual's normalizer is
+`Σ_x max(0, p(x) − q(x)) = 1 − α`, the rejection probability. So
+
+```
+P(emit x) = q(x)·min(1, p(x)/q(x)) + (1 − α) · max(0, p(x) − q(x)) / (1 − α)
+          = min(p(x), q(x)) + max(0, p(x) − q(x)) = p(x)
+```
+
+The same algebra tells you what acceptance rate to expect: `α = Σ min(p, q) = 1 − TV(p, q)`, one minus
+the total-variation distance between the two distributions. Acceptance is a direct measure of how much
+the drafter's distribution overlaps the target's, not of whether its single top guess is right. Under greedy decoding the rule collapses to "accept while
 the draft matches the target's argmax", which is the easiest version to reason about.
 
 ### What the speedup depends on
@@ -74,8 +85,15 @@ Let α be the probability a draft token is accepted (a measure of draft–target
 position as an independent trial, the expected number of tokens produced per target pass is
 `(1 − α^(γ+1)) / (1 − α)`. With α = 0.8 and γ = 5 that is
 about 3.7 tokens per pass; with α = 0.5 it is about 2. The wall-clock gain is that figure divided by the
-relative cost of the cycle (γ draft steps plus one slightly longer target pass), so the draft must be
-much cheaper than the target *and* agree with it often. Agreement is highest on predictable text, such
+relative cost of the cycle (γ draft steps plus one slightly longer target pass). Writing *c* for the
+cost of one draft step relative to one target pass, and treating verification as one target pass:
+
+```
+speedup ≈ (1 − α^(γ+1)) / ((1 − α) · (γ·c + 1))
+```
+
+So the draft must be much cheaper than the target *and* agree with it often; either alone is not
+enough. Agreement is highest on predictable text, such
 as code, boilerplate, structured output and anything that copies from the prompt, and lowest on creative
 text at high temperature. Increasing γ raises the ceiling but lowers the average acceptance of later
 positions, and past a point the extra verification compute costs more than it saves.
@@ -88,7 +106,9 @@ positions, and past a point the extra verification compute costs more than it sa
   edits that reproduce input, weak elsewhere.
 - **Extra heads on the target** (Medusa): small heads attached to the last hidden state predict tokens
   at offsets +2, +3, ..., so drafting costs one target pass's worth of extra heads rather than a second
-  model. Candidates are verified as a tree in one pass.
+  model. Candidates are verified as a tree in one pass. Note that Medusa also offers a relaxed "typical
+  acceptance" rule that trades exactness for higher acceptance; only the rejection-sampling rule above is
+  lossless, so check which mode a deployment uses before claiming identical outputs.
 - **A feature-level draft head** (EAGLE): a light autoregressive module that predicts the next hidden
   state rather than the next token, reusing the target's own representations for higher acceptance.
 
@@ -140,7 +160,9 @@ lengths = []
 for _ in range(2000):
     toks = torch.multinomial(draft, gamma, replacement=True, generator=g)
     lengths.append(len(speculative_step(target.expand(gamma + 1, V), draft.expand(gamma, V), toks, g)))
-print("mean tokens per target pass:", sum(lengths) / len(lengths))   # between 1 and gamma+1
+alpha = torch.minimum(target, draft).sum().item()                   # = 1 - TV(target, draft)
+print(f"alpha={alpha:.2f} predicted={(1 - alpha**(gamma + 1)) / (1 - alpha):.2f}",
+      "measured:", sum(lengths) / len(lengths))   # agree within sampling noise on this i.i.d. toy
 # A stationary toy: real positions have different distributions, but the accept/reject logic is identical.
 ```
 

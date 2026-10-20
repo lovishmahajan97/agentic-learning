@@ -5,7 +5,7 @@ name: Model portfolio
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - system-design/model-selection
   - system-design/model-routing-cascading
@@ -73,6 +73,29 @@ tokens per request type), quota and rate limits, owner, announced deprecation da
 fallback. The record is what turns "we use several models" into something an auditor, a finance team
 and an on-call engineer can each read.
 
+### Sizing the set: when a tier earns its place
+The fixed-versus-marginal argument becomes a rule you can compute. Moving a task family from model A
+to a cheaper model B is worth a new portfolio entry when
+
+```
+requests per month × (cost per request on A − cost per request on B)
+  − added errors per month × cost per error   >   fixed monthly cost of running B as an entry
+```
+
+where the fixed cost is the eval runs, the security and contract review amortised, prompt maintenance,
+monitoring and on-call attention. The rule explains both failure modes at once: a small, high-volume
+task family clears it easily (the classification move in the example below saves about 2,300 units a
+day), while a ninth model added for one team's low-volume task does not, even if it is slightly better.
+It also says *when* to re-run the question: when volume grows, when prices shift, or when an incumbent
+gets cheaper.
+
+### Assignment versus routing
+Most tasks are **assigned** statically: the configuration says this task family uses `workhorse`, and
+it is changed only after an eval. **Routing** chooses a tier per request at run time (by difficulty,
+confidence or input length) and needs its own evaluation of the router. Start with assignment *because*
+it is cheap and auditable; add routing only for families where tracing shows a clear mix of easy and
+hard requests, which is exactly what the agentic slice in the example turns out to be.
+
 ### Entry and exit rules
 A model enters only if it beats an incumbent on a shared eval for some task family, or unlocks a
 constraint the set cannot meet (a new modality, a cheaper tier, a residency requirement). This rule
@@ -117,8 +140,9 @@ traffic but the step-level routing inside the smallest slice, and prefix caching
 context would cut it further.
 
 ## Trade-offs
-- Tiering cuts spend, but every tier adds evaluation, prompt and monitoring overhead; below a certain
-  traffic volume a two-model portfolio, one strong and one small, is the right size.
+- Tiering cuts spend, but every tier adds evaluation, prompt and monitoring overhead; once a tier's
+  monthly saving falls below that fixed overhead (the sizing rule above), a two-model portfolio, one
+  strong and one small, is the right size.
 - A central approved list gives governance and purchasing leverage but slows experimentation; the
   usual fix is a sandbox tier for unregistered models on non-sensitive data, with registration
   required before anything reaches production.

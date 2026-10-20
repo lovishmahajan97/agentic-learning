@@ -4,8 +4,8 @@ module: reliability
 name: Business continuity
 kind: practice
 difficulty: core
-est_minutes: 12
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - reliability/disaster-recovery
   - reliability/fmea
@@ -60,6 +60,12 @@ trust. RPO and RTO for each supporting system are *derived* from this, which is 
 honestly often shrinks the list of things that need expensive recovery: most functions can wait a
 day, and a few cannot wait ten minutes.
 
+The derivation has one subtlety. Restoring the system is not the same as restoring the function: after
+the system is back, people still have to clear the backlog, re-enter work done by hand and verify the
+results. So the system RTO must leave room inside the tolerable downtime:
+`RTO + time to catch up and verify ≤ maximum tolerable downtime`. A function that can tolerate four
+hours and needs two hours of catch-up after any outage gets an RTO of two hours, not four.
+
 ### Threat and dependency mapping
 For each critical function, list how it can be disrupted and through which dependency: infrastructure
 (region, network), suppliers (model provider, vector database SaaS, identity provider), data
@@ -79,6 +85,14 @@ Each critical function gets a sequence of fallbacks, cheapest and most automatic
    tooling, *because* the business function matters more than the automation that normally does it.
 4. **Suspension with communication**: the function pauses, customers and regulators are told what and
    when, and the backlog plan is known.
+
+### The three phases of an event
+A disruption runs through **response** (detect, contain, decide to activate, communicate), then
+**continuity** (operate on the chosen rung of the ladder for as long as needed) and then **recovery**
+(restore the primary path, work off the backlog, reconcile what was done manually or by the fallback
+back into the systems of record, and stand down). Plans are usually detailed about the first phase and
+vague about the last, yet the last is where data gets lost: tickets triaged on a spreadsheet that were
+never entered, or fallback-model answers that nobody re-checked.
 
 ### Plans, roles and communication
 The business continuity plan documents activation criteria (who may declare an event and on what
@@ -119,7 +133,10 @@ service degrades to keyword rules that route to a general queue with a banner te
 is degraded; at T+30 minutes, if the backlog exceeds 150 tickets, the support lead activates the manual
 procedure in which two agents triage from a shared view, which the BIA shows can sustain roughly half
 of peak volume, so the backlog grows at about 150 tickets per hour and enterprise tickets are pulled
-first to protect the four-hour SLA. Communication: the status page updates at T+15 minutes, enterprise
+first to protect the four-hour SLA. The catch-up arithmetic is why the RTO is one hour against a
+two-hour tolerable downtime: an hour at peak on the manual rung leaves roughly 150 untriaged tickets,
+and the restored service needs time to work them off and to have the manually routed tickets checked
+before the enterprise response clock runs out. Communication: the status page updates at T+15 minutes, enterprise
 customers with contractual notification clauses are emailed at T+60.
 
 For deprecation risk: the second provider is exercised in production for one hour every month, and
@@ -148,6 +165,9 @@ expired, which is now monitored.
   backlog grows; name the roles and deputies in advance.
 - Single points of knowledge: one engineer understands the prompts and the eval set, and the plan
   silently assumes they are reachable. Key-person loss is a continuity event.
+- No recovery phase in the plan: work done manually during the event is never reconciled, visible
+  weeks later as tickets, orders or approvals that exist on paper or in a chat thread but not in the
+  system of record.
 - Ignoring supplier-side disruptions such as deprecations, quota cuts and terms changes because the
   dashboard is green; the symptom is a ninety-day deadline nobody planned for.
 

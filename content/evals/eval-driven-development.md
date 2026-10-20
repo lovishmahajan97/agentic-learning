@@ -5,6 +5,7 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -94,8 +95,10 @@ accept eval items, because the eval is the specification they can read.
 
 ## Example
 A CI gate in pytest. It runs each golden item *k* times, scores with a deterministic check and a
-calibrated judge, and fails only on a significant drop against the last accepted run or on a slice
-falling below its floor, so sampling noise does not turn it into a gate people ignore.
+calibrated judge, and fails only on a drop larger than a noise band against the last accepted run or
+on a slice falling below its floor, so sampling noise does not turn it into a gate people ignore. The
+band is not a constant to copy: its right width depends on the number of items and on how much the
+score moves between identical runs.
 
 ```python
 # tests/test_eval_gate.py — runs in CI on every prompt, retrieval or model change
@@ -105,7 +108,7 @@ from graders import cites_valid_source, faithful   # deterministic check + judge
 
 DATASET = [json.loads(l) for l in open("evals/support_v7.jsonl")]   # versioned golden set
 BASELINE = json.load(open("evals/baseline_v7.json"))                # per-item scores of last accepted run
-TOLERANCE, K = 0.03, 3                                              # noise band; samples per item
+TOLERANCE, K = 0.03, 3   # illustrative: set the band from repeated baseline runs (~2-3 SD); K samples/item
 
 @functools.lru_cache(maxsize=None)
 def run():
@@ -122,7 +125,7 @@ def test_mean_did_not_drop():
 
 def test_few_items_regressed():
     # an item regressed if it lost at least two of its K samples versus the baseline run
-    regressed = [i for i, s in run().items() if s <= BASELINE.get(i, 0) - 2 / K]
+    regressed = [i for i, s in run().items() if round((BASELINE.get(i, 0) - s) * K) >= 2]  # count, not float
     assert len(regressed) <= 0.02 * len(DATASET), f"regressed items: {regressed[:10]}"
 
 def test_every_slice_above_floor():
@@ -132,7 +135,12 @@ def test_every_slice_above_floor():
 ```
 
 When the gate passes and the change is accepted, the new per-item scores are written to
-`baseline_v7.json`, so the next change is compared against the state that actually shipped.
+`baseline_v7.json`, so the next change is compared against the state that actually shipped. To size
+`TOLERANCE`, re-run the unchanged system a handful of times and look at the spread of the mean: as a
+rough guide, the run-to-run standard error of a pass rate near 0.8 over the same 200 items × 3
+samples is at most √(0.8 × 0.2 / 600) ≈ 0.016 (less when many items always pass or always fail), and
+the difference between two such runs at most about 0.023, so a 0.03 band can still trip on pure noise
+now and then. A larger set, or a paired per-item test, narrows it.
 
 ## Trade-offs
 - Writing evals before building delays the first demo by days but makes every later iteration
@@ -221,4 +229,4 @@ latency or benign refusals exceed budget, or if the judge cannot yet be trusted 
 - [ ] Because the vendor requires test-data isolation for compliance
 > Iterating on a prompt against visible items is training on the test set; the dev-set score keeps
 > rising while production does not. A held-out slice, rotated occasionally, is the only unbiased
-> estimate of how the change will behave on inputs you have not tuned for.
+> offline estimate of how the change will behave on inputs you have not tuned for.

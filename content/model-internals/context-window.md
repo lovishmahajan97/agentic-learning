@@ -5,7 +5,7 @@ name: Context window
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - model-internals/kv-cache
   - model-internals/positional-encoding
@@ -52,7 +52,21 @@ outputs, retrieved chunks, and the template's own role markers. Many APIs cap ou
 figure well below the window, so the practical limit on a long answer is the output cap, not the window.
 Tokens are counted by the model's own tokenizer, and the same text can differ in token count by tens of
 percent across tokenizers (more for non-English text and code), so budgets must be computed with the
-right one.
+right one. Less visible consumers count too: images and audio are converted to tokens, and on reasoning
+models the hidden thinking tokens are generated into the same window and usually billed and capped as
+output, so a request that "only" asks for a short answer can still run out of room. APIs differ in what
+happens at the edge: most reject an over-long request outright, some truncate silently.
+
+### What a full window costs
+Put numbers on the first two constraints with a GQA model such as Llama-3-8B (32 layers, 8 KV heads,
+head dimension 128, fp16). The KV cache costs 2 × 32 × 8 × 128 × 2 bytes = 128 KiB per token, so a
+single 128k-token request holds about 16 GiB of cache, roughly the size of the model's own fp16 weights.
+A model without GQA (32 KV heads) would need four times that. Compute grows faster: per layer, the
+projections and MLP cost on the order of 24·d² FLOPs per token regardless of length, while attention
+scores and the weighted sum cost about 4·n·d for a token that attends over *n* positions. The attention
+term overtakes the rest once *n* exceeds roughly 6·d, around 25k tokens at d = 4,096 (a rule of thumb
+for orders of magnitude, not a measurement). Below that, long prompts cost roughly linearly; above it,
+every doubling of the prompt costs more than double.
 
 ### Why the limit sits where it does
 Three constraints set the number. **Training length**: models are pre-trained at some length and often
@@ -117,12 +131,15 @@ chunks = ["Policy section ... " * 120 for _ in range(6)]        # 6 chunks, ~360
 history = [f"turn {i}: " + "words " * 250 for i in range(20)]  # ~250 tokens per turn
 kept, left = fit_history(system, chunks, history, "How do I get a refund?")
 print(f"kept {len(kept)} of {len(history)} turns, {left} tokens spare")
-# Dropping the oldest turns is the crude option; summarizing them is the usual upgrade.
+# Roughly: fixed parts ~2,600 tokens, so ~4,800 remain for history and about 18 of the 20
+# ~250-token turns survive. Dropping the oldest turns is the crude option; summarizing them is the
+# usual upgrade, and it is what you would do before ever cutting the system prompt or chunks.
 ```
 
 ## Trade-offs
 - A larger window lets you skip retrieval and paste everything in, but prefill latency and per-request
-  cost grow with every token on every turn; retrieval wins once the corpus exceeds a few requests' worth.
+  cost grow with every token on every turn; retrieval wins once the corpus no longer fits, changes too
+  often to keep cached, or costs more to re-read per request than an occasional retrieval miss costs you.
 - Keeping full history maximizes fidelity, while summarizing it cuts tokens and latency at the price of
   lost detail; the flip happens when old turns stop being referenced.
 - Reserving a large output budget protects long answers but shrinks the space for input; size it to the
@@ -141,12 +158,16 @@ print(f"kept {len(kept)} of {len(history)} turns, {left} tokens spare")
   abruptly mid-conversation with no error.
 - Setting `max_tokens` far above real answer lengths; engines whose schedulers budget KV memory against
   a request's worst-case length then admit fewer concurrent requests even though answers are short.
+- Forgetting that reasoning models spend hidden thinking tokens from the same budget; the symptom is
+  empty or cut-off answers with a "length" finish reason on hard prompts while easy ones work.
 
 ## When to use
 There is no opting out; every request has a window. The decisions are how much of it to spend on
 instructions, on examples, on retrieved material, on history, and on the answer. Measure the token
 distribution of real requests, the rate of truncation events, and task accuracy as a function of where
-key information sits in the prompt. Prefer retrieval when the corpus is large or changes, long context
+key information sits in the prompt. Watch for the RoPE-scaling trap too: some model cards note that statically enabling a context-extension
+method for all requests can slightly degrade quality on short inputs, so enable it only on deployments
+that actually receive long prompts. Prefer retrieval when the corpus is large or changes, long context
 when a single document must be reasoned over as a whole, and compaction for long agent runs. In
 day-to-day work the window appears as a budgeting function, a truncation policy and a cost line; in
 interviews, expect to be asked why windows are finite, what the KV cache has to do with it, and whether

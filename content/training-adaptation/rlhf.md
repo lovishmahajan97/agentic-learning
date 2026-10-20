@@ -5,7 +5,7 @@ name: RLHF
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/dpo
   - training-adaptation/grpo
@@ -69,7 +69,11 @@ L_RM(φ) = − E_(x, y_w, y_l) [ log σ( r_φ(x, y_w) − r_φ(x, y_l) ) ]
 
 Only differences matter, so the reward scale is arbitrary; implementations often normalise it. The loss
 is chosen because it directly models the data you have (comparisons) rather than absolute scores
-nobody gave you.
+nobody gave you. Starting the reward model from the SFT checkpoint is deliberate: it must judge the
+kind of text the policy produces, and a model that already represents that distribution learns the
+judgement from far fewer comparisons. Its quality is measured as accuracy on held-out comparison pairs,
+and that number should be read against inter-annotator agreement on the same pairs: a reward model
+cannot meaningfully beat the rate at which humans agree with each other.
 
 ### Step 3: optimise the policy with PPO
 The objective is expected reward with a KL penalty to the reference policy π_ref (the SFT model):
@@ -79,9 +83,14 @@ J(θ) = E_x E_y~π_θ [ r_φ(x, y) − β · KL( π_θ(·|x) ‖ π_ref(·|x) ) 
 ```
 
 In practice the KL term is applied per token as a shaped reward (−β·[log π_θ(y_t|·) − log π_ref(y_t|·)])
-and the reward model's score is added at the final token. PPO then runs the standard loop: sample
-responses from the current policy, compute rewards, estimate advantages with a learned *value model*
-and generalised advantage estimation, and update the policy with the clipped surrogate objective
+and the reward model's score is added at the final token, because it judges the finished response and
+says nothing about individual tokens. That creates a credit-assignment problem: which of 300 tokens
+earned the score? PPO answers it with a learned *value model* V(s_t) that predicts the eventual return
+from each prefix. The temporal-difference error `δ_t = r_t + V(s_{t+1}) − V(s_t)` says whether token t
+made the outcome look better or worse than expected, and generalised advantage estimation sums these
+errors with a decay, `A_t = Σ_k (γλ)^k · δ_{t+k}` (γ is usually 1 for text; λ trades bias against
+variance). PPO then runs the standard loop: sample responses from the current policy, compute rewards,
+compute advantages, and update the policy with the clipped surrogate objective
 `min(ρ·A, clip(ρ, 1−ε, 1+ε)·A)` where ρ is the ratio of new to old token probabilities. The clip is
 there because policy-gradient steps on sampled text are high-variance; it prevents any one batch from
 moving the policy too far. InstructGPT additionally mixed in pre-training gradients ("PPO-ptx") to
@@ -90,8 +99,8 @@ limit the capability loss they called the alignment tax.
 ### Why the KL penalty is not optional
 The reward model is accurate near the data it was trained on and increasingly wrong far from it. An
 unconstrained policy climbs the reward surface into regions where the reward model's score is high
-and the real quality is low: longer and longer answers, flattery, repeated keywords, confident
-hedging, or outright gibberish that happens to score well. Gao et al. measured this
+and the real quality is low: longer and longer answers, flattery, repeated keywords, an authoritative
+tone regardless of correctness, or outright gibberish that happens to score well. Gao et al. measured this
 *overoptimisation*: as the policy moves further from the reference (measured in KL), the proxy reward
 keeps rising while the true reward peaks and then falls. β sets how far you let it go; it is tuned
 against held-out human evaluation, not against the reward model.
@@ -109,6 +118,12 @@ round of PPO, sample from the new policy, collect new comparisons, retrain the r
 A cheaper cousin is rejection sampling fine-tuning: sample k responses, keep the top-scored by the
 reward model, SFT on those. It uses the same reward model with no RL machinery and is often the first
 round before PPO.
+
+### Where the comparisons come from
+"Human feedback" is increasingly partly AI feedback. In RLAIF, a strong model ranks the pairs against a
+written set of principles (the idea behind Constitutional AI), and humans label a smaller slice to
+audit the judge. The rest of the pipeline is unchanged; what changes is that the judge's biases (for
+length, for its own style) become the reward model's biases, so the audit slice is not optional.
 
 ## Example
 The two numerical pieces that make RLHF concrete: the reward model's pairwise loss and the per-token
@@ -160,7 +175,8 @@ over a sequence estimates the KL, which is why the sequence-level number is the 
   preserves capability; the right value flips with how trustworthy the reward model is far from its
   data.
 - Separate reward models for helpfulness and safety allow explicit trade-offs between them, but need
-  a combination rule and twice the comparison data.
+  a combination rule and twice the comparison data; a single model is simpler and wins when the two
+  goals rarely conflict on your prompt distribution.
 
 ## Pitfalls
 - Trusting the reward model's score as the metric of success; the symptom is rising proxy reward with

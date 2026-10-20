@@ -5,6 +5,7 @@ name: Similarity search (cosine, dot product)
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/embedding-dimension-and-normalization
@@ -61,15 +62,17 @@ Euclidean penalizes both angle and length mismatch. The whole metric debate is a
 ### Why normalization at index time is the standard move
 Normalizing is one division per vector, done once when the vector is written. After that, the cheapest
 score (a dot product: d multiplies and adds, no square root) returns the cosine ranking, and any index
-built for inner product or L2 gives cosine results too. Databases exploit this: when you store unit
-vectors, the engine can skip the per-candidate norm computation. This is why most embedding pipelines
+built for inner product or L2 gives cosine results too. This is why pgvector's docs, for example,
+recommend the inner-product operator when vectors are already unit length: the engine does not detect
+normalization for you, but choosing inner product skips the per-candidate norm work. It is also why most embedding pipelines
 normalize before writing and why several API providers return unit-length vectors already; check the
 model card rather than assuming.
 
 ### When magnitude carries meaning
 Some retrievers are deliberately trained with an unnormalized dot product (DPR is the classic example).
-There the model can learn to give "generally useful" passages a larger norm, a kind of built-in prior,
-and the query norm can act as a confidence scale. Normalizing those vectors throws that information away.
+There the model can learn to give "generally useful" passages a larger norm, a kind of built-in prior.
+(The query norm never changes the ranking for a single query; it only rescales that query's scores.)
+Normalizing the document vectors of such a model throws the prior away.
 Conversely, a cosine-trained model has no incentive to keep norms meaningful, so dot product on its raw
 outputs adds noise. The rule: use the similarity the model card names. If it is silent, normalize and use
 cosine; it is the choice that cannot be badly wrong.
@@ -120,7 +123,7 @@ l2  = np.linalg.norm(D - q, axis=1)
 
 print("dot    :", topk(dot))                  # expect ids < 5000: length wins
 print("cosine :", topk(cos))                  # angle only; ids spread over the corpus
-print("l2     :", topk(-l2))                  # smaller distance = better
+print("l2     :", topk(-l2))                  # smaller is better; ids >= 5000: long rows penalized
 
 # Normalize once at write time; the cheap dot product now equals cosine.
 Dn = D / np.linalg.norm(D, axis=1, keepdims=True)

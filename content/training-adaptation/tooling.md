@@ -5,7 +5,7 @@ name: Tooling (Unsloth, Axolotl, TRL)
 kind: tool
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/peft
   - training-adaptation/supervised-fine-tuning
@@ -165,6 +165,17 @@ trainer.save_model()                     # writes the adapter only
 # then build SFTTrainer(model=model, ...) with peft_config=None.
 ```
 
+What the trainer does with one row is the part worth verifying by hand. The `messages` list is rendered by
+Qwen's ChatML template, in which each turn becomes `<|im_start|>{role}\n{content}<|im_end|>`, then
+tokenised. With `assistant_only_loss`, every system and user
+token gets label −100, so only the assistant span contributes to the loss. Packing concatenates rendered
+rows into 2,048-token sequences, and with a padding-free / position-id-aware attention path each row
+restarts its positions so it cannot attend to its neighbour. Then count steps (illustrative): 3,000 chats
+averaging 500 tokens are 1.5M tokens; an optimizer step consumes 16 × 2,048 ≈ 32.8k tokens, so one epoch
+is ~46 steps and two epochs ~92, which makes `warmup_ratio=0.03` about three steps and `save_strategy="epoch"`
+two checkpoints. Decode one packed batch and print its labels before the first real run: it takes a
+minute and catches template and masking bugs that the loss curve never shows.
+
 ## Trade-offs
 - TRL gives full control and the newest algorithms first, but you own the plumbing around the trainer
   (data formatting, launch, multi-GPU config); it flips toward Axolotl once a team runs many similar jobs.
@@ -185,7 +196,8 @@ trainer.save_model()                     # writes the adapter only
 - Pinning nothing: TRL and Transformers rename arguments across releases (`tokenizer` → `processing_class`,
   `max_seq_length` → `max_length`); the symptom is a job that ran last month failing on an unknown keyword.
 - Merging a QLoRA adapter into the 4-bit base instead of the bf16 base; the symptom is a merged model
-  that scores worse than the adapter-plus-base it came from.
+  that scores worse than the adapter-plus-base it came from. Even a bf16 merge is slightly off, because
+  the adapter was trained against dequantised 4-bit weights, so re-run the eval on the merged artifact.
 - Trusting Unsloth's speedup without checking the architecture list; the symptom is an error at load or a
   run that is no faster than stock Transformers.
 

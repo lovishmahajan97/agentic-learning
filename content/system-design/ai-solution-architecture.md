@@ -5,7 +5,7 @@ name: AI / solution architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - system-design/reference-architectures
   - system-design/nfrs
@@ -90,6 +90,24 @@ retries, fallbacks, schema guarantees, evaluation, or cost accounting.
 - **A cheap feedback loop.** Traces → labelled failures → golden set → eval → change in prompt, model
   or retrieval → release gate. If this loop takes a week, the system will not improve.
 
+### The two budgets as formulas
+Latency and cost are the two NFRs that the model call dominates, and both decompose into terms the
+architecture controls:
+
+```
+p95_latency  ≈ t_auth + t_retrieval + t_prefill(input_tokens) + output_tokens / decode_rate
+               + t_validation + P(retry) × t_retry
+cost_per_successful_task = Σ over calls (in_tokens × price_in + out_tokens × price_out)
+                           ÷ fraction of tasks that succeed
+```
+
+The latency formula shows why output length, not model choice, is usually the biggest lever: decode
+time is linear in tokens generated, so a cap on answer length or streaming (which moves the perceived
+cost to time-to-first-token) beats shaving milliseconds off retrieval. The cost formula has two traps
+it makes visible: input tokens are multiplied by every call in an agent loop or retry, and the
+denominator means a cheaper model with a lower success rate can cost *more* per useful outcome once
+retries, escalations and human rework are counted.
+
 ### Solution architecture versus AI architecture
 The *solution* half is enterprise integration: single sign-on, the systems of record the context comes
 from, deployment constraints such as VPC or data residency, compliance evidence, operations and support
@@ -119,8 +137,13 @@ to other claims → streamed to the UI → trace written with tokens, latency an
 Latency budget: retrieval 300 ms, prefill ≈ 500 ms, decode of a 300-token answer at ≈ 50 tokens/s is
 6 s, which blows the 4 s target. Two architectural responses: stream, so the user perceives time to
 first token (≈ 1 s), and cap Q&A answers at 200 tokens with a "show more" follow-up. Cost: 40k × 3.2k
-≈ 128M input tokens per day, which is the number that justifies the mid-tier model for Q&A and prompt
-caching of the fixed 600-token prefix. Evaluation: 150 real adjuster questions with reviewed answers,
+≈ 128M input tokens per day, plus 40k × 200 ≈ 8M output tokens. That volume is what justifies the
+mid-tier model for Q&A: at an illustrative 10× price ratio between tiers, sending Q&A to the frontier
+model multiplies the daily bill by ten for answers the eval shows are no better. The breakdown of the
+3,200 input tokens also tells you where to optimise. Caching the fixed 600-token prefix touches only
+about 19% of input; the retrieved context is 2,500 tokens, about 78%, so cutting top-k from 8 to 5
+chunks (≈ 940 fewer tokens, about 29% of input) is the larger saving, *if* the eval shows citation
+recall does not drop. Evaluation: 150 real adjuster questions with reviewed answers,
 faithfulness measured by citation match, run on every prompt or model change and weekly in production.
 
 ## Trade-offs
@@ -134,6 +157,8 @@ faithfulness measured by citation match, run on every prompt or model change and
   cost of a wrong action, so low-stakes drafting needs far fewer gates than money movement.
 - Full tracing of prompts and outputs is what makes evaluation possible, but it is also a store of
   sensitive data; retention, redaction and access policies have to be designed with it, not after.
+  The flip is data class: for regulated data, keep redacted traces by default and a small sampled
+  full-fidelity set under tighter access, accepting slower debugging for a smaller breach surface.
 
 ## Pitfalls
 - Prompt-as-architecture: a 4,000-token system prompt holding business rules, data and formatting.

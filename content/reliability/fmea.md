@@ -5,7 +5,7 @@ name: FMEA (Failure Mode and Effects Analysis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - reliability/chaos-engineering-and-resilience-testing
   - reliability/fault-tolerance
@@ -82,11 +82,15 @@ logs nobody reads detect nothing.
 
 ### Risk Priority Number and its limits
 The classic ranking is RPN = S × O × D, from 1 to 1,000, sorted descending. It is useful because it is
-simple, and misleading in one specific way: it treats the three dimensions as interchangeable, so a rare,
-undetectable catastrophe (S 10, O 1, D 1 gives 10) can rank below a frequent cosmetic bug (S 2, O 5,
-D 5 gives 50). The automotive industry's newer handbook replaced RPN with an Action Priority table that
-considers severity first for this reason. The practical rule: any row with severity 9 or 10 goes to the
-top regardless of RPN, then sort the rest by RPN.
+simple, and misleading in two specific ways. First, it treats the three dimensions as interchangeable,
+so a rare, hard-to-detect catastrophe (S 10, O 1, D 9 gives 90) ranks below a frequent, moderately
+visible annoyance (S 4, O 6, D 5 gives 120), and rows with identical RPNs can carry completely different
+risks (S 10, O 2, D 5 and S 5, O 4, D 5 are both 100). Second, the scales are ordinal: a 6 is "worse than
+a 5", not 20 percent worse, so multiplying them produces a number with no physical meaning, and only 120
+distinct values between 1 and 1,000 can occur at all, which makes gaps between RPNs look larger than the
+judgment behind them. The automotive industry's 2019 handbook replaced RPN with an Action Priority table
+that looks at severity first, then occurrence, then detection, for these reasons. The practical rule:
+any row with severity 9 or 10 goes to the top regardless of RPN, then sort the rest by RPN.
 
 ### Actions, owners and re-scoring
 Each top row gets an action that reduces one of the three factors. Prevention lowers O (a schema that
@@ -98,8 +102,18 @@ changes is a sign the table has become decoration.
 ### Design versus process FMEA
 Design FMEA analyzes the system as built. Process FMEA analyzes how it is operated and changed: deploys,
 prompt edits, model version upgrades, index rebuilds, credential rotation. AI systems need both, and the
-process rows are often the highest: a large share of AI incidents trace to someone changing a prompt or
-a model version without an eval gate, not to code.
+process rows often score highest, because a prompt edit or a model version change can alter behavior
+everywhere at once without touching code, and without an eval gate nothing stands between the edit and
+production.
+
+### Bottom-up, one failure at a time, and what that misses
+FMEA is bottom-up: it starts from components and asks what each failure does to the whole. Its blind
+spot follows from that: each row considers a single failure mode, so combinations (the index is stale
+*and* the freshness alert's job is down; the provider is slow *and* retries double the load) are easy to
+miss. Fault tree analysis is the complementary top-down method: start from one unacceptable outcome
+("money refunded to the wrong customer") and decompose it with AND/OR gates into the combinations of
+events that produce it. Use FMEA to find the breadth of modes, and a small fault tree for each
+severity-10 effect to check that no single failure, or common pair, reaches it.
 
 ## Example
 A fragment of an FMEA for a support assistant that answers from a document index and can issue refunds
@@ -148,6 +162,9 @@ contained. The team spent one afternoon and re-prioritized a quarter.
   the file last modified the week before an audit.
 - Scoring occurrence from intuition when data exists. The symptom: provider 429s scored as rare while
   the dashboard shows them daily, so the row is deprioritized and the retry budget never gets fixed.
+- Treating rows as independent. The symptom: every row has a control, yet an incident happens when two
+  controls fail together, for example the canary and the alert both running on the same scheduler that
+  stopped.
 - Confusing cause with mode. The symptom: rows like "engineer forgot the filter", which cannot be
   detected or scored for effect; the mode is "retrieval returns another tenant's data", the forgotten
   filter is one of its causes.
@@ -201,9 +218,9 @@ opinions.
 - [x] RPN treats the factors as interchangeable, so a rare undetectable catastrophe can rank below a frequent cosmetic bug; gate on severity first, then sort by RPN
 - [ ] RPN only works for hardware, so software teams should use mean time between failures instead
 - [ ] RPN overweights detection, so detection should be dropped from the formula
-> S 10 × O 1 × D 1 is 10 while S 2 × O 5 × D 5 is 50, yet the first row is the one that ends the
-> company. Severity-first ordering, as in the newer Action Priority approach, keeps catastrophic rows at
-> the top.
+> S 10 × O 1 × D 9 is 90 while S 4 × O 6 × D 5 is 120, yet the first row, a rare catastrophe nobody would
+> notice, is the one that ends the company. Severity-first ordering, as in the Action Priority approach,
+> keeps catastrophic rows at the top; doubling a weight only moves the distortion elsewhere.
 
 ### Q: Which of these is correctly stated as a failure mode rather than an effect or a cause?
 - [ ] The engineer forgot to add the tenant filter to the new retrieval client

@@ -5,7 +5,7 @@ name: KV-cache memory estimation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - model-internals/kv-cache
   - model-internals/grouped-query-attention
@@ -62,6 +62,13 @@ latent vector per layer per token plus a small decoupled RoPE key, so the formul
 1 × layers × (latent_dim + rope_dim) × bytes (for DeepSeek-V3: 61 × (512 + 64) × 2 ≈ 70 KB in bf16, versus
 several MB for an equivalent MHA layout); read the architecture before applying the standard formula.
 
+Sliding-window attention is the other common exception. A layer that only attends to the last *W*
+positions needs at most *W* tokens of cache no matter how long the sequence gets, and several recent
+model families interleave sliding-window layers with full-attention layers. Then the estimate is a sum:
+full-attention layers scale with sequence length, windowed layers are capped at *W*, and the average
+bytes per token falls as sequences grow past the window. Whether an engine actually frees the
+out-of-window blocks depends on the engine and version, so confirm with its startup log.
+
 ### From per-token to per-GPU
 ```
 cache_per_request = bytes_per_token × (prompt_tokens + max_output_tokens)
@@ -69,7 +76,7 @@ pool_bytes        = gpu_memory × utilization_fraction − weight_bytes − acti
 max_concurrency   ≈ pool_bytes / cache_per_request
 ```
 
-Three refinements matter in practice:
+Four refinements matter in practice:
 
 1. **Weights.** Parameters × bytes per parameter: 8B × 2 = 16 GB in fp16, 8 GB at int8, ~4.5 GB at 4-bit
    (plus a little for scales). Quantizing weights frees cache space; that is often its biggest payoff.
@@ -82,6 +89,11 @@ Three refinements matter in practice:
    what fits without preemption, and use the mean to estimate steady-state concurrency. Paged allocation
    means a request only consumes what it has actually generated so far, so admission can be optimistic
    about the mean while the max context length bounds the worst case.
+4. **Tensor parallelism splits the cache, up to a point.** With tensor parallelism of degree *T*, each GPU
+   holds the K/V of `n_kv_heads / T` heads, so per-GPU cache per token is divided by *T* along with the
+   weights, and the pool is the sum over GPUs. Once *T* exceeds `n_kv_heads` (say *T* = 16 on a model
+   with 8 KV heads) heads must be replicated, and the per-GPU cache stops shrinking. *T* must also divide
+   the head counts, which is why real deployments use TP degrees of 2, 4 or 8, not 3 or 6.
 
 ### Running the numbers for common shapes
 Illustrative, computed from public config values:
@@ -181,15 +193,18 @@ question, and the follow-up is always "what would you change if it does not fit"
 **Q:** A customer wants a 70B-class GQA model (80 layers, 8 KV heads, head_dim 128) in fp16 to serve 40
 concurrent sessions that average 12k tokens of context, on 80 GB GPUs. How many GPUs, and what would you
 propose if they only have two?
-**A:** Cache per token is 2 × 80 × 8 × 128 × 2 = 320 KB. Per session at 12k tokens: ~3.84 GB. Forty
-sessions: ~154 GB of cache. Weights in fp16 are ~140 GB, which already needs at least two 80 GB GPUs with
-tensor parallelism, and at 90% utilization those two offer ~144 GB, so after weights and workspace there
-is almost nothing left for cache: the model loads but serves one or two sessions. Four GPUs give ~288 GB
-usable, ~140 GB after weights and workspace, about 36 sessions at the average and no tail headroom; six
-GPUs (~280 GB of cache) would be comfortable. With only two GPUs: quantize the weights to 8-bit (~70 GB,
-leaving ~70 GB) and the cache to 8-bit (halving per-session cost to ~1.9 GB), which fits ~35 sessions
-at the average, then cap context per session at 16k, enable paging and prefix caching, and run a quality
-eval on the quantized configuration before promising anything. A strong answer notes that decode at 40 sessions
+**A:** Cache per token is 2 × 80 × 8 × 128 × 2 = 327,680 B ≈ 320 KB. Per session at 12k tokens: ~3.9 GB.
+Forty sessions: ~157 GB of cache. Weights in fp16 are ~140 GB, which already needs at least two 80 GB GPUs
+with tensor parallelism, and at 90% utilization those two offer ~144 GB, so after weights and workspace
+there is almost nothing left for cache: the model loads but serves one or two sessions. Four GPUs (TP = 4)
+give ~288 GB usable, roughly 130–140 GB after weights and per-GPU workspace, about 34 sessions at the
+average and no tail headroom, so slightly short. Six GPUs is not a valid TP degree for 8 KV heads, so the
+next real step is eight: either one TP = 8 replica with ~400 GB of cache, or two TP = 4 replicas of ~34
+sessions each, which also buys redundancy. With only two GPUs: quantize the weights to 8-bit (~70 GB) and
+the cache to 8-bit (halving per-session cost to ~2 GB); with ~65 GB left after weights and workspace that
+fits roughly 30–33 sessions at the average. Then cap context per session at 16k to bound the tail, enable
+paging and prefix caching, and run a quality eval on the quantized configuration before promising
+anything. A strong answer notes that decode at 40 sessions
 will have higher TPOT because every step reads all 40 caches.
 
 ## Quiz

@@ -5,6 +5,7 @@ name: Exceptions and custom exception hierarchies
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -106,6 +107,7 @@ import time, httpx
 class LLMError(Exception): ...
 class Transient(LLMError): ...                      # safe to retry
 class Permanent(LLMError): ...                      # do not retry
+class Recoverable(LLMError): ...                    # retry only after changing the request
 
 class RateLimited(Transient):
     def __init__(self, retry_after: float):
@@ -114,7 +116,7 @@ class RateLimited(Transient):
     def __str__(self) -> str:
         return f"rate limited, retry after {self.retry_after:.1f}s"
 
-class ContextTooLong(Permanent):
+class ContextTooLong(Recoverable):
     def __init__(self, tokens: int, limit: int):
         super().__init__(tokens, limit)
         self.tokens, self.limit = tokens, limit
@@ -123,14 +125,16 @@ def call_provider(client: httpx.Client, prompt: str) -> str:
     try:
         r = client.post("/v1/complete", json={"prompt": prompt}, timeout=30)
         r.raise_for_status()
-    except httpx.TimeoutException as e:
-        raise Transient("provider timeout") from e  # keep the cause for logs
+    except httpx.TransportError as e:               # timeouts, refused or reset connections
+        raise Transient(f"transport error: {e!r}") from e   # keep the cause for logs
     except httpx.HTTPStatusError as e:
-        status, body = e.response.status_code, e.response.json()
+        status = e.response.status_code
         if status == 429:
             raise RateLimited(float(e.response.headers.get("retry-after", 2))) from e
-        if status >= 500:
+        if status >= 500:                           # check before parsing: 5xx bodies are often HTML
             raise Transient(f"provider returned {status}") from e
+        is_json = "json" in e.response.headers.get("content-type", "")
+        body = e.response.json() if is_json else {}
         if body.get("error", {}).get("code") == "context_length_exceeded":
             raise ContextTooLong(body["error"]["tokens"], body["error"]["limit"]) from e
         raise Permanent(f"provider returned {status}: {body}") from e   # 400/401/403: stop
@@ -145,7 +149,7 @@ def answer(client: httpx.Client, prompt: str, attempts: int = 3) -> str:
         except Transient:
             time.sleep(2 ** n)
         except ContextTooLong as e:                 # recoverable: shrink, then try again
-            prompt = prompt[: len(prompt) * e.limit // (2 * e.tokens)]
+            prompt = prompt[: len(prompt) * e.limit * 9 // (10 * e.tokens)]  # ~10% margin
     raise Permanent(f"gave up after {attempts} attempts")
 ```
 

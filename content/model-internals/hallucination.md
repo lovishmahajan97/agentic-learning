@@ -5,7 +5,7 @@ name: Hallucination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - model-internals/sampling-strategies
   - model-internals/small-language-models
@@ -36,7 +36,9 @@ seen once or never. At inference the model must emit a token regardless. When th
 recoverable from the weights, the distribution still peaks somewhere plausible, and the sampler emits that
 with the same fluency as a well-known fact. Three mechanisms reinforce this. Parametric knowledge is lossy
 compression: rare facts are stored weakly or not at all, and there is no explicit "not stored" signal to
-read. Autoregression commits: once a wrong token is sampled, say a fabricated paper title, every later
+read. (The signal is not wholly absent: pre-trained models' probabilities are often reasonably calibrated
+on multiple-choice questions, as Kadavath et al. reported in 2022. But free-form generation never consults
+that signal before committing to a token, and post-training tends to degrade it.) Autoregression commits: once a wrong token is sampled, say a fabricated paper title, every later
 token is conditioned on it, and the model's strong prior for coherence makes it elaborate rather than
 retract, so errors snowball. And post-training sharpens the problem in a specific way: human raters and
 binary-graded benchmarks reward complete, confident answers and penalise hedging, so the policy learns that
@@ -45,8 +47,8 @@ GPT-4 technical report showed calibration getting worse after RLHF.
 
 The naive fixes fail for the same reasons. "Train on more data" shrinks the long tail but cannot close it.
 "Set temperature to zero" removes sampling noise, but greedy decoding still takes the argmax of a wrong
-distribution; it cuts variance, not bias. "Tell it not to hallucinate" helps at the margin, because the
-model cannot reliably introspect on what it knows. "Fine-tune on the facts" can teach some facts, but
+distribution; it cuts variance, not bias. "Tell it not to hallucinate" helps only at the margin, because
+the instruction cannot create a reliable "I don't know this" signal the decoding loop would act on. "Fine-tune on the facts" can teach some facts, but
 fine-tuning on knowledge the base model lacks has been reported to increase hallucination elsewhere. The
 durable fix is architectural: supply evidence, verify outputs, and make abstention cheap.
 
@@ -145,6 +147,7 @@ def faithfulness_report(answer, passages):
 retrieved_passages = ["Refunds are issued within 14 days of a returned item being received."]
 answer_text = "Refunds take 14 days and are paid to the original card."   # second claim is unsupported
 report = faithfulness_report(answer_text, retrieved_passages)
+# Expected: 2 claims; "paid to the original card" comes back not_found, so unsupported_rate = 0.5.
 if report["unsupported_rate"] > 0:
     # Options: regenerate with the unsupported claims listed as "do not state",
     # return only the supported claims with their [source] indices, or route to review.

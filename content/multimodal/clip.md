@@ -5,7 +5,7 @@ name: CLIP
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - multimodal/image-embeddings
   - multimodal/vision-language-models
@@ -61,7 +61,19 @@ and clipped so the scale never exceeds 100). The N diagonal entries are the true
 off-diagonal entries are negatives. The loss is a symmetric cross-entropy: for each image, a softmax
 over the N texts should put its mass on the matching text, and for each text, a softmax over the N
 images should pick the matching image. The two directions are averaged. This is the InfoNCE loss; it
-pushes matching pairs together and all other pairs in the batch apart.
+pushes matching pairs together and all other pairs in the batch apart. Written out, with unit vectors
+`x_i` (images), `y_j` (texts) and learned scale `s = 1/T`:
+
+```
+logits[i, j] = s · (x_i · y_j)                         # N × N matrix
+L_img→txt    = −(1/N) Σ_i log( exp(logits[i,i]) / Σ_j exp(logits[i,j]) )
+L_txt→img    = −(1/N) Σ_j log( exp(logits[j,j]) / Σ_i exp(logits[i,j]) )
+L            = (L_img→txt + L_txt→img) / 2
+```
+
+In code this is two `cross_entropy(logits, arange(N))` calls, one on the matrix and one on its
+transpose. The temperature is learned rather than fixed because the right sharpness changes during
+training: too soft and the gradient from hard negatives vanishes, too sharp and training is unstable.
 
 Two consequences follow. First, the batch *is* the negative set, so larger batches give harder, more
 informative negatives; CLIP used a batch of 32,768 pairs, and the training data was about 400 million
@@ -85,11 +97,31 @@ or to encode precise spatial layout, because captions rarely make those distinct
 is therefore excellent for retrieval and coarse classification and weak for compositional reasoning,
 which is the reason VLMs bolt an LLM on top of it rather than using it alone.
 
+### The modality gap
+"One shared space" is looser than it sounds. In practice image embeddings and text embeddings occupy
+two separated regions of the sphere: a caption is closer to its own image than to other images, but
+almost any image is closer to other images than to any text. The loss only requires the right ordering
+within each row, not that the two clouds overlap. Practically, cross-modal cosines sit in a narrow low
+band while image-to-image cosines sit much higher, so a threshold tuned for one direction is meaningless
+in the other, and mixing image and text vectors in one nearest-neighbour index without care ranks all
+same-modality items first.
+
+### Zero-shot versus linear probe
+Zero-shot uses the text encoder to build the classifier. When you have even a few labelled examples per
+class, a logistic-regression "linear probe" trained on frozen image embeddings usually beats the
+zero-shot classifier, because it learns which embedding directions matter for *your* classes instead of
+relying on how well a sentence describes them. The CLIP paper notes that with very few examples per
+class a probe can underperform zero-shot; once labels exist in modest numbers, the probe is the cheap
+upgrade to try before any fine-tuning.
+
 ### Successors and variants
 OpenCLIP reproduced and scaled the recipe on public data (LAION). SigLIP replaces the batch-wide softmax
 with an independent sigmoid loss per pair, so each (image, text) pair is a binary "match or not"
-decision; this removes the need for a global normalisation across the batch, makes memory scale better,
-and gives somewhat better encoders that many recent VLMs use. The mechanism, two encoders aligned by
+decision: `−log σ(z_ij · (t · x_i·y_j + b))` with `z_ij = +1` for the true pair and `−1` otherwise,
+and a learned bias `b`, initialised strongly negative, that offsets the fact that almost every pair is a
+negative. Because no row has to be normalised across the whole batch, the batch can be split across
+devices without gathering all embeddings for one softmax, memory scales better, and it trains well at
+smaller batch sizes; many recent VLMs use SigLIP encoders as their vision tower. The mechanism, two encoders aligned by
 positives-versus-negatives, is unchanged.
 
 ## Example

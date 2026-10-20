@@ -5,7 +5,7 @@ name: Langfuse
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - observability/tracing
   - observability/token-cost-tracking
@@ -52,7 +52,9 @@ A **trace** is one unit of work, typically one request or one agent task. It car
 parent, are **observations** of three types: a **span** (any step: retrieval, parsing, a tool call), a
 **generation** (a model call, with model name, parameters, input messages, output, usage split into input
 and output tokens, cost, and a completion-start timestamp from which time to first token is derived), and an
-**event** (a point in time). **Sessions** group the traces of one conversation so a reviewer reads it in
+**event** (a point in time). Recent SDK versions add finer observation types (agent, tool, retriever,
+embedding, guardrail and others) that render differently in the UI but are spans underneath; generation is
+the type that matters mechanically, because it is the only one that carries usage and cost. **Sessions** group the traces of one conversation so a reviewer reads it in
 order; **users** roll up cost and quality per customer.
 
 **Scores** attach a named numeric, categorical or boolean value, with an optional comment, to a trace or an
@@ -81,7 +83,15 @@ design handled poorly at scale; Postgres keeps transactional data such as projec
 Cost is computed per generation by matching the model name against a price table (built in for the major
 providers, extensible with custom model definitions for fine-tunes, Azure deployment names or self-hosted
 models); usage comes from the provider response when present, and can be estimated with a tokenizer for
-some models when it is not.
+some models when it is not. The arithmetic is per usage type:
+
+```
+cost = input_tokens × input_price + output_tokens × output_price (+ cached-read tokens × cached price, …)
+```
+
+which is why a generation must carry usage split by type, not just a total: output tokens typically cost
+several times more than input tokens, so a total alone cannot be priced. You can also send a cost
+explicitly, which overrides the table, for providers whose invoice does not follow token counts.
 
 ### Instrumentation options
 In Python the `@observe()` decorator wraps a function in a span, nests calls through context variables and
@@ -90,7 +100,10 @@ turns the outermost call into the trace; `as_type="generation"` marks a model ca
 a LangChain callback handler, LlamaIndex and LiteLLM integrations, a JS/TS SDK with Vercel AI SDK support,
 and an OTLP endpoint, so spans produced by any OpenTelemetry SDK, OpenLLMetry or OpenInference
 instrumentation are mapped onto generations using the GenAI attribute conventions. The current Python SDK
-is itself built on the OpenTelemetry SDK. A `mask` callback redacts fields before data leaves the process.
+is itself built on the OpenTelemetry SDK. A `mask` callback redacts fields before data leaves the process,
+and a client-side sample rate keeps a fixed fraction of traces; sampling is decided per trace so a kept
+trace is complete, but scores and cost totals then describe the sample and must be scaled to estimate the
+whole.
 
 ## Example
 A support bot traced with the Python SDK: the decorator builds the trace, the OpenAI drop-in records the
@@ -129,7 +142,16 @@ langfuse.flush()                            # required in scripts and serverless
 ```
 
 In the UI the trace shows `answer` → `retrieve` and `answer` → generation, with tokens, cost, latency and the
-prompt version; the session view shows the whole conversation `s_9`; the user view sums cost for `u_42`.
+prompt version; the trace's input and output default to the outermost function's arguments and return value.
+The session view shows the whole conversation `s_9`; the user view sums cost for `u_42`.
+
+Follow one turn through the cost machinery. Suppose the compiled prompt plus context is 1,850 input tokens
+and the answer is 120 output tokens, with illustrative prices of $0.15 per million input tokens and $0.60
+per million output tokens. The generation's cost is 1,850 × 0.15e-6 + 120 × 0.60e-6 ≈ $0.00028 + $0.00007 =
+$0.00035. Cost lives on generations; trace, session and user totals are aggregates over them, so a conversation of six turns that grows its context each turn might cost
+$0.003, and a user with forty such conversations about $0.12. If the deployment name were `support-gpt4o-mini-eu`
+instead of a recognised model id, the tokens would still be recorded and every one of those totals would read
+zero until a custom model definition matched the name.
 
 ## Trade-offs
 - Self-hosting keeps prompts and customer data in your VPC with no licence cost, but you now operate
@@ -139,6 +161,9 @@ prompt version; the session view shows the whole conversation `s_9`; the user vi
   node-level LangGraph traces with no decorators, which matters when the stack is entirely LangGraph.
 - Capturing full inputs and outputs is what makes a trace debuggable, and is also PII and storage; masking
   and sampling cut both the risk and the debuggability, so decide per field rather than globally.
+- Client-side sampling cuts ingestion and storage cost proportionally, but rare failures and per-user cost
+  become estimates; keep 100% while volume is affordable and sample only once storage, not insight, is the
+  binding cost.
 - Managed LLM-as-a-judge evaluators give a continuous quality signal on production without labelling, at a
   judge-model cost per evaluated trace and with judge bias; the sample rate is the knob, and a human
   annotation queue is the calibration.

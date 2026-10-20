@@ -5,6 +5,7 @@ name: Tool-call success rate
 kind: metric
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - agent-reliability/task-completion-rate
   - agent-reliability/tool-adapters-service-interfaces
@@ -191,8 +192,10 @@ attribution to an owner, and the p^n argument that links tool reliability to tas
 **Q:** Completion rate on ten-step tasks fell from 80% to 55% this week with no prompt or model change.
 The aggregate tool success rate is still 96%. Where do you look, and what do you expect to find?
 **A:** The aggregate is averaging nine healthy tools against one broken one, so I break it down per tool
-and per error class. A drop from 80% to 55% on ten-step tasks is consistent with one tool used in most
-tasks falling by a few points per step, because the per-step rates multiply across the chain. I would
+and per error class. A drop from 80% to 55% on ten-step tasks needs a per-task factor of about 0.69, and
+per-step rates multiply, so it is consistent with one tool that appears about three times per task
+falling to roughly 88% per step (0.80 × 0.88³ ≈ 0.55). If that tool carries around a third of all calls,
+it moves the aggregate by only three or four points, which is why 96% still looks healthy. I would
 expect to see a single tool with a rising `upstream_timeout`, `rate_limited` or `empty_result` class,
 which points at a vendor change, a quota, or a retrieval index issue respectively, and I would compare
 per-attempt with per-step rates to see whether retries are already masking part of it. If instead

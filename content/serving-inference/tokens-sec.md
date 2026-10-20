@@ -5,7 +5,7 @@ name: Tokens per second
 kind: metric
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/tpot
   - serving-inference/throughput-vs-latency
@@ -69,6 +69,17 @@ stops when KV memory is full and new requests queue. The two curves cross whatev
 some concurrency; that crossing, not the plateau, is the capacity you can sell for interactive
 traffic.
 
+"Aggregate ≈ concurrency × per-stream rate" is only the decode-phase view. Little's law makes it exact
+in steady state: requests per second = concurrency / mean request latency, so
+
+```
+aggregate_output_tok/s ≈ concurrency × n_out / (TTFT + (n_out − 1) × TPOT)
+```
+
+With 64 in flight, TPOT 25 ms and TTFT 500 ms, 1,000-token answers give about 64 × 1000 / 25.5 s ≈
+2,500 tokens/s, while 50-token answers give 64 × 50 / 1.7 s ≈ 1,900 tokens/s on the same engine,
+because each slot spends almost a third of its life in queue and prefill rather than decoding.
+
 ### What moves the numbers
 - **Bytes per step:** model size and weight precision set the floor of per-stream speed.
 - **Memory bandwidth:** the hardware term; FLOPs matter only once compute binds at high batch.
@@ -99,9 +110,11 @@ at concurrency 1 for 200 tokens/s and the same GPU-hour yields $4.17 per million
 entire economics of batching, and it is why the concurrency you choose is a pricing decision.
 
 ## Example
-A small closed-loop load generator against any OpenAI-compatible streaming server. It reports
-aggregate output tokens/s, median per-stream rate and TTFT percentiles at several concurrency levels,
-which is the curve you need before setting a per-replica concurrency limit.
+A small closed-loop load generator against any OpenAI-compatible streaming server: *c* workers each
+send a request, wait for it to finish, and send the next, so concurrency stays near *c* for the
+whole run. It reports aggregate output tokens/s (total tokens over wall time, not an average of
+per-request rates), median per-stream rate and TTFT percentiles at several concurrency levels, which
+is the curve you need before setting a per-replica concurrency limit.
 
 ```python
 import asyncio, statistics, time
@@ -122,15 +135,19 @@ async def one(max_tokens=256):
             t_first = time.perf_counter()
     return t_first - t0, n, time.perf_counter() - t0
 
-async def level(c: int):
+async def level(c: int, per_worker: int = 4):
+    res = []
+    async def worker():                    # closed loop: send the next request when one finishes
+        for _ in range(per_worker):
+            res.append(await one())
     t0 = time.perf_counter()
-    res = await asyncio.gather(*(one() for _ in range(c)))
+    await asyncio.gather(*(worker() for _ in range(c)))
     wall = time.perf_counter() - t0
-    out = sum(n for _, n, _ in res)                                   # total output tokens
+    out = sum(n for _, n, _ in res)                                   # total output tokens / wall time
     per_stream = [n / (total - ttft) for ttft, n, total in res if n > 1]
     ttfts = sorted(ttft for ttft, _, _ in res)
     print(f"c={c:3d}  aggregate={out / wall:7.0f} tok/s  per-stream p50={statistics.median(per_stream):5.0f} tok/s"
-          f"  TTFT p50={ttfts[len(ttfts)//2]*1e3:5.0f} ms  p_max={ttfts[-1]*1e3:5.0f} ms")
+          f"  TTFT p50={ttfts[len(ttfts)//2]*1e3:5.0f} ms  p95={ttfts[int(len(ttfts)*.95)]*1e3:5.0f} ms")
 
 async def main():
     await one()                                                       # warm-up
@@ -138,7 +155,8 @@ async def main():
         await level(c)
 asyncio.run(main())
 # Typical shape: aggregate climbs steeply then flattens; per-stream falls gently then faster;
-# TTFT max jumps when the engine starts queueing. Pick the largest c that still meets your SLOs.
+# TTFT p95 jumps when the engine starts queueing. Pick the largest c that still meets your SLOs.
+# A closed loop never offers more than c requests, so rerun open-loop before trusting the limit.
 ```
 
 ## Trade-offs

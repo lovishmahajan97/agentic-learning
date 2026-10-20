@@ -5,6 +5,7 @@ name: Evaluation gates for production releases
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - llmops-platform/ci-cd-for-prompts-and-models
   - llmops-platform/canary-shadow-deployments
@@ -79,8 +80,11 @@ inconclusive as pass lets regressions through and treating it as fail teaches pe
 lucky. With many slices, false alarms multiply, so slice verdicts default to review rather than block,
 or margins are widened.
 
-A worked instance: 400 items, champion pass rate 0.82, candidate 0.84, mean paired difference +2.0
-points, bootstrap 95% interval [−0.5, +4.5]. With δ = 2, the lower bound −0.5 is above −2, so the gate
+A worked instance (illustrative numbers): 400 items, champion pass rate 0.82, candidate 0.84, mean paired
+difference +2.0 points, bootstrap 95% interval [−0.5, +4.5]. The interval's width depends on how many
+items changed verdict between the two bundles: for pass/fail scores the per-item differences are −1, 0
+or +1, so their variance is roughly the discordant fraction, and a half-width of 2.5 points at n = 400
+corresponds to about one item in fifteen flipping. With δ = 2, the lower bound −0.5 is above −2, so the gate
 passes, but the interval includes zero, so the release note may not claim an improvement. Had the interval
 been [−3.5, +0.5], the lower bound would fall below −δ while the upper bound sits above it: inconclusive,
 needs review, probably a larger paired run.
@@ -193,9 +197,12 @@ wants to ship it as an improvement. What does your gate say, and what do you tel
 **A:** First confirm both runs share the dataset and scorer versions and that the champion was re-run,
 not read from history. Then compute the paired bootstrap interval on the 300 per-item differences; at
 this size a 1.5-point mean difference will very likely have an interval that includes zero, so the gate
-can report non-inferior for a two-point margin but cannot certify an improvement. Check the absolute
+cannot certify an improvement. Whether it can even report non-inferior for a two-point margin depends on
+how many items flipped: the lower bound is about 1.5 minus the half-width, so it clears −2 only if the
+half-width is under 3.5 points, which at n = 300 means roughly fewer than one item in ten changing
+verdict; with more churn than that the verdict is needs-review, not pass. Check the absolute
 floors, the per-slice verdicts and the cost and latency budgets, since a longer prompt often buys its
-points with tokens. Tell the PM the change is safe to ship if everything else passes, that "improvement"
+points with tokens. Tell the PM the change is safe to ship if the gate passes and everything else does too, that "improvement"
 needs either a larger paired run or a canary that shows it in live metrics, and that the release note
 should say "no regression" until then.
 

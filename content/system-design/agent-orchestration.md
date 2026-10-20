@@ -5,7 +5,7 @@ name: Agent orchestration
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agents/workflows-vs-agents
   - agents/state-machines
@@ -83,11 +83,16 @@ The orchestrator executes the graph and owns the cross-cutting concerns, *becaus
 means every node reimplements them differently:
 - **Persistence.** Checkpoint state after each node so a run can resume at the node where it stopped.
   This is also what makes human-in-the-loop possible: an interrupt is a checkpoint plus a status, and
-  resumption is loading it and continuing.
+  resumption is loading it and continuing. Note the semantics this gives you: a crash *after* a node
+  finishes but *before* its checkpoint is written re-runs that node on resume, so node execution is
+  at-least-once, never exactly-once. That single fact is why side-effecting nodes need idempotency keys
+  and why model-calling nodes should be safe to repeat.
 - **Policies.** Step and cost budgets, per-node timeouts, retry with backoff for transient failures, and
   idempotency keys for nodes with side effects so a retry does not repeat them.
 - **Concurrency.** Fan-out and join primitives with limits, so parallel branches do not exhaust rate
-  limits.
+  limits. When parallel branches write to the same state field, the runtime needs an explicit merge rule
+  (append to a list, take the max, last-writer-wins); LangGraph calls these reducers. Without one, the
+  branch that finishes last silently overwrites the others.
 - **Events.** A structured stream per run (node started, model called, tool result, waiting for
   approval, done) that clients subscribe to, *because* long runs need progress and operators need traces.
 - **Cancellation.** A cooperative stop signal checked between nodes, with in-flight tool calls either
@@ -98,6 +103,15 @@ For short runs an orchestrator can execute inside a request. For runs that wait 
 scheduled follow-ups) orchestration must be event-driven: a run advances when an event arrives, workers
 are stateless, and the durable state is in the store. This is where agent orchestration meets workflow
 engines such as Temporal; the graph is the same, the executor is a durable one.
+
+### Orchestration versus choreography
+Everything above is *orchestration*: one component holds the graph and tells each step when to run.
+The alternative, *choreography*, has no central owner: each agent or service reacts to events on a bus
+and emits its own. Choreography couples components less and scales organisationally, but the end-to-end
+flow exists only implicitly in the sum of subscriptions, so "where is run 42 and why did it stop?" has no
+single answer. For LLM applications, where steps are non-deterministic and budgets and approvals must be
+enforced per run, a central orchestrator per run is the usual choice; choreography fits the boundaries
+*between* runs and systems (a finished run emits an event another team's pipeline consumes).
 
 ### Frameworks
 Graph libraries such as LangGraph give you the state graph, checkpointing and interrupts; vendor agent
@@ -118,18 +132,22 @@ class State:
     ticket: str
     draft: str = ""
     score: float = 0.0
+    critique: str = ""
     approved: bool | None = None
     step: int = 0
     status: str = "running"
     history: list = field(default_factory=list)
 
-def draft_reply(s): s.draft = call_model(f"Draft a reply to: {s.ticket}").text; return s
-def grade(s):       s.score = float(call_model(f"Score 0-1 for policy compliance:\n{s.draft}").text); return s
-def approval(s):    # interrupt node: nothing to compute until a human acts
+def draft_reply(s):
+    s.draft = call_model(f"Draft a reply to: {s.ticket}\nFix these issues if any: {s.critique}").text; return s
+def grade(s):        # evaluator: structured output, so the router can branch on a number
+    g = call_model(f"Policy compliance of this draft as JSON {{score: 0-1, critique}}:\n{s.draft}").json
+    s.score, s.critique = float(g["score"]), g["critique"]; return s
+def approval(s):     # interrupt node: nothing to compute until a human acts
     if s.approved is None: s.status = "waiting_approval"
     elif not s.approved:   s.status = "rejected"
     return s
-def send(s):        mail.send_idempotent(key=f"{s.ticket}:send", body=s.draft); s.status = "done"; return s
+def send(s):         mail.send_idempotent(key=f"{s.ticket}:send", body=s.draft); s.status = "done"; return s
 
 NODES = {"draft_reply": draft_reply, "grade": grade, "approval": approval, "send": send}
 EDGES = {"draft_reply": "grade",                                                          # static edge
@@ -148,8 +166,17 @@ def run(run_id, store, max_steps=10):
         store.save(run_id, asdict(s), cursor=node)                  # checkpoint after every node
         emit(run_id, node=s.history[-1], score=s.score)
     return s
-# A human sets approved=True and status="running" in the store; run(run_id, store) then resumes at "approval".
 ```
+
+Trace one ticket. `draft_reply` (step 1) → `grade` returns 0.55 with the critique "promises a refund
+date" (step 2) → the router loops back → `draft_reply` uses the critique (step 3) → `grade` returns
+0.82 (step 4) → `approval` finds `approved is None`, sets `waiting_approval` and the run returns at step 5
+with its cursor on `approval`; no worker is held. Hours later the approval service writes
+`approved=True, status="running"` and calls `run` again: it loads the checkpoint, re-enters `approval`,
+routes to `send`, and finishes. If the process dies after `send` sends but before its checkpoint, the
+resume re-runs `send`, and the idempotency key `ticket:send` turns the second send into a no-op. The
+`s.step < 6` guard in the router and `max_steps` in the loop are two independent bounds on the
+revise cycle, one per level.
 
 ## Trade-offs
 - Explicit graphs make paths enumerable and testable, but every new behaviour is a code change; a
@@ -172,6 +199,8 @@ def run(run_id, store, max_steps=10):
   forever at increasing cost with no termination.
 - Treating human approval as a blocking call in a worker; the symptom is held connections, worker
   exhaustion and runs lost when the process restarts.
+- Parallel branches writing the same state key without a reducer; the symptom is a fan-out of three
+  searches whose joined result contains only one branch's findings, varying run to run.
 - No per-run event stream; the symptom is users seeing a spinner for minutes and operators unable to say
   which node a stuck run is in.
 

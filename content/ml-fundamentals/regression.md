@@ -5,7 +5,7 @@ name: Regression
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/loss-functions
@@ -50,9 +50,16 @@ not just the model.
 ŷ = f_θ(x). The simplest form is linear, ŷ = wᵀx + b, and it is more powerful than it looks because x
 can contain transformed features: log(tokens), tokens², an embedding, an indicator for the model tier.
 A neural regressor is the same final linear layer applied to learned features. A reward model is an LLM
-whose output head produces a single scalar instead of vocabulary logits.
+whose output head produces a single scalar instead of vocabulary logits. Note that "logistic regression"
+is a classifier despite its name: it regresses the log-odds, then thresholds a probability.
 
 ### The loss decides what you estimate
+Why a loss picks a statistic: at a fixed x, choose the single prediction c that minimises the expected
+loss over the noisy y values seen there. For squared error, d/dc E[(c − y)²] = 2(c − E[y]) = 0 gives
+c = E[y], the mean. For absolute error, the derivative of E|c − y| is P(y < c) − P(y > c), zero when half
+the mass lies on each side: the median. On latencies of 100, 110, 120 and 2,000 ms, MSE wants about 583 ms and
+MAE anything between 110 and 120 ms; neither is wrong, they answer different questions.
+
 - **Mean squared error**, mean (ŷ − y)². The minimiser is E[y | x], the conditional mean. The gradient
   2(ŷ − y) grows with the error, so a point 10× further away pulls 10× harder; outliers dominate.
 - **Mean absolute error**, mean |ŷ − y|. The minimiser is the conditional median. The gradient is ±1
@@ -76,7 +83,10 @@ afterthought (see the gradient-descent lesson).
 ### Regularisation
 Ridge adds λ||w||² and shrinks coefficients, which stabilises the fit when features are collinear and
 still has a closed form, (XᵀX + λI)⁻¹Xᵀy. Lasso adds λ||w||₁ and drives some coefficients exactly to
-zero, which selects features. Weight decay in deep networks is ridge by another name.
+zero, which selects features. The reason to pay this bias is variance: as the number of features
+approaches the number of rows, least squares starts fitting noise and test error climbs while training
+error falls; λ, chosen by cross-validation, sets where you sit on that trade. Weight decay in deep
+networks is the same idea (for plain SGD it is exactly ridge; for Adam see the optimizers lesson).
 
 ### Evaluation
 RMSE is in the units of the target and punishes large errors; MAE is easier to explain and robust; R²
@@ -100,7 +110,9 @@ because prompt lengths in the thousands make the raw problem badly conditioned.
 import numpy as np
 rng = np.random.default_rng(0)
 
-# Synthetic serving logs (illustrative): latency ≈ 40 + 0.05*prompt_tokens + 25*output_tokens + noise
+# Synthetic serving logs (illustrative): latency ≈ 40 + 0.05*prompt_tokens + 25*output_tokens + noise.
+# Output tokens are fine for *explaining* past latency (per-token decode cost for capacity planning);
+# a request-time predictor could not use them, because they are unknown before generation (see Pitfalls).
 n = 5000
 prompt = rng.integers(50, 4000, n); out = rng.integers(1, 400, n)
 latency = 40 + 0.05 * prompt + 25 * out + rng.normal(0, 30, n)

@@ -5,6 +5,7 @@ name: API versioning & backward compatibility
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - backend-fundamentals/rest-graphql-api-design
   - fastapi-for-ai/openapi-contract-testing
@@ -18,7 +19,7 @@ sources:
   - IETF RFC 8594 — The Sunset HTTP Header Field
   - Official docs: Stripe API versioning
   - Official docs: Anthropic API versions
-  - Wright, 2012 — Hyrum's Law
+  - Winters, Manshreck & Wright, 2020 — Software Engineering at Google (Hyrum's Law)
 ---
 
 ## TL;DR
@@ -71,8 +72,8 @@ knowingly. This is Postel's principle applied with judgement, *because* total le
   `anthropic-version` date): keeps URLs stable and allows per-request choice; harder to try in a
   browser and easy to forget in a proxy.
 - **Pinned date per account** (Stripe's approach): each account is pinned to the version current
-  when it signed up; the server applies a chain of transformations to render new behaviour in old
-  shapes. Maximum compatibility, maximum server-side machinery.
+  when it first called the API, overridable per request with a `Stripe-Version` header; the server
+  applies a chain of transformations to render new behaviour in old shapes. Maximum compatibility, maximum server-side machinery.
 - **Query parameter** (`?version=2`): simple but mixes with filters and cache keys.
 - **Evolution only** (GraphQL's stance): no versions; add fields, mark old ones `@deprecated`, remove
   after usage reaches zero.
@@ -82,8 +83,9 @@ Whichever you choose, keep one implementation and render versions at the edge as
 
 ### Deprecation lifecycle
 Announce in docs and changelog; emit `Sunset` (RFC 8594, an HTTP date) and a `Link` to the migration
-guide on old-version responses, and mark the route deprecated in OpenAPI; a standardized `Deprecation`
-header also exists, so check its current value format before emitting it. Measure requests per
+guide on old-version responses, and mark the route deprecated in OpenAPI. RFC 9745 (2025) adds a
+`Deprecation` header whose value is a structured-field date (`@` followed by Unix seconds) and a
+`deprecation` link relation for the migration guide. Measure requests per
 version per client so you know who is left. Run brownouts (short planned outages of the old version)
 before removal. Remove on the announced date.
 
@@ -114,7 +116,7 @@ class SummaryV2(BaseModel):             # current shape: renamed field, structur
     model: str
 
 class SummaryV1(BaseModel):             # frozen shape old clients depend on
-    model_config = ConfigDict(extra="ignore")   # tolerant: unknown fields are dropped, not errors
+    model_config = ConfigDict(extra="ignore")   # Pydantic's default, spelled out: unknown input dropped
     id: str
     summary: str                        # renamed to `text` in v2, hence the shim below
 
@@ -131,7 +133,8 @@ async def create_v2(doc_id: str):
 @v1.post("/summaries", response_model=SummaryV1, deprecated=True)   # flagged in OpenAPI docs
 async def create_v1(doc_id: str, response: Response):
     s = await summarize(doc_id)                      # one implementation, two representations
-    response.headers["Sunset"] = "Sat, 31 Oct 2026 00:00:00 GMT"
+    response.headers["Deprecation"] = "@1767225600"            # RFC 9745: deprecated since 2026-01-01
+    response.headers["Sunset"] = "Sat, 31 Oct 2026 00:00:00 GMT"  # RFC 8594: removal date
     response.headers["Link"] = '</docs/migrate-v2>; rel="deprecation"'
     return SummaryV1(id=s.id, summary=s.text)        # render the old shape; drop fields v1 never promised
 

@@ -5,7 +5,7 @@ name: Token / cost tracking
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - observability/monitoring
   - observability/spans
@@ -91,12 +91,26 @@ records and the trace.
 
 ### Why conversations are expensive: a worked example
 Suppose a system prompt plus tool definitions is 1,500 tokens and each turn adds about 300 user
-tokens and 400 assistant tokens. Turn *n* sends the whole history, so its input is roughly
-1,500 + 700 × (n − 1). Over a 20-turn conversation total input is 20 × 1,500 + 700 × (0 + 1 + … + 19)
-= 30,000 + 133,000 = 163,000 tokens, against only 8,000 output tokens. Input dominates by a factor of
-twenty even though output is priced higher per token, and the last turn alone sends about ten times
-the input tokens of the first. This arithmetic is why prompt caching (the repeated prefix is billed at a discount) and
-history compaction exist, and why cost per conversation must be tracked separately from cost per turn.
+tokens and 400 assistant tokens. Turn *n* sends the system prompt, the *n* − 1 earlier exchanges and
+the new user message, so its input is 1,800 + 700 × (n − 1). Over a 20-turn conversation total input
+is 20 × 1,800 + 700 × (0 + 1 + … + 19) = 36,000 + 133,000 = 169,000 tokens, against only 8,000
+output tokens. The history term grows with the square of the turn count, the last turn alone sends
+about eight times the input of the first (15,100 versus 1,800 tokens), and input outnumbers output
+about twenty to one. At illustrative prices of 2 and 10 dollars per million input and output tokens,
+that is about 0.34 dollars of input against 0.08 of output: input dominates the bill even though each
+output token costs five times as much. This arithmetic is why prompt caching (the repeated prefix is
+billed at a discount) and history compaction exist, and why cost per conversation must be tracked
+separately from cost per turn.
+
+### Beyond text tokens
+Not every cost is a text token on the main model. Images and audio are converted to tokens by
+provider-specific rules (image cost typically depends on resolution), some server-side tools are billed
+per call on top of tokens, and embeddings, rerankers, guardrail classifiers and LLM-as-judge calls are
+separate metered calls that belong to the same feature. For a self-hosted model the meter is GPU time,
+so cost per token is derived: GPU cost per hour divided by tokens actually served per hour, which
+makes utilisation, not list price, the number that moves it. Each of these needs its own usage record
+and price row, or the feature's cost is understated by exactly the parts nobody thought of as "the
+LLM".
 
 ### Budgets and enforcement
 With per-call records flowing, budgets become comparisons: soft alerts when a tenant or feature
@@ -174,6 +188,9 @@ print(f"cold cache: {cost_usd('example-model', cold):.4f} USD")   # 0.0168+0.003
   zero-token records for exactly the streaming routes.
 - Counting only the successful final call and not retries, fallbacks or judge calls; the symptom is a
   dashboard that undercounts by the retry rate and never matches the invoice on bad-provider days.
+- Ignoring reasoning tokens; reasoning models bill their hidden reasoning as output tokens, so the
+  symptom is output-token counts and cost far above what the visible answer's length would suggest,
+  with no explanation unless reasoning tokens are recorded as their own field.
 - Recomputing historical cost with current prices after a price change; the symptom is last month's
   cost "changing" in reports.
 - Reporting average cost per request for agent features; the symptom is a budget blown by a handful of
@@ -231,9 +248,10 @@ argument for recording them from the start.
 - [x] Later turns resend the whole history, so total input tokens grow roughly quadratically with turn count and dwarf output tokens
 - [ ] Output tokens dominate because they are priced higher
 - [ ] Prompt caching makes the history free after the first turn
-> Turn n sends roughly 1,500 + 700(n−1) input tokens; summed over 20 turns that is about 163,000
-> input tokens against 8,000 output. Caching discounts the repeated prefix but does not make it free,
-> and only while the prefix is reused within the cache window.
+> Each turn resends the system prompt and every earlier exchange, so input per turn grows by about
+> 700 tokens a turn and the total grows with the square of the turn count, well past 150,000 tokens
+> over 20 turns. Caching discounts the repeated prefix but does not make it free, and only while the
+> prefix is reused within the cache window.
 
 ### Q: Why is "cost per successful task" a better comparison than "cost per request" when evaluating a cheaper model for an agent feature?
 - [ ] Requests cannot be counted for agents

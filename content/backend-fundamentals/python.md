@@ -5,6 +5,7 @@ name: Python
 kind: tool
 difficulty: intro
 est_minutes: 10
+status: fact-checked
 related:
   - python-for-ai/async-await
   - python-for-ai/gil
@@ -37,7 +38,7 @@ reimplementing those pieces, shelling out to Python anyway, or maintaining two s
 
 The obvious objection is "Python is slow, serve it in Go or Java". It fails on arithmetic. A model call
 takes hundreds of milliseconds to tens of seconds; the request-handling overhead that a faster
-language would shave is measured in microseconds. The hot loops that matter, matrix multiplies and
+language would shave is measured in microseconds to low milliseconds. The hot loops that matter, matrix multiplies and
 tokenization, already run in C, C++, Rust or CUDA underneath the Python API. What Python must do well
 is wait on many model calls at once, and `asyncio` does exactly that.
 
@@ -54,8 +55,9 @@ thread-safe without it. Threads still help for I/O: the interpreter drops the GI
 system calls, and well-behaved C extensions (NumPy, PyTorch, hashing, compression) release it during
 long native work. For CPU-bound pure-Python code, use `multiprocessing` or `ProcessPoolExecutor`, which
 sidestep the GIL by running separate interpreters. Python 3.13 added an experimental free-threaded
-build (PEP 703) that removes the GIL, but it is opt-in and the ecosystem is still catching up, so plan
-as if the GIL is there.
+build (PEP 703) that removes the GIL, and 3.14 made that build officially supported, but it is still a
+separate opt-in build rather than the default and not every C extension supports it yet, so plan as if
+the GIL is there.
 
 ### asyncio: waiting without threads
 An `async def` function is a coroutine; `await` hands control back to the event loop until the awaited
@@ -103,7 +105,7 @@ async def classify(client: httpx.AsyncClient, text: str) -> Verdict | None:
     async with SEM:                             # waits without holding a thread
         r = await client.post("http://localhost:8000/v1/classify", json={"text": text}, timeout=30)
     try:
-        return Verdict.model_validate(r.json())  # runtime check of the model's structured output
+        return Verdict.model_validate_json(r.content)  # runtime check; bad JSON is a ValidationError too
     except ValidationError:
         return None
 
@@ -118,7 +120,7 @@ async def main(texts: list[str]):
         counts = await asyncio.gather(*(loop.run_in_executor(pool, count_words, t) for t in texts))
     return list(zip(verdicts, counts))
 
-if __name__ == "__main__":                      # required for process pools on macOS/Windows
+if __name__ == "__main__":                      # required when workers are spawned, not forked
     print(asyncio.run(main(["refund my order", "great product"] * 50)))
 ```
 
@@ -186,8 +188,9 @@ when the model, eval and SDK ecosystem is Python-first.
 - [ ] A NumPy matrix multiply over a batch of embeddings
 - [x] A pure-Python loop that parses a 500 MB log file line by line
 - [ ] Reading configuration from environment variables at startup
-> Pure-Python CPU work holds the GIL and blocks the event loop; a process pool runs it in separate
-> interpreters. NumPy releases the GIL in native code, and awaited HTTP calls are I/O-bound.
+> Pure-Python CPU work holds the GIL, so neither the event loop nor a thread can overlap it; only a
+> separate process can. A long NumPy multiply also blocks the loop if run inline, but it releases the GIL,
+> so a thread in the same process (`asyncio.to_thread`) suffices. Awaited HTTP calls are I/O-bound.
 
 ### Q: What does a Pydantic model add that a type hint alone does not?
 - [ ] It makes the interpreter reject wrongly typed arguments at call time

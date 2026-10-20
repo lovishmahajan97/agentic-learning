@@ -4,8 +4,8 @@ module: system-design
 name: Multi-tenancy
 kind: concept
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - system-design/tenant-isolation
   - reliability/tenant-level-quotas-and-noisy-neighbor-isolation
@@ -63,8 +63,10 @@ The AWS SaaS Lens vocabulary is useful because it names the options precisely:
   `tenant_id` column on every table, one vector index with tenant metadata, one model-serving fleet.
   Cheapest and simplest to operate; isolation depends entirely on correct filtering and quotas.
 - **Bridge.** Shared infrastructure, partitioned structure: a schema or namespace per tenant in a shared
-  database, a collection per tenant in the vector store. Stronger separation and per-tenant migration is
-  possible, at the cost of N schemas to manage and connection-pool pressure.
+  database, a collection per tenant in the vector store. Stronger separation, per-tenant backup and
+  restore, and per-tenant migration timing become possible, at the cost of running every migration N
+  times, a catalog that grows with N × tables, and multiplied connection pools if each tenant gets its own
+  database credentials.
 - **Silo.** A dedicated resource per tenant: separate database, cluster or whole stack. Strongest
   isolation, highest cost, and the operational model drifts back toward one-deployment-per-customer.
 
@@ -72,6 +74,33 @@ Most real systems mix them *per resource and per tier*: pooled compute and a poo
 self-serve customers, bridge databases for mid-market, silo for the enterprise tier that pays for it.
 The architecture decision is not "which model" but "which model for which resource, and what moves a
 tenant between tiers".
+
+### The tenant directory: placement as data
+"Which model for which resource" only works if placement is data rather than code. A control-plane
+**tenant directory** maps each tenant to its tier, region, cell, database or schema, index namespace and
+encryption-key ID. The data plane looks the tenant up (and caches the answer) on every request, *because*
+that indirection is what lets you move a tenant without touching callers. Moving a tenant from pool to
+silo then has a fixed shape: provision the new placement, copy the data, dual-write or freeze writes for
+the cut-over window, verify row and vector counts, flip the directory entry, and only then delete from
+the old placement. Larger SaaS systems extend this into **cells**: several identical, independently
+deployed pooled stacks, each holding a subset of tenants, so a bad deploy or a runaway tenant hurts one
+cell rather than everyone. Cells cap blast radius at the price of a routing layer and N fleets to deploy.
+
+### Tenant is a boundary, not an authorisation model
+The tenant is the outer boundary of data ownership; inside it, users still have roles and documents
+still have ACLs. Scoping retrieval by tenant is necessary but not sufficient: an intern and the CFO of
+the same tenant must not retrieve the same board minutes. Decide early which level of the customer
+hierarchy (reseller, organisation, workspace) is the isolation boundary, because that is the key every
+store is partitioned by, and changing it later means re-keying everything.
+
+### Lifecycle: onboarding and offboarding
+Onboarding creates the directory entry, configuration, keys and any dedicated resources in one
+idempotent workflow, so a half-failed signup can simply be retried. Offboarding is harder and is where
+audits find gaps: deleting a tenant must reach the primary database, the vector index, object storage,
+caches, queues, logs and traces, evaluation samples, fine-tuned adapters and, on their retention
+schedule, backups. In a silo this is "drop the stack"; in a pool it is a delete keyed by tenant across
+every store, which only works if every store carries the key. Per-tenant encryption keys turn the backup
+problem into deleting one key (crypto-shredding).
 
 ### Tenant-aware configuration
 Tenants differ in more than data. A tenant record carries the model (or model tier) it is allowed to use,
@@ -166,6 +195,8 @@ async def enqueue_ingestion(doc_id: str):
   or handlers that run as "no tenant" and either fail or write into the wrong partition.
 - Hard-coding exceptions for a big customer in the code; the symptom is a release that breaks only for
   them, discovered in production because the test suite has no such tenant.
+- Offboarding by deleting database rows only; the symptom is a departed customer's document resurfacing
+  from the vector index or a cached answer, or a deletion audit finding it in traces and eval samples.
 - Measuring cost per model but not per tenant; the symptom is a tenant on a flat plan quietly consuming
   most of the token budget with no alarm until the invoice.
 

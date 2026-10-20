@@ -5,7 +5,7 @@ name: Saga pattern & distributed transactions
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - system-design/outbox-inbox-patterns
   - system-design/event-driven-architecture
@@ -48,6 +48,16 @@ effect is exactly the one that cannot participate. Availability also compounds: 
 participant up at the same moment, which is the temporal coupling that event-driven designs try to
 remove.
 
+2PC is not dead, though; it has moved inside systems that can make its weak point safe. Spanner-style
+databases run 2PC across shards, but each participant and the coordinator is itself a replicated
+consensus group, so "the coordinator crashed" means a new leader of that group takes over with the
+decision already in its log and nobody blocks for long. The XA standard exposes 2PC across a database
+and a broker that both implement it, which works inside one organisation's infrastructure and still
+excludes every SaaS API. Three-phase commit adds a pre-commit round to avoid blocking under crash
+failures, but it can decide inconsistently under network partitions, so it is rarely deployed. The
+lesson: atomic commit across participants is available when you own all of them and replicate the
+coordinator; a business process across vendors is not that case.
+
 The saga, proposed in 1987 for long-lived database transactions, accepts that there is no global
 rollback and designs the undo explicitly instead. That design work, deciding what "undo a charge" means
 and when it is no longer possible, is the real content of the pattern.
@@ -59,13 +69,23 @@ For every Tᵢ that may need undoing there is a compensating transaction Cᵢ. I
 Cₖ₋₁, Cₖ₋₂, … C₁ in reverse order. The end state is either "all Tᵢ committed" or "every committed Tᵢ
 compensated", which is the saga's version of atomicity. Durability comes from each local commit plus a
 persisted saga log that records which step the saga has reached, *because* the coordinator process may
-crash between steps and must resume rather than restart.
+crash between steps and must resume rather than restart. The log records intent before each step
+(`started charge_card`) and the outcome after (`done charge_card`): on recovery, a step with `started`
+but no `done` is exactly the unknown-outcome case below, and it is resolved by querying the participant
+with the step's idempotency key, never by assuming either answer.
 
 ### Compensation is semantic, not physical
 A rollback restores bytes; a compensation is a new business action that cancels the effect. "Charge
 card" is compensated by "refund", not by deleting the charge, and the refund is visible on the
 statement. "Reserve stock" is compensated by "release reservation". "Send email" has no compensation; at
 best you send a correction. This is why step ordering matters more in sagas than in transactions.
+
+A step can be made cheaper to undo by splitting it into a reservation and a confirmation, the
+**Try-Confirm-Cancel (TCC)** shape: *try* places a hold that expires on its own (a seat hold, a card
+authorisation), *confirm* turns it into the real effect at the end of the saga, and *cancel* releases it.
+Holding instead of acting means most compensations are "let the hold lapse or release it", which is
+invisible to the customer, *because* nothing irreversible happened until confirm. The cost is that the
+participant must support holds, and a hold's expiry must outlast the slowest path to confirm.
 
 ### Compensatable, pivot and retriable steps
 Classify each step. **Compensatable** steps can be undone. The **pivot** is the step after which the saga
@@ -128,6 +148,7 @@ def run_saga(saga_id, steps, ctx, saga_log):
     done = []                                        # steps whose action committed
     for step in steps:
         key = f"{saga_id}:{step.name}"               # same key on every retry of this step
+        saga_log.append(("started", step.name))      # intent first: recovery sees in-flight steps
         try:
             ctx[step.name] = step.action(ctx, idempotency_key=key)
             saga_log.append(("done", step.name)); done.append(step)
@@ -188,6 +209,8 @@ no-ops on the second pass, so only the email is actually retried.
   mid-flight, and the compensation overwrites their change, surfacing as "the system reverted my edit".
 - No saga log or heartbeat; the orchestrator crashes between steps, nobody resumes, and orders sit in
   `PENDING` until a customer complains.
+- Holds that expire before the saga confirms them; sagas that wait on a human approval or a slow
+  partner fail at confirm with "hold not found", and the seat or authorisation is gone.
 - Treating the LLM as a step that can be redone freely; re-running a non-deterministic step on retry
   produces different tool arguments, so the compensation keyed to the first attempt no longer matches.
 

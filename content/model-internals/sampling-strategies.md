@@ -5,7 +5,7 @@ name: Sampling strategies (temperature, top-k / top-p, greedy vs beam)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - model-internals/logits
   - model-internals/softmax
@@ -41,9 +41,10 @@ highest-likelihood continuations are exactly the bland, repetitive ones; human t
 *less* likely than beam output under the model, because people say surprising things.
 
 Pure sampling from the full distribution avoids blandness but has the opposite failure. Each step
-places a few percent of mass on the tail collectively, so over a few hundred tokens the sampler will
-draw a nonsensical token, and once a derailment is in the context, the model conditions on it and the
-text degrades. Temperature, top-k and top-p exist to keep the diversity of sampling while cutting off
+places a few percent of mass on the tail collectively, and small per-step risks compound: if 2% of the
+mass at each step sits on tokens that do not fit (an illustrative figure), the chance of a 300-token
+answer avoiding all of them is 0.98³⁰⁰ ≈ 0.2%. The sampler will draw a nonsensical token, and once a
+derailment is in the context, the model conditions on it and the text degrades. Temperature, top-k and top-p exist to keep the diversity of sampling while cutting off
 the tail that causes incoherence.
 
 ## How it works
@@ -71,6 +72,11 @@ frequency and presence penalties sit earlier in the same pipeline and lower the 
 already appeared.
 
 ### Searching: greedy versus beam
+Why greedy is not optimal, in numbers: suppose the first step offers A at 0.5 and B at 0.4, and the
+best continuation after A has probability 0.3 while the best after B has 0.9. Greedy commits to A and
+ends with a sequence probability of 0.5 × 0.3 = 0.15; keeping both prefixes alive finds B then its
+continuation at 0.4 × 0.9 = 0.36. A locally weaker token can open a far more likely sequence.
+
 Greedy is beam search with `B = 1`. Beam search expands each of *B* partial sequences by the vocabulary,
 scores all candidates by cumulative log-probability, keeps the best *B*, and repeats until each beam
 ends; a length penalty is usually applied because longer sequences accumulate more negative log-prob and

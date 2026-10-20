@@ -5,7 +5,7 @@ name: Batch size
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/gradient-accumulation
@@ -71,9 +71,28 @@ more hardware. With `B ≫ B_noise`, doubling `B` leaves `S` unchanged and doubl
 `B = B_noise` both are 2× their minimum, which is why the noise scale is a sensible "critical" batch size.
 Two consequences follow. The noise scale *grows* during training, because `|G|` shrinks as the loss falls
 while the per-example noise does not, so the useful batch size is larger late in training than early;
-this is why some pre-training recipes ramp the batch size up over the first part of the run. And harder
-tasks and larger models tend to have a larger noise scale, which is why LLM pre-training uses batches of
-millions of tokens while a small classifier saturates at a few hundred examples.
+this is why some pre-training recipes ramp the batch size up over the first part of the run. And the
+noise scale tracks how low a loss the run reaches and how hard the task is: the scaling-law work of
+Kaplan et al. found the critical batch to depend mainly on the loss rather than directly on parameter
+count (later studies dispute the details), which is why LLM pre-training, reaching low losses on a hard
+task, uses batches of millions of tokens while a small classifier saturates at a few hundred examples.
+
+### Measuring the noise scale
+You do not have to guess it. Because the squared norm of a mini-batch gradient is biased upward by the
+noise, `E|G_B|² = |G|² + tr(Σ)/B`, measuring the gradient norm at two batch sizes gives two equations in
+the two unknowns:
+
+```
+|G|²   ≈ (B_big · |G_big|² − B_small · |G_small|²) / (B_big − B_small)
+tr(Σ)  ≈ (|G_small|² − |G_big|²) / (1/B_small − 1/B_big)
+B_simple = tr(Σ) / |G|²
+```
+
+Under data parallelism both are free: each rank's local gradient before the all-reduce is the small
+batch, and the reduced gradient is the big one. The individual estimates are noisy, so average the
+numerator and denominator separately over many steps (an exponential moving average) before dividing.
+`B_simple` assumes a well-conditioned loss surface, so treat it as an order-of-magnitude guide to where
+the critical batch is and how it moves during training, not a value to set to the nearest token.
 
 ### Learning rate must move with batch size
 A bigger batch justifies a bigger step, because the step is computed from a more trustworthy gradient.
@@ -172,7 +191,8 @@ Treat batch size as the first number fixed in a training plan, because the learn
 count all follow from it. For fine-tuning, start small enough to get at least a few hundred optimizer
 steps over the run, then raise the micro-batch until the GPU is busy and use accumulation only to reach a
 target effective batch. For pre-training or large-scale continued training, pick the effective batch from
-the model's expected noise scale (prior runs of similar size are the best guide), consider ramping it,
+the model's expected noise scale (prior runs of similar size are the best guide, and the two-batch
+estimator measures it on the live run), consider ramping it,
 and scale the learning rate when the batch changes. Always compare runs on loss versus tokens, not loss
 versus steps. In interviews, the depth expected is the noise-scale argument, the coupling with learning
 rate, and the distinction between micro-batch, effective batch and tokens per step.
@@ -194,8 +214,9 @@ How do you evaluate that?
 optimization problem is identical and the run simply finishes sooner. The proposal is a different
 experiment. Multiplying the batch by 8 only shortens the run if the current batch is well below the
 gradient noise scale; if it is near or above it, the step count barely falls and the run consumes up to
-8× more tokens for the same loss. The honest evaluation is to estimate the noise scale from gradient
-statistics or from prior runs of this model size, scale the learning rate (square-root for Adam as a
+8× more tokens for the same loss. The honest evaluation is to estimate the noise scale, which with 64 data-parallel ranks is nearly free
+(compare each rank's local gradient norm with the all-reduced norm, as in the two-batch estimator), or
+take it from prior runs of this model size, scale the learning rate (square-root for Adam as a
 starting point, then re-tune), lengthen warmup, and compare both configurations on loss versus tokens.
 If the data budget is fixed, exceeding the noise scale also means fewer effective passes over unique
 data, which is a quality cost, not just a compute one.

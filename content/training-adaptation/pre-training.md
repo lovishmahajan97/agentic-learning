@@ -4,8 +4,8 @@ module: training-adaptation
 name: Pre-training
 kind: concept
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - training-adaptation/post-training
   - training-adaptation/supervised-fine-tuning
@@ -62,8 +62,24 @@ position in every sequence. The causal mask lets one forward pass score all T po
 sequence of 8k tokens yields 8k training signals. Perplexity is just exp of this loss, which is why
 pre-training progress is reported in loss or perplexity rather than accuracy.
 
+Two numbers anchor the scale. A randomly initialised model spreads probability evenly over the
+vocabulary, so its loss starts near ln(V): about 11.9 nats for a 152k-token vocabulary, a perplexity
+equal to the vocabulary size. Every nat the loss falls below that is information the model has
+extracted about how text continues; perplexity can be read as "the number of tokens the model is
+still choosing between, on average".
+
+### Why causal next-token prediction, not masked prediction
+BERT-style masked language modelling hides about 15% of tokens and predicts them from both sides. It
+makes good encoders, but it supervises only the masked positions and it does not yield a generator:
+nothing in it learns to produce text left to right. The causal objective supervises *every* position
+in one pass and its trained form is directly a sampler, so the same weights serve completion, chat
+and, after post-training, tool calls. That is why decoder-only causal pre-training became the default
+for LLMs, with masked objectives kept for embedding and classification encoders.
+
 ### The data
-Tokens come from a curated mixture: web crawl, code, books, reference text, academic papers, and
+The tokenizer is trained first, on a sample of the same corpus, and is frozen for the model's life;
+its vocabulary decides how many tokens a given text costs, which is why a model can be several times
+more expensive per word in a language its tokenizer under-represents. Tokens come from a curated mixture: web crawl, code, books, reference text, academic papers, and
 increasingly multilingual and synthetic data. The pipeline matters as much as the model: language
 identification, quality filtering (classifiers or heuristics), near-duplicate removal (duplicated text
 makes the model memorise rather than generalise), and decontamination against evaluation sets. The
@@ -85,8 +101,21 @@ Practical recipes use AdamW with a linear warmup followed by a cosine or warmup-
 batch sizes in the millions of tokens, bf16 mixed precision and gradient clipping. Training runs in
 stages: the main run on short sequences, then a shorter long-context stage that extends the context
 window, and often a final *annealing* phase on high-quality data with the learning rate decayed to near
-zero, which measurably lifts benchmark scores. Mid-training checkpoints are kept so a loss spike or
-divergence can be rolled back.
+zero, which measurably lifts benchmark scores. Warmup exists because Adam's second-moment estimates
+are unreliable for the first steps and, in practice, a full learning rate on random weights tends to
+diverge; the decay
+exists because a high rate keeps the weights bouncing around a basin rather than settling into it, which
+is why loss drops visibly during the final decay. Mid-training checkpoints are kept so a loss spike or
+divergence can be rolled back to a point before it and resumed, often with the offending data batches
+skipped.
+
+### What the model learns, and why prompting works at all
+To push loss down on trillions of varied tokens, the cheapest strategy for the network is to build
+general machinery: representations of entities and their relations, of syntax, of the structure of
+code. One by-product is *in-context learning*: documents on the web often contain repeated patterns
+(lists of examples, Q&A pages, tables), and predicting the next item in such a pattern requires
+inferring the rule from the earlier items. A base model therefore already does few-shot learning from
+the prompt, which is the latent ability that instruction tuning later makes reliable.
 
 ### Why the result is a base model
 Nothing in the objective says "be helpful". A base model prompted with a question may answer, continue
@@ -123,6 +152,11 @@ opt.step(); opt.zero_grad()
 # Scale this loop to ~10^13 tokens, thousands of GPUs and a cosine LR schedule and you have a base model.
 ```
 
+Read the printed numbers against the anchors above: on this short sentence a trained base model's
+loss sits far below the ~11.9 nats a random model would score, and the `[:, :-1]` / `[:, 1:]` shift is
+the entire supervision mechanism. The tokens of the sentence are both input and label, which is the
+"self-supervised" claim made concrete.
+
 Back-of-envelope on the budget, as an illustrative order of magnitude: a 7B-parameter model trained on
 1 trillion tokens needs about 6 × 7e9 × 1e12 ≈ 4e22 FLOPs. At an achieved 4e14 FLOP/s per GPU (roughly
 40% utilisation of a modern accelerator's bf16 peak) that is 1e8 GPU-seconds, about 1,200 GPU-days.
@@ -130,13 +164,18 @@ Pre-training is the one stage where the arithmetic is in GPU-years, not GPU-hour
 
 ## Trade-offs
 - More tokens per parameter raise quality for a fixed model size and lower serving cost, but past the
-  compute-optimal point each extra point of quality costs disproportionately more training compute.
+  compute-optimal point each extra point of quality costs disproportionately more training compute;
+  over-training wins when the model will serve enough traffic that inference spend exceeds training
+  spend, and loses for a model trained once and queried rarely.
 - A broad data mixture gives general competence, while over-weighting one domain (code, a language)
   improves it at the expense of others; the right mix depends on what the model will be served for.
-- Longer training sequences teach long-range structure but cost quadratic attention compute, which is
-  why context extension is done in a short late stage rather than from the start.
+- Longer training sequences teach long-range structure but cost quadratic attention compute; at a few
+  thousand tokens the matrix multiplies in the MLP and projections dominate, so the quadratic term bites
+  only at long contexts, which is why context extension is done in a short late stage rather than from
+  the start.
 - Aggressive quality filtering raises per-token value but can remove the dialects, formats and messy
-  text the model will meet in production, hurting robustness.
+  text the model will meet in production, hurting robustness; it pays while unique high-quality data is
+  plentiful and stops paying once filtering forces the same documents to be repeated for many epochs.
 
 ## Pitfalls
 - Judging a base model by chatting with it; it was never trained to answer, so a rambling or repetitive
@@ -144,9 +183,13 @@ Pre-training is the one stage where the arithmetic is in GPU-years, not GPU-hour
   tasks instead.
 - Letting evaluation data leak into the corpus; the symptom is benchmark scores that do not transfer to
   held-out tasks of the same kind, which is why decontamination is part of the pipeline.
-- Reading a single pre-training loss number as a quality comparison across models; loss depends on the
-  tokenizer and the data mix, so two models' losses are only comparable with the same tokenizer and
-  evaluation corpus.
+- Reading a single pre-training loss number as a quality comparison across models; loss is per token, so
+  a model with a coarser tokenizer looks worse per token while being better per character. The symptom
+  is a ranking by perplexity that disagrees with downstream evals; normalise to bits per byte (or per
+  character) on the same corpus before comparing.
+- Ignoring loss spikes in a long run; a sudden jump that does not recover, or recovers to a worse curve,
+  usually means numerical instability or a bad data shard. The fix is to roll back to an earlier
+  checkpoint, skip the batches, and lower the learning rate or tighten clipping, not to train through it.
 - Treating "continued pre-training" on domain text as cheap; without mixing in general data at a sensible
   ratio the model forgets general skills, and the symptom is a jump in loss on everything outside the
   domain.
@@ -156,7 +199,9 @@ Almost no application team pre-trains from scratch; the cost is in GPU-years and
 is a product in itself. What you decide is *which* pre-trained base to build on, and the knowledge of how
 it was made is what lets you decide well: its token budget and data mix predict its strengths, its
 tokenizer and context window are fixed at this stage, and its licence and training-data provenance are
-set here. Continued pre-training on a large domain corpus (tens of millions of tokens or more, such as
+set here. To choose a base, measure on *your* data: tokens per word on a sample of your documents (cost
+and context budget), bits per byte on held-out domain text, and few-shot or log-likelihood scores on a
+small task set you care about. Continued pre-training on a large domain corpus (tens of millions of tokens or more, such as
 legal or biomedical text) is the one case where an application team does run this objective, usually
 on a smaller model. In interviews, expect to explain the objective, why it is self-supervised, what
 scaling laws say about N versus D, and why a base model differs from a chat model.

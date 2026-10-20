@@ -5,6 +5,7 @@ name: Loop detection
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/max-step-budgets
@@ -49,7 +50,8 @@ where the cycle spans several steps.
    formatting between attempts.
 2. **Short cycles.** Keep the sequence of action hashes and look for a repeated subsequence of period
    *p* in the recent window (A B A B, or A B C A B C). Compare the last *p* actions with the *p*
-   before them for *p* from 1 to a small maximum; this costs O(P) per step.
+   before them for *p* from 2 to a small maximum *P* (period 1 is just an exact repeat, which signal
+   1 already counts); with hashed actions this is O(P²) comparisons per step, trivial for P ≈ 4.
 3. **No progress.** Hash the tool *result* as well. If the pair (action, result) repeats, nothing in
    the world changed, which is the strongest loop signal. Alternatively track a task-specific
    progress metric (failing test count, files changed, distinct URLs visited) and count steps since
@@ -91,8 +93,9 @@ help the model change course.
 
 ## Example
 The guard hashes canonical (tool, args) pairs, tracks exact repeats, detects short cycles over a
-sliding window, and counts identical (action, result) pairs as no-progress; the loop calls `before`
-ahead of dispatch and `after` once the tool returns, and acts on the returned rung.
+sliding window, and counts identical (action, result) pairs as no-progress; for tools marked
+pollable only repeats with an unchanged result count. The loop calls `before` ahead of dispatch and
+`after` once the tool returns, and acts on the returned rung.
 
 ```python
 import hashlib, json
@@ -103,34 +106,35 @@ def canon(*parts):
     return hashlib.sha1(raw.encode()).hexdigest()
 
 class LoopGuard:
-    def __init__(self, inform=3, block=4, abort=6, window=12, max_period=4):
+    def __init__(self, inform=3, block=4, abort=6, window=12, max_period=4, pollable=()):
         self.calls, self.same, self.seen = Counter(), Counter(), set()
-        self.seq = deque(maxlen=window)
+        self.seq, self.pollable = deque(maxlen=window), set(pollable)
         self.inform, self.block, self.abort, self.max_period = inform, block, abort, max_period
 
     def _cycle(self):
         s = list(self.seq)
-        for p in range(1, self.max_period + 1):
-            if len(s) >= 2 * p and s[-p:] == s[-2 * p:-p]:
+        for p in range(2, self.max_period + 1):     # pure repeats (A A A) are counted below
+            if len(s) >= 2 * p and s[-p:] == s[-2 * p:-p] and len(set(s[-p:])) > 1:
                 return p
         return 0
 
     def before(self, name, args):              # call before dispatching the tool
         h = canon(name, args)
         self.seq.append(h); self.calls[h] += 1
-        n, p = self.calls[h], self._cycle()
-        if n >= self.abort or self.same[h] >= self.abort - 1:
-            return "abort", f"{name}: {n} identical calls, {self.same[h]} with identical results"
-        if n >= self.block and self.same[h] >= 2:
+        n, same, p = self.calls[h], self.same[h], self._cycle()
+        k = same + 1 if name in self.pollable else n   # polling counts only unchanged results
+        if k >= self.abort:
+            return "abort", f"{name}: {n} identical calls, {same} with identical results"
+        if k >= self.block and same >= 2:
             return "block", f"refused: identical to {n - 1} earlier calls whose result did not change"
-        if n >= self.inform:
+        if k >= self.inform:
             return "inform", f"you have called {name} with these exact arguments {n} times"
         if p:
             return "inform", f"your last {2 * p} actions repeat with period {p}; change approach"
         return "ok", ""
 
     def after(self, name, args, result):       # call after the tool returns
-        key = canon(name, args, str(result)[:4000])
+        key = canon(name, args, str(result))   # full result: test summaries sit at the end
         if key in self.seen:
             self.same[canon(name, args)] += 1
         self.seen.add(key)

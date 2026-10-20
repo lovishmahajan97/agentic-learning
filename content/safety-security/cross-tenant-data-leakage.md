@@ -4,8 +4,8 @@ module: safety-security
 name: Cross-tenant data leakage
 kind: concept
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - system-design/tenant-isolation
   - system-design/multi-tenancy
@@ -70,6 +70,18 @@ the filter in one code path.
 8. **Infrastructure bugs around the model.** The March 2023 ChatGPT incident exposed other users' chat
    titles and some billing details because of a bug in a Redis client library under concurrency. The LLM
    was not involved; the cache next to it was.
+9. **Background jobs.** Re-indexing, nightly summarisation, eval and fine-tuning jobs run outside any
+   request, so there is no verified token to derive a tenant from. The classic bug is a job that falls
+   back to a default tenant, or to "all tenants" because the filter argument was `None`, and writes
+   another customer's content into a shared summary or index.
+
+### Tenant is not the only boundary
+Inside one tenant, documents usually carry their own permissions: HR files, board minutes, a deal room.
+Everything above applies one level down. Retrieval must filter on the caller's groups as well as the
+tenant (ACL-aware retrieval), and a cache shared across a tenant's users must key on the permission set,
+not just the tenant, or the CFO's cached answer about the restructuring is served to an intern who asks
+the same question. A practical key is a hash of the sorted group IDs the caller had at retrieval time;
+answers built from per-user documents (a mailbox, a personal drive) should not be shared at all.
 
 ### The defence pattern
 - **One tenant identity, derived once.** Resolve `tenant_id` from the verified token at the API edge and
@@ -86,8 +98,16 @@ the filter in one code path.
   from a leak. Namespaces are the usual middle ground.
 - **Tenant in every cache key.** `hash(tenant_id, model, prompt)`; a semantic cache additionally filters
   candidates by tenant before similarity.
+- **Jobs carry the tenant explicitly and fail closed.** A background job takes `tenant_id` from the record
+  that was written under a verified request context and refuses to run if it is missing, because a
+  `None` filter on most vector clients means "no filter".
 - **Classify derived stores like their source.** Embeddings, traces and memory inherit the source data's
-  classification, access control and retention.
+  classification, access control and retention. Embeddings are not a safe abstraction: inversion attacks
+  recover much of the original text from sentence embeddings (Morris et al., 2023), so a leaked vector is
+  a leaked document.
+- **Offboarding reaches every derived copy.** Deleting a tenant means the index, caches, memory, traces
+  and any adapter trained on their data, verified by re-running the canary queries afterwards; a deletion
+  that only drops the source rows leaves the leak surfaces populated.
 - **Prove it with canaries.** Plant a unique token per tenant in a document, then in CI query every
   other tenant for it with a large k across retrieval, cache and memory, and assert it never appears.
   In production, sample outputs and scan for any tenant's canary in the wrong tenant's response.
@@ -106,6 +126,7 @@ from dataclasses import dataclass
 class TenantCtx:
     tenant_id: str            # set once from the verified JWT at the API edge
     user_id: str
+    groups: frozenset[str]    # document ACL groups, also from the verified identity
 
 class ScopedStore:
     """Every method takes ctx; there is no unscoped variant to call by mistake."""
@@ -114,11 +135,13 @@ class ScopedStore:
 
     def retrieve(self, ctx: TenantCtx, qvec, k=8):
         # filter evaluated inside the ANN search, so k is k *within* the tenant
-        flt = {"must": [{"key": "tenant_id", "match": {"value": ctx.tenant_id}}]}
+        flt = {"must": [{"key": "tenant_id", "match": {"value": ctx.tenant_id}},
+                        {"key": "acl_groups", "match": {"any": sorted(ctx.groups)}}]}
         return self.vec.search(vector=qvec, limit=k, query_filter=flt)
 
     def cache_key(self, ctx: TenantCtx, model: str, prompt: str) -> str:
-        return hashlib.sha256(f"{ctx.tenant_id}|{model}|{prompt}".encode()).hexdigest()
+        acl = ",".join(sorted(ctx.groups))       # same tenant, different permissions => different key
+        return hashlib.sha256(f"{ctx.tenant_id}|{acl}|{model}|{prompt}".encode()).hexdigest()
 
     def answer(self, ctx, model, prompt, qvec, llm):
         key = self.cache_key(ctx, model, prompt)
@@ -134,7 +157,7 @@ CANARIES = {"acme": "CANARY-acme-7f3a", "globex": "CANARY-globex-91c2", "initech
 
 @pytest.mark.parametrize("asker", CANARIES)
 def test_no_cross_tenant_leak(store, embed, asker):
-    ctx = TenantCtx(tenant_id=asker, user_id="qa-bot")
+    ctx = TenantCtx(tenant_id=asker, user_id="qa-bot", groups=frozenset({"all-staff"}))
     for owner, token in CANARIES.items():
         if owner == asker:
             continue
@@ -142,8 +165,12 @@ def test_no_cross_tenant_leak(store, embed, asker):
         assert not any(token in h.payload["text"] for h in hits), f"{asker} can see {owner}"
 ```
 
-The test uses k=50 deliberately: a post-filter implementation that only drops foreign hits from the top 8
-would still pass at k=8 by luck and fail here, which is the point.
+The test uses k=50 deliberately. With three tenants of 40,000, 2,000 and 300 chunks in one index, a
+post-filter that retrieves the top 8 and then drops foreign hits will often return zero results for the
+300-chunk tenant, and someone will "fix" it by fetching more; the large-k test is what catches a missing
+or post-applied filter, because the query is phrased to make the foreign canary the nearest neighbour.
+Including the ACL groups in the cache key means two users of the same tenant with different permissions
+never share a cached answer, at the price of a lower hit rate.
 
 ## Trade-offs
 - Collection-per-tenant buys hard isolation and trivial deletion, but each collection carries index and
@@ -169,6 +196,10 @@ would still pass at k=8 by luck and fail here, which is the point.
   misuse.
 - Testing isolation with one happy-path query per tenant; the symptom is passing tests and a leak that
   only appears under near-duplicate questions or large k.
+- Keying caches on the tenant but not on the caller's permissions; the symptom is an employee receiving a
+  summary of a document they get a 403 for when they try to open it.
+- Letting a background job run with an optional tenant argument; the symptom is a nightly digest or a
+  re-built index containing content from tenants it was never meant to touch.
 
 ## When to use
 Treat every multi-tenant LLM feature as needing an explicit isolation design before launch, and revisit it

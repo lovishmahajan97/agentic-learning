@@ -5,7 +5,7 @@ name: Distributed tracing across services
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - observability/tracing
   - observability/spans
@@ -75,8 +75,13 @@ silently cutting the chain.
 The `01` flag says "this trace is being sampled". It is set at the root and honoured downstream so a
 trace is either complete or absent. If each service sampled independently at 10%, a five-hop trace
 would be complete one time in a hundred thousand. Tail-based sampling (decide after the whole trace
-has arrived) is done in a collector that buffers spans by trace id, which requires all services to
-export to the same collector tier.
+has arrived, so every error and slow trace can be kept) is done in a collector that buffers spans by
+trace id. That only works if *every* span of a trace reaches the *same* collector instance, while
+services export independently to whatever instance their load balancer picks. The usual answer is two
+tiers: a first tier that routes spans by hashing the trace id (the OpenTelemetry Collector has a
+load-balancing exporter for this) and a second tier that buffers and decides. The buffer also needs a
+timeout, and spans arriving after the decision are dropped or kept inconsistently, which is one more
+reason to keep traces short.
 
 ### Queues and asynchronous hops
 For a message queue there is no response to join on, so the context is injected into message headers
@@ -99,8 +104,16 @@ trace backends retain data for days while the workflow may live for weeks.
   under names such as `request-id` or `x-request-id`) as an attribute, *because* it is the only handle
   their support team can use when you report a slow or failed call.
 - **Thread pools.** Not a network hop, but the same failure: Python does not copy context into
-  executor threads by default (asyncio tasks do copy it at creation). Wrap submitted callables with
-  `contextvars.copy_context().run` or use an instrumented executor.
+  executor threads by default. asyncio tasks copy it at creation and `asyncio.to_thread` copies it,
+  but `loop.run_in_executor` and a bare `ThreadPoolExecutor.submit` do not. Wrap submitted callables
+  with `contextvars.copy_context().run` or use an instrumented executor.
+
+### The edge is a trust boundary
+A `traceparent` arriving from the public internet is untrusted input. A client can set the sampled
+flag on every request and force you to record (and pay to store) all of them, or reuse a trace id so
+unrelated requests merge into one tree. Public-facing services therefore usually start a fresh trace,
+optionally adding a *link* to the incoming context so a partner's trace can still be found, and honour
+incoming context only from known internal callers. The same reasoning applies to incoming baggage.
 
 ### Baggage: carrying more than ids
 W3C Baggage is a companion header for application-defined key-values (tenant, feature flag,
@@ -177,6 +190,8 @@ def enqueue_agent_step(queue, step: dict):
   start milliseconds after a gap in the real trace.
 - Putting user identifiers or emails into baggage; the symptom is a security review finding them in
   outbound headers to a third-party model provider.
+- Continuing whatever `traceparent` the public client sends; the symptom is trace volume and
+  storage cost that track one client's behaviour, or unrelated requests appearing in the same tree.
 - Each service sampling independently; the symptom is traces that are complete for short paths and
   almost never complete for deep ones.
 - Treating a child-before-parent waterfall as evidence of a bug; the symptom is minutes lost before

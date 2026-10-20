@@ -5,7 +5,7 @@ name: Model fallback strategies
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/fallbacks
   - serving-inference/retry-strategies
@@ -33,7 +33,11 @@ resets), throttling (429, sometimes with a `Retry-After`), slow responses that b
 provider is overloaded, capability changes (a model id retired, behaviour shifted by a silent update),
 and exhausted quota in one region while another has capacity. Each surfaces to the user as an error or a
 spinner that never resolves. If your availability target is higher than the provider's, arithmetic alone
-says you need a second, independent path.
+says you need a second, independent path: two paths that each succeed 99.5% of the time give
+1 − 0.005² = 99.9975% *if their failures are independent*. They rarely are. Two resellers of the same
+upstream model, two deployments in one cloud region, or two keys drawing on one organisation quota fail
+together, so the real gain is set by how independent the rungs are, and independence is the property to
+design for.
 
 The naive alternative, "retry with backoff", only covers transient blips on the same endpoint. During a
 real incident it makes things worse: every client retries, load on the failing provider multiplies, and
@@ -54,7 +58,12 @@ Every error maps to one of three actions, and the mapping is the heart of the de
 - **Fail over** on repeated 5xx or timeouts, an open circuit, a 404 for a retired model id, or regional
   capacity errors.
 - **Neither** for 400 invalid request, 401, content-policy refusals and context-too-long: these recur
-  identically on every target, so failing over just multiplies latency and cost.
+  identically on every target, so failing over just multiplies latency and cost. They also say nothing
+  about the target's health, so they must not count towards its circuit breaker.
+- **Escalate on invalid output.** A response that arrives but fails schema validation after one repair
+  attempt is a legitimate reason to try the next rung, usually a stronger model. This is the cascade
+  idea applied to reliability; count it separately from error-triggered fallback, because it signals a
+  prompt or model-fit problem rather than an outage.
 
 ### The ladder, ordered by behavioural distance
 1. Same model, another deployment or region: identical behaviour, different capacity.
@@ -131,7 +140,7 @@ class Breaker:                       # closed -> open (after N failures in windo
         if len(self.errors) >= self.fails:
             self.open_until, self.errors = now + self.cooldown, []
 
-RETRYABLE = {408, 429, 500, 502, 503, 504}
+FAILOVER_ON = {408, 429, 500, 502, 503, 504}   # target-side failures; same-target retries live in call_model
 LADDER = [("primary-us", 3.0), ("primary-eu", 3.0), ("vendor-b-equivalent", 6.0)]   # (target, timeout s)
 breakers = {t: Breaker() for t, _ in LADDER}
 
@@ -146,9 +155,10 @@ async def complete(messages, deadline=10.0):
             breakers[target].record(ok=True)
             return {"served_by": target, "fallback_depth": depth, **resp}
         except ModelError as e:
+            if e.status not in FAILOVER_ON:             # 400/401/policy: the request is bad, not the target,
+                breakers[target].record(ok=True)        # so it must not trip the breaker...
+                raise                                   # ...and it would fail identically on every rung
             breakers[target].record(ok=False); last_err = e
-            if e.status not in RETRYABLE:
-                raise                                   # 400/401/policy errors recur on every rung
             await asyncio.sleep(random.uniform(0, 0.2))  # jitter before the next rung
         except asyncio.TimeoutError:
             breakers[target].record(ok=False); last_err = "timeout"
@@ -156,7 +166,14 @@ async def complete(messages, deadline=10.0):
 ```
 
 `served_by` and `fallback_depth` go into metrics and traces; the alert on fallback depth greater than zero
-is what tells you the primary is unhealthy before customers do.
+is what tells you the primary is unhealthy before customers do. Two details are deliberate. Client errors
+are recorded as healthy, because a burst of malformed requests from one buggy caller must not open the
+breaker and push everyone else's traffic to a worse rung. And the per-rung timeouts (3 s, 3 s, 6 s) sum
+to more than the 10 s deadline, so the third rung only gets what is left: if both primaries time out,
+it has just under 4 s of its 6 s, and a rung that cannot finish in that time is better skipped
+(`remaining <= 0` is the crude version of that check). A production breaker also has to release the half-open
+probe slot on every exit path, including cancellation when the client disconnects, or a target can stay
+skipped indefinitely.
 
 ## Trade-offs
 - Availability rises, but output consistency falls as the ladder descends to other vendors; for audited

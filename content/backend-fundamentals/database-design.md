@@ -5,6 +5,7 @@ name: Database design
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - backend-fundamentals/sql
   - backend-fundamentals/nosql
@@ -62,9 +63,12 @@ one kind of thing, and every non-key column should depend on the whole key and n
 
 1. **1NF:** no repeating groups or lists packed into a column; `tags = "a,b,c"` becomes a `tags` table or
    an array column with proper indexing.
-2. **2NF/3NF:** a column that depends on something other than the primary key moves to its own table. If
-   `messages` stores `user_email`, and email depends on `user_id` rather than on the message, it belongs
-   in `users`. Otherwise changing an email means rewriting every message row.
+2. **2NF:** with a composite key, no column may depend on only part of it; in a
+   `(conversation_id, user_id)` membership table, `user_name` depends on `user_id` alone and belongs in
+   `users`.
+3. **3NF:** no non-key column may depend on another non-key column. If `messages` stores `user_id` and
+   `user_email`, the email depends on `user_id` rather than on the message, so it belongs in `users`.
+   Otherwise changing an email means rewriting every message row.
 
 Normalization is the default *because* writes are where consistency is decided; a normalized schema makes
 the correct write the only possible write. The cost is joins on read, which is where denormalization comes
@@ -75,12 +79,15 @@ measured to be slow, and write down the invariant you are now responsible for.
 ### Constraints are invariants the database guarantees
 `NOT NULL`, `UNIQUE`, `CHECK (tokens_used >= 0)`, foreign keys with explicit `ON DELETE` behaviour, and
 enum-like `CHECK (role IN ('user','assistant','tool'))` are the cheapest tests you will ever write: they
-run on every write path, including the ones you forgot. A partial unique index (`UNIQUE (tenant_id,
-external_id) WHERE deleted_at IS NULL`) encodes "unique among live rows", which code alone gets wrong.
+run on every write path, including the ones you forgot. A partial unique index (`CREATE UNIQUE INDEX ... ON
+documents (tenant_id, external_id) WHERE deleted_at IS NULL`; a plain `UNIQUE` constraint cannot take a
+`WHERE`) encodes "unique among live rows", which code alone gets wrong under concurrent inserts.
 
 ### Types carry meaning
-Use `timestamptz`, never bare `timestamp`, because a timestamp without a zone is a different instant on
-every server. Use `numeric` for money and token prices, never `float`, because binary floats cannot
+Use `timestamptz`, never bare `timestamp`. A `timestamptz` is stored as an absolute instant (UTC
+internally); a bare `timestamp` stores only a wall-clock reading, so which instant it means depends on
+whatever zone the writer happened to assume, and rows written from servers in different zones cannot be
+compared. Use `numeric` for money and token prices, never `float`, because binary floats cannot
 represent 0.1 exactly and the rounding errors accumulate in invoices. Use `jsonb` for genuinely
 semi-structured payloads (raw model responses, tool arguments), and pull out any field you filter or join
 on into a real column with a real index. Store a `schema_version` next to any jsonb you will parse later.
@@ -99,12 +106,14 @@ expensive. The design question is never "which columns are important" but "which
 patterns run often". A composite index on `(conversation_id, created_at)` serves "messages of this
 conversation in order" in one range scan; the same two columns in the other order do not. Equality
 columns go first, the range or sort column last. Foreign-key columns usually need an index because joins
-and cascading deletes look rows up by them.
+and cascading deletes look rows up by them, and PostgreSQL does not create one automatically on the
+referencing side.
 
 ## Example
 A minimal schema for an LLM application. Note the tenant column on every row, the constraints that encode
-rules, the jsonb for raw payloads with an indexed extracted field, and the one composite index built for
-the one hot query (load a conversation's messages in order).
+rules, the jsonb for raw payloads next to the extracted columns (`model`, token counts) that queries
+actually filter and aggregate on, the composite index built for the one hot query (load a conversation's
+messages in order), and the plain index on the foreign key that cascading deletes need.
 
 ```sql
 CREATE TABLE conversations (
@@ -142,8 +151,10 @@ CREATE TABLE tool_calls (
   arguments     jsonb NOT NULL,
   status        text NOT NULL CHECK (status IN ('pending','succeeded','failed')),
   idempotency_key text,
-  UNIQUE (idempotency_key)                   -- a retried call cannot run twice
+  UNIQUE (idempotency_key)                   -- a retried call cannot be recorded twice
 );
+-- FK lookup for joins and for ON DELETE CASCADE from messages
+CREATE INDEX tool_calls_by_message ON tool_calls (message_id);
 ```
 
 ## Trade-offs
@@ -165,8 +176,8 @@ CREATE TABLE tool_calls (
   query that returns another tenant's rows the first time someone forgets the join.
 - Using `float` for money or token prices; the symptom is invoices that are off by a cent and tests that
   compare with tolerances.
-- Bare `timestamp` columns; the symptom is events that shift by hours after a server or container changes
-  time zone, and "yesterday" reports that disagree.
+- Bare `timestamp` columns; the symptom is rows written before and after a server or container time-zone
+  change that are hours apart in meaning but adjacent in value, and "yesterday" reports that disagree.
 - Indexing columns rather than queries; the symptom is ten single-column indexes, slow writes, and the one
   hot query still doing a sort because no composite index matches its `WHERE` and `ORDER BY`.
 - Entity-attribute-value tables ("one table of key/value pairs for everything") to avoid migrations; the
@@ -214,8 +225,8 @@ transaction as the insert.
 - [ ] Single-column indexes cannot be used together in the same query
 - [ ] The composite index takes less space than two single-column indexes
 > The planner can walk the composite index from the first matching conversation_id in created_at order, so
-> no sort step is needed. Two single-column indexes can be combined with a bitmap scan but still require a
-> separate sort.
+> no sort step is needed. With single-column indexes the planner must either fetch the conversation's rows
+> and sort them, or combine indexes in a bitmap scan, which also loses order and needs a separate sort.
 
 ### Q: A team drops foreign keys "to make inserts faster". Which failure is this most likely to cause?
 - [ ] Queries become slower because the planner can no longer use joins

@@ -5,7 +5,7 @@ name: Learning-rate schedulers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/warmup
   - ml-fundamentals/optimizers
@@ -89,7 +89,26 @@ removing the need to commit to `T` up front, which is why newer pre-training rec
 ### Cyclical and warm restarts
 SGDR restarts the cosine cycle periodically, jumping η back up. The intuition is that a jump kicks the
 model out of a sharp basin into a wider one; the practical benefit is cheap snapshot ensembles, one per
-cycle. It is rare in LLM work but common in smaller vision and tabular models.
+cycle. It is rare in LLM work but common in smaller vision and tabular models. One-cycle (`OneCycleLR`)
+is a single version of the same idea for short runs: ramp up to a high peak over the first part of the
+run, then anneal well below the starting value, so a fixed small budget gets both phases.
+
+### Metric-driven: reduce on plateau
+`ReduceLROnPlateau` cuts η by a factor when a monitored validation metric stops improving for a set
+number of evaluations. It needs no horizon, which is attractive, but it makes the schedule depend on the
+evaluation cadence and on noise in the validation metric: a noisy eval triggers early drops, and two runs
+with identical configs can follow different schedules, which makes them hard to compare. It survives in
+classic supervised training with cheap, stable validation; LLM recipes prefer a schedule written as a
+function of the step so that it is reproducible and known in advance.
+
+### What happens past `T`
+Implementations disagree, and it matters whenever a run is extended. A hand-written schedule usually
+clamps: `progress = min(1, ...)`, so η stays at the floor forever. Hugging Face's linear schedule clamps
+at zero. But a cosine written as `cos(π·t/T)` without a clamp keeps going: past `T` the cosine climbs
+back up, so η rises again towards the peak and reaches it at `2T`. PyTorch's `CosineAnnealingLR` and the
+Hugging Face cosine-with-warmup lambda both behave this way if you step them past their configured length.
+An extended run therefore either learns almost nothing (clamped) or silently re-warms to a high rate with
+no warmup (unclamped); neither is the plan, and the learning-rate log is the only place it shows.
 
 ### What the scheduler steps on
 Schedulers advance per *optimizer* step, not per micro-batch and not per epoch. With gradient accumulation
@@ -109,7 +128,7 @@ peak_lr, warmup, total, floor = 3e-4, 100, 1000, 0.1
 def multiplier(step):
     if step < warmup:
         return step / warmup                       # linear ramp 0 -> 1
-    progress = (step - warmup) / max(1, total - warmup)
+    progress = min(1.0, (step - warmup) / max(1, total - warmup))  # clamp: stay at floor past T
     cosine = 0.5 * (1 + math.cos(math.pi * progress))   # 1 -> 0
     return floor + (1 - floor) * cosine            # 1 -> floor
 
@@ -149,13 +168,16 @@ The same shape is available as `transformers.get_cosine_schedule_with_warmup`, a
   finishes early and the second half of the run trains at a learning rate close to zero.
 - Resuming from a checkpoint without restoring scheduler state, which restarts warmup or resets the
   decay; the loss curve shows a jump at the resume point that was not there before.
-- Extending a cosine run past its planned end: the learning rate is already at the floor, so the extra
-  steps barely move the model, and people conclude "more data did not help".
+- Extending a cosine run past its planned end without re-planning it: with a clamped schedule the extra
+  steps run at the floor and barely move the model ("more data did not help"); with an unclamped cosine
+  the rate climbs back towards the peak and the loss rises. Either way the logged learning rate shows it.
 - Reading the sharp loss drop during the decay phase as a sign the model suddenly "got it"; the drop is the
   noise floor shrinking as η falls, and it appears in every well-scheduled run.
 
 ## When to use
-Every real training run has a schedule; the decision is which one. For fine-tuning, use linear or cosine
+Every real training run has a schedule; the decision is which one, and it is usually a smaller decision
+than the peak value: among reasonable decaying shapes, a well-tuned peak matters more than the choice
+between linear and cosine, so tune the peak first (a short sweep over a factor of 2–3) and the shape second. For fine-tuning, use linear or cosine
 decay with a short warmup and let the run end at a small learning rate, because the total steps are known
 and stability of the final weights matters more than squeezing out the last fraction of loss. For
 pre-training or long continued pre-training where the budget may change, prefer WSD or constant with a
@@ -177,9 +199,11 @@ fixed horizon is a liability.
 **Q:** A team fine-tunes with cosine decay over 3,000 steps, then decides the model is undertrained and
 runs 3,000 more steps by resuming the checkpoint with the same config. The extra steps barely change the
 loss. What happened, and what should they have done?
-**A:** The resumed run restored the scheduler at step 3,000, where cosine has already reached its floor,
-so all 3,000 extra steps ran at the minimum learning rate and the weights hardly moved. The result says
-nothing about whether more data helps. Options: restart from the original checkpoint with `T = 6,000`
+**A:** The resumed run restored the scheduler at step 3,000 with the same 3,000-step horizon. Their
+schedule clamps at the floor (the observation of "barely changes" says so), so all 3,000 extra steps ran
+at the minimum learning rate and the weights hardly moved; with an unclamped cosine the same mistake would
+instead have re-warmed the rate towards the peak with no warmup, which shows up as a loss rise. Either way
+the experiment says nothing about whether more training helps. Options: restart from the original checkpoint with `T = 6,000`
 so the schedule is planned for the full length; or, if resuming is required, create a new schedule that
 re-warms briefly to a moderate peak and decays over the extra steps. Going forward, a WSD-style schedule
 would let them extend the stable phase and apply the decay only once the final length is known. The

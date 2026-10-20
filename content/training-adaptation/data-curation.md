@@ -5,7 +5,7 @@ name: Data curation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/data-labeling
   - training-adaptation/synthetic-data-generation
@@ -117,7 +117,10 @@ as surely as the content.
 
 ### 8. Fine-tuning specifics
 Verify responses where you can (execute code, check answers), remove hedging or refusals you do not want,
-enforce one style, check inter-annotator agreement on a sample, and look at the data: a few hundred
+enforce one style, check inter-annotator agreement on a sample, and select for coverage as well as
+quality: embed the prompts, cluster them, and sample across clusters, because a set filtered only on
+quality collapses onto the most common, easiest request types and leaves the long tail untaught. Then look
+at the data: a few hundred
 examples read by a human expose systematic problems no metric reports. Then version the dataset, pin it to
 the model it produced, and feed error analysis from evals back into the next version.
 

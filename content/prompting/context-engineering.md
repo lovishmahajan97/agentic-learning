@@ -5,6 +5,7 @@ name: Context engineering
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - prompting/system-prompt
   - prompting/prompt-caching
@@ -45,7 +46,8 @@ the way an operating system treats memory.
 
 ## How it works
 ### What the context contains, in layers
-Render order on most APIs is tool definitions, then the system prompt, then messages. Inside that, the
+Every API renders the request in a fixed order (on Anthropic's: tool definitions, then the system
+prompt, then messages; other providers fix their own). Inside that, the
 material has very different stability: identity and rules (never change), tool definitions (rarely),
 long-lived reference and memory (per deployment or per user), session state such as retrieved chunks and
 a user profile (per task), conversation history (grows), the latest tool results (short-lived), and the
@@ -55,13 +57,14 @@ should meet the durable rules before the volatile data.
 ### Budgeting
 Give each layer a token budget that sums to less than the window minus a reserve for output. Count
 tokens with the tokenizer or the provider's count endpoint, never characters, since code and non-Latin
-text tokenize densely. Trigger compaction at a threshold well below the limit (say 70% of the window, an
+text produce more tokens per character than English prose. Trigger compaction at a threshold well below the limit (say 70% of the window, an
 illustrative figure) rather than on overflow, because compaction itself needs room to run.
 
 ### Placement
 Stable content first so it caches. Critical instructions at the start and the actual question at the
 end, exploiting primacy and recency. Retrieved documents ordered so the most relevant sit at the edges
-and the weakest in the middle, which is where attention is weakest. Explicit delimiters (XML tags, headed
+and the weakest in the middle, which is where attention is weakest (a heuristic from the lost-in-the-middle
+results; how much it helps varies by model, so verify it on your own evals). Explicit delimiters (XML tags, headed
 sections) so the model can tell instruction from data, and labels on untrusted content so it is less
 likely to be followed as instruction.
 
@@ -97,15 +100,23 @@ model and by content.
 
 ## Example
 A budgeted context assembler. Retrieved chunks are kept while they fit and ordered best-at-the-edges,
-consumed tool results are pruned, history is compacted at a user-turn boundary when over budget, and the
-total is asserted against the window minus the output reserve. `count` wraps your tokenizer or the
+consumed tool results are stubbed (not deleted, because every `tool_use` block in history must keep its
+matching `tool_result`), history is compacted at a plain user-text turn when over budget, and the total
+is asserted against the window minus the output reserve. `count` wraps your tokenizer or the
 provider's token-count endpoint; `summarize` is a model call that writes a structured state note.
 
 ```python
 WINDOW, OUTPUT_RESERVE = 200_000, 16_000
 BUDGET = {"system": 6_000, "tools": 8_000, "retrieved": 40_000, "history": 100_000}   # illustrative split
 
-def assemble(system, tools, retrieved, history, question, count, summarize):
+def stub(m):        # same tool_use_ids, one-line content: the call/result pairing stays valid
+    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": b["tool_use_id"],
+            "content": "[consumed; see state note]"} for b in m["content"]]}
+
+def fresh_user_turn(m):    # a turn of plain user text, never a tool_result (its tool_use would be cut off)
+    return m["role"] == "user" and isinstance(m["content"], str)
+
+def assemble(system, tools, retrieved, history, consumed, question, count, summarize):
     assert count(system) <= BUDGET["system"] and count(tools) <= BUDGET["tools"]
     # 1. retrieval: keep the best chunks that fit, then put the strongest at the edges, weakest in the middle
     kept, used = [], 0
@@ -115,12 +126,14 @@ def assemble(system, tools, retrieved, history, question, count, summarize):
         kept.append(chunk); used += count(chunk.text)
     ordered = kept[0::2] + kept[1::2][::-1]                     # best, 3rd, 5th ... 4th, 2nd
     docs = "\n".join(f"<doc id='{c.id}' source='{c.source}'>\n{c.text}\n</doc>" for c in ordered)
-    # 2. history: drop consumed tool results, then compact the oldest turns if still over budget
-    hist = [m for m in history if not m.get("consumed_tool_result")]
+    # 2. history: stub consumed tool results (indexes in `consumed`), then compact if still over budget
+    hist = [stub(m) if i in consumed else m for i, m in enumerate(history)]
     if count(hist) > BUDGET["history"]:
-        cut = len(hist) - 10
-        while hist[cut]["role"] != "user":                     # resume at a user turn so roles alternate
+        cut = max(len(hist) - 10, 1)
+        while cut < len(hist) and not fresh_user_turn(hist[cut]):
             cut += 1
+        if cut == len(hist):
+            raise RuntimeError("no safe compaction point in the recent turns")
         head, tail = hist[:cut], hist[cut:]
         hist = [{"role": "user", "content": f"<summary>{summarize(head)}</summary>"},
                 {"role": "assistant", "content": "Understood. Continuing from the summary."}] + tail

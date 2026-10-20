@@ -5,7 +5,7 @@ name: SLAs / SLOs (and SLIs, error budgets)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - reliability/high-availability
   - reliability/fmea
@@ -58,8 +58,10 @@ careful: excluding too much hides real failures. Measure as close to the user as
 balancer or in the client, because the server cannot count requests it never received.
 
 An **SLO** is a target plus a window: 99.9 percent of valid requests good over a rolling 30 days. Rolling
-windows beat calendar months because a calendar window resets everyone's attention on the first and
-exhausts by the twentieth. A service usually carries several SLOs: availability, latency, and for AI
+windows suit engineering decisions because a calendar window resets everyone's attention on the first
+and exhausts by the twentieth; calendar windows remain common for SLAs and business reporting because
+contracts and invoices are monthly. Many teams run the rolling window internally and report the calendar
+one externally. A service usually carries several SLOs: availability, latency, and for AI
 products a quality SLO.
 
 An **SLA** is a subset of the SLOs, looser, legally reviewed, with defined remedies and exclusions
@@ -127,7 +129,9 @@ On day 9 a prompt edit raises schema-validation failures from 0.02 percent to 0.
 That is a bad fraction of 0.0015 against an allowed 0.001: a burn rate of 1.5. Nothing is on fire, no
 page fires, but at 463 × 0.0015 ≈ 0.69 bad responses per minute the remaining budget lasts 13,055 ÷ 0.69
 ≈ 18,800 minutes, about 13 days, so the SLO will be breached before the window closes. The three-day 1×
-ticket alert catches it on day 12. The error budget policy now applies: the prompt change is rolled back
+ticket alert catches it once the new 1.5× burn dominates its window, roughly two days in (around day
+11), long before the budget is gone; the paging thresholds never fire, which is the point of having a
+slow-burn tier. The error budget policy now applies: the prompt change is rolled back
 or guarded with a repair step, and model upgrades are frozen until the rolling budget recovers. The
 external SLA of 99.5 percent, allowing 100,000 bad responses, was never close to breach; the internal SLO
 did its job of forcing action two weeks before a customer could have noticed.
@@ -153,6 +157,9 @@ did its job of forcing action two weeks before a customer could have noticed.
   support tickets climb.
 - Measuring inside the service. The symptom: the service reports 99.99 percent while the load balancer
   shows 2 percent 502s during every deploy.
+- Setting a high-nines SLO on a low-traffic service. The symptom: at 2,000 requests a month a 99.9
+  percent SLO allows two bad requests, so one flaky client exhausts the budget and burn-rate alerts
+  flap; use a longer window, a looser target, or synthetic probes to supply enough events.
 - Using mean latency as the SLI. The symptom: p50 is fine while a tenth of users wait 20 seconds; use
   the fraction of requests under a threshold instead.
 - Calendar-month windows. The symptom: relaxed attention on the first, a burned budget by the twentieth,

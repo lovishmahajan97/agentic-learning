@@ -5,7 +5,7 @@ name: TTS (text-to-speech)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - multimodal/speech-to-text
   - serving-inference/streaming
@@ -58,7 +58,11 @@ neural models downstream faithfully pronounce whatever the front end hands them.
 ### Stage 2: acoustic model
 The phoneme (or character) sequence is mapped to an intermediate acoustic representation, classically
 a mel-spectrogram: a time-frequency picture at roughly 80 bands per frame and on the order of a hundred
-frames per second of speech (a 10–12.5 ms hop), hundreds of times fewer values than the waveform. Two designs matter. Autoregressive models (Tacotron 2) generate frames one at a time
+frames per second of speech (a 10–12.5 ms hop). At 24 kHz that is a couple of hundred times fewer
+*time steps* than the waveform; each step is a vector of ~80 values, so the raw value count is only a few
+times smaller. The saving that matters is sequence length, because that is what an attention or
+autoregressive model pays for, and the smooth spectral envelope is far easier to predict than
+individual samples with their phase. Two designs matter. Autoregressive models (Tacotron 2) generate frames one at a time
 with attention over the input text; natural, but slow and prone to skipping or repeating words when
 attention wanders. Non-autoregressive models (FastSpeech 2) first predict each phoneme's *duration*,
 expand the sequence accordingly, predict pitch and energy per phoneme, and then generate all frames in
@@ -80,6 +84,14 @@ predicts audio tokens conditioned on text tokens plus a few seconds of reference
 reference is just a prompt, the model clones an unseen voice zero-shot, with the same hallucination and
 repetition risks as any autoregressive LM. The codec decoder then turns tokens back into waveform.
 
+The token arithmetic explains the architectures. A codec such as EnCodec at 24 kHz emits 75 frames per
+second, and residual vector quantisation stacks several codebooks per frame, each refining the residual
+error of the previous one (8 codebooks of 1,024 entries give 75 × 8 × 10 bits = 6 kbps). Ten seconds of
+speech is then 750 frames × 8 = 6,000 tokens, too many to generate one by one at conversational speed.
+VALL-E therefore predicts only the first, coarsest codebook autoregressively (it carries most of the
+content and prosody) and fills in the other seven non-autoregressively in parallel; later models use
+interleaving or "delay" patterns across codebooks for the same reason.
+
 ### Streaming and latency
 A conversational agent cannot wait for the whole reply to be synthesised. The pipeline is streamed at
 two levels: the LLM's text is split at sentence or clause boundaries as it arrives, and each piece is
@@ -88,6 +100,13 @@ small frames. The metrics are time-to-first-audio (TTFA) and real-time factor (R
 audio duration; below 1 means faster than real time, and the margin is your concurrency headroom).
 Barge-in, stopping playback and generation when the user starts talking, is a product requirement that
 the architecture must support, which means cancellable synthesis.
+
+A worked budget shows why sentence streaming is non-negotiable (illustrative numbers): end-of-speech
+detection 300 ms, final ASR 200 ms, LLM first token 400 ms, first clause of ~12 tokens at 50 tokens/s
+240 ms, TTS first chunk 150 ms, network and jitter buffer 100 ms gives roughly 1.4 s to first audio.
+If TTS instead waits for a 150-token reply, the LLM alone adds about 3 s before synthesis starts. The
+lever with the most leverage is usually how early the splitter releases the first chunk (a clause
+boundary rather than a full sentence), not the vocoder.
 
 ### Quality and control
 Naturalness is measured by mean opinion score (MOS, listeners rate 1 to 5), intelligibility by running

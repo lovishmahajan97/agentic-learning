@@ -5,7 +5,7 @@ name: Mixed precision
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/gradient-clipping
   - ml-fundamentals/gradient-accumulation
@@ -80,12 +80,21 @@ inputs, so it is safe, whereas a softmax over thousands of logits or a variance 
 long sum whose rounding error compounds in 16 bits.
 
 ### fp32 master weights and the update
-Forward and backward produce 16-bit activations and gradients. The optimizer reads the gradients (cast
-up), updates the fp32 master weights, whose rounding unit is 2^-23, and the next forward casts the
-updated masters down again. Memory per parameter under Adam is therefore *not* reduced by mixed
-precision: 16-bit weight copy (2) + 16-bit gradient (2) + fp32 master (4) + fp32 first moment (4) + fp32
-second moment (4) = 16 bytes per parameter, the accounting used in the ZeRO paper, so a 7B model carries
-about 112 GB of model state regardless. Mixed precision shrinks activation memory and buys compute speed;
+The optimizer always updates an fp32 copy of the weights, whose rounding unit is 2^-23, so small updates
+accumulate; the next forward casts the updated weights down again. There are two common ways to lay
+this out, and they cost the same:
+
+```
+autocast style (PyTorch AMP):   fp32 params 4 + fp32 grads 4 + Adam m 4 + v 4          = 16 bytes/param
+master-copy style (Megatron,    bf16 params 2 + bf16 grads 2 + fp32 master 4 + m 4 + v 4 = 16 bytes/param
+  DeepSpeed, ZeRO accounting)
+```
+
+Under autocast the parameters *are* the fp32 masters; the 16-bit weights exist only as transient per-op
+casts, and gradients land in fp32 because autograd casts them back through the cast op. Frameworks that
+keep persistent 16-bit weights and gradients (to halve gradient communication) hold the fp32 master
+inside the optimizer instead. Either way, memory per parameter under Adam is *not* reduced by mixed
+precision, and a 7B model carries about 112 GB of model state regardless. Mixed precision shrinks activation memory and buys compute speed;
 cutting model-state memory is the job of sharding, 8-bit optimizers and quantization.
 
 ### Loss scaling (fp16 only)
@@ -183,9 +192,12 @@ def train_step(model, opt, x, y, dtype, scaler=None, max_norm=1.0):
   moves, and nothing raises an error.
 - Attaching a `GradScaler` to a bf16 run: harmless but pointless, and a sign that an fp16 recipe was copied
   without understanding which problem the scaler solves.
-- Computing a mean or variance in bf16 by hand, for example a custom RMSNorm doing `x.pow(2).mean()` on a
-  bf16 tensor: the sum of thousands of small squares loses terms, and the model trains worse than the
-  reference for no visible reason. Upcast to fp32 inside the op.
+- Computing normalization statistics in 16 bits by hand, for example a custom RMSNorm doing
+  `x * torch.rsqrt(x.pow(2).mean(-1) + eps)` on a bf16 tensor. PyTorch's built-in reductions accumulate in
+  fp32 internally, but every intermediate here (the squares, the mean, the `rsqrt`, the product) is rounded
+  to three significant digits, a hand-written or blocked sum can lose small terms outright, and in fp16 a
+  single activation above 256 overflows when squared. The model trains slightly worse than the reference
+  (bf16) or NaNs (fp16); upcast to fp32 inside the op, as reference implementations do.
 - Saving checkpoints with only the 16-bit weight copy, then resuming: the fp32 master state is gone, the
   restarted run follows a different trajectory and often shows a loss bump. Save fp32 masters plus
   optimizer state for resumable checkpoints; bf16-only exports are for inference.

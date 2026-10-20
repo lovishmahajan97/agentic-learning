@@ -5,7 +5,7 @@ name: LangSmith
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - observability/tracing
   - observability/langfuse
@@ -56,6 +56,11 @@ and environment. **Threads** are traces that share a conversation key in metadat
 `thread_id` or `conversation_id`); the UI reassembles them into a conversation view, which is how you read
 a multi-turn chat the way the user experienced it.
 
+Each run also carries its `trace_id` (the root's id) and a `dotted_order` string built from the start time
+and id of every ancestor. That field exists *because* runs arrive out of order: a child usually finishes,
+and is posted, before its parent, and batches from two processes interleave. Sorting by `dotted_order`
+reconstructs the tree and the sibling order deterministically without waiting for the parent to land.
+
 ### How runs get created
 With LangChain or LangGraph, setting `LANGSMITH_TRACING=true` plus an API key and project name installs a
 tracer callback handler, and every chain, node, model call and tool invocation becomes a run with no code
@@ -63,12 +68,16 @@ change. Outside the framework, `@traceable(run_type=...)` wraps any function: it
 a context variable, creates a child run, records arguments, return value and exceptions, and restores the
 parent on exit. `wrap_openai` and `wrap_anthropic` wrap provider clients so each completion becomes an `llm`
 run with token usage, including streamed responses, which the wrapper reassembles. A `RunTree` object gives
-manual control when decorators do not fit, and helpers carry the run context in headers so a trace can
-continue in another service.
+manual control when decorators do not fit. Across services, the caller serialises its current run tree
+to headers (`get_current_run_tree().to_headers()`) and the callee opens `tracing_context(parent=headers)`,
+so its runs become children in the same trace; this is LangSmith's own propagation format, not W3C
+`traceparent`, which matters when the hop also runs through OpenTelemetry-instrumented middleware.
 
 ### Transport
 Runs are queued and posted in background batches to the LangSmith API, so tracing stays off the request
-path; a short-lived process must wait for the queue to drain (`wait_for_all_tracers()` or the client's
+path. A run is typically sent twice, once on start (inputs, start time, parent) and once on end (outputs,
+error, end time, usage), which is why an in-flight agent step shows up in the UI as pending and why a crash
+leaves runs with inputs but no end; a short-lived process must wait for the queue to drain (`wait_for_all_tracers()` or the client's
 flush) or child runs are lost. LangSmith also exposes an OTLP endpoint, so OpenTelemetry-instrumented
 services can send spans into a project without the SDK.
 
@@ -87,6 +96,11 @@ applies the evaluators (plain functions or LLM judges that receive inputs, outpu
 and records their results as feedback; the result is an **experiment** you compare with others in the UI.
 Pairwise evaluators score two experiments against each other for preference judgements. The same
 experiments can be launched from the playground to test prompt variants and models without code.
+
+### Branding scope
+As of late 2025 LangChain uses the LangSmith name for its broader platform, including the agent deployment
+product previously called LangGraph Platform. This lesson concerns only the observability and evaluation
+part; tracing does not require deploying through LangSmith.
 
 ### Prompts and monitoring
 The prompt hub versions prompts by commit; `client.pull_prompt("name")` returns a LangChain prompt
@@ -143,6 +157,15 @@ evaluate(lambda inputs: answer(inputs["question"]),      # a str result is store
 The production trace appears as `support_answer` → `retrieve` and `support_answer` → `ChatOpenAI`-style
 `llm` run; the experiment appears under the dataset with one traced run per example and a
 `mentions_reference` feedback score you can compare with the next prompt version.
+
+Mechanically, the production call creates three runs sharing one `trace_id`. `retrieve` starts and ends
+first, so its end record is often posted before `support_answer` has ended; `dotted_order` puts it in place.
+The `llm` run records the messages, the response and the provider's usage, from which cost is priced. The
+`session_id` is set on the root call, which is what thread grouping reads. In the
+experiment, `evaluate` calls the lambda once per example, so each example yields its own trace, and the
+evaluator's boolean becomes a feedback row keyed `mentions_reference` on that trace's root run. With 200
+examples and two experiments, the comparison view lines up 200 pairs of runs by example id, which is what
+makes "v2 fixed 14 examples and broke 3" a readable statement rather than an average.
 
 ## Trade-offs
 - Deepest LangChain and LangGraph integration (node state, tool calls, streamed tokens for free) against

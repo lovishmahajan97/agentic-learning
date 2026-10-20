@@ -5,7 +5,7 @@ name: Bulkheads
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - reliability/circuit-breakers
   - reliability/tenant-level-quotas-and-noisy-neighbor-isolation
@@ -54,10 +54,22 @@ bulkhead supplies.
 ## How it works
 ### Size with Little's law
 The concurrency a dependency can consume is its call rate times its latency, and in the failure case
-latency equals the timeout. The bulkhead cap for a dependency is therefore its normal rate × normal
-latency, with headroom for bursts, and crucially it must be a small fraction of the total pool. The
-formula tells you two things: how large a cap is safe, and how much damage the dependency can do at
-worst, because occupancy can never exceed the cap no matter how slow it gets.
+latency equals the timeout. The bulkhead cap for a dependency is therefore its peak rate × a high
+percentile of latency (p99, not the mean, because LLM latency has a long tail and the cap must absorb
+it), with headroom for bursts, and crucially it must be a small fraction of the total pool. The formula
+tells you two things: how large a cap is safe, and how much damage the dependency can do at worst,
+because occupancy can never exceed the cap no matter how slow it gets.
+
+Read it backwards as well. A cap *C* on a dependency called at rate λ tolerates an average latency of
+up to *C* ÷ λ before callers start being rejected. A CRM cap of 20 at 5 calls per second admits
+everything until CRM latency averages 4 seconds, about thirteen times its normal 300 ms; beyond that
+the bulkhead starts shedding. That number is the real design choice: how much slowdown you will absorb
+before you would rather degrade.
+
+The caps do not have to sum to the pool. Oversubscription is normal, because dependencies rarely all
+hang at once; what must hold is that, when any one compartment (or any pair that shares a plausible
+common cause, such as two APIs behind the same customer VPN) is pinned at its cap, the remaining
+capacity still covers the healthy paths' demand. Check that condition, not the sum.
 
 ### Five forms, from cheapest to strongest
 1. **Semaphore bulkhead.** A counting semaphore per dependency in the process. Acquire before the call,
@@ -91,7 +103,9 @@ are now the stuck resource. A rejection should carry enough information for a gr
 `Retry-After`.
 
 ### How it composes with breakers and load shedding
-A bulkhead is a static limit that bounds damage regardless of health. A breaker is a dynamic reaction
+A bulkhead is a static limit that bounds damage regardless of health. It also protects the dependency:
+a cap of 20 is the most concurrent load your service can ever put on the CRM, which matters when the
+CRM's own capacity is the thing that is failing. A breaker is a dynamic reaction
 that stops sending once failure is observed. Load shedding is global admission control under overload.
 They stack: the bulkhead keeps a hung dependency from exhausting the pool while the breaker accumulates
 its minimum calls; once the breaker opens, even the bulkhead's permits are freed; and if the whole
@@ -123,7 +137,7 @@ class Bulkhead:
         finally:
             self.sem.release()                                  # released on success, error or cancellation
 
-# Little's law: concurrency = call rate x latency, plus headroom. Illustrative numbers:
+# Little's law: concurrency = peak rate x tail latency, plus headroom. Illustrative numbers:
 # LLM 20 rps x 3 s = 60 -> cap 100; vector DB 40 rps x 0.05 s = 2 -> cap 10; CRM 5 rps x 0.3 s = 1.5 -> cap 20
 # (generous headroom for the CRM, but still a tenth of the 200-worker pool, so a hang can take at most 20).
 LLM = Bulkhead("llm", 100)
@@ -163,6 +177,9 @@ is a compartment that slowly fills with ghosts.
   domain, not by code module.
 
 ## Pitfalls
+- Sizing the cap from mean latency. The symptom: steady trickle of `BulkheadFull` rejections on a healthy
+  dependency at peak, because the tail of slow but successful calls holds permits the mean did not
+  account for.
 - Setting the cap as a large fraction of the pool. The symptom: a bulkhead of 150 out of 200 "works"
   until the dependency hangs, and the service still cascades because 150 stuck workers is an outage.
 - Sharing one HTTP client across dependencies behind separate semaphores. The symptom: the CRM

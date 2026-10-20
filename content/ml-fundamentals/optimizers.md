@@ -5,7 +5,7 @@ name: Optimizers (Adam, AdamW)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/backpropagation
@@ -84,6 +84,12 @@ history has a large √v̂, so its decay is scaled down almost to nothing; a wei
 λθ dominating both numerator and denominator, so the ratio is about sign(θ) and it decays at the full
 rate regardless of λ. The regularisation strength has become a function of gradient statistics rather
 than of λ.
+
+A rough quantitative picture: near convergence a weight's loss gradient is mostly noise with RMS σ,
+so m̂ ≈ λθ while √v̂ ≈ σ (when λθ ≪ σ), and the coupled update shrinks the weight by about ηλθ/σ per
+step. The effective decay coefficient is λ/σ, not λ. With λ = 0.01, a weight whose gradient RMS is 1 is
+decayed at 0.01 and one whose gradient RMS is 0.1 at 0.1, ten times harder, for no reason anyone chose.
+Under AdamW both decay at exactly ηλ per step.
 
 AdamW removes λθ from the gradient entirely and applies decay as its own step: θ ← θ − η(m̂/(√v̂ + ε) +
 λθ), implemented in PyTorch as θ ← θ·(1 − ηλ) followed by the ordinary Adam step. Every weight now
@@ -170,8 +176,10 @@ print(g.abs())                                            # ... even though the 
   the resume point as m and v restart from zero.
 - Forgetting optimizer state in capacity planning; the symptom is an out-of-memory error at the first
   `optimizer.step()` even though the bf16 weights fitted comfortably.
-- Keeping m and v in bf16 to save memory; the symptom is training that stalls as small updates round to
-  zero, which is why the states are kept in fp32 or quantised with error compensation.
+- Keeping m and v in plain bf16 to save memory; bf16 resolves only about 0.4% relative changes, so the
+  per-step increment (1 − β2)·g² = 0.001·g² to v is rounded away and the scale estimate stops tracking.
+  The symptom is training that stalls or drifts compared with an fp32-state run, which is why states stay
+  in fp32 or use block-wise 8-bit quantisation designed for this.
 
 ## When to use
 Default to AdamW for transformers and for most new architectures: learning rate from a short sweep,

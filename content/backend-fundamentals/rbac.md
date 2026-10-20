@@ -5,6 +5,7 @@ name: RBAC
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - backend-fundamentals/authentication-vs-authorization
   - backend-fundamentals/oauth-2-0-oidc
@@ -113,7 +114,7 @@ customer's policy demands them.
 
 ## Example
 A scoped, hierarchical RBAC check with permission-named guards. Roles inherit downward, assignments
-carry a scope, and a role at any ancestor scope applies to the resource. `current_user` is the
+carry a scope, and a role at any ancestor scope applies to the resource. `current_user` stands in for the
 authentication dependency from the OAuth lesson; the point here is that handlers name *permissions*,
 never roles, so adding a role touches one table instead of every endpoint.
 
@@ -121,6 +122,7 @@ never roles, so adding a role touches one table instead of every endpoint.
 from fastapi import Depends, FastAPI, HTTPException
 
 app = FastAPI()
+def current_user() -> str: return "alice"   # stub for the bearer-token auth dependency
 PERMS = {                                   # role -> permissions granted directly
     "viewer": {"documents:read"},
     "editor": {"documents:write"},
@@ -162,8 +164,8 @@ assert not allowed("alice", "documents:delete", "project:42")  # admin nowhere
 ```
 
 ## Trade-offs
-- Indirection shrinks the assignment problem from users × permissions to users + roles, but the role
-  catalogue needs an owner; once roles are minted per team per exception ("role explosion") you are
+- Indirection shrinks the assignment problem from users × permissions to user-role plus role-permission
+  rows, but the role catalogue needs an owner; once roles are minted per team per exception ("role explosion") you are
   back to per-user lists with an extra hop.
 - Roles carried in the token make every check a local set lookup with no database round trip, but
   revocation lags by the token lifetime; the moment you need removal to bite within seconds
@@ -236,14 +238,15 @@ injection cannot widen its reach.
 > Where roles are stored is an implementation choice, and JWTs can carry any claim, so neither explains
 > the design.
 
-### Q: A user's role was removed ten minutes ago but they can still call a protected endpoint. What is the most likely cause?
+### Q: You removed a user's only role in your application's authorization service ten minutes ago, but they can still call a protected endpoint. Access tokens live for an hour. What is the most likely cause?
 - [ ] The role hierarchy still grants the permission through a junior role
 - [x] Roles are carried in the access token, which has not expired, so the check is using stale claims
 - [ ] The permission check is scoped to the wrong tenant
 - [ ] The identity provider has not propagated the change through SCIM
-> Token claims are a snapshot at issue time, so revocation lags by the token lifetime. A junior role
-> would mean the removed role was never the source of the permission, and SCIM lag affects assignment
-> creation, not a token that is already issued and valid.
+> Token claims are a snapshot at issue time, so revocation lags by the token lifetime. With no other
+> role left there is no junior role to inherit from, and SCIM carries changes from the identity
+> provider into the app, whereas this change was made in the app's own store; neither touches a token
+> that is already issued and valid.
 
 ### Q: Which requirement is RBAC alone poorly suited to express?
 - [ ] Administrators can manage the members of their own organisation

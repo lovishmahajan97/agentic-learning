@@ -5,6 +5,7 @@ name: Memory retrieval / update / deletion policies
 kind: practice
 difficulty: advanced
 est_minutes: 14
+status: fact-checked
 related:
   - agents/agent-memory
   - agents/context-compaction-summarization
@@ -86,8 +87,9 @@ fact, and recompute importance. Every mutation is logged.
   *because* unbounded stores degrade retrieval and cost.
 - **User control.** Users must be able to see, correct and delete what the agent remembers; the policy
   is not complete without the UI or API that exposes it.
-- **Erasure on request and offboarding.** Right-to-erasure obligations (for example under the GDPR)
-  require deleting a person's data everywhere: the raw store, the vector index, caches, compaction
+- **Erasure on request and offboarding.** Right-to-erasure obligations (for example GDPR Article 17,
+  which has its own exceptions such as legal retention duties) require deleting a person's data
+  everywhere it is held: the raw store, the vector index, caches, compaction
   summaries that embed the fact, derived consolidations, and logs, with backups rolling off on a
   documented schedule. Keep a tombstone so re-extraction from an old transcript cannot resurrect the
   memory, and verify with a post-deletion retrieval test.
@@ -108,15 +110,20 @@ TRUSTED = {"user", "verified_tool", "operator"}        # write gating: never "re
 def upsert_memory(user_id, text, source, kind="semantic"):
     if source not in TRUSTED:
         return "rejected_untrusted_source"
+    if tombstones.blocks(user_id):                     # erased users stay erased
+        return "rejected_tombstoned"
     neighbors = store.search(user_id=user_id, query=text, k=3, active_only=True)   # scoped first
-    decision = llm_json(
-        f"New statement: {text}\nExisting memories: {[n['text'] for n in neighbors]}\n"
-        'Return {"action": "add|update|ignore|delete", "target": "<existing text or null>"}')
+    listing = "\n".join(f"{i}: {n['text']}" for i, n in enumerate(neighbors)) or "none"
+    decision = llm_json(f"New statement: {text}\nExisting memories:\n{listing}\n"
+        'Return {"action": "add|update|ignore|delete", "target": <index of existing memory or null>}')
     now, mid = time.time(), str(uuid.uuid4())
+    t = decision.get("target")
+    if decision["action"] in ("update", "delete") and not (isinstance(t, int) and 0 <= t < len(neighbors)):
+        decision["action"] = "add"                     # model named no valid target: fail safe
     if decision["action"] == "ignore":
         return "ignored_duplicate"
     if decision["action"] in ("update", "delete"):
-        old = next(n for n in neighbors if n["text"] == decision["target"])
+        old = neighbors[t]
         store.update(old["id"], active=False, superseded_by=mid if decision["action"] == "update" else None,
                      ended_at=now)                      # keep history; retrieval filters active_only
         if decision["action"] == "delete":
@@ -133,12 +140,16 @@ def erase_user(user_id):
     vector_index.delete(ids)                             # derived index, same ids
     summary_store.delete(user_id=user_id)                # compaction summaries that embed facts
     tombstones.add(user_id, ids, at=time.time())         # block re-extraction from old transcripts
-    assert store.search(user_id=user_id, query="anything", k=1) == []   # verify, then log
+    if store.search(user_id=user_id, query="anything", k=1):            # verify, then log
+        raise RuntimeError(f"erasure incomplete for {user_id}")
     audit("user_erased", user_id, len(ids))
 ```
 
 The decisions that matter are the trusted-source gate, superseding rather than overwriting, filtering
-on `active` at retrieval time, and erasing the index and summaries along with the raw records.
+on `active` at retrieval time, and erasing the index and summaries along with the raw records. Two
+details are deliberate: the model picks the target by *index*, because asking it to echo the existing
+text verbatim fails on any paraphrase; and the tombstone is checked on the write path, since a tombstone
+nobody reads blocks nothing. The tombstone records the user id and time, not the erased content.
 
 ## Trade-offs
 - Blending recency and importance into retrieval keeps results fresh and relevant, but each weight is
@@ -152,11 +163,12 @@ on `active` at retrieval time, and erasing the index and summaries along with th
   found in documents; the compromise is storing such facts as low-trust, clearly labelled, and never as
   instructions.
 - Aggressive TTLs keep the store small and compliant, while risking the loss of a rarely used but
-  important fact; importance-weighted expiry is the usual middle ground.
+  important fact; importance-weighted expiry is a common middle ground.
 
 ## Pitfalls
-- Scoring across all users and filtering afterwards; the symptom is another user's fact appearing
-  when a tenant has few memories of its own.
+- Scoring across all users and filtering afterwards; the symptom is users with few memories getting
+  thin or empty recall because the global top-k was filled by other users' entries, and any bug in that
+  post-filter becomes a cross-user leak.
 - Append-only updates; the symptom is two addresses, two plans or two names retrieved together and
   the agent choosing the wrong one.
 - Storing memories from retrieved documents or web pages; the symptom is an instruction-shaped memory

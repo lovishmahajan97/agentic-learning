@@ -5,7 +5,7 @@ name: Positional encoding (RoPE)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - model-internals/self-attention
   - model-internals/context-window
@@ -72,8 +72,9 @@ positions should only influence *who attends to whom*.
 Pair 0 rotates one radian per token and wraps every ~6 tokens, so it resolves very local order. The
 slowest pair, with d = 128 and base 10,000, turns by about 27° across 4,096 tokens and completes a full
 rotation only every ~54,000 tokens, so within a typical context it barely moves and acts as a
-near-absolute, long-range channel. Raising the base to 500,000 slows every frequency; the slowest pair
-then needs millions of tokens for a full turn. The spread of frequencies lets different dimensions
+near-absolute, long-range channel. Raising the base to 500,000 leaves pair 0 at one radian per token and
+slows every other pair, increasingly so toward the slow end; the slowest pair then needs about 2.5
+million tokens for a full turn, so more pairs stay inside the arc they saw in training at long range. The spread of frequencies lets different dimensions
 specialize in different ranges, the same geometric schedule the sinusoidal encoding used additively.
 The RoPE paper also shows that the inner product between a fixed query and key decays with distance on
 average, a built-in mild preference for nearby tokens.
@@ -84,8 +85,12 @@ Llama code (which multiplies complex numbers), or "rotate-half", which pairs dim
 *i + d/2* and computes `q·cos + rotate_half(q)·sin`, as in the Hugging Face Llama implementation. They
 differ by a permutation of dimensions, and the permutation is baked into trained `W_Q` and `W_K`, so
 converting checkpoints between layouts requires permuting those weights; the official conversion script
-does exactly that, and forgetting it is a classic porting bug. The cos/sin tables `[max_len, d/2]` are precomputed, usually in fp32, and applied
-after the projections and before the score matmul.
+does exactly that, and forgetting it is a classic porting bug. The cos/sin tables `[max_len, d/2]` are
+precomputed, usually in fp32, and applied after the Q/K projections and before the score matmul. The
+order matters: rotating the hidden state *before* `W_Q` and `W_K` would put the projection matrices
+between the two rotations and destroy the `R_mᵀ·R_n = R_(n−m)` cancellation. Some families rotate only a
+fraction of each head's dimensions (`partial_rotary_factor` or `rotary_pct` in configs) and leave the
+rest position-free, so check the config rather than assuming the whole head is rotated.
 
 ### Interaction with the KV cache
 Each key is rotated by its own absolute position when it is inserted into the cache, and each query by
@@ -97,7 +102,7 @@ cached key from *i* onward.
 
 ### Context extension
 Past the training length, the low-frequency pairs reach angles the model never saw, attention patterns
-break and perplexity rises sharply within a few hundred tokens of the limit. Position interpolation
+break and perplexity rises sharply soon after the limit. Position interpolation
 (Chen et al.) rescales positions by `L_train / L_new` so all angles stay inside the trained range, then
 fine-tunes briefly; it works but squeezes the high-frequency pairs, costing resolution between adjacent
 tokens. NTK-aware scaling instead raises the base, which stretches low frequencies a lot and high ones
@@ -153,17 +158,19 @@ print(f"slowest pair: {np.degrees(4096 * theta_min):.1f} degrees over 4096 token
   ALiBi's fixed penalty behaves better out of the box.
 - Learned absolute tables are simple and strong at trained lengths, with a hard cap on context; they
   remain reasonable for fixed-length encoders and wrong for anything that must grow.
-- A larger base (500,000 versus 10,000) improves long-context behaviour by slowing all frequencies, at
-  the cost of less angular resolution between nearby tokens at short range; whether that costs quality
-  depends on model and data, and vendors tune it empirically.
+- A larger base (500,000 versus 10,000) improves long-context behaviour by slowing the middle and low
+  frequencies, at the cost of fewer pairs that distinguish offsets in the hundreds-to-thousands range;
+  whether that costs short-context quality depends on model and data, and vendors tune it empirically.
 - Position interpolation is simple and robust after a short fine-tune but blurs local resolution; YaRN
   preserves high frequencies and needs fewer tokens but has more knobs to get wrong.
 
 ## Pitfalls
 - Mixing the interleaved and rotate-half layouts when loading ported weights; the symptom is a model with
   correct shapes and no errors whose perplexity is in the hundreds.
-- Applying the rotation to values, or after the softmax; the symptom is a model that trains but never
-  learns sharp positional patterns because the relative property is gone.
+- Feeding wrong position ids: restarting at 0 on each decode step, or counting pad tokens in a
+  left-padded batch; the symptom is output that is fine for the longest prompt in a batch but degraded
+  for shorter ones, or quality that drops right after the first generated token. Positions must come
+  from the attention mask and the cache length.
 - Running past `max_position_embeddings` with no scaling; the symptom is output that degenerates into
   repetition or nonsense right after the trained length, with no exception raised.
 - Computing the cos/sin tables in bf16 or fp16 for large positions; the symptom is slowly degrading
@@ -199,7 +206,7 @@ by *m* and a key rotated by *n* equals the dot product between the original quer
 retrieved content is unaffected. During training at 4k, the low-frequency pairs only ever sweep a small
 arc, so the model's weights are tuned to scores produced within that arc. At positions 4k–8k those pairs
 enter angles never seen, the scores they contribute are effectively random, attention patterns break and
-perplexity rises within a few hundred tokens. Position interpolation rescales positions so 8k maps into
+perplexity climbs. Position interpolation rescales positions so 8k maps into
 the trained arc, then a short fine-tune restores quality.
 
 ## Quiz

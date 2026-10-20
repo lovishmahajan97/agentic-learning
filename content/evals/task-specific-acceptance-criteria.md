@@ -5,6 +5,7 @@ name: Task-specific acceptance criteria
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -101,14 +102,16 @@ import json, re
 from collections import defaultdict
 
 ALLOWED = {"billing", "refund", "shipping", "cancel", "other"}
+# crude on purpose: also flags ISO dates and long order ids; use a real PII detector in production
 PII = re.compile(r"\b[\w.+-]+@[\w-]+\.\w+\b|\b\+?\d[\d\s().-]{8,}\d\b")
 
 def checks(ticket: dict, raw_output: str, label: dict):
     try:
         out = json.loads(raw_output)
     except json.JSONDecodeError:
-        yield ("valid_json", False, "hard"); return   # generator: yield the failure, then stop
-    yield ("valid_json", True, "hard")
+        out = None
+    yield ("valid_json", isinstance(out, dict), "hard")   # a bare string or list is not a valid record
+    if not isinstance(out, dict): return                  # generator: report the failure, then stop
     yield ("category_in_set", out.get("category") in ALLOWED, "hard")
     yield ("no_pii_in_summary", not PII.search(out.get("summary", "")), "hard")
     yield ("summary_max_40_words", len(out.get("summary", "").split()) <= 40, "soft")

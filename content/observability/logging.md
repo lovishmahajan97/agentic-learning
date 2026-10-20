@@ -5,7 +5,7 @@ name: Logging
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - observability/tracing
   - observability/monitoring
@@ -60,7 +60,9 @@ encoding: one object per line, append-only, trivially shippable.
 ### Binding context once
 The correlation fields are bound to the request context at the edge (middleware extracts or creates
 the request id and reads the current trace id) and merged into every subsequent record automatically
-by a context-variable processor. Call sites log only what is specific to their event. This is the most
+by a context-variable processor. The middleware must also *clear* that context at the start of each
+request, *because* a worker thread that is reused keeps whatever was bound last, and the next request
+would otherwise inherit the previous one's tenant and ids. Call sites log only what is specific to their event. This is the most
 important mechanical choice, *because* it makes correlation independent of discipline: a line logged
 deep inside a retry helper still carries the ids.
 
@@ -104,6 +106,11 @@ OpenTelemetry's logs signal exists precisely to carry that correlation and to sh
 same collector as spans.
 
 ### Retention and deletion
+Operational logs are not an audit log. An audit log records who did what with which authority (a tool
+that refunded money, an approval that was granted), is append-only, is never sampled and is kept for
+years; debugging logs are sampled, redacted and expire. Mixing them forces the worst of both: audit
+retention on payload-heavy debug data, or debug sampling on records you are legally required to keep.
+
 Logs with payloads are user data. Define retention tiers (hot and searchable for a short window, cold
 archive for compliance, then deletion) and make deletion requests executable, which is only possible
 when records are keyed by tenant and user ids.
@@ -117,12 +124,12 @@ completion rather than the half-parsed result. Token counts are stand-ins for th
 ```python
 import hashlib, json, re, time, uuid
 import structlog
-from structlog.contextvars import bind_contextvars, merge_contextvars
+from structlog.contextvars import bind_contextvars, clear_contextvars, merge_contextvars
 
 SECRET = re.compile(r"\b(sk|key)-[A-Za-z0-9]{8,}")
 
 def redact(logger, method, event):            # pipeline step: runs on every record
-    for k, v in list(event.items()):
+    for k, v in list(event.items()):           # top level only; real ones recurse
         if isinstance(v, str):
             event[k] = SECRET.sub("[REDACTED]", v)[:2000]   # mask secrets, cap size
     return event
@@ -137,6 +144,7 @@ structlog.configure(processors=[
 log = structlog.get_logger()
 
 def handle_turn(tenant, trace_id, prompt):
+    clear_contextvars()                         # drop the previous request's fields
     bind_contextvars(request_id=uuid.uuid4().hex, trace_id=trace_id, tenant=tenant)
     t0 = time.perf_counter()
     raw = '{"status": "shipped", "eta": "2 May"'     # stand-in: truncated model output
@@ -176,6 +184,9 @@ handle_turn("acme", "4bf92f3577b34da6a3ce929d0e0e4736",
   or to each other, so an incident becomes a timestamp-matching exercise.
 - Prompts containing customer data or pasted API keys written at INFO; the symptom is a security
   finding, followed by logging being disabled wholesale.
+- Binding request context without clearing it; the symptom is log lines from one request carrying
+  another request's tenant or request id, which surfaces as an impossible cross-tenant "leak" in an
+  investigation.
 - Counting log lines as your metrics; the symptom is dashboards that take minutes to render and a
   logging bill that dwarfs the metrics system.
 - Logging only failures; the symptom is a model that quietly degrades (wrong but well-formed answers)

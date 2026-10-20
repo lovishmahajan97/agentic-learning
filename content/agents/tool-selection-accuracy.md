@@ -5,6 +5,7 @@ name: Tool selection accuracy
 kind: metric
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - agents/tool-calling
   - agents/tool-schemas-and-argument-validation
@@ -61,7 +62,9 @@ Step-level accuracy is the conjunction: right decision, right tool, right argume
 Sample real traffic, not imagined prompts, and label each turn with the expected tool (or `none`) and
 the expected key arguments. Include `none` cases in roughly their real proportion so precision is
 measured, and deliberately include near-miss pairs that separate similar tools. A set in the low
-hundreds of cases is enough to see large regressions; label it as a golden set, keep it out of any
+hundreds of cases is enough to see large regressions but not small ones: with 200 cases the standard
+error on a 90% score is about 2 points (sqrt(0.9 × 0.1 / 200) ≈ 0.021), so only shifts of roughly five
+points or more are distinguishable from noise. Label it as a golden set, keep it out of any
 few-shot examples embedded in tool descriptions, and version it with the tool definitions. For
 mid-trajectory decisions, snapshot the conversation up to the decision point as the case input.
 
@@ -69,13 +72,15 @@ mid-trajectory decisions, snapshot the conversation up to the decision point as 
 Each case is one model request with the production system prompt and tool list and `tool_choice` left
 on `auto`; score the first response's `tool_use` blocks. Because the prefix (tools plus system prompt)
 is identical across cases, prompt caching makes a few hundred cases inexpensive, and the run fits in CI
-on every change to a description, the tool list or the model version.
+on every change to a description, the tool list or the model version. Selection is sampled, not
+deterministic, so run borderline cases several times (or the whole set two or three times) and treat
+run-to-run variation as part of the noise floor.
 
 ### What moves the number
 - **Trigger conditions in descriptions.** "Call this when the user asks about an order's status; do
-  not use it for returns" raises recall and reduces confusion more than any other single edit. Some
-  recent models reach for tools more conservatively, which makes explicit "call when" language matter
-  more, not less.
+  not use it for returns" is usually the highest-leverage single edit for recall and confusion. How
+  eagerly a model reaches for tools differs between model families and versions (some under-call, some
+  over-call), which is why the "call when" language has to be re-validated on every model change.
 - **Fewer, more distinct tools.** Merge overlapping tools behind an enum parameter, split a do-anything
   tool whose `mode` parameter is really five tools, and give names that read as verbs on nouns.
 - **Fewer tools in context.** Beyond a few dozen tools (the threshold is model-dependent and
@@ -90,8 +95,9 @@ learned behaviour. Re-run the eval on every model change and treat a should-call
 not as a bug in your code.
 
 ## Example
-A minimal eval harness: a labelled case set, one request per case, and three scores plus a confusion
-map. It uses the production `TOOLS` and `SYSTEM` and never executes a tool, so it is safe to run in CI.
+A minimal eval harness: a labelled case set, one request per case, and the decomposed scores (should-call
+recall and precision, name accuracy over cases where a call was needed and made, argument accuracy over
+correctly named calls) plus a confusion map that also records missed and unnecessary calls. It uses the production `TOOLS` and `SYSTEM` and never executes a tool, so it is safe to run in CI.
 
 ```python
 import anthropic
@@ -111,19 +117,21 @@ def first_call(user_msg: str):
                                tools=TOOLS, messages=[{"role": "user", "content": user_msg}])
     return next(((b.name, b.input) for b in r.content if b.type == "tool_use"), (None, {}))
 
-tally, confusion = Counter(), Counter()
+t, confusion = Counter(), Counter()
 for msg, want, want_args in CASES:
     got, args = first_call(msg)
-    tally["decision_ok"] += (got is None) == (want is None)
+    t["needed"] += want is not None
+    t["called"] += got is not None
     if want is not None and got is not None:
-        tally["name_ok"] += got == want
-        tally["args_ok"] += got == want and all(args.get(k) == v for k, v in want_args.items())
-        if got != want:
-            confusion[(want, got)] += 1
+        t["both"] += 1
+        t["name_ok"] += got == want
+        t["args_ok"] += got == want and all(args.get(k) == v for k, v in want_args.items())
+    if got != want:
+        confusion[(want, got)] += 1        # includes (tool, None) misses and (None, tool) over-calls
 
-n, n_tool = len(CASES), sum(1 for _, w, _ in CASES if w)
-print(f"call/no-call {tally['decision_ok']/n:.0%}  name {tally['name_ok']/n_tool:.0%}  "
-      f"args {tally['args_ok']/n_tool:.0%}")
+d = lambda a, b: t[a] / max(t[b], 1)
+print(f"recall {d('both', 'needed'):.0%}  precision {d('both', 'called'):.0%}  "
+      f"name {d('name_ok', 'both'):.0%}  args {d('args_ok', 'name_ok'):.0%}")
 print("confusions (expected -> chosen):", dict(confusion))
 ```
 

@@ -5,7 +5,7 @@ name: GPU memory optimization (VRAM math)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -53,9 +53,12 @@ how many concurrent conversations of what length a GPU can hold, and which lever
 ### Line 1: weights
 `bytes = params × bytes_per_param`. bf16/fp16 is 2, fp8/int8 is 1, 4-bit is 0.5 plus the scales and
 zero points: the simple `Q4_0` layout stores 32 weights × 4 bits plus a 16-bit scale, 4.5 bits per
-weight; group-128 schemes such as GPTQ or AWQ land near 4.1–4.2. Count the embedding table and LM head
-separately when they are untied: for a 128k-token vocabulary and hidden size 8,192 in bf16, each is
-about 2.1 GB. For mixture-of-experts models count *all* experts, since every expert must be resident even
+weight; group-128 schemes such as GPTQ or AWQ land near 4.1–4.2. Published parameter counts include the
+embedding table and LM head, but if you estimate from per-layer shapes, add them: for a 128k-token
+vocabulary and hidden size 8,192 in bf16 each is about 2.1 GB, and an untied model has both. They are
+also often left at higher precision by weight-only quantizers, so a "4-bit" file is larger than
+params × 0.5 suggests. Anything else resident belongs on this line too: a draft model for speculative
+decoding (plus its own KV cache), a vision encoder, preallocated LoRA adapter slots. For mixture-of-experts models count *all* experts, since every expert must be resident even
 though only a few run per token; a model with 47B total and 13B active parameters costs 94 GB in bf16,
 not 26 GB.
 
@@ -72,7 +75,11 @@ During prefill a chunk of T tokens flows through each layer as a [T, hidden] ten
 [T, intermediate] inside the MLP, and attention needs its own buffers. FlashAttention-style kernels
 never materialise the [T, T] score matrix, so attention memory is linear in T; without them a 32k
 prompt would need gigabytes of scores per head. Chunked prefill caps T per step, which caps this peak
-regardless of prompt length. Sampling needs a logits buffer of [batch, vocab] in fp32: 256 sequences ×
+regardless of prompt length. For scale: with T = 8,192 and a 70B-class intermediate size of 28,672, the
+gate and up projections each produce 8,192 × 28,672 × 2 bytes ≈ 0.47 GB, about 0.94 GB together before a
+tensor-parallel split, and that is one layer's transient, reused layer after layer rather than summed.
+The LM head is the other trap: run on every prompt position it would produce 8,192 × 128k × 4 bytes ≈
+4.2 GB of fp32 logits, which is why engines compute logits only at the positions they sample from. Sampling needs a logits buffer of [batch, vocab] in fp32: 256 sequences ×
 128k vocabulary × 4 bytes is about 131 MB, small but real. Engines estimate this line by running a dummy
 forward pass at the maximum batch and token budget during startup, which is why those limits change the
 reported KV capacity.
@@ -108,14 +115,16 @@ total, not for attribution.
 A Llama-3-70B-class model (80 layers, 8 KV heads, head_dim 128, hidden 8,192, about 140 GB in bf16) on
 two 80 GB GPUs with tensor parallelism of 2 and a 0.9 memory fraction, so 72 GB usable per GPU.
 
-In bf16, weights are about 70.6 GB per GPU, which with any reserve already exceeds the 72 GB budget:
-not a deployment. Quantize the weights to int8: about 35.3 GB per GPU. KV per token is 2 × 80 × 8 × 128
+In bf16, weights are about 70.6 GB per GPU against a 72 GB budget: after the activation reserve there
+is essentially nothing left for cache (a few GB at best, depending on how strictly you count GB versus
+GiB), so not a useful deployment. Quantize the weights to int8: about 35.3 GB per GPU. KV per token is 2 × 80 × 8 × 128
 × 2 = 320 KB in fp16, or 160 KB per GPU after sharding. Reserve an illustrative 2 GB for activation peak
 and overhead: 72 − 35.3 − 2 ≈ 34.7 GB for the pool, which is 34.7 × 2³⁰ ÷ 160 KB ≈ 227,000 tokens. At an
 expected 8k tokens per conversation that is about 27 concurrent conversations. Switching the KV cache to
 fp8 halves bytes per token and doubles that to about 55; capping context at 4k doubles it again to about
 111. Each step of the plan is one term of the ledger, and the calculator below reproduces it so the
-numbers can be re-run for any model.
+numbers can be re-run for any model. (It blurs GB and GiB, a 7% difference that is smaller than the
+uncertainty in the reserve; when the margin is that thin, use the engine's logged block count instead.)
 
 ```python
 def vram_plan(vram_gb, params_b, w_bytes, layers, kv_heads, head_dim, kv_bytes,

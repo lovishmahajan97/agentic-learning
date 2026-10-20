@@ -5,6 +5,7 @@ name: Prompt versioning
 kind: practice
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - prompting/prompt-templates
   - prompting/prompt-caching
@@ -43,8 +44,8 @@ runtime rather than at review.
 The naive answer, "it is in git, so it is versioned", is half right. Git versions the file. It does
 not record which commit produced which response, does not capture the variables rendered at runtime,
 and hides that the model id and the tool descriptions changed in the same pull request. Sculley et al.
-called this configuration debt: ML systems fail through unversioned configuration more often than
-through bugs in code. Prompt versioning is the practice of turning the *effective prompt* into an
+called this configuration debt: in mature ML systems the configuration is large, rarely reviewed
+with the rigour applied to code, and a common source of costly mistakes. Prompt versioning is the practice of turning the *effective prompt* into an
 identifiable, testable, revertible artifact.
 
 ## How it works
@@ -90,8 +91,10 @@ live traffic. The eval exists *because* prompt changes have non-local effects th
 cannot predict; the canary exists because the golden set never covers the real distribution.
 
 ### Two interactions worth knowing
-A prompt release changes bytes near the front of the request, so it invalidates the prompt cache for
-every request at once: expect a cost and time-to-first-token blip and prefer a gradual alias move.
+A prompt release changes bytes near the front of the request, so every request on the new version
+misses the prompt cache until the new prefix has been written once: expect a short cost and
+time-to-first-token blip, larger at high concurrency where many requests miss before the first write
+lands. A gradual alias move keeps most traffic on the still-warm old prefix while the new one warms.
 And a model upgrade is a prompt version too, because prompts are tuned to a model; pin the model in
 the bundle and re-evaluate when it changes.
 
@@ -157,8 +160,8 @@ def triage(client, ticket: str, tracer) -> str:
   symptom is "the prompt did not change" while behaviour did after someone reworded a tool.
 - Promoting on the aggregate score alone; the symptom is a mean that rose one point while one critical
   category fell from 95% to 70%, visible only in per-case diffs.
-- Releasing to 100% of traffic at once; the symptom is a cost and latency spike at every prompt deploy
-  as the entire prompt cache misses simultaneously.
+- Releasing to 100% of traffic at once; the symptom is a regression that reaches every user before any
+  metric can flag it, plus a brief cost and latency spike as all traffic misses the prompt cache together.
 
 ## When to use
 From the first prompt that reaches a user. The minimum that pays for itself in a week is: prompt in a

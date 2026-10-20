@@ -5,6 +5,7 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -89,8 +90,9 @@ tools registered with a decorator, a dependency type injected into tools through
 typed output validated by Pydantic, with retries driven by validation failures (the model is shown the
 validation error and asked again). It is model-agnostic, integrates natively with Logfire for tracing,
 and ships a companion graph library for explicit state machines. Under the hood it is the plain agent
-loop with schemas generated from type hints; nothing is hidden. Sharp edges: younger than the others,
-so fewer integrations, and a fast-moving API in which names have been renamed between releases.
+loop with schemas generated from type hints; little is hidden. Sharp edges: younger than the others,
+so fewer integrations, and an API that moved fast before its 1.0 release (2025), with names such as
+`result_type` renamed to `output_type`, so older tutorials no longer run as written.
 
 ### DSPy
 A different kind of thing: a programming model in which you declare *signatures* (typed input and
@@ -114,19 +116,23 @@ abstraction leaks, that is what you are debugging.
 ## Example
 Two philosophies on the same task, support-ticket triage. Pydantic AI makes the tool and the output
 type explicit and validates them; DSPy declares the task and leaves the prompt to the compiler. Model
-identifiers are configuration, not code. Exact parameter names follow each library's current release.
+identifiers are configuration, not code, and the two libraries spell them differently (Pydantic AI
+uses `provider:model`, DSPy passes LiteLLM's `provider/model`). Parameter names follow Pydantic AI 1.x
+(`output_type`, `result.output`; older releases used `result_type` and `result.data`) and DSPy 2.5+.
 
 ```python
 import os
-from pydantic import BaseModel
+from typing import Literal
+from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 
 class Triage(BaseModel):
-    category: str            # billing | bug | feature
-    priority: int            # 1 (urgent) to 4
+    category: Literal["billing", "bug", "feature"]   # anything else fails validation
+    priority: int = Field(ge=1, le=4)                 # 1 (urgent) to 4
     reason: str
 
-agent = Agent(os.environ["MODEL"], deps_type=dict, output_type=Triage,
+agent = Agent(os.environ["PYDANTIC_AI_MODEL"],        # "provider:model", e.g. "openai:<model>"
+              deps_type=dict, output_type=Triage,
               system_prompt="Triage support tickets using the account data available through tools.")
 
 @agent.tool
@@ -139,7 +145,7 @@ print(result.output)       # a validated Triage; a malformed answer triggers a r
 
 # ---- DSPy: declare the task, compile the prompt ----
 import dspy
-dspy.configure(lm=dspy.LM(os.environ["MODEL"]))
+dspy.configure(lm=dspy.LM(os.environ["DSPY_MODEL"]))  # LiteLLM form, "provider/model": not the same string
 
 class TriageSig(dspy.Signature):
     """Classify a support ticket and assign a priority."""

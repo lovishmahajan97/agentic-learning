@@ -5,6 +5,7 @@ name: Kubernetes
 kind: tool
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/ci-cd
@@ -60,7 +61,7 @@ back and why a `docker run` on a node is invisible to the cluster.
 
 ### The objects you actually use
 - **Pod**: one or more containers sharing a network namespace and volumes; the unit of scheduling;
-  ephemeral, never created directly in production.
+  ephemeral, and almost never created directly in production (a controller owns it).
 - **Deployment → ReplicaSet → Pods**: a replica count, a Pod template and a rollout strategy. Changing
   the image creates a new ReplicaSet and scales it up while the old one scales down, bounded by
   `maxSurge` and `maxUnavailable`; a bad rollout rolls back to the previous ReplicaSet.
@@ -93,7 +94,8 @@ time-slicing configured on the node.
 ### Termination
 When a Pod is deleted it is marked Terminating, removed from Service endpoints (asynchronously, so
 traffic can still arrive for a moment), its `preStop` hook runs, PID 1 receives SIGTERM, and after
-`terminationGracePeriodSeconds` (30 by default) it receives SIGKILL. The server must stop accepting,
+`terminationGracePeriodSeconds` (30 by default, and the clock starts before `preStop`, so the hook's
+time counts against it) it receives SIGKILL. The server must stop accepting,
 drain in-flight requests, including streams, and exit. For LLM responses that can run for minutes,
 raise the grace period and add a short `preStop` sleep so endpoint removal propagates first.
 
@@ -177,15 +179,17 @@ spec:
   high, Pods stuck Pending with `Insufficient nvidia.com/gpu` in the events.
 - A liveness probe that calls the model or the database; the symptom is a restart storm during an
   incident that turns a slow dependency into a full outage.
-- No startup probe on a service that loads weights for minutes; the symptom is CrashLoopBackOff with
-  the Pod restarting roughly every minute during load.
+- No startup probe on a service that loads weights for minutes; the symptom is CrashLoopBackOff: the
+  liveness probe kills the container mid-load (with default settings after about 30 seconds of failed
+  checks), and the restart backoff grows toward its five-minute cap while the model never finishes
+  loading.
 - Readiness returning 200 before the model is loaded; the symptom is a burst of 5xx responses right
   after every deploy.
 - The default 30-second grace period with no drain logic; the symptom is streaming responses cut
   mid-token on every rollout and node drain.
 - Deploying a `:latest` tag; the symptom is Pods on different nodes running different code depending on
   when each node last pulled.
-- OOMKilled with no application log; the symptom is restarts under load because the memory request was
+- OOMKilled with no application log; the symptom is restarts under load because the memory limit was
   set below the real peak of tokenizer plus model plus batch.
 - Treating `emptyDir` or local disk as durable for an index; the symptom is data gone after the Pod is
   rescheduled.
@@ -250,6 +254,6 @@ across a rollout.
 - [ ] The scheduler only honours GPU requests in the kube-system namespace
 - [x] `nvidia.com/gpu` is an integer, non-overcommittable resource exposed by the device plugin, and GPU nodes are usually tainted, so the Pod needs a free whole GPU plus a matching toleration
 - [ ] GPU nodes do not run the kubelet
-> CPU can be oversubscribed and sliced, so a CPU Pod almost always fits somewhere. A GPU request needs
-> an entire unallocated device on a node whose taint the Pod tolerates; if none is free the Pod waits
+> CPU is requested in millicores on plentiful, cheap nodes, so a CPU Pod usually fits somewhere. A GPU
+> request needs an entire unallocated device on a node whose taint the Pod tolerates; if none is free the Pod waits
 > until one is released or a new node is provisioned.

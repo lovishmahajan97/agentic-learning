@@ -5,7 +5,7 @@ name: Class imbalance
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/precision-recall-f1
@@ -59,6 +59,13 @@ ROC's false-positive axis is normalised by the huge negative count and hides the
 Specify the operating point as a constraint ("recall ≥ 0.8 at the best precision", or "at most N
 false alarms per day") and pick the threshold on a validation split, never on the test split.
 
+Then check that the evaluation set can measure what you claim. Recall is estimated from the positives
+alone, so its standard error is about √(r(1 − r) / n_pos): with 50 positives a measured recall of 0.80
+has a standard error near 0.057, a 95% interval of roughly ±0.11, which is too wide to tell 0.75 from
+0.85. With 400 positives the interval narrows to about ±0.04. The size of the dataset is irrelevant;
+the number of positives is what buys precision on recall, which is why evaluation sets for rare
+classes are deliberately enriched (and why that enrichment must be undone for precision, below).
+
 ### Lever 1: move the threshold
 For a model that already ranks reasonably, most of the "imbalance problem" is the 0.5 default. Choose
 τ on validation to meet the cost-optimal rule above or the product constraint. No retraining, no
@@ -72,8 +79,14 @@ so with 2% positives the minority weight is about 25 and the majority about 0.51
 `class_weight="balanced"`). This is oversampling in expectation without duplicating rows. It moves the
 boundary toward recall, but it changes the whole fitted solution, not only the intercept, so verify
 the ranking with average precision rather than assuming it improved; and the probabilities now reflect
-an artificial 50/50 prior and must be recalibrated or corrected before anything consumes them. For
-deep networks the same idea is weighted cross-entropy, or **focal loss**:
+an artificial 50/50 prior and must be recalibrated or corrected before anything consumes them. When
+does reweighting genuinely help rather than merely relocate the threshold? When the model cannot fit
+everything and must choose where to spend capacity (a misspecified or heavily regularized model), the
+weights tell it to fit the minority's boundary at the expense of the bulk of the negatives, which can
+improve ranking in the high-recall region you will actually operate in; and when training by
+minibatch SGD, where a 1%-positive class appears about once per hundred examples and oversampling makes
+its gradient signal less noisy. Both are empirical claims about your data, so measure AP with and
+without. For deep networks the same idea is weighted cross-entropy, or **focal loss**:
 
 ```
 FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
@@ -163,9 +176,13 @@ for cw in (None, "balanced"):
 # the 2% base rate; and its average precision is not better (in this run it is clearly worse, ~0.74 vs ~0.82).
 ```
 
-The last line is the one people miss: the weights did not teach the model anything new about the
-minority, they moved its operating point and inflated its probabilities, and the same operating point
-was available for free by moving τ.
+The output is the one people miss. In one run: unweighted, AP 0.82, recall 0.67 at τ = 0.5, and
+recall 0.80 at precision 0.61 once τ is tuned to about 0.13. Balanced, AP 0.74, recall 0.89 at τ = 0.5
+but precision 0.16, and at the tuned τ about 0.73 recall 0.83 at precision 0.31, with a mean predicted
+probability of 0.17 on 2% data. The weights did not teach the model anything new about the minority:
+they moved its operating point, inflated its probabilities and, because a linear model on this data
+is misspecified, changed which errors it traded off, here for the worse. The unweighted model reached
+the recall target by moving τ alone, at twice the precision.
 
 ## Trade-offs
 - Threshold moving costs nothing and keeps probabilities honest, but it cannot help a model that never

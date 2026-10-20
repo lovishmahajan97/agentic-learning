@@ -5,6 +5,7 @@ name: Chunk overlap
 kind: concept
 difficulty: intro
 est_minutes: 10
+status: fact-checked
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -107,8 +108,9 @@ text = "Limits apply per project. This limit does not apply to enterprise plans.
 for overlap in (0, 100, 200):
     n = len(sliding_chunks(text, 400, overlap))
     print(f"overlap={overlap:3d}  chunks={n:3d}  inflation={n / len(sliding_chunks(text, 400, 0)):.2f}x")
-# A ~2,400-token text gives about 6 chunks at overlap 0, ~8 at 100 and ~12 at 200:
-# every token is indexed 1x, ~1.33x and 2x respectively, and so is the storage and embedding bill.
+# This text is ~2,100 cl100k tokens: 6 chunks at overlap 0, 7 at 100 and 10 at 200 (1.17x, 1.67x).
+# On a short text the partial last window hides some of the cost; on long documents the ratio
+# approaches S / (S - O), i.e. 1.33x and 2x, as the worked numbers below show.
 ```
 
 Worked numbers: a 100,000-token manual with `S = 400` and `O = 0` yields 250 chunks. With `O = 100`
@@ -136,8 +138,9 @@ gain from 100 to 200 is usually small while the cost doubles, which is why moder
 - Treating overlap as the fix for missing headings or definitions far from the boundary; the symptom
   is chunks that still lack their subject, which overlap cannot supply because it only repeats
   neighbouring text.
-- Counting document size by chunk count after adding overlap, so capacity planning and cost forecasts
-  undershoot; the symptom is a vector store filling up well before the projected corpus size.
+- Forecasting chunk count as corpus tokens divided by chunk size, ignoring the stride, so capacity
+  planning and cost forecasts undershoot; the symptom is a vector store filling up well before the
+  projected corpus size.
 
 ## When to use
 Use moderate overlap whenever your splitter can cut inside a sentence or argument, which is any fixed

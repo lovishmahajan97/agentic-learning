@@ -5,7 +5,7 @@ name: Gradient accumulation
 kind: practice
 difficulty: core
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/batch-size
   - ml-fundamentals/gradient-clipping
@@ -98,7 +98,10 @@ gives a micro-batch holding 50 real tokens the same weight as one holding 4,000,
 per-token mean of the window. The exact form is to sum token losses within each micro-batch and divide by
 the total token count across the window, computed once before the loop. This mismatch was found in
 widely used fine-tuning code in 2024 and showed up as a training loss that depended on the accumulation
-count.
+count. Data parallelism adds one more level: DDP *averages* gradients across ranks, so dividing by each
+rank's local token count yields a mean of per-rank means. The exact version all-reduces the window's token
+count once, divides each rank's summed loss by that global count, and multiplies by the world size to
+undo DDP's averaging.
 
 ### What it costs
 Nothing in memory beyond the `.grad` buffers, which exist anyway. In time, `k` forward/backward passes
@@ -213,7 +216,8 @@ real discrepancy?
 **A:** For a transformer with a per-token mean loss, the accumulated gradient equals the large-batch
 gradient in exact arithmetic, so the two runs should follow the same trajectory. Legitimate differences
 are small: floating-point summation order under bf16 or fp16, different dropout random streams, and
-different data order if the loaders are not seeded identically. Anything larger points at a bug. The
+different data order if the loaders are not seeded identically. Because the gradient is the same, Adam's
+`m` and `v` and therefore every update are the same too; there is no optimizer-side reason for drift. Anything larger points at a bug. The
 usual suspects, in order: the loss normalized as a per-micro-batch mean divided by 8 when sequences
 vary in length, so short micro-batches are over-weighted; the scheduler or warmup counting micro-batches,
 so the learning rates at "step 500" are not the same; clipping applied inside the loop; `zero_grad()`

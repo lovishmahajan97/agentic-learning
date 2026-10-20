@@ -5,6 +5,7 @@ name: OAuth 2.0 / OIDC
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - backend-fundamentals/authentication-vs-authorization
   - backend-fundamentals/rbac
@@ -17,7 +18,7 @@ sources:
   - Hardt (ed.), 2012 — The OAuth 2.0 Authorization Framework (RFC 6749)
   - Sakimura et al., 2014 — OpenID Connect Core 1.0
   - Sakimura, Bradley, Agarwal, 2015 — Proof Key for Code Exchange by OAuth Public Clients (RFC 7636)
-  - Lodderstedt et al. — OAuth 2.0 Security Best Current Practice (IETF)
+  - Lodderstedt, Bradley, Labunets, Fett, 2025 — Best Current Practice for OAuth 2.0 Security (RFC 9700)
 ---
 
 ## TL;DR
@@ -69,11 +70,12 @@ only ever carries a short-lived, single-use authorization code; tokens move on t
 4. It redirects back to `redirect_uri?code=…&state=…`. The client checks `state` matches the session.
 5. **Back channel.** The client POSTs `code`, `redirect_uri`, `code_verifier` and, for a confidential
    client, its `client_secret` to `/token`. The server checks the code is unused and unexpired, that
-   `SHA256(code_verifier)` equals the challenge from step 2, and that `redirect_uri` matches the one
-   registered. PKCE exists *because* public clients (SPAs, mobile apps, CLIs) cannot keep a secret and a
+   `SHA256(code_verifier)` equals the challenge from step 2, and that `redirect_uri` is identical to the
+   one sent in step 2 (which `/authorize` already matched against the registered list). PKCE exists *because* public clients (SPAs, mobile apps, CLIs) cannot keep a secret and a
    code can be intercepted (a malicious app registering the same custom URL scheme, a proxy log). Binding
-   the code to a value the interceptor never saw makes the stolen code worthless. The current IETF
-   security best-practice recommends PKCE for confidential clients too, since it also stops code injection.
+   the code to a value the interceptor never saw makes the stolen code worthless. The IETF security
+   best current practice (RFC 9700) makes PKCE mandatory for public clients and recommends it for
+   confidential clients too, since it also stops code injection.
 6. The response carries `access_token`, `token_type`, `expires_in`, optionally `refresh_token`, and,
    when the `openid` scope was requested, `id_token`.
 
@@ -84,7 +86,8 @@ only ever carries a short-lived, single-use authorization code; tokens move on t
   opaque token, a call to the introspection endpoint (RFC 7662).
 - **ID token.** For the client; always a JWT. Claims: `iss`, `sub` (the stable user identifier; key
   your user table on this, not on email, which can change or be re-issued), `aud` (must equal your
-  `client_id`), `exp`, `iat`, `nonce`, `auth_time`, and optionally `email`, `name`. Never send it to an
+  `client_id`), `exp`, `iat`, plus `nonce` (present when the request sent one) and `auth_time` (when requested), and
+  optionally `email`, `name`. Never send it to an
   API as a credential; its audience is you.
 - **Refresh token.** Lets the client get fresh access tokens without the user present. It is the
   longest-lived secret in the system and therefore the most valuable to steal. Mitigations: rotation
@@ -121,6 +124,7 @@ import base64, hashlib, secrets, urllib.parse, requests, jwt   # pip install req
 ISSUER, CLIENT_ID, CLIENT_SECRET = "https://login.example.com", "my-web-app", "<from secrets manager>"
 REDIRECT_URI = "https://app.example.com/callback"
 disc = requests.get(f"{ISSUER}/.well-known/openid-configuration").json()   # endpoints + jwks_uri
+jwks = jwt.PyJWKClient(disc["jwks_uri"])   # caches keys; refetches when it meets an unknown kid
 
 def start_login(session):            # 1. PKCE pair, state, nonce -> stored server-side, never in the URL
     verifier = secrets.token_urlsafe(64)
@@ -137,9 +141,10 @@ def handle_callback(code, returned_state, session):   # 2. browser returns ?code
     tok = requests.post(disc["token_endpoint"], data={             # back channel, TLS, server-to-server
         "grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI,
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
-        "code_verifier": session["verifier"]}).json()
+        "code_verifier": session["verifier"]})
+    tok.raise_for_status(); tok = tok.json()                   # error responses carry no tokens
     # 3. Validate the ID token: signature via JWKS, pinned algorithm, issuer, audience = our client_id, expiry
-    key = jwt.PyJWKClient(disc["jwks_uri"]).get_signing_key_from_jwt(tok["id_token"])
+    key = jwks.get_signing_key_from_jwt(tok["id_token"])
     claims = jwt.decode(tok["id_token"], key.key, algorithms=["RS256"],
                         audience=CLIENT_ID, issuer=disc["issuer"])
     if claims.get("nonce") != session["nonce"]:
@@ -157,7 +162,7 @@ the server.
   authorization server on your login path; it flips to "a session cookie is enough" for an internal tool
   that talks only to its own backend and never to third parties.
 - JWT access tokens let a resource server validate locally with no network call, but cannot be revoked
-  before `exp`; opaque tokens with introspection revoke instantly at the cost of a call (or short cache)
+  before `exp` without adding a denylist lookup, which gives back the network call; opaque tokens with introspection revoke instantly at the cost of a call (or short cache)
   per request. Choose by how long a stolen token may stay valid.
 - Short-lived access tokens shrink the damage from a leak, but move the risk onto the refresh token and
   the session store; without rotation and server-side storage you have only relocated the problem.

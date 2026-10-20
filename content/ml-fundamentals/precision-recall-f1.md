@@ -5,7 +5,7 @@ name: Precision / recall / F1
 kind: metric
 difficulty: intro
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/roc-auc
@@ -71,6 +71,14 @@ where β says how many times more you value recall than precision: F2 for screen
 is the expensive error, F0.5 where a false alarm is (for example, automatically blocking a user). F1 is
 β = 1.
 
+Two consequences of the formula are worth knowing. F1 = 2TP / (2TP + FP + FN) has no TN term, so it is
+not symmetric in the labels: relabel which class is "positive" and F1 changes, while a constant
+classifier that flags everything scores 2π / (1 + π) at prevalence π, not zero. When both classes
+matter, MCC uses all four cells. And for calibrated scores the F1-maximising threshold is exactly half
+the F1 it achieves (Lipton, Elkan & Narayanaswamy): if the best attainable F1 is 0.4, the best threshold
+is 0.2. Since F1 ≤ 1, that threshold is never above 0.5, which is the formal reason "maximise F1 at
+τ = 0.5" is almost always the wrong default on rare positives.
+
 ### The threshold is the knob
 A scorer outputs s(x) and you predict positive when s(x) ≥ τ. Lowering τ flags more items: recall can
 only go up (it is monotone in τ), precision usually goes down but not monotonically. Plotting (R(τ),
@@ -104,8 +112,10 @@ reason to stratify small evaluation sets. Per-class metrics with a support of th
 print the support column.
 
 ### Where it shows up in LLM systems
-Retrieval: recall@k over the relevant chunks decides whether the generator can possibly answer;
-precision@k decides how much noise it must ignore. Extraction: span-level precision and recall, exact
+Retrieval: with R relevant chunks for a query and the top k retrieved, precision@k = (relevant in top
+k) / k and recall@k = (relevant in top k) / R. Recall@k decides whether the generator can possibly
+answer; precision@k decides how much noise it must ignore. Here k plays the role of the threshold, so
+raising k trades precision for recall exactly as lowering τ does. Extraction: span-level precision and recall, exact
 or partial match. Extractive QA: token-level F1 between the predicted and gold answer strings (the
 SQuAD convention, reported alongside exact match). Guardrails: recall on injections versus the
 false-block rate on legitimate traffic. Hallucination detection: recall on fabricated claims is the
@@ -132,6 +142,7 @@ score = np.where(y == 1, rng.normal(0.65, 0.15, 2_000),          # detector scor
 for tau in (0.5, 0.4, 0.3):
     p, r, f, _ = precision_recall_fscore_support(y, score >= tau, average="binary", zero_division=0)
     print(f"tau={tau}: precision={p:.2f} recall={r:.2f} F1={f:.2f} flagged={(score >= tau).sum()}")
+# One run: tau=0.5 P=0.21 R=0.77 (405 flagged); 0.4 P=0.13 R=0.93 (815); 0.3 P=0.08 R=1.00 (1,327)
 
 # Product spec: "catch at least 90% of hallucinations". Pick the most precise threshold that does.
 prec, rec, thr = precision_recall_curve(y, score)
@@ -146,8 +157,11 @@ yp = np.array([0] * 88 + [1] * 2 + [1] * 6 + [0] * 2 + [0] * 2)  # the 2-example
 print("micro", f1_score(yt, yp, average="micro"), "macro", round(f1_score(yt, yp, average="macro"), 3))
 ```
 
-As τ drops from 0.5 to 0.3, recall climbs toward 1.0 while precision falls and the flagged count
-roughly triples: the same model, three different products.
+As τ drops from 0.5 to 0.3, recall climbs from 0.77 to 1.0 while precision falls from 0.21 to 0.08
+and the flagged count more than triples: the same model, three different products. Note how low the
+precision is even though the two score distributions are two standard deviations apart (a ROC-AUC
+around 0.92): at 5% prevalence there are nineteen negatives for every positive, so the overlapping tail
+of the negatives fills the queue. Average precision of about 0.5 says the same thing in one number.
 
 ## Trade-offs
 - F1 gives one comparable number but bakes in "a false alarm costs the same as a miss"; it flips to Fβ
@@ -169,6 +183,8 @@ roughly triples: the same model, three different products.
   reproduced on the next batch of data, because the selection leaked test labels into the decision.
 - Comparing precision across datasets with different prevalence; the symptom is a model that
   "degraded" when it moved from a 50/50 benchmark to 2% production traffic without changing at all.
+- Choosing the positive class by convention rather than by what the product detects; the symptom
+  is an F1 that changes sharply when someone relabels the classes, because F1 ignores true negatives.
 - Quoting macro-F1 with classes of support one to five; the symptom is the metric swinging by 0.1
   between runs with no model change.
 - Blaming the generator for low RAG answer quality when recall@k is the problem; the symptom is weeks

@@ -5,6 +5,7 @@ name: Docker / CI/CD deployment
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/ci-cd
@@ -69,19 +70,27 @@ the image. Run as the `node` user the official image provides rather than root.
 
 ### Signals: exec form, PID 1 and draining
 `CMD ["node", "dist/server.js"]` (exec form) makes Node PID 1. The shell form `CMD node dist/server.js`
-makes `/bin/sh` PID 1 and Node its child, and `sh` does not forward `SIGTERM`, so the orchestrator
-waits out its grace period and then `SIGKILL`s the process mid-stream. Node as PID 1 receives the
-signal but does not reap zombie children; if the service spawns subprocesses (an MCP server over stdio,
-a converter), add `--init` or `tini` as the entrypoint. The drain itself, stop accepting, finish or
+runs `/bin/sh -c "node dist/server.js"`, so the shell is PID 1 and Node its child, and a shell does not
+forward `SIGTERM` to its children; the orchestrator waits out its grace period and then `SIGKILL`s the
+process mid-stream. (Some shells exec a lone `-c` command directly, which would accidentally make
+Node PID 1; do not rely on it, since it breaks the moment someone adds `&&`.) Being PID 1 has two
+consequences of its own. The kernel applies no default action to signals sent to PID 1, so Node only
+reacts to `SIGTERM` if your code installs a handler; without one the signal is ignored and you again
+wait for `SIGKILL`. And Node does not reap zombie children; if the service spawns subprocesses (an MCP
+server over stdio, a converter), run with `docker run --init`, `tini` or `dumb-init` as the entrypoint. The drain itself, stop accepting, finish or
 abort in-flight streams, close the pool, is the graceful-shutdown lesson; the deployment's job is to
 deliver the signal and to set the grace period longer than the longest completion you allow.
 
 ### Memory and the container boundary
-V8 sizes its default heap from the machine's memory, not from the container's cgroup limit, so a pod
-limited to 1 GiB can be killed by the kernel while Node still believes it has room. Set
-`--max-old-space-size` explicitly, somewhat below the container limit, leaving room for buffers and
-native memory; streaming large contexts and holding many concurrent responses are where Node services
-discover this.
+Node's default V8 heap limit is a heuristic derived from the memory it detects. Older releases read
+the host's total memory and ignored the container's cgroup limit; newer ones read the cgroup limit,
+but how well depends on the Node version and cgroup v1 versus v2. Either way the heap limit covers only
+the JavaScript heap: `Buffer`s, native addons, thread stacks and the code cache live outside it, so the
+process's resident memory can cross the container limit while V8 still believes it has room, and the
+kernel's OOM killer ends it. Set `--max-old-space-size` explicitly, somewhat below the container limit
+(the example leaves about a quarter of a 1 GiB limit for non-heap memory), and confirm with
+`v8.getHeapStatistics()` at startup; streaming large contexts and holding many concurrent responses
+are where Node services discover this.
 
 ### Health, readiness and config
 Expose a liveness endpoint that only proves the event loop is responsive and a readiness endpoint that
@@ -128,7 +137,8 @@ COPY --from=build /app/dist ./dist
 COPY package.json ./
 USER node
 EXPOSE 3000
-CMD ["node", "--max-old-space-size=768", "dist/server.js"]   # exec form: SIGTERM reaches node
+# exec form so SIGTERM reaches node; heap set for a 1 GiB container memory limit
+CMD ["node", "--max-old-space-size=768", "dist/server.js"]
 ```
 
 ```yaml
@@ -190,8 +200,8 @@ jobs:
   ten-minute build for a one-line change.
 - Passing the provider key as a build `ARG` or `ENV`; the symptom is the key readable in the image
   history (`docker history`) and in every registry that image was pushed to.
-- Leaving the default heap size; the symptom is OOM kills by the kernel under load with no JavaScript
-  heap error in the logs.
+- Leaving the heap limit to the default heuristic; the symptom is OOM kills by the kernel under load
+  (exit code 137) with no JavaScript heap error in the logs.
 - Running `npm install` instead of `npm ci`; the symptom is a dependency version in production that no
   developer machine or CI run ever tested.
 - A readiness probe that stays green while draining; the symptom is new requests landing on a process
@@ -203,9 +213,9 @@ jobs:
 Every Node AI service that runs anywhere but a laptop needs this; the question is how much. A single
 multi-stage Dockerfile, `npm ci`, exec-form `CMD`, runtime secrets and a PR pipeline with typecheck and
 tests are the floor. Add integration tests with service containers once a database or queue is in the
-path, an explicit heap limit and readiness-aware drain once you stream, and a budgeted eval job once
-prompts change more than once a month. Measure image size, build time for a one-line change (it should
-be under a minute with warm caches), deploy duration, and the count of requests failed during a
+path, an explicit heap limit and readiness-aware drain once you stream, and a budgeted eval job as soon
+as prompts change regularly. Measure image size, build time for a one-line change (with warm caches it
+should cost little more than the compile step, since the install layer is reused), deploy duration, and the count of requests failed during a
 rollout, which should be zero. Interviewers ask why `SIGTERM` is not reaching the process, what
 `npm ci` guarantees, and where the API key should live; concrete answers to those three separate a
 senior engineer from someone who has only run `docker build`.
@@ -221,10 +231,11 @@ senior engineer from someone who has only run `docker build`.
 ## Check yourself
 **Q:** After each deploy, a streaming chat service shows a spike of truncated responses and the old
 pods linger for exactly thirty seconds before dying. What is happening, and what changes fix it?
-**A:** Thirty seconds is the default termination grace period, and lingering for all of it means the
-process never handled `SIGTERM`: most likely the `CMD` is in shell form, so `sh` is PID 1 and the
-signal never reaches Node, or the handler exists but nothing stops the HTTP server and in-flight
-streams, so the orchestrator finally sends `SIGKILL` mid-response. Fix it by switching to exec-form
+**A:** Thirty seconds is Kubernetes' default `terminationGracePeriodSeconds`, and lingering for all of
+it means the process never acted on `SIGTERM`. Three causes are common: the `CMD` is in shell form, so
+`sh` is PID 1 and the signal never reaches Node; Node is PID 1 but installs no `SIGTERM` handler, and
+the kernel ignores default-action signals for PID 1; or the handler exists but nothing stops the HTTP
+server and in-flight streams. In each case the orchestrator finally sends `SIGKILL` mid-response. Fix it by switching to exec-form
 `CMD` (or `exec` in the entrypoint script), handling `SIGTERM` by flipping readiness to false, calling
 `server.close()`, aborting or finishing active streams with an `AbortController`, and closing pools;
 then set the grace period above the longest allowed completion. Verify with a deploy under synthetic
@@ -245,9 +256,9 @@ streaming load and confirm zero truncated responses.
 - [ ] Environment variables are not expanded, so the process reads no configuration
 - [x] `/bin/sh` becomes PID 1 and does not forward `SIGTERM`, so the process is killed after the grace period instead of draining
 - [ ] The container cannot expose ports because the shell owns the network namespace
-> Shell form wraps the command in `sh -c`. The shell receives the signal and ignores it, Node never sees
-> it, and the orchestrator escalates to `SIGKILL`. Exec form (`CMD ["node", ...]`) makes Node PID 1 so
-> the graceful-shutdown handler runs.
+> Shell form wraps the command in `sh -c`. The shell receives the signal and does not pass it on, Node
+> never sees it, and the orchestrator escalates to `SIGKILL`. Exec form (`CMD ["node", ...]`) makes Node
+> PID 1 so the graceful-shutdown handler you install runs. Environment expansion and ports are unaffected.
 
 ### Q: Where should the provider API key enter a deployed Node AI service?
 - [ ] As a Docker build argument so the image is self-contained

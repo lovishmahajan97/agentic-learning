@@ -5,6 +5,7 @@ name: A/B testing
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - evals/offline-vs-online-evaluation
   - evals/pairwise-comparison
@@ -61,8 +62,8 @@ Assign at the user level for anything conversational: `bucket = hash(user_id + e
 notices the inconsistency. Session-level assignment is for anonymous traffic; request-level only for
 stateless one-shot tasks. The unit of *analysis* must match the unit of *randomisation*: randomising by
 user and then counting requests as independent samples underestimates variance, because one user's
-requests are correlated, and produces false positives. The salt is per experiment so that users are not
-assigned to the same arm across experiments.
+requests are correlated, and produces false positives. The salt is per experiment so that assignments are
+independent across experiments, instead of the same users always landing in treatment together.
 
 ### Sample size before, not after
 Power analysis says how much traffic the test needs to detect the minimum effect. For a proportion
@@ -77,7 +78,7 @@ traffic or to longer-running tests with larger expected effects.
 Start with a small ramp (1%, then 10%) guarded by the canary metrics, then move to the planned split,
 usually 50/50 because it maximises power for a given total. Run for at least one full weekly cycle so
 weekday and weekend users are both represented. Check the **sample ratio**: if a 50/50 assignment logs
-52/48, the bucketing or logging is biased (a crash on one arm drops its users, say) and the result is
+52/48 on 10,000 users (z ≈ 4, p < 0.001), the bucketing or logging is biased (a crash on one arm drops its users, say) and the result is
 invalid regardless of the p-value.
 
 ### Analysis
@@ -146,8 +147,8 @@ print(sample_ratio_mismatch(4100, 4350))               # planned 50/50; investig
   shows up elsewhere; secondary metrics inform the next hypothesis rather than this decision.
 - User-level assignment keeps the experience consistent and the statistics honest, but it reduces the
   effective sample size compared with counting requests, which flips only for stateless tasks.
-- Sequential methods allow early stopping safely, but they need more total samples than a fixed-horizon
-  test to reach the same power, so they pay off only when early stops are common.
+- Sequential methods allow early stopping safely, but they need a larger maximum sample than a
+  fixed-horizon test for the same power, so they pay off only when real effects often stop the test early.
 - Judge-scored metrics make low-traffic tests feasible, but they move the question from "did users
   benefit" to "did the judge approve", which is acceptable only after the judge is validated.
 

@@ -5,7 +5,7 @@ name: Chaos engineering & resilience testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - reliability/fmea
   - reliability/circuit-breakers
@@ -77,7 +77,9 @@ The discipline is defined by its method, not by breaking things.
    per task: the SLIs. Not CPU or queue depth, because the hypothesis is about whether users notice.
 2. **State a falsifiable hypothesis.** "If the primary provider returns 429 on 30 percent of calls,
    success rate stays at or above 99 percent and p95 rises by less than 20 percent." A hypothesis makes
-   the result a finding either way; "we killed a pod and nothing happened" teaches nothing.
+   the result a finding either way; "we killed a pod and nothing happened" teaches nothing. Only
+   hypothesize resilience you believe you have: if you already expect the system to fall over, the
+   experiment has nothing to discover and the right move is to fix it first.
 3. **Inject realistic events.** Latency, errors, instance loss, network partition, dependency
    unavailability, resource exhaustion, zone loss, clock skew. Prefer the events your FMEA ranked highest;
    that table is the experiment backlog.
@@ -86,7 +88,10 @@ The discipline is defined by its method, not by breaking things.
    hours with on-call informed, because an experiment that is indistinguishable from an incident is one.
 5. **Compare experiment and control.** Route a slice of traffic through the fault and an equal slice
    without, and compare the SLIs, as in an A/B test. This separates the fault's effect from background
-   noise.
+   noise, but only with enough traffic in each arm. Telling a 99 percent success rate from 98 percent
+   needs on the order of a thousand requests per arm (the standard error of a 99 percent rate over
+   1,000 requests is about 0.3 points), so a one-percent slice of a low-traffic service may need hours
+   to reach a verdict. Size the slice and the duration together.
 6. **Fix, then widen, then automate.** Each refuted hypothesis becomes a fix and a regression test. Verified
    hypotheses graduate to larger blast radius and eventually to continuous automated runs, because the
    system will drift away from the verified state.
@@ -167,6 +172,10 @@ the experiment slice's SLIs that flips the flag off.
 - Production experiments give true signal, with real traffic, data and vendor limits, at real risk;
   staging is safe but misses emergent behavior. Start in staging and graduate to production only once
   abort conditions, observability per slice and a kill switch exist.
+- A small blast radius limits harm but also limits evidence: the smaller the slice, the longer the
+  experiment must run to separate the fault's effect from noise. Widen the slice once the abort
+  condition has proven it fires, rather than running a tiny slice for so long that drift muddies the
+  comparison.
 - Every experiment costs engineering time and sometimes vendor dollars, because faults push traffic to
   fallbacks and retries; prioritize by FMEA risk rather than by what is easy to inject.
 - Continuous automated chaos catches drift but demands a mature on-call and can be mistaken for a real

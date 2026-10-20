@@ -5,7 +5,7 @@ name: Prompt injection (direct, indirect)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - prompting/prompt-injection
   - prompting/jailbreaks
@@ -78,7 +78,10 @@ URLs, are injection defences and not just hygiene.
 ### Defence layers
 1. **Reduce privilege.** Least-privilege tools, read-only by default, scoped short-lived credentials. Per
    workflow, remove one leg of the trifecta: no external communication, or no untrusted content, or no
-   private data.
+   private data. Meta's "rule of two" states the same idea with state change included: within one
+   session an agent should combine at most two of untrusted input, access to sensitive data or
+   systems, and the ability to change state or communicate externally; needing all three means a
+   human approves.
 2. **Isolate untrusted content.** Mark it so the model can tell it apart: delimiters plus datamarking or
    encoding (spotlighting), untrusted text in the user turn rather than the system prompt, structured
    roles. Stronger: a dual-model design where a privileged planner never sees untrusted text and a
@@ -93,7 +96,18 @@ URLs, are injection defences and not just hygiene.
    reduction rather than enforcement.
 6. **Monitor and test.** Log tool calls with the provenance of their arguments, alert when an argument
    contains strings from untrusted content, and keep an injection regression suite that runs after every
-   prompt or model change.
+   prompt or model change. Score it on two numbers: attack success rate (share of injected tasks where
+   the attacker's goal happened) and utility under attack (share of the user's real tasks still
+   completed). Report both, *because* a defence that refuses everything scores a perfect 0% attack
+   success rate and is useless; benchmarks such as AgentDojo measure exactly this pair.
+
+### Why detection alone cannot be the boundary
+The attacker gets unlimited tries offline against the same model and classifier you deploy, and needs
+one success; you must stop every attempt. A classifier that stops 99% of a known corpus still lets an
+adaptive attacker through after enough paraphrases, and every percentage point of extra recall costs
+false positives on legitimate imperative text. Contrast an allowlist on email recipients: it holds at
+100% regardless of how the payload is worded, because it never looks at the words. That asymmetry is
+why layers 1, 2 and 4 carry the guarantees and layer 3 is an early-warning signal.
 
 ## Example
 An email assistant that quarantines message bodies with spotlighting, plants a canary, and enforces a
@@ -101,7 +115,7 @@ recipient policy outside the model. The injected message asks the assistant to f
 may or may not comply, and the policy makes sure it does not matter.
 
 ```python
-import re, secrets, anthropic
+import json, re, secrets, anthropic
 
 client = anthropic.Anthropic()
 CANARY = secrets.token_hex(4)
@@ -133,8 +147,12 @@ for block in r.content:
     if block.type == "text":
         assert CANARY not in block.text, "system prompt leaked"
         print(block.text)
-    elif block.type == "tool_use" and not allowed(block.name, block.input, {"priya@corp.example"}):
-        print("BLOCKED:", block.name, block.input)   # the injected forward never executes
+    elif block.type == "tool_use":
+        assert CANARY not in json.dumps(block.input), "system prompt smuggled into tool arguments"
+        if not allowed(block.name, block.input, {"priya@corp.example"}):
+            print("BLOCKED:", block.name, block.input)   # the injected forward never executes
+# Whatever the model does with message 2, the only possible send is to Priya. The recipient check is
+# deterministic, so it holds against payloads nobody has written yet.
 ```
 
 ## Trade-offs

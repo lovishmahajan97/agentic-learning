@@ -5,6 +5,7 @@ name: Deterministic replay & reproducibility
 kind: concept
 difficulty: advanced
 est_minutes: 15
+status: fact-checked
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/structured-event-streams
@@ -38,7 +39,8 @@ night's, the clock, the random id generator. Change one token at step 2 and step
 The naive alternative is "set temperature to 0 and rerun". It fails for reasons worth knowing. Greedy
 decoding removes sampling noise but not numerical noise: floating-point reductions on GPUs are
 order-dependent, batching puts your request next to different neighbours, and kernels get updated, so the
-argmax can flip on near-tied logits. Hosted providers additionally change models behind stable names. And
+argmax can flip on near-tied logits. Hosted providers additionally move alias model names to new
+snapshots, and even a dated snapshot can see serving-stack changes. And
 none of this touches the tools, which are the bigger source of divergence in practice.
 
 Durable workflow engines solved the same problem for ordinary distributed code by splitting it into
@@ -201,9 +203,11 @@ succeeds. Walk through how you find the cause and how you prove your fix works.
 **A:** Rerunning is not reproduction; the model, tools and clock differ. Load last night's recording and
 replay it with the effect interface in replay mode: no model or tool is called, the orchestrator reissues
 the same requests, and the replayer serves the recorded outputs, so the run reproduces exactly. Inspect the
-prompt and tool results the model saw at step 6, which usually reveals a misleading tool result or a prompt
-assembled with an unexpected value such as a timestamp. Make the fix, then fork: replay to step 6 with the
-fixed code, go live from there, and confirm the divergence is gone. Because the model is stochastic, a
+exact prompt the model saw when it chose the step-7 call, including the tool results from steps 1 to 6,
+which usually reveals a misleading tool result or a prompt assembled with an unexpected value such as a
+timestamp. Make the fix, then fork: replay steps 1 to 6 under the fixed code, go live from step 7, and
+confirm the divergence is gone. If the fix changes requests before step 7, the replayer raises a
+non-determinism error at that point, which tells you the fork has to start earlier. Because the model is stochastic, a
 single success proves little, so run the task N times with the fix and compare the failure rate to the
 baseline with a confidence interval. Finally, record the code version with the fix so future replays of
 this recording warn that it predates the change.

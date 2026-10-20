@@ -5,6 +5,7 @@ name: Learning rate
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/warmup
@@ -54,15 +55,17 @@ mean and squared magnitude. The division normalises scale away: for a consistent
 step is about η per parameter regardless of how large the raw gradient was, and smaller when the gradient
 flips sign. That is why transformer learning rates cluster in a narrow band whatever the layer: the Llama 2
 report, for instance, trained its 7B and 13B models with a peak of 3e-4 and the 34B and 70B with 1.5e-4,
-with cosine decay to 10% of peak. AdamW's weight decay is also multiplied by η (`θ ← θ·(1 − η·λ)`), so
-raising the learning rate strengthens regularisation at the same time.
+with cosine decay to 10% of peak. In PyTorch's AdamW and most framework implementations the weight-decay
+step is also multiplied by η (`θ ← θ·(1 − η·λ)`), so raising the learning rate strengthens regularisation
+at the same time.
 
 ### Warmup: why the first steps are special
 Runs start with η near zero and ramp linearly to the peak, over thousands of steps in pretraining or a few
 percent of the steps in fine-tuning. Two reasons. Adam's second-moment estimate is built from very few
 samples at the start, so normalisation is unreliable and a full-size step can land anywhere. And the
-earliest gradients are the largest and least informative: a freshly attached head or a zero-initialised
-adapter produces gradients that would tear through pretrained features if applied at full rate. Warmup
+earliest gradients are often the largest and least informative: in a full fine-tune, a freshly attached,
+randomly initialised head sends large, essentially random gradients back into the pretrained body, which
+would tear through pretrained features if applied at full rate. Warmup
 lets the statistics and the representation settle before committing to large moves. Depth on the
 mechanism lives in `ml-fundamentals/warmup`.
 
@@ -83,7 +86,9 @@ copied from a run with a different batch size is a different hyperparameter.
 Full fine-tuning of an LLM typically uses peaks in the low 1e-5 range; LoRA and other adapters typically
 use rates around ten times higher. Treat these as common starting points, not laws. The full-model rate is
 low because every weight moves and large moves erase pretrained knowledge (see catastrophic forgetting);
-adapter rates are higher because the trainable set is small, starts at zero and must leave zero quickly.
+adapter rates are higher because the trainable set is small and its contribution starts at zero (LoRA's
+B matrix is zero-initialised), so the low-rank update must grow from nothing within the run; the exact
+ratio is empirical.
 
 ### Finding the rate
 The range test increases η exponentially over a short run and plots loss: the usable region ends just
@@ -177,7 +182,8 @@ change.
 modest rate accumulated over hundreds of steps shifts the whole network away from the pretrained solution;
 the regression is forgetting, and the fixes are a lower rate, fewer steps, early stopping on a general
 evaluation, or mixing general data into the set. The LoRA adapters start at zero and are a tiny fraction
-of the parameters, so at 2e-5 they barely leave their initialisation within the run; adapter training
+of the parameters, and their update starts at zero because LoRA's B matrix is zero-initialised, so at
+2e-5 the low-rank product barely grows within the run; adapter training
 commonly uses rates around ten times higher. The change is to tune the rate per parameterisation, run a
 quick grid at ×3 spacing for each, and watch both the task metric and the general evaluation rather than
 training loss alone.

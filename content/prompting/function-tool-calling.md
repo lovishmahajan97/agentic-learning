@@ -5,6 +5,7 @@ name: Function / tool calling
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - prompting/structured-outputs-json-mode
   - prompting/react
@@ -69,9 +70,10 @@ must be kept verbatim in history, since the result refers to it.
 
 ### Who controls the decision
 `tool_choice` is `auto` by default (the model decides), `none` forbids calls, and some providers offer a
-forced mode (`any`, or a named tool); Anthropic's newest models reject forced modes, so steer with the
-prompt instead and use structured outputs when the forced call only existed to obtain JSON.
-`disable_parallel_tool_use` limits a turn to one call, which matters for tools with side effects.
+forced mode (`any`, or a named tool); several of Anthropic's newest models (as of late 2026) reject
+forced modes with an error, so check your model and, where forcing is unavailable, steer with the prompt and use structured outputs when the forced call only existed to obtain JSON.
+`disable_parallel_tool_use` (a field of `tool_choice`) limits a turn to at most one call, which matters
+for tools with side effects; it applies to the whole request, not to one tool.
 `strict: true` on a tool applies constrained decoding to the arguments, the same mechanism as
 structured outputs, so the input validates exactly against the schema.
 
@@ -119,15 +121,16 @@ def run_tool(name, args):                                   # your code: validat
         if args["amount_cents"] > 50_00:                    # policy lives here, where a prompt cannot override it
             return {"error": "amount above auto-approval limit; escalate to a human"}
         return json.dumps(payments.refund(args["order_id"], args["amount_cents"]))
+    return {"error": f"unknown tool {name}"}               # never return None as a tool result
 
 def chat(user_text, max_steps=6):
     messages = [{"role": "user", "content": user_text}]
     for _ in range(max_steps):
-        r = client.messages.create(model="claude-opus-5-5", max_tokens=1024,
+        r = client.messages.create(model="claude-opus-5-5", max_tokens=4096,  # thinking counts too
                                    system="You are a support agent for Acme.", tools=TOOLS, messages=messages)
         messages.append({"role": "assistant", "content": r.content})   # keep tool_use blocks verbatim
         if r.stop_reason != "tool_use":
-            return next(b.text for b in r.content if b.type == "text")
+            return next((b.text for b in r.content if b.type == "text"), "")  # also end_turn / max_tokens
         results = []
         for b in r.content:
             if b.type == "tool_use":
@@ -195,8 +198,9 @@ the turn in one user message with matching ids and `is_error` on failures, and s
 step budget. The refund rules (limit, eligibility window, one refund per order) live in the execution
 code behind the tool, with an idempotency key and a human-approval gate above a threshold, because
 anything stated only in the prompt can be overridden by a jailbreak or by instructions hidden in an order
-note. Parallel calls are disabled for the refund tool, every call is logged, and tool results are treated
-as untrusted text.
+note. Parallel calls are disabled for the request (the switch is per request, not per tool) or the
+executor runs refund calls serially and rejects a second refund for the same order; every call is
+logged, and tool results are treated as untrusted text.
 
 ## Quiz
 ### Q: When the model "calls a tool", who executes the function?

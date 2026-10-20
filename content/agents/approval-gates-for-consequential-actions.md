@@ -5,6 +5,7 @@ name: Approval gates for consequential actions
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agents/human-in-the-loop
   - agents/tool-calling
@@ -51,7 +52,10 @@ human decision, make the pause survive hours of waiting, and make the approval u
 ### 1. Classify the call, not just the tool
 Every tool gets a static risk class: read-only, reversible write, consequential. That is necessary but
 not sufficient, because risk often depends on the arguments. `run_sql` is read-only for a SELECT and
-consequential for a DELETE; `issue_refund` of $5 is reversible in practice while $5,000 is not;
+consequential for a DELETE (but do not decide that by string-matching the query: `SELECT 1; DROP TABLE
+orders` starts with SELECT, and `SELECT ... INTO` creates a table in PostgreSQL; enforce read-only with a
+read-only database role or transaction); `issue_refund` of $5 is not reversible either, but it is a
+bounded loss you can absorb and audit after the fact, while $5,000 is not;
 `edit_file` in a scratch directory differs from `edit_file` on a production config. So the classifier
 is a function of (tool, arguments, context): thresholds on amounts and row counts, allowlists of
 targets, environment (staging vs production), and whether the action leaves the system (email, payment,
@@ -80,8 +84,9 @@ consumed on use, because a standing approval is a credential. The decision, the 
 are written to the audit log.
 
 ### 5. Resume and execute once
-On approval the run reloads, the executor re-checks the hash, marks the approval used, and runs the tool
-with an idempotency key derived from the run and step, so that a retry after a network failure does not
+On approval the run reloads, the executor re-checks the hash, atomically claims the approval for this
+execution (so two workers resuming the same run cannot both use it), and runs the tool with an
+idempotency key derived from the run and step, so that a retry after a network failure does not
 refund twice. The tool result enters the transcript like any other, and the model continues.
 
 ### Scoping and fatigue control
@@ -93,24 +98,24 @@ softer gate.
 
 ## Example
 An executor with a risk classifier that looks at arguments, a pending-approval store that makes the
-pause survive restarts, and an approval bound to the argument hash and consumed on use.
+pause survive restarts, and an approval bound to the argument hash and consumed on use. The approval is
+claimed by exactly one execution key, so a retry of the same step after a network failure can re-run
+(and the tool's idempotency key deduplicates the effect), while any other execution is refused.
 
 ```python
 import hashlib, json
 
-READ_ONLY = {"search", "read_file", "get_order"}
+READ_ONLY = {"search", "read_file", "get_order", "run_sql_readonly"}   # SQL via a read-only DB role
 
 def risk(tool: str, args: dict, env: str) -> str:
     """Classify by effect: the same tool can be safe or consequential depending on arguments."""
     if tool in READ_ONLY:
         return "safe"
-    if tool == "run_sql" and args["query"].lstrip().upper().startswith("SELECT"):
-        return "safe"
-    if tool == "issue_refund" and args["amount"] <= 50:
-        return "reversible"                      # executes, but is logged and sampled for audit
+    if tool == "issue_refund" and 0 < args["amount"] <= 50:
+        return "low_risk"          # bounded loss: executes, logged, sampled for audit (pair with a per-run cap)
     if tool == "edit_file" and env != "production":
-        return "reversible"
-    return "consequential"
+        return "low_risk"          # reversible: scratch and staging files can be restored
+    return "consequential"         # default-deny: anything unrecognized, including raw run_sql, is gated
 
 def call_hash(tool, args):
     return hashlib.sha256(json.dumps({"tool": tool, "args": args}, sort_keys=True).encode()).hexdigest()
@@ -123,10 +128,11 @@ def execute(run_id, step, tool, args, env, tools, store, approver):
         if approval is None:
             store.save_pending(run_id, step, tool, args, h, preview=tools[tool].dry_run(**args))
             return {"status": "awaiting_approval", "request": h}   # durable pause: the loop parks here
-        if approval.used or approval.expired() or not approver.may_approve(approval.by, tool):
-            return {"status": "denied", "reason": "approval missing, expired, used or unauthorized"}
-        store.mark_used(run_id, h)                                  # one approval, one execution
-    return tools[tool].run(**args, idempotency_key=key)
+        if approval.expired() or not approver.may_approve(approval.by, tool):
+            return {"status": "denied", "reason": "approval expired or approver not authorized"}
+        if not store.claim(run_id, h, key):      # atomic compare-and-set: unused, or already claimed by this key
+            return {"status": "denied", "reason": "approval already consumed by another execution"}
+    return tools[tool].run(**args, idempotency_key=key)   # a retry of this step re-runs with the same key
 ```
 
 ## Trade-offs
@@ -184,9 +190,11 @@ executor, argument binding and durable pause, not the prompt.
 **Q:** A support agent can look up orders, draft replies, and issue refunds. Design the approval gating
 so that it is safe under prompt injection from customer emails, does not drown the support lead in
 approvals, and survives the lead taking a day to respond.
-**A:** Classify in the executor: lookups and drafts are safe; `issue_refund` is reversible up to a
-threshold, say $50, and consequential above it; `send_reply` is consequential when the draft commits to
-a refund, credit or cancellation, detected by the harness, and reversible otherwise. Consequential calls
+**A:** Classify in the executor: lookups and drafts are safe; `issue_refund` is low-risk (a bounded,
+auditable loss) up to a threshold, say $50, with a per-customer and per-run cap so an attacker cannot
+split a large refund into many small ones, and consequential above it; `send_reply` is consequential
+when the draft commits to a refund, credit or cancellation, detected by the harness, and low-risk
+otherwise (an email cannot be unsent, but a routine acknowledgement does little harm). Consequential calls
 are written to a pending-approval store with a preview (the rendered reply, the refund amount and order
 history) and the run checkpoints and exits; nothing waits in memory. The approval is bound to the hash
 of the exact arguments, requires the support-lead role, expires after 48 hours with a default of deny,

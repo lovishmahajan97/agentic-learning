@@ -5,6 +5,7 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agents/mcp-authentication-authorization-transport-security
   - agents/a2a-protocol
@@ -20,7 +21,7 @@ sources:
 ---
 
 ## TL;DR
-MCP is an open protocol, released by Anthropic in late 2024, that standardizes how an AI application
+MCP is an open protocol, released by Anthropic in November 2024, that standardizes how an AI application
 connects to external capability servers. A server exposes tools, resources and prompts over JSON-RPC;
 any MCP-capable host can discover and call them, so an integration is written once instead of once
 per framework. It solves the plumbing of connecting models to systems; it does not remove the need for
@@ -45,7 +46,9 @@ MCP separates the two sides with a contract. The server side packages a system a
 Schema inputs, resources with URIs and prompt templates; the client side is a small, generic piece of
 the host that speaks the protocol. Once both exist, a new server works with every host and a new host
 works with every server, which is why the ecosystem grew quickly and why customers increasingly already
-have MCP servers you are expected to plug into.
+have MCP servers you are expected to plug into. Other model providers adopted it during 2025, and
+Anthropic later donated the protocol to the Agentic AI Foundation under the Linux Foundation, so it is
+no longer a single-vendor format.
 
 ## How it works
 ### Roles
@@ -56,7 +59,9 @@ remote service. The host can hold many clients, and it decides what the model se
 ### The primitives
 - **Tools** are model-controlled: `tools/list` returns each tool's name, description and
   `inputSchema` (JSON Schema); `tools/call` runs one and returns a list of content blocks (text,
-  image, embedded resource) plus an `isError` flag. These map one-to-one onto a provider's tool
+  image, audio, embedded resources or resource links, depending on the revision) plus an `isError`
+  flag. Since the 2025-06-18 revision a tool may also declare an `outputSchema` and return typed
+  `structuredContent` alongside the content blocks. These map one-to-one onto a provider's tool
   definition and `tool_result`, which is the whole point.
 - **Resources** are application-controlled data identified by URIs (`file://…`, `db://…`), listed and
   read by the host, optionally with change subscriptions. The host decides what goes into the model's
@@ -64,8 +69,9 @@ remote service. The host can hold many clients, and it decides what the model se
 - **Prompts** are user-controlled templates (`prompts/list`, `prompts/get`), typically surfaced as
   slash commands or menu items.
 - **Server-to-client requests**: *sampling* lets a server ask the host's model for a completion
-  without holding its own API key; *roots* let the host tell a server which filesystem roots it may
-  touch; newer revisions add *elicitation*, where a server asks the user for input mid-operation.
+  without holding its own API key (the host should keep a human able to review it); *roots* let the
+  host tell a server which filesystem locations it should work within, which is advisory, not an
+  enforced sandbox; newer revisions add *elicitation*, where a server asks the user for input mid-operation.
   Notifications such as `tools/list_changed` let a server announce that its capabilities changed.
 
 ### The wire
@@ -82,9 +88,11 @@ The host lists tools from each connected server, converts them to the model prov
 description, `input_schema`), usually prefixes names with the server name to avoid collisions, and
 passes the result in `tools`. When the model emits a `tool_use`, the host routes it to the right
 client's `tools/call`, converts the returned content blocks into a `tool_result`, and sets `is_error`
-from `isError`. The model never knows MCP is involved. Some providers can do this hop server-side:
-the Anthropic API accepts `mcp_servers` plus an `mcp_toolset` entry so the connection is made from the
-provider's side, and the Python SDK ships helpers that turn MCP tools into tool-runner tools.
+from `isError`. The model never knows MCP is involved. Some providers can do this hop server-side for
+remote (HTTP) servers: Anthropic's MCP connector, a beta feature at the time of writing, takes an
+`mcp_servers` list in the request so the connection is made from the provider's side, and OpenAI's
+Responses API offers a comparable remote-MCP tool. Parameter names in these betas have changed between
+versions, so check the current docs rather than copying an old snippet.
 
 ### Compared with the alternatives
 Plain in-process function tools remain the right choice for a single codebase with a few tools; MCP
@@ -122,11 +130,11 @@ async def main(question: str):
             listed = await session.list_tools()
             tools = [{"name": f"fs__{t.name}", "description": t.description or "",
                       "input_schema": t.inputSchema} for t in listed.tools]   # 1:1 mapping, namespaced
-            client = anthropic.Anthropic()
+            client = anthropic.AsyncAnthropic()                          # do not block the event loop
             messages = [{"role": "user", "content": question}]
             for _ in range(12):                                          # step budget
-                resp = client.messages.create(model="claude-opus-5-5", max_tokens=8192,
-                                              tools=tools, messages=messages)
+                resp = await client.messages.create(model="claude-opus-5-5", max_tokens=8192,
+                                                    tools=tools, messages=messages)
                 messages.append({"role": "assistant", "content": resp.content})
                 if resp.stop_reason != "tool_use":
                     return "".join(b.text for b in resp.content if b.type == "text")
@@ -136,8 +144,10 @@ async def main(question: str):
                         continue
                     r = await session.call_tool(b.name.removeprefix("fs__"), arguments=b.input)
                     text = "\n".join(c.text for c in r.content if getattr(c, "type", "") == "text")
+                    if len(text) > 8000:                                 # cap, and say so
+                        text = text[:8000] + "\n[truncated: narrow the request]"
                     results.append({"type": "tool_result", "tool_use_id": b.id,
-                                    "content": text[:8000], "is_error": bool(r.isError)})
+                                    "content": text, "is_error": bool(r.isError)})
                 messages.append({"role": "user", "content": results})
             raise RuntimeError("step budget exhausted")
 

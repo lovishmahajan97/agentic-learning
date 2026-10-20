@@ -5,7 +5,7 @@ name: Embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - model-internals/tokenization
   - model-internals/transformer
@@ -25,7 +25,8 @@ sources:
 ## TL;DR
 An embedding is a learned dense vector that stands in for a discrete thing (a token, a sentence) so a
 network can do arithmetic on it. Inside an LLM, the embedding table turns token ids into the vectors
-the transformer consumes, and its transpose turns hidden states back into logits. Outside the LLM, an
+the transformer consumes, and a matrix of the same shape (sometimes the very same one) turns hidden
+states back into logits. Outside the LLM, an
 embedding *model* compresses whole passages into vectors whose distance tracks meaning, which is what
 makes semantic search possible. Same word, two different training objectives.
 
@@ -41,7 +42,9 @@ would have to be relearned from scratch for every token.
 An embedding replaces the one-hot with a short dense vector, typically a few hundred to several thousand
 dimensions, whose values are learned. Because the vectors are trained by gradient descent on the task
 (next-token prediction), tokens that behave similarly in context are pushed to similar places, and that
-geometry is free information for every later layer. The same reasoning applies one level up: if you want
+geometry is free information for every later layer. It also makes learning transfer: a gradient step
+taken because of a sentence about "cat" moves a vector that sits near "kitten", so evidence about one
+token partly informs its neighbours instead of being locked in one orthogonal axis. The same reasoning applies one level up: if you want
 to find the document most relevant to a question, comparing strings fails on paraphrase, while comparing
 learned vectors succeeds, because the vectors were trained so that meaning, not spelling, determines
 distance.
@@ -64,7 +67,9 @@ tokenizer.
 After lookup, the model needs to know *where* each token is, because attention itself is permutation
 invariant. Older models add a learned positional vector to the token embedding; most current models apply
 rotary position embeddings inside attention instead, so the input embedding carries only identity. The
-`positional-encoding` topic covers that choice.
+`positional-encoding` topic covers that choice. (The original transformer also multiplied the looked-up
+vector by √d_model to put it on a scale comparable to the positional signal; some current models, Gemma
+among them, keep a similar scaling.)
 
 ### The unembedding and weight tying
 At the top of the stack, the final hidden state `h` (dimension `d_model`) is projected to a score per
@@ -83,8 +88,19 @@ first-token state, or take the last token for decoder-based embedders. Pooling a
 raw hidden states of a language model trained only on next-token prediction make poor sentence vectors,
 because nothing in that objective asks the pooled vector of two paraphrases to coincide. Embedding models
 are therefore trained **contrastively**: given (query, relevant passage) pairs, pull each pair together
-and push the query away from the other passages in the batch (in-batch negatives, InfoNCE loss). That
-objective is what makes cosine similarity meaningful.
+and push the query away from the other passages in the batch (in-batch negatives, InfoNCE loss). For a
+batch of *B* pairs with similarity `s(q, p) = cos(q, p)` and temperature τ:
+
+```
+L = − (1/B) Σ_i log [ exp(s(q_i, p_i)/τ) / Σ_j exp(s(q_i, p_j)/τ) ]
+```
+
+It is a *B*-way softmax classification: "which passage in this batch is mine?". That framing explains
+the training recipe. Bigger batches mean more negatives per query and a harder, more informative task;
+**hard negatives** (passages that look relevant but are not, often mined with BM25 or an earlier model)
+are added because random in-batch negatives are too easy to teach fine distinctions; and τ (small, for
+example 0.05) sharpens the softmax so near-misses are penalized. The objective directly optimizes the
+quantity you later query with, which is what makes cosine similarity meaningful.
 
 Practical consequences of that training:
 - Vectors are compared with cosine similarity or dot product; with L2-normalized vectors these are
@@ -131,8 +147,11 @@ print((v @ v.T).round(2))     # cosine matrix: [0,1] clearly highest, [0,2] and 
 - A bigger vocabulary means fewer tokens per document and cheaper context, but a larger embedding table
   and more rarely-updated rows; it pays off when the corpus is multilingual or code-heavy.
 - Higher embedding dimension stores finer distinctions but multiplies vector-index memory and search
-  cost linearly; below a few hundred dimensions recall drops noticeably, above a couple of thousand the
-  gains usually do not justify the index size unless the corpus is very large and diverse.
+  cost linearly; the recall gained per extra dimension shrinks quickly, so the bigger vector pays off
+  only on large, diverse corpora, and the break-even point must be measured with recall@k, not assumed.
+- Rows for tokens that are rare in training get few gradient updates and stay near their initialization;
+  a large vocabulary built on one corpus and trained on another can contain such under-trained tokens,
+  which surface as bizarre outputs when a prompt contains them (the "glitch token" phenomenon).
 - Tying input and output embeddings saves parameters and helps small models, while untying gives large
   models more capacity; the benefit flips as the table becomes a small fraction of total parameters.
 - A general-purpose embedding model works out of the box, whereas a fine-tuned one on domain pairs
@@ -150,6 +169,9 @@ print((v @ v.T).round(2))     # cosine matrix: [0,1] clearly highest, [0,2] and 
   between your offline evaluation and the production index.
 - Embedding chunks that are longer than the model's input limit; the tail is truncated silently and
   content past the cut is never retrievable.
+- Copying a similarity threshold ("treat cosine > 0.8 as relevant") from another model; score
+  distributions differ by model, some put unrelated pairs well above zero, and the symptom is a filter
+  that passes everything or nothing. Calibrate thresholds per model on labelled pairs.
 
 ## When to use
 Token embeddings are not a choice; every LLM has them, and you meet them when you count parameters,
@@ -179,7 +201,10 @@ documents and effectively at random distance from old ones; cosine scores betwee
 meaningless, not merely slightly off. The fix is a full re-embedding of the corpus with the new model
 into a fresh index, cut over atomically once it is complete, with the model name and version stored
 with every vector so the mismatch is detectable next time. While the backfill runs, either keep
-querying the old index or run both and merge results per index, never across them.
+querying the old index or run both and merge results per index, never across them; raw scores from
+two models are on different scales, so merge by rank (for example reciprocal rank fusion) rather than by
+score. A strong answer also mentions the evaluation that should have caught it: recall@k on a labelled
+set covering old documents, run before the cutover.
 
 ## Quiz
 ### Q: Why is an embedding lookup mathematically identical to a linear layer applied to a one-hot vector?

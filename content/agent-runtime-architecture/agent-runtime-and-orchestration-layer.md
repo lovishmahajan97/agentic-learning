@@ -5,7 +5,7 @@ name: Agent runtime & orchestration layer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -63,13 +63,33 @@ waiting_for_event → running → completed | failed | cancelled`. Making the wa
 lets the loop pause for a day: the run is parked in storage, nothing is on a call stack, and an external
 event (approval granted, webhook arrived) re-schedules it.
 
-### One step is one transaction
-The order of persistence inside a step matters. The runtime writes the model's decision (the tool call it
-wants) to the log *before* executing the tool, and writes the tool result *before* calling the model again.
-If the process dies between executing a side-effecting tool and recording its result, recovery sees a
-"tool call with no result" and must not blindly re-run it; it either queries the tool for the outcome or
-re-issues the call with the same idempotency key (`run_id:call_id`). The runtime therefore pairs its log
-with idempotent tool execution; one without the other still duplicates emails and tickets.
+### Write-ahead ordering inside a step
+A step cannot be one database transaction, because the tool's side effect (an email sent, a ticket opened)
+happens in another system that cannot join your transaction. The runtime instead brackets the side effect
+with two durable writes, the way a database write-ahead log does: it records the model's decision (the tool
+call it wants) *before* executing the tool, and records the tool result *before* calling the model again.
+That ordering makes every crash point distinguishable on recovery:
+
+| Log ends with | Meaning | Recovery action |
+|---|---|---|
+| tool result | step complete | call the model for the next decision |
+| decision, no result | tool never ran, or ran with unknown outcome | re-issue with the same idempotency key, or ask the tool for the outcome |
+| nothing new | model call lost | call the model again (costs tokens, no side effect) |
+
+The middle row is why the runtime pairs its log with idempotent tool execution: the re-issued call carries
+the same key (`run_id:call_id`) and the tool deduplicates on it. One without the other still duplicates
+emails and tickets. The same reasoning applies to the event stream: publishing an event and writing the
+log are two systems, so a runtime that must never lose events writes them to an outbox table in the same
+transaction as the step and publishes from there.
+
+### Ownership: leases and fencing
+Re-scheduling a run after a crash creates a new hazard: the "crashed" worker may only have been slow (a long
+GC pause, a network partition) and still be executing. Two workers advancing one run will fork its log and
+double its side effects. Runtimes therefore hand out a run to one worker at a time under a **lease** with an
+expiry, renewed by heartbeat, and every append carries the lease's monotonically increasing token; the store
+rejects writes from a stale token. The lease length is a trade: short leases recover dead workers quickly but
+falsely expire healthy ones during long tool calls, so long tools should heartbeat or run asynchronously
+with the run parked in `waiting_for_tool`.
 
 ### Layers of the runtime
 A production runtime is a stack of narrow components, each replaceable:
@@ -106,8 +126,8 @@ Either way, the architecture above is what you are assembling.
 
 ## Example
 A minimal runtime: the run is an append-only log, the prompt is projected from it, every tool call passes a
-policy gate before dispatch, approvals park the run instead of blocking a thread, and each step is persisted
-and published before the loop continues.
+policy gate before dispatch, approvals park the run instead of blocking a thread, and the same `tick()`
+resumes after a crash or an approval because it first looks for a decided-but-unexecuted call in the log.
 
 ```python
 from dataclasses import dataclass, field
@@ -121,37 +141,47 @@ class Run:
 def project(steps):                                    # log -> messages for the next model call
     return [s["message"] for s in steps if "message" in s]
 
+def pending_call(steps):                               # decision recorded, result not: resume point
+    last = steps[-1] if steps else None
+    return last.get("call") if last and last["type"] == "model" else None
+
 class Runtime:
     def __init__(self, gateway, tools, policy, store, events):
-        self.gateway, self.tools, self.policy = gateway, tools, policy
-        self.store, self.events = store, events
+        self.gateway, self.tools, self.policy, self.store, self.events = gateway, tools, policy, store, events
 
     def append(self, run, step):
         run.steps.append(step)
-        self.store.append(run.id, step)                # persist before anything else happens
+        self.store.append(run.id, step)                # durable before anything else happens
         self.events.publish(run.id, step)              # UIs, traces and evals subscribe here
 
     def tick(self, run: Run, max_steps=40):
         while run.status == "running" and len(run.steps) < max_steps:
-            decision = self.gateway.complete(project(run.steps), tenant=run.tenant)
-            self.append(run, {"type": "model", "message": decision.message})
-            if decision.tool_call is None:
-                run.status = "completed"; break
-            call = decision.tool_call
-            verdict = self.policy.check(run, call)     # the model proposes; the runtime disposes
+            call = pending_call(run.steps)             # after a crash or an approval, don't re-ask the model
+            if call is None:
+                d = self.gateway.complete(project(run.steps), tenant=run.tenant)
+                self.append(run, {"type": "model", "message": d.message, "call": d.tool_call})
+                if d.tool_call is None:
+                    run.status = "completed"; break
+                call = d.tool_call
+            verdict = self.policy.check(run, call)     # allow | deny | needs_approval (reads approval records)
             if verdict.effect == "needs_approval":
-                run.status = "waiting_for_approval"    # parked; an approval event re-schedules tick()
+                run.status = "waiting_for_approval"    # parked; the approval event re-schedules tick()
                 self.store.request_approval(run.id, call); break
-            if verdict.effect == "deny":
-                out = {"error": f"denied: {verdict.reason}"}
-            else:
-                out = self.tools.dispatch(call, ctx=run, idempotency_key=f"{run.id}:{call.id}")
+            out = ({"error": f"denied: {verdict.reason}"} if verdict.effect == "deny" else
+                   self.tools.dispatch(call, ctx=run, idempotency_key=f"{run.id}:{call.id}"))
             self.append(run, {"type": "tool_result", "call_id": call.id,
                               "message": {"role": "tool", "tool_call_id": call.id, "content": out}})
-        if len(run.steps) >= max_steps and run.status == "running":
+        if run.status == "running":
             run.status = "failed"                      # budget exhausted is a terminal state, not a hang
         self.store.save(run)
 ```
+
+Trace a run that asks to issue a refund: step 1 records the decision `refund(order=812, amount=40)`; the
+policy returns `needs_approval`, so the run is saved as `waiting_for_approval` and the worker is free. A
+day later the approval is recorded and the run is re-queued. `tick()` finds the pending call in the log,
+the policy now sees the approval and returns `allow`, and the refund is dispatched with key `run_7:call_1`.
+If the worker dies mid-dispatch, the next worker repeats exactly that path, and the payment service sees the
+same key and refunds once.
 
 ## Trade-offs
 - A separate runtime buys durability, observability and one enforcement point, but adds a persistence
@@ -162,8 +192,9 @@ class Runtime:
 - An append-only step log makes replay and audit trivial but grows without bound, so you must own
   compaction and retention; a mutable state blob is simpler until the first "what happened?" incident.
 - Adopting a durable workflow engine saves you from writing checkpointing and timers, but its programming
-  model (deterministic replay, versioned workflow code) constrains how agent code can change; bespoke
-  runtimes are more flexible and more work.
+  model (deterministic replay, versioned workflow code) constrains how agent code can change; the constraint
+  bites when runs live for days while agent code ships daily, and matters little when runs are short enough
+  to drain before a deploy.
 - Hosted vendor agent runtimes remove the loop entirely, but you inherit their state model, pay their per-call and
   per-tool pricing, and still have to build policy, tenancy and credential handling around them.
 
@@ -176,6 +207,8 @@ class Runtime:
   symptom is audit logs showing executed actions with no corresponding policy decision.
 - Enforcing step and cost budgets per model call but not per run tree; the symptom is a supervisor that
   spawns ten children, each within budget, and spends ten times the limit.
+- Re-scheduling a run without a lease or fencing token; the symptom is a run log with two interleaved
+  branches and duplicated tool calls after a worker stalled rather than died.
 - Blocking a worker thread while waiting for a human approval; the symptom is a thread pool exhausted
   by runs that are "running" but doing nothing.
 - Coupling the executor to one vendor's tool-call wire format; the symptom is a provider fallback that

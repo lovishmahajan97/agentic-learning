@@ -5,6 +5,7 @@ name: TypeScript strict mode & advanced types
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - node-ts-for-ai/runtime-schema-validation
   - node-ts-for-ai/promises-and-async-error-propagation
@@ -27,8 +28,8 @@ in the middle of a streamed answer.
 ## Why it exists
 A Node AI service is mostly glue between things that have no static shape: JSON from a model, tool-call
 arguments the model invented, server-sent events that come in four or five variants, SDK response
-objects with deeply optional fields (`choices[0]?.message?.content` may legitimately be `null` when the
-model returned a tool call instead of text). JavaScript lets you read any property of anything, so the
+objects with deeply optional fields (in OpenAI's Chat Completions shape, `choices[0]?.message?.content`
+is legitimately `null` when the model returned a tool call instead of text). JavaScript lets you read any property of anything, so the
 natural failure mode is `TypeError: Cannot read properties of undefined` thrown halfway through a
 request, after tokens have been billed and partially streamed to the user.
 
@@ -50,11 +51,13 @@ null handling, variant handling, and the boundary where untrusted data becomes t
 - **`strictNullChecks`** — `null` and `undefined` are their own types, not members of every type. A
   `string | null` must be narrowed before `.trim()`. This single flag catches the most common class
   of JS production crash.
-- **`strictFunctionTypes`** — function parameters are checked contravariantly. A handler typed to
-  accept `TextEvent` cannot be passed where a handler of `StreamEvent` is expected, because it would
-  receive events it cannot handle.
+- **`strictFunctionTypes`** — parameters of function-typed values are checked contravariantly. A handler
+  typed to accept `TextEvent` cannot be passed where a handler of `StreamEvent` is expected, because it
+  would receive events it cannot handle. Parameters declared with method syntax (`onEvent(e: T): void`
+  in an interface) stay bivariant for compatibility, so prefer property syntax (`onEvent: (e: T) => void`)
+  for callback contracts.
 - **`strictPropertyInitialization`**, **`strictBindCallApply`**, **`noImplicitThis`**, **`alwaysStrict`**
-  — class fields must be set in the constructor, `.call/.apply` are type-checked, `this` must have a
+  — class fields must be initialised at declaration or in the constructor, `.call/.apply` are type-checked, `this` must have a
   known type, and `"use strict"` is emitted.
 - **`useUnknownInCatchVariables`** — `catch (e)` makes `e: unknown`, so you must narrow before reading
   `e.message`. Anything can be thrown in JS, including strings and `undefined`.
@@ -89,8 +92,8 @@ and inference from arguments means callers rarely write the type parameters by h
 ### Conditional, mapped and template-literal types
 Mapped types transform every property (`Partial<T>`, `Readonly<T>`, `Record<K, V>`, or a custom
 `{ [P in keyof T]: T[P] | null }`). Conditional types branch on a type
-(`T extends Promise<infer U> ? U : T`, which is how the built-in `Awaited` works, alongside
-`ReturnType` and `Parameters`). Template-literal types build string unions
+(`T extends Promise<infer U> ? U : T` is a simplified `Awaited`; the built-in one also recurses and
+unwraps any thenable; `ReturnType` and `Parameters` are built the same way with `infer`). Template-literal types build string unions
 (`` `${Provider}:${Model}` ``). They are for library and contract code — typing an SDK wrapper or a
 tool registry — not for everyday application logic, where they cost readability.
 

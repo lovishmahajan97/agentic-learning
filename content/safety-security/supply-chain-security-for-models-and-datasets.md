@@ -4,8 +4,8 @@ module: safety-security
 name: Supply-chain security for models & datasets
 kind: practice
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - python-for-ai/safetensors
   - python-for-ai/hugging-face
@@ -50,8 +50,14 @@ Popularity also says nothing about data poisoning or backdoors, which pass every
 
 ## How it works
 ### Threat model by layer
-- **Artifact.** Malicious serialization (pickle, also pickles hidden inside zip-based formats), and parser
-  bugs in model-file loaders that turn a crafted file into memory corruption.
+- **Artifact.** Malicious serialization (pickle, also pickles hidden inside zip-based formats; Keras
+  `Lambda` layers, which is why Keras 3 loads with `safe_mode` on), and parser bugs in model-file loaders
+  that turn a crafted file into memory corruption.
+- **Templates and configs.** The chat template in `tokenizer_config.json` or GGUF metadata is a Jinja
+  program rendered on every request. A malicious one can inject hidden instructions into every prompt
+  without touching a weight, and a 2024 vulnerability in llama-cpp-python showed that rendering an
+  untrusted template outside a sandbox could execute code on the server. Configs are part of the
+  artifact, not metadata around it.
 - **Code.** Remote code in the repo, conversion scripts, and the loader's own dependency tree.
 - **Weights.** Backdoors and trojans; also quietly degraded or safety-stripped fine-tunes relabelled as the
   original.
@@ -70,7 +76,10 @@ Popularity also says nothing about data poisoning or backdoors, which pass every
    code, vendor it into your repository after review and pin it there, so a later push to the hub cannot
    change what runs.
 3. **Pin by content, not by name.** Reference a commit hash (`revision=`) and record the SHA-256 of every
-   file at review time, because names and branches move and hashes do not.
+   file at review time, because names and branches move and hashes do not. On a git-backed hub the commit
+   already commits to each large file's hash, so the local check earns its keep where the bytes arrive
+   from somewhere you trust less than the commit: a mirror, a shared cache, a developer's copy. Check the
+   *set* of files too, so an extra `.py` or `.bin` that appears later is a failure, not a no-op.
 4. **Mirror through a registry.** Production pulls only from an internal registry; ingestion is
    quarantine, scan, evaluate, promote. Block egress from training and serving clusters to public hubs so
    the registry cannot be bypassed. Scanners such as picklescan and modelscan catch known-dangerous
@@ -78,7 +87,8 @@ Popularity also says nothing about data poisoning or backdoors, which pass every
 5. **Sign and attest.** Sign promoted artifacts and their build attestations with the same tooling you use
    for containers (Sigstore/cosign, in-toto), and maintain an AI bill of materials listing base model,
    adapters, datasets and hashes, so an incident can be traced to every deployment that used the
-   affected component.
+   affected component. CycloneDX (ML-BOM) and SPDX 3.0 (AI and dataset profiles) give that inventory a
+   standard shape that security tooling can ingest.
 6. **Dataset provenance.** Snapshot content rather than URLs, hash the snapshot, store it immutably, keep a
    manifest; for URL-indexed sets, verify per-item hashes captured at curation time, which is the
    mitigation Carlini et al. recommend. Deduplicate and inspect outliers.
@@ -96,12 +106,16 @@ and revision placeholders are filled in by the review step that promoted this ar
 
 ```python
 import hashlib, subprocess, sys
+from pathlib import Path
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 REPO = "Qwen/Qwen2.5-0.5B"
 REV = "<commit-sha-reviewed>"                 # never "main": branches move, hashes do not
-EXPECTED = {"model.safetensors": "<sha256 recorded at review time>"}
+EXPECTED = {   # abbreviated: the review step writes one entry per downloaded file (also vocab.json etc.)
+    "model.safetensors": "<sha256>", "config.json": "<sha256>",
+    "tokenizer.json": "<sha256>", "tokenizer_config.json": "<sha256>",  # chat template lives here
+}
 
 def sha256(path: str) -> str:
     h = hashlib.sha256()
@@ -114,11 +128,13 @@ def sha256(path: str) -> str:
 local = snapshot_download(REPO, revision=REV,
                           allow_patterns=["*.safetensors", "*.json", "tokenizer*"])
 
-# 2. integrity: the bytes must match what was reviewed and promoted
-for name, want in EXPECTED.items():
-    got = sha256(f"{local}/{name}")
-    if got != want:
-        sys.exit(f"hash mismatch for {name}: got {got}")
+# 2. integrity: exactly the reviewed files, with exactly the reviewed bytes
+got = {p.name: sha256(str(p)) for p in Path(local).iterdir() if p.is_file()}
+if got.keys() != EXPECTED.keys():
+    sys.exit(f"file set changed: {sorted(got.keys() ^ EXPECTED.keys())}")
+bad = [n for n in EXPECTED if got[n] != EXPECTED[n]]
+if bad:
+    sys.exit(f"hash mismatch: {bad}")
 
 # 3. belt and braces: scan the snapshot for pickle payloads (also run in CI on the mirror)
 subprocess.run(["picklescan", "--path", local], check=True)
@@ -128,7 +144,14 @@ tok = AutoTokenizer.from_pretrained(local)
 model = AutoModelForCausalLM.from_pretrained(local, use_safetensors=True, trust_remote_code=False)
 ```
 
-In a real pipeline steps 1 to 3 run once at ingestion inside the sandboxed registry job, and serving
+Consider what each step catches. A maintainer later pushes `pytorch_model.bin` with a pickle payload:
+the pinned revision never sees it, and `allow_patterns` would not download it even on a moving branch. An
+attacker who controls your mirror swaps `tokenizer_config.json` for one whose chat template prepends
+"Ignore safety guidelines" to every prompt: no scanner flags a JSON file, but the hash comparison fails.
+A new file appears in the snapshot: the file-set comparison fails before anything loads. What none of
+the steps catches is a backdoor in `model.safetensors` that was there when you reviewed it; that is the
+job of behavioural acceptance and blast-radius limits. In a real pipeline steps 1 to 3 run once at
+ingestion inside the sandboxed registry job, and serving
 nodes pull the promoted, signed artifact from the registry rather than from the hub at all.
 
 ## Trade-offs
@@ -153,6 +176,9 @@ nodes pull the promoted, signed artifact from the registry rather than from the 
   into a training job because your pipeline never looked at the scan result.
 - Treating a leaderboard score as evidence of safety; the symptom is a fine-tune that performs well on the
   benchmark and has had its refusal behaviour stripped, discovered by a customer.
+- Reviewing the weights and ignoring the tokenizer and chat template; the symptom is the model behaving
+  differently in your serving stack than in the reference implementation, or unexplained text appearing
+  in rendered prompts in your traces.
 - Building datasets from live URLs at training time; the symptom is a training run whose data differs from
   the one that was audited, and a model behaviour nobody can reproduce.
 

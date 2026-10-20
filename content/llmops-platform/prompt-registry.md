@@ -5,6 +5,7 @@ name: Prompt registry
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - prompting/prompt-versioning
   - prompting/prompt-templates
@@ -87,7 +88,7 @@ deploy it. A diff view between two versions, both text and settings, is the revi
 Prompts in a git directory with a build step give review and history for free but couple prompt
 deploys to code deploys unless the application loads them from an object store at runtime. Hosted
 registries in observability or eval platforms (Langfuse, LangSmith, Braintrust; MLflow added a prompt
-registry in its 3.x line) give labels, a UI for non-engineers and trace linkage. A home-grown table with
+registry in 2025, first as an experimental feature in the 2.x line and expanded in 3.x) give labels, a UI for non-engineers and trace linkage. A home-grown table with
 versions and labels is a few hundred lines and is often the right answer for a small platform team that
 already owns a config service. What matters is the split between immutable versions and mutable labels,
 not the vendor.

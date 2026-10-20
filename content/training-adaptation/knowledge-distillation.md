@@ -5,7 +5,7 @@ name: Knowledge distillation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/synthetic-data-generation
@@ -61,9 +61,12 @@ p_i(T) = exp(z_i / T) / Σ_j exp(z_j / T)
 At *T* = 1 a confident teacher's distribution is almost one-hot, so the information in the small
 probabilities is invisible. Raising *T* flattens the distribution and amplifies the ratios between the
 wrong answers. For teacher logits [6, 2, 1], *T* = 1 gives [0.976, 0.018, 0.007]; *T* = 4 gives
-[0.605, 0.222, 0.173]. Both encode the same ratio between the wrong answers (p₂/p₃ = e^(1/T), about 2.7
-at *T* = 1 and 1.3 at *T* = 4), but at *T* = 1 those two classes hold 2.5% of the mass and produce almost no
-gradient; at *T* = 4 they hold 40% of it, so the student actually gets to learn the ranking.
+[0.605, 0.222, 0.173]. Both preserve the *ranking* of the wrong answers (the ratio p₂/p₃ = e^(1/T) is
+compressed from about 2.7 to 1.3 but never inverts), yet at *T* = 1 those two classes hold 2.5% of the mass
+and produce almost no gradient; at *T* = 4 they hold 40% of it, so the student actually gets to learn the
+ranking. Too high a *T* has the opposite failure: everything approaches uniform and the signal about
+which alternative is *more* plausible washes out, which is why small values (roughly 1–4 for LLMs) are the
+usual search range rather than a rule.
 
 The loss mixes two terms:
 
@@ -110,6 +113,14 @@ suits a student with less capacity than the teacher. Methods such as MiniLLM use
 generalised-KD interpolates between the two with a Jensen–Shannon style divergence. Treat this as a
 tunable, and remember that whichever you choose, the student's ceiling on the covered distribution is the
 teacher.
+
+### Feature (intermediate-layer) distillation
+Outputs are not the only thing to match. When the student is architecturally close to the teacher, you can
+add losses that pull the student's hidden states (through a learned projection if widths differ) or
+attention maps toward the teacher's at chosen layers; DistilBERT added a cosine loss on hidden states to
+its soft-target loss. This gives every layer a direct target instead of only the last one, which speeds
+up recovery, but it needs white-box access to both models and a layer mapping (student layer *i* ↔
+teacher layer *2i*, say), so it is used mostly when the student was built by shrinking the teacher.
 
 ### Why it pairs with pruning
 A student initialised randomly must relearn everything. A student initialised by structurally pruning

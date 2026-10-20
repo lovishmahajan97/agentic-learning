@@ -5,7 +5,7 @@ name: Multi-tenant state isolation
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - system-design/multi-tenancy
   - system-design/tenant-isolation
@@ -52,7 +52,9 @@ call can supply someone else's. The design has to make the wrong thing impossibl
 Isolation starts with an inventory. For an agent runtime the list is usually: (1) run and step store,
 (2) long-term memory, (3) retrieval indexes, (4) file and object storage, (5) execution sandboxes,
 (6) caches: semantic cache, tool-result cache, embedding cache, (7) logs and traces, (8) queues and event
-streams, (9) evaluation datasets built from production traffic. Every surface gets an owner and an
+streams, (9) evaluation datasets built from production traffic, and (10) in-process state: a framework agent
+object with built-in memory, or a module-level conversation buffer, created once at import and reused by
+every request the process serves. Every surface gets an owner and an
 isolation mechanism, and the list is reviewed whenever a new store is added. This step is unglamorous and
 is where most real incidents would have been prevented.
 
@@ -73,13 +75,18 @@ per surface:
 - **Vector indexes**: a mandatory tenant filter or a tenant partition. Most engines support payload
   filtering during search (Qdrant filters, pgvector with RLS) or per-tenant namespaces (Pinecone
   namespaces); the filter must be applied *inside* the search, not after top-k, or small tenants get
-  empty results while large ones dominate the candidates.
+  empty results while large ones dominate the candidates. In-search filtering needs a payload index on the
+  tenant field, and engines handle very selective filters differently (some switch to exact search), so
+  measure recall for your smallest tenants, not your average one.
 - **Object storage**: per-tenant prefixes with identity policies that condition access on the prefix, and
   credentials scoped per request, not a bucket-wide key held by the runtime.
 - **Sandboxes**: ephemeral per run (or at least per tenant), destroyed afterwards, with no shared volumes;
   warm pools are acceptable only if a pooled sandbox is never handed to a second tenant.
 - **Caches**: tenant (and, for personal data, user) is part of the key, never inferred from the value.
-  A semantic cache is a retrieval index and gets the same filter rules.
+  A semantic cache is a retrieval index and gets the same filter rules. Self-hosted inference with prefix
+  caching shares KV blocks between requests whose prompts start identically; that returns no foreign
+  content, but cache hits are faster than misses, which is a potential timing side channel, so deployments
+  with strict isolation requirements partition or salt the prefix cache per tenant.
 - **Logs and traces**: tenant as a first-class attribute, access to prompt content restricted by tenant
   in the observability tool, or prompt bodies redacted before export.
 
@@ -111,11 +118,11 @@ from contextlib import contextmanager
 
 DDL = """
 alter table agent_steps enable row level security;
-alter table agent_steps force row level security;               -- owner is not exempt
-create policy tenant_rows on agent_steps                        -- FOR ALL by default; with no
-  using (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid);  -- WITH CHECK, USING
--- also gates INSERT/UPDATE rows. missing_ok=true plus nullif: an unset or reset ('') setting compares
--- as NULL and yields zero rows instead of an error, so an unscoped request fails closed.
+alter table agent_steps force row level security;   -- the table owner is not exempt
+create policy tenant_rows on agent_steps            -- FOR ALL; USING also acts as WITH CHECK on writes
+  using (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid);
+-- missing_ok=true plus nullif: an unset or reset ('') setting compares as NULL, so an unscoped request
+-- sees zero rows and cannot insert any, instead of erroring or seeing everything: it fails closed.
 """
 
 @contextmanager
@@ -144,6 +151,15 @@ def test_no_cross_tenant_leak(run_agent, ctx_a, ctx_b, stores):
         assert not store.contains(ctx_b.tenant_id, marker)
 ```
 
+Why the vector filter placement matters, with numbers: a shared memory collection holds 1,000,000 vectors,
+of which tenant B owns 2,000 (0.2%). A post-filter design asks for the top 100 neighbours and then drops
+foreign rows. If B's vectors were spread like everyone else's, about 0.2 of those 100 would be B's, so the
+typical result is empty and B's agent "has no memory". The usual fix is to raise the candidate count, which
+makes every query slower and still fails for the smallest tenants. With the filter inside the search, the
+engine returns B's 8 nearest vectors directly, and no foreign payload is ever returned to application code
+that might log or cache it. The canary test then checks the property end to end, through the same product
+path a real user would take, across every store in the inventory.
+
 ## Trade-offs
 - Shared stores with enforced scoping are cheap and operationally simple, but a single policy bug has
   platform-wide blast radius; dedicated databases or cells per tenant invert that, and become mandatory
@@ -169,6 +185,8 @@ def test_no_cross_tenant_leak(run_agent, ctx_a, ctx_b, stores):
 - Forgetting non-obvious surfaces: a semantic cache without tenant in the key, traces visible to all
   support staff, or an eval set exported from production; the symptom is a leak that bypasses every
   database control you audited.
+- Instantiating an agent or memory object once at module import and serving every request with it; the
+  symptom is a user seeing a fragment of someone else's conversation under concurrent load, never in tests.
 - Reusing a warm sandbox across tenants; the symptom is generated code that lists files it should never
   have seen.
 - Offboarding that deletes rows but not vectors, objects or cached answers; the symptom is a departed
@@ -221,8 +239,8 @@ is caught before a customer reports it, and run the offboarding deletion drill a
 - [x] Post-filtering can leave small tenants with few or no results because large tenants fill the candidate set
 - [ ] Inside-query filters are the only way to log the tenant for audit
 > Top-k is computed over the whole collection; if a tenant's vectors are a small fraction, few or none of
-> them appear among the k nearest, and the post-filter discards the rest. Pre- or in-query filtering keeps
-> recall correct and also prevents other tenants' vectors from being scored at all.
+> them appear among the k nearest, and the post-filter discards the rest. In-query filtering keeps recall
+> correct for every tenant and never returns foreign payloads to application code.
 
 ### Q: Which setting choice makes PostgreSQL row-level security safe to use behind a connection pool?
 - [ ] `SET app.tenant_id` once when the connection is opened

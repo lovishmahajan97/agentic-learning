@@ -5,6 +5,7 @@ name: Data labeling
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - training-adaptation/data-curation
   - training-adaptation/supervised-fine-tuning
@@ -71,8 +72,9 @@ guidelines).
    agreement expected by chance from each rater's label frequencies. The correction matters because two
    raters who both say "not spam" 95% of the time agree about 90% of the time by luck alone. Fleiss'
    kappa extends this to many raters; Krippendorff's alpha also handles missing labels and ordinal
-   scales. The Landis–Koch reading is the common one: below 0.4 poor, 0.6–0.8 substantial, above 0.8
-   near-perfect, with the bar set by the stakes of the task.
+   scales. The Landis–Koch bands are the common reading: below 0 poor, 0–0.20 slight, 0.21–0.40 fair,
+   0.41–0.60 moderate, 0.61–0.80 substantial, above 0.80 almost perfect. The bands are a convention, not
+   a test; set the acceptable bar by the stakes of the task.
 4. **Adjudicate and rewrite.** Every disagreement is a guideline gap or an annotator error. Fix the
    guideline, re-brief, re-pilot until agreement is acceptable.
 5. **Produce with QA.** Single-label most items, but keep 5–10% overlap to track agreement, seed gold

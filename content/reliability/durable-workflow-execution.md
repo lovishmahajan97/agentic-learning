@@ -4,8 +4,8 @@ module: reliability
 name: Durable workflow execution
 kind: pattern
 difficulty: advanced
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-and-checkpoint-stores
@@ -99,6 +99,14 @@ steps, use **continue-as-new**, which closes the current history and starts a fr
 forward only the needed state, *because* replaying a history of millions of events is slow and
 memory-hungry.
 
+### Failure and compensation
+When an activity exhausts its retry policy, the engine raises an error *inside the workflow code*,
+where ordinary control flow decides what happens next. That makes the saga pattern a `try`/`except`:
+record a compensating action after each step that succeeds (cancel the booking, refund the charge,
+retract the draft) and run them in reverse order if a later step fails for good. Compensations are
+activities too, so they are retried and must be idempotent. This is forward recovery: the external
+world cannot be rolled back, only corrected, so the workflow encodes how to correct it.
+
 ### Compared with the alternatives
 A saga implemented by hand gives compensation but not resumption; a queue gives retries but not
 orchestration; a declarative state-machine service (Step Functions style) gives durability with
@@ -122,8 +130,8 @@ async def draft_reply(ticket_id: str) -> str:
 
 @activity.defn
 async def send_reply(ticket_id: str, text: str) -> None:
-    # idempotency key = workflow identity + step, so an activity retry cannot send twice
-    await mailer.send(ticket_id, text, idempotency_key=f"reply:{ticket_id}")
+    info = activity.info()     # same workflow_id and activity_id on every retry of this step
+    await mailer.send(ticket_id, text, idempotency_key=f"{info.workflow_id}:{info.activity_id}")
 
 @workflow.defn
 class TicketReplyWorkflow:
@@ -154,7 +162,26 @@ class TicketReplyWorkflow:
 
 Notice what is *not* in the workflow: no `datetime.now()`, no HTTP, no database. Those would be
 re-executed on replay. The model is called inside an activity precisely because it is
-non-deterministic; its recorded result is what the replayed workflow sees.
+non-deterministic; its recorded result is what the replayed workflow sees. The idempotency key comes
+from the workflow and step identity rather than the ticket, *because* a ticket may legitimately get a
+second reply from a later workflow, while a retry of this step must never send twice.
+
+Trace one run. The reviewer is slow, and the worker is redeployed on day one. The history so far (simplified; real Temporal histories also
+interleave workflow-task and activity-started events):
+
+```
+1 WorkflowExecutionStarted  ticket_id="T-812"
+2 ActivityTaskScheduled     draft_reply
+3 ActivityTaskCompleted     result="Hi Dana, the refund was issued on ..."
+4 TimerStarted              2 days   (from wait_condition's timeout)
+```
+
+A new worker picks the workflow up and runs `run()` from the top. At `execute_activity(draft_reply)`
+the engine finds events 2 and 3 and returns the recorded draft without calling the model; at
+`wait_condition` it finds the timer and simply waits. The `approve` signal arrives on day two and is
+appended as a `WorkflowExecutionSignaled` event; the condition is now true, so the code schedules `send_reply`, which
+has no recorded result and therefore really runs. One model call in total, however many times the
+workers restarted.
 
 ## Trade-offs
 - Crash-proof resumption and readable straight-line orchestration, in exchange for determinism rules
@@ -178,6 +205,9 @@ non-deterministic; its recorded result is what the replayed workflow sees.
   effect twice; the symptom is duplicates that correlate with deploys and worker restarts.
 - Unbounded agent loops in one history, discovered as slowly growing replay latency and memory until
   the workflow stalls; use continue-as-new on a step budget.
+- Retry policies left at defaults that retry forever, so an activity that fails on bad input
+  (a non-retryable error) keeps retrying for days; the symptom is workflows that never fail and never
+  finish. Mark validation and auth errors non-retryable and set a maximum attempts or expiry.
 - Missing heartbeats on long activities, so a dead worker's multi-minute inference is not rescheduled
   until the full timeout expires, inflating latency on every infrastructure hiccup.
 

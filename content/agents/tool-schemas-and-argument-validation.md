@@ -5,6 +5,7 @@ name: Tool schemas & argument validation
 kind: practice
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts
@@ -51,7 +52,8 @@ The declared `input_schema` is a JSON Schema object: `type`, `properties`, `requ
 `description` per property, `default`, `items` for arrays, nested objects, and `additionalProperties`.
 The model reads every description. Put units, formats and examples there: "amount in minor currency
 units (cents)", "ISO 4217 code", "max 50 results". `additionalProperties: false` tells the model not to
-invent fields and is required by strict mode.
+invent fields and is required by strict mode on the major providers (OpenAI's strict mode additionally
+requires every property to be listed in `required`, with optional fields expressed as nullable).
 
 ### Design rules, and the reason for each
 - **Flat over nested**, because every level of nesting is another place to misplace a key.
@@ -61,8 +63,10 @@ invent fields and is required by strict mode.
   can get wrong; expose only what the task needs, not the downstream API's whole surface.
 - **Units and formats in names and descriptions** (`total_cents`, `starts_at_utc`), because "amount"
   can mean cents or dollars and the model will pick one.
-- **Avoid unions, recursion and deep polymorphism**, because models fill them poorly and strict modes
-  typically do not support recursion or numeric and length constraints at all.
+- **Avoid unions, recursion and deep polymorphism**, because models fill them poorly and strict-mode
+  support for them differs by provider: at the time of writing OpenAI's strict mode accepts recursive
+  schemas and some numeric and pattern keywords, while Anthropic's rejects recursive schemas and numeric
+  or length bounds. Check the provider's supported subset rather than assuming either.
 
 ### Where the shape guarantee comes from
 Without strict mode the model generates JSON as text and the API parses it; wrong types and missing
@@ -74,8 +78,9 @@ parameter. Treat availability and the exact supported subset as vendor-dependent
 
 ### Validation layers in the harness
 1. **Shape**: parse `input` into a typed model (Pydantic, Zod). Do this even with strict mode, because
-   a streamed input cut off at `max_tokens` can parse as a valid but incomplete object, and because the
-   model you run next year may not have strict mode.
+   constraints outside the provider's strict subset (often numeric bounds, sometimes patterns) are
+   stripped from the schema you send and are enforced only here, because a response truncated at
+   `max_tokens` is not a complete call, and because the next model or provider may not offer strict mode.
 2. **Meaning**: ranges, cross-field rules, existence checks against your data ("order not found").
 3. **Permission**: tenant and user scoping come from the authenticated session in the harness, never
    from an argument the model supplied, because the model will cheerfully pass whatever id appears in
@@ -83,7 +88,9 @@ parameter. Treat availability and the exact supported subset as vendor-dependent
 4. **Consequence**: destructive or expensive calls get an approval gate regardless of validation.
 
 A failure at any layer returns `is_error: true` with a message naming the field, the problem and the
-fix, and nothing else (no stack traces, no table names). Cap validation retries per call, two or three
+fix, and nothing else (no stack traces, no table names). One exception to "be specific": make "does not
+exist" and "exists but belongs to someone else" return the same message, otherwise the error channel
+tells a caller which other tenants' ids are real. Cap validation retries per call, two or three
 is typical, so a model that cannot satisfy the schema does not loop forever.
 
 ## Example
@@ -114,20 +121,23 @@ REFUND_TOOL = {"name": "issue_refund",
                "description": "Refund part or all of a paid order. Call only after the user "
                               "has confirmed the order id and amount.",
                "input_schema": RefundInput.model_json_schema()}
-# If you enable strict mode, strip constraints the provider does not support (pattern, gt)
-# from the sent schema and keep enforcing them here; SDK helpers do this automatically.
+# If you enable strict mode, strip keywords outside the provider's subset (e.g. gt on Anthropic)
+# from the sent schema and keep enforcing them here; some SDK helpers do this for you.
 
 def handle_refund(block, session_tenant: str) -> dict:
     try:
         args = RefundInput.model_validate(block.input)
     except ValidationError as e:
-        msg = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors())
+        msg = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg'].removeprefix('Value error, ')}"
+                        for err in e.errors())
         return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
                 "content": f"invalid arguments: {msg}"}
     order = ORDERS[args.order_id]
     if order["tenant"] != session_tenant:                 # authorization from the session
-        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
-                "content": "order not accessible from this account"}
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,  # identical to a
+                "content": f"invalid arguments: order_id: order {args.order_id} not found; "
+                           "ids look like ORD-123456"}                          # missing id
+
     if args.amount_cents > order["paid_cents"]:           # cross-field semantic rule
         return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
                 "content": f"amount_cents exceeds paid amount {order['paid_cents']}"}

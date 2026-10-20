@@ -5,7 +5,7 @@ name: Self-attention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - model-internals/attention-mechanism
   - model-internals/multi-head-attention
@@ -52,9 +52,11 @@ the layer has no notion of order unless you give it one.
 ### Projections
 From the layer input **X** of shape `[n, d]`, three learned projections produce queries, keys and values:
 `Q = X·W_Q`, `K = X·W_K`, `V = X·W_V`. They are separate matrices because a token's roles as asker,
-advertiser and content are different. If you used **X** directly for all three, every token would match
-itself most strongly, since a vector's dot product with itself is large, and the layer would mostly
-return each token unchanged.
+advertiser and content are different. If you used **X** directly for all three, the score matrix
+`X·Xᵀ` would be symmetric (i would want j exactly as much as j wants i, which "adjective → its noun"
+relations are not), and for vectors of similar norm each token would match itself most strongly, so the
+layer would mostly return each token unchanged. Separate W_Q and W_K make the score an asymmetric,
+learned relation.
 
 ### Scores, mask, mix
 `S = Q·Kᵀ / √d_k` is an `[n, n]` matrix whose entry (i, j) says how much position *i* wants to read
@@ -126,7 +128,7 @@ out = (A @ v).transpose(1, 2).reshape(B, n, d) @ Wo         # merge heads, outpu
 
 ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 ref = ref.transpose(1, 2).reshape(B, n, d) @ Wo
-print(torch.allclose(out, ref, atol=1e-5))                  # True: same math, fused kernel
+print(torch.allclose(out, ref, atol=1e-4))                  # True: same math, fused kernel
 print(S.shape, "scores per head are n x n ->", n * n, "entries; at n=8192 that is", 8192 ** 2)
 ```
 

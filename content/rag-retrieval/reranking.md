@@ -5,6 +5,7 @@ name: Reranking (cross-encoder)
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - rag-retrieval/hybrid-search
   - rag-retrieval/similarity-search
@@ -78,8 +79,8 @@ reorder); too large and latency and cost grow for no gain, because recall@n has 
 
 ### Why it improves answers, not just rankings
 Generation quality depends on what is at the top of the prompt. Rerankers push the passage that actually
-answers the question into position 1 or 2, which matters because models attend more reliably to the
-start of the context than to its middle, and they demote near-miss passages that share vocabulary but
+answers the question into position 1 or 2, which matters because models use information at the start
+(and end) of a long context more reliably than information buried in its middle, and they demote near-miss passages that share vocabulary but
 not the answer, which are precisely the ones that induce confident wrong answers. Lowering k after
 reranking also shortens prompts and cuts cost.
 
@@ -97,8 +98,8 @@ window and take the maximum.
 - **LLM rerankers.** Prompt a generative model with the query and candidate list and ask for an ordering
   or per-candidate relevance. Strongest on nuanced relevance, slowest and most expensive, and sensitive
   to candidate order in the prompt.
-- **Hosted rerank APIs.** Several providers (Cohere, Voyage, Jina and others) expose a cross-encoder
-  behind an endpoint; no GPU to run, but a network call per query and per-call pricing.
+- **Hosted rerank APIs.** Several providers (Cohere, Voyage, Jina and others) expose a reranking model,
+  typically cross-encoder style though architectures are not always disclosed, behind an endpoint; no GPU to run, but a network call per query and per-call pricing.
 
 ### Score semantics
 A cross-encoder logit is comparable across candidates for the same query and, if the model was trained
@@ -144,8 +145,8 @@ for i, s in sorted(zip(stage1, scores), key=lambda t: -t[1]):
 
 ## Trade-offs
 - A cross-encoder adds precision the first stage cannot reach, but costs one transformer pass per
-  candidate per query; the trade turns against it when the candidate pool is small enough that the first
-  stage is already precise, or when the latency budget is single-digit milliseconds.
+  candidate per query; the trade turns against it when the first stage is already precise at your k on
+  labeled queries, or when the latency budget is single-digit milliseconds.
 - Reranking more candidates raises the chance the right passage is reordered to the top, but only until
   recall@n plateaus; beyond that every extra candidate is pure latency and GPU cost.
 - A larger reranker model scores more accurately, but the gain shrinks with candidate quality, so a small

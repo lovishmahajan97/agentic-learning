@@ -5,6 +5,7 @@ name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/inverted-indexes
@@ -101,7 +102,7 @@ time.
 |---|---|---|
 | Index cost | CPU, tokenization only | GPU or API call to embed every chunk |
 | Query cost | Sub-millisecond to milliseconds on CPU | Embed the query (model call) plus ANN search |
-| Index update | Append postings; immediate | Embed then insert; model change forces full re-index |
+| Index update | Append postings; near-real-time (seconds) | Embed then insert; model change forces full re-index |
 | Explainability | Term-level | None without extra tooling |
 | Tuning | Analyzer, k1, b, field boosts | Model choice, fine-tuning, chunking |
 | Exact tokens | Strong | Weak |
@@ -140,8 +141,8 @@ for q in queries:
 
 BM25 nails the error-code query, because "e4012", "px" and "200" are exact tokens, while the dense model
 may confuse the PX-200 and PX-210 passages, whose vectors are nearly identical in shape. On the billing
-paraphrase, BM25 scores every document at zero (no shared content words; "billed" is not "billing"
-without a stemmer), while the dense model ranks the cancellation passage first. The exact margins depend
+paraphrase, BM25 scores every document at zero (no shared tokens at all; "billed" is not "billing"
+without a stemmer), so `argmax` just returns the first passage with a score of 0.0, while the dense model ranks the cancellation passage first. The exact margins depend
 on the model, which is itself the point: the behavior is structural, the numbers are not.
 
 ## Trade-offs
@@ -152,7 +153,7 @@ on the model, which is itself the point: the behavior is structural, the numbers
   per query and a full re-index on every model change; it flips back toward sparse when the corpus is
   huge, churns constantly, or the GPU budget is tight.
 - Learned sparse keeps one CPU-served inverted index while adding semantics, at the cost of a neural
-  encoder at index time and some loss versus a strong dense model on pure paraphrase tasks.
+  encoder at index time (and, for most variants, at query time) and some loss versus a strong dense model on pure paraphrase tasks.
 - In-domain fine-tuning of a dense model can overtake BM25 decisively, but needs labeled query–passage
   pairs; without them an off-the-shelf model on jargon-heavy text may lose to BM25, which needs no labels
   at all.

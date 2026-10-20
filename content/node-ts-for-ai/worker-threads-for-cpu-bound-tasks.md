@@ -5,6 +5,7 @@ name: Worker threads for CPU-bound tasks
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/bullmq-and-durable-jobs
@@ -55,8 +56,9 @@ pooled and reused rather than created per request.
 ### Message passing and structured clone
 Parent and worker talk through `MessagePort`s: `worker.postMessage(value)` on one side,
 `parentPort.on('message', ...)` on the other. Values are copied with the structured clone algorithm,
-which handles plain objects, arrays, `Map`, `Set`, `Date`, typed arrays and `Error`s, but not functions,
-class instances with methods, or DOM-like handles. Cloning is O(size): sending a 100 MB string to a
+which handles plain objects, arrays, `Map`, `Set`, `Date`, typed arrays and `Error`s. Functions and
+symbols throw a `DataCloneError`, and class instances arrive as plain objects with their prototype and
+methods gone, so a `Tokenizer` object cannot be sent, only the data needed to rebuild one. Cloning is O(size): sending a 100 MB string to a
 worker copies 100 MB, and the copy itself happens on the sending thread, blocking it. The design
 consequence is that the message should be a job description (a file path, an id, a small payload), and
 large data should be transferred or shared rather than cloned.
@@ -72,21 +74,25 @@ dangerous in the usual ways: no structural locking, so keep it to numeric arrays
 ### Pooling
 A pool keeps N workers (typically the CPU count, minus one for the main thread) alive, queues jobs, and
 dispatches each to an idle worker, resolving a promise with the result. Writing one is about forty
-lines; `piscina` (maintained by Node contributors) is the common library and adds idle timeouts,
+lines; `piscina` (created by Node.js core contributors) is the common library and adds idle timeouts,
 cancellation and `AbortSignal` support. The pool is also your concurrency limit: with a queue in front,
 a burst of 1,000 tokenization requests becomes N parallel jobs and a bounded wait, instead of 1,000
-threads.
+threads. Check the CPU count the runtime reports against the container's CPU quota; on older Node
+versions and some orchestrators `availableParallelism()` reflects the host, and a pool sized to 64 host
+cores inside a 2-CPU container just thrashes.
 
 ### What workers are not for
-I/O-bound work gains nothing: a worker waiting on an HTTP call is a wasted thread. Native addons that
-already release the thread (many `crypto` and `zlib` functions use libuv's pool) do not need a worker.
+I/O-bound work gains nothing: a worker waiting on an HTTP call is a wasted thread. Work that native
+code already runs off the loop (the async `crypto` and `zlib` APIs use libuv's pool) does not need a
+worker.
 And work that needs more than one machine's cores, or must survive a process crash, belongs in a job
 queue (see the BullMQ lesson), not in threads. Workers also complicate observability: logs, traces and
 metrics from inside a worker need to be forwarded or tagged, because the worker has its own globals.
 
 ## Example
 A minimal pool that dispatches top-k cosine-similarity jobs to workers, transferring the query vector
-instead of cloning it. The worker file and the pool live in separate modules; this listing shows both
+instead of cloning it. The embedding matrix lives in a `SharedArrayBuffer`: passing an ordinary
+`Float32Array` as `workerData` would structured-clone the whole ~1.2 GB matrix into every worker. The worker file and the pool live in separate modules; this listing shows both
 with the worker guarded by `isMainThread`.
 
 ```ts
@@ -97,12 +103,12 @@ type Job = { query: Float32Array; k: number };
 type Hit = { index: number; score: number };
 
 if (!isMainThread) {
-  const vectors = workerData.vectors as Float32Array;      // flattened [n, dim], loaded once per worker
+  const vectors = workerData.vectors as Float32Array;      // flattened [n, dim], L2-normalised, shared
   const dim = workerData.dim as number;
   parentPort!.on("message", ({ query, k }: Job) => {
     const hits: Hit[] = [];
     for (let i = 0, n = vectors.length / dim; i < n; i++) {
-      let dot = 0;
+      let dot = 0;                                          // dot of unit vectors = cosine
       for (let d = 0; d < dim; d++) dot += query[d]! * vectors[i * dim + d]!;
       hits.push({ index: i, score: dot });
     }
@@ -110,26 +116,29 @@ if (!isMainThread) {
     parentPort!.postMessage(hits.slice(0, k));             // small result: cloning is fine
   });
 } else {
-  class Pool {
+  class Pool {                                              // minimal: no crash replacement
     private idle: Worker[] = []; private queue: Array<() => void> = [];
-    constructor(file: string, data: unknown, size = Math.max(1, availableParallelism() - 1)) {
+    constructor(file: URL, data: unknown, size = Math.max(1, availableParallelism() - 1)) {
       for (let i = 0; i < size; i++) this.idle.push(new Worker(file, { workerData: data }));
     }
     run(job: Job): Promise<Hit[]> {
       return new Promise((resolve, reject) => {
         const start = () => {
           const w = this.idle.pop()!;
-          w.once("message", (hits: Hit[]) => { this.idle.push(w); this.queue.shift()?.(); resolve(hits); });
-          w.once("error", reject);
-          w.postMessage(job, [job.query.buffer]);          // transfer: O(1), query is detached here
+          const onError = (e: Error) => { w.off("message", onMsg); reject(e); };
+          const onMsg = (hits: Hit[]) => {
+            w.off("error", onError); this.idle.push(w); this.queue.shift()?.(); resolve(hits);
+          };
+          w.once("message", onMsg).once("error", onError);
+          w.postMessage(job, [job.query.buffer as ArrayBuffer]); // transfer: O(1), query detached here
         };
         this.idle.length ? start() : this.queue.push(start);
       });
     }
   }
-  const dim = 1536, n = 200_000;
-  const vectors = new Float32Array(n * dim);              // in practice, loaded from disk
-  const pool = new Pool(new URL(import.meta.url).pathname, { vectors, dim });
+  const dim = 1536, n = 200_000;                            // 200k x 1536 x 4 B = ~1.2 GB
+  const vectors = new Float32Array(new SharedArrayBuffer(n * dim * 4)); // shared, not cloned per worker
+  const pool = new Pool(new URL(import.meta.url), { vectors, dim });
   const hits = await pool.run({ query: new Float32Array(dim).fill(0.01), k: 5 });
   console.log(hits[0]);                                    // main loop stayed free to serve streams
 }

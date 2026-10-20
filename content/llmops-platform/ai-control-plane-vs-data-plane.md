@@ -5,6 +5,7 @@ name: AI control plane vs data plane
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - system-design/ai-gateway
   - llmops-platform/model-registry
@@ -30,8 +31,8 @@ snapshot, never by redeploying the data plane.
 
 ## Why it exists
 The two halves of an AI platform have opposite requirements. The request path handles thousands of
-calls a second, each with a latency budget measured in hundreds of milliseconds before the model even
-starts, and must keep working through partial failures. The management side handles a few changes an
+calls a second, where every millisecond the platform adds before the model starts lands directly in
+time-to-first-token, and must keep working through partial failures. The management side handles a few changes an
 hour: promote a bundle, change a canary percentage, add a tenant's model allow-list, rotate a key. It
 must be consistent, audited and permissioned, and nobody cares if a change takes two seconds.
 
@@ -102,15 +103,17 @@ the gateway runs as stateless replicas consuming snapshots, and the admin side i
 with its own availability target, access control and audit.
 
 ## Example
-A minimal data-plane handler: it refreshes a versioned snapshot in the background, keeps serving the
-old one when the control plane is unreachable, picks the bundle with a sticky canary bucket, enforces
-tenant policy locally, and stamps the snapshot version on telemetry. `call_model` and `emit_span`
+A minimal data-plane handler: it starts from the snapshot persisted on local disk, refreshes it in the
+background, keeps serving the old one when the control plane is unreachable, picks the bundle with a
+sticky canary bucket, enforces tenant policy locally, and stamps the snapshot version on telemetry.
+Signature verification is left out for brevity. `call_model` and `emit_span`
 are the application's existing functions.
 
 ```python
 import hashlib, json, threading, time, urllib.request
 
-CONF = {"version": 0, "aliases": {}, "bundles": {}, "rollouts": {}, "policy": {}}   # last-known-good
+LOCAL = "/var/lib/gateway/last_snapshot.json"
+CONF = json.load(open(LOCAL))      # last-known-good from disk, so a cold start survives an outage
 
 def refresh(url="http://control-plane/config/current", every=30):
     """Pull the control plane's snapshot; keep serving the old one if it is unreachable."""
@@ -121,6 +124,7 @@ def refresh(url="http://control-plane/config/current", every=30):
                 snap = json.load(r)
             if snap["version"] > CONF["version"]:        # monotonic: a stale node never wins
                 CONF = snap                               # whole-snapshot atomic swap
+                json.dump(snap, open(LOCAL, "w"))         # persist for the next cold start
         except Exception as e:
             print(f"control plane unreachable ({e}); still serving config v{CONF['version']}")
         time.sleep(every)
@@ -133,7 +137,7 @@ def bucket(key):                                           # stable across repli
 def resolve(c, use_case, tenant):
     r = c["rollouts"].get(use_case)      # {"stable": "support@41", "candidate": "support@42", "percent": 5}
     if r and bucket(f"{use_case}:{tenant}") < r["percent"]:
-        return r["candidate"]                              # sticky: a tenant stays on one version
+        return r["candidate"]               # sticky per tenant: percent counts tenants, not requests
     return r["stable"] if r else c["aliases"][use_case]
 
 def handle(tenant, use_case, messages):

@@ -5,6 +5,7 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -60,8 +61,9 @@ embedding them would waste space and tempt someone to search them.
 ### Indexing
 Split each document into parents, preferably at structural boundaries (headings, sections) so each
 parent is coherent, with a size cap so a runaway section is cut. Split each parent into children, embed
-the children, store the parents. Illustratively, a 40-page manual might become 60 parents and 900
-children; the index holds 900 vectors, the parent store holds 60 texts.
+the children, store the parents. Illustratively, a 40-page manual of roughly 25k tokens might become about
+20 section parents of ~1,200 tokens and about 125 children of ~200 tokens; the index holds 125 vectors,
+the parent store holds 20 texts.
 
 ### Query path
 1. Search the child index with a k larger than the number of parents you will return, say 20, because
@@ -119,7 +121,7 @@ def retrieve_parents(query, k_children=20, n_parents=4):
     return out
 
 ctx = retrieve_parents("What is the rate limit for the search endpoint on the Pro plan?")
-# A 200-token child "Pro plan: 50 requests/minute, bursts to 100 for 10 s" scores highest; the
+# A short child "Pro plan: 50 requests/minute, bursts to 100 for 10 s" scores highest; the
 # generator receives its 1,500-token parent section, which also names the endpoint and the
 # exceptions, and the citation points at the matched child span rather than the whole section.
 ```

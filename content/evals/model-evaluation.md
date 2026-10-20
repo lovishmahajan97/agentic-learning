@@ -5,6 +5,7 @@ name: Model evaluation
 kind: concept
 difficulty: intro
 est_minutes: 14
+status: fact-checked
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -109,14 +110,17 @@ A worked scenario (numbers illustrative). A team runs a RAG support assistant an
 embedding model. Their golden dataset has 300 questions stratified across six intents, each with a
 reference answer and the ids of the document chunks that answer it.
 
-They evaluate at two levels. Component: retrieval recall@5 (fraction of items where a correct chunk
-is in the top five) moves from 0.84 to 0.90 on the 300 items. End-to-end: an LLM judge, previously
+They evaluate at two levels. Component: retrieval hit rate@5 (fraction of items where at least one
+correct chunk is in the top five; often loosely called recall@5, which strictly is the fraction of all
+relevant chunks retrieved) moves from 0.84 to 0.90 on the 300 items. End-to-end: an LLM judge, previously
 checked against human labels, grades each answer against the reference as pass or fail; the pass rate
 moves from 0.78 to 0.83.
 
 Is +5 points real? The standard error at p ≈ 0.8, n = 300 is √(0.8 × 0.2 / 300) ≈ 0.023, so each
-number carries roughly ±4.5 points, and the two intervals overlap. The paired view is sharper: 27
-items flipped fail → pass and 12 flipped pass → fail; net +15 of 300 is the +5 points. Looking at the
+number carries roughly ±4.5 points, and an unpaired test on the difference (standard error ≈ 0.032,
+z ≈ 1.5) cannot call it. The paired view is sharper because it ignores the items that did not change:
+27 items flipped fail → pass and 12 flipped pass → fail; net +15 of 300 is the +5 points, and an exact
+sign (McNemar) test on 27 versus 12 gives p ≈ 0.02. The gain is probably real. Looking at the
 12 regressions, 9 are in the "billing" intent, where the new embeddings rank a policy FAQ above the
 customer's own invoice data. The decision is not "ship" or "don't ship" but "fix billing retrieval,
 re-run, then ship behind a canary while sampling live answers through the same judge". That is what

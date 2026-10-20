@@ -5,7 +5,7 @@ name: Throughput vs latency
 kind: decision
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/continuous-batching
   - serving-inference/batching-and-concurrency-limits
@@ -40,8 +40,10 @@ wait, not the step, becomes the latency.
 Teams that never choose get the worst of both. Run at high utilisation to keep cost per token low and
 the p99 latency explodes, because queueing delay grows without bound as utilisation approaches 100 %.
 Run at low concurrency to keep latency tight and you pay for GPUs that are 80 % idle. The naive
-"autoscale on GPU utilisation" does not resolve it either: a GPU can report high utilisation while
-being bandwidth-bound with spare compute, and the metric lags the queue that users feel.
+"autoscale on GPU utilisation" does not resolve it either. The usual utilisation metric (what
+`nvidia-smi` reports) is the fraction of time any kernel is running, not the fraction of compute in
+use, so a decode loop at batch 4 and one at batch 200 can both read near 100 %. It tells you the GPU
+is busy, not how much headroom is left, and it says nothing about the queue that users feel.
 
 Providers make the trade-off explicit in their pricing. Interactive endpoints are tuned for latency
 and cost more; batch endpoints run at the throughput end of the curve with multi-hour completion
@@ -137,8 +139,8 @@ queueing delay is added on top; real measurements will sit below every figure he
   queueing admits everyone and lets latency drift, which is better only when callers can wait.
 
 ## Pitfalls
-- Autoscaling on GPU utilisation; the symptom is replicas that scale out after users have already
-  waited through a queue, because utilisation lags and saturates early in bandwidth-bound decode.
+- Autoscaling on GPU utilisation; the symptom is a metric pinned near 100 % at both light and heavy
+  load, so replicas scale out late or never while users wait through a queue.
 - Benchmarking throughput with a closed loop and no SLO; the symptom is a "capacity" figure that
   production never reaches without blowing p99.
 - Sizing from mean latency; the symptom is on-call pages for p99 while the dashboard average looks

@@ -5,6 +5,7 @@ name: Webhook signature verification & replay protection
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - backend-fundamentals/api-and-sdk-integration
   - backend-fundamentals/message-queues
@@ -41,7 +42,8 @@ The naive defences each fail in a specific way. A secret URL is a bearer token t
 logs, proxies, browser history and a screenshot in a support ticket, and rotating it means touching
 every integration. An IP allowlist breaks because providers send from large, changing cloud ranges and
 your own ingress may rewrite source addresses. A `"source": "billing"` field in the JSON is written by
-whoever sends the JSON. Mutual TLS would settle the question, but almost no provider offers it. What
+whoever sends the JSON. Mutual TLS would settle the question, but few SaaS providers offer it for
+webhooks. What
 remains is a shared secret used to compute a message authentication code over the exact bytes
 received: cheap, verifiable offline, and proof that whoever produced the message held the secret.
 
@@ -131,7 +133,8 @@ def verify(raw: bytes, header: str) -> None:
     if abs(time.time() - int(ts)) > TOLERANCE_S:
         raise HTTPException(400, "timestamp outside tolerance")        # bounds replay to a short window
     expected = hmac.new(SECRET, f"{ts}.".encode() + raw, hashlib.sha256).hexdigest()
-    if not any(hmac.compare_digest(expected, s) for s in sigs):        # constant-time compare
+    # constant-time compare on bytes: compare_digest raises TypeError on non-ASCII str input
+    if not any(hmac.compare_digest(expected.encode(), s.encode()) for s in sigs):
         raise HTTPException(400, "bad signature")
 
 @app.post("/webhooks/provider")
@@ -141,10 +144,14 @@ async def receive(request: Request):
     event_id = json.loads(raw).get("id")
     if not event_id:
         raise HTTPException(400, "missing event id")
-    first = await r.set(f"webhook:seen:{event_id}", 1, nx=True, ex=SEEN_TTL_S)
-    if not first:
+    key = f"webhook:seen:{event_id}"
+    if not await r.set(key, 1, nx=True, ex=SEEN_TTL_S):
         return {"status": "duplicate"}             # 2xx: a retry or a replay, either way do nothing again
-    await r.lpush("webhook:inbox", raw)            # ack fast; a worker fetches the object by id and acts
+    try:
+        await r.lpush("webhook:inbox", raw)        # ack fast; a worker fetches the object by id and acts
+    except Exception:
+        await r.delete(key)                        # un-mark so the provider's retry is not dropped
+        raise
     return {"status": "queued"}
 ```
 

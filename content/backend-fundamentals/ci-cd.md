@@ -5,6 +5,7 @@ name: CI/CD
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/kubernetes
@@ -119,7 +120,7 @@ name: ci
 on:
   pull_request:
   push: {branches: [main]}
-permissions: {contents: read, packages: write, id-token: write}   # id-token: OIDC to the cloud
+permissions: {contents: read}                # least privilege by default; jobs widen it
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -137,13 +138,14 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production                  # protection rule: required reviewers
+    permissions: {contents: read, packages: write, id-token: write}   # id-token: OIDC to the cloud
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
         with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
       - id: build
         uses: docker/build-push-action@v6
-        with: {push: true, tags: "ghcr.io/${{ github.repository }}:${{ github.sha }}"}
+        with: {push: true, tags: "ghcr.io/${{ github.repository }}:${{ github.sha }}"}   # repo name must be lowercase
       - uses: aws-actions/configure-aws-credentials@v4
         with: {role-to-assume: "arn:aws:iam::123456789012:role/ci-deploy", aws-region: us-east-1}
       - run: |                                 # promote the exact digest that was built and tested
@@ -155,7 +157,8 @@ jobs:
 ## Trade-offs
 - Running evaluations on every pull request catches prompt regressions early, but costs money, time and
   attention when the eval is noisy; the balance flips to a small smoke set per pull request plus a full
-  nightly run once eval cost per run exceeds what you would spend on a human review.
+  nightly run once the per-pull-request eval bill or wait time starts pushing people to batch prompt
+  changes or skip the gate.
 - Continuous deployment maximises flow by removing the human gate, but for regulated customers or
   high-blast-radius changes continuous delivery with an approval and a canary is the right stopping
   point.
@@ -181,8 +184,9 @@ jobs:
   of that action silently running in your pipeline. Pin to a commit SHA.
 - Only code is versioned and rolled back; the symptom is a bad prompt requiring a hotfix pull request
   under pressure instead of a one-click revert.
-- Secret-bearing jobs that run on pull requests from forks via `pull_request_target`; the symptom is a
-  malicious pull request exfiltrating secrets through a log line.
+- `pull_request_target` workflows, which run with secrets in the base repository's context, that check
+  out and execute the fork's code; the symptom is a malicious pull request exfiltrating secrets through
+  a build script or log line.
 - A commit stage that grows past half an hour; the symptom is rising pull-request size and lead time,
   because developers batch changes to avoid waiting.
 
@@ -242,6 +246,6 @@ artifact so a rollback reverts both.
 - [x] The job presents a short-lived signed identity token that the cloud exchanges for temporary credentials, so there is no long-lived secret to leak or rotate
 - [ ] Kubernetes requires OIDC for any `kubectl` access from a pipeline
 - [ ] Stored keys cannot be restricted to a single repository
-> The credential exists only for the duration of the job and is bound to the repository and workflow
-> that requested it, which removes the single most common CI leak. OIDC tokens are deliberately
+> The credential is short-lived, and the cloud's trust policy accepts the token only when its claims
+> (repository, branch or environment) match, which removes the single most common CI leak. OIDC tokens are deliberately
 > short-lived, and `kubectl` access works with many credential types.

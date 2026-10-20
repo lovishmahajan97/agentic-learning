@@ -5,7 +5,7 @@ name: Structured / constrained generation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - prompting/structured-outputs-json-mode
   - prompting/function-tool-calling
@@ -66,8 +66,16 @@ into a deterministic finite automaton, then, for every automaton state, walk eve
 through the automaton and record which tokens are legal from that state and which state each leads to.
 At generation time the engine tracks the current state and the allowed set is a table lookup; the
 expensive vocabulary scan happened at compile time *because* it depends only on the grammar and the
-tokenizer, not on the request. Non-recursive JSON schemas compile to regexes; recursive or deeply nested
-grammars need a pushdown automaton (a context-free grammar), which is what llama.cpp's GBNF grammars and
+tokenizer, not on the request.
+
+A tiny case shows what the index holds. Take the pattern "exactly three digits, then stop" and a toy
+vocabulary containing `7`, `42`, `123`, `1234`, `a` and ` 5`. From the start state (no digits yet), `7`
+leads to the one-digit state, `42` to the two-digit state, `123` straight to the accepting state, and
+`1234`, `a` and ` 5` are illegal. From the two-digit state only single-digit tokens are legal; from the
+accepting state only end-of-sequence is. Note that multi-character tokens jump several automaton steps
+at once, which is exactly what a character-level grammar check cannot see without walking each token.
+
+Non-recursive JSON schemas compile to regexes; recursive or deeply nested grammars need a pushdown automaton (a context-free grammar), which is what llama.cpp's GBNF grammars and
 XGrammar implement, the latter caching the tokens whose legality does not depend on the stack so that
 most steps are still a lookup.
 
@@ -78,12 +86,25 @@ key name), some engines skip sampling and append it directly, which saves decode
 And enums, numeric ranges and string patterns become hard constraints: a `"status"` field declared as
 `enum: ["open", "closed"]` cannot come back as `"Closed"`.
 
+### The cost at serving time
+Masking has to fit inside a decode step that takes milliseconds for a whole batch, so engines treat it as
+a pipeline problem. The grammar state advance and mask computation run on the CPU while the GPU computes
+the forward pass for the same step, and the result is applied as a compact per-sequence bitmask over the
+vocabulary just before sampling; when mask computation is slower than the forward pass, it shows up
+directly as higher time per output token. Appending runs of forced tokens without sampling, mentioned
+above, is what SGLang calls jump-forward decoding. Every sequence in a batch can carry a different
+grammar, so the CPU-side work (compiling grammars and computing each sequence's mask) is the part that
+has to scale with concurrency; applying the finished mask on the GPU is cheap.
+
 ### What it does not control
 A valid schema says nothing about whether the values are true. A hallucinated invoice number passes a
 regex for invoice numbers. Semantic validation (Pydantic validators, cross-field rules, database
 lookups) still belongs after generation, and retry-with-feedback remains the right tool for *those*
 failures. Constrained decoding also changes the distribution: at a point where the model wanted to write
-prose, it must choose among whitespace or a quote, and may take a low-probability path. Tokenization
+prose, it must choose among whitespace or a quote, and may take a low-probability path. Masking and
+renormalising at each step is also not the same as sampling from the model's distribution conditioned
+on producing valid output: the mask is greedy and local, so the model can be steered into a prefix whose
+only legal continuations it considers unlikely, and it is never allowed to back up. Tokenization
 artefacts matter too; forcing output to begin with `{` rather than ` {` can land the model in a token
 sequence it rarely saw in training. One 2024 study (Tam et al.) reported that strict format restrictions
 can degrade reasoning performance in some settings, which is why the mitigations below exist.
@@ -96,6 +117,8 @@ can degrade reasoning performance in some settings, which is why the mitigations
   appears.
 - Compile and cache grammars by schema hash. Compilation ranges from milliseconds to seconds for large
   schemas, and a per-request dynamic schema throws that away every call.
+- Do not confuse "JSON mode" with schema enforcement: JSON mode guarantees syntactically valid JSON of
+  any shape, while structured-output modes enforce your schema's fields, types and enums.
 - Check backend coverage: hosted strict modes and open-engine backends support a *subset* of JSON Schema
   (for example requiring every field and forbidding additional properties), so validate the schema
   against the backend before relying on a feature.
@@ -124,6 +147,7 @@ class ChoiceConstraint(LogitsProcessor):
     def __init__(self, choices, prompt_len):
         self.trie, self.prompt_len = {}, prompt_len
         for c in choices:                                   # built ONCE: grammar x tokenizer
+            # one canonical tokenization per choice; real engines allow every token path that spells it
             node = self.trie
             for t in tok(c, add_special_tokens=False).input_ids:
                 node = node.setdefault(t, {})

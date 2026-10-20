@@ -5,6 +5,7 @@ name: FastAPI
 kind: tool
 difficulty: intro
 est_minutes: 11
+status: fact-checked
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/async-endpoints
@@ -54,7 +55,8 @@ Uvicorn accepts the connection and hands an ASGI `scope` to the app. The request
 middleware stack (CORS, auth, tracing), the router matches the path and method, FastAPI resolves the
 handler's dependencies, validates path, query and body parameters against the declared types, calls
 the handler, then serialises the return value through `response_model`. Validation failures stop at
-the boundary with a 422 and a field-level error list, before any of your code runs.
+the boundary with a 422 and a field-level error list, before the handler body runs (dependencies
+may already have executed, so keep side effects out of them).
 
 ### `async def` versus `def` handlers
 An `async def` handler runs directly on the event loop, so every `await` yields to other requests. A
@@ -135,8 +137,8 @@ async def chat(body: ChatRequest, client: httpx.AsyncClient = Depends(http)):
   design them to be stateless.
 
 ## Pitfalls
-- Using a synchronous provider SDK or `requests` inside `async def`; the symptom is p99 latency that
-  equals the slowest upstream call for every request on that worker.
+- Using a synchronous provider SDK or `requests` inside `async def`; the symptom is latency on every
+  endpoint of that worker growing with the sum of the blocking upstream calls queued ahead of it.
 - Creating an `httpx.AsyncClient` per request; the symptom is a new TLS handshake per call and socket
   exhaustion under load, fixed by one client in `lifespan`.
 - Returning ORM objects or internal dicts without `response_model`; the symptom is an internal field
@@ -160,7 +162,8 @@ differently. The `fastapi-for-ai` module covers each mechanism in depth.
 - **Architect:** Decides that the AI service layer is ASGI and stateless, sets worker and concurrency
   limits per process, and treats the OpenAPI schema as the published contract for other teams.
 - **FDE:** Stands up a FastAPI service inside a customer's network, exposes `/docs` so their
-  integrators can self-serve, and explains why their sync middleware must not wrap async handlers.
+  integrators can self-serve, and explains why blocking code in their middleware (a sync auth lookup)
+stalls every async handler behind it.
 
 ## Check yourself
 **Q:** A FastAPI service has one `async def` endpoint that calls a provider through a synchronous SDK.
@@ -171,7 +174,8 @@ no other coroutine on that worker, including the health check, can run until it 
 requests queue behind each other. Fix one: switch to the SDK's async client (or httpx) so the call
 yields to the loop; this is the right long-term fix but requires the whole path to be async. Fix two:
 change the handler to plain `def` so FastAPI runs it in the threadpool; this unblocks the loop
-immediately but caps concurrency at the threadpool size and adds thread overhead. Either way, add a
+immediately but caps concurrency at the threadpool size (AnyIO's default limiter is 40 threads,
+tunable) and adds thread overhead. Either way, add a
 metric for event-loop lag so a regression is visible.
 
 ## Quiz

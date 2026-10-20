@@ -5,6 +5,7 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - evals/model-evaluation
   - evals/dataset-contamination
@@ -39,7 +40,9 @@ benchmark is informative while models score well below its ceiling and have not 
 models improve it saturates (differences at the top are within noise or within label error), and as
 its items spread across the web it becomes contaminated (scores reflect memorization). Newer, harder,
 better-guarded benchmarks replace older ones: GPQA and SWE-bench (both 2023) took over from MMLU
-(2020) and HumanEval (2021) as the numbers people watch.
+(2020) and HumanEval (2021) as the numbers people watch, and they in turn are approaching their own
+ceilings at the frontier as harder successors appear. Which benchmarks are "current" changes yearly;
+the cycle is the stable fact.
 
 The naive alternative is picking a model from the table in a vendor's announcement. It fails because
 numbers across reports are rarely comparable (different shot counts, chain-of-thought or not, pass@1
@@ -85,11 +88,12 @@ codebase, editing, running tests. The sharp edge is that a score is a *system* s
 without the scaffold and the cost per task.
 
 ### GPQA: expert reasoning that search cannot shortcut
-448 four-option questions in biology, physics and chemistry written by domain experts with PhDs and
-validated by other experts. The construction target was that experts score high while skilled
+448 four-option questions in biology, physics and chemistry written by domain experts who have or
+are pursuing PhDs, and validated by other experts. The construction target was that experts score high while skilled
 non-experts with unrestricted web access score low (the paper reports roughly 65% for experts, about
 74% discounting clear expert mistakes, versus about 34% for non-experts), hence "Google-proof". The
-Diamond subset (198 questions) keeps only items where experts agreed and non-experts failed, and is
+Diamond subset (198 questions) keeps only items that both expert validators answered correctly (or
+where the expert who erred later acknowledged the mistake) and that most non-experts got wrong, and is
 the number usually reported. It measures reasoning beyond retrieval and is where reasoning-oriented
 models separate from others. Its weakness is size: 198 items means a wide confidence interval.
 
@@ -99,7 +103,7 @@ temperature and number of samples averaged, subset (Diamond, Verified, Lite), sc
 date, and whether the score is self-reported. Then apply statistics: a score is a proportion with
 standard error √(p(1−p)/n). On GPQA Diamond at p = 0.6 that is ±3.5 points standard error, so two
 models four points apart are not distinguishable at 95% confidence; on MMLU's ~14k items the same
-calculation gives ±0.3. Finally ask about contamination: the dataset-contamination lesson covers how
+calculation gives ±0.4. Finally ask about contamination: the dataset-contamination lesson covers how
 to detect it.
 
 ### From benchmark to decision
@@ -127,7 +131,7 @@ def ci95(score: float, n_items: int) -> float:
     """Half-width of a 95% normal-approximation interval for a proportion over n_items."""
     return 1.96 * sqrt(score * (1 - score) / n_items)
 
-print(pass_at_k(10, 3, 1), round(pass_at_k(10, 3, 5), 3))     # 0.3  0.917
+print(round(pass_at_k(10, 3, 1), 3), round(pass_at_k(10, 3, 5), 3))   # 0.3  0.917
 
 benchmarks = {"GPQA Diamond": 198, "HumanEval": 164, "SWE-bench Verified": 500, "MMLU": 14_042}
 for name, n in benchmarks.items():
@@ -149,8 +153,10 @@ with the same protocol can tighten that.
   makes items easy to find and train on, so comparability decays with time.
 - Execution-based grading (HumanEval, SWE-bench) is objective and resists paraphrase problems, but it
   needs sandboxes, dependencies and time per item, and test coverage bounds what "correct" means.
-- Small expert-written sets (GPQA) are hard to contaminate and high in quality, but their size makes
-  confidence intervals wide and single-run comparisons unreliable.
+- Small expert-written sets (GPQA) are high in quality and were released with measures meant to keep
+  them out of crawls (a canary string and a request not to post items in plain text), but they are
+  public and not immune to contamination, and their size makes confidence intervals wide and
+  single-run comparisons unreliable.
 - Agentic benchmarks (SWE-bench) reflect real work far better than multiple choice, but they measure
   model plus scaffold, so a score is reproducible only with the full harness and its cost.
 

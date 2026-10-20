@@ -5,7 +5,7 @@ name: CPU offloading
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/gpu-memory-optimization
   - serving-inference/kv-cache-paging-and-eviction
@@ -71,8 +71,12 @@ compute per layer to overlap the copies, which is exactly FlexGen's regime.
 `-ngl` (number of GPU layers) works this way: the first N layers run on the GPU, the rest on CPU cores
 using host memory bandwidth, typically tens of GB/s on a dual-channel desktop and a few hundred on a
 server. Nothing crosses PCIe except the activations at the boundary, so the cost is CPU memory bandwidth
-and CPU matmul speed rather than bus speed. For a few layers on a fast CPU this is often better than
-streaming; for half the model it is still 10–40× slower than keeping it on the GPU.
+and CPU matmul speed rather than bus speed. This is why split execution usually beats streaming at batch
+size 1: host memory bandwidth (tens to hundreds of GB/s) is at least comparable to, and on a server well
+above, the 25–60 GB/s of a PCIe link, and the weights only have to be read where they already live. The
+two halves run one after the other for each token, so the costs add: `step ≈ gpu_bytes / HBM_bw +
+cpu_bytes / host_bw`. Half of a 40 GB model on a desktop with ~60 GB/s of host bandwidth is about
+20 ms + 330 ms; on a many-channel server it is far less, but the CPU half still dominates the step.
 
 ### A timing model
 When transfer and compute overlap, `step_time ≈ max(resident_bytes / HBM_bw, offloaded_bytes /
@@ -86,8 +90,21 @@ When the block pool runs dry, a preempted sequence's blocks can be swapped to pi
 swapped back when it resumes, or dropped and recomputed by re-running prefill. Swapping an 8k-token
 context of a Llama-3-8B-class model moves about 1 GB, roughly 40 ms over Gen4, while recomputing its
 prefill costs on the order of a hundred TFLOP, several hundred milliseconds. For short prompts recompute
-is simpler and nearly free; for long prompts swap wins. Engines pick per sequence, and the swap space
-size bounds how many sequences can be parked.
+is simpler and nearly free; for long prompts swap wins, although the crossover moves with GPU speed and
+link speed. Which one runs is an engine policy rather than a per-request optimisation: vLLM's V0
+scheduler, for instance, recomputed single-sequence requests by default and swapped multi-sequence
+groups (beam search, `n > 1`), for which it did not implement recomputation. The swap space size
+bounds how many sequences can be parked.
+
+### Mixture-of-experts changes the arithmetic
+In an MoE model each token is routed to a few experts per layer, so a decode step reads only the routed
+experts' weights, not the whole expert set. That makes a split that would be hopeless for a dense model
+workable: keep attention, shared layers and the KV cache on the GPU, keep the large expert FFNs in host
+RAM, and compute the routed experts on the CPU. Bytes read on the CPU side per token scale with the
+*active* expert parameters while memory scales with the *total*, which is the right match for cheap,
+large host RAM. llama.cpp supports this kind of placement through its tensor-override options; batching
+erodes the advantage, because a batch of tokens routes to many different experts and the CPU ends up
+reading most of them each step.
 
 ### NVMe and unified memory
 ZeRO-Infinity and FlexGen extend the hierarchy to NVMe (GPU ← CPU ← SSD), with GPUDirect Storage able to
@@ -140,8 +157,9 @@ print(f"a {budget_ms} ms budget tolerates at most {max_offload_gb:.1f} GB offloa
   model that "works" at one or two tokens per second with the GPU at 5% utilization and host RAM full.
 - Streaming from pageable instead of pinned memory, which halves effective bandwidth and adds CPU copy
   overhead; visible as transfer time far above the PCIe spec.
-- Sizing swap space too small, so the engine falls back to recomputation for long contexts under load;
-  the symptom is a throughput cliff and prefill-heavy GPU traces when concurrency rises.
+- Sizing swap space too small for the long-context tail. Depending on the engine, preemptions then fail
+  outright or fall back to recomputation; the symptom is aborted requests, or a throughput cliff with
+  prefill-heavy GPU traces, when concurrency rises.
 - Benchmarking on a workstation with a Gen5 x16 slot and deploying to a cloud instance whose GPU sits on
   a shared or narrower link; identical settings, half the speed.
 - Treating offloading as an alternative to quantization. Quantizing from fp16 to 4-bit removes 75% of
@@ -172,8 +190,9 @@ reports 3 tokens/s. They ask whether a faster CPU would help. What is your analy
 exceeds 48 GB, so a few gigabytes are offloaded. If the engine streams those layers over PCIe, step time
 is dominated by offloaded bytes divided by bus bandwidth, roughly 40 ms per gigabyte on Gen4, and a
 faster CPU changes nothing; 3 tokens/s is about 330 ms per token, consistent with roughly 7–8 GB crossing
-a Gen4 link every step. If it computes them on the CPU, host memory bandwidth and CPU matmul speed
-matter, and a faster CPU helps a little but not to GPU-class speed. The real fix is to remove the
+a Gen4 link every step. If it computes them on the CPU, the offloaded share runs at host memory
+bandwidth, so more memory channels help more than a faster core clock, and neither reaches GPU-class
+speed. The real fix is to remove the
 overflow: cap context length so the KV cache shrinks, use a slightly smaller quantization or a model
 with fewer KV heads, or add a second GPU with tensor parallelism. I would measure the offloaded size and
 transfer time first, then predict the gain of each option before they buy anything.

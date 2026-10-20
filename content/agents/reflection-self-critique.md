@@ -5,6 +5,7 @@ name: Reflection / self-critique
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/planning
@@ -40,9 +41,10 @@ Without external evidence the model is re-rolling with a bias toward *changing* 
 prompt implies something is wrong, and studies of intrinsic self-correction on reasoning tasks found it
 often fails to help and sometimes hurts. The pattern earns its cost when the critique step sees
 something the generator did not: an execution result, a retrieved fact, a rubric applied in a clean
-context, or a different model. Reflexion, for example, showed large gains on coding tasks precisely
-because the reflection was grounded in unit-test outcomes and the lesson was carried into the next
-attempt as text. That is the mechanism to copy: feedback that is grounded, persisted, and fed forward.
+context, or a different model. Reflexion, for example, showed large gains on coding benchmarks
+precisely because the reflection was grounded in execution: the agent ran unit tests (which it wrote
+itself, so the signal came from actually running code, not from rereading it) and carried the lesson
+into the next attempt as text. That is the mechanism to copy: feedback that is grounded, persisted, and fed forward.
 
 ## How it works
 ### The loop
@@ -61,8 +63,9 @@ attempt as text. That is the mechanism to copy: feedback that is grounded, persi
 When the generator critiques its own output inside the same conversation, its context is saturated
 with the reasoning that produced the answer, and attention to that reasoning makes it likely to confirm
 it. A fresh call that sees only the task, the artifact and a rubric is a different computation: it has
-no stake in the answer. Using a different model, or the same model with a role prompt and no history,
-is cheap and measurably reduces agreement bias. Make the critic output structured: `{"pass": bool,
+no prior reasoning to defend. Using a different model, or the same model with a role prompt and no
+history, is cheap and weakens that agreement bias; it does not remove it, since LLM judges are known to
+favour outputs that resemble their own, so measure critic-versus-human agreement on your task. Make the critic output structured: `{"pass": bool,
 "issues": [{"where": ..., "what": ..., "severity": ...}]}` *because* a free-text "looks good overall"
 cannot drive the revise step or a stopping rule.
 
@@ -89,16 +92,19 @@ A test-grounded code-repair loop: generate, run `pytest`, convert failures into 
 with the reflection in context, keep the best attempt.
 
 ```python
-import subprocess, tempfile, pathlib
+import pathlib, re, subprocess, sys, tempfile
 
-def run_tests(code: str, tests: str) -> tuple[int, str]:
+def run_tests(code: str, tests: str) -> tuple[bool, int, str]:
     d = pathlib.Path(tempfile.mkdtemp())
     (d / "solution.py").write_text(code)
     (d / "test_solution.py").write_text(tests)
-    p = subprocess.run(["python", "-m", "pytest", "-q", "-x", str(d)],
-                       capture_output=True, text=True, timeout=60)
-    failed = p.stdout.count("FAILED") + p.stdout.count("ERROR")
-    return failed, p.stdout[-2000:]                     # tail is enough for a lesson
+    try:                                                # no -x: we want to count every pass
+        p = subprocess.run([sys.executable, "-m", "pytest", "-q", str(d)],
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, 0, "Tests timed out after 60 s (infinite loop?)"
+    m = re.search(r"(\d+) passed", p.stdout)
+    return p.returncode == 0, int(m.group(1)) if m else 0, p.stdout[-2000:]
 
 def reflect(task, code, report):
     return llm(f"Task: {task}\nCode:\n{code}\nTest output:\n{report}\n"
@@ -106,25 +112,28 @@ def reflect(task, code, report):
                "Do not rewrite the code.")
 
 def solve(task, tests, max_iters=4):
-    lessons, best = [], (10**9, None)
+    lessons, best = [], (-1, None)
     for i in range(max_iters):
         code = llm(f"Task: {task}\nLessons from earlier attempts:\n" + "\n".join(lessons)
                    + "\nReturn only Python code for solution.py.")
-        failed, report = run_tests(code, tests)
-        if failed < best[0]:
-            best = (failed, code)                       # revisions are not monotone; keep the best
-        if failed == 0:
+        ok, passed, report = run_tests(code, tests)
+        if passed > best[0]:
+            best = (passed, code)                       # revisions are not monotone; keep the best
+        if ok:
             return code, i + 1
         lessons.append(f"Attempt {i+1}: " + reflect(task, code, report))
     return best[1], max_iters
 ```
 
 The reflection prompt is forbidden from rewriting code so the lesson stays short and specific, and the
-test output, not the model's opinion, decides whether to continue.
+test output, not the model's opinion, decides whether to continue. Scoring by tests *passed* (rather than
+failures counted with `-x`, which stops at the first one) is what makes "keep the best" meaningful, and
+it ranks an attempt that does not even import below one that fails a single test.
 
 ## Trade-offs
-- Grounded reflection raises success rates on checkable tasks substantially, but each iteration doubles
-  the calls; for one-shot tasks that are usually right, the extra cost is pure overhead.
+- Grounded reflection raises success rates on checkable tasks substantially, but each iteration adds a
+  critique call and an evaluator run on top of a fresh generation; for tasks that are usually right in
+  one shot, the extra cost is pure overhead.
 - A separate critic model reduces agreement bias, yet it adds latency and a second prompt to maintain;
   when the generator is already strong and tasks are simple, the critic rarely changes the outcome.
 - Carrying lessons across episodes compounds improvement on recurring task types, but stale lessons

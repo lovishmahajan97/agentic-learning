@@ -5,6 +5,7 @@ name: Inverted indexes
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -22,7 +23,7 @@ sources:
 An inverted index flips the document→words mapping into words→documents: for every term, a sorted
 posting list of the documents that contain it, with counts and positions. A query then touches only the
 lists for its terms instead of every document, which is what makes lexical search over hundreds of
-millions of documents answerable in milliseconds on a CPU. The design choices (sorted ids, compression,
+millions of documents answerable in milliseconds on CPUs (sharded across machines at the high end). The design choices (sorted ids, compression,
 immutable segments, skip pointers) all exist to make those list scans fast and updates safe.
 
 ## Why it exists
@@ -59,8 +60,9 @@ The index has two parts.
 
 - The **term dictionary** maps each term to the location of its posting list and to collection
   statistics such as document frequency. It must support exact lookup and, for prefix and wildcard
-  queries, ordered traversal. Lucene stores it as a finite-state transducer, a compressed trie that fits
-  millions of terms in memory.
+  queries, ordered traversal. Lucene keeps a finite-state transducer (a compressed, trie-like automaton)
+  over term prefixes in memory, which points into on-disk blocks of sorted terms; that is how a dictionary
+  of many millions of terms stays fast without being fully resident.
 - The **posting list** for a term is the sequence of documents containing it, sorted by document id,
   each entry carrying the term frequency, optionally the positions of each occurrence (for phrase and
   proximity queries) and payload data. Sorted order is what makes everything else possible.
@@ -69,16 +71,17 @@ The index has two parts.
 Sorted ids let two lists be intersected with a merge: two cursors, advance the smaller, O(|A| + |B|)
 instead of O(|A|·|B|). They also let the list be stored as gaps between consecutive ids rather than
 absolute values; gaps are small numbers, especially for common terms, and variable-byte or bit-packed
-encodings (PForDelta and relatives) store them in a byte or two instead of four. A list for a term in ten
-million documents shrinks several-fold and, more importantly, streams through the CPU cache. Skip
-pointers placed every few hundred entries let an intersection jump over stretches of one list that
+encodings (PForDelta and relatives) store them in a byte or two, often fewer bits, instead of four. A
+list for a term in ten million documents shrinks several-fold and, more importantly, streams through the
+CPU cache. Skip data stored per block of roughly a hundred entries (Lucene encodes postings in blocks of
+128) lets an intersection jump over stretches of one list that
 cannot match the other, so intersecting a rare term with a common one costs about the size of the rare
 list.
 
 ### Query evaluation
 Two strategies exist. Term-at-a-time walks each query term's list fully and accumulates partial scores
 per document; document-at-a-time advances all lists in lockstep and scores each document completely
-before moving on. Document-at-a-time is what production engines use because it enables early
+before moving on. Document-at-a-time is what Lucene and most production engines mostly use, because it enables early
 termination: with BM25 you can precompute, per term, the maximum score any document can get from it.
 Algorithms like WAND and MaxScore use those upper bounds to skip documents that cannot enter the current
 top k, so a top-10 query over a term in ten million documents reads a small fraction of the list. This is
@@ -147,7 +150,7 @@ def phrase(t1, t2):                   # positions make "hnsw graphs" differ from
 print(postings["hnsw"])                                    # [(1, 1, [2]), (2, 1, [0])]
 print(intersect(postings["hnsw"], postings["recall"]))     # [2]
 print(phrase("hnsw", "graphs"), phrase("graphs", "hnsw"))  # [2] []
-print({t: len(p) for t, p in postings.items() if len(p) > 1})  # document frequency per term
+print({t: len(p) for t, p in postings.items() if len(p) > 1})  # df>1: {'hnsw': 2, 'ivfflat': 2, 'recall': 2}
 ```
 
 Real engines add compression, skip pointers and segments on top, but the shape is exactly this: a

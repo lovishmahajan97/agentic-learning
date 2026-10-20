@@ -5,6 +5,7 @@ name: Chunking strategies (fixed, recursive, semantic)
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - rag-retrieval/chunk-overlap
   - rag-retrieval/retrieval-granularity
@@ -21,17 +22,17 @@ sources:
 
 ## TL;DR
 An embedding model turns a span of text into one vector, so a whole document becomes a blurry average
-in which the specific passage a question needs is drowned out, and most encoders truncate long inputs
-anyway. Chunking cuts documents into retrievable units before embedding. Fixed-size splitting is
+in which the specific passage a question needs is drowned out, and text past the
+encoder's input limit is lost. Chunking cuts documents into retrievable units first. Fixed-size is
 predictable but blind to structure; recursive splitting tries natural boundaries (paragraph, line,
 sentence) before falling back to hard cuts; semantic splitting places boundaries where adjacent
 sentences stop being about the same thing. The strategy defines what "a hit" means downstream.
 
 ## Why it exists
-Three constraints force chunking. Two are hard. Embedding models have a maximum input length, often
-512 tokens for BERT-derived encoders and a few thousand for newer ones, and most of them truncate
-silently: the second half of a long document simply never reaches the vector, so no query can ever
-retrieve it. The generation side has a budget too; stuffing ten full documents into every prompt is
+Three constraints force chunking. Two are hard. Embedding models have a maximum input length, typically
+512 tokens for BERT-derived encoders and around 8,000 for many newer long-context ones. Local libraries
+such as sentence-transformers truncate silently (some hosted APIs return an error instead): the second
+half of a long document simply never reaches the vector, so no query can ever retrieve it. The generation side has a budget too; stuffing ten full documents into every prompt is
 slow, expensive and, past a point, hurts answer quality because the model has to find the needle itself.
 
 The third constraint is softer but decides retrieval quality: dilution. Pooling a 30-page contract into
@@ -129,7 +130,10 @@ doc = ("# Timeouts\n\n" + "Set the connect timeout to 5 seconds. " * 6 + "\n\n"
        "# Retries\n\n" + "Retry idempotent calls at most three times with jitter. " * 4)
 for c in recursive_split(doc, max_len=200):
     print(len(c), repr(c[:60]))
-# Each printed chunk is <= 200 chars and most end at a paragraph or sentence boundary.
+# Six chunks: 10, 189, 37, 9, 167, 55 chars, all <= 200 and ending on a paragraph or sentence.
+# Note "# Timeouts" and "# Retries" come out as orphan chunks: the oversized paragraph after each
+# heading forces a flush, so the body chunks lose their subject. That is exactly why structure-aware
+# splitters copy the heading path into every chunk instead of treating it as ordinary text.
 ```
 
 ## Trade-offs
@@ -192,12 +196,12 @@ known, measuring recall@k before and after rather than eyeballing results.
 ## Quiz
 ### Q: Why are documents chunked before embedding rather than embedded whole?
 - [ ] Vector databases cap the size of a record's payload
-- [x] A single vector averages away specific passages, and most encoders truncate long inputs silently
+- [x] A single vector averages away specific passages, and encoders cannot take input past their limit
 - [ ] Chunking is required to compute cosine similarity between texts of different lengths
-- [ ] Embedding cost grows quadratically with document length
+- [ ] Each vector's dimensionality grows with input length, so long documents must be split to fit
 > Pooling a long document into one vector dilutes the specific passage a query needs, and inputs
-> beyond the encoder's limit are dropped silently. Cosine similarity works at any length, and cost
-> grows roughly linearly, so neither is the reason.
+> beyond the encoder's limit are truncated or rejected. Cosine similarity works at any length, and an
+> encoder emits the same fixed dimension whatever the input length, so neither is the reason.
 
 ### Q: In a recursive splitter, what happens to a paragraph that is larger than the chunk limit?
 - [ ] It is truncated to the limit and the remainder is discarded

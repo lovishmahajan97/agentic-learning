@@ -5,7 +5,7 @@ name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/litellm
   - system-design/model-fallback-strategies
@@ -67,10 +67,35 @@ load-balancing and same-model failover work.
 A hosted gateway (the core gateway is also open source, written in TypeScript) where behaviour is
 declared in a config: a `strategy` (fallback or load-balance) over `targets`, each with its own virtual key
 and optional retry, cache (exact or semantic) and timeout settings. Clients pass a config id or inline
-config in request headers; provider keys live in Portkey's vault as virtual keys; traces, cost and
+config in request headers; provider credentials live in Portkey's vault and clients reference them by
+an id rather than holding them (virtual keys, in Portkey's terms); traces, cost and
 metadata tags appear in its dashboards; guardrails attach to configs. Hosted removes the operational
 burden but adds a third-party processor to your data path, which compliance must review, unless you
 deploy the gateway inside your own environment.
+
+### Enforcing budgets and rate limits
+Budgets and limits are counters in shared state, and LLM traffic makes them awkward in one specific way:
+a request's cost is not known until it finishes, because the model decides the output length. A gateway
+therefore checks *before* the call (requests per minute, and tokens per minute from the prompt's token
+count plus `max_tokens` or an estimate) and charges actual usage *after* the response completes. Two
+consequences follow. A budget can be overshot by whatever is in flight when it runs out, so a hard cap
+needs headroom or a per-request ceiling enforced through `max_tokens`. And with several replicas the
+counters must live in Redis or similar, not in each process, or every replica enforces the full limit
+on its own and the effective limit is multiplied by the replica count.
+
+Choosing among deployments of one alias is a routing strategy (LiteLLM offers simple shuffle,
+least-busy, latency-based and usage-based routing, among others), and a deployment that fails
+repeatedly is put into a cooldown and skipped for a period: a circuit breaker under another name. These
+strategies only see what the gateway sees, latency and errors, never answer quality.
+
+### Alternatives
+Other products occupy the same slot. API-gateway vendors added AI plugins (Kong AI Gateway), CDNs offer
+hosted gateways (Cloudflare AI Gateway), and Envoy AI Gateway builds on Envoy for teams already running it
+on Kubernetes. The choice follows the same axes as LiteLLM versus Portkey: where prompts flow, who
+operates the component, which providers and provider-specific features pass through intact, and whether
+it fits the traffic infrastructure you already run. At the light end, an in-process library such as the
+LiteLLM SDK's `Router` gives the same routing and fallbacks with no extra hop, but no central
+enforcement: every service holds keys again and budgets are per process.
 
 ### What it centralises
 Key custody; budgets and quotas per team or customer; rate-limit coordination; retries and fallbacks;
@@ -159,6 +184,8 @@ and a canary, not a deploy of every service.
   radius when the key leaks.
 - Nobody owning the configuration; the symptom is dozens of aliases, half pointing at deprecated models,
   with fallbacks that have never been exercised.
+- Rate-limit counters kept per replica instead of in shared state; the symptom is provider 429s and
+  budget overruns while the gateway's own limits never trip, worsening each time a replica is added.
 
 ## When to use
 Adopt a gateway once more than one team or more than one provider is involved, or as soon as finance or

@@ -5,7 +5,7 @@ name: Warmup
 kind: practice
 difficulty: core
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/optimizers
@@ -69,8 +69,11 @@ accumulation: 500 warmup steps with accumulation 8 means 4,000 micro-batches.
 
 ### What it protects against, step by step
 1. **Steps 1–10.** Adam's `m` and `v` are nearly empty. Bias correction fixes their *mean* but not their
-   *variance*; the per-parameter step `m̂/√v̂` can be wildly off for individual weights. A tiny η keeps
-   those mis-scaled updates harmless while `v` fills.
+   *variance*; the per-parameter step `m̂/√v̂` can be wildly off for individual weights. The extreme case is
+   step one: after bias correction `m̂ = g` and `v̂ = g²`, so the update is `η · g/|g| = η · sign(g)`.
+   Every parameter, including those whose gradient is pure noise, moves by the full learning rate in the
+   direction of a single batch. At η = 1e-4 that is every one of billions of weights shifted by 1e-4 at
+   once. A tiny η keeps those mis-scaled updates harmless while `v` fills.
 2. **Steps 10–W.** Gradients are still large and the loss surface is sharp. Weight norms, LayerNorm
    statistics and attention logit scales are settling. A rising η lets the model take progressively larger
    steps as the curvature along the trajectory decreases.
@@ -89,7 +92,10 @@ a flat early loss curve that only starts dropping when the ramp ends.
 Warmup, gradient clipping and Pre-LN normalization all attack the same early instability from different
 sides, which is why modern recipes use all three. Clipping bounds the damage of any single bad step;
 Pre-LN keeps gradient magnitudes roughly uniform across depth; warmup shrinks the step itself. Removing
-one usually means asking more of the others.
+one usually means asking more of the others. RAdam builds the variance correction into the optimizer
+itself (it damps the adaptive step until `v` has enough samples), which is why some recipes run it without
+an explicit ramp; most LLM recipes still pair AdamW with a plain linear warmup because it is simpler to
+reason about and tune.
 
 ### Resuming and re-warming
 When resuming a run from a checkpoint with intact optimizer state, warmup should *not* repeat, because
@@ -128,12 +134,15 @@ print(f"{seen[0]:.2e} {seen[warmup // 2]:.2e} {seen[warmup - 1]:.2e} {seen[opt_s
 ```
 
 If `opt_steps` had been computed from micro-batches (`epochs * n_examples // micro_batch` = 7,500), the
-same 5% rule would give 375 warmup steps, longer than the entire real run of 936 optimizer steps would
-need, and the cosine decay would never reach its floor.
+same 5% rule would give 375 warmup steps: 40% of the 936 optimizer steps that actually run. Worse, the
+cosine is planned for 7,500 steps, so when the data runs out the decay is only (936 − 375)/(7,500 − 375),
+about 8%, of the way through, the learning rate is still near its peak, and the final weights never get
+an anneal.
 
 ## Trade-offs
 - A longer warmup is safer against early divergence but spends more of a short fine-tuning run below the
-  productive learning rate; past roughly 10% of total steps the safety gain is usually negligible.
+  productive learning rate; once the early gradient-norm spike is gone, extra ramp buys nothing, so the
+  trade flips as soon as a shorter warmup shows a clean norm trace.
 - Warmup lets you use a higher peak learning rate (and therefore reach a given loss in fewer steps),
   but the higher peak then needs a proper decay phase or the run ends noisy.
 - Pre-LN architectures and gradient clipping reduce the *need* for warmup, so very short ramps work, but
@@ -150,9 +159,10 @@ need, and the cosine decay would never reach its floor.
   trace first, which jumps before the loss does.
 - Reusing a pre-training warmup length (thousands of steps) for a fine-tuning run of 500 steps, so the
   model never reaches its intended learning rate.
-- Starting LoRA fine-tuning at a high peak rate with no warmup; the adapter's `B` matrix is zero-initialized
-  so the update starts as a no-op, and the first few steps can set a bad direction that later steps only
-  partially undo.
+- Starting LoRA fine-tuning at its usual higher peak rate with no warmup: `B` is zero-initialized, so on
+  step one only `B` receives a gradient, and Adam's sign-like first step moves every element of `B` by the
+  full rate in one batch's direction. The symptom is a loss jump or grad-norm spike in the first tens of
+  steps that a 20–50 step ramp removes.
 
 ## When to use
 Use warmup in essentially every run that uses Adam-family optimizers, which is every run in modern
@@ -175,11 +185,12 @@ plus large, poorly conditioned initial gradients.
 ## Check yourself
 **Q:** A colleague argues that because the model uses Pre-LN and gradient clipping at 1.0, warmup is
 redundant and they will fine-tune at a constant 1e-4 from step one. What do you expect to happen, and why?
-**A:** Pre-LN removes the depth-dependent gradient blow-up and clipping bounds the size of any one step,
+**A:** Pre-LN removes the depth-dependent gradient blow-up and clipping bounds the raw gradient of any one batch,
 but neither fixes Adam's early second-moment estimates. In the first steps `v` is estimated from one or
-two gradients per parameter, so individual parameters whose first observed gradients were small receive
-updates far larger than intended even after clipping, because clipping acts on the raw gradient, not on
-Adam's normalized step. Expect a loss that drops briefly and then spikes within the first hundred steps,
+two gradients per parameter; on step one the update is literally `η · sign(g)`, so every parameter moves
+by the full 1e-4 whatever its gradient size. Clipping cannot prevent that, because clipping rescales the
+raw gradient and Adam's normalization divides the rescaling straight back out: a gradient clipped from
+norm 10 to norm 1 produces the same first step as the unclipped one. Expect a loss that drops briefly and then spikes within the first hundred steps,
 or a run that converges but to a worse final loss than the same recipe with a 50-step ramp. The cost of
 warmup is a few percent of a short run, and the fix for any observed spike is cheaper up front than after
 a wasted run.

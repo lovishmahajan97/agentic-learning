@@ -5,7 +5,7 @@ name: Vision-language models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - multimodal/clip
   - multimodal/image-embeddings
@@ -94,6 +94,24 @@ way, image tokens consume context and are billed as tokens; a single high-resolu
 order of a thousand tokens or more, an illustrative figure that varies by model and vendor. Pre-resizing
 images to the detail you actually need is the cheapest optimisation available.
 
+The arithmetic is worth doing by hand, because token count is quadratic in image side length:
+
+```
+tokens ≈ (H / (patch × merge)) × (W / (patch × merge))      # per tile, plus any global view
+```
+
+With 14-pixel patches and a 2×2 token merge after the encoder (Qwen2-VL merges adjacent patches this
+way to cut sequence length 4×), a 1024 × 1024 image gives about (1024/28)² ≈ 1,340 tokens; halving the
+side to 512 gives about 335. Halving resolution quarters the cost, which is why a deliberate resize beats
+any prompt optimisation. A resampler breaks this relationship on purpose: its output count is fixed, so
+cost stops growing with resolution but so does the detail it can carry.
+
+### Outputs that point back into the image
+The decoder only emits text, so "where" answers are serialised as text too: grounding-trained models
+emit bounding boxes as coordinate tokens (often normalised to a fixed grid such as 0–1000, convention
+varies by model). This is what lets a computer-use agent turn "click Submit" into pixel coordinates, and
+it is why such coordinates must be rescaled to the original image if you resized it before sending.
+
 ### Early-fusion variants
 Some models skip the separate encoder: Fuyu feeds linearly projected raw patches straight into the
 decoder, and models described as "natively multimodal" are pretrained on interleaved image and text
@@ -159,6 +177,8 @@ print(resp.usage.prompt_tokens)  # watch this grow with image resolution
   the symptom is an agent following instructions embedded in a screenshot or a scanned document.
 - Evaluating on captioning quality when the task is question answering; the symptom is a model that
   describes images beautifully and fails the actual extraction your product needs.
+- Resizing or padding an image and then using returned box coordinates as if they referred to the
+  original; the symptom is clicks or crops that land consistently offset or scaled from the target.
 
 ## When to use
 Reach for a VLM when the answer depends on information that a caption or OCR dump would discard: charts,

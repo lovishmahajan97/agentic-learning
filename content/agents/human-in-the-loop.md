@@ -5,6 +5,7 @@ name: Human-in-the-loop
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agents/approval-gates-for-consequential-actions
   - agents/state-machines
@@ -30,8 +31,9 @@ reduction and how to keep each decision cheap, informed and genuine rather than 
 An agent that is right 97% of the time is wrong 30 times per thousand actions. For drafting a summary
 that is fine; for issuing refunds, changing access rights or emailing customers it is not, and some of
 those errors cannot be undone. The model also lacks two things no amount of capability supplies:
-*authority* (a regulated credit decision must be made by an accountable person; a contract must be
-signed by someone who can be held to it) and *information* (the user knows which of two plausible
+*authority* (many jurisdictions give people the right to have a significant automated decision, such
+as a credit refusal, reviewed by an accountable person; a contract must be signed by someone who can be
+held to it) and *information* (the user knows which of two plausible
 interpretations of "clean up the old reports" they meant, and the agent cannot find that out by
 searching).
 
@@ -105,10 +107,13 @@ agreement above $50.
 The harness is then reconfigured. Refunds of $50 or less (1,400 a day) execute automatically with a 5%
 random audit (70 a day). Refunds above $50 (600 a day) stay blocking. Reviewer load becomes
 (600 + 70) × 45 s ≈ 8.4 hours a day, a two-thirds reduction. Residual risk on the automated class is
-1,400 × 0.8% ≈ 11 wrong decisions a day, each bounded at $50, so at most about $560 a day of exposure,
+1,400 × 0.8% ≈ 11 wrong decisions a day (treating every week-one disagreement as an agent error), each
+bounded at $50, so at most about $560 a day of exposure,
 which the business compares against the 16 reviewer-hours saved. The audit sample is the safety net: if
-agreement on the 70 audited cases falls below a set threshold for two days, the harness automatically
-returns the class to blocking review. Canary proposals, obviously wrong refunds inserted into the
+agreement on the audited cases falls below a set threshold, the harness automatically returns the class
+to blocking review. At 99.2% agreement, 70 audits a day yield well under one disagreement a day on
+average, so the threshold has to be judged over a rolling window of several hundred audits (or the
+sample raised); a two-day window of 140 cases is too small to distinguish 99% from 97%. Canary proposals, obviously wrong refunds inserted into the
 blocking queue, confirm reviewers are still catching the large majority of them; if that catch rate
 drops, what reviewers see is redesigned before autonomy is widened further.
 

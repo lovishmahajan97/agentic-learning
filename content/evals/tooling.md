@@ -5,6 +5,7 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - evals/eval-harness
   - evals/llm-as-a-judge
@@ -107,7 +108,8 @@ for anything else, datasets, experiments through `evaluate(target, data=..., eva
 annotation queues for human review, online evaluators that sample production traces, and a prompt
 hub with a playground. It does not require LangChain. Best fit: LangChain or LangGraph shops and
 teams that need a human annotation workflow. Sharp edges: hosted by default with self-hosting on
-enterprise tiers; pricing scales with trace volume; the trace format is its own.
+enterprise tiers; pricing scales with trace volume; its native run/trace schema is LangSmith-specific
+(OpenTelemetry ingestion exists, but the evaluation features are built around the native format).
 
 ### Langfuse (open-source platform)
 Open source and self-hostable, with tracing SDKs for Python and JavaScript (recent versions build on

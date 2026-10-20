@@ -5,7 +5,7 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/streaming
   - serving-inference/cancellation
@@ -58,7 +58,9 @@ into connect, read, write and pool phases, each defaulting to five seconds), you
 handler, the proxy or load balancer in front of it (nginx's `proxy_read_timeout` and an AWS ALB's
 idle timeout both default to 60 s), the provider's gateway, and finally the engine's scheduler, which
 may hold a request in its admission queue. The effective timeout is the *shortest* of these, and the
-one that fires is rarely the one you configured.
+one that fires is rarely the one you configured. Retries stack on top: because that SDK retries a
+timed-out request by default, its worst case is three full timeouts, half an hour, before your code
+sees an error, unless you lower `timeout` or `max_retries`.
 
 ### Which timers, and what each one means
 - **Connect timeout.** TCP and TLS handshake. Short (a few seconds); failure here means the host is
@@ -108,49 +110,51 @@ rejected with a fast 429 or 503 rather than served late. Cap per-request generat
 spent before clients time out.
 
 ## Example
-Layered timeouts around a streaming call with `httpx`: a short connect timeout, an idle timer that
-resets on every chunk, and a total deadline derived from `max_tokens` and measured TPOT. The caller
-passes an absolute deadline so an agent can share one budget across several steps.
+Layered timeouts around a streaming call with `httpx`: a short connect timeout, a cumulative
+first-token timer, an idle timer that resets on every line (heartbeats included), and a total
+deadline derived from `max_tokens` and measured TPOT, capped by the caller's absolute deadline so an
+agent can share one budget across several steps. With these numbers a 512-token call gets
+`8 + 512 × 0.05 × 1.5 ≈ 46 s`, and the first-token timer turns a stuck queue into an error after
+15 s instead of 46.
 
 ```python
 import asyncio, json, time
 import httpx
 
 TTFT_P99, TPOT_P99 = 8.0, 0.05            # measured for this model and traffic, in seconds
+FIRST_TOKEN, IDLE = 15.0, 20.0
 
 def call_budget(max_tokens: int) -> float:
     return TTFT_P99 + max_tokens * TPOT_P99 * 1.5    # 1.5x margin on decode
 
-async def stream_completion(client: httpx.AsyncClient, payload: dict, deadline: float):
-    remaining = deadline - time.monotonic()
-    budget = min(call_budget(payload["max_tokens"]), remaining)
+async def stream_completion(client: httpx.AsyncClient, payload: dict, deadline: float) -> str:
+    budget = min(call_budget(payload["max_tokens"]), deadline - time.monotonic())
     if budget < 2.0:
         raise TimeoutError("not enough budget left to start this call")
-    timeout = httpx.Timeout(connect=3.0, read=20.0, write=10.0, pool=3.0)  # read = idle gap
+    first_by = time.monotonic() + FIRST_TOKEN
+    timeout = httpx.Timeout(connect=3.0, read=IDLE + 5, write=10.0, pool=3.0)  # socket backstop
     text = []
     try:
         async with asyncio.timeout(budget):                       # total deadline (Python 3.11+)
             async with client.stream("POST", "/v1/chat/completions",
                                      json={**payload, "stream": True}, timeout=timeout) as r:
                 r.raise_for_status()
-                async for line in r.aiter_lines():                # read timeout resets per line
+                lines = r.aiter_lines()
+                while True:
+                    wait = IDLE if text else min(IDLE, first_by - time.monotonic())
+                    try:
+                        line = await asyncio.wait_for(anext(lines), max(wait, 0.0))
+                    except StopAsyncIteration:
+                        break
                     if not line.startswith("data: ") or line == "data: [DONE]":
-                        continue
+                        continue                                  # heartbeats reset IDLE only
                     delta = json.loads(line[6:])["choices"][0]["delta"].get("content")
                     if delta: text.append(delta)
-    except (TimeoutError, httpx.ReadTimeout) as e:
-        # leaving the `async with client.stream` block closed the connection, which is the
-        # signal the upstream needs to abort decoding; decide here whether partial text is usable
-        raise TimeoutError(f"timed out after {len(text)} chunks: {e}") from e
+    except (TimeoutError, httpx.TimeoutException) as e:
+        # leaving `client.stream` closed the connection: the upstream's only signal to stop decoding
+        phase = "first-token" if not text else "idle-or-total"
+        raise TimeoutError(f"{phase} timeout after {len(text)} chunks") from e
     return "".join(text)
-
-async def main():
-    deadline = time.monotonic() + 60.0                            # the user's whole budget
-    async with httpx.AsyncClient(base_url="http://localhost:8000") as client:
-        out = await stream_completion(client, {"model": "my-model", "max_tokens": 512,
-              "messages": [{"role": "user", "content": "Explain timeouts."}]}, deadline)
-        print(out[:200])
-asyncio.run(main())
 ```
 
 ## Trade-offs

@@ -5,7 +5,7 @@ name: Self-host vs API
 kind: decision
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - system-design/build-vs-buy
   - system-design/open-weight-vs-proprietary
@@ -60,6 +60,19 @@ until the KV cache fills memory. `utilisation` is average load divided by provis
 interactive traffic has daily peaks several times its average, you provision for the peak and run the
 rest of the day partly idle, unless batch work fills the valleys. The third term is people: a fraction of
 an engineer plus on-call, which is a fixed cost that does not shrink with traffic.
+
+### Break-even is a staircase, not a point
+The API bill is linear in volume: `api = V × p_blended`, where `p_blended` weights the input, output and
+cached-input prices by your real token mix (prompt-heavy traffic has a blended price close to the input
+price; the example below works out to about $0.23 per million tokens). The self-host bill is
+`ceil(peak_load / per_gpu_throughput) × gpu_hourly × 730 + people`, which is flat until peak load needs
+another GPU and then jumps. Its first step is whatever the model needs to run at all: one GPU for a
+quantised 8B model, a multi-GPU node for a 70B model at 16-bit precision. Two consequences follow. Below
+the first step the API almost always wins, because you pay for a whole node to serve a fraction of its
+capacity. Above it, anything that raises per-GPU throughput or lowers the peak pulls the staircase down:
+a smaller or quantised model, larger batches, prefix caching for shared system prompts, and batch jobs
+that fill the night-time valleys so the peak-to-average ratio falls. The comparison is really about
+model size and utilisation, which is why two teams quoting the same GPU price reach opposite answers.
 
 ### The constraints that decide before cost does
 - **Data.** Residency, retention, customer contracts, or an air gap. Check what the API vendor's

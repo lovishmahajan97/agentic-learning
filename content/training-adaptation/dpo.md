@@ -5,7 +5,7 @@ name: DPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/rlhf
   - training-adaptation/grpo
@@ -89,18 +89,33 @@ reference forward pass instead of loading a second copy.
 DPO uses whichever pairs you give it. If the chosen and rejected responses came from a different model
 than the one being trained, the loss is comparing sequences the policy would rarely generate, and the
 gradient's effect on the policy's actual outputs is indirect. This is the distribution-shift cost of
-dropping the sampling loop. The fix is to generate the candidate responses with the policy being
-trained (or its SFT ancestor), label those, and iterate in rounds, which recovers much of on-policy
-RLHF's advantage while keeping the simple loss.
+dropping the sampling loop. The reference matters here too: the derivation treats π_ref as the
+distribution the pairs live near, so when you only have someone else's pairs, the DPO paper's advice is
+to first SFT the reference on the chosen responses so it is close to the data. The better fix is to
+generate the candidate responses with the policy being trained (or its SFT ancestor), label those, and
+iterate in rounds (often called iterative or online DPO), which recovers much of on-policy RLHF's
+advantage while keeping the simple loss.
 
 ### Known failure: likelihood displacement
 The loss only cares about the *difference* in log-ratios. A model can increase the margin by reducing
 the probability of both chosen and rejected responses, as long as the rejected one falls faster. In
 practice chosen log-probability often does decrease during DPO, and the probability mass goes
 somewhere unobserved, sometimes to worse responses. Monitoring chosen log-probability, not just the
-margin, catches this; mixing a small SFT term on the chosen responses or using variants designed for
-it (IPO, KTO, ORPO, SimPO each change the loss or drop the reference in different ways) are the usual
-mitigations.
+margin, catches this; mixing a small SFT term on the chosen responses or switching to a variant are the
+usual mitigations.
+
+### The variants, and what each one changes
+- **IPO** replaces the log-sigmoid with a squared loss that pulls the margin toward a fixed target
+  instead of toward infinity, because with near-deterministic preferences DPO's loss keeps rewarding
+  ever-larger margins and overfits.
+- **KTO** needs no pairs: each response is labelled simply desirable or undesirable, which fits
+  thumbs-up / thumbs-down product feedback that never comes as matched comparisons.
+- **ORPO** drops the reference model and adds an odds-ratio penalty to an ordinary SFT loss, folding SFT
+  and preference training into one stage.
+- **SimPO** also drops the reference and uses the *length-normalised* average log-probability as the
+  implicit reward, with a target margin, which directly attacks the length bias of summed log-probs.
+All four keep DPO's shape: an offline loss on preference data with no reward model and no sampling.
+Which one wins is data-dependent, so treat them as ablations to run, not upgrades to assume.
 
 ## Example
 The DPO loss on sequence log-probabilities, with the reference log-probs precomputed. Shapes are

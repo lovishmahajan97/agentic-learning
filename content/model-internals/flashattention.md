@@ -5,7 +5,7 @@ name: FlashAttention
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - model-internals/self-attention
   - model-internals/multi-head-attention
@@ -58,7 +58,10 @@ SRAM before writing anything back.
 Queries are split into blocks of B_r rows and keys and values into blocks of B_c rows, sized so that one
 block of each fits in SRAM. For each query block, the kernel iterates over the key/value blocks: load
 K_j and V_j, compute the partial scores `S_ij = Q_i·K_jᵀ` (a B_r × B_c tile that lives in SRAM), fold it
-into the running output, and move on. The full **S** and **P** never exist in HBM.
+into the running output, and move on. The full **S** and **P** never exist in HBM. Tiling also turns the
+causal mask into a saving rather than a cost: a K/V block lying entirely to the right of the query block is skipped
+without being loaded, and only blocks on the diagonal need element-wise masking, so causal attention
+does roughly half the work of the unmasked version.
 
 ### Online softmax
 Softmax needs each row's maximum and the sum of exponentials over *all* n columns, which are unknown
@@ -97,6 +100,15 @@ throughput over the first version. FlashAttention-3 (2024) targets Hopper GPUs w
 overlap of tensor-core matmuls and softmax, and adds FP8 support. Exact figures vary by shape and
 hardware, so measure on yours.
 
+### Decode is a different problem
+FlashAttention-2 parallelizes over batch, heads and query blocks. At decode there is one query row per
+sequence, so at small batch there are too few independent units of work to occupy the GPU, while the
+cost is all in reading a long K/V cache. Flash-Decoding (from the same authors) splits the *key/value
+length* across thread blocks instead: each block computes a partial output with its own running max and
+log-sum-exp over its slice of the cache, and a final reduction rescales and combines them with exactly
+the online-softmax rule above. The same algebra that lets one block stream over keys lets many blocks
+work on disjoint key ranges in parallel. Serving engines ship decode-specific kernels for this reason.
+
 ### Where you meet it
 PyTorch's `F.scaled_dot_product_attention` dispatches to a flash kernel when dtype, head dimension and
 mask allow, otherwise to a memory-efficient or plain math backend. Hugging Face exposes
@@ -114,7 +126,8 @@ compiles custom mask patterns into fused kernels for the cases FlashAttention do
 ## Example
 Naive attention against the flash backend on one GPU, comparing peak memory, time and the outputs. The
 naive version allocates three ~4.3 GB tensors in sequence (scores, masked scores, probabilities), which
-are all live at once at the softmax; the flash version adds only a few hundred megabytes beyond the inputs.
+are all live at once at the softmax; the flash version adds only its output and one statistic per row,
+so its peak stays well under a gigabyte including the ~200 MB of inputs.
 
 ```python
 import time, torch, torch.nn.functional as F

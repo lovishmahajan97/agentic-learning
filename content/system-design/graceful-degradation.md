@@ -5,7 +5,7 @@ name: Graceful degradation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - system-design/model-fallback-strategies
   - reliability/backpressure-and-load-shedding
@@ -65,12 +65,22 @@ Dependency health (breaker state, error rate, p95 latency), load (queue depth, c
 *this* response to sources-only), and a human-operated kill switch. Evaluate triggers where the decision
 is made and with hysteresis: step down quickly on a bad signal, step back up only after the signal has
 been healthy for a sustained period, *because* flapping between levels is worse for users than staying
-one level down.
+one level down. Concretely that means separate enter and exit thresholds plus a minimum dwell time: for
+example (illustrative numbers), enter Reduced when p95 exceeds 4 s, and leave it only after p95 has
+stayed under 2.5 s for ten minutes. The gap between 4 s and 2.5 s is what stops a signal hovering near
+one threshold from toggling the level on every sample.
+
+Budget triggers deserve the same care. Trigger on projected burn, not on spend so far:
+`spent + current_rate × hours_left > cap` fires mid-morning on a heavy day and lets you step down one
+level gently, whereas `spent ≥ cap` fires late in the day and drops every user straight to the cached
+level for the rest of it.
 
 ### Shed by priority, isolate by class
 Classify requests: interactive versus batch, paying versus free, critical versus nice-to-have. Shed
 batch and low tiers first and keep a reserved share of capacity for critical interactive traffic in its
-own bulkhead, so a batch backfill can never starve the chat box.
+own bulkhead, so a batch backfill can never starve the chat box. Shed at admission, before any tokens
+are spent: a request abandoned after generation has started has already paid for the work it throws
+away, and under overload that waste is exactly the capacity you were short of.
 
 ### Deadlines and partial results
 Give each request a deadline and return what you have when it expires: retrieved passages without the
@@ -144,7 +154,11 @@ async def answer(q, user, h, deadline_s=6.0):
 ```
 
 The `level` field in every response is the metric: a histogram of it over time is the dashboard that
-shows whether the product has been quietly running degraded.
+shows whether the product has been quietly running degraded. `current_level` is stateless for brevity;
+the hysteresis belongs in the background task that builds `h`, which should hold a level until its exit
+condition has persisted for the dwell time, so every request in a window sees the same level. Note also
+the order of the ladder: each step down is cheaper than the one above it, and a failure inside a level
+moves the request down rather than retrying, so an incident lowers spend instead of raising it.
 
 ## Trade-offs
 - The product survives incidents, but you maintain several code paths and the eval for each; when the

@@ -5,6 +5,7 @@ name: Tool permissions & least privilege
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agent-reliability/idempotent-tool-execution
   - agent-reliability/audit-logs-execution-traces

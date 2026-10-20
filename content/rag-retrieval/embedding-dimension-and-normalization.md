@@ -5,6 +5,7 @@ name: Embedding dimension & normalization
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/similarity-search
@@ -55,7 +56,7 @@ When both are unit length, cosine *is* the dot product, and
 ```
 
 so Euclidean distance is a monotone function of the dot product. All three produce the same order. This
-is why most embedding providers return normalized vectors and why "which metric should I pick" is only a
+is why many embedding providers return normalized vectors and why "which metric should I pick" is only a
 real question for unnormalized ones. The practical rule: normalize at write time, store unit vectors,
 and build the index on inner product; that saves a division per comparison, and pgvector's `<#>`
 (negative inner product), `<=>` (cosine distance) and `<->` (L2) then agree on order.
@@ -88,8 +89,9 @@ Orthogonal to truncation. float32 to float16 halves memory with essentially no r
 scalar quantization quarters it; binary quantization (one bit per dimension, scored by Hamming distance)
 gives up to 32× and works surprisingly well on high-dimensional normalized vectors when the top
 candidates are rescored with full-precision vectors. Product quantization (IVF-PQ in FAISS and Milvus)
-compresses further by replacing sub-vectors with codebook ids. Normalization helps every one of these,
-because unit vectors have bounded coordinates and the quantizer's range is predictable.
+compresses further by replacing sub-vectors with codebook ids. Normalization helps scalar quantization
+and PQ, because unit vectors have bounded coordinates and the quantizer's range is predictable; binary
+quantization keeps only the sign, so for it the norm is irrelevant.
 
 ### PCA and friends
 PCA fitted on your own corpus can drop dimensions for any model, Matryoshka-trained or not, but it must
@@ -157,7 +159,8 @@ model the prefix retains the order only if the model was trained Matryoshka-styl
 - Copying a cosine threshold such as 0.75 from another model or a blog post; symptom: after a model swap
   either nothing or everything passes the filter.
 - Sizing storage from raw vectors alone; symptom: out-of-memory during index build, because HNSW graph
-  links, payloads and copies of the chunk text add tens of percent on top of the vectors.
+  links, payloads and copies of the chunk text all add to the vector bytes; graph links alone are small
+  for high-dimensional vectors, but stored chunk text and payload indexes can add a large fraction.
 - Writing vectors of mixed dimensions into one collection; symptom: insert errors where the store
   enforces the column dimension (pgvector does), or silently wrong scores where it does not.
 

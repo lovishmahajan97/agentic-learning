@@ -5,7 +5,7 @@ name: Multi-agent systems
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - agents/multi-agent-patterns
   - agents/task-decomposition
@@ -74,6 +74,25 @@ structured and compact *because* the coordinator's context is the scarce resourc
 will exhaust it. Large intermediate results go to a shared artifact store and are passed by reference,
 *because* copying them through model context costs tokens on both sides and degrades attention.
 
+This compression is the main thing a sub-agent buys. Illustratively, a worker may read 40k tokens of
+pages and tool output to answer its sub-question and return a 400-token structured finding; five such
+workers let the supervisor reason over 2k tokens of distilled evidence instead of 200k of raw material
+that would not fit, or would fit and drown the signal. The price is that the total token bill is the
+sum over all agents, which is why multi-agent runs cost several times a single agent's (Anthropic's
+write-up of its research system reports on the order of 15× the tokens of a chat interaction).
+
+### Reliability arithmetic: why topology matters
+Compounding is about *undetected* errors. In a pipeline, stage 3 receives stage 2's output and usually
+cannot tell a fluent wrong answer from a right one, so success is roughly the product p₁·p₂·…·pₙ. A
+fan-out whose join needs every worker is also a product (five workers at 0.9 each: 0.9⁵ ≈ 0.59), but
+two properties change the arithmetic. Workers are independent, so a failed one can be retried alone:
+with one retry each, a worker succeeds with probability 1 − 0.1² = 0.99, and all five with
+0.99⁵ ≈ 0.95. And the join can be a quorum (synthesize if at least k of n succeeded). Both only work if
+failure is *detectable*, which is why workers return a schema with an explicit "not found" or low
+confidence rather than prose, and why pipelines need a validator between stages before any retry
+logic helps. (Retries assume independent failures; a worker that fails because the sub-question is
+unanswerable will fail again, so cap them.)
+
 ### Coordination state
 There must be one place that knows which sub-tasks exist, their status and their results: a task table
 keyed by run id. The coordinator can be a model (flexible, derives the plan) or code (predictable, fixed
@@ -109,35 +128,46 @@ and `task_table` is the persisted coordination state.
 import asyncio, json
 
 READ_ONLY = ["search_docs", "fetch_page"]            # workers never receive write tools
+FAILED = {"answer": None, "sources": [], "confidence": 0.0}
 
-async def worker(run_id, subtask, budget_usd=0.10):
-    result = await agent_run(
-        run_id=f"{run_id}/{subtask['id']}",           # child span under the parent run
-        system="Answer the sub-question using the tools. Return JSON: {answer, sources, confidence}.",
-        task=json.dumps(subtask), tools=READ_ONLY, max_steps=6, budget_usd=budget_usd)
-    fallback = {"answer": None, "sources": [], "confidence": 0.0}
-    return {"id": subtask["id"], **(json.loads(result) if result else fallback)}
+async def worker(run_id, subtask, budget_usd=0.10, retries=1):
+    for attempt in range(retries + 1):               # independent worker -> retry it alone
+        try:
+            result = await agent_run(
+                run_id=f"{run_id}/{subtask['id']}/{attempt}",   # child span under the parent run
+                system="Answer the sub-question using the tools. Return JSON: {answer, sources, confidence}. "
+                       "Use answer=null if the tools do not support an answer.",
+                task=json.dumps(subtask), tools=READ_ONLY, max_steps=6, budget_usd=budget_usd)
+            out = json.loads(result)
+            if out.get("answer"):
+                return {"id": subtask["id"], **out}
+        except (json.JSONDecodeError, TimeoutError):
+            pass                                     # malformed or slow: a detectable failure
+    return {"id": subtask["id"], **FAILED}
 
 async def supervise(run_id, question, max_workers=5):
     plan = call_model(f"Split into at most {max_workers} independent sub-questions as JSON "
-                      f"[{{id, question, why}}]. Question: {question}").json
+                      f"[{{id, question, why}}]. Question: {question}").json[:max_workers]
     task_table.create(run_id, [p["id"] for p in plan])                  # coordination state, persisted
     results = await asyncio.gather(*(worker(run_id, p) for p in plan))  # parallel fan-out
     for r in results:
         task_table.mark(run_id, r["id"], "done" if r["answer"] else "failed")
     evidence = [r for r in results if r["answer"] and r["confidence"] >= 0.5]
-    if len(evidence) < max(1, len(plan) // 2):                          # refuse to synthesize from failures
+    if len(evidence) < max(1, (len(plan) + 1) // 2):                    # quorum: a majority must succeed
         return {"status": "insufficient_evidence", "results": results}
-    synthesis = call_model("Synthesize an answer with citations from these findings only:\n"
-                           + json.dumps(evidence) + f"\n\nQuestion: {question}").text
+    synthesis = call_model("Synthesize an answer with citations from these findings only. Name any "
+                           "sub-question that has no finding:\n" + json.dumps(evidence)
+                           + f"\n\nQuestion: {question}").text
     return {"status": "ok", "answer": synthesis, "sub_results": results}
-
-# asyncio.run(supervise("run-42", "Compare the data-residency rules of our three largest markets"))
 ```
 
-The two architectural choices that matter are visible: workers receive a typed sub-task rather than the
-supervisor's transcript and return a schema rather than a trace, and the supervisor declines to
-synthesize when most workers failed instead of producing a confident answer from thin evidence.
+The architectural choices that matter are visible: workers receive a typed sub-task rather than the
+supervisor's transcript and return a schema rather than a trace; a worker's failure is detectable
+(null answer, bad JSON, timeout) so it can be retried in isolation; and the supervisor applies a
+quorum, declining to synthesize when most workers failed instead of producing a confident answer from
+thin evidence. For the data-residency question, a plan of three sub-questions (one per market) where one
+worker returns null twice yields two findings, which meets the quorum of two, and the synthesis is told
+to say that the third market is unanswered rather than fill it in.
 
 ## Trade-offs
 - Parallel workers cut wall-clock time for breadth-first tasks, but total tokens rise because each worker
@@ -187,13 +217,16 @@ final answer.
 success. A colleague proposes five specialist agents. How would you decide whether that is an
 improvement, and what would you watch for?
 **A:** First I would name what the split buys. If sub-questions are independent, parallel workers can
-cut wall-clock substantially; if 20 tools are hurting tool selection, five agents with four tools each
+cut wall-clock substantially, since latency becomes the slowest worker rather than the sum; if 20 tools are hurting tool selection, five agents with four tools each
 may raise accuracy; if one tool reads untrusted web pages, separating it from write tools is a security
 gain. Then I would run both designs on the same eval set and compare task success, total tokens, latency
 and failure attribution per stage, because the multi-agent version will cost more tokens and introduce
 routing and synthesis errors that did not exist before. I would watch for compounding: a pipeline of five
 95% stages is roughly 77% end to end, so the topology should be parallel with a join rather than
-sequential where possible, with the supervisor declining to synthesize from failed workers.
+sequential where possible, because independent workers can be retried alone and joined with a quorum,
+provided their failures are detectable through a structured "not found". I would also check that the
+baseline's failures are actually the kind the split fixes: if the single agent fails because it lacks
+data, five agents will lack it too.
 
 ## Quiz
 ### Q: Which gain does NOT by itself justify splitting one agent into several?
@@ -217,6 +250,6 @@ sequential where possible, with the supervisor declining to synthesize from fail
 - [x] About 77%, so long sequential chains need intermediate checks or fewer stages
 - [ ] About 99%, because later stages correct earlier errors
 - [ ] About 50%, because errors always double at each hand-off
-> Sequential stages multiply: 0.95 to the fifth power is roughly 0.77. Compounding is why pipelines need
-> validation between stages, and why parallel topologies with a join are preferred when sub-tasks are
-> independent.
+> Sequential stages multiply: 0.95 to the fifth power is roughly 0.77, because a later stage cannot
+> usually detect an earlier stage's fluent error. Compounding is why pipelines need validation between
+> stages, and why independent parallel workers, retried alone and joined by quorum, fare better.

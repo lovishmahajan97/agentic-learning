@@ -5,6 +5,7 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -91,7 +92,7 @@ import numpy as np
 
 def hyde_search(question, n_samples=3, k=10, include_query=True):
     prompt = f"Write a short documentation passage that answers the question.\nQuestion: {question}\nPassage:"
-    hypos = [llm(prompt, temperature=0.7) for _ in range(n_samples)]
+    hypos = [llm(prompt, temperature=0.7) for _ in range(n_samples)]   # parallelise in production
     vecs = [embed(h, kind="passage") for h in hypos]          # same encoder as the index
     if include_query:
         vecs.append(embed(question, kind="query"))             # anchor to the user's words
@@ -111,7 +112,8 @@ hits, hypos = hyde_search("How do I rotate an API key without downtime?")
 - The largest gains appear with zero-shot or out-of-domain encoders and question-shaped queries over
   passage-shaped corpora; with an instruction-tuned embedder trained on your query type the gain shrinks
   or reverses.
-- One generation per query adds hundreds of milliseconds or more and a per-query cost; applying it only
+- One generation per query adds latency on the order of several hundred milliseconds to a few seconds
+  (a whole passage must be decoded before search can start) and a per-query cost; applying it only
   as a fallback when first-pass scores are weak keeps the cost off the common path.
 - Robust to small factual errors in the hypothetical but fragile to entity confusion; on private or novel
   domains the model writes a generic passage and retrieval becomes generic with it.

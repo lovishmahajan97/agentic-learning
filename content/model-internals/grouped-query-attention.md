@@ -5,7 +5,7 @@ name: Grouped-query attention (GQA)
 kind: concept
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - model-internals/multi-head-attention
   - model-internals/kv-cache
@@ -77,7 +77,10 @@ Bytes read per decode step ≈ weights + the cache of every sequence in the batc
 average length with an 8B fp16 model: ~16 GB of weights plus ~128 GB of MHA cache, against 16 + 32 GB
 with GQA. Roughly three times fewer bytes per step means up to roughly three times the decode throughput
 before compute becomes the limit; treat the factor as illustrative, since real engines overlap and batch
-differently. Prefill is unaffected: it is compute-bound and the attention FLOPs are identical because the
+differently. A second, subtler effect: in decode attention every K/V vector loaded from HBM is used by
+h/g query heads instead of one, so the attention kernel's arithmetic intensity rises by the group size.
+MHA decode attention does about one multiply-add per cached element loaded, which no GPU can feed
+from memory; GQA moves it partway toward the compute-bound regime. Prefill is unaffected: it is compute-bound and the attention FLOPs are identical because the
 queries are not shared.
 
 ### Uptraining existing checkpoints
@@ -154,7 +157,8 @@ for name, kv_heads in (("MHA 32 kv heads", 32), ("GQA  8 kv heads", 8), ("MQA  1
 - Materializing `repeat_kv` copies in a custom attention path at prefill; the symptom is transient
   activation memory as large as MHA even though the cache itself is small.
 - Converting an MHA checkpoint to a GQA layout by slicing or averaging heads without the uptraining
-  step; the symptom is perplexity that jumps by multiples on the first evaluation.
+  step; the symptom is a sharp perplexity jump on the first evaluation that only continued
+  pre-training (the paper's ~5% uptraining) recovers.
 - Tensor-parallel degree larger than the KV-head count; the symptom is per-GPU cache memory that does
   not shrink as expected when you add GPUs.
 

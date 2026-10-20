@@ -5,6 +5,7 @@ name: Model lifecycle & deprecation policy
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - llmops-platform/model-registry
   - llmops-platform/ci-cd-for-prompts-and-models
@@ -74,8 +75,9 @@ platform-wide while quality bars are domain-specific.
 ### Provider models have a lifecycle too
 A hosted model registered as a virtual version carries the provider's snapshot id, its announced
 retirement date if any, and the recommended successor. Providers publish deprecation schedules and
-give advance notice measured in months; the exact period varies by provider and by whether the model
-was generally available, so the policy reads the provider's page rather than assuming a number. The
+typically give advance notice of weeks to months; the exact period varies by provider, by model tier
+and by whether the model was generally available or a preview, and providers revise these terms, so
+the policy reads the provider's current page rather than assuming a number. The
 platform mirrors each external deprecation as an internal one, *because* consumers should learn about
 retirements from one place with one format. Some clouds offer deployments that auto-upgrade to the
 successor when a version retires; the policy should decide explicitly whether that is allowed, since

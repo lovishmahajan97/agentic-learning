@@ -5,7 +5,7 @@ name: Cancellation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/timeouts
   - serving-inference/streaming
@@ -87,8 +87,12 @@ pure generation that is harmless. For an agent mid tool-call it is not: the tool
 email, written the row or charged the card before the cancel landed. Make tools idempotent or
 two-phase, record the run as "cancelled" rather than "failed", and shield the small pieces of work
 that must complete (writing the usage record, releasing a lock) so a cancel cannot tear them. For
-billing, remember that a cancelled stream never delivers its final usage event, while the provider
-still charges for tokens generated up to the abort; count the deltas you received yourself.
+billing, remember that a cancelled stream never delivers its final usage event, while a provider
+generally charges for tokens generated up to the moment its gateway sees the abort, which can be
+more than you received (tokens in flight, buffered at a proxy, or decoded during the
+disconnect-detection lag). Keep the text you did receive and tokenize it for an estimate, treat that
+as a lower bound, and reconcile against the provider's usage reports rather than streamed chunk
+counts.
 
 ### Patterns built on cancellation
 - **Supersede.** The newest user message cancels the in-flight generation before starting the next,
@@ -117,18 +121,19 @@ MODEL = "my-model"
 class ChatSession:
     def __init__(self):
         self.current: asyncio.Task | None = None
-        self.tokens_seen = 0                     # our own count; a cancelled stream sends no usage event
+        self.received: list[str] = []            # a cancelled stream sends no usage event; tokenize
+                                                 # this later for a lower-bound estimate of billed output
 
     async def _generate(self, messages, on_delta):
         stream = await client.chat.completions.create(model=MODEL, messages=messages, stream=True)
         try:
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:
-                    self.tokens_seen += 1
+                    self.received.append(chunk.choices[0].delta.content)
                     on_delta(chunk.choices[0].delta.content)
         finally:
-            await stream.close()                 # runs on CancelledError too: closes the HTTP response,
-                                                 # so the provider aborts the sequence and stops billing
+            await stream.close()                 # runs on CancelledError too: closing the HTTP response
+                                                 # is the provider's only signal to abort the sequence
 
     async def submit(self, messages, on_delta) -> asyncio.Task:
         prev = self.current
@@ -140,11 +145,12 @@ class ChatSession:
 
 async def demo():
     s = ChatSession()
-    first = await s.submit([{"role": "user", "content": "Write a long essay about rivers."}], print)
+    show = lambda t: print(t, end="", flush=True)
+    first = await s.submit([{"role": "user", "content": "Write a long essay about rivers."}], show)
     await asyncio.sleep(1.0)                     # user changes their mind one second in
-    second = await s.submit([{"role": "user", "content": "Actually, one sentence on rivers."}], print)
+    second = await s.submit([{"role": "user", "content": "Actually, one sentence on rivers."}], show)
     await second
-    print("\nfirst cancelled:", first.cancelled(), "| tokens streamed:", s.tokens_seen)
+    print("\nfirst cancelled:", first.cancelled(), "| chars received:", sum(map(len, s.received)))
 
 asyncio.run(demo())
 ```
@@ -186,7 +192,8 @@ optional once outputs are longer than a sentence or traffic is bursty. Reach for
 short, latency-critical calls with capacity to spare, and for speculative prefetch only when the
 abandoned cost is clearly less than the latency saved. Do not tie long batch jobs to a connection at
 all. Measure the abandonment rate, time from client disconnect to engine abort, and tokens generated
-after disconnect, and check that the provider bill moves with your own delta counts. In interviews,
+after disconnect, and check that the provider's reported usage falls when abandonment rises; if
+it does not, the abort is not reaching them. In interviews,
 tracing the stop signal hop by hop from `AbortController` to KV-block release is the answer that
 shows you have run this in production.
 

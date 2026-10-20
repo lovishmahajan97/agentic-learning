@@ -5,6 +5,7 @@ name: Model monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - llmops-platform/drift
   - llmops-platform/observability-stack
@@ -65,8 +66,9 @@ weekly feedback review. Proxies are chosen *because* they are deterministic, fre
 
 ### Layer 3: quality and outcome signals
 - Online judge: an LLM scores a sample of live responses against a rubric (groundedness, completeness,
-  policy adherence). Sampled *because* a judge call costs about as much as the request it scores; 1–5%
-  is a common order of magnitude (illustrative), stratified so small tenants are still covered.
+  policy adherence). Sampled *because* a judge call is another LLM inference over the full prompt and
+  response, often comparable to or more than the cost of the request it scores; 1–5% is a common order
+  of magnitude (illustrative), stratified so small tenants are still covered.
 - Human review queues: low-judge-score or flagged traces routed to reviewers; the labels feed both the
   monitor's calibration and the golden set.
 - Explicit feedback: thumbs, ratings, "report". Sparse and selection-biased, so track the rate of
@@ -98,6 +100,7 @@ A windowed monitor over logged events: proxies on all requests, judge scores on 
 compared per version against a baseline window with a minimum-sample guard.
 
 ```python
+import math
 from collections import defaultdict
 from statistics import mean
 
@@ -114,7 +117,7 @@ def summarise(events):            # events: dicts from the trace store, one per 
         out[key] = {"n": len(es),
                     "refusal_rate": mean(e["refused"] for e in es),
                     "schema_fail_rate": mean(not e["schema_ok"] for e in es),
-                    "p95_ms": sorted(e["ms"] for e in es)[int(0.95 * len(es)) - 1],
+                    "p95_ms": sorted(e["ms"] for e in es)[math.ceil(0.95 * len(es)) - 1],  # nearest rank
                     "cost_per_req": mean(e["cost"] for e in es),
                     "judge_mean": mean(judged) if judged else None, "judge_n": len(judged)}
     return out
@@ -189,17 +192,17 @@ first: output length distribution, refusal rate, tool-call rate or schema-failur
 same timestamp across all tenants, which is the signature of an upstream change rather than a user
 mix change. The sampled online judge would show a score shift within a few hours once the minimum
 sample accrues, with the lowest-scoring traces attached for review. Explicit feedback would lag by a
-day. The monitor would also expose that the model id reported in responses differs from the pinned
-snapshot, which is the root cause; the fix is to pin snapshots and treat alias updates as releases
-that go through shadow or canary.
+day. Where the provider returns the resolved model snapshot in response metadata, logging it would show
+that value changing at the same timestamp, which is the root cause; the fix is to pin snapshots and
+treat any model change, alias update included, as a release that goes through shadow or canary.
 
 ## Quiz
 ### Q: Why are behavioural proxies such as refusal rate and schema-failure rate monitored on every request while judge scores are sampled?
 - [ ] Judge scores are only valid on requests with user feedback
-- [x] Proxies are deterministic and nearly free to compute, whereas a judge call costs about as much as the request it scores
+- [x] Proxies are deterministic and nearly free to compute, whereas each judge call is another LLM inference, often as costly as the request it scores
 - [ ] Proxies are more accurate measures of answer quality than judges
 - [ ] Sampling is required by data-protection rules for judged content
-> Proxies are cheap functions of the output, so full coverage is affordable; judging duplicates inference cost, so it is sampled and used to decide where expensive human labels go.
+> Proxies are cheap functions of the output, so full coverage is affordable; judging adds a second inference per scored request, so it is sampled and used to decide where expensive human labels go.
 
 ### Q: A monitor reports overall judge score unchanged after a release, yet one enterprise customer complains loudly. What design gap most likely explains it?
 - [ ] The judge model was not run at temperature zero

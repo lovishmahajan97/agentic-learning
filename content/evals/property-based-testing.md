@@ -5,6 +5,7 @@ name: Property-based testing
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/property-based-testing
   - evals/metamorphic-testing
@@ -49,8 +50,9 @@ exception inside a retrieval pipeline.
 ### Three parts
 1. **Generators** (strategies in Hypothesis) describe the input space: `st.text()`, `st.integers(min_value=0)`,
    `st.lists(...)`, `st.builds(MyDataclass, ...)`, `st.recursive(...)` for JSON-like trees. They compose,
-   and the framework biases them toward boundary values (empty, zero, maximum, surrogate characters)
-   because that is where bugs cluster.
+   and the framework biases them toward boundary and simple values (empty collections, zero, the ends of
+   a declared range, unusual Unicode) because that is where bugs cluster. Note that `st.text()` excludes
+   surrogate code points by default, so ask for them explicitly if your code handles raw UTF-16 data.
 2. **A property** is a test function with asserts that must hold for every generated input.
 3. **The runner** executes a configured number of examples (Hypothesis defaults to 100), and on failure
    **shrinks**: it repeatedly tries simpler inputs that still fail, guided by the structure of the
@@ -147,8 +149,9 @@ def test_chunk_properties(text, p):
 ## Pitfalls
 - Writing the property as a copy of the implementation; the symptom is a test that passes forever and a
   bug that ships in both.
-- Over-filtering generated inputs with `assume` until almost nothing survives; the symptom is a health
-  check warning and a test that effectively ran ten examples.
+- Over-filtering generated inputs with `assume` until almost nothing survives; the symptom is a
+  `FailedHealthCheck` error (`filter_too_much`), or, if someone suppresses it, a test that effectively
+  ran ten examples.
 - Letting a model-calling property run with the default deadline and example count; the symptom is a
   flaky, slow test that gets marked skip within a week.
 - Ignoring the shrunk counterexample and patching for the original 2 KB input; the symptom is the same

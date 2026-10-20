@@ -5,6 +5,7 @@ name: Metamorphic testing
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - evals/property-based-testing
   - evals/regression-tests
@@ -50,8 +51,9 @@ nor a trustworthy judge of correctness: they need only a reliable way to say whe
 ### A relation, not an expected value
 A metamorphic test has three parts: a source input *x*, a transformation *T* that produces a follow-up
 input *T(x)*, and a relation *R* that must hold between the outputs *f(x)* and *f(T(x))*. The test
-passes if *R* holds. Nothing says whether *f(x)* was correct, which is the point: a violation proves at
-least one of the two outputs is wrong without saying which, and that is still a bug report.
+passes if *R* holds. Nothing says whether *f(x)* was correct, which is the point: provided the relation
+genuinely holds for that input (the paraphrase really kept the meaning), a violation proves at least one
+of the two outputs is wrong without saying which, and that is still a bug report.
 
 CheckList (Ribeiro et al.) organised the same idea for NLP into invariance tests (INV: the output should
 not change), directional expectation tests (DIR: the output should move in a known direction), and
@@ -146,8 +148,8 @@ def violation_rates(cases: list[tuple[str, list[str]]]) -> dict[str, float]:
   drift; the right choice flips with how structured the output is.
 - Automated transforms are cheap but can produce invalid follow-ups (a paraphrase that changes the
   question); using a model to transform adds cost and its own errors, so validate transforms on a sample.
-- Measuring the noise floor doubles the base cost of every run, yet without it any violation rate is
-  uninterpretable, so it flips only when outputs are fully deterministic.
+- Measuring the noise floor adds one more relation's worth of model calls to every run, yet without it
+  any violation rate is uninterpretable, so it can be skipped only when outputs are fully deterministic.
 
 ## Pitfalls
 - Skipping the identity baseline; the symptom is a "12% paraphrase sensitivity" that turns out to be
@@ -216,6 +218,6 @@ cases. Correctness still needs a golden set; this measures stability, which the 
 - [ ] The original output is wrong, since the paraphrase is a cleaner input
 - [x] At least one of the two outputs is wrong, but which one needs a human or a correctness judge
 - [ ] The comparator is too strict and should be relaxed
-> The relation only states that the two outputs must agree. Disagreement proves inconsistency, not
-> which side is correct; assuming either direction is a common mistake that can enshrine the wrong
+> The relation only states that the two outputs must agree. Assuming the paraphrase kept the meaning,
+> disagreement proves inconsistency, not which side is correct; assuming either direction is a common mistake that can enshrine the wrong
 > answer as the expectation.

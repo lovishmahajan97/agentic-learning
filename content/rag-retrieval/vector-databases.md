@@ -5,6 +5,7 @@ name: Vector databases (pgvector, Qdrant, Pinecone, Weaviate, Milvus, Chroma)
 kind: tool
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - rag-retrieval/ann-indexes
   - rag-retrieval/similarity-search
@@ -31,8 +32,8 @@ mostly about operations and scale, not retrieval quality.
 
 ## Why it exists
 Exact nearest-neighbour search costs O(N·d) per query: ten million 1536-dimensional vectors is roughly
-15 billion multiply-adds per query, fine for a nightly batch job and hopeless at 100 queries per second
-with a 50 ms budget. Approximate nearest-neighbour indexes such as HNSW and IVF cut the work to a small
+15 billion multiply-adds per query and about 61 GB of float32 vectors streamed from memory, fine for a
+nightly batch job and hopeless on a CPU node at 100 queries per second with a 50 ms budget. Approximate nearest-neighbour indexes such as HNSW and IVF cut the work to a small
 fraction of the corpus at a modest recall cost. But an index is not a database. FAISS gives you an
 in-memory index; you still have to persist it, update it as documents change (graph indexes handle
 deletes awkwardly), store the chunk text and metadata somewhere, filter by tenant or date without
@@ -40,7 +41,9 @@ destroying recall, replicate for availability, and shard when the vectors stop f
 that start with "FAISS and a pickle file" rebuild each of these after an incident.
 
 The relational alternative, storing vectors as float arrays and ordering by a computed distance, is
-exact and simple but scans every row, so it stops working at a few hundred thousand vectors. A vector
+exact and simple but scans every row, so somewhere between hundreds of thousands and a few million
+vectors (illustrative; it depends on dimension, hardware and latency budget) it stops fitting an
+interactive request. A vector
 database is the layer that packages ANN indexing with ordinary database properties: durability, CRUD,
 filtering, access control and horizontal scale.
 
@@ -61,8 +64,8 @@ the top-k and then drops non-matching rows: fast, but a selective filter can lea
 none at all. Dedicated engines integrate the filter into the graph traversal (Qdrant calls this
 filterable HNSW) and fall back to a brute-force scan when a filter is very selective. pgvector applies
 the `WHERE` clause to rows coming out of the index scan, which is why a filtered query can return fewer
-rows than `LIMIT` asks for; recent versions add iterative index scans that keep walking the graph until
-enough matching rows are found. Knowing which behaviour your store has is the key to debugging "the
+rows than `LIMIT` asks for; version 0.8.0 added opt-in iterative index scans (`hnsw.iterative_scan`)
+that keep walking the graph until enough matching rows are found. Knowing which behaviour your store has is the key to debugging "the
 filtered query returns nothing".
 
 ### The six, briefly
@@ -78,7 +81,8 @@ filtered query returns nothing".
   for you at write and query time, built-in BM25 with hybrid score fusion, GraphQL and REST APIs, and
   multi-tenancy with per-tenant shards.
 - **Milvus** is an open-source distributed system that separates compute from storage: segments in object
-  storage, metadata in etcd, and a message queue as the write log, with many index types (IVF variants,
+  storage, metadata in etcd, and a log service as the write-ahead log (historically Pulsar or Kafka;
+  the exact component varies by release), with many index types (IVF variants,
   HNSW, DiskANN, GPU indexes). It targets billions of vectors and is correspondingly heavier to operate;
   Milvus Lite embeds in a Python process for development and Zilliz Cloud is the managed version.
 - **Pinecone** is a fully managed, proprietary service with serverless and pod-based deployments,
@@ -86,8 +90,9 @@ filtered query returns nothing".
   operations; you pay per usage and accept that data and index live with the vendor.
 - **Chroma** is open source and Python/JS-first: it runs embedded in the application process with
   on-disk persistence or as a small server, exposes collections with `add`, `query` and `where`
-  filters, and uses an HNSW index underneath. It is ideal for prototypes and tests, not for
-  high-concurrency or multi-node deployments.
+  filters, and uses an HNSW index underneath. The open-source single-node mode is ideal for prototypes
+  and tests, not for high-concurrency or multi-node deployments; the vendor's hosted service is a
+  separate, distributed offering, so check its current capabilities rather than assuming either way.
 
 Adjacent options: FAISS and hnswlib (libraries, not databases), Elasticsearch and OpenSearch kNN (if you
 already run them for lexical search), Redis, LanceDB and Vespa.
@@ -96,7 +101,8 @@ already run them for lexical search), Redis, LanceDB and Vespa.
 Memory is the first wall: vectors plus the HNSW graph must be in RAM for low latency. As an illustrative
 order of magnitude, ten million 1536-dimensional float32 vectors are about 61 GB before the graph.
 Beyond one node, engines shard by id hash and replicate shards for reads; disk-based indexes trade
-latency for capacity; quantization shrinks memory by 4× to 32× with rescoring. The second wall is
+latency for capacity; quantization shrinks memory by 4× (int8) to 32× (binary), or more with product quantization, usually
+with full-precision rescoring to recover recall. The second wall is
 write throughput: HNSW inserts are expensive, so bulk loads should finish before the index is built.
 
 ## Example
@@ -131,18 +137,22 @@ ORDER BY embedding <=> $1::vector       -- must use the same operator the index 
 LIMIT 10;
 ```
 
-The `model` predicate is what makes a blue/green model migration safe inside a single table, and the
-`ORDER BY` operator must match the index's operator class or Postgres falls back to a sequential scan.
+The `model` predicate is what makes an in-place model migration safe inside a single table, as long as
+the new model has the same dimension (a different one needs a new column or table, which is the
+blue/green route); during the migration it is also a filter that can shrink HNSW results, as described
+above. The `ORDER BY` operator must match the index's operator class or Postgres falls back to a
+sequential scan.
 
 ## Trade-offs
 - pgvector gives one system, transactions and joins against business data, but index builds are slow,
   scaling is vertical, and filtered recall needs care; the trade flips toward a dedicated engine when the
   corpus reaches tens of millions of vectors or filtered queries dominate the load.
-- A dedicated open-source engine (Qdrant, Weaviate, Milvus) delivers the best filtered search,
+- A dedicated open-source engine (Qdrant, Weaviate, Milvus) generally delivers stronger filtered search,
   quantization and horizontal scale, but is another stateful system to run, upgrade and back up; without
   a platform team that burden flips the decision toward managed.
 - A managed service (Pinecone, Qdrant Cloud, Zilliz Cloud, Weaviate Cloud) removes operations entirely,
-  at a per-vector monthly cost, a data-residency question and an exit cost; strict residency rules or a
+  at usage-based pricing (storage plus reads and writes, model varies by vendor), a data-residency
+  question and an exit cost; strict residency rules or a
   large, rarely-queried corpus flip it back toward self-hosting.
 - An embedded store (Chroma, Milvus Lite, LanceDB) needs no infrastructure and is perfect for notebooks,
   tests and demos, but offers no concurrency, replication or multi-node growth; the first multi-user
@@ -205,8 +215,8 @@ when hybrid sparse-dense search and quantization become requirements.
 - [x] The engine runs the approximate search first and applies the filter afterwards, so matching rows outside the retrieved candidates are never seen
 - [ ] Filters disable the index and force an exact scan that times out
 - [ ] Metadata filters are only applied to the first shard
-> Post-filtering is the common default: the ANN index returns its k nearest candidates and the filter
-> removes those that do not match. If the filter is selective, few candidates survive. Filterable HNSW,
+> Post-filtering, which is what a plain pgvector HNSW scan does, means the ANN index returns its
+> nearest candidates and the filter removes those that do not match. If the filter is selective, few candidates survive. Filterable HNSW,
 > iterative scans or partitioning by the filter key are the fixes.
 
 ### Q: Which statement best captures the difference between pgvector and a dedicated engine such as Qdrant or Milvus?
@@ -224,5 +234,6 @@ when hybrid sparse-dense search and quantization become requirements.
 - [ ] Used cosine distance instead of inner product
 - [ ] Split the data across more collections
 > HNSW inserts search the graph to place every new node and update neighbour links, which is far slower
-> than building the graph in one pass over loaded data. Bulk load, then build, is the standard sequence
-> in every one of these systems.
+> than building the graph in one pass over loaded data. Bulk load, then build, is the documented
+> sequence for pgvector, and engines such as Qdrant let you defer indexing during bulk upload for the
+> same reason.

@@ -5,6 +5,7 @@ name: Idempotent tool execution
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/conversation-execution-identifiers
@@ -114,7 +115,9 @@ loop detection address that case.
 ## Example
 The wrapper claims the key before executing, waits briefly if another worker holds it, replays the
 stored result on repeats with a `replayed` flag, and forwards the key to the downstream API so the
-dedup also lives where the effect lives.
+dedup also lives where the effect lives. If the tool raises, the key is released so a retry can run;
+that is safe only because the downstream API dedupes on the same key. An adapter without downstream
+support should instead mark the row "unknown" and reconcile before retrying.
 
 ```python
 import hashlib, time
@@ -122,8 +125,8 @@ import hashlib, time
 class DedupStore:                 # key -> {status, result}; back with a durable table in prod
     def __init__(self):
         self.rows = {}
-    def begin(self, key):         # returns the existing row, or None if we now own the key
-        row = self.rows.get(key)
+    def begin(self, key):         # existing row, or None if we now own the key; in prod an
+        row = self.rows.get(key)  # atomic INSERT ... ON CONFLICT DO NOTHING, not get-then-set
         if row is None:
             self.rows[key] = {"status": "in_flight", "started": time.time()}
         return row
@@ -141,7 +144,11 @@ def idempotent(store: DedupStore, wait_s: float = 10):
                 return {**row["result"], "replayed": True}
             if row:                                 # still in flight after the wait
                 raise RuntimeError("in_flight: retry later, do not re-issue")
-            result = tool(**args, idempotency_key=key)   # key goes downstream too
+            try:
+                result = tool(**args, idempotency_key=key)   # key goes downstream too
+            except Exception:
+                store.rows.pop(key, None)           # release, or it stays in flight forever
+                raise
             store.finish(key, result)
             return result
         return run
@@ -153,7 +160,7 @@ def key_for(ids, call_index: int) -> str:
 @idempotent(DedupStore())
 def create_ticket(title, body, idempotency_key):
     return api.post("/tickets", json={"title": title, "body": body},
-                    headers={"Idempotency-Key": idempotency_key})
+                    headers={"Idempotency-Key": idempotency_key}).json()
 
 # in the agent loop:  create_ticket({"title": t, "body": b}, key=key_for(ids, i))
 ```

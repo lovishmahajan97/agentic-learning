@@ -5,6 +5,7 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - evals/llm-as-a-judge
   - evals/rubrics
@@ -56,14 +57,18 @@ controlled inputs rather than discovered by accident after a bad release.
 Take a sample of real inputs, on the order of 100–300 items (illustrative), and have humans label them
 with the exact rubric the judge will use. Seed it with the cases that expose bias: correct-but-terse
 answers, wrong-but-eloquent ones, pairs that differ only in formatting, and genuine ties. Measure
-inter-annotator agreement first, because that number is the ceiling: a judge cannot be shown to be more
-accurate than the labels it is compared against.
+inter-annotator agreement first, because it is the yardstick: a judge cannot be shown to be more
+accurate than the labels it is compared against, and its agreement number only means something next to
+human–human agreement computed the same way.
 
 ### Step 2: measure agreement, not just scores
 Run the judge on the calibration set and compute agreement with the human majority: accuracy for
 pairwise verdicts, Cohen's kappa for pass/fail, Spearman correlation for ordinal scores. Compare that
-number with human–human agreement on the same items. A judge within a few points of human–human
-agreement is "another annotator"; one far below is not usable as a gate. Then look at *where* it
+number with human–human agreement on the same items, computed like for like: judge versus each
+annotator next to annotator versus annotator, or judge versus the majority next to each annotator versus
+the majority of the others. Agreement with a majority label is naturally higher than agreement with one
+noisy person, so mixing the two makes a judge look better than it is. A judge within a few points of
+human–human agreement is "another annotator"; one far below is not usable as a gate. Then look at *where* it
 disagrees. Disagreements concentrated on one failure mode (say, numeric claims) tell you the judge
 cannot evaluate that criterion and a human or a programmatic check must.
 
@@ -136,10 +141,11 @@ def calibrate(pairs, human):
     print(f"chose longer answer: judge {st.mean(judge_longer):.0%} vs humans {st.mean(human_longer):.0%}")
 ```
 
-Illustrative output on 200 pairs: 46 inconsistent (23%), with the first slot winning 71 of the 92
-verdicts in those pairs, which is a clear first-position bias. On the 154 consistent pairs the judge
-agrees with humans on 128 (83%) while humans agreed with each other on 86%, so it is close to annotator
-quality. But it picks the longer answer 68% of the time against the humans' 55%: a verbosity tilt of
+Illustrative output on 200 pairs: 46 inconsistent (23%), with the first slot winning 72 of the 92
+verdicts in those pairs (a flipped pair contributes either two first-slot wins or none, so this count is
+always even), which is a clear first-position bias. On the 154 consistent pairs the judge agrees with the
+human majority on 128 (83%), while individual annotators agreed with the majority of the others on 86%,
+so it is close to annotator quality. But it picks the longer answer 68% of the time against the humans' 55%: a verbosity tilt of
 roughly 13 points that will reward any prompt change that makes outputs wordier.
 
 ## Trade-offs
@@ -192,7 +198,7 @@ prompt wins 64% of comparisons. What do you check before shipping, and why?
 **A:** First, position consistency: run every pair in both orders; if a large share of verdicts flip, part
 of the 64% is slot order, so recompute on consistent pairs or average. Second, length: if the new prompt
 produces longer outputs, compute a length-controlled win rate or restrict to length-matched pairs, because
-verbosity bias alone can manufacture a double-digit win rate. Third, agreement with humans on a labeled
+verbosity bias alone can manufacture a double-digit swing in win rate. Third, agreement with humans on a labeled
 subset of about a hundred pairs, compared with human–human agreement, to confirm the judge is tracking
 quality on this task. Fourth, self-preference: if the change involved a model swap, make sure the judge is
 from a different family. Finally, bootstrap a confidence interval; if it still excludes 50% after these
@@ -207,13 +213,14 @@ controls, ship behind an online A/B to confirm.
 > A verdict that depends on which slot an answer occupies is position bias by definition. Both-order
 > judging cancels it; truncation and judge-family changes target different biases.
 
-### Q: A judge agrees with the human labels 92% of the time, while two human annotators agree with each other only 78%. What is the most likely explanation?
+### Q: A report says the judge agrees with the human majority label 92% of the time, while two human annotators agree with each other only 78%. What should you conclude first?
 - [ ] The judge is genuinely better than the human annotators
 - [ ] Position bias inflated the judge's accuracy
-- [x] The judge was compared against a single annotator whose habits it happens to match, or the sample is small; check against a multi-annotator majority
+- [x] The two numbers are not like for like: agreement with a majority label is naturally higher than agreement between two individuals; recompute both the same way, with intervals, before concluding anything
 - [ ] Kappa was computed with the wrong marginals
-> Human–human agreement is the ceiling for how well any label set can be reproduced. A judge "beating" it
-> almost always means it was scored against one person's labels or on too few items.
+> A majority label is less noisy than any single annotator, so judge-versus-majority can exceed
+> annotator-versus-annotator even for a merely human-level judge. Labels written by these humans also
+> cannot demonstrate that the judge is better than them; position bias and kappa marginals do not explain the gap.
 
 ### Q: Which mitigation specifically targets self-enhancement (self-preference) bias?
 - [ ] Judging each pair in both orders

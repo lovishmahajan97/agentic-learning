@@ -5,6 +5,7 @@ name: Model registry
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - llmops-platform/experiment-tracking
   - llmops-platform/prompt-registry

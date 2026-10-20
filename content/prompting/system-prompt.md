@@ -5,6 +5,7 @@ name: System prompt
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - prompting/prompt-engineering
   - prompting/prompt-templates
@@ -84,14 +85,15 @@ determined user and should be assumed public.
 ### Cost and caching
 The system prompt is sent on every call, so its cost is tokens × requests. Because it is byte-identical
 across requests it is the ideal cache target: providers that cache prompt prefixes charge a fraction of
-the input price for the cached part. The design rule that follows is static first, dynamic last: put the
+the input price for cache reads (some also charge a premium on the request that writes the cache, and
+entries expire after minutes of inactivity, so low-traffic prompts benefit less). The design rule that follows is static first, dynamic last: put the
 frozen instructions at the top, retrieved context and the user's text after them, and verify by watching
 the cached-token count in the usage block of each response.
 
 ## Example
-A system prompt with scope, rules and format, probed with four inputs that attack it in the three ways
-instructions get overridden: a direct user override, an injection inside data, and an out-of-scope
-request. Each probe is sampled three times because adherence is a rate, not a bit. The call also asks the
+A system prompt with scope, rules and format, probed with four inputs: an in-scope baseline, then the
+three ways instructions get overridden: a direct user override, an injection inside data, and an
+out-of-scope request. Each probe is sampled three times because adherence is a rate, not a bit. The call also asks the
 API to cache the stable prefix; note that providers only cache prefixes above a model-specific minimum
 length (on the order of hundreds to a few thousand tokens), so a prompt this short will report zero
 cached tokens until it grows.
@@ -119,11 +121,11 @@ PROBES = [
 
 def ask(text):
     r = client.messages.create(
-        model=MODEL, max_tokens=300, system=SYSTEM,
+        model=MODEL, max_tokens=1024, system=SYSTEM,          # headroom: any thinking counts too
         cache_control={"type": "ephemeral"},            # cache the stable prefix (tools + system)
         messages=[{"role": "user", "content": text}])
-    answer = next(b.text for b in r.content if b.type == "text")
-    return answer, r.usage.cache_read_input_tokens
+    answer = next((b.text for b in r.content if b.type == "text"), "")
+    return answer, r.usage.cache_read_input_tokens or 0
 
 for p in PROBES:
     for _ in range(3):                                  # sampling: adherence is a rate, not a bit
@@ -148,13 +150,14 @@ for p in PROBES:
 
 ## Pitfalls
 - Putting a timestamp, user name or request ID into the system prompt; the symptom is a cache-read token
-  count of zero on every call and an input bill that never drops after caching is enabled.
+  count at or near zero and an input bill that barely drops after caching is enabled.
 - Treating the system prompt as a security boundary; the symptom is a red-team transcript where a user
   message or a retrieved document talks the model out of its rules.
 - Accumulating rules for months until two of them conflict; the symptom is behaviour that flips between
   conversations depending on which rule the model happened to weight.
-- Listing everything the model must not mention; the symptom is the forbidden topic surfacing more often,
-  because the instruction put it into the context.
+- Listing everything the model must not mention instead of saying what to do instead; the symptom is the
+  forbidden topic still surfacing under pressure, because a bare prohibition names the topic and gives the
+  model no alternative behaviour to fall back on.
 - Storing anything confidential in the prompt and assuming it stays hidden; the symptom is your prompt
   posted verbatim on a forum.
 - Testing adherence only on single-turn prompts; the symptom is a model that follows the format for the
@@ -202,10 +205,11 @@ turn thirty, not just turn one.
 ### Q: A team adds the current date and the logged-in user's name to the first line of the system prompt. What is the most likely consequence?
 - [ ] The model becomes more accurate because it knows who it is talking to
 - [ ] Nothing changes, since the system prompt is small
-- [x] The cached prefix is invalidated on every request, so prompt caching never pays off
+- [x] The prefix now differs per user and per day, so requests can no longer share the cached instructions and the hit rate collapses
 - [ ] The instruction hierarchy breaks because dates count as user data
-> Prompt caching matches the prefix byte for byte. Any per-request value placed before the static
-> instructions makes every prefix unique. Dynamic data belongs after the stable block or in the user turn.
+> Prompt caching matches the prefix byte for byte. A per-user or per-day value placed before the static
+> instructions splits one shared prefix into one per user per day, so almost nothing is reused across
+> traffic. Dynamic data belongs after the stable block or in the user turn.
 
 ### Q: Which statement about the authority of the system prompt is accurate?
 - [ ] It is enforced by the sampling loop, so instructions in it cannot be violated

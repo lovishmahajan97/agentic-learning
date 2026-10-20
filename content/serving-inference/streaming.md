@@ -5,7 +5,7 @@ name: Streaming (SSE)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/ttft
   - serving-inference/tpot
@@ -55,8 +55,10 @@ The fields that matter are `data:` (the payload; several `data:` lines in one ev
 newlines), `event:` (an optional name the client can dispatch on), `id:` (lets a reconnecting client
 send `Last-Event-ID`) and `retry:` (reconnect delay hint). A line starting with `:` is a comment; the
 client ignores it, which makes `: keep-alive` a free heartbeat. The response stays open; under
-HTTP/1.1 it is sent with `Transfer-Encoding: chunked`, under HTTP/2 as an open stream. A token stream
-is just:
+HTTP/1.1 it is sent with `Transfer-Encoding: chunked`, under HTTP/2 as an open stream. The framing is
+defined by the blank line, not by network packets: one TCP read can hold half an event or three of
+them, and can even split a multi-byte UTF-8 character, so a client must decode bytes incrementally,
+buffer until it sees the blank line, and only then parse the event. A token stream is just:
 
 ```
 event: delta
@@ -185,6 +187,9 @@ async def answer(req: Request):
   broken links until the closing token arrives.
 - Counting SSE chunks as tokens; servers may coalesce or split, so the symptom is usage numbers that
   disagree with the provider's bill.
+- Hand-rolled clients that treat each network read as one event; the symptom is intermittent JSON
+  parse errors or garbled non-ASCII characters that appear only on slow or distant networks, where
+  reads split events differently than on localhost.
 - Forgetting that a disconnected client does not stop generation unless you propagate the stop; the
   symptom is GPU time and provider spend that stay flat when traffic drops.
 

@@ -5,7 +5,7 @@ name: Scaling laws
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - model-internals/small-language-models
   - model-internals/mixture-of-experts
@@ -65,8 +65,11 @@ L(N, D) = E + A / N^α + B / D^β
 E is the irreducible entropy of the text under the tokenizer, A/N^α is the approximation error from finite
 capacity, and B/D^β is the estimation error from finite data. Their published fit gave E ≈ 1.69, A ≈ 406.4,
 B ≈ 410.7, α ≈ 0.34 and β ≈ 0.28 for their data and tokenizer. The constants do not transfer to other
-setups; the shape does. Minimising L subject to 6ND = C gives N_opt ∝ C^a and D_opt ∝ C^b with a ≈ b ≈ 0.5,
-which is where the constant tokens-per-parameter ratio comes from.
+setups; the shape does. Minimising L subject to 6ND = C gives N_opt ∝ C^a and D_opt ∝ C^b with
+a = β/(α+β) and b = α/(α+β). When a ≈ b ≈ 0.5, N and D grow in lockstep as compute grows, and that is why
+the compute-optimal tokens-per-parameter ratio is a constant rather than a function of budget. With the
+constants above, a ≈ 0.45, so this particular fit favours data slightly more; the other two methods below
+gave close to 0.5 each.
 
 ### Three ways to fit it
 Hoffmann et al. used three methods and got the same answer: fix N and vary training length, taking the
@@ -97,35 +100,45 @@ inference compute per query buys more accuracy than a larger base model, which i
 compute lesson.
 
 ## Example
-Using Chinchilla's published fit as an illustrative model of the curve's shape, compare a compute-optimal
-run with a 10× smaller over-trained run at the same 10²⁴ FLOP training budget, then add the cost of
-serving 10¹³ tokens. The small model is about 0.02 nats worse in loss and 10× cheaper per served token,
-which makes it cheaper over its lifetime by more than 2×.
+Take a 10²⁴ FLOP training budget and a model that will serve 10¹³ tokens over its life (both
+illustrative), and use Chinchilla's published parametric fit as a stand-in for the curve. Compare three
+ways to spend the same budget: the 20-tokens-per-parameter rule, the minimum of the fitted curve itself,
+and a model 10× smaller than the rule suggests.
 
 ```python
 import math
 
-E, A, B, alpha, beta = 1.69, 406.4, 410.7, 0.34, 0.28   # Chinchilla's fit; constants are setup-specific
+E, A, B, alpha, beta = 1.69, 406.4, 410.7, 0.34, 0.28   # Chinchilla's published fit; setup-specific
 
 def loss(N, D):
     return E + A / N**alpha + B / D**beta
 
-def chinchilla_optimal(C, tokens_per_param=20):
-    N = math.sqrt(C / (6 * tokens_per_param))           # 6 * N * D = C with D = 20 N
-    return N, tokens_per_param * N
+C = 1e24                                     # training budget in FLOPs (illustrative)
+T = 1e13                                     # tokens served over the model's life (illustrative)
+tokens_for = lambda N: C / (6 * N)           # spend the whole budget: 6 N D = C
 
-C = 1e24                                                # training budget in FLOPs (illustrative)
-N_opt, D_opt = chinchilla_optimal(C)
-N_small = N_opt / 10
-D_small = C / (6 * N_small)                             # same budget, ten times the tokens
-T = 1e13                                                # tokens served over the model's life (illustrative)
+N_rule = math.sqrt(C / (6 * 20))             # the "20 tokens per parameter" rule
+N_fit = min((10 ** (9 + i / 100) for i in range(300)),
+            key=lambda N: loss(N, tokens_for(N)))   # argmin of the fitted curve itself
+N_small = N_rule / 10                        # deliberately over-trained
 
-for tag, N, D in [("compute-optimal", N_opt, D_opt), ("over-trained", N_small, D_small)]:
-    print(f"{tag:16s} N={N/1e9:5.1f}B  D={D/1e12:5.1f}T  loss={loss(N, D):.3f}  "
-          f"train={6*N*D:.1e}  serve={2*N*T:.1e}  lifetime={6*N*D + 2*N*T:.2e} FLOPs")
-# compute-optimal  N= 91.3B  D=  1.8T  loss=1.918  train=1.0e+24  serve=1.8e+24  lifetime=2.83e+24 FLOPs
-# over-trained     N=  9.1B  D= 18.3T  loss=1.936  train=1.0e+24  serve=1.8e+23  lifetime=1.18e+24 FLOPs
+for tag, N in [("20:1 rule", N_rule), ("fit argmin", N_fit), ("over-trained", N_small)]:
+    D = tokens_for(N)
+    print(f"{tag:12s} N={N/1e9:5.1f}B  D={D/1e12:5.1f}T  D/N={D/N:6.0f}  loss={loss(N, D):.3f}  "
+          f"lifetime={6*N*D + 2*N*T:.2e} FLOPs")
+# 20:1 rule    N= 91.3B  D=  1.8T  D/N=    20  loss=1.918  lifetime=2.83e+24 FLOPs
+# fit argmin   N= 41.7B  D=  4.0T  D/N=    96  loss=1.911  lifetime=1.83e+24 FLOPs
+# over-trained N=  9.1B  D= 18.3T  D/N=  2000  loss=1.936  lifetime=1.18e+24 FLOPs
 ```
+
+Three lessons sit in those rows. First, the over-trained 9B model is only about 0.02–0.025 nats worse
+than either alternative yet costs 10× less per served token, so its lifetime compute is less than half the
+20:1 model's. Second, the loss surface is flat near its minimum: models spanning a 10× range of N land
+within a few hundredths of a nat, which is why the budget split can be bent toward inference economics at
+little cost. Third, the published constants and the published rule disagree: minimising this fit puts the
+optimum near 96 tokens per parameter, not 20. The paper's other two estimation methods gave the roughly
+20:1 split, and a later replication (Besiroglu et al., 2024) argued the published parametric constants were
+poorly fitted. Trust the shape of a scaling law, not its constants to the second decimal place.
 
 The decision then moves to the question the law cannot answer: does 0.02 nats of loss matter on the tasks
 you care about? That is measured with task evals, not predicted.
@@ -181,8 +194,9 @@ do you quantify it?
 **A:** Chinchilla optimality minimises training compute for a target loss and ignores serving. Write
 lifetime cost as 6ND + 2NT where T is tokens served; when T is far larger than D the inference term dominates,
 so it is worth shrinking N and raising D at the same training budget and accepting a slightly higher loss.
-Quantify it with the fitted L(N, D): at 10²⁴ FLOPs the optimum is about 90B parameters on 1.8T tokens,
-while a 9B model on 18T tokens is roughly 0.02 nats worse yet 10× cheaper per served token. Then check
+Quantify it with a fitted L(N, D): at 10²⁴ FLOPs the 20:1 rule gives about 90B parameters on 1.8T
+tokens, while a 9B model on 18T tokens is roughly 0.02 nats worse yet 10× cheaper per served token, because
+the loss surface is flat near its optimum. Then check
 whether that loss gap shows up on the downstream evals that matter, note that over-training has diminishing
 returns, and confirm you can actually source 18T tokens without heavy repetition.
 

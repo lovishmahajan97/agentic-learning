@@ -5,7 +5,7 @@ name: Residual connections
 kind: concept
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/normalization
   - ml-fundamentals/backpropagation
@@ -47,7 +47,7 @@ to change what a layer is asked to learn: instead of the desired mapping `H(x)`,
 zero, which is exactly where small random weights start; the network begins as roughly the identity and
 each layer only has to learn a perturbation. Depth stopped being an optimization liability, networks of
 more than a hundred layers trained without difficulty, and the transformer adopted the same block
-structure a year later and has never dropped it.
+structure within two years and has never dropped it.
 
 ## How it works
 ### Forward: additive composition
@@ -136,8 +136,9 @@ def first_vs_last_grad(residual):
 for residual in (False, True):
     first, last = first_vs_last_grad(residual)
     print(f"residual={residual!s:5} layer 1: {first:.1e}  layer {depth}: {last:.1e}  ratio: {first/last:.1e}")
-# Observed on CPU with seed 0:  residual=False  layer 1: 1.5e-16  layer 64: 1.1e-02  ratio: 1.3e-14
-#                               residual=True   layer 1: 1.9e+01  layer 64: 4.3e+00  ratio: 4.4e+00
+# One CPU run, seed 0 (exact digits vary by version; the orders of magnitude do not):
+#   residual=False  layer 1: 1.5e-16  layer 64: 1.1e-02  ratio: 1.3e-14
+#   residual=True   layer 1: 1.9e+01  layer 64: 4.3e+00  ratio: 4.4e+00
 # Plain stack: the layer-1 gradient is ~14 orders of magnitude below layer 64's, because it is the
 #   product of 64 Jacobians each with norm below one (tanh' <= 1 and the default init shrinks variance).
 # Residual stack: the two are within a small factor of each other, because the identity term in every
@@ -152,8 +153,9 @@ for residual in (False, True):
   depth, which is why Pre-LN models need scaled branch initialization and a final norm, and why late
   layers in very deep models still contribute less.
 - Short gradient paths make the network robust to removing or reordering individual blocks, which
-  enables pruning, early exit and layer sharing, but the same property means adding layers gives
-  diminishing returns per layer compared with widening.
+  enables pruning, early exit and layer sharing, but the same redundancy is why very deep, narrow models
+  can leave late layers underused; whether the next parameter is better spent on depth or width is an
+  empirical, model-family question, not something the residual argument settles.
 - The residual stream must be materialized and stored per layer for backward, costing
   `batch × seq × d_model` activations per block; gradient checkpointing trades recompute for that memory
   when long sequences make it dominant.
@@ -165,9 +167,10 @@ for residual in (False, True):
 - Putting dropout, a projection or a scaling factor on the skip path instead of on the branch output; the
   model trains noticeably slower and deeper configurations stop converging, which is the identity-mappings
   result rediscovered.
-- Not scaling the branch output projections at initialization in a deep Pre-LN model; activations at the
-  top of the stack are large at step zero, the first loss values sit far above `ln(vocab_size)`, and early
-  training spikes.
+- Not scaling the branch output projections at initialization in a deep Pre-LN model; the stream norm
+  at step zero grows steadily with layer index (log it per layer to see it), the final norm hides this from
+  the logits, and the symptom is a run that is less stable than the recipe predicts, with early loss
+  spikes at the target learning rate.
 - Letting shapes drift (a sublayer that changes the hidden size) and "fixing" it with a learned projection
   on the residual path at every layer; the network is now effectively plain, and the gradient-path
   argument no longer holds.

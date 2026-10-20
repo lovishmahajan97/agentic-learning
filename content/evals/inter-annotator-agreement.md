@@ -5,6 +5,7 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -22,8 +23,8 @@ sources:
 ## TL;DR
 Inter-annotator agreement (IAA) measures how consistently independent humans label the same items. It
 matters because labels are the ground truth every eval and every judge is scored against: if two experts
-agree only 70% of the time, no model can be shown to be more than roughly 70% "right", and the guideline,
-not the model, is the problem. Chance-corrected statistics (Cohen's κ, Fleiss' κ, Krippendorff's α) are
+agree only 70% of the time, every score measured against those labels carries that noise, and the
+guideline, not the model, is usually the problem. Chance-corrected statistics (Cohen's κ, Fleiss' κ, Krippendorff's α) are
 used instead of raw agreement because raw agreement is inflated whenever one label dominates.
 
 ## Why it exists
@@ -34,8 +35,11 @@ the set is ambiguous enough that two experts read it differently, and the model'
 noise of that size. Every conclusion downstream, from "prompt B is 3 points better" to "the judge agrees
 with humans 88% of the time", inherits it.
 
-Agreement does three jobs. It sets the **ceiling**: a model or LLM judge compared against these labels
-cannot meaningfully exceed the labelers' agreement with each other. It **diagnoses guidelines**: low
+Agreement does three jobs. It sets the **reference point**: human–human agreement is what "as good as
+a person" looks like on these labels. It is not a hard ceiling: a perfect judge would agree with each
+annotator as often as that annotator is right, which is higher than two error-prone annotators agree with
+each other, so a strong judge can land slightly above it. What the labels cannot do is *demonstrate*
+that a judge is better than the people who wrote them. It **diagnoses guidelines**: low
 agreement on one criterion means the definition is ambiguous, which is fixed by rewriting anchors, not
 by replacing annotators. And it **sizes the process**: how many annotators per item, whether adjudication
 is needed, how much overlap to keep during production labeling.
@@ -74,8 +78,10 @@ correlation coefficient (ICC) captures absolute agreement. For rankings, Kendall
 The Landis and Koch bands (0.41–0.60 moderate, 0.61–0.80 substantial, above 0.80 almost perfect) are a
 convention, not a law; what is acceptable depends on how the labels are used. Gating labels for a
 release need high agreement; preference labels for training tolerate less. Two **kappa paradoxes** catch
-people: high p_o with low κ when one class dominates (most agreement was predictable), and lower κ for
-raters with different marginals even at the same p_o. So report p_o, κ and the confusion table together,
+people: high p_o with low κ when one class dominates (most agreement was predictable), and *higher* κ
+for raters whose marginals differ than for raters with matched marginals at the same p_o, because
+mismatched label rates lower p_e (so a systematic difference between raters can make κ look better).
+So report p_o, κ and the confusion table together,
 with a bootstrap interval over items, because κ = 0.7 on 30 items has a wide interval.
 
 ### The process around the number
@@ -84,7 +90,7 @@ disagreement, rewrite the ambiguous anchors, and re-pilot. In production labelin
 items double-labeled for monitoring. Resolve disagreements by adjudication (a third rater or discussion),
 and keep the "contested" flag on those items, because they are the ones a model will also get wrong for
 defensible reasons. When you later compare an LLM judge with humans, compute judge–human κ the same way
-and put it next to human–human κ: a judge at the human ceiling is another annotator, not a better one.
+and put it next to human–human κ: a judge at the human level is another annotator, not a better one.
 
 ## Example
 Cohen's kappa by hand on two pilots of 100 support answers labeled pass or fail by two SMEs. The second
@@ -137,7 +143,7 @@ golden set built from pilot 2 would have a "fail" label that is mostly one perso
 - Annotators who are not independent (one sees the other's labels, or they confer during the pilot); the
   symptom is a high pilot kappa followed by a much lower production kappa.
 - Comparing an LLM judge with labels from a single annotator; the symptom is a judge that "beats humans",
-  which really means it matches one person's habits.
+  which often means it matches one person's habits and is unverified against everyone else.
 - Small pilots without intervals; the symptom is κ = 0.7 on 30 items followed by 0.45 on the next batch
   with no change in process.
 
@@ -163,7 +169,9 @@ judge to humans?".
 90% of items. The customer concludes the judge is better than a human. What do you say?
 **A:** Start by computing κ: if most answers pass, much of the 88% is chance and the real agreement is
 lower. Then note that matching one annotator at 90% while the two humans agree at 88% does not show the
-judge is better; it most likely shows the judge happens to match SME-1's habits on a skewed set. The fair
+judge is better: a two-point gap on 200 items is inside the noise (the standard error is about two
+points), and even a merely human-level judge can match one SME slightly more often than the two SMEs
+match each other. Check its agreement with SME-2 as well, since it may simply share SME-1's habits. The fair
 comparison is the judge against the adjudicated or majority label on the items where the humans agree,
 which are the only items with a defensible truth, reporting judge–human κ next to human–human κ with
 bootstrap intervals. If the judge's κ is close to the humans', it is as reliable as another annotator and
@@ -191,7 +199,8 @@ measured at all.
 ### Q: An LLM judge agrees with human labels at κ = 0.62, while human–human agreement is κ = 0.65. What is the correct conclusion?
 - [ ] The judge is worse than humans and should not be used
 - [ ] The judge is better than humans because its interval overlaps theirs
-- [x] The judge is roughly as reliable as another human annotator; its remaining disagreements mostly fall on items humans also find ambiguous
+- [x] The judge is roughly as reliable as another human annotator; the three-point gap is within noise, so check where its disagreements fall before letting it replace a person
 - [ ] Nothing can be concluded without an accuracy figure
-> Human agreement is the ceiling for any comparison against human labels, so a judge near it has reached
-> annotator quality. Treating it as better or worse than humans overreads a three-point difference.
+> Human–human agreement is the reference level for comparisons against human labels, so a judge near it
+> has reached annotator quality. Calling it better or worse than humans overreads a three-point difference,
+> and with no ground truth beyond the labels, agreement is the accuracy figure you have.

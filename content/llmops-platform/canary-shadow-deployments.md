@@ -5,6 +5,7 @@ name: Canary / shadow deployments
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - llmops-platform/rollback
   - llmops-platform/evaluation-gates-for-production-releases
@@ -98,17 +99,20 @@ configuration, not in application code, so a rollout or rollback is a config cha
 
 ## Example
 A minimal gateway router: sticky canary assignment by user hash, an asynchronous shadow fork for a
-separate candidate, and paired logging. The shadow call runs after the response is returned, and the
-shadow candidate is configured with side-effecting tools disabled.
+separate candidate, and paired logging. The shadow call is scheduled as a background task so the user's
+response never waits on it, only incumbent-served requests are mirrored (so every shadow pair is
+candidate-vs-incumbent), and the shadow candidate runs with side-effecting tools disabled. Each
+experiment salts the hash, so the same 5% of users are not the guinea pigs for every rollout.
 
 ```python
 import asyncio, hashlib, json, time
 
 ROLLOUT = {"incumbent": "bundle-v12", "canary": "bundle-v13", "canary_pct": 5,
-           "shadow": "bundle-v14", "shadow_pct": 20}
+           "shadow": "bundle-v14", "shadow_pct": 20, "salt": "exp-2026-10-v13"}
+_background: set[asyncio.Task] = set()            # keep refs so tasks are not GC'd mid-run
 
-def bucket(key: str) -> int:                       # stable 0..99 bucket per user
-    return int(hashlib.sha256(key.encode()).hexdigest(), 16) % 100
+def bucket(key: str, salt: str) -> int:           # stable 0..99 bucket per user per experiment
+    return int(hashlib.sha256(f"{salt}:{key}".encode()).hexdigest(), 16) % 100
 
 async def call_bundle(bundle: str, req: dict, allow_side_effects=True) -> dict:
     t = time.perf_counter()
@@ -121,13 +125,14 @@ async def shadow(req: dict, served: dict, trace_id: str):
     log.info(json.dumps({"trace": trace_id, "served": served, "shadow": cand}))
 
 async def handle(req: dict, user_id: str, trace_id: str) -> dict:
-    b = bucket(user_id)
+    b = bucket(user_id, ROLLOUT["salt"])
     bundle = ROLLOUT["canary"] if b < ROLLOUT["canary_pct"] else ROLLOUT["incumbent"]
     served = await call_bundle(bundle, req)
     metrics.observe(bundle=bundle, ms=served["ms"], schema_ok=served["schema_ok"],
                     refused=served["refused"], cost=served["cost"])
-    if b < ROLLOUT["shadow_pct"]:
-        asyncio.create_task(shadow(req, served, trace_id))   # never on the user's critical path
+    if bundle == ROLLOUT["incumbent"] and bucket(user_id, "shadow") < ROLLOUT["shadow_pct"]:
+        task = asyncio.create_task(shadow(req, served, trace_id))  # off the critical path
+        _background.add(task); task.add_done_callback(_background.discard)
     return served
 # ROLLOUT is loaded from the control plane; promoting or rolling back is a config write, not a deploy.
 ```

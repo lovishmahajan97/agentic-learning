@@ -5,7 +5,7 @@ name: Monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - observability/latency-percentiles
   - observability/token-cost-tracking
@@ -16,6 +16,7 @@ related:
   - deployment/health-checks
 sources:
   - Beyer et al., 2016 — Site Reliability Engineering
+  - Beyer et al., 2018 — The Site Reliability Workbook
   - Official docs: Prometheus
 ---
 
@@ -55,7 +56,10 @@ Monitoring systems store time series built from three instruments. A **counter**
 in-flight requests, cache size). A **histogram** records a distribution (latency, tokens per request)
 in buckets so percentiles can be computed later across instances. Latency must be a histogram
 *because* an average hides the slow tail that users actually complain about; the latency-percentiles
-lesson covers why p95 and p99 are the numbers to watch.
+lesson covers why p95 and p99 are the numbers to watch. Two consequences of bucketing: a percentile
+computed from buckets is interpolated within a bucket, so it is only as precise as the bucket edges
+near it; and an SLO threshold ("first token within 2 s") should *be* a bucket edge, so the fraction of
+requests under it is an exact count rather than an estimate.
 
 ### The baseline: golden signals with LLM dimensions
 Latency, traffic, errors and saturation still apply, with two changes. Latency splits into time to
@@ -74,6 +78,10 @@ bucket plus the sum and count), which is how metrics systems fall over. The rule
 - **Behavioural proxies**: refusal rate, guardrail trigger rate, and the distribution of output tokens
   (a sudden drop often means truncated or refused answers; a rise often means a prompt regression),
   agent iterations per task and the rate of hitting the step budget.
+- **Saturation, LLM style**: for a hosted API it is quota headroom, the remaining requests and
+  tokens per minute that providers report in rate-limit response headers (names vary by provider),
+  plus your own in-flight count and queue depth; for a self-hosted model it is queue depth and KV-cache
+  utilisation. Headroom shrinking towards zero predicts 429s before they start.
 - **Context pressure**: prompt tokens per request and the fraction of requests where compaction or
   truncation ran.
 - **Cost**: tokens and computed cost per request, per feature and per tenant, with a budget burn rate.
@@ -92,11 +100,22 @@ silent provider changes, deprecated models and broken retrieval before real traf
 LLM equivalent of a health check that actually exercises the dependency rather than pinging it.
 
 ### Targets, SLOs and alerting
-Pick a small number of user-facing symptoms (p95 time to first token, successful-turn rate, judge
-score over a day) and set targets. Alert on burn rate against those targets, *because* alerting on
-causes (CPU, a single rate-limit response) produces pages for things users never noticed, while
-alerting on symptoms with fast- and slow-burn windows pages for what matters and stays quiet
-otherwise. Everything else is a dashboard for diagnosis, not a page.
+Pick a small number of user-facing symptoms (time to first token, successful-turn rate, judge
+score over a day) and set targets as ratios of good events: "99% of chat turns get a first token within
+2 s over 30 days". One minus the target is the **error budget** (here 1% of turns). Alert on symptoms
+rather than causes, *because* paging on causes (CPU, a single rate-limit response) wakes people for
+things users never noticed.
+
+The alert condition is the **burn rate**: the observed bad-event ratio divided by the budget ratio. A
+burn rate of 1 spends exactly the 30-day budget in 30 days; a burn rate of 14.4 sustained for one hour
+spends 2% of it (14.4 × 1 h / 720 h). The SRE Workbook's multiwindow scheme pages on fast burns (for
+example above 14.4 over the last hour, confirmed over the last 5 minutes so the page clears quickly
+once the problem stops) and opens a ticket on slow burns (for example above 1 over three days).
+Concretely, against the 1% budget: a provider brownout that makes 15% of turns miss 2 s for an hour is
+a burn rate of 15 and pages; a creeping 2% of slow turns is a burn rate of 2, never pages, and still
+gets a ticket before the month's budget is gone. A static "p95 above 2 s" threshold catches neither
+case reliably, because it ignores how long the problem lasted and how much budget it consumed.
+Everything else is a dashboard for diagnosis, not a page.
 
 ### Where the data comes from
 Metrics should be derived from the same instrumentation as traces: a generation span's attributes
@@ -108,8 +127,9 @@ most expensive query in the company at large scale.
 ## Example
 A wrapper around a streaming model call that records the signals above with `prometheus_client`.
 Note the bounded label sets: `outcome` is mapped to a handful of values, and nothing per-user or
-per-conversation becomes a label. The comment at the end sketches the symptom-based alerts you would
-write on top of these series.
+per-conversation becomes a label. The TTFT buckets include 2 s because that is the SLO threshold. The
+comment at the end is the burn-rate alert from the section above, written in PromQL against these
+series.
 
 ```python
 import time
@@ -146,8 +166,11 @@ def monitored_call(model, route, call):
         INFLIGHT.labels(model).dec()
 
 start_http_server(9000)   # exposes /metrics for Prometheus to scrape
-# Alerts (symptom-based): page when the 5-minute p95 of llm_ttft_seconds for the
-# "chat" route exceeds 2 s, or when rate_limited outcomes exceed 2% of calls.
+# SLO: 99% of chat calls get a first token within 2 s. Bad ratio over a window w:
+#   1 - sum(rate(llm_ttft_seconds_bucket{route="chat",le="2.0"}[w]))
+#     / sum(rate(llm_ttft_seconds_count{route="chat"}[w]))
+# Page if bad_ratio / 0.01 > 14.4 for w=1h AND w=5m; ticket if > 1 for w=3d.
+# Failed calls never record TTFT, so a separate success-rate SLO on REQS covers them.
 ```
 
 ## Trade-offs
@@ -173,6 +196,8 @@ start_http_server(9000)   # exposes /metrics for Prometheus to scrape
   or queries timing out, often weeks later once cardinality has accumulated.
 - Monitoring only errors and latency on an LLM feature; the symptom is a quality regression after a
   prompt change that nobody detects until the weekly eval or a customer complaint.
+- Choosing histogram buckets without reference to the SLO threshold; the symptom is a compliance
+  number that moves when someone changes the buckets, because the threshold was being interpolated.
 - Paging on causes (any rate-limit response, any retry); the symptom is alert fatigue and the real
   page being ignored.
 - Trusting the provider's status page over your own measurements; the symptom is a tenant-specific
@@ -188,8 +213,8 @@ once the feature is stable enough that a judge score means something. Measure yo
 asking after each incident whether an alert fired before the first user report, and how long the
 dashboards took to point at the cause. Day to day, this is the dashboard you look at after every
 prompt or model change. In interviews, the test is whether you can name the LLM-specific signals that
-catch silent failures and explain why you would alert on p95 time to first token rather than on
-provider rate-limit responses.
+catch silent failures, explain why you would alert on the burn rate of a time-to-first-token SLO
+rather than on provider rate-limit responses, and do the burn-rate arithmetic for a given target.
 
 ## Role lens
 - **Engineer:** Instruments the call wrapper with counters and histograms, keeps label cardinality

@@ -5,7 +5,7 @@ name: Model selection
 kind: decision
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - evals/model-evaluation
   - evals/benchmarking
@@ -71,8 +71,17 @@ over-sample the hard and high-cost cases, since that is where candidates differ.
 Same examples, same prompt structure, then a bounded, equal amount of prompt adaptation per model,
 because format sensitivity differs between families and zero adaptation punishes the newcomer. Fix
 sampling settings, run several seeds, and report a mean with a confidence interval: on 100 examples a
-proportion near 0.9 has a 95% half-width of roughly ±6 points, so a 2-point gap is noise. Keep the set
-private; a model that has seen your examples is not being evaluated.
+proportion near 0.9 has a 95% half-width of roughly ±6 points (1.96 × √(0.9 × 0.1 / 100) ≈ 0.059), so a
+2-point gap is noise. Two consequences follow from that formula. Repeated runs only average out
+sampling randomness; they do not shrink the error from having drawn *these* 100 examples, which only
+more examples can do, and halving the interval needs four times as many (about 860 examples for ±2
+points at 0.9). And because every candidate runs on the same examples, compare them **paired**: count
+the examples only model A gets right and only model B gets right (McNemar's test uses exactly these
+discordant counts). Pairing cancels the difficulty of each example, so it detects real differences
+that two overlapping intervals hide, and it tells you *how* the models differ: few discordant examples
+means they behave alike; many in both directions means they fail on different inputs, which argues for
+a cascade rather than a straight swap. Keep the set private; a model that has seen your examples is not
+being evaluated.
 
 ### Step 4: measure cost and latency on real request shapes
 Cost per request is input tokens × input price plus output tokens × output price, adjusted for cached
@@ -81,6 +90,15 @@ across families (the same document can be 20–30% more tokens in one than anoth
 non-English text) and because output verbosity differs. For reasoning models the hidden reasoning
 tokens are billed as output on most providers and can dominate, so price per token alone misleads. Measure time to
 first token and total latency at p50 and p95, under realistic concurrency, at the hours you will run.
+The number to compare is not cost per call but
+
+```
+cost per successful task = (cost of all calls, including retries after format failures and escalations)
+                           ÷ (tasks that pass the eval)
+```
+
+*because* a model that is 40% cheaper per call but needs a retry on one call in five, or escalates
+often, can lose its advantage once the denominator and the extra calls are counted.
 
 ### Step 5: find the frontier and apply the rule
 Lay candidates out on quality versus cost versus latency and discard any model that another beats on
@@ -191,9 +209,12 @@ first" is the expected depth; naming a favourite model is not.
 retrieval-augmented assistant. On your 100-example eval the cheaper model scores 2 points lower. How do
 you decide, and what would make you say no?
 **A:** First, 2 points on 100 examples is inside the noise: the 95% interval around a score near 0.9 is
-roughly ±6 points, so the gap is not established. Expand the set toward several hundred examples or
-run multiple seeds and compare the lower bounds against the bar, not against each other. Second, read
-the failures by category: if the cheaper model's extra misses cluster in a high-cost class such as
+roughly ±6 points, so the gap is not established, and re-running seeds will not fix that, only more
+examples will. Expand the set toward several hundred and compare each model's lower bound against the
+bar, not against each other. Because both ran on the same examples, look at the paired view: if the
+2-point gap is 3 losses against 1 win, the models behave almost identically and I read those few
+examples; if it is 14 losses against 12 wins, they fail on different inputs, which means the score is
+unstable and a cascade may beat either model alone. Second, read the failures by category: if the cheaper model's extra misses cluster in a high-cost class such as
 wrong citations on compliance questions, that is disqualifying even if the total is small; if they
 are stylistic, it is not. Third, check the dimensions the score ignores: format compliance, p95
 latency, rate limits at peak, and the real cost ratio measured from tokens, since tokenizers differ.
@@ -214,11 +235,11 @@ land in the costly category.
 ### Q: Two candidate models differ by 3 points on a 60-example evaluation set. What is the right conclusion?
 - [ ] The higher-scoring model is better and should be chosen
 - [ ] The cheaper model should be chosen because 3 points never matters
-- [x] The difference is probably within noise; enlarge the set or repeat runs and compare confidence intervals against the quality bar before deciding
+- [x] The difference is probably within noise; enlarge the set, inspect the paired per-example disagreements, and compare lower confidence bounds against the quality bar before deciding
 - [ ] Both models should be rejected for a larger model
-> With 60 examples the sampling interval is wide, so a 3-point gap cannot be distinguished from
-> run-to-run variance. The decision needs tighter intervals and should be made against the bar with
-> margin, not by comparing two noisy means.
+> With 60 examples the 95% interval is roughly ±7 to ±8 points near 0.9, so a 3-point gap (about two
+> examples) cannot be distinguished from sampling noise. More examples tighten it; repeated runs do
+> not. The decision should be made against the bar with margin, not by comparing two noisy means.
 
 ### Q: Which of these must be applied as a hard filter before any quality comparison?
 - [ ] Price per million output tokens

@@ -5,6 +5,7 @@ name: Typed tool contracts
 kind: pattern
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - agents/tool-schemas-and-argument-validation
   - agents/tool-result-interpretation
@@ -64,21 +65,25 @@ also why cross-process protocols such as MCP transport tools as schemas rather t
 A registry maps each tool name to its contract. At startup the registry produces the provider-format
 tool list (`name`, `description`, `input_schema` from the input type). At call time it validates the raw
 input into the input type, runs the handler, validates the handler's return value against the output
-type, and serializes it. The SDK tool runners (`@beta_tool` generating a schema from a Python signature,
-`betaZodTool` from a Zod schema) are this pattern in miniature; the registry version adds the output
+type, and serializes it. Anthropic's SDK tool runners (beta at the time of writing: `@beta_tool`
+generating a schema from a Python signature, `betaZodTool` from a Zod schema) and similar helpers in
+other SDKs are this pattern in miniature; the registry version adds the output
 type, the error taxonomy and the harness metadata.
 
 ### Versioning
 Treat the contract like a public API. Additive changes (a new optional field with a default) are safe.
-Renames and type changes are breaking: ship them as a new tool name (`search_orders_v2`) or a new
-required parameter with a transition period, because prompts, few-shot examples, evals and cached
+Renames and type changes are breaking: ship them as a new tool name (`search_orders_v2`), or add the
+new parameter as optional and keep accepting the old one for a transition period before removing it, because prompts, few-shot examples, evals and cached
 conversations all encode the old shape. A snapshot test that compares the generated schema against a
 committed copy makes an unintended change fail CI; an intended one updates the snapshot in the same PR.
 
 ### Across process boundaries
 When tools live in another service or language, the contract is what crosses the wire. MCP's
-`tools/list` returns exactly an input schema per tool, and newer protocol revisions let a server declare
-an output schema as well; a typed contract on your side maps onto that one-to-one. The same contract
+`tools/list` returns a name, description and `inputSchema` per tool; since the 2025-06-18 revision a
+server can also declare an `outputSchema` and return matching `structuredContent`, and optional tool
+annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) carry side-effect metadata. A typed
+contract on your side maps onto that directly, with one caution: annotations from a server you do not
+control are claims, not guarantees, so the harness should not relax a gate on their word alone. The same contract
 also feeds the eval harness: expected arguments in a selection eval are instances of the input type,
 so a schema change breaks the eval loudly rather than invalidating it silently.
 
@@ -96,6 +101,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 class ErrorKind(str, Enum):
     not_found = "not_found"; invalid_argument = "invalid_argument"; transient = "transient"
+    internal = "internal"
 
 class ToolError(Exception):
     def __init__(self, kind: ErrorKind, message: str, retryable: bool = False):
@@ -127,12 +133,20 @@ class Tool:
         try:
             args = self.input_model.model_validate(raw_input)
         except ValidationError as e:
-            return json.dumps({"kind": "invalid_argument", "message": str(e), "retryable": False}), True
+            msg = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())
+            return json.dumps({"kind": "invalid_argument", "message": msg, "retryable": False}), True
         try:
             out = self.output_model.model_validate(self.handler(args))   # output is checked too
             return out.model_dump_json(), False
         except ToolError as e:
             return json.dumps(e.body), True
+        except ValidationError:                             # handler broke its own output contract
+            return json.dumps({"kind": "internal", "message": "tool returned malformed data",
+                               "retryable": False}), True  # our bug, not the model's: log and alert
+
+CUSTOMERS = {"C-10492"}
+ALL_ORDERS = [{"order_id": "O-1", "customer_id": "C-10492", "status": "shipped",
+               "total_cents": 12_900, "placed_on": "2026-10-02"}]
 
 def search_orders(args: SearchOrdersIn) -> dict:
     rows = [r for r in ALL_ORDERS if r["customer_id"] == args.customer_id

@@ -5,7 +5,7 @@ name: PEFT (LoRA, QLoRA)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/quantization
@@ -81,9 +81,17 @@ matrices (16 × (4,096 + 11,008) ≈ 242k each) brings the total to about 40M tr
 Note what LoRA does *not* save: the frozen base still has to be in memory (≈13.4 GB in bf16 for 7B), and
 backpropagation still flows through every layer to reach the adapters, so compute per step is only
 modestly lower than full fine-tuning (the weight-gradient matmuls for frozen matrices are skipped,
-which is about half of the backward FLOPs, or a third of the forward-plus-backward total). The win is memory for optimizer state, master weights and weight
-gradients, plus a checkpoint measured in tens to a few hundred megabytes (40M adapter parameters are
-about 80 MB in bf16 or 160 MB in fp32, against 13.4 GB for the base).
+which is about half of the backward FLOPs, or a third of the forward-plus-backward total). Activation
+memory is also unchanged, because the activations of every frozen layer are still needed to backpropagate
+to the adapters below it; at long sequence lengths activations, not weights, become the term that OOMs,
+which is why LoRA recipes almost always switch on gradient checkpointing. The win is memory for optimizer
+state, master weights and weight gradients, plus a checkpoint measured in tens to a few hundred megabytes
+(40M adapter parameters are about 80 MB in bf16 or 160 MB in fp32, against 13.4 GB for the base).
+
+Why does a rank-16 update suffice? Because a gradient step on W₀ for a narrow task mostly pushes in a few
+consistent directions; LoRA bets that the full ΔW a fine-tune would learn is well approximated by its top
+r singular directions. The bet holds for style, format and behaviour shifts and weakens as the task
+demands more genuinely new information, which is the condition that decides LoRA versus full fine-tuning.
 
 At export time you either **merge** (W = W₀ + (α/r)BA, a dense matrix of the original shape, zero extra
 latency) or keep adapters separate so a server can hold one base and many adapters, batching requests for

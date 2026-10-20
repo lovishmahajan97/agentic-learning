@@ -5,6 +5,7 @@ name: LLM-as-a-judge
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - evals/judge-calibration-and-bias
   - evals/rubrics
@@ -65,7 +66,8 @@ calibrated".
 ### Designing the judge prompt
 State the task the output was supposed to do, the criterion in concrete terms with examples of pass and
 fail, and the output format. Ask for a short justification *before* the verdict, *because* reasoning
-first improves agreement with humans and produces an audit trail you can read when the judge is wrong.
+first often improves agreement with humans (the evidence is mixed and model-dependent, so measure it
+on your calibration set) and always produces an audit trail you can read when the judge is wrong.
 Return structured output (JSON with `verdict` and `reason`) so the harness never parses prose. Keep each
 judge single-purpose: one criterion per call, *because* a judge asked to assess accuracy, tone and
 completeness at once blurs them into one score. Few-shot examples taken from human-labeled cases, kept
@@ -95,7 +97,8 @@ and keep sampling live outputs for human spot checks so drift is caught.
 A judge call costs tokens per item per criterion, so judge cost can exceed generation cost. Use
 deterministic checks for anything deterministic, a smaller model for simple criteria once calibrated,
 and batch offline. Judges belong in the offline harness and in sampled online monitoring; using one as
-a synchronous guardrail doubles latency and should be a deliberate decision.
+a synchronous guardrail adds a full model call to every request's latency and should be a deliberate
+decision.
 
 ## Example
 A single-criterion, reference-guided binary judge with a reasoning-first JSON verdict, followed by the
@@ -151,8 +154,8 @@ good enough to gate a release, and the 15 missed failures are where to look to i
   requires two runs per item in both orders and yields no absolute pass rate to gate on.
 - A smaller, cheaper judge model cuts eval cost sharply, but its agreement must be re-measured per
   criterion; cheap judges fail first on subtle factual errors.
-- Reasoning-first verdicts improve agreement and auditability, but add output tokens and latency
-  per item, which matters when the judge is sampled online.
+- Reasoning-first verdicts usually help agreement and always help auditability, but add output
+  tokens and latency per item, which matters when the judge is sampled online.
 
 ## Pitfalls
 - Shipping a judge that was never compared with human labels; the symptom is a stable, high offline
@@ -214,14 +217,15 @@ feeds back into the rubric and triggers re-calibration when the generator change
 - [x] The judge shows position bias; the comparison needs both orders per item and inconsistent pairs counted as ties
 - [ ] The golden dataset is too small
 - [ ] The judge needs a higher temperature to break ties
-> A 24-point swing from ordering alone means position, not content, is driving many verdicts. Running
-> both orders and treating flips as ties removes the bias; averaging it away hides it.
+> A 24-point swing from ordering alone means position, not content, is driving many verdicts. B's
+> 56% average across orders is not evidence on its own: count each item whose verdict flips with the
+> order as a tie and decide on the order-consistent wins, which shows how much real signal is left.
 
 ### Q: Which criterion is the worst fit for an LLM judge?
 - [ ] Whether a support reply's tone matches the brand guidelines
 - [ ] Whether every claim in a RAG answer is supported by the retrieved passages
 - [x] Whether a generated SQL query returns the correct rows
-- [ ] Whether an answer follows the requested format and length instructions
+- [ ] Whether an answer addresses every part of a multi-part customer question
 > Judges misgrade executable artifacts by inspection. A SQL query can be run against a fixture and
 > compared to the expected rows deterministically, which is cheaper and more reliable than any judgment.
-> Tone, groundedness and instruction adherence are the kinds of criteria that need a judge.
+> Tone, groundedness and completeness against the question are the kinds of criteria that need a judge.

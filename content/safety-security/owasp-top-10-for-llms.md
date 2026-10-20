@@ -4,8 +4,8 @@ module: safety-security
 name: OWASP Top 10 for LLMs
 kind: concept
 difficulty: intro
-est_minutes: 13
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - safety-security/prompt-injection
   - safety-security/excessive-agency
@@ -81,6 +81,16 @@ The ten items are easier to remember as six trust boundaries than as a numbered 
 - *LLM03 Supply Chain.* Compromised models, datasets, adapters and the packages that load them. Deep
   lesson: supply-chain security for models and datasets.
 
+### Attacks cross rows, so read the matrix across
+Real incidents rarely sit in one item. A typical chain: an attacker plants instructions in a document
+that gets indexed (LLM04/LLM08); a user's question retrieves it and the model follows it (LLM01); the
+model writes a markdown image whose URL carries the user's data, and the chat client renders it (LLM05);
+the data reaches the attacker's server (LLM02). Four rows, one attack. The useful observation is that the
+cheapest reliable control is often in a different row from the one the incident gets filed under: you
+cannot reliably stop LLM01, but not rendering remote images (an LLM05 control) breaks this chain
+completely. That is why the list works best as a set of boundaries with layered controls, and why the
+action and resource boundaries, which do not depend on detecting the attack, carry most of the weight.
+
 ### What changed from v1.1 to 2025, and why it matters
 The 2023 list had Insecure Plugin Design, Model Denial of Service, Overreliance and Model Theft as
 separate items. In 2025, plugin design folded into Excessive Agency and Supply Chain, because the failure
@@ -93,11 +103,17 @@ grants it too much", which is also the direction your controls should take.
 
 ### How to use the list
 It is a threat-modelling prompt, not a compliance standard. There is no certification and "OWASP
-compliant" has no formal meaning. The practical use is a table with one row per item and three columns:
+compliant" has no formal meaning. Nor is the numbering your priority order: it reflects what is common
+across the industry, while your ranking should come from exposure and blast radius in your system. An
+internal summariser with no tools barely has an LLM06 problem; a customer-facing agent that can move money
+has little else. The practical use is a table with one row per item and three columns:
 how the risk manifests in *this* system, the control, and the evidence (a test, a config, a log). Items
 that do not apply get a one-line reason rather than a blank, because reviewers read blanks as gaps. OWASP
 has since published agentic-specific guidance under its agentic security initiative; the ten items above
-remain the baseline vocabulary.
+remain the baseline vocabulary. Two neighbouring frameworks answer different questions: MITRE ATLAS
+catalogues adversary tactics and techniques against ML systems, which is what red teams plan from, and
+the NIST AI Risk Management Framework describes the organisational process for governing AI risk. The
+OWASP list sits between them as the engineering checklist for one application.
 
 ## Example
 Threat-model a contract-review assistant: RAG over each customer's uploaded contracts, a tool that creates
@@ -117,7 +133,10 @@ span, and a groundedness eval runs weekly. LLM10: illustrative limits of 8k inpu
 tokens, 60 requests per user per hour, a per-tenant monthly token budget, and a ten-step cap on the agent
 loop. LLM03: the base model, embedding model and reranker each have recorded hashes, signatures and an
 entry in the AI bill of materials. Each row now has a control and a piece of evidence a reviewer can ask
-for.
+for. Ranking them for this system: LLM01 with LLM06 first, because the one write path lands in 300
+customers' trackers and contracts are attacker-supplied by construction; LLM08 and LLM02 next, because a
+single missing filter exposes one customer's contracts to another; LLM10 and LLM03 after that. A chatbot
+over public documentation, by contrast, would rank LLM09 and LLM10 near the top and LLM06 near the bottom.
 
 ## Trade-offs
 - A shared checklist speeds reviews and questionnaires, but filled-in rows can substitute for thinking;
@@ -140,6 +159,8 @@ for.
   completion that was rendered or executed without validation, which no model change would have fixed.
 - Writing the matrix once at launch; the symptom is a new tool or data source shipped months later with
   no row and no review.
+- Assessing each row in isolation; the symptom is every row marked "mitigated" while a red team chains an
+  injection through rendering into disclosure, because no single row owned the chain.
 
 ## When to use
 Use the list at three moments: when designing a new LLM feature, as the skeleton of the threat model;

@@ -5,6 +5,7 @@ name: Type hints
 kind: concept
 difficulty: intro
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/mypy
   - python-for-ai/protocols-generics-structural-typing
@@ -49,19 +50,23 @@ be `None`. One source of truth serves the checker, the runtime and the human rea
 
 ## How it works
 ### What the interpreter does with an annotation
-An annotation is an expression written after a colon. For a function, `def f(x: int) -> str` makes
-Python evaluate `int` and `str` at definition time and store them in `f.__annotations__` as a dict
+An annotation is an expression written after a colon. For a function, `def f(x: int) -> str`
+records `int` and `str` as metadata, exposed as `f.__annotations__`, a dict
 `{"x": int, "return": str}`. For a class or module, `name: list[str] = []` stores the type in
 `__annotations__` of that scope. Nothing else happens. Calling `f("hello")` runs normally, because
 CPython performs no checking; the annotation is metadata. This design choice is deliberate: the
-language keeps zero runtime cost and full backward compatibility, and leaves enforcement to tools.
+language keeps near-zero runtime cost and full backward compatibility, and leaves enforcement to
+tools.
 
-Because annotations are evaluated at definition time, a forward reference to a class defined later
-in the module fails with `NameError` unless it is quoted (`"Message"`) or the module opts into
-postponed evaluation with `from __future__ import annotations`, which stores every annotation as a
-string. Libraries that need the real type then call `typing.get_type_hints(obj)` to resolve the
-strings. Newer Python versions move toward lazy evaluation of annotations by default; the exact
-mechanics depend on the interpreter version, so check which one your project runs when a library
+*When* the annotation expression is evaluated depends on the interpreter version. Up to Python 3.13
+it is evaluated eagerly at definition time, so a forward reference to a class defined later in the
+module fails with `NameError` unless it is quoted (`"Message"`) or the module opts into postponed
+evaluation with `from __future__ import annotations`, which stores every annotation as a string.
+Libraries that need the real type then call `typing.get_type_hints(obj)` to resolve the strings.
+Python 3.14 (PEP 649 and PEP 749) makes evaluation lazy by default: annotations are computed only
+when something first reads `__annotations__` (or calls `annotationlib.get_annotations`), so a
+forward reference no longer fails at `def` time, but it can still fail later if the name is
+undefined when a library finally inspects it. Check which version your project runs when a library
 complains about unresolved forward references.
 
 ### What a checker does with it
@@ -82,7 +87,8 @@ The important vocabulary:
   (`list[str]`) so callers can pass tuples or generators.
 - `Callable[[str, int], bool]` types a function value; `Awaitable[T]` and `Coroutine` type async
   results, which matters when wrapping an async client.
-- `Any` means "opt out"; `object` means "anything, but you may not call methods on it". Choosing
+- `Any` means "opt out"; `object` means "anything, but you may only use what every object supports
+  until you narrow it (for example with `isinstance`)". Choosing
   `object` over `Any` for genuinely unknown inputs keeps the hole small.
 - `Annotated[T, meta]` attaches extra data to a type without changing it; Pydantic's `Field` and
   FastAPI's `Depends` use this so the same annotation carries both the static type and runtime
@@ -93,8 +99,8 @@ The important vocabulary:
   the checker thinks `x` is, which is the fastest way to debug an inference surprise.
 
 ### Why runtime libraries read them
-Pydantic, dataclasses, FastAPI, `attrs` and the `instructor` library all introspect
-`__annotations__` at class creation. A `BaseModel` with `temperature: float = 0.7` becomes a
+Pydantic, dataclasses and `attrs` introspect annotations at class creation, FastAPI does it when a
+route is registered, and libraries such as `instructor` reuse Pydantic's models. A `BaseModel` with `temperature: float = 0.7` becomes a
 validator that coerces `"0.7"` to `0.7` and rejects `"hot"`. This is the bridge between static and
 runtime typing: the annotation you wrote for the checker becomes the schema that validates a model's
 JSON output and the JSON Schema you hand to a tool-calling API. Writing the type once and getting
@@ -136,14 +142,18 @@ def reply(messages: Sequence[Message], cfg: GenConfig, response: Any) -> str:
         raise ValueError("model returned no text content")
     return text.strip()
 
-cfg = GenConfig(model="gpt-4o-mini", temperature="0.2")   # coerced to 0.2 by Pydantic
+raw = {"model": "gpt-4o-mini", "temperature": "0.2"}       # e.g. parsed from a YAML config
+cfg = GenConfig.model_validate(raw)                        # "0.2" coerced to 0.2 by Pydantic
 print(cfg.temperature, type(cfg.temperature))            # 0.2 <class 'float'>
 # GenConfig(model="x", temperature=3.0) raises a ValidationError: le=2.0
 ```
 
 Run `mypy` on this file and delete the `if text is None` branch: the checker reports that
 `str | None` has no attribute `strip`. That is the whole value proposition, delivered before the
-first API call.
+first API call. Note the division of labour on the last lines: writing
+`GenConfig(model="x", temperature="0.2")` directly would run fine (Pydantic coerces it) but a
+checker that understands Pydantic's `__init__` flags the `str` argument, which is why untyped input
+goes through `model_validate` at the boundary instead.
 
 ## Trade-offs
 - You gain compile-time detection of shape bugs across the call graph, but you pay the annotation
@@ -165,8 +175,8 @@ first API call.
 - Letting `json.loads` output (typed `Any`) flow through the pipeline untouched; the symptom is a
   clean mypy run followed by `KeyError` in production, because `Any` suppressed every downstream
   error. Validate at the boundary with Pydantic or a `TypedDict` so the type becomes concrete.
-- Forward-reference `NameError` at import time when one class annotates a field with another class
-  defined below it; fix by quoting the name or using `from __future__ import annotations`, and know
+- Forward-reference `NameError` at import time (Python 3.13 and earlier) when one class annotates a
+  field with another class defined below it; fix by quoting the name or using `from __future__ import annotations`, and know
   that some runtime libraries then need `get_type_hints` to resolve the strings.
 - Using `Optional[X]` without a default and expecting it to mean "optional argument"; `Optional`
   only means "may be None", and the checker will still require the argument be passed.
@@ -208,7 +218,7 @@ that third-party stubs are installed so SDK calls are not silently `Any` either.
 - [ ] Coerces "a" to int if possible, otherwise raises
 - [x] Nothing; the annotation is stored in `f.__annotations__` and never checked
 - [ ] Emits a RuntimeWarning about a type mismatch
-> Annotations are inert metadata evaluated at definition time. Enforcement is the job of static
+> Annotations are inert metadata (evaluated at definition time up to 3.13, lazily from 3.14). Enforcement is the job of static
 > checkers or libraries that explicitly read the annotations, never the interpreter itself.
 
 ### Q: Why can a fully "type-hinted" codebase still let shape bugs through mypy?

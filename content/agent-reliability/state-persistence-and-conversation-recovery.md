@@ -5,6 +5,7 @@ name: State persistence & conversation recovery
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-and-checkpoint-stores
@@ -133,6 +134,7 @@ def build_context(store, cid, recent=40):
     log = store.events.get(cid, [])
     summary = next((e for e in reversed(log) if e["type"] == "summary"), None)
     tail = [e for e in log if summary is None or e["seq"] > summary["seq"]][-recent:]
+    # a real view also moves the cut so it never separates a tool call from its result
     msgs = [{"role": "system", "content": summary["payload"]["text"]}] if summary else []
     # mapping event types to the provider's message format is omitted for brevity
     return msgs + [{"role": e["type"], "content": json.dumps(e["payload"])} for e in tail]

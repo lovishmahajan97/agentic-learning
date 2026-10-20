@@ -5,6 +5,7 @@ name: SQL
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
@@ -36,7 +37,7 @@ actual data.
 The naive alternative in application code is the loop: fetch the conversations, then for each one fetch
 its messages, then for each message count tokens. That is the N+1 pattern, and it fails for two reasons.
 Each round trip to the database costs a network hop (hundreds of microseconds to milliseconds), so 1,000
-conversations cost 1,001 queries and seconds of wall time. And the database never sees the whole
+conversations cost 1,001 queries and somewhere between half a second and several seconds of wall time. And the database never sees the whole
 question, so it cannot pick a hash join or use an index to do the work in one pass. A single query with a
 join and an aggregate lets the engine do it in one scan.
 
@@ -77,7 +78,9 @@ to the matching rows; cheapest when few qualify) and a bitmap scan (collect matc
 more indexes, then read them in physical order). A predicate is **sargable** (can use an index) when the
 indexed column appears bare on one side of a comparison: `created_at >= $1` can use an index;
 `date(created_at) = $1` cannot, because the index stores `created_at`, not its date. `LIKE 'abc%'` can use
-a B-tree; `LIKE '%abc%'` cannot. The planner is only as good as its statistics, so a table that grew 100×
+a B-tree, but in PostgreSQL only if the index uses the `C` collation or the `text_pattern_ops` operator
+class (a default index under a locale such as `en_US.UTF-8` is not used for `LIKE`); `LIKE '%abc%'` cannot
+use a B-tree at all and needs a trigram (`pg_trgm`) index. The planner is only as good as its statistics, so a table that grew 100×
 since the last `ANALYZE` gets bad plans.
 
 ### Parameters, not string formatting
@@ -99,12 +102,18 @@ hot or analytical queries by hand.
 
 ## Example
 Two queries that an LLM backend runs constantly. The first is a per-tenant spend report with a running
-total, done in one pass with a window function. The second is "newest message per conversation" for an
-inbox view using `DISTINCT ON`, plus keyset pagination so page depth does not change the cost.
+total, done in one pass with a window function over the grouped rows. The second is "newest message per
+conversation" for an inbox view using a `LATERAL` subquery (the `DISTINCT ON` form above is the
+alternative), with a keyset cursor so page depth does not change the cost. Each page still evaluates the
+lateral lookup for every conversation the user owns; when users have thousands of conversations, the
+usual next step is a denormalized `conversations.last_message_at` with an index on `(tenant_id, user_id,
+last_message_at, id)`, so the cursor seeks straight to the page.
 
 ```sql
 -- 1. Daily token spend per tenant for the last 7 days, with a running total.
---    Uses the (tenant_id, created_at) index: a range scan, then one hash aggregate.
+--    No tenant filter, so a (tenant_id, created_at) index gives no simple range scan;
+--    an index on created_at (or a BRIN index on an append-only table) serves this.
+--    Day boundaries follow the session TimeZone setting.
 SELECT tenant_id,
        date_trunc('day', created_at) AS day,
        SUM(input_tokens + output_tokens)                                 AS tokens,
@@ -128,7 +137,7 @@ JOIN   LATERAL (
          LIMIT  1                                     -- hits (conversation_id, created_at)
        ) m ON true
 WHERE  c.tenant_id = $1 AND c.user_id = $2 AND c.deleted_at IS NULL
-  AND  (m.created_at, m.id) < ($3, $4)                -- cursor from the previous page
+  AND  (m.created_at, m.id) < ($3, $4)                -- previous page's last row; first page: ('infinity', 0)
 ORDER  BY m.created_at DESC, m.id DESC
 LIMIT  20;
 ```
@@ -156,7 +165,9 @@ the actual one. A large mismatch means stale statistics or a predicate the plann
 - The N+1 loop hidden behind an ORM relationship; the symptom is a request that issues hundreds of
   identical small queries in the log, each fast, together slow.
 - Wrapping an indexed column in a function (`lower(email) = $1`, `date(created_at) = $1`); the symptom is
-  a sequential scan in `EXPLAIN` despite an index existing. Use an expression index or rewrite as a range.
+  a sequential scan in `EXPLAIN` despite an index existing. Rewrite as a range or add an expression index;
+  the expression must be immutable, so on a `timestamptz` column index `((created_at AT TIME ZONE 'UTC')::date)`,
+  not `date(created_at)`, which depends on the session time zone.
 - `NOT IN (subquery)` where the subquery can return NULL; the symptom is a query that silently returns
   zero rows. Use `NOT EXISTS`.
 - `SELECT *` in application code; the symptom is a column added for a migration that doubles network
@@ -190,8 +201,9 @@ given predicate cannot use an index, and diagnose an N+1 from a description of s
 production but 20 ms in staging. There is an index on `(tenant_id, created_at)`. What do you check and why?
 **A:** First run `EXPLAIN (ANALYZE, BUFFERS)` in production to see whether the index is used at all. If the
 plan shows a sequential scan, the predicate is probably not sargable (a function wrapped around
-`created_at`, or a type mismatch such as comparing a `timestamptz` column to a `text` parameter that
-forces a cast) or the statistics are stale after rapid growth, so `ANALYZE messages` and compare. If the
+`created_at`, or a type mismatch that makes PostgreSQL cast the column rather than the parameter, such as
+an `integer` column compared with a `numeric` parameter) or the statistics are stale after rapid growth,
+so `ANALYZE messages` and compare. If the
 index is used but the query is still slow, look at actual versus estimated rows: one huge tenant can make
 the range scan return millions of rows, in which case the aggregate itself is the cost and a pre-aggregated
 daily table is the fix. Staging is fast simply because it is small; the planner's choice flips with data
@@ -204,7 +216,8 @@ volume, which is why plans must be checked against production-sized data.
 - [ ] The literal must be cast to timestamptz before the index can be used
 - [ ] B-tree indexes only support equality on integer columns
 > The index is ordered by the raw column. Applying a function hides the column from the planner; rewrite
-> as a range (`created_at >= '2026-10-20' AND created_at < '2026-10-21'`) or create an expression index.
+> as a range (`created_at >= '2026-10-20' AND created_at < '2026-10-21'`) or create an index on an
+> immutable expression such as `((created_at AT TIME ZONE 'UTC')::date)`.
 
 ### Q: An endpoint loads 500 conversations and then each conversation's last message via an ORM relationship. Which fix addresses the root cause?
 - [ ] Add an index on messages.content to speed up each lookup

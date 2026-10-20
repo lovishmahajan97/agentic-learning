@@ -4,8 +4,8 @@ module: ml-fundamentals
 name: Dropout / regularization
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - ml-fundamentals/optimizers
   - ml-fundamentals/normalization
@@ -91,6 +91,28 @@ is what "decoupled" means. Standard practice is to exclude biases and LayerNorm 
 because shrinking a scale parameter toward zero changes what the layer computes rather than how
 complex it is.
 
+### L1 versus L2: why one produces zeros
+The two penalties differ in how hard they pull as a weight approaches zero. The L2 gradient is λw, so
+the pull shrinks in proportion to the weight: small weights get a tiny push and settle at small but
+non-zero values wherever the data gradient balances it. The L1 (sub)gradient is λ·sign(w), a constant
+pull of size λ whatever the weight's magnitude, so any weight whose data gradient is weaker than λ is
+driven all the way to zero and held there. That is why L1 (the lasso) performs feature selection and
+L2 (ridge, weight decay) only shrinks. Optimizers implement L1 with a proximal step, soft-thresholding
+w ← sign(w)·max(|w| − ηλ, 0), *because* plain gradient steps on a non-differentiable kink oscillate
+around zero rather than landing on it. In Bayesian terms L2 is a Gaussian prior on the weights and L1 a
+Laplace prior, whose sharp peak at zero is the sparsity. Deep networks almost always use L2-style
+decay: sparsity in individual weights saves nothing on dense hardware, and smooth shrinkage interacts
+better with stochastic optimizers.
+
+### Early stopping as a regularizer
+Gradient descent from small initial weights fits the large, consistent directions in the data first
+and the noise-specific ones later, so the number of steps acts like a capacity budget. For linear
+least squares with gradient descent this can be made precise: stopping early behaves much like an L2
+penalty whose strength falls as training continues. In practice you evaluate the eval-mode validation
+metric every N steps, keep the best checkpoint, and stop after it has not improved for a patience
+window. It costs nothing in compute, which is why it is the first regularizer to apply, but it spends
+the validation split: the more checkpoints you pick among, the more optimistic that split's score becomes.
+
 ### Why the data regime decides
 Regularization trades fit for generalization, so it only pays when the model can overfit. A
 fine-tuning run that sees 5,000 examples for three epochs can memorize them; dropout and weight decay
@@ -148,6 +170,9 @@ opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
 - Label smoothing softens over-confident targets and often helps accuracy and reduces
   overconfidence, but it caps the confidence the model can express and changes the probability
   scale, so re-measure calibration before anything downstream consumes the probabilities.
+- L1 yields sparse, inspectable linear models, but among correlated features it keeps one more or
+  less arbitrarily and the choice changes between resamples; flip to L2 or elastic net when features
+  are correlated and you need stable coefficients rather than a short feature list.
 - Early stopping is the cheapest regularizer, but it ties your model to the validation split; if that
   split leaks or drifts, you stop at the wrong point.
 

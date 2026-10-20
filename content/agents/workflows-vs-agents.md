@@ -5,6 +5,7 @@ name: Workflows vs agents
 kind: decision
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -35,7 +36,7 @@ trajectories rather than steps, and the only honest evaluation is end to end.
 
 The two naive positions both lose. "Make everything an agent" is seductive because the demo is
 impressive: one prompt, tools, and it figures things out. In production it means unbounded cost per
-request, p99 latencies ten times the median, regressions you cannot localize, and an eval story that
+request, p99 latencies that can be many times the median, regressions you cannot localize, and an eval story that
 amounts to "run it and see". "Never use agents" is safe but caps you at the cases you foresaw: a
 document-processing pipeline cannot recover when the document is a kind it has never seen, and a
 support flow cannot investigate an account anomaly that requires three lookups whose order depends on
@@ -67,7 +68,8 @@ decides each next action and when to stop.
 
 ### What the choice changes
 - **Cost:** workflow cost is roughly fixed per request; agent cost is a distribution with a long tail.
-  Budget for the p95, not the mean.
+  Do not plan from the typical (median) run: the mean sits well above it, so plan totals from the mean
+  measured on a realistic sample that includes the tail, and set per-request caps from the p95 or p99.
 - **Latency:** workflows are predictable and can be parallelized by design; agent loops are serial by
   nature.
 - **Reliability:** workflow failures are per step, retriable in place; agent failures are per
@@ -111,7 +113,8 @@ invoices, and finding the cause means reading trajectories.
 
 The hybrid the team ships: the workflow for the 92% of invoices that validate cleanly, and the agent,
 with a 15-step budget and read-only tools, only for the exception route, with its proposed resolution
-gated for human approval. Cost rises by a fraction of the agent-only figure, the hard cases get handled,
+gated for human approval. The added cost is roughly 8% of invoices × five to eight times the per-invoice
+workflow cost, so about 40–65% above the pure workflow rather than 400–700%; the hard cases get handled,
 and the two parts are tested separately: unit tests for the workflow, a trajectory eval for the
 exception agent.
 
@@ -135,8 +138,9 @@ exception agent.
   every week, which means the path is not actually predictable and an agentic step is overdue.
 - Evaluating an agent with step-level unit tests; the symptom is green tests and a falling
   task-completion rate, because the failures are in the trajectory, not in any step.
-- Budgeting agent cost from the mean; the symptom is a monthly bill dominated by the 5% of runs that
-  ran to the step limit.
+- Budgeting agent cost from the typical run (the median, or a mean from a handful of demo runs); the
+  symptom is a monthly bill well above plan, dominated by the few percent of runs that ran to the step
+  limit.
 - Letting an agent step run without a budget, a restricted tool set or gates inside an otherwise fixed
   workflow; the symptom is the one agentic node producing all of the incidents.
 - Treating "agent" as a product requirement rather than a design choice; the symptom is a system that
@@ -157,7 +161,8 @@ modes, and describing a hybrid.
   agentic steps behind budgets and tool allowlists, and writes unit tests for steps and trajectory
   evals for agents.
 - **Architect:** Draws the boundary between deterministic and autonomous parts, sets cost and latency
-  budgets at the p95, and decides which exception paths justify an agent at all.
+  caps at the p95 (with totals planned from the measured mean), and decides which exception paths
+  justify an agent at all.
 - **FDE:** Translates a customer's process into a flowchart first, identifies the genuinely
   unpredictable steps, and sets expectations on cost variance and evaluation before promising autonomy.
 
@@ -184,13 +189,14 @@ workflow cannot handle, and widen autonomy only as those metrics and human agree
 > the flowchart, the predictable, cheaper, testable workflow wins; unforeseeable paths are the only
 > reason to pay for autonomy.
 
-### Q: Why should agent cost be budgeted from the p95 rather than the mean?
+### Q: Why is the cost of a typical (median) agent run a poor basis for an agent's budget?
 - [ ] Because token prices change over time
-- [x] Because agent run length has a heavy tail, and a small fraction of runs that hit the step budget can dominate total cost
-- [ ] Because the mean cannot be computed for agents
+- [x] Because agent run length has a heavy tail, so the mean sits well above the median and a small fraction of runs that hit the step budget can dominate total cost
+- [ ] Because the median ignores the cost of the system prompt
 - [ ] Because workflows always cost more than agents
-> Model-chosen paths vary in length; most runs are short and a few are very long. Fixed-path workflows
-> have little variance, which is one of their main advantages.
+> Model-chosen paths vary in length; most runs are short and a few are very long. Plan totals from a
+> mean measured on enough runs to include the tail, and cap individual runs at the p95 or p99. Fixed-path
+> workflows have little variance, which is one of their main advantages.
 
 ### Q: Which is the best description of a well-designed hybrid?
 - [ ] An agent that occasionally calls a classifier

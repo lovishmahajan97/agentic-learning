@@ -5,6 +5,7 @@ name: Error analysis
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -82,8 +83,10 @@ gap may need a different model or a different product decision.
 
 ### 5. Fix one thing and re-measure on the same sample
 Change the top-priority component, then re-run the same traces plus the eval set. Confirm that the
-target category shrank and that no other category grew. Measuring on the same sample removes sampling
-noise from the before/after comparison.
+target category shrank and that no other category grew. Measuring on the same sample removes
+input-sampling noise from the before/after comparison; it does not remove the model's own run-to-run
+variance, so treat a change of one or two traces as noise. Then confirm on a fresh sample, *because*
+a fix tuned while staring at these exact traces can overfit them.
 
 ### 6. Promote stable categories into evals
 Each category that survives a couple of rounds becomes (a) golden items — the failing traces with a
@@ -114,7 +117,8 @@ tier, 5; over-long or badly formatted, 3; other, 2. Retrieval is 36% of failures
 is mostly a metadata-filter problem, so the first fix is retrieval (hybrid search plus a tier filter);
 "guesses account data" is only 6 cases but highest severity, so it is second, fixed with a handoff
 rule and a deterministic grader. Re-running the same 100 traces after the retrieval fix: retrieval
-failures 13 → 4, contradictions unchanged at 7 (expected, generation was untouched), total 36 → 27.
+failures 13 → 4, wrong tier 5 → 2 (the tier filter), contradictions unchanged at 7 (expected,
+generation was untouched), total 36 → 24.
 The schema and the counting are a few lines:
 
 ```python

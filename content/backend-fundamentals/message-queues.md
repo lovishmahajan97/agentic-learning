@@ -5,6 +5,7 @@ name: Message queues (Kafka, SQS, RabbitMQ)
 kind: concept
 difficulty: core
 est_minutes: 18
+status: fact-checked
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/redis
@@ -23,8 +24,8 @@ sources:
 
 ## TL;DR
 A message queue puts a durable buffer between the code that produces work and the code that does it, so
-the two no longer have to be up, fast, or scaled the same way at the same moment. Every real broker
-delivers at least once, so consumers must be idempotent. Kafka is a replayable partitioned log, SQS is a
+the two no longer have to be up, fast, or scaled the same way at the same moment. Reliable delivery in
+every mainstream broker means at-least-once, so consumers must be idempotent. Kafka is a replayable partitioned log, SQS is a
 managed queue with no replay, and RabbitMQ is a flexible-routing broker; the choice follows from whether
 you need ordering, replay, routing or just a simple buffer.
 
@@ -64,8 +65,10 @@ A single queue consumed by one worker is ordered; the moment you add workers, me
 order. Kafka's answer is **partitions**: a topic is split into N ordered logs, a message's key decides its
 partition (same key, same partition, strict order), and a **consumer group** assigns each partition to
 exactly one consumer in the group. Parallelism is therefore capped by partition count, and a skewed key
-(one huge tenant) makes one partition hot. SQS FIFO queues offer the same idea with message group ids;
-SQS standard queues and RabbitMQ classic queues give best-effort ordering only.
+(one huge tenant) makes one partition hot. SQS FIFO queues offer the same idea with message group ids.
+SQS standard queues give best-effort ordering only. A RabbitMQ queue is FIFO as stored, but competing
+consumers and requeued redeliveries mean messages are not *processed* in order once there is more than
+one consumer or any failure.
 
 ### Backpressure and retries
 A queue only levels load if someone watches the **lag** (messages waiting, or the age of the oldest
@@ -83,7 +86,9 @@ offset. Durability comes from replicating each partition to several brokers and,
 compaction keeps the latest message per key, turning a topic into a changelog. Kafka is built for high
 throughput, many consumers of the same stream, and event sourcing; it costs an operations burden (or a
 managed service) and a rigid partition-based parallelism model. It is a poor fit for a small job queue
-where each job needs individual retry and priority.
+where each job needs individual retry and priority. Recent Kafka releases add share groups (KIP-932),
+queue-style consumption with per-message acknowledgement beyond the partition count; check its maturity
+on your version before relying on it.
 
 ### SQS: a managed queue without replay
 SQS is a fully managed queue: no brokers to run, near-unlimited throughput on standard queues, and
@@ -93,7 +98,8 @@ waits up to 20 seconds for messages instead of returning empty. Retention is bou
 messages are deleted when acknowledged, so there is no replay; a redrive policy moves messages to a DLQ
 after `maxReceiveCount` attempts. Standard queues are at-least-once with best-effort ordering; FIFO
 queues add ordering per message group and a deduplication id honoured for a five-minute window. Message
-size is small (a quarter of a megabyte historically; check current limits), so payloads go to S3.
+size is bounded (256 KiB for most of SQS's history, raised to 1 MiB in 2025; check current limits), so
+large payloads go to S3.
 
 ### RabbitMQ: a routing broker
 RabbitMQ implements AMQP: producers publish to an **exchange**, bindings route messages to **queues** by
@@ -111,8 +117,9 @@ table with `SKIP LOCKED` is often enough, and Redis-backed queues sit between th
 
 ## Example
 An SQS consumer for an embedding job. It long-polls, processes each message idempotently (the job id is
-the dedup key stored with the result), extends the visibility timeout while a slow model call runs so the
-message is not redelivered mid-flight, and deletes only after success. Failures are left to expire and
+the dedup key stored with the result), extends the visibility timeout of every message in the batch while
+they wait and while the slow model call runs, so none is redelivered mid-flight, and deletes only after
+success. Failures are left to expire and
 retry; the queue's redrive policy sends repeat offenders to a DLQ.
 
 ```python
@@ -135,11 +142,12 @@ def process(job):
 while True:
     resp = sqs.receive_message(QueueUrl=QUEUE, MaxNumberOfMessages=5,
                                WaitTimeSeconds=20, VisibilityTimeout=60)
-    for msg in resp.get("Messages", []):
-        stop = threading.Event()
-        hb = threading.Thread(target=extend_visibility,
-                              args=(msg["ReceiptHandle"], stop), daemon=True)
-        hb.start()
+    batch = resp.get("Messages", [])
+    stops = [threading.Event() for _ in batch]          # heartbeat all, not just the current one
+    for msg, stop in zip(batch, stops):
+        threading.Thread(target=extend_visibility,
+                         args=(msg["ReceiptHandle"], stop), daemon=True).start()
+    for msg, stop in zip(batch, stops):
         try:
             process(json.loads(msg["Body"]))
             sqs.delete_message(QueueUrl=QUEUE, ReceiptHandle=msg["ReceiptHandle"])
@@ -150,8 +158,10 @@ while True:
 ```
 
 `results`, `embed`, `load_chunks` and `log` are the application's own; the shape of the loop is what
-matters. With Kafka the same loop would poll a partition, process, then commit the offset; with RabbitMQ
-it would `basic_consume` with `prefetch_count=5` and `basic_ack` after success.
+matters. Without the batch-wide heartbeat, messages two to five would sit unprocessed while message one
+ran, their 60-second timeout would lapse, and another worker would receive them too. With Kafka the same
+loop would poll, process, then commit the offset; with RabbitMQ it would set `basic_qos(prefetch_count=5)`,
+`basic_consume`, and `basic_ack` after success.
 
 ## Trade-offs
 - Decoupling producers from consumers gains availability and burst tolerance, but the caller no longer
@@ -232,8 +242,9 @@ older than the current state. Add a DLQ so poison messages do not block either p
 - [ ] Kafka automatically increases the partition count to 8
 - [x] Four consumers sit idle, because each partition is assigned to at most one consumer in a group
 - [ ] Messages are round-robined across all 8 consumers regardless of partition
-> Parallelism within a consumer group is bounded by partition count. Extra consumers are standby only,
-> which is why partition count must be planned for peak consumer parallelism.
+> Parallelism within a classic consumer group is bounded by partition count. Extra consumers are standby
+> only, which is why partition count must be planned for peak consumer parallelism (newer share groups are
+> a separate mechanism with different rules).
 
 ### Q: Which situation makes SQS a better choice than Kafka?
 - [ ] Multiple independent teams need to replay the same event history

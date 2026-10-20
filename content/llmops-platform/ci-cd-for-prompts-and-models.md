@@ -5,6 +5,7 @@ name: CI/CD for prompts and models
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - backend-fundamentals/ci-cd
   - llmops-platform/evaluation-gates-for-production-releases
@@ -80,11 +81,18 @@ candidate's and the champion's answers on the same items is what a reviewer actu
 `evaluation-gates-for-production-releases` lesson covers the statistics.
 
 ### Content-addressed caching
-Eval cost is dominated by model calls, so every call is keyed by
-`hash(model id, params, prompt version, input)` and cached. A PR that touches one prompt re-runs only the
-items that use that prompt; a code-only PR often re-runs nothing and just re-scores. This is what makes a
-per-PR eval affordable, and it is also why the cache key must include every pin: a key that omits the
-model id will happily serve stale outputs after a model upgrade and hide the change.
+Eval cost is dominated by model calls, so the cache sits at the model-client boundary and every call is
+keyed by `hash(model id, decoding params, exact rendered request)`, where the rendered request is the full
+message list (prompt text, retrieved context, tool definitions) the application actually sends. Keying on
+the rendered request rather than on `(prompt version, item input)` matters: a code or index change that
+alters what gets retrieved or how the prompt is assembled changes the request and therefore misses the
+cache, whereas a key built only from the item's input would serve the old output and hide the change. A
+PR that touches one prompt re-runs only the items whose requests that prompt affects; a code-only PR that
+leaves every request byte-identical re-runs nothing and just re-scores. This is what makes a per-PR eval
+affordable, and it is also why the cache key must include every pin: a key that omits the model id will
+happily serve stale outputs after a model upgrade and hide the change. One consequence to accept
+knowingly: with temperature above zero, a cache hit replays one frozen sample, so the cached smoke eval
+measures that sample, not the sampling variance.
 
 ### Promote, do not rebuild
 The bundle that passed the release eval is promoted dev → staging → production by moving a pointer in
@@ -105,8 +113,9 @@ adapter arriving in the model registry the same way. The trigger differs; the la
 
 ## Example
 A PR-time smoke eval that sits as one job in the pipeline. The YAML fragment shows where it runs; the
-script shows the content-addressed cache and the comparison against the baseline written by the last
-green build of `main`. `call_app` and `score` are your harness's entrypoint and scorer.
+script shows the content-addressed cache wrapped around the model client and the comparison against the
+baseline written by the last green build of `main`. `call_app`, `llm_call` and `score` are your
+application's entrypoint (accepting an injected model client), your raw provider call and your scorer.
 
 ```yaml
 # .github/workflows/llm-ci.yml (fragment): trigger on anything that changes the bundle
@@ -115,7 +124,9 @@ on:
     paths: ["app/**", "prompts/**", "release.json"]
 jobs:
   smoke-eval:
+    runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - run: python scripts/smoke_eval.py --subset smoke   # nightly job runs --subset full
 ```
 
@@ -128,17 +139,17 @@ subset = sys.argv[sys.argv.index("--subset") + 1]
 items = [json.loads(l) for l in open(f"data/golden/{subset}.jsonl")]
 cache = pathlib.Path(".evalcache"); cache.mkdir(exist_ok=True)
 
-def key(item):   # every pin is in the key, so an unchanged (model, prompt, params, input) never re-calls the model
-    blob = json.dumps([bundle["model"], bundle["prompt"], bundle["params"], item["input"]], sort_keys=True)
-    return hashlib.sha256(blob.encode()).hexdigest()
-
-def run_item(item):
-    p = cache / key(item)
+def cached_llm(messages):   # key = model + params + the exact rendered request, so any change that alters it misses
+    blob = json.dumps([bundle["model"], bundle["params"], messages], sort_keys=True)
+    p = cache / hashlib.sha256(blob.encode()).hexdigest()
     if p.exists():
         return json.loads(p.read_text())
-    out = call_app(bundle, item["input"])                 # the production code path, not a copy of it
-    rec = {"id": item["id"], "output": out, "score": score(item, out)}
-    p.write_text(json.dumps(rec)); return rec
+    out = llm_call(bundle["model"], bundle["params"], messages)
+    p.write_text(json.dumps(out)); return out
+
+def run_item(item):
+    out = call_app(bundle, item["input"], llm=cached_llm)   # the production code path; only its model calls are cached
+    return {"id": item["id"], "output": out, "score": score(item, out)}
 
 results = [run_item(i) for i in items]
 mean = sum(r["score"] for r in results) / len(results)
@@ -227,5 +238,5 @@ incident's cases to the golden set so the regression is a permanent test.
 - [ ] Providers require it for billing attribution
 - [x] Without it, a model upgrade would be served stale cached outputs and the change would be invisible
 - [ ] Hashing is cheaper when the key is longer
-> The cache exists to skip calls whose inputs have not changed. If the model id is not part of the input
-> definition, swapping the model counts as "unchanged" and the eval silently measures the old model.
+> The cache exists to skip calls whose inputs have not changed. If the model id is not part of the key,
+> swapping the model counts as "unchanged" and the eval silently measures the old model's cached outputs.

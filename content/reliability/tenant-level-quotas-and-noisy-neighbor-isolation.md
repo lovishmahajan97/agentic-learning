@@ -5,7 +5,7 @@ name: Tenant-level quotas & noisy-neighbor isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - reliability/bulkheads
   - reliability/backpressure-and-load-shedding
@@ -75,11 +75,36 @@ the same as a tenant with one. Pair this with a per-tenant concurrency semaphore
 cannot hold every in-flight slot. Fair scheduling is work-conserving: when only one tenant is active it
 receives everything, which hard caps alone can never offer.
 
+### Be fair in the unit that is scarce
+Round-robin by *request* is not fair when requests differ in size. If A's queued requests are 20k-token
+summaries and B's are 400-token chats, one turn each per cycle gives A fifty times B's share of the
+token budget. Deficit round robin fixes this: each tenant's queue earns a quantum of, say, 8k tokens
+per cycle into a deficit counter, and dispatches requests from the head of its queue while the counter
+covers their (estimated) token cost, carrying the remainder forward. B sends up to twenty chats per
+cycle; A's 20k request waits until its counter has accumulated three cycles of quantum. Over time each
+active tenant receives an equal share of tokens, not of requests, and a tier weight is just a larger
+quantum.
+
+### Divide quotas hierarchically
+A tenant is rarely one actor. An enterprise customer has teams, end users and agents inside its quota,
+and one of them can starve the rest exactly as one tenant starves the fleet. The same mechanisms nest:
+a bucket per organization, and inside it a bucket or fair-share lane per user or API key, with a
+request admitted only if every level can cover it. Keep the levels few (organization, then user or
+workload) because each one is another counter on the hot path.
+
 ### Tier the isolation
 Pooled tenants share buckets and lanes. Tenants who pay for guarantees get a dedicated pool: their own
 provider key or model deployment, their own worker group, their own vector-index replica. This is the
 bulkhead pattern applied per tenant, and it is the only level at which a vendor-side limit (a per-key
 TPM cap) is genuinely isolated, because the vendor's limiter does not know your tenants exist.
+
+Between fully pooled and fully dedicated sits shuffle sharding. Assign each tenant a small random
+subset of the workers or replicas (say 2 of 8) and route its traffic only there. A tenant that poisons
+its workers, with a crash-inducing input or a pathological prompt, takes out its own shard, and any
+other tenant shares *both* of those workers only if it drew the same pair, which happens for 1 in 28
+tenants with 2-of-8. Isolation improves combinatorially without the cost of dedicated capacity, though
+it bounds the blast radius of a bad tenant rather than dividing capacity fairly, so it complements
+quotas rather than replacing them.
 
 ### Degrade before you deny
 When a tenant reaches its cap, the cheapest useful behavior is often not a 429 but a downgrade: route
@@ -121,6 +146,8 @@ class TenantLimiter:
         self.stamp[t] = now
 
     def reserve(self, t, est_tokens):
+        if est_tokens > self.cap:                            # can never fit: a 400, not a retryable 429
+            raise ValueError(f"request needs {est_tokens} tokens; per-minute cap is {self.cap:.0f}")
         self._refill(t)
         if self.level[t] < est_tokens:                       # reject now; queueing would hide overload
             raise QuotaExceeded(t, retry_after=(est_tokens - self.level[t]) / self.rate)
@@ -146,7 +173,8 @@ Notice the ordering: the reservation happens before the lane is taken and before
 a tenant over quota never occupies a slot. A failed call still charges the prompt tokens, so a retry
 storm counts against the tenant that caused it rather than against the shared pool. The 429 carries a
 `retry_after` computed from the refill rate, which gives well-behaved clients an honest wait instead of
-a guess.
+a guess. A request larger than the whole bucket is rejected as a client error instead, because a 429 for
+it would promise a retry that can never succeed and invite the client to loop.
 
 ## Trade-offs
 - Hard per-tenant caps guarantee isolation but strand capacity: if the caps sum to the provider limit,
@@ -172,6 +200,8 @@ a guess.
   silently grows on scale-out; provider 429s appear right after autoscaling events.
 - Attributing retries to the pool rather than the tenant. The symptom: a tenant's retry storm multiplies
   upstream load and every other tenant pays for it.
+- Fair-queuing by request count when request sizes vary. The symptom: per-tenant turn counts look equal
+  while the token share by tenant shows the large-prompt tenant taking most of the budget.
 - Identifying tenants by API key alone when a customer has many end users. The symptom: the customer
   complains that "our app is slow for some users", because one of their users is starving the rest
   inside a single quota.

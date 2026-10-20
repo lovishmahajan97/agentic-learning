@@ -5,7 +5,7 @@ name: Quantization quality evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/quantization
   - model-internals/perplexity
@@ -60,8 +60,10 @@ sampling and from divergence after a first wrong token. Three numbers come out o
 - **Perplexity delta** on held-out text: WikiText-2 and C4 are the conventional sets, but add a sample of
   *your* domain text, because that is where calibration mismatch shows.
 - **Mean KL divergence** `KL(P_fp16 || P_quant)` per token. KL catches cases where perplexity improves
-  by accident while the distribution moves; it is the most sensitive cheap signal. llama.cpp's perplexity
-  tool can save full-precision logits and report KL statistics against a quantized run.
+  by accident while the distribution moves; it is the most sensitive cheap signal. Look at the tail as
+  well as the mean (the 99th-percentile or maximum per-token KL), *because* damage concentrates on a few
+  positions and a small mean can hide a handful of badly wrong ones. llama.cpp's perplexity tool can save
+  full-precision logits and report KL statistics, including percentiles, against a quantized run.
 - **Top-1 agreement**: the fraction of positions where both models' argmax token matches. Under greedy
   decoding this is a direct proxy for how often the quantized model would have gone a different way.
 These are deterministic and take minutes, so they belong in CI for every new quantized artifact.
@@ -80,7 +82,15 @@ remove sampling noise, then repeat with the production configuration over severa
 same task graders; for open-ended outputs, use pairwise LLM-as-judge with the fp16 output as the
 reference and randomised position. Because every prompt is scored under both models, use *paired*
 statistics (paired bootstrap or a sign test on per-item wins) rather than comparing two independent
-means; pairing can shrink the detectable effect size substantially at the same sample size.
+means. The arithmetic shows why. On 300 items at 80% accuracy, two independent runs give a standard error
+on the difference of √(2 × 0.8 × 0.2 / 300) ≈ 3.3 points, a 95% interval of about ±6.4. If the models
+disagree on only 15 items (5%), the paired standard error is roughly √(0.05 / 300) ≈ 1.3 points, an
+interval near ±2.5: the same data now resolves effects less than half the size.
+
+Count the *flips* as well as the net change: items that went correct → wrong and wrong → correct. A
+quantized model can hold accuracy flat while 10 answers break and 10 others happen to improve, and the
+users who owned those 10 broken answers see a regression the average hides. The flip count is also the
+discordant count that drives the paired statistics, so it costs nothing extra to report.
 
 ### Step 4: stress the known weak spots
 Add targeted slices *because* average scores mask them: long-context retrieval (needle-style prompts at
@@ -159,6 +169,8 @@ print(f"ppl fp16={math.exp(nll16/n):.3f}  ppl 4bit={math.exp(nll4/n):.3f}")
   separately, since long-context failures usually trace to the cache.
 - Declaring a 0.8-point accuracy drop "within noise" or "significant" without a confidence interval
   from paired per-item results.
+- Reporting only net accuracy. Equal numbers of fixed and broken items cancel in the mean; the symptom
+  is an eval that says "no change" followed by specific, reproducible complaints from production users.
 
 ## When to use
 Run the full ladder whenever a quantized artifact is a candidate for production: a new checkpoint, a new
@@ -186,8 +198,9 @@ depends on long inputs, exact numbers and dates, and valid structured output, wh
 categories that degrade first, and none were measured. I would ask for KL and top-1 agreement on a sample
 of their contracts, a paired comparison of extraction accuracy and JSON validity on their golden set under
 identical prompts and decoding, a long-context slice at their maximum document length, separate tests if
-the KV cache is quantized, and confidence intervals on every delta. A 0.3-point MMLU drop without an
-interval is not evidence either way.
+the KV cache is quantized, and confidence intervals on every delta, plus the list of flipped items
+so someone reads what actually broke. A 0.3-point MMLU drop without an interval is not evidence either
+way.
 
 ## Quiz
 ### Q: Why is per-token KL divergence a better early signal of quantization damage than perplexity alone?

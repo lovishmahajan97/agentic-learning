@@ -5,7 +5,7 @@ name: Model routing / cascading
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - system-design/model-selection
   - system-design/slm-vs-llm-trade-offs
@@ -65,6 +65,15 @@ costs money. The threshold is set by the cost ratio and the quality penalty you 
 tuned on an eval set, and then monitored per route in production because the error rates drift as prompts
 and models change. The router's own cost must be small next to the saving *because* it runs on every
 request: a 30 ms classifier is free, a 2 s LLM call usually is not.
+
+The threshold has a simple form worth deriving. Let the router estimate `p`, the probability that the
+small model's answer is adequate, and let `L` be the cost of an inadequate answer in the same units as
+tokens (a retry, a human escalation, a lost customer). Sending the request small is worth it when
+`c_small + (1 − p) × L < c_large`, so route small when `p > 1 − (c_large − c_small) / L`. With
+illustrative costs c_small = 1 and c_large = 15, a bad answer costing 50 gives a threshold of p > 0.72;
+a bad answer costing 500 (a billing dispute) pushes it to p > 0.972, and only requests the router is
+almost certain about go small. The threshold therefore encodes the business cost of a miss, not the
+router's accuracy, which is why one router can need a different threshold per feature.
 
 ### Cascading: decide after a cheap attempt
 Call the small model; run a check; return if it passes, escalate if it fails. The check is the whole
@@ -189,10 +198,12 @@ signal comes from and why self-reported confidence is not it.
 satisfaction. Design a routing or cascading approach and explain how you would prove it did no harm.
 **A:** Start with data: sample a few thousand recent requests, answer each with both the small and the
 large model, and have a judge plus a human sample label whether the small answer was adequate. That gives
-the easy share, which bounds the achievable saving, and labelled data for a router. If the easy share is
-around 60% or more, a cascade with a deterministic gate plus a cheap judge, or a trained router if p95
-latency is tight, can reach the target; compute expected cost with the formula and the measured
-escalation rate. To prove no harm: offline eval per route on the labelled set; an online A/B against the
+the easy share, which bounds the achievable saving, and labelled data for a router. Then do the
+arithmetic: with unit costs of 1 for the small model, 0.5 for the check and 15 for the large one, halving
+spend means 1.5 + 15 × p_escalate ≤ 7.5, so at most 40% may escalate, which needs an easy share of at
+least 60% even with a perfect check. If the measured share clears that with margin, a cascade with a
+deterministic gate plus a cheap judge (or a trained router if p95 latency is tight) can reach the
+target; if it does not, no router will, and the conversation moves to prompt length or caching. To prove no harm: offline eval per route on the labelled set; an online A/B against the
 all-large baseline on resolution rate and satisfaction; a permanent few-per-cent shadow slice served by
 the large model to track the gap continuously; and alerts on escalation rate and judge disagreement. Also
 check tail latency per route and that answer consistency is acceptable for the product.

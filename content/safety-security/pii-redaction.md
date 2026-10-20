@@ -5,7 +5,7 @@ name: PII redaction
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - security-governance-compliance/pii-protection-dlp
   - safety-security/data-leakage
@@ -30,8 +30,8 @@ model useful while raw values stay inside your boundary.
 An LLM feature multiplies the places where user text lives. The prompt goes to a vendor. Tracing tools
 store full prompts and completions by default, because that is what makes them useful for debugging.
 Eval sets get built from production traces. Chunks and their embeddings sit in a vector index
-indefinitely, and an embedding of a sentence containing a phone number is still that phone number for
-anyone who can query the index. Fine-tuning sets are copied from the same traces. Finally, model
+indefinitely; the index usually stores the chunk text next to the vector, and embeddings themselves can
+be partially inverted back to text, so a phone number embedded is a phone number retained. Fine-tuning sets are copied from the same traces. Finally, model
 output is text shown to a person, and the person may not be the one the data belongs to.
 
 Data-protection law (GDPR's data-minimisation principle, HIPAA for health data, PCI DSS for card data,
@@ -88,12 +88,27 @@ for reversible mappings lives separately from logs with a time-to-live measured 
 ### Consistency and re-hydration
 The same value must map to the same placeholder within a session so the model can follow references.
 Re-hydration replaces placeholders only when the viewer is authorised to see the original, which ties
-redaction to the same access-control decisions as retrieval.
+redaction to the same access-control decisions as retrieval. Two mechanical details bite in practice.
+With streaming, a placeholder can arrive split across chunks (`<EMA` then `IL_1>`), so the re-hydrator
+must buffer from any `<` until the placeholder closes. And the model may rewrite a placeholder
+(`EMAIL_1`, `<Email 1>`) or invent one that is not in the vault; match leniently, and leave anything
+unknown unresolved rather than guessing.
+
+### Redaction is not anonymisation
+Removing direct identifiers leaves quasi-identifiers, and a handful of them together (birth date,
+postcode, sex, employer, a rare condition) can single out one person; this re-identification by
+linkage is a well-documented result in privacy research. A model with world knowledge makes it worse,
+because it can resolve "<PERSON_1>, the CEO of the company in the previous paragraph" by itself. Treat
+redacted text as pseudonymised personal data, which is what data-protection law calls it, not as
+anonymous data that is free to share.
 
 ### Measuring
-Label a sample of real traffic per entity type and track precision and recall; recall failures are the
-dangerous ones. Run a stricter, slower detector over logs after the fact to estimate the leak rate of
-the fast path.
+Label a sample of real traffic per entity type and track precision (share of redactions that were
+really PII) and recall (share of real PII that was caught). Recall failures are the dangerous ones and
+they never reach zero: at an illustrative 99% recall and 10,000 identifiers a day, about 100 a day still
+land in the logs. Redaction therefore *reduces* exposure; the redacted stores still need access control
+and retention limits. Run a stricter, slower detector over logs after the fact to estimate the leak
+rate of the fast path, and treat precision as a utility metric: over-redaction quietly breaks the task.
 
 ## Example
 A self-contained redactor: checksum-validated card detection, consistent typed placeholders, and a
@@ -144,6 +159,12 @@ print(safe)  # Hi, I'm Dana (<EMAIL_1>, <PHONE_1>). Card <CARD_1> was charged tw
 # `safe` is what the model, the trace and the log see. The model answers "I'll refund <CARD_1>"
 # and r.rehydrate(reply) restores the value on the way back to the authorised user only.
 # "Dana" survived: names have no format, so they need an NER recognizer such as Presidio's.
+
+print(Redactor().redact("Order 1234567890123456 shipped 2026-09-30; call me on 07700 900123."))
+# Order <PHONE_1> shipped <PHONE_2>; call me on <PHONE_3>.
+# The Luhn check correctly refused to call the order number a card, but the loose phone pattern then
+# swallowed it and the date: precision failures that break a support workflow. Real phone detection
+# needs per-locale rules (or a library such as phonenumbers) plus context words, not one regex.
 ```
 
 ## Trade-offs
@@ -173,6 +194,9 @@ print(safe)  # Hi, I'm Dana (<EMAIL_1>, <PHONE_1>). Card <CARD_1> was charged tw
   logs through tool results.
 - Re-hydrating for whoever receives the output rather than checking authorisation; the symptom is one
   tenant's phone number in another tenant's shared dashboard.
+- Assuming the model returns placeholders verbatim; the symptom is users seeing raw `EMAIL_1` or
+  `<Email 1>` strings because re-hydration matched only the exact token, or a split placeholder in
+  streamed output.
 - Using plain hashing as a pseudonym; the symptom is a security review reversing every phone-number hash
   by enumerating the number space in minutes.
 

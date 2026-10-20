@@ -5,7 +5,7 @@ name: Reasoning models / test-time compute
 kind: concept
 difficulty: core
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - prompting/chain-of-thought
   - model-internals/sampling-strategies
@@ -89,19 +89,31 @@ to optimise. Majority voting needs discrete answers; for free-form outputs you f
 pairwise comparison, which brings its own error rate.
 
 ### How a reasoning model is trained, in outline
-Start from a pre-trained and usually instruction-tuned model. Run RL on problems with checkable answers.
-DeepSeek-R1 used GRPO: sample a group of responses per prompt, score each with rule-based rewards for
-correctness and format, compute each response's advantage relative to the group's mean, and update the
-policy toward higher-advantage responses. Trace length grows over training as the model discovers that
-checking its work pays. A later stage adds supervised fine-tuning on curated traces plus another RL round
-for readability and general tasks. Distillation then transfers much of the capability: fine-tuning smaller
-models on traces from the big reasoner gives small models that reason far better than their size suggests,
-with the gains concentrated on the distilled domains.
+Start from a strong pre-trained model and run RL on problems with checkable answers. DeepSeek-R1 used
+GRPO: sample a group of responses per prompt (say 16), score each with rule-based rewards for a correct
+final answer and the required format, and give each response an advantage equal to its reward minus the
+group mean, divided by the group's standard deviation. The policy is pushed toward above-average responses
+and away from below-average ones. The group baseline is the design choice that matters: PPO needs a learned
+value network as large as the policy to estimate "how good was this state", and GRPO replaces it with the
+other samples for the same prompt, which halves the models in memory and avoids training a critic on long,
+sparse-reward traces. Rule-based rewards are chosen over a learned reward model because a learned scorer
+can be gamed over long RL runs, while "does the answer equal 42" or "do the tests pass" cannot.
+
+DeepSeek-R1-Zero applied this directly to the base model, and trace length grew over training as the
+policy found that checking its work raised reward; but its traces mixed languages and were hard to read.
+R1 therefore added a small supervised "cold start" on curated long-reasoning examples before RL, then a
+round of supervised fine-tuning on rejection-sampled traces plus general data, then a final RL stage
+covering general helpfulness as well as reasoning. Distillation then transfers much of the capability:
+fine-tuning smaller models on traces from the big reasoner gives small models that reason far better than
+their size suggests, with the gains concentrated on the distilled domains.
 
 ### What you control at inference
 A thinking budget or effort level, under vendor-specific names; whether the trace is returned, hidden or
 summarised; temperature and N for your own parallel sampling; and stopping rules such as an agreement
-threshold. Thinking tokens are billed as output tokens, the whole trace precedes the first answer token, and
+threshold. Open-weight setups can also force the budget directly: cap thinking by inserting the
+end-of-thinking marker, or extend it by suppressing that marker and appending a word such as "Wait" (the
+"budget forcing" used in the s1 work), which is a crude but direct way to trace an accuracy-versus-tokens
+curve. Thinking tokens are billed as output tokens, the whole trace precedes the first answer token, and
 the trace competes with your prompt for context.
 
 ### Limits
@@ -112,7 +124,9 @@ the trace competes with your prompt for context.
 - **Domain.** Gains concentrate where answers are verifiable; on open-ended writing or on questions
   bottlenecked by knowledge rather than reasoning, retrieval helps more than thinking.
 - **Variance.** Results fluctuate between runs more than single-shot answers do, so evaluate with several
-  runs and report pass@k or pass^k, not one number.
+  runs and report pass@k or pass^k, not one number. pass@k is the probability that at least one of k
+  attempts succeeds, the right metric when a verifier will pick the winner; pass^k is the probability that
+  all k succeed, the right metric when a user or agent gets one shot each time and must be reliable.
 
 ## Example
 Self-consistency with early stopping and an escalation signal. If a single chain is right 70% of the time
@@ -147,6 +161,9 @@ def solve(question, n_max=8, n_min=3, stop_agreement=0.8):
             "escalate": count / n_max < 0.5}             # low agreement: route to a stronger model or review
 
 print(solve("A train leaves at 09:40 and arrives at 13:05. How many minutes is the journey?"))
+# Correct: 205 (3 h 25 min). A common slip is 275 (4 h 35 min, subtracting the minutes the wrong way
+# round). If, say, 3 of the first 3 samples say 205, agreement is 1.0 and the loop stops after 3 calls;
+# a 2-vs-1 split (0.67) keeps sampling, which is where the extra compute goes.
 ```
 
 Swap the vote for a verifier when one exists: run the unit tests on each sampled patch and return the first

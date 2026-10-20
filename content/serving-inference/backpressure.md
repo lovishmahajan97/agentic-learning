@@ -5,7 +5,7 @@ name: Backpressure
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/timeouts
@@ -91,6 +91,17 @@ reads them, so the application buffers; the engine keeps generating and holding 
 that may have gone away. Bound the per-connection buffer, detect disconnects, and cancel the generation
 (see cancellation), otherwise capacity leaks to dead streams.
 
+### The caller's half of the loop
+A rejection only relieves pressure if the caller slows down. Well-behaved clients honour `Retry-After`,
+back off with jitter, and cap retries with a budget (see retry strategies); a good internal client also
+shrinks its own concurrency when it sees 503s and grows it slowly on success (additive increase,
+multiplicative decrease, the same rule TCP uses), because that converges on the server's real capacity
+without either side knowing the number in advance. If your callers are your own services, enforce this
+in the shared client library; if they are external, assume some will retry immediately and size the
+edge rejection path to absorb it. Three controls are easy to confuse here: *rate limiting* caps one
+caller's share regardless of server health, *backpressure* is the signal that the server as a whole is
+full, and *load shedding* is the act of dropping work once that signal fires. A system needs all three.
+
 ### Queues as deliberate backpressure
 For non-interactive work a durable queue with a bounded consumer pool turns rejection into latency:
 producers enqueue freely, consumers pull at the GPU's pace. This only works if the queue has a maximum
@@ -122,7 +133,7 @@ async def generate(req: Request):
     queue_wait_ms = (time.monotonic() - t0) * 1000   # export as a histogram: this IS the pressure signal
     try:
         if await req.is_disconnected():               # caller gave up while queued: do no GPU work
-            return Response(status_code=499)
+            return Response(status_code=499)          # nginx's "client closed request" convention
         return await call_engine(body)               # vLLM / provider call, with its own timeout
     finally:
         sem.release()

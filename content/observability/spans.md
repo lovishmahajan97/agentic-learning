@@ -5,7 +5,7 @@ name: Spans
 kind: concept
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - observability/tracing
   - observability/distributed-tracing-across-services
@@ -60,7 +60,9 @@ because they are the lingua franca.
   be read as network and queueing time.
 - `status`: unset, `OK`, or `ERROR` with a description. Recording an exception on a span does not by
   itself mark it failed; you set the status, *because* a caught, retried failure inside an otherwise
-  successful operation should not paint the operation red.
+  successful operation should not paint the operation red. OpenTelemetry's convention is that
+  libraries leave a successful span `UNSET` and only application code asserts `OK`, so backends treat
+  "not error" as success.
 - `attributes`: key-value pairs with primitive or array values. This is where LLM semantics live.
 - `events`: timestamped points inside the span, each with its own attributes, for things that happen
   *during* an operation but are not operations themselves: first token received, retry attempted,
@@ -74,6 +76,20 @@ exactly once. "Current" lives in a context (a `ContextVar` in Python, `AsyncLoca
 a child started anywhere downstream can discover its parent. The end must happen on every exit path,
 which is why idiomatic APIs are context managers or decorators: a span that is never ended never
 exports, and the trace then looks truncated at exactly the step that failed, the one you most wanted.
+
+Ending a span freezes it. Attributes set afterwards are dropped (the SDK at most logs a warning),
+which bites streaming code hardest: if a function opens a span, starts a provider stream and returns
+the iterator, the span ends when the function returns, milliseconds in, while the tokens, the
+first-token time and the usage all arrive later during iteration. The span must stay open until the
+stream is exhausted, so wrap the iteration itself (a generator that holds the span) rather than the
+call that creates the stream.
+
+Finished spans go to a *span processor*. A simple processor exports synchronously as each span ends,
+which is fine for a demo and puts the exporter's network call on your request path in production. A
+batch processor queues ended spans and exports them in the background, *because* tracing must never
+add the backend's latency to the user's; the cost is that its queue is bounded, so under overload or a
+dead backend it drops spans rather than block, and an abrupt process exit loses whatever was still
+queued unless the provider is shut down (flushed) on exit.
 
 ### Attributes for LLM spans
 What to record follows from the questions you will ask. For a generation span: provider, model id,
@@ -101,7 +117,8 @@ payload or by reference, nothing per-user in names.
 ## Example
 A streaming generation instrumented with the OpenTelemetry SDK. The console exporter prints two
 spans sharing one `trace_id`; the `generation` span has the root's id as its parent, carries model
-and usage attributes, and holds a `first_token` event from which TTFT can be derived. The attribute
+and usage attributes, and holds a `first_token` event from which TTFT can be derived. The span is
+held open across the whole iteration of the stream, which is why its duration and usage are real. The attribute
 names follow the `gen_ai.` conventions; verify them against the current spec before relying on them.
 `start_as_current_span` already records uncaught exceptions and sets the error status; the explicit
 handler is there to show the mechanism.
@@ -114,7 +131,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExpor
 from opentelemetry.trace import Status, StatusCode
 
 provider = TracerProvider()
-provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))  # demo; Batch in prod
 trace.set_tracer_provider(provider)
 tracer = trace.get_tracer("support-bot")
 
@@ -172,6 +189,11 @@ with tracer.start_as_current_span("chat.turn") as root:
   thousands of distinct operations with one data point each, so no latency chart is possible.
 - Recording an exception without setting the status, or the reverse; the symptom is error-rate
   dashboards that disagree with the exceptions visible in the trace detail.
+- Wrapping the function that *creates* a provider stream instead of the loop that consumes it; the
+  symptom is generation spans lasting a few milliseconds with no usage or first-token event while the
+  root span takes seconds.
+- Shipping the simple (synchronous) span processor to production; the symptom is request latency that
+  rises whenever the trace backend is slow, and requests that hang when it is down.
 - Capturing the prompt *template* instead of the rendered prompt; the symptom is a span that cannot
   reproduce the model's behaviour because the variables, truncation and history are missing.
 

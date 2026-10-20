@@ -5,6 +5,7 @@ name: Context compaction / summarization
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/agent-memory
@@ -60,8 +61,10 @@ to a file the model can grep, because a 12,000-line log is almost never read in 
 has acted on an observation, replace it in the transcript with a short stub ("output of 40 KB pruned;
 re-run the tool if needed"). Keep the last K observations intact, because the model may still be reading
 them. Pruning is lossless in a practical sense when tools are idempotent: the information is one call
-away. This layer alone often doubles the achievable run length, because tool output is typically the
-large majority of tokens in a tool-heavy run.
+away. In a tool-heavy run, tool output is typically the large majority of tokens, so this layer alone
+can extend the achievable run length several-fold (how much depends entirely on your output mix; measure
+it). Stubbing an old observation is still a prefix edit, though: everything after the first stubbed
+message misses the prompt cache, so batch stubbing at compaction time rather than doing it every step.
 
 ### Layer 2: summarize across a threshold
 When the transcript crosses a trigger (a fraction of the window, say 60–80%, leaving headroom for the
@@ -82,9 +85,10 @@ compaction meets agent memory: the summary is short-term memory, the file is lon
 
 ### Boundaries and the prompt cache
 Cut only at message boundaries, and never separate a tool call from its result: APIs reject orphaned
-tool results, and a call whose result vanished invites the model to hallucinate one. Compaction rewrites
-the prefix of the prompt, so the next call misses the prompt cache entirely; do it rarely and in large
-chunks rather than a little every step. Tell the model it happened ("earlier context was compacted;
+tool results, and a call whose result vanished invites the model to hallucinate one. Prompt caches match
+the longest unchanged prefix, so any compaction (a summary or a stubbed observation) means the next call
+misses the cache for everything after the first changed message; only the pinned head (system prompt,
+tools, task) still hits. Do it rarely and in large chunks rather than a little every step. Tell the model it happened ("earlier context was compacted;
 summary follows"), because otherwise it will refer to things it believes it can still see.
 
 ### What must survive
@@ -93,9 +97,10 @@ decisions already made and their reasons, identifiers of things created, user pr
 results survive. Anything cheaply re-derivable (file contents, search results) can go.
 
 ## Example
-A compaction step that runs before each model call. It prunes old tool outputs first, because that is
-cheap and leaves most of the cached prefix intact, and only summarizes when pruning is not enough. The
-summary is JSON and is validated before it replaces the old span.
+A compaction step that runs before each model call. It prunes old tool outputs first, because that needs
+no extra model call and loses nothing that a re-run cannot recover, and only summarizes when pruning is not
+enough. Both are prefix edits, so the cache is rebuilt after either; the threshold check keeps them rare.
+The summary is JSON and is validated before it replaces the old span.
 
 ```python
 import json
@@ -118,7 +123,7 @@ def compact(messages, llm, count_tokens):
         return messages
     messages = prune_old_outputs(messages, KEEP_RECENT)
     if count_tokens(messages) < TRIGGER * LIMIT:
-        return messages                      # pruning was enough; most of the cached prefix survives
+        return messages                      # pruning was enough; no summary call needed
     pinned, old, recent = messages[:2], messages[2:-KEEP_RECENT], messages[-KEEP_RECENT:]
     while recent and recent[0]["role"] == "tool":       # never split a tool call from its result
         old.append(recent.pop(0))

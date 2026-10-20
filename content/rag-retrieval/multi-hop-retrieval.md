@@ -5,6 +5,7 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
+status: fact-checked
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/agentic-rag
@@ -29,9 +30,10 @@ reading: retrieve, extract the bridging fact, form the next query, repeat under 
 
 ## Why it exists
 The failure here is not a ranking problem, so none of the usual ranking fixes apply. The document that
-says "Alice reports to Bob" shares no terms and no topic with "incident 4812"; its embedding is nowhere
-near the question's, and its BM25 score is zero. Raising k does not help, because the passage is not in
-the tail of the ranking, it is outside the ranking altogether. A reranker cannot promote a candidate
+says "Alice reports to Bob" shares no distinctive terms and no topic with "incident 4812"; its embedding
+is nowhere near the question's, and its BM25 score is at best an incidental match on a common word such
+as "report". Raising k does not help, because the passage is not in the affordable tail of the ranking:
+it sits so far down, among thousands of unrelated passages, that it is effectively outside it. A reranker cannot promote a candidate
 that was never retrieved. Query rewriting cannot invent the name Alice before anyone has read the
 incident report. The only way to reach the second document is to read the first, pull out the bridging
 entity, and search again with it.
@@ -193,11 +195,12 @@ slice.
 ## Quiz
 ### Q: Why does increasing top-k not help a bridge-type multi-hop question?
 - [ ] Larger k slows the reranker too much
-- [x] The second document shares no terms or topic with the question, so it is not in the ranking at all, not merely low in it
+- [x] The second document shares no distinctive terms or topic with the question, so it ranks far below any affordable cut-off, not merely just outside the top-k
 - [ ] Vector indexes cap results at a fixed number
 - [ ] Multi-hop questions require sparse retrieval
-> Ranking fixes only reorder candidates that scored at all; a passage about "Alice reports to Bob" has
-> no similarity to "incident 4812" until the name Alice is known, which requires reading the first hop.
+> Ranking fixes only reorder candidates that made the candidate list; a passage about "Alice reports to
+> Bob" has no meaningful similarity to "incident 4812" until the name Alice is known, which requires
+> reading the first hop.
 
 ### Q: Which termination condition is sufficient on its own for a multi-hop loop?
 - [ ] The model's "done" signal

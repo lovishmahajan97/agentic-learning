@@ -4,8 +4,8 @@ module: serving-inference
 name: Engines (vLLM, SGLang, TGI, TensorRT-LLM, Ollama, llama.cpp)
 kind: tool
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - serving-inference/model-serving
   - serving-inference/continuous-batching
@@ -58,6 +58,29 @@ equivalent), prefix sharing across requests, quantized weight formats (AWQ, GPTQ
 OpenAI-compatible HTTP server with streaming, and grammar-constrained decoding. They differ in emphasis,
 hardware reach, model format and how much work it takes to run them.
 
+### A request's path through a datacenter engine
+1. **Startup sizing.** The engine loads weights, runs a profiling pass to measure peak activation
+   memory, and turns whatever remains of its memory allowance into a fixed pool of KV blocks. In vLLM
+   the allowance is `--gpu-memory-utilization` × GPU memory, so the KV pool is that minus weights minus
+   activations; the startup log reports the resulting capacity in tokens. Everything later is bounded by
+   this pool, *because* KV memory, not compute, is what limits concurrency.
+2. **Admission.** The HTTP layer applies the chat template, tokenizes, and hands the request to the
+   scheduler's waiting queue. Applying the template inside the engine is why a wrong template corrupts
+   output silently: the model sees a format it was never trained on.
+3. **Scheduling each step.** Every iteration the scheduler picks which waiting requests to prefill and
+   which running ones to decode, subject to the sequence cap and free blocks. Prefill is often split
+   into chunks so a 30k-token prompt does not stall every running decode for a whole step.
+4. **Prefix lookup.** Before prefilling, the engine checks whether the prompt's leading blocks are
+   already cached and reuses them, so only the new suffix is computed.
+5. **Decode and stream.** Each step emits one token per running sequence (more with speculative
+   decoding), applies any grammar mask for structured output, detokenizes incrementally and streams.
+6. **Finish or preempt.** On a stop condition the blocks return to the pool. If a running sequence needs
+   a block and none is free, the engine preempts some sequence and recomputes or swaps its cache later,
+   which shows up as latency spikes rather than errors.
+
+The engines differ mainly in steps 3 to 5: scheduler policy, how prefixes are matched, and how fast the
+kernels are, which is why they must be compared on your traffic rather than on a single prompt.
+
 ### vLLM
 The engine that introduced PagedAttention. Python-first, loads Hugging Face checkpoints directly,
 supports the widest range of models and several hardware backends (NVIDIA first, AMD and others
@@ -80,7 +103,8 @@ Hugging Face's server: a Rust router in front of Python model shards, continuous
 attention, several quantization backends, token streaming, and an OpenAI-style Messages API. Its draw is
 integration with the Hub and Inference Endpoints; if your fleet already lives in the Hugging Face
 ecosystem it is the shortest path. Its feature pace on the newest serving tricks has generally trailed
-vLLM and SGLang.
+vLLM and SGLang, so check the project's current maintenance status and roadmap before choosing it for a
+new deployment.
 
 ### TensorRT-LLM
 NVIDIA's engine. Its distinctive workflow compiles models ahead of time into TensorRT engines specialised
@@ -153,6 +177,15 @@ stream("vllm", "Explain continuous batching in two sentences.")
 stream("ollama", "Explain continuous batching in two sentences.")
 # Same code, two engines: what differs is throughput under concurrency, not the API.
 ```
+
+What do those vLLM flags buy on one 80 GB GPU? Llama-3.1-8B has 32 layers, 8 KV heads and head
+dimension 128, so in bf16 each token's cache is 2 × 32 × 8 × 128 × 2 bytes = 128 KiB. The memory
+allowance is 0.90 × 80 = 72 GB; weights take about 16 GB; allow a few GB for activations and CUDA
+graphs (illustrative), leaving roughly 52 GB of KV pool, or about 400,000 tokens. That is only about 48
+sequences at the full 8,192-token context, so `--max-num-seqs 128` is reachable only if the average
+live sequence is around 3,000 tokens or less; beyond that, the scheduler holds requests in the waiting
+queue or preempts. Raising `--max-model-len` to 32k does not change the pool, it only lets fewer, longer
+sequences use it.
 
 ## Trade-offs
 - vLLM's breadth (models, hardware, features) comes with a fast-moving codebase; pinning versions and
@@ -232,15 +265,15 @@ fixed.
 - [ ] TGI
 > TensorRT-LLM builds a TensorRT engine specialised to the GPU type, batch and sequence limits, which
 > enables aggressive kernel fusion but means a rebuild when hardware or limits change. The others load
-> checkpoints at startup and never need a build step.
+> checkpoints at startup and need no per-GPU build step.
 
 ### Q: What is the relationship between Ollama and llama.cpp?
 - [ ] They are independent implementations of the same GGUF specification
 - [x] Ollama packages llama.cpp with a model registry, a REST API and defaults for local use
 - [ ] llama.cpp is a GPU-only fork of Ollama
 - [ ] Ollama is the datacenter version of llama.cpp with continuous batching
-> Ollama's inference core is llama.cpp; it adds pulling models, a Modelfile, an HTTP API and device
-> detection. It inherits llama.cpp's strengths on commodity hardware and its limits under many concurrent
+> Ollama is built on llama.cpp and its ggml library; it adds pulling models, a Modelfile, an HTTP API
+> and device detection. It inherits llama.cpp's strengths on commodity hardware and its limits under many concurrent
 > users.
 
 ### Q: Which workload benefits most from SGLang's RadixAttention relative to a standard paged KV cache?
@@ -249,5 +282,6 @@ fixed.
 - [ ] Offline batch embedding of documents
 - [ ] CPU-only inference on edge devices
 > RadixAttention stores the KV cache as a radix tree over token sequences, so any request whose prefix
-> matches a cached one reuses it without recomputation. The win scales with how much prefix is shared,
-> which is largest in multi-turn and agent traffic.
+> matches a cached one reuses it without recomputation. vLLM's block-hash prefix caching also reuses
+> shared prefixes, so the gap is one of degree; it is largest in multi-turn and agent traffic, where
+> branching conversations share long, irregular prefixes.

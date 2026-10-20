@@ -5,6 +5,7 @@ name: Experiment tracking (MLflow, W&B)
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - llmops-platform/model-registry
   - llmops-platform/reproducible-evaluations
@@ -47,7 +48,9 @@ a specific schema and a UI on top, which is what a tracker is.
 ## How it works
 ### The data model both tools share
 An **experiment** (MLflow) or **project** (W&B) groups **runs**. A run has **parameters** fixed at start
-(immutable, because changing them mid-run would make comparisons meaningless), **metrics** logged as time
+(treated as immutable, because changing them mid-run would make comparisons meaningless; MLflow rejects
+re-logging a param with a different value, while W&B lets `config` be updated but that is an escape hatch,
+not the model), **metrics** logged as time
 series against a step or epoch (so you can see divergence or over-fitting at step *k*, not just the
 final number), **artifacts** which are files (checkpoints, per-item eval outputs, plots, configs),
 **tags** for free-form filtering, and automatically captured context: git commit, command line, Python
@@ -61,13 +64,14 @@ Blob for files), which is why self-hosting is a container plus a database plus a
 it adds a model registry with versions and aliases, a packaging format with "flavours" (`pyfunc`,
 `transformers`, `sklearn` and others) that lets any registered model be loaded with one call, and
 autologging integrations that capture params and metrics from common training frameworks without
-explicit calls. The 3.x line added GenAI features — tracing, an evaluation API and a prompt registry —
-so an LLM team can keep evals and prompts in the same store as training runs. Databricks offers a
-managed version; everything else is self-hosted.
+explicit calls. Through the later 2.x releases and the 3.x line it added GenAI features — tracing, LLM
+evaluation APIs and a prompt registry — so an LLM team can keep evals and prompts in the same store as
+training runs. Databricks offers a managed version, and some cloud ML platforms (Amazon SageMaker, for
+example) offer managed MLflow tracking servers; otherwise you self-host.
 
 ### Weights & Biases
 W&B is SaaS-first with a self-hosted server option for data-residency requirements. The API is
-`wandb.init(project, config)`, `wandb.log({...}, step=...)` and `run.finish()`. Its distinguishing
+`wandb.init(project=..., config=...)`, `wandb.log({...}, step=...)` and `run.finish()`. Its distinguishing
 pieces are **Artifacts**, versioned datasets and models with an automatic lineage graph (which run
 consumed which artifact version and produced which), **Sweeps**, a built-in hyperparameter search
 orchestrator that schedules agents across machines, **Tables** for per-example analysis inside the UI,
@@ -94,7 +98,8 @@ one system of record per artifact class, not one tool for everything.
 ## Example
 The same LoRA fine-tuning run logged two ways. Parameters are fixed at the start, metrics are
 step-indexed, artifacts are files, and the dataset and code versions are logged as params so the run is
-reproducible. `train_and_eval` is your loop, yielding per-step metrics.
+reproducible. `train_and_eval` is your loop, yielding per-step metrics; the two halves are alternatives,
+shown together only for comparison (as written, the loop would train twice).
 
 ```python
 import mlflow, wandb, subprocess
@@ -112,7 +117,7 @@ with mlflow.start_run(run_name="lora-r16-lr2e-4") as run:
     for step, (train_loss, eval_acc) in enumerate(train_and_eval(cfg)):
         mlflow.log_metrics({"train_loss": train_loss, "eval_acc": eval_acc}, step=step)
     mlflow.log_artifact("outputs/eval_items.jsonl")                   # per-item outputs for error analysis
-    mlflow.log_artifacts("outputs/adapter", artifact_path="model")    # the thing the registry will version
+    mlflow.log_artifacts("outputs/adapter", artifact_path="model")    # raw files; use a flavour's log_model for pyfunc loading
     print("register with run id:", run.info.run_id)
 
 # --- W&B: SaaS or self-hosted server; config + log + a versioned Artifact with lineage --------

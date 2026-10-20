@@ -5,6 +5,7 @@ name: Centralized vs federated AI platform
 kind: decision
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - strategy/platform-strategy
   - llmops-platform/ai-control-plane-vs-data-plane
@@ -45,8 +46,8 @@ a queue, and the teams with the most urgent needs route around it, recreating th
 centralization was meant to end. The central team, measured by what it ships, starts building
 applications for the loudest business unit and stops being a platform.
 
-The decision exists because the two failure modes are real and opposite. Conway's law guarantees the
-platform's shape will follow the organisation's, so the question is which responsibilities must be
+The decision exists because the two failure modes are real and opposite. Conway's law predicts the
+platform's shape will tend to follow the organisation's communication structure, so the question is which responsibilities must be
 owned once, for the whole company, and which must stay with the people who understand the domain.
 Team Topologies' answer is a platform team that treats the platform as a product consumed by
 stream-aligned teams; Data Mesh's answer for analytics, domain ownership with federated

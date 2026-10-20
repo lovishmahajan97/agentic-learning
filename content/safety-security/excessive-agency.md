@@ -5,7 +5,7 @@ name: Excessive agency
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - safety-security/tool-privilege-escalation
   - agents/approval-gates-for-consequential-actions
@@ -81,6 +81,16 @@ guarantees live, *because* a deterministic executor can be tested, logged and au
 cannot. Approval ergonomics matter: batch low-risk actions and escalate rarely, otherwise humans
 rubber-stamp and the gate becomes theatre.
 
+### Blast radius as arithmetic
+The worst case of a tool is roughly *what one call can do × how many calls can happen before a human
+notices*. Take an email tool with no recipient restriction and no rate limit on an agent that runs
+overnight. At one call per second for eight hours, that is 28,800 sends before anyone looks. A
+per-session cap of 25 calls, a recipient allowlist and a daily limit of 200 turn the worst case into
+200 emails to known addresses. Each control attacks a different factor: narrower tools shrink the
+damage per call, scoped credentials shrink what any call can reach, budgets shrink the count, and
+alerting shrinks the time until someone notices. When reviewing an agent, compute this product per
+tool; the largest one is your first fix.
+
 ### Measuring agency
 Count tools exposed versus tools actually used per workflow; the gap is unnecessary surface. Track the
 share of calls requiring approval and the approval acceptance rate; a rate near 100% means the gate is
@@ -111,21 +121,22 @@ class Session:
     audit: list = field(default_factory=list)
 
 def execute(session: Session, tool: Tool, args: dict) -> str:
+    def done(outcome: str, msg: str) -> str:                         # every decision is audited, denials too
+        session.audit.append({"tool": tool.name, "args": args, "tier": tool.tier, "outcome": outcome})
+        return msg
     if session.budget["calls"] <= 0:
-        return "ERROR: step budget exhausted; stop and report progress"
+        return done("budget", "ERROR: step budget exhausted; stop and report progress")
     session.budget["calls"] -= 1
     if not tool.scopes <= session.user_scopes:                      # permissions axis
-        return f"ERROR: {tool.name} requires {tool.scopes - session.user_scopes}"
+        return done("scope", f"ERROR: {tool.name} requires {tool.scopes - session.user_scopes}")
     if tool.tier == 2:                                               # autonomy axis
         cents = int(args.get("amount_cents", 0))
         if session.budget["spent"] + cents > session.budget["spend_cap"]:
-            return "ERROR: spend cap reached for this session"
+            return done("spend_cap", "ERROR: spend cap reached for this session")
         if not session.approve(tool.name, args):
-            return "DENIED by user; choose another course of action"
+            return done("denied", "DENIED by user; choose another course of action")
         session.budget["spent"] += cents
-    result = tool.fn(**args)
-    session.audit.append({"tool": tool.name, "args": args, "tier": tool.tier})
-    return result
+    return done("executed", tool.fn(**args))
 
 TOOLS = {t.name: t for t in [                                        # functionality axis: two tools, no shell
     Tool("get_order", lambda order_id: f"order {order_id}: $89.99, delivered", 0, {"orders:read"}),
@@ -164,6 +175,11 @@ print(execute(s, TOOLS["issue_refund"], {"order_id": "ORD-104233", "amount_cents
 - No step or spend budget; the symptom is a loop that burned thousands of calls overnight.
 - Passing secrets through tool arguments; the symptom is API keys in traces and occasionally in model
   output.
+- Reviewing a third-party tool server once and trusting it afterwards; the symptom is new or redefined
+  functions appearing after an upstream update that nobody approved, which version pinning and a
+  diff of the exposed tool list on every change would have caught.
+- Auditing only executed calls; the symptom is an incident review that cannot tell how many times the
+  agent tried a denied action before it found one that worked.
 - Irreversible actions without a draft or soft-delete mode; the symptom is a misfire with nothing to roll
   back.
 

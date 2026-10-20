@@ -5,7 +5,7 @@ name: Calibration
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/roc-auc
   - ml-fundamentals/class-imbalance
@@ -117,6 +117,18 @@ Calibration is measured against one data distribution. Under distribution shift,
 become more overconfident on inputs unlike their training data, so a calibrated model in the eval
 harness is not a calibrated model six months later. Treat ECE on fresh labelled samples as a
 production monitor, not a one-time certificate.
+
+### Abstention needs ranking *and* calibration
+An "answer or escalate" rule asks two separate questions of the confidence. Does sorting by confidence
+put the wrong answers at the bottom? That is discrimination, measured by the AUROC of confidence
+against correctness, or by the risk–coverage curve: error rate among the kept answers as you keep the
+top 100%, 90%, 80%… Then, where do I cut? That is where calibration matters, because with calibrated
+confidence a threshold c means the marginal kept answer is wrong with probability 1 − c, the expected
+error among kept answers is the mean of 1 − confidence over them, and the escalation rate can be
+predicted before launch. Temperature scaling fixes only the second: it cannot reorder answers, so a confidence
+signal whose risk–coverage curve is flat stays useless however well it is calibrated. Measure both
+before building a cascade; if the curve is flat, the fix is a better signal (sampling agreement, a
+trained verifier), not a better calibrator.
 
 ### Three confidences in an LLM
 1. **Token probabilities.** For multiple-choice or classification formats, the probability mass on the

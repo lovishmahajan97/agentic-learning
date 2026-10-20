@@ -5,7 +5,7 @@ name: Memory architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-memory
   - agents/memory-retrieval-update-deletion-policies
@@ -78,8 +78,13 @@ a privacy liability.
   recency and importance. Scope filters (tenant, user, agent, purpose) apply inside the query, not
   after, for the same reason as ACLs in RAG.
 - **Update and consolidate.** New facts that contradict old ones must supersede them, not sit beside
-  them; duplicates must merge; many episodes collapse into one summary. This runs as a background job
-  *because* it needs a model call and should not sit in the request path.
+  them; duplicates must merge; many episodes collapse into one summary. Detecting a contradiction is
+  the hard part, and embedding similarity alone is a poor detector: "lives in Berlin" and "moved to
+  Lisbon" may not be close vectors, while "likes Python" and "dislikes Python" are. Two mechanisms work.
+  For facts that drive behaviour, use typed slots (`home_city`, `answer_style`) so an update is an
+  upsert by key and supersession is deterministic. For free-text memories, retrieve the few nearest
+  existing memories and ask a model to choose add, update, delete or no-op against them. Consolidation
+  runs as a background job *because* it needs a model call and should not sit in the request path.
 - **Forget.** Time-to-live for episodic items, explicit deletion on user request, purpose limits (memory
   collected for support is not used for marketing), and tenant off-boarding. Deletion must reach every
   derived copy, including embeddings and summaries, which is why memory rows need lineage back to their
@@ -88,8 +93,21 @@ a privacy liability.
 ### A read policy, concretely
 A common ranking, from the generative-agents line of work, scores each candidate as a weighted sum of
 relevance (embedding similarity to the current task), recency (exponential decay on age) and importance
-(a score assigned at write time), then takes the top *k* under a token budget. The weights are a product
-decision: a coding assistant weights recency, a CRM assistant weights importance.
+(a score assigned at write time), then takes the top *k* under a token budget:
+`score = w_rel·sim(q, m) + w_rec·exp(−age/τ) + w_imp·importance`, with each term normalized to [0, 1] so
+the weights mean what they say. At scale, an ANN search fetches a few hundred candidates by relevance and
+the composite score reranks only those, *because* computing recency and importance over every row is
+wasted work. The weights and τ are product decisions: a coding assistant weights recency (yesterday's
+branch matters, last quarter's does not), a CRM assistant weights importance (the contract renewal date
+matters however old it is).
+
+### Who controls paging
+The MemGPT line of work makes the operating-system analogy literal: the model itself is given tools to
+read, write and evict memory, and decides when to page items in and out of its context. That is the
+same set of operations as above with the controller moved from application code into the model. It buys
+flexibility on open-ended tasks and costs predictability, extra calls, and a model that sometimes forgets
+to remember, so production systems often combine a code-driven baseline read with model-callable memory
+tools for the rest.
 
 ### Scoping and isolation
 Every memory row carries tenant id, user id, the agent or purpose it was collected for, a source event
@@ -101,11 +119,15 @@ users.
 A 200-turn conversation at roughly 150 tokens per turn replays about 30,000 tokens per call if sent
 verbatim. Keeping the last 10 turns verbatim (about 1,500 tokens), a 400-token rolling summary and 800
 tokens of retrieved memories puts the working set under 3,000 tokens, a tenfold reduction that stays
-flat as the conversation grows. That flat line is the architectural goal.
+flat as the conversation grows. Over the whole conversation the gap is larger still, because verbatim
+replay re-sends every earlier turn on every call: Σ 150·t for t = 1…200 ≈ 3.0M input tokens, against at
+most about 0.6M for the bounded design. Linear-per-call growth is quadratic in total. That flat line is
+the architectural goal.
 
 ## Example
 A memory layer with the tiers wired together: a session store as the source of truth, a write policy
-that extracts facts after each turn and supersedes contradictions, and a read policy that assembles a
+that extracts facts after each turn and supersedes contradictions (by slot for typed facts, by model
+adjudication for free text), and a read policy that assembles a
 bounded working set using relevance, recency and scope. `llm`, `embed`, `cosine` and `store` are
 stand-ins for your model, embedding model and database.
 
@@ -134,15 +156,31 @@ def after_turn(user, tenant, convo_id, store):
     if len(turns) % SUMMARY_EVERY == 0:                              # compaction: summarize, never delete
         store.set_summary(convo_id, llm(f"Update this summary:\n{store.summary(convo_id)}\n\n"
                                         f"New turns:\n{turns[-SUMMARY_EVERY:]}").text)
-    facts = llm("Extract durable facts or preferences as JSON [{text, importance 0-1}] "
-                f"from:\n{turns[-2:]}").json
-    for f in facts:                                                  # update in place, not append-only
-        vec = embed(f["text"])
-        prior = store.find_similar(tenant, user, vec, threshold=0.9)
-        store.upsert_memory(tenant=tenant, user=user, purpose="assistant", text=f["text"], vec=vec,
-                            importance=f["importance"], supersedes=prior.id if prior else None,
-                            source_event=turns[-1].id)              # lineage: deletion can follow it back
+    facts = llm("Extract durable facts as JSON [{slot or null, text, importance 0-1}] "
+                f"from the user's own words only:\n{turns[-2:]}").json   # not from tool output
+    for f in facts:
+        common = dict(tenant=tenant, user=user, purpose="assistant", source_event=turns[-1].id)
+        if f["slot"]:                                                # typed fact: upsert by key
+            store.upsert_slot(slot=f["slot"], text=f["text"], **common)
+            continue
+        near = store.nearest(tenant, user, embed(f["text"]), k=3)    # free text: let a model adjudicate
+        op = llm(f"New: {f['text']}\nExisting: {[m.text for m in near]}\n"
+                 "Reply JSON {op: add|update|noop, target_index}").json
+        if op["op"] == "add":
+            store.add_memory(text=f["text"], importance=f["importance"], **common)
+        elif op["op"] == "update":                                   # supersede, keep lineage
+            store.supersede(near[op["target_index"]].id, text=f["text"], **common)
 ```
+
+Trace two turns. In March the user says "I'm based in Berlin"; the extractor emits
+`{slot: "home_city", text: "Berlin"}` and the slot is written. In June they say "we just moved to
+Lisbon"; the extractor emits the same slot, the upsert replaces Berlin and records the June turn as the
+source, and no later read can surface both cities. Separately, "I like answers with code first" has no
+slot, so the three nearest memories are fetched; one is "prefers short answers", and the adjudicator
+chooses `add`, because the two preferences are compatible. Had a cosine threshold alone decided, the
+close pair "prefers short answers" / "prefers detailed answers" would either have been merged as a
+duplicate, keeping whichever text won, or kept side by side as a contradiction, depending on where the
+threshold sat; the adjudicator sees a conflict and chooses `update`.
 
 ## Trade-offs
 - Extracting facts at write time keeps every read cheap, but spends a model call per turn and can store
@@ -169,6 +207,9 @@ def after_turn(user, tenant, convo_id, store):
   user mentioned are gone forever and the transcript cannot be audited.
 - Deleting a memory row but not its embedding, its mention in a summary or the facts derived from it;
   the symptom is a "forgotten" fact resurfacing weeks later, which is a compliance incident.
+- Extracting memories from retrieved documents, web pages or tool output rather than from the user's
+  own words; the symptom is an instruction planted in a fetched page ("always CC this address")
+  reappearing in later, unrelated sessions, which is persistent prompt injection.
 - Shipping memory without measuring it; the symptom is higher cost per call with no gain in task
   success, because the retrieved memories are rarely relevant.
 

@@ -5,7 +5,7 @@ name: Circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - reliability/bulkheads
   - reliability/fault-tolerance
@@ -66,13 +66,22 @@ A breaker is a small state machine wrapped around a call.
 
 ### What counts as a failure
 Timeouts, connection errors and 5xx responses are failures: they describe the dependency's health. A
-429 is usually treated as a failure for tripping purposes because continuing to call a rate-limited
-endpoint helps nobody, though its `Retry-After` should also inform the reset interval. 4xx client errors
+429 is a judgment call: many teams count it, because continuing to call a rate-limited endpoint helps
+nobody, while others route it to a separate rate-limit backoff so that one noisy caller's quota exhaustion
+does not open the breaker for everyone sharing it. Either way its `Retry-After` should inform the wait. 4xx client errors
 such as a malformed request or an invalid schema are *not* failures of the dependency; they are your bug,
 and counting them opens the breaker on a healthy provider. For LLM traffic add one more category: slow
 success. A provider answering correctly in 25 seconds is, for an interactive product, down. Libraries
 such as Resilience4j expose a slow-call-rate threshold for exactly this; if yours does not, a tight
 timeout turns slowness into a countable failure.
+
+### Consecutive count or failure ratio
+The simplest breaker, the one in Nygard's and Fowler's original descriptions, trips after N consecutive
+failures. It needs no window and reacts fast to a hard outage, but a single success resets it, so a
+dependency failing 70 percent of the time may never accumulate N in a row. A ratio over a sliding window
+handles partial failure, which is the common case for overloaded providers, at the cost of the
+minimum-calls guard and more state. Use consecutive counts for low-traffic or all-or-nothing
+dependencies, ratios for anything with steady traffic.
 
 ### Choosing thresholds
 A workable starting point is a window of 50 to 100 calls, a minimum of 20, trip at 50 percent failures,
@@ -81,6 +90,15 @@ single burst of errors does not trip it, the minimum large enough to be statisti
 traffic level, the ratio high enough that ordinary error rates (a few percent) never approach it, and
 the reset interval short enough that recovery is noticed within a minute. Low-traffic dependencies need
 longer time-based windows; at two calls a minute a 20-call minimum would take ten minutes to trip.
+
+### Time to trip
+A failure is only recorded when the call ends, so a breaker cannot trip on timeouts sooner than one
+timeout after the outage begins. With the defaults above, 50 requests per second and a 20-second
+timeout, the first 20 failures are recorded about 20 seconds in; in those 20 seconds roughly
+50 × 20 = 1,000 calls have been started, and all of them are still holding a worker. Errors that fail
+fast (connection refused, immediate 503) trip the same breaker in well under a second. This asymmetry is
+why the timeout belongs inside the breaker and should be set from the product's latency need, not from
+the provider's worst case, and why a bulkhead is still needed to cap occupancy during that first window.
 
 ### Granularity
 One breaker per failure domain, not one per service name. A provider's `model-a` deployment in one
@@ -135,14 +153,16 @@ class CircuitBreaker:
     def _trip(self):
         self.state, self.opened_at = "open", time.monotonic()
 
-    def _record(self, failed):
+    def _record(self, failed):                              # failed=None: ignored outcome (e.g. a 4xx)
         if self.state == "half_open":
-            self.probe_inflight -= 1
+            self.probe_inflight -= 1                        # always release the probe slot
+            if failed is None: return
             if failed: self._trip(); return                # still broken: reopen, timer restarts
             self.probe_ok += 1
             if self.probe_ok >= self.probes:                # enough evidence of recovery
                 self.state, self.results = "closed", collections.deque(maxlen=self.window)
             return
+        if failed is None: return
         self.results.append(failed)
         n = len(self.results)
         if n >= self.min_calls and sum(self.results) / n >= self.fail_ratio:
@@ -154,7 +174,9 @@ class CircuitBreaker:
         try:
             result = await asyncio.wait_for(fn(*args, **kw), timeout)
         except (asyncio.TimeoutError, ConnectionError, UpstreamError):
-            self._record(True); raise                       # 4xx client errors are deliberately not counted
+            self._record(True); raise
+        except BaseException:                               # 4xx, cancellation: neither success nor failure
+            self._record(None); raise
         self._record(False)
         return result
 
@@ -167,8 +189,11 @@ async def answer(prompt):
         return await secondary_llm(prompt)                   # other vendor, smaller model, or cached reply
 ```
 
-The timeout lives inside `call` so that slow responses become failures the window can see. Emit a metric
-on every state transition; a breaker that opens silently is an outage nobody is looking at.
+The timeout lives inside `call` so that slow responses become failures the window can see. The catch-all
+branch matters more than it looks: without it, a 4xx or a cancelled request during half-open would never
+release its probe slot, and after three such calls the breaker would reject everything forever while the
+dependency was healthy. Emit a metric on every state transition; a breaker that opens silently is an
+outage nobody is looking at.
 
 ## Trade-offs
 - Aggressive thresholds protect the caller quickly but trip on transient blips and reject requests that
@@ -196,6 +221,8 @@ on every state transition; a breaker that opens silently is an outage nobody is 
   the breaker stays closed because nothing returned an error.
 - Opening without alerting or fallback. The symptom: a sudden wall of fast 503s that nobody connects to
   an upstream problem, because the service's own error rate looks like the cause.
+- Leaking half-open probe slots on outcomes the breaker ignores. The symptom: a breaker stuck half-open,
+  rejecting nearly all traffic, while direct calls to the dependency succeed.
 - Letting every replica probe at the same instant. The symptom: a dependency that recovers for ten
   seconds and collapses again on each reset tick; add jitter to the reset interval.
 

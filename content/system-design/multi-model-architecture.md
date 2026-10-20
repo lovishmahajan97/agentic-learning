@@ -5,7 +5,7 @@ name: Multi-model architecture
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - system-design/model-portfolio
   - system-design/model-routing-cascading
@@ -53,7 +53,11 @@ routing / cascading) is orthogonal to decomposition across jobs.
 
 ### Patterns of composition
 1. **Pipeline.** Guard → rewrite → embed → retrieve → rerank → generate → verify. Stages that do not
-   depend on each other (guard and embed) run concurrently.
+   depend on each other (guard and embed) run concurrently. A gate that almost always passes can also
+   run *speculatively*: start retrieval, or even generation, while the guard decides, and discard the
+   work if it blocks. You pay wasted calls on the few blocked requests to remove the guard's latency
+   from every other request; it is unsafe only if the speculative stage has side effects or streams to
+   the user before the gate has passed.
 2. **Generator plus verifier.** A second model checks grounding, schema or policy. Inline when it gates
    the response; sampled and asynchronous when it feeds monitoring.
 3. **Planner plus executors.** A strong model decomposes a task and cheap models carry out subtasks; the
@@ -73,7 +77,11 @@ detectable at the boundary instead of three stages downstream, and versions make
 Latency adds along the serial path, so parallelise what you can and budget with tail numbers: the p99 of a
 sum of four stages is at least the largest single-stage p99 and can exceed the sum of all four p99s,
 because tail events in different stages combine (the sum of the p99s is only guaranteed to be at least
-the p96 of the total, by a union bound over the four stages). Cost adds per request; find the dominant stage, which is
+the p96 of the total, by a union bound over the four stages). In practice, when stages are slow for
+independent reasons, the sum of the p99s is a pessimistic budget, because tails rarely coincide; it is
+correlated slowness (two stages on one GPU pool or one provider, a retry policy at every stage, a
+shared overloaded network path) that drives the real p99 towards or past that sum. Budget with the sum,
+then measure the end-to-end distribution. Cost adds per request; find the dominant stage, which is
 usually generation but is sometimes a reranker scoring 50 candidates with a large cross-encoder. Failure
 is per stage: each needs its own timeout, fallback and degraded mode (drop the reranker, skip the judge).
 
@@ -132,7 +140,17 @@ async def answer(question):
 ```
 
 The trace is what makes the architecture debuggable: when quality drops you can group judge scores by the
-`generate` model version, or latency by stage, instead of guessing.
+`generate` model version, or latency by stage, instead of guessing. Note that the sampled judge appends
+to the trace *after* the response has returned, so the trace must be emitted when background work
+finishes, not at return.
+
+Read the latency budget off the structure. With illustrative p95s of guard 80 ms in parallel with embed
+40 ms, vector search 30 ms, rerank 150 ms and generation 2.5 s, the serial budget is about
+80 + 30 + 150 + 2,500 ≈ 2.8 s. Running guard and embed together saved the 40 ms of the shorter one, and
+generation is nine-tenths of the total, so streaming its output (which moves the user-visible number to
+time-to-first-token) does more for perceived latency than any change to the other stages. Cost usually
+has the same shape, until someone raises the rerank candidate count from 50 to 500 and the reranker
+becomes the dominant line.
 
 ## Trade-offs
 - Each stage gets a right-sized model for quality and cost, but there are more moving parts, vendors and

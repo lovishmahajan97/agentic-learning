@@ -5,6 +5,7 @@ name: NoSQL
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -68,7 +69,10 @@ in Cassandra the partition key plus clustering columns; in MongoDB the shard key
 
 ### Replication and consistency
 Each partition is replicated to N nodes for durability. Writes are acknowledged after W replicas accept
-them and reads consult R replicas; when W + R > N a read is guaranteed to overlap a recent write (quorum).
+them and reads consult R replicas; when W + R > N the read set must overlap the write set, so a read
+reaches at least one replica holding the latest acknowledged write (a strict quorum). Edge cases weaken
+this in practice: sloppy quorums that accept writes on stand-in nodes, concurrent writes resolved by
+last-write-wins, and writes that failed on some replicas but were not rolled back.
 Choosing W = 1 gives the fastest writes and the possibility that a read a moment later sees the old value:
 **eventual consistency**. Most stores let you choose per operation (Cassandra consistency levels,
 DynamoDB's `ConsistentRead`), and strongly consistent reads cost more and may fail when a replica is
@@ -89,16 +93,20 @@ shapes the data so each one is a single-partition read. Two decisions dominate:
    access pattern. A GSI is maintained asynchronously, so reads through it are eventually consistent.
 
 ### Hot partitions
-Throughput is provisioned per partition, not per table. If one tenant produces 40% of all writes and
-tenant id is the partition key, that partition throttles while the rest of the cluster idles. Fixes are
+Capacity is configured per table, but each physical partition has its own throughput ceiling (in
+DynamoDB, documented as roughly 3,000 read units and 1,000 write units per second per partition). If one
+tenant produces 40% of all writes and tenant id is the partition key, that partition throttles while the
+rest of the cluster idles. DynamoDB's adaptive capacity and split-for-heat soften this for some
+workloads, but they are not something to design around. Fixes are
 to add a high-cardinality component to the key (tenant + conversation, or tenant + a shard suffix) so a
 busy tenant spreads over several partitions, at the cost of fan-out reads for "everything for this tenant".
 
 ### Transactions and indexes
-Modern document stores support multi-document transactions, and DynamoDB offers transactional writes
-across a few items, but they are slower, limited in scope and not the default idiom. Secondary indexes
-exist in all of them, but each one is a copy of the data maintained on every write, which is why
-"index everything" costs far more here than in PostgreSQL.
+Modern document stores support multi-document transactions, and DynamoDB offers transactional reads and
+writes across a bounded set of items (up to 100 per transaction at the time of writing), but they cost
+more capacity, are limited in scope and are not the default idiom. Secondary indexes exist in all of them,
+and each one is a copy of the data maintained on every write; in DynamoDB every GSI also consumes its own
+write capacity and storage, so "index everything" shows up directly on the bill.
 
 ## Example
 Agent sessions and their messages in DynamoDB, designed from two access patterns: "list a user's recent
@@ -111,6 +119,7 @@ import boto3, time
 from boto3.dynamodb.conditions import Key
 
 table = boto3.resource("dynamodb").Table("agent-app")
+Duplicate = table.meta.client.exceptions.ConditionalCheckFailedException
 
 def create_session(tenant, user, session_id, title):
     table.put_item(Item={
@@ -120,11 +129,13 @@ def create_session(tenant, user, session_id, title):
     })
 
 def append_message(session_id, seq, role, content):
-    table.put_item(
-        Item={"pk": f"SESSION#{session_id}", "sk": f"MSG#{seq:08d}",
-              "role": role, "content": content},
-        ConditionExpression="attribute_not_exists(sk)",   # idempotent on retry
-    )
+    try:
+        table.put_item(
+            Item={"pk": f"SESSION#{session_id}", "sk": f"MSG#{seq:08d}",
+                  "role": role, "content": content},
+            ConditionExpression="attribute_not_exists(sk)")   # never overwrite a message
+    except Duplicate:
+        pass                                  # a retry of a write that already landed
 
 def recent_sessions(tenant, user, limit=10):
     r = table.query(
@@ -227,5 +238,5 @@ load, not just identify ownership.
 - [ ] W = 1, R = 2, because two readers will outvote the stale replica
 - [x] W = 2, R = 2, because the write and read replica sets must overlap
 - [ ] Any setting, because replication is synchronous by default
-> Overlap requires W + R > N. With W = 2 and R = 2, at least one replica consulted by the read holds the
-> write. W = 1 with R = 2 can read two replicas that both missed it.
+> Overlap requires W + R > N. With W = 2 and R = 2 (a strict quorum), at least one replica consulted by the
+> read holds the write. W = 1 with R = 2 can read the two replicas that both missed it.

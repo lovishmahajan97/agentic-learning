@@ -5,6 +5,7 @@ name: Durable execution & checkpointing
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
   - agent-reliability/state-and-checkpoint-stores
@@ -63,8 +64,10 @@ snapshotting only the small non-transcript part.
 **Event-sourced replay.** Persist each event (model response, tool result, timer fired, signal
 received) to an append-only history. On resume, re-run the orchestration code from the beginning;
 whenever it reaches a call whose result is already in the history, substitute the recorded result
-instead of executing. This is the Temporal model: workflow code must be deterministic (no clocks,
-randomness or I/O outside recorded activities) so replay follows the same path, while model calls and
+instead of executing. This is the Temporal model: workflow code must be deterministic (no direct
+clock reads, randomness or I/O; time and random values come from the engine's deterministic APIs,
+which are recorded in the history, and all I/O goes through activities) so replay follows the same
+path, while model calls and
 tool calls are activities with recorded results and their own retry policies. The pay-off is that
 orchestration code reads like ordinary sequential code while being crash-proof; the price is the
 determinism discipline and a learning curve.
@@ -210,7 +213,7 @@ attempts and a second ticket appears.
 ### Q: What does event-sourced replay (the Temporal-style model) require of orchestration code?
 - [ ] It must be written in a compiled language
 - [ ] It must checkpoint explicitly after every step
-- [x] It must be deterministic, with all I/O, randomness and clocks confined to recorded activities so replay follows the same path
+- [x] It must be deterministic, with I/O in recorded activities and time or randomness taken only from the engine's recorded APIs, so replay follows the same path
 - [ ] It must keep the whole transcript in memory
 > Replay re-runs the code and substitutes recorded results; if the code could take a different path on
 > replay, the substitution would be wrong. Determinism is the price of implicit checkpointing.

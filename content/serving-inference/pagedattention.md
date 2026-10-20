@@ -5,7 +5,7 @@ name: PagedAttention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -69,11 +69,20 @@ allocation scheme where freed space is always reusable, which is why the kernel'
 OS page allocator work the same way.
 
 ### The attention kernel
-The decode kernel takes the new token's query, walks the request's block table, gathers K and V from
-each physical block, and accumulates attention block by block. The indirection costs something: memory
-accesses are less coalesced than for a single contiguous tensor, so the kernel itself is somewhat slower
-than a contiguous one. The design accepts that *because* decode throughput is limited by how many
-sequences fit, not by per-sequence kernel speed; a slightly slower kernel over far more sequences wins.
+The engine hands the kernel a block-table tensor of shape [num_seqs, max_blocks_per_seq] plus each
+sequence's current length. For each sequence the kernel takes the new token's query, walks that row of
+the table, loads K and V from each physical block, and accumulates attention block by block. Softmax
+needs the maximum and the sum over *all* scores, which are unknown until the last block, so the kernel
+keeps a running maximum *m*, a running denominator *l* and a running weighted sum of V, and rescales what
+it has accumulated by `exp(m_old − m_new)` whenever a later block raises the maximum (the same
+online-softmax trick FlashAttention uses). The output is exact; only the memory layout changed.
+
+The indirection costs something: memory accesses are less coalesced than for a single contiguous
+tensor, so the kernel itself is somewhat slower than a contiguous one. The design accepts that *because*
+decode throughput is limited by how many sequences fit, not by per-sequence kernel speed; a slightly
+slower kernel over far more sequences wins. The idea has outlived the original kernel: current engines
+often run FlashAttention- or FlashInfer-family kernels that accept a block table directly, so
+"PagedAttention" now names the memory-management scheme more than one specific kernel.
 
 ### Sizing the pool
 At startup the engine measures what the weights take, runs a dummy forward pass at the maximum batch to
@@ -92,9 +101,11 @@ copies it first, the same copy-on-write rule as `fork()`.
 ### Running out of blocks
 On-demand allocation means the pool can run dry mid-generation. The scheduler then preempts a sequence,
 either by swapping its blocks to CPU memory or by freeing them and recomputing the prefix later (which of
-the two an engine offers varies by version: vLLM's V1 engine recomputes only). Recompute is often cheaper
-for short sequences because prefill is compute-efficient; swap is cheaper for long ones.
-Either way, preemption counters rising in the metrics is the sign the pool is too small for the traffic.
+the two an engine offers varies by version: vLLM's V1 engine recomputes only). Swap cost grows with the
+sequence's cache bytes over PCIe, recompute cost with the prefill FLOPs to rebuild it; the rough
+intuition is that recompute suits short sequences and swap long ones, but the crossover depends on the
+hardware and on how busy the GPU already is, so neither wins universally. Either way, preemption counters rising in the metrics is the sign the pool
+is too small for the traffic.
 
 ### Choosing the block size
 Larger blocks mean fewer table entries and better memory coalescing in the kernel, but more waste in each
@@ -131,7 +142,8 @@ for avg_len, max_len in [(1500, 8192), (6000, 8192)]:
 
 ## Trade-offs
 - You recover most of the memory lost to reservation and fragmentation, but the attention kernel pays an
-  indirection and coalescing cost per block, which is a loss only when a GPU serves one long request.
+  indirection and coalescing cost per block, a net loss only when the batch is too small for the extra
+  sequences to matter, such as one long request alone on a GPU.
 - On-demand allocation admits many more requests, but it can run out of blocks mid-generation, so the
   system needs a preemption policy (swap or recompute) that contiguous reservation never needed.
 - Block sharing makes beam search, parallel sampling and prefix caching nearly free in memory, at the cost
@@ -145,7 +157,8 @@ for avg_len, max_len in [(1500, 8192), (6000, 8192)]:
 - Ignoring preemption metrics. A pool that is slightly too small shows up as a throughput cliff and
   jittery latency under load, not as an OOM, because sequences are silently swapped or recomputed.
 - Expecting prefix caching to share partially identical prompts. Only whole blocks with identical content
-  and prefix are shared, so a timestamp in the first line of the system prompt defeats it entirely.
+  and prefix are shared, so a timestamp in the first line of the system prompt defeats it entirely;
+  the symptom is a prefix-cache hit rate near zero for prompts that look identical.
 - Setting `gpu_memory_utilization` to 0.98 to get more blocks and then OOMing when another process, a
   CUDA graph or a larger-than-profiled activation peak needs the headroom.
 

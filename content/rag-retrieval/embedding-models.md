@@ -5,6 +5,7 @@ name: Embedding models
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - model-internals/embeddings
   - rag-retrieval/embedding-dimension-and-normalization
@@ -76,9 +77,9 @@ BGE and instruction-tuned models accept a task instruction prepended to the quer
 the model still returns vectors, just worse ones. There is no error, only a quiet recall drop.
 
 ### Capacity limits
-Every model has a maximum input length, often 512 tokens for BERT-derived models and several thousand
-for newer ones. Longer inputs are truncated, usually silently, which is one of the reasons chunking
-exists. Larger models generally produce better vectors but embed more slowly and emit more dimensions,
+Every model has a maximum input length, typically 512 tokens for BERT-derived models and around 8,000
+for many newer long-context ones. Longer inputs are truncated silently by most local libraries (some
+hosted APIs reject them with an error instead), which is one of the reasons chunking exists. Larger models generally produce better vectors but embed more slowly and emit more dimensions,
 which cost storage and comparison time for every chunk forever; the dimension lesson covers that
 arithmetic.
 
@@ -100,8 +101,8 @@ your own corpus before committing, because changing the model later means re-emb
 
 ## Example
 Two queries against three passages with an asymmetric open model. Neither query shares a content word
-with its correct passage ("money back" versus "refunds", "stop" versus "cancel"), which is the case
-BM25 cannot solve. The prefixes are part of the model's contract, and `normalize_embeddings=True` makes
+with its correct passage ("money back" versus "refunds", "end my membership" versus "cancel a
+subscription"), which is the case BM25 cannot solve. The prefixes are part of the model's contract, and `normalize_embeddings=True` makes
 the matrix product a cosine similarity.
 
 ```python
@@ -115,7 +116,7 @@ docs = [
     "passage: To cancel a subscription, open Billing and click Cancel plan.",
 ]
 queries = ["query: how long does it take to get my money back?",
-           "query: stop my monthly plan"]
+           "query: end my monthly membership"]
 
 D = model.encode(docs, normalize_embeddings=True)     # shape (3, 768), unit length rows
 Q = model.encode(queries, normalize_embeddings=True)  # shape (2, 768)
@@ -124,8 +125,8 @@ scores = Q @ D.T                                      # cosine similarity becaus
 for q, row in zip(queries, scores):
     best = int(np.argmax(row))
     print(f"{q!r} -> doc {best}  scores={np.round(row, 3)}")
-# Expected: query 0 -> doc 0, query 1 -> doc 2. Drop the prefixes and re-run: the ranking usually
-# survives on three passages, but the margins shrink, which at corpus scale becomes lost recall.
+# Expected: query 0 -> doc 0, query 1 -> doc 2. Dropping the prefixes usually does not flip a
+# three-passage toy; their cost shows up as lost recall@k over a real corpus, so measure it there.
 ```
 
 ## Trade-offs

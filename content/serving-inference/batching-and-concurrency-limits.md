@@ -5,7 +5,7 @@ name: Batching & concurrency limits
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/continuous-batching
   - serving-inference/prefill-vs-decode
@@ -42,6 +42,11 @@ takes about the same 4.8 ms plus the extra KV-cache reads, and aggregate through
 That is the whole reason serving systems batch: arithmetic intensity grows linearly with batch size until
 it reaches the hardware's ridge point (peak FLOPs ÷ bandwidth, roughly 300 FLOP/byte for that GPU in
 bf16), after which the step becomes compute-bound and latency per token starts growing with the batch.
+The arithmetic is simple: each 2-byte bf16 weight does 2 FLOPs (a multiply and an add) per sequence, so
+a batch of B gives about B FLOPs per weight byte, and the weight matmuls alone would stay bandwidth-bound
+up to a batch in the low hundreds. In practice the knee usually arrives earlier, for the reason in the
+latency section below: each sequence also brings its own KV cache to read, and that traffic does not
+amortise across the batch.
 
 So why not admit everything? Three reasons. KV memory is finite and each admitted sequence consumes it
 for its whole lifetime, so over-admission leads to preemption, swap traffic and eventually OOM. Latency
@@ -54,7 +59,11 @@ that degrades for everyone into one that queues or rejects predictably.
 ## How it works
 ### Static versus continuous batching
 Static batching groups N requests, runs them until the longest finishes, and only then admits more; the
-GPU idles on finished slots. Continuous (iteration-level) batching, introduced by Orca, re-forms the
+GPU idles on finished slots. *Dynamic* batching, the classic model-server approach (Triton's
+queue-delay setting is the familiar example), waits up to a few milliseconds to collect requests into
+one batch, then runs it as a unit; that suits single-pass models such as embedders and classifiers,
+where every request takes the same one forward pass, but for generation it still holds the batch until
+the longest output finishes. Continuous (iteration-level) batching, introduced by Orca, re-forms the
 batch every decode step: finished sequences leave, waiting ones join. The continuous-batching lesson
 covers the scheduler; here the point is that it makes "batch size" a dynamic quantity bounded by limits
 rather than a fixed number you pick.
@@ -66,7 +75,10 @@ Every engine exposes some version of these (vLLM's names in parentheses):
 2. **Maximum tokens per step** (`max_num_batched_tokens`): bounds how many tokens, prompt and decode
    together, are processed in one step. With chunked prefill (Sarathi-Serve's idea), a long prompt is split into chunks that
    ride along with decode tokens, so a 20k-token prompt cannot monopolise a step and stall every
-   in-flight conversation. Lower values give smoother TPOT; higher values give faster prefill.
+   in-flight conversation. Lower values give smoother TPOT; higher values give faster prefill. The
+   budget can be modest *because* prefill is already batched across positions: a chunk of T prompt
+   tokens reuses each weight T times, so a chunk of a few hundred to a few thousand tokens already
+   saturates the tensor cores, and making it larger mainly lengthens the step that decode tokens wait on.
 3. **KV-cache capacity** (the block pool): the hard ceiling on tokens in flight. The scheduler admits a
    request only if its prompt fits, and preempts when generation outgrows the pool.
 Each step the scheduler fills the step with decode tokens first, then admits waiting prompts up to the
@@ -76,10 +88,14 @@ few steps usually is not.
 ### Where the latency actually goes
 Step time is roughly `max(bytes_read / bandwidth, FLOPs / peak_FLOPs) + fixed overhead`. Bytes read
 include the weights *and the KV cache of every active sequence*, and the second term is the one people
-forget. With 64 sequences each at 8k tokens on the model above (128 KB of KV per token), the step reads
-64 × 8,192 × 128 KB ≈ 64 GB of cache on top of 16 GB of weights: about 24 ms, so roughly 40 tokens per
-second per user instead of 200. The safe concurrency therefore depends on context length, not just
-request count, which is why limits should be expressed in tokens.
+forget. With 64 sequences each at 6k tokens on the model above (128 KB of KV per token), the step reads
+64 × 6,144 × 128 KB = 48 GiB (about 51.5 GB) of cache on top of 16 GB of weights: about 20 ms, so
+roughly 50 tokens per second per user instead of 200. The cache reads now outweigh the weights three to
+one, and they grow with every sequence added. Notice also that this configuration nearly fills an 80 GB
+card: when the KV pool is full, each decode step reads close to all of HBM, so the step-time floor is
+roughly HBM capacity ÷ bandwidth (about 24 ms here) however the bytes divide between weights and cache.
+The safe concurrency therefore depends on context length, not just request count, which is why limits
+should be expressed in tokens.
 
 ### Little's law and the queue
 Concurrency in the system equals arrival rate × residence time. If you need 10 requests/s and each
@@ -122,6 +138,7 @@ async def one(client, sem):
                     n += 1
                     first = first or time.perf_counter() - t0
         total = time.perf_counter() - t0
+        first = total if first is None else first           # no tokens streamed: count as all wait
         return first, (total - first) / max(n - 1, 1), n   # TTFT, TPOT, tokens
 
 async def sweep(level, requests=64):

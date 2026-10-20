@@ -5,7 +5,7 @@ name: Workflow orchestration (Temporal, Prefect, Airflow)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - reliability/durable-workflow-execution
   - agent-reliability/durable-execution-and-checkpointing
@@ -56,8 +56,11 @@ defined in Python. A scheduler evaluates DAGs against their schedule, creates ta
 hands them to an executor (local, Celery, Kubernetes) that runs them on workers; a metadata database
 records every task state. Tasks are meant to be idempotent, coarse units (run this SQL, launch this
 Spark job, call this API) and exchange only small values through XCom, *because* the DAG is a scheduling
-plan, not a data-flow program. Retries, SLAs, backfills over past dates and a mature UI are its
-strengths. Its shape fits periodic batch: nightly re-embedding, daily data-quality checks, hourly
+plan, not a data-flow program. Each DAG run is bound to a *data interval* (its logical date), and
+well-written tasks read only that interval's data and overwrite only that interval's output. That
+convention is what makes a retry or a backfill safe: re-running "2024-03-14" replaces that day's
+partition instead of appending a duplicate. Retries, SLAs, backfills over past dates and a mature UI are
+its strengths. Its shape fits periodic batch: nightly re-embedding, daily data-quality checks, hourly
 connector syncs. It fits poorly when the graph depends on runtime data or when a run must wait on a
 human for days.
 
@@ -69,8 +72,11 @@ caching of task results, schedules and concurrency limits, while your own worker
 hybrid model chosen *because* data and credentials then never leave your infrastructure. It suits the
 many AI pipelines where the number of documents, the branches and the parameters are discovered as the
 flow runs. It is still a pipeline tool: a flow run can be paused or suspended to wait for human input,
-but there is no replayable event history, so a stateful process that must survive anything for weeks is
-not its design centre.
+but there is no replayable event history. Recovery is by retrying tasks and by re-running the flow
+function while skipping tasks whose results were persisted under a cache key; a suspended run resumes by
+executing the flow from the top in this way. That works well when tasks are coarse and their results are
+persisted, and poorly for a process with many small stateful steps that must survive anything for
+weeks, which is not its design centre.
 
 ### Temporal: durable execution
 Temporal (descended from Uber's Cadence) solves a different problem: making ordinary code durable. You
@@ -91,6 +97,16 @@ answer *queries* (which step are you on), start child workflows, and run indefin
 continuing-as-new to keep history bounded. The cost is the determinism discipline, a server to run or
 buy, and keeping payloads small by passing large data by reference, because every activity input and
 output lands in history.
+
+### The same crash, three recovery models
+Put a worker crash in the middle of step 3 of a five-step run, and the tools differ in what they know.
+Airflow knows task instances: tasks 1–2 are `success`, task 3 is marked failed (or found as a zombie and
+failed) and retried as a whole unit, so correctness rests on task 3 being idempotent for its interval.
+Prefect knows task runs and persisted results: retrying the flow re-enters it from the top, steps 1–2
+return cached results, step 3 runs again. Temporal knows every decision the workflow made: a new worker
+replays the code, steps 1–2 return their recorded results instantly, and step 3's activity is retried
+after its timeout. The finer the recorded state, the smaller the unit of redo, and the more discipline
+the code must obey (idempotent tasks; cacheable tasks; deterministic workflow code respectively).
 
 ### Which fits an AI system where
 - Re-chunk and re-embed a corpus nightly, with backfill over past days: **Airflow**.
@@ -156,8 +172,18 @@ class DocumentExtraction:
 # Worker(client, task_queue="extraction", workflows=[DocumentExtraction], activities=[extract_fields, write_record])
 ```
 
-If the worker dies after `extract_fields` completed, the replacement worker replays `run`, gets the
-recorded `fields` from history without calling the LLM again, and continues from the approval wait.
+Walk one low-confidence document through it. The server's history for the run reads, simplified:
+(1) workflow started with `doc_id`; (2) activity `extract_fields` scheduled; (3) activity started,
+recorded with attempt 2 because the server retried a provider 503 per the retry policy (intermediate
+attempts are not written as separate events); (4) activity completed with result
+`{..., "confidence": 0.62}`; (5) a 3-day timer started for the wait. No worker holds anything now. A deploy restarts every worker overnight. The next morning a
+reviewer sends the `approve(True)` signal, which is appended as event (6). A fresh worker replays `run`
+from the top: `execute_activity(extract_fields)` is matched to events 2–4 and returns the recorded
+fields without calling the LLM; `wait_condition` is matched to the timer; the signal handler applies
+event (6), so the condition is now true; and the code reaches `write_record`, which is the first genuinely
+new command. If someone had put `datetime.now()` in the workflow to stamp the record, the replay would
+compute a different value than the original run, which is exactly the class of bug the determinism rule
+and the SDK's `workflow.now()` exist to prevent.
 
 ## Trade-offs
 - Airflow's static DAGs give predictable scheduling, backfills and a mature ecosystem, but once the graph
@@ -178,8 +204,11 @@ recorded `fields` from history without calling the LLM again, and continues from
   non-determinism errors on replay after a worker restart or a code deploy.
 - Assuming the orchestrator makes side effects exactly-once; the symptom is duplicate emails or writes
   after a retry, fixed only by idempotency keys in the activity or task.
-- Using Airflow for per-request or event-driven work; the symptom is scheduling latency measured in tens
-  of seconds to minutes and DAG files sprouting conditionals to fake dynamism.
+- Using Airflow for per-request or event-driven work; the symptom is noticeable scheduler latency
+  between tasks (it was built for batch, not milliseconds) and DAG files sprouting conditionals to fake
+  dynamism.
+- Writing Airflow tasks that append rather than overwrite their interval's output; the symptom is
+  doubled rows for exactly the days that were retried or backfilled.
 - Passing megabytes of document text or embeddings through task results or workflow history; the symptom
   is slow UIs, size limits being hit, and failed runs on large documents.
 - Deploying changed workflow code with runs in flight and no versioning; the symptom is those runs

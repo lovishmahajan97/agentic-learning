@@ -5,6 +5,7 @@ name: Agent loop
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agents/tool-calling
   - agents/workflows-vs-agents
@@ -66,11 +67,14 @@ nowhere to put policy.
 4. Execute each requested tool. Catch exceptions and turn them into results rather than crashing: an
    error the model can read is recoverable, an exception that kills the loop is not.
 5. Append one user message containing a `tool_result` block per call, each carrying its `tool_use_id`.
-   If several tools were requested in one turn, all their results go in that same message.
+   If several tools were requested in one turn, all their results go in that same message. (This is
+   the Claude API's shape; OpenAI's Chat Completions instead sends one `role: "tool"` message per
+   call. The invariant on every API is that each call is answered before the next model turn.)
 6. Go to step 1.
 
-The loop ends when `stop_reason` is anything other than `tool_use` (normally `end_turn`), or when the
-harness decides to stop: a step budget, a wall-clock or token budget, a detected repetition, or an
+The loop ends when `stop_reason` is anything other than `tool_use` (normally `end_turn`; with
+provider-run server tools, `pause_turn` means "send the conversation back to let me continue", not
+"done"), or when the harness decides to stop: a step budget, a wall-clock or token budget, a detected repetition, or an
 unrecoverable error. `max_tokens` as a stop reason means the model was cut off mid-answer, not that it
 finished; treat it as a failure to retry, never as a result to execute.
 
@@ -79,8 +83,9 @@ The model is stateless, so every iteration sends the entire history. Over *n* st
 processed grow roughly as 1 + 2 + … + n, quadratic in the number of steps. Prompt caching makes this
 affordable *because* the history is append-only: the cached prefix stays valid and only the new tail
 is processed. This is why harnesses never edit earlier messages in place; an edit invalidates the cache
-from that point and, on some current models, also invalidates reasoning blocks that are bound to the
-conversation. When the history must shrink, it is compacted explicitly (summarized, or old tool results
+from that point onward. Reasoning output adds a harder constraint on some APIs: Claude's thinking blocks
+carry a signature and must be passed back unmodified within a tool-use turn, and OpenAI's reasoning
+items are returned encrypted for the same reason, so tampering with them gets the request rejected. When the history must shrink, it is compacted explicitly (summarized, or old tool results
 cleared) as a separate, deliberate operation.
 
 ### Where reasoning fits
@@ -117,8 +122,10 @@ def run(user_text: str, max_steps: int = 8) -> str:
     for _ in range(max_steps):
         resp = client.messages.create(model="claude-opus-5-5", max_tokens=8192,
                                       tools=TOOLS, messages=messages)
+        if resp.stop_reason == "max_tokens":        # cut off: never return or execute it
+            raise RuntimeError("truncated turn; retry with a higher max_tokens")
         messages.append({"role": "assistant", "content": resp.content})  # keep tool_use blocks
-        if resp.stop_reason != "tool_use":          # end_turn, max_tokens, refusal, ...
+        if resp.stop_reason != "tool_use":          # end_turn, stop_sequence, refusal
             return "".join(b.text for b in resp.content if b.type == "text")
         results = []
         for block in resp.content:
@@ -159,7 +166,7 @@ print(run("Where is order A100, and has order A200 shipped yet?"))
 - Treating `stop_reason == "max_tokens"` like a finished answer; the symptom is truncated JSON or a
   half-written tool call that the harness then tries to execute.
 - Editing earlier messages to "fix" the model's path mid-run; the symptom is a cache hit rate that
-  collapses and, on models that bind reasoning blocks to the conversation, rejected requests.
+  collapses and, if the edit touches signed or encrypted reasoning blocks, rejected requests.
 
 ## When to use
 Reach for a loop when the next action genuinely depends on the result of the previous one and the
@@ -213,7 +220,7 @@ transcript from the model.
 
 ### Q: Which fact most directly explains why agent harnesses keep message history append-only?
 - [ ] Models are trained to reject conversations that have been edited
-- [x] Prompt caching and conversation-bound reasoning blocks depend on an unchanged prefix, so edits make later turns more expensive or invalid
+- [x] Prompt caching and signed reasoning blocks depend on an unchanged prefix, so edits make later turns more expensive or invalid
 - [ ] Appending is the only operation the SDK message list supports
 - [ ] Edited history exceeds the context window faster than appended history
 > Caching works by matching the prefix byte for byte, so an edit at position *i* invalidates everything

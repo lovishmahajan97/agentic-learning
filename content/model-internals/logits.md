@@ -5,7 +5,7 @@ name: Logits
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - model-internals/softmax
   - model-internals/sampling-strategies
@@ -28,12 +28,15 @@ measure about confidence (logprobs, perplexity) is read from it.
 
 ## Why it exists
 A classifier over *V* classes needs a score per class, and a language model is a classifier over the
-vocabulary at every position. Two design choices follow. The network could emit probabilities directly,
-but a layer whose outputs must be non-negative and sum to one is awkward to build and worse to train:
-gradients would have to respect the constraint, and the loss would saturate near the boundaries. Emitting
-an unconstrained real number per class and normalizing afterwards separates the two jobs. The linear
-layer scores, softmax normalizes, and the cross-entropy loss can be computed in a numerically stable
-fused form directly from the scores.
+vocabulary at every position. The last layer is linear, and a linear map produces arbitrary reals, not
+numbers that are non-negative and sum to one. You could clamp and rescale them, or train the outputs to
+match one-hot targets with squared error, but both train badly: clamping kills gradients for every
+negative score, and squared error on probabilities gives almost no gradient to a confidently wrong
+prediction. The working design separates the jobs. The linear layer emits an unconstrained score per
+token (the logit), softmax normalizes, and cross-entropy is computed straight from the scores in a
+fused, numerically stable form. The payoff is the gradient: for target token *y*,
+`∂L/∂z = softmax(z) − onehot(y)`, so every wrong token is pushed down in proportion to the probability it
+stole and the right one is pushed up by its shortfall, with no saturation however wrong the model is.
 
 Keeping scores and probabilities distinct is also what makes inference controllable. Probabilities are
 locked to the simplex; scores are not. Add a constant to a token's logit and its probability rises
@@ -66,8 +69,11 @@ you sample from is `logits[:, -1, :]`.
 ### Editing logits
 The sampler sees logits, not text, so steering means arithmetic:
 - **Temperature** divides the whole vector by *T* before softmax.
-- **Logit bias** adds a per-token offset. OpenAI's API accepts values from −100 to 100; a large negative
-  value effectively bans a token, a large positive one forces it.
+- **Logit bias** adds a per-token offset *b*. Because `p_i / p_j = exp(z_i − z_j)`, a bias of *b*
+  multiplies that token's odds against every other token by `e^b`: +1 is about 2.7×, +5 about 150×.
+  With logits `[2.0, 1.0, 0.1]` the probabilities are `[0.66, 0.24, 0.10]`; a +1 bias on the third token
+  gives `[0.56, 0.21, 0.23]`. OpenAI's API accepts values from −100 to 100; at −100 the factor `e^−100`
+  effectively bans a token, and a large positive value effectively forces it.
 - **Masking** sets disallowed tokens to −∞, giving them exactly zero probability. Constrained decoding
   builds this mask each step from a grammar or JSON schema, which is why structured output can be
   guaranteed rather than merely requested.
@@ -81,8 +87,8 @@ Logits are produced in the model's compute dtype, but softmax and cross-entropy 
 fp32, *because* `exp` of a half-precision score overflows easily and small probability differences
 vanish in 16-bit. Some architectures bound the logits explicitly (Gemma 2 applies a `tanh` soft cap to
 its final logits) to keep training stable. Finally, since `W_U` can be applied to *any* hidden state,
-applying it to intermediate layers shows what the model would predict if it stopped early; this
-"logit lens" is a standard interpretability tool and a reminder that logits are just a dot product
+applying it (after the final normalization layer) to intermediate layers shows what the model would
+predict if it stopped early; this "logit lens" is a standard interpretability tool and a reminder that logits are just a dot product
 between a residual-stream vector and each token's output embedding.
 
 ## Example
@@ -123,8 +129,11 @@ print("after edits:", repr(tok.decode(torch.softmax(z2, -1).argmax())))
   wins for a handful of tokens, loses when the desired change is semantic rather than lexical.
 - Hard masking guarantees format compliance at zero probability leakage, but a mask that excludes the
   token the model wanted can push it into low-probability continuations and hurt content quality.
-- Computing the full vocabulary projection at every position is what training needs, but at decode time
-  it is wasted beyond the last position, so engines compute only the last row.
+- A larger vocabulary gives finer-grained tokens but a larger logits tensor; in training, one
+  8,192-token sequence with a 128,256-entry vocabulary produces about 1.05 billion logits, ~4.2 GB in
+  fp32, which is why chunked or fused cross-entropy kernels that never materialize the full tensor matter
+  once vocabularies and sequences grow. At decode time only the last row is computed, so the cost
+  vanishes there.
 
 ## Pitfalls
 - Reading logits as probabilities or comparing their absolute values across prompts; the symptom is

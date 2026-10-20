@@ -5,6 +5,7 @@ name: TypedDict, Literal and Enum
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
@@ -55,14 +56,15 @@ class exists only so the checker knows the keys and value types. This design was
 the whole point is to type data you already hold as dicts without changing a single runtime
 object; a wrapper class would defeat that. Consequences follow: there is no validation, so a dict
 from `json.loads` (typed `Any`) must be validated by something (Pydantic's `TypeAdapter`
-can validate a `TypedDict`) or trusted via a `cast`.
+can validate a `TypedDict`); otherwise it is simply trusted, because the checker accepts `Any`
+wherever a `TypedDict` is expected without a word of complaint.
 
 Keys are all required by default. `total=False` makes all of them optional; `NotRequired[T]` and
 `Required[T]` (3.11) mark individual keys, which matters for API payloads where `tool_calls` is
 present only on some turns. Reading an optional key with `d.get("k")` yields `T | None`, so the
 checker forces a narrowing branch. `ReadOnly[T]` (3.13) marks keys that must not be assigned.
-TypedDicts are structural: one with a superset of keys is assignable where the subset is expected,
-which lets a generic `Message` function accept richer provider-specific dicts. Keys that are not
+TypedDicts are structural: one with a superset of keys is assignable where the subset is expected
+(provided the shared keys have the same value types and required-ness), which lets a generic `Message` function accept richer provider-specific dicts. Keys that are not
 valid identifiers (`"content-type"`) use the functional form `TypedDict("Headers", {...})`.
 
 ### Literal: a finite set, checked statically
@@ -93,8 +95,9 @@ TypedDict for dict-shaped data whose runtime form must stay a dict (SDK payloads
 tool arguments); switch to a Pydantic model when you need validation or the shape is consumed in
 many places. Literal for small string sets that are only compared and serialized. Enum when you
 need iteration, identity, methods, or a value referenced from many modules; prefer `StrEnum` when
-it meets JSON. Pydantic accepts all three and renders Literal and Enum as JSON Schema `enum`
-constraints, so the choice does not affect the schema you send to a model.
+it meets JSON. Pydantic accepts all three and renders both Literal and Enum as JSON Schema `enum`
+constraints (an Enum as a named entry under `$defs` referenced by `$ref`, a multi-value Literal
+inline, a single-value Literal as `const`), so the choice barely changes what the model is shown.
 
 ## Example
 A wire-format chat message with an optional key, a `StrEnum` carrying behaviour, and an
@@ -145,8 +148,8 @@ print(json.dumps({"finish": reason}))              # {"finish": "tool_calls"}: S
 # msg["role"] = "robot"   -> checker error: "robot" is not a Role
 ```
 
-Remove the `CONTENT_FILTER` case and mypy or pyright reports that `assert_never` received a
-`FinishReason`, not `Never`. That is the exhaustiveness guarantee in action.
+Remove the `CONTENT_FILTER` case and mypy or pyright reports that `assert_never` received
+`Literal[FinishReason.CONTENT_FILTER]` (the member left over after narrowing), not `Never`. That is the exhaustiveness guarantee in action.
 
 ## Trade-offs
 - TypedDict costs nothing at runtime and keeps data SDK-ready, but gives no validation or methods;
@@ -166,8 +169,9 @@ Remove the `CONTENT_FILTER` case and mypy or pyright reports that `assert_never`
   and the symptom is a branch that never executes. Use `StrEnum` or compare `.value`.
 - Passing a plain Enum member into `json.dumps`; it fails with "Object of type ... is not JSON
   serializable", typically deep inside a logging or request-serialization call.
-- Assigning `json.loads(...)` output straight to a `TypedDict`-typed variable; the checker either
-  errors or, if you `cast`, trusts a shape nobody verified, and the `KeyError` appears later.
+- Assigning `json.loads(...)` output straight to a `TypedDict`-typed variable; because the result is
+  `Any`, the checker accepts it silently and trusts a shape nobody verified, and the `KeyError`
+  appears later. Validate with `TypeAdapter(ChatMessage).validate_python(...)` at the boundary.
 - Giving two Enum members the same value; the second silently becomes an alias and disappears from
   iteration, which looks like a "missing" member in a dropdown or a prompt listing valid options.
 - Adding a new Literal or Enum member without an `assert_never` guard in handlers; nothing warns, and

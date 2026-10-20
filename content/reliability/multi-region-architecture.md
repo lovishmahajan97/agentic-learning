@@ -4,8 +4,8 @@ module: reliability
 name: Multi-region architecture
 kind: pattern
 difficulty: advanced
-est_minutes: 16
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - reliability/high-availability
   - reliability/disaster-recovery
@@ -89,6 +89,13 @@ automatic failover of a *database* on a flaky health signal produces split brain
 accepting writes. Mature teams automate stateless failover and keep data-tier failover behind a
 human-confirmed runbook step or a strict fencing mechanism.
 
+The failover path must also be **statically stable**: it must work using only what already runs in
+the surviving region. A runbook that needs the failed region's CI/CD system, its secrets manager, a
+DNS or IAM change routed through a control plane hosted there, or a container registry that only
+exists there, fails exactly when it is needed. The same logic favours pre-provisioned capacity over
+"scale up on failover", *because* during a regional event every other customer of that cloud is
+calling the same scaling APIs in the same surviving regions at the same moment.
+
 ### Capacity is part of the design
 If two regions each run at 70% utilisation and one dies, the survivor needs 140%. Either run each
 region at or below 50% (paying for idle capacity) or plan explicit load shedding on failover:
@@ -157,6 +164,9 @@ US tenants are re-homed during a low-traffic window after the replica catches up
   duplicated agent actions from the seconds before failover.
 - Sizing each region for its own load; after failover the survivor overloads and a regional outage
   becomes a global one, visible as a second wave of errors minutes after the first.
+- A failover procedure with a hidden dependency on the failed region (its CI/CD runner, secrets store
+  or registry); drills that only fail over while the source region is healthy never reveal it, so the
+  symptom is a runbook step that hangs during the real event.
 
 ## When to use
 Go multi-region when you can name the driver: a contractual requirement to survive region loss, a
@@ -164,8 +174,9 @@ latency budget that one region cannot meet for a material user base, a residency
 quota you cannot obtain in one region. Otherwise multi-AZ plus a tested disaster-recovery plan is
 cheaper and usually adequate. If you do go, start with partitioned active-active and asynchronous
 replication, and reserve synchronous or globally consistent stores for the few records that truly
-need them. Measure replication lag, failover time and survivor utilisation, and rehearse failover on
-a schedule. In interviews, the signal of depth is talking about where writes are owned and what is
+need them. Measure replication lag (as a distribution, since its tail is your real RPO), failover time
+and survivor utilisation, and rehearse failover on a schedule, ideally by cutting the source region
+off rather than politely draining it. In interviews, the signal of depth is talking about where writes are owned and what is
 lost on failover, not about load balancers.
 
 ## Role lens

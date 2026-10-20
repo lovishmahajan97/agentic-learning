@@ -5,6 +5,7 @@ name: BM25 internals
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - rag-retrieval/inverted-indexes
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -60,8 +61,10 @@ length in the collection, and (in Lucene's form)
 IDF(q) = ln( (N − n(q) + 0.5) / (n(q) + 0.5) + 1 )
 ```
 
-with N the number of documents and n(q) the number containing q. Each piece answers one of the three
-failures above.
+with N the number of documents and n(q) the number containing q. (Recent Lucene versions also drop the
+constant `(k1 + 1)` from the numerator; it scales every score equally and so never changes the ranking,
+but it is why Lucene's raw scores are smaller than a textbook implementation's.) Each piece answers one
+of the three failures above.
 
 ### IDF: rarity as information
 A term present in nearly every document tells you nothing about which one is relevant, so its weight
@@ -211,8 +214,10 @@ Using the BM25 formula, explain why and what you would change.
 **A:** Two forces push the stub up. Length normalization with b = 0.75 divides the manual's term counts
 by a factor near |D|/avgdl, which for a document many times longer than average is large, so even dozens
 of mentions of the product name are discounted heavily; meanwhile the stub is shorter than average, so
-its single mention is amplified. Saturation then flattens the manual's remaining advantage: beyond
-roughly ten occurrences, extra mentions add almost nothing at k1 = 1.2. I would first ask whether the
+its single mention is amplified. Saturation then caps whatever advantage remains: since the count is
+effectively divided by the length factor before saturating, the manual's many mentions behave like a
+handful in an average document, and no number of mentions can push the term's contribution past
+(k1 + 1) × IDF. I would first ask whether the
 whole manual is the right unit at all; indexing sections or pages as documents usually fixes this
 outright because each becomes near average length. If whole manuals must be documents, lower b toward
 0.3 to reduce the length penalty and raise k1 so term density keeps counting, then re-measure recall on

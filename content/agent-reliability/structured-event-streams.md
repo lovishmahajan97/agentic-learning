@@ -5,6 +5,7 @@ name: Structured event streams
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -83,7 +84,8 @@ lives in the blob store with its own retention, while the event history stays in
 ### State is a fold
 The run's state at any point is `reduce(apply, events[:n], initial)`. `apply` is a pure function that,
 for example, appends an `llm.response` to the message list, records a pending tool call on
-`tool.call.requested`, and resolves it on `tool.call.result`. Resumption after a crash is replaying the
+`tool.call.requested`, and resolves it on `tool.call.result`. It may update its accumulator in place, but
+it must read nothing except the state and the event: no clock, no network, no randomness. Resumption after a crash is replaying the
 persisted events through `apply` and continuing from the resulting state. A checkpoint is just a cached
 fold at some `seq`, kept so that replay does not start from zero.
 
@@ -142,7 +144,7 @@ def emit(run_id: str, counter: itertools.count, cls, **payload) -> Event:
     return cls(run_id=run_id, seq=next(counter), **payload)        # single writer assigns seq
 
 def apply(state: dict, ev: Event) -> dict:
-    """Pure fold: the run's state is reduce(apply, events)."""
+    """Deterministic fold, no I/O; it mutates only the accumulator. state = reduce(apply, events)."""
     if ev.type == "llm.response":
         state["messages"].append({"role": "assistant", "content": ev.text, "tool_calls": ev.tool_calls})
     elif ev.type == "tool.call.requested":
@@ -210,12 +212,13 @@ you have built an agent that survived contact with production.
 **Q:** Your agent runs two tool calls in parallel, and the UI occasionally shows a result row before its
 "calling tool" row. A worker crash during that window also caused one tool to run twice on resume. Explain
 both symptoms with one root cause and fix it.
-**A:** Both come from ordering by wall-clock time and from writing events after the effect. Parallel calls
-complete in any order, and if each thread stamps its own timestamp the result event can carry an earlier
-`ts` than the request event emitted by another thread; the UI sorting by `ts` shows the inversion. The
-duplicate execution comes from emitting `tool.call.requested` only after the call returns: a crash between
-execution and the write leaves no record, so the fold on resume sees no pending call and issues it again.
-The fix is a single writer per run that assigns a monotonic `seq`, consumers that sort by `seq`, and a
+**A:** The root cause is that no single writer owns the run's history: events are written by whichever
+process or thread holds them, stamped with that process's clock, and written when convenient rather than
+before the effect. Ordering suffers because the orchestrator stamps `tool.call.requested` with its clock
+while a worker on another host stamps `tool.call.result` with its own; a skew larger than the call's
+duration gives the result an earlier `ts`, and a UI sorting by `ts` shows the inversion. Durability
+suffers because the request is only persisted when the worker reports back: a crash between execution and
+that write leaves no record, so the fold on resume sees no pending call and issues it again. The fix is a single writer per run that assigns a monotonic `seq`, consumers that sort by `seq`, and a
 durable `tool.call.requested` event written before the adapter runs, paired with an idempotency key so
 that even a retry after a crash cannot repeat the effect.
 

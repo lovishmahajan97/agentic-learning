@@ -5,6 +5,7 @@ name: Overfitting
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - training-adaptation/train-val-test-split
   - training-adaptation/epochs
@@ -67,8 +68,9 @@ that goes below the noise floor on training data has memorised the noise.
 
 ### Levers, and why each one works
 1. **Data.** More examples make memorisation harder than learning the rule; deduplication removes rows
-   the model would otherwise see several times per epoch; cleaner labels lower the noise floor. This is the
-   only lever that raises the ceiling as well as closing the gap.
+   the model would otherwise see several times per epoch; cleaner labels lower the noise floor. Of the
+   levers in this list it is the only one that raises the ceiling as well as closing the gap (a stronger
+   base model can raise the ceiling too, but that is a model choice, not an overfitting remedy).
 2. **Steps.** Fewer epochs, a lower learning rate, and early stopping limit how far the model travels from
    the pretrained prior, so it stops after the shared structure and before the particulars.
 3. **Capacity.** Parameter-efficient fine-tuning (low-rank adapters, a few trainable layers) constrains the
@@ -145,8 +147,8 @@ for epoch, val_loss in enumerate([1.38, 1.21, 1.18, 1.19, 1.25, 1.33, 1.44, 1.52
   set it stops at the wrong place, and the real cost moves to building that set properly.
 - Parameter-efficient fine-tuning limits how much the model can memorise, but it equally limits how much
   of a genuinely new task it can learn; for tasks far from pretraining, full fine-tuning with more data wins.
-- More data is the only lever that improves the achievable ceiling, but it costs labelling time, and
-  synthetic data that shares one template can add rows while adding little diversity.
+- Among the anti-overfitting levers, more data is the only one that improves the achievable ceiling,
+  but it costs labelling time, and synthetic data that shares one template can add rows while adding little diversity.
 
 ## Pitfalls
 - Judging a run by training loss; the symptom is a proud "loss went to 0.1" followed by a model that
@@ -204,11 +206,12 @@ constrain the trainable parameters.
 
 ### Q: A 2,000-example fine-tune overfits after two epochs. Which single change most directly raises the achievable quality rather than just closing the gap?
 - [ ] Training for more epochs with a lower learning rate
-- [ ] Switching to a larger base model
+- [ ] Raising the LoRA rank so the adapter has more trainable capacity
 - [x] Adding more deduplicated, diverse training examples
 - [ ] Increasing weight decay
 > More diverse data makes the rule cheaper to learn than the rows and lowers the noise floor, improving
-> the ceiling; the other options trade bias for variance or add capacity without adding information.
+> the ceiling. Weight decay and a lower rate only trade variance for bias, and a higher LoRA rank adds
+> trainable capacity without adding information, which makes memorising the 2,000 rows easier, not harder.
 
 ### Q: The validation set contains near-duplicates of training examples. What happens to overfitting detection?
 - [ ] Overfitting is detected earlier because duplicates are easier to fit

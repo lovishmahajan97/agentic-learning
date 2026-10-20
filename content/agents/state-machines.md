@@ -5,6 +5,7 @@ name: State machines
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -50,8 +51,9 @@ states and transitions is something you can check, test, draw and resume.
 ## How it works
 ### Anatomy
 - **States** are a finite set, each with its own allowed tools and often its own prompt fragment.
-  Because the tool list differs by state, the model in INVESTIGATE cannot call `deploy`: the tool is
-  not in the request, so there is nothing to refuse.
+  Because the tool list differs by state, the model in INVESTIGATE cannot sensibly call `deploy`: the
+  tool is not in the request. Models occasionally emit a call to a tool they were not offered, so the
+  harness still checks the name against the state's list and rejects anything else.
 - **Data** is a typed record (a Pydantic model or TypedDict) holding the facts guards need:
   `tests_passed`, `attempts`, `approved_by`, `plan`. It is separate from the transcript because the
   transcript is prose and guards need booleans.
@@ -103,7 +105,8 @@ are describing a workflow and should write it as code with no model choosing tra
 ## Example
 A bug-fix agent as a small machine. The model only sees the tools of its current state, the transition
 table decides what each tool call means, and two guards enforce the invariants: no finishing without
-passing tests, and no more than three apply attempts.
+passing tests, and no more than three apply attempts. Legality is checked *before* the tool executes, so
+a rejected call has no side effect, and repeated rejections end the run in FAILED rather than looping.
 
 ```python
 from enum import Enum
@@ -126,27 +129,37 @@ TABLE = {(S.INVESTIGATE, "submit_plan"): S.PROPOSE, (S.PROPOSE, "approve_plan"):
          (S.PROPOSE, "revise_plan"): S.INVESTIGATE, (S.APPLY, "run_tests"): S.VERIFY,
          (S.VERIFY, "retry"): S.APPLY, (S.VERIFY, "finish"): S.DONE}
 
-def transition(state: S, event: str, d: Data) -> S:
+def check(state: S, event: str, d: Data) -> None:      # runs BEFORE any side effect
     if event not in TOOLS[state]:
         raise ValueError(f"{event} is not allowed in {state.value}")
-    nxt = TABLE.get((state, event), state)             # tools that do not change phase self-loop
-    if nxt is S.DONE and not d.tests_passed:            # guard: the invariant lives in code
+    if TABLE.get((state, event)) is S.DONE and not d.tests_passed:   # guard lives in code
         raise ValueError("cannot finish: tests have not passed")
+
+def next_state(state: S, event: str, d: Data) -> S:
     if (state, event) == (S.VERIFY, "retry"):
         d.attempts += 1
         if d.attempts >= 3:
-            return S.FAILED                             # bounded retry ends in a terminal state
-    return nxt
+            return S.FAILED                          # bounded retry ends in a terminal state
+    return TABLE.get((state, event), state)          # tools that do not change phase self-loop
 
-def run(model, execute, store, run_id):
-    state, d = store.load(run_id) or (S.INVESTIGATE, Data())   # resume where we left off
+def run(model, execute, store, run_id, max_rejections=5):
+    state, d, step = store.load(run_id) or (S.INVESTIGATE, Data(), 0)   # resume where we left off
+    rejections, feedback = 0, None
     while state not in (S.DONE, S.FAILED):
-        call = model.next_action(state, d, tools=TOOLS[state])   # only this state's tools are offered
-        result = execute(call, idempotency_key=f"{run_id}:{store.step(run_id)}")
+        call = model.next_action(state, d, tools=TOOLS[state], feedback=feedback)
+        try:
+            check(state, call.name, d)
+        except ValueError as e:                      # reject, tell the model why, re-prompt
+            rejections, feedback = rejections + 1, str(e)
+            state = S.FAILED if rejections >= max_rejections else state
+            store.save(run_id, state, d, step)
+            continue
+        feedback = None
+        result = execute(call, idempotency_key=f"{run_id}:{step}")   # same key if re-run after a crash
         if call.name == "run_tests": d.tests_passed = result.ok
         if call.name == "submit_plan": d.plan = call.args["plan"]
-        state = transition(state, call.name, d)
-        store.save(run_id, state, d)                             # checkpoint after every transition
+        state, step = next_state(state, call.name, d), step + 1
+        store.save(run_id, state, d, step)           # checkpoint after every transition
     return state
 ```
 

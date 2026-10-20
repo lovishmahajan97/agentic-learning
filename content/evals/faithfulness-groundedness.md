@@ -5,6 +5,7 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/hallucination-evaluation
   - evals/retrieval-evaluation
@@ -122,10 +123,10 @@ def faithfulness(answer: str, context: str, llm) -> dict:
     }
 
 # Context: "Standard plans may be refunded within 30 days of purchase. Enterprise plans are non-refundable."
-# Answer:  "You can get a refund within 30 days. This applies to all plans, including Enterprise.
+# Answer:  "Standard plans can be refunded within 30 days. This also applies to Enterprise plans.
 #           Refunds go back to the original payment method."
-# Claims -> "A refund is available within 30 days"            SUPPORTED
-#           "The 30-day refund applies to Enterprise plans"   CONTRADICTED
+# Claims -> "Standard plans can be refunded within 30 days"   SUPPORTED
+#           "Enterprise plans can be refunded within 30 days" CONTRADICTED
 #           "Refunds go to the original payment method"       NOT_FOUND
 # faithfulness = 1/3, contradicted = 1  ->  fails a contradiction gate despite a correct first sentence.
 ```
@@ -182,7 +183,7 @@ claim-decomposition pipeline and the abstention loophole.
 **Q:** A RAG assistant for an insurer scores 0.91 faithfulness on your eval set, yet the compliance team
 found three answers quoting coverage limits that appear nowhere in the policy documents. Explain how both
 can be true and what you would change.
-**A:** 0.91 is a mean over claims; a 9% unsupported share across thousands of claims easily contains
+**A:** 0.91 is an average of per-answer claim ratios; a 9% unsupported share across thousands of claims easily contains
 three invented coverage limits, and averages hide gated failures. Other contributors: decomposition too
 coarse, so a figure sits inside a long claim judged "mostly supported"; judge leniency on numbers; the
 judge drawing on its own knowledge; or NOT_FOUND and CONTRADICTED collapsed together. Changes: gate any

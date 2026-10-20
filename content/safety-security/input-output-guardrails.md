@@ -5,7 +5,7 @@ name: Input / output guardrails
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - safety-security/prompt-injection
   - safety-security/output-validation
@@ -95,6 +95,24 @@ are testable and auditable. Model-based checkers inherit model weaknesses, inclu
 give them only the text to classify and the policy, never the whole conversation, and constrain their
 output to a label so there is nothing to hijack.
 
+Input rails do not have to sit serially in front of the model. When the main call has no side effects
+(no tools, nothing written), you can start it in parallel with the input classifier and discard its
+answer if the rail fires, *because* blocks are rare and you then pay the classifier's latency only on
+the requests it stops. Once the model can call tools, this shortcut is gone: the rail must finish
+before anything can act.
+
+### Why a stack of rails needs numbers
+Two pieces of arithmetic decide how rails should behave. First, false positives compound. If five
+independent rails each wrongly block 1% of legitimate traffic, the share of legitimate requests blocked
+by at least one is 1 − 0.99⁵ ≈ 4.9%. Every rail you add costs users, so each must earn its place.
+
+Second, base rates. Suppose 0.1% of requests are attacks and a classifier catches 95% of them with a 1%
+false-positive rate. Per 100,000 requests it flags 95 real attacks and about 999 legitimate ones, so
+only ~9% of its blocks are correct. A detector that sounds accurate is mostly wrong when what it hunts
+is rare. That is why low-prevalence rails usually *flag*, step up scrutiny or route to review rather
+than hard-block, and why hard blocks are reserved for checks with near-zero false positives (canary
+match, schema failure, an exact contractual term) or for harms severe enough to justify the friction.
+
 ### Streaming
 Output rails conflict with token streaming. The options are to buffer the whole response (adds
 latency), check at sentence or chunk boundaries with a UI that can retract text, or run cheap checks
@@ -108,7 +126,7 @@ thresholds, measure false positives or run a new rail in shadow mode before enfo
 ## Example
 A minimal rail pipeline: deterministic checks first, a small label-only classifier second, the main
 model in the middle, and a canary leak check on the way out. Each rail is a pure function you can unit
-test with a fixture set.
+test with a fixture set, and each block reason maps to its own honest message.
 
 ```python
 import re, anthropic
@@ -117,43 +135,50 @@ from dataclasses import dataclass
 client = anthropic.Anthropic()
 CANARY = "zx-canary-7f3a"                      # planted in the system prompt; must never be echoed
 SYSTEM = f"You are a billing-support assistant for AcmePay. Internal tag: {CANARY}."
-INJECTION = re.compile(r"ignore (all|previous|the above) instructions|you are now|system prompt", re.I)
+INJECTION = re.compile(r"ignore (all|previous|the above) instructions|you are now", re.I)  # crude by design
 CARD = re.compile(r"\b(?:\d[ -]?){13,16}\b")
+MESSAGES = {"too_long": "Please shorten your message to under 8,000 characters.",
+            "injection_pattern": "I can't process that request. Please rephrase your billing question.",
+            "off_topic": "I can only help with AcmePay billing, payments and account access.",
+            "out_of_policy": "I can't give legal, tax or investment advice; a human agent will follow up."}
 
 @dataclass
 class Verdict:
     allow: bool
     reason: str = ""
 
-def classify(prompt: str) -> str:               # cheap checker: policy + text only, label-only output
-    r = client.messages.create(model="claude-haiku-5-5", max_tokens=200,
-                               messages=[{"role": "user", "content": prompt}])
+def classify(policy: str, text: str) -> str:    # checker sees policy + delimited text only; label-only output
+    r = client.messages.create(model="claude-haiku-5-5", max_tokens=1024, system=policy,
+                               messages=[{"role": "user", "content": f"<text>{text}</text>"}])
     return next(b.text for b in r.content if b.type == "text").strip().upper()
 
-def input_rails(text: str) -> Verdict:
-    if len(text) > 8000: return Verdict(False, "too_long")
-    if INJECTION.search(text): return Verdict(False, "injection_pattern")
-    if CARD.search(text): return Verdict(False, "card_number_in_input")
-    label = classify(f"Is this message about billing, payments or account access? Reply ON or OFF.\n\n{text}")
-    return Verdict(label.startswith("ON"), "off_topic")
+def input_rails(text: str) -> tuple[Verdict, str]:   # returns the verdict and the text to send onward
+    if len(text) > 8000: return Verdict(False, "too_long"), text
+    if INJECTION.search(text): return Verdict(False, "injection_pattern"), text
+    text = CARD.sub("[CARD REMOVED]", text)       # redact rather than block: the user meant no harm
+    label = classify("Is the text about billing, payments or account access? Reply ON or OFF only.", text)
+    return Verdict(label.startswith("ON"), "off_topic"), text
 
-def output_rails(answer: str, user_text: str) -> Verdict:
-    if CANARY in answer: return Verdict(False, "system_prompt_leak")
-    if CARD.search(answer) and not CARD.search(user_text): return Verdict(False, "card_number_in_output")
-    label = classify(f"Does this reply give legal, tax or investment advice? Reply YES or NO.\n\n{answer}")
+def output_rails(answer: str) -> Verdict:
+    if CANARY in answer: return Verdict(False, "system_prompt_leak")   # near-zero false positives: hard block
+    if CARD.search(answer): return Verdict(False, "card_number_in_output")
+    label = classify("Does the text give legal, tax or investment advice? Reply YES or NO only.", answer)
     return Verdict(label.startswith("NO"), "out_of_policy")
 
 def answer(user_text: str) -> str:
-    v = input_rails(user_text)
+    v, clean = input_rails(user_text)
     if not v.allow:
-        print("input_block", v.reason); return "I can only help with AcmePay billing questions."
+        print("input_block", v.reason); return MESSAGES[v.reason]       # log line carries the trace id in real code
     r = client.messages.create(model="claude-opus-5-5", max_tokens=1024, system=SYSTEM,
-                               messages=[{"role": "user", "content": user_text}])
+                               messages=[{"role": "user", "content": clean}])
     text = next(b.text for b in r.content if b.type == "text")
-    v = output_rails(text, user_text)
+    v = output_rails(text)
     if not v.allow:
-        print("output_block", v.reason); return "I can't answer that part; a human agent will follow up."
+        print("output_block", v.reason)
+        return MESSAGES.get(v.reason, "I can't share that; a human agent will follow up.")
     return text
+# answer("My card 4111 1111 1111 1111 was charged twice") -> the model sees "[CARD REMOVED]";
+# answer("Should I move my savings into index funds?") -> off_topic, a specific message, not a crash.
 ```
 
 ## Trade-offs
@@ -190,7 +215,8 @@ Any LLM feature exposed to untrusted input or producing consequential output nee
 question is how much of it. Start with the smallest set you can test: size limits, schema validation,
 a canary leak check and output moderation. Add classifiers only when you have a measured failure that
 justifies the latency and cost, and never add a rail you cannot evaluate: each one needs labelled
-positives and negatives and a tracked false-positive rate. Day to day this looks like triaging block
+positives and negatives, a tracked false-positive rate and a block precision (the share of its blocks
+that a reviewer agrees with). Day to day this looks like triaging block
 logs weekly, running new rails in shadow mode before enforcing them, and re-running the red-team suite
 after every prompt or model change. In interviews, "how would you stop the bot doing X" should be
 answered with layered rails plus the measurement loop, not with a sentence in the system prompt.
@@ -210,8 +236,10 @@ blocked. Walk through what you would change and in what order.
 checks first and short-circuit; give the checker only the final answer plus the policy, with a small
 model and a label-only output; run it concurrently with generation on buffered chunks, or only on
 responses a cheap heuristic flags; for low-risk flows stream with retraction. For precision: build a
-labelled set from the blocked cases, measure false positives per rail rather than overall, adjust
-thresholds per rail, and downgrade borderline scores from block to flag-for-review. Put both numbers
+labelled set from the blocked cases and estimate the checker's precision: if real violations are rare,
+a 3% false-block rate means most of its blocks are wrong, so the rail is costing far more than it saves.
+Measure false positives per rail rather than overall, adjust thresholds per rail, and downgrade
+borderline scores from block to flag-for-review. Put both numbers
 on a dashboard so the trade-off is explicit and the next tuning decision is made with data.
 
 ## Quiz

@@ -5,7 +5,7 @@ name: Output validation (Pydantic, Instructor, Outlines)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pydantic
   - python-for-ai/instructor
@@ -59,7 +59,8 @@ definition serves the provider, the parser and the documentation.
 ### Instructor: validation in the loop
 Instructor patches a provider client (`instructor.from_anthropic`, `instructor.from_openai`, ...) so the
 call accepts `response_model=YourModel` and `max_retries=N`. Under the hood it derives the schema,
-requests structured output through the provider's tool-call or JSON mode, parses the reply with Pydantic
+requests structured output through the provider's tool-call or JSON mode (a `mode` setting chooses
+which, since providers differ in what they support), parses the reply with Pydantic
 and, on `ValidationError`, appends the failed attempt plus a user message containing the error text and
 asks again. It works *because* models are good at fixing a named error in a named field; most retries
 converge in one round. The cost is extra calls on failure, so a high retry rate is a signal to fix the
@@ -67,16 +68,26 @@ prompt or schema, not to raise `max_retries`. Any Python assertion in a validato
 instruction, which is how semantic rules get enforced.
 
 ### Outlines: constraints inside decoding
-Outlines compiles a JSON schema, regex or grammar into a finite-state machine over the tokenizer's
-vocabulary. At each decode step it computes which tokens keep the automaton in a valid state and masks
-the logits of every other token before sampling. The output therefore matches the grammar by
-construction, with no retries. The index is built once per schema and cached. The requirement is logit
+Outlines turns a regex, or a JSON schema first converted to a regex, into a finite-state machine (FSM)
+over characters. The difficulty is that the model emits *tokens*, and one token can span several
+characters or cross a field boundary. So Outlines builds an index ahead of time: for every FSM state,
+the set of vocabulary tokens whose whole character string walks the FSM to another valid state. At
+each decode step it looks up the current state, sets the logits of every token outside that set to −∞,
+and samples from what remains. Concretely, for the regex `\d{3}` after the model has emitted `4`, the
+tokens `2` and `27` are allowed but `273` (one digit too many) and `a` are masked. The output matches
+the pattern by construction, with no retries, and the per-step cost is a lookup *because* the
+expensive work was done once per schema and cached; that precomputation is the contribution of
+Willard and Louf. A regular language cannot express unbounded nesting, so recursive schemas are
+bounded to a fixed depth; full context-free grammars need a pushdown automaton or incremental parser,
+which engines such as XGrammar provide. The requirement is logit
 access, which means local or open-weight models (Transformers, vLLM integrations); hosted APIs offer the
 same idea as provider-operated "structured outputs" or strict schemas. Two limits matter. It guarantees
 syntax, not truth: a model forced to fill a field it does not know fills it with something plausible, so
 schemas should allow `null` or an `"unknown"` enum where ignorance is a legitimate answer. And a tight
 grammar can steer the model into low-probability continuations, which is why schema design (field
-order, descriptions, optionality) still affects quality.
+order, descriptions, optionality) still affects quality. Field order matters *because* decoding is
+left to right: a `reason` field placed before `decision` lets the model write its justification and
+then commit, while the reverse makes it commit first and rationalise afterwards.
 
 ### Provider-native structured outputs
 Most major APIs now accept a JSON schema and constrain generation server-side, which is constrained
@@ -104,10 +115,10 @@ import anthropic
 
 class RefundDecision(BaseModel):
     order_id: str = Field(pattern=r"^ORD-\d{6}$")
+    order_date: date
+    reason: str = Field(min_length=10, max_length=300)   # before the verdict: justify, then commit
     decision: Literal["approve", "deny", "escalate"]
     amount_cents: int = Field(ge=0)
-    reason: str = Field(min_length=10, max_length=300)
-    order_date: date
 
     @field_validator("order_date")
     @classmethod
@@ -123,9 +134,10 @@ class RefundDecision(BaseModel):
         return self
 
 SHAPE = {"type": "object", "additionalProperties": False,          # shape only: providers enforce this
-         "required": ["order_id", "decision", "amount_cents", "reason", "order_date"],
-         "properties": {"order_id": {"type": "string"}, "decision": {"type": "string", "enum": ["approve", "deny", "escalate"]},
-                        "amount_cents": {"type": "integer"}, "reason": {"type": "string"}, "order_date": {"type": "string"}}}
+         "required": ["order_id", "order_date", "reason", "decision", "amount_cents"],
+         "properties": {"order_id": {"type": "string"}, "order_date": {"type": "string"}, "reason": {"type": "string"},
+                        "decision": {"type": "string", "enum": ["approve", "deny", "escalate"]},
+                        "amount_cents": {"type": "integer"}}}
 client = anthropic.Anthropic()
 
 def decide(ticket: str, max_retries: int = 2) -> RefundDecision:
@@ -133,6 +145,8 @@ def decide(ticket: str, max_retries: int = 2) -> RefundDecision:
     for _ in range(max_retries + 1):
         r = client.messages.create(model="claude-opus-5-5", max_tokens=1024, messages=messages,
                                    output_config={"format": {"type": "json_schema", "schema": SHAPE}})
+        if r.stop_reason == "max_tokens":
+            raise RuntimeError("truncated output: raise max_tokens, retrying will not help")
         text = next(b.text for b in r.content if b.type == "text")       # parses and has the right keys
         try:
             return RefundDecision.model_validate_json(text)                # semantic rules run here
@@ -142,6 +156,9 @@ def decide(ticket: str, max_retries: int = 2) -> RefundDecision:
     raise RuntimeError("no valid decision after retries; route to review")
 
 print(decide("ORD-104233, placed 2026-09-30, blender arrived cracked, paid $89.99.").model_dump())
+# A failure this loop repairs: {"decision": "deny", "amount_cents": 8999, ...} passes the provider's
+# shape check, then model_validator raises "a denied refund must have amount_cents == 0"; the retry
+# carries that exact sentence and the model returns either approve/8999 or deny/0.
 ```
 
 ## Trade-offs
@@ -151,7 +168,8 @@ print(decide("ORD-104233, placed 2026-09-30, blender arrived cracked, paid $89.9
 - Retry-on-error is simple and provider-agnostic, but worst-case cost and latency multiply by the retry
   count; when the failure rate climbs past a few percent the fix is the prompt or schema, not more retries.
 - Strict schemas (closed enums, no extra fields) catch drift the day it starts, but every new category
-  in the domain becomes a schema release; version the contract rather than loosening it.
+  in the domain becomes a schema release; version the contract rather than loosening it. Loosen
+  instead (an `other` value plus a free-text field) when categories churn faster than you can release.
 - Pydantic's default lax coercion (`"42"` to `42`) is convenient and hides model errors; use strict mode
   where the type carries meaning, such as money or identifiers.
 - Semantic validators that hit a database make rules retryable but couple validation to I/O and latency;

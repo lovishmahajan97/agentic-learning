@@ -5,6 +5,7 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
+status: fact-checked
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -68,8 +69,10 @@ answer with a made-up policy number ships.
 
 ### Binary beats Likert
 Prefer yes/no checks per criterion over 1–5 scales. A five-level scale has four boundaries to disagree
-on; a binary check has one, so inter-annotator agreement is higher and judge accuracy is higher. If you
-need granularity, add more binary criteria rather than more levels. The resulting score, fraction of
+on; a binary check has one, so raw inter-annotator agreement and judge–human agreement are typically
+higher. One caveat: when a binary criterion almost always passes, chance-corrected agreement (kappa) can
+still be low, so read it alongside the pass rate. If you need granularity, add more binary criteria
+rather than more levels. The resulting score, fraction of
 checks passed, is also directly interpretable. When a quantity is genuinely continuous (how well a
 summary fits a length budget) use a three-level anchored scale, rarely more.
 
@@ -120,7 +123,7 @@ Context:
 Question: {question}
 Response: {response}
 Criterion: {check}
-Quote the evidence from the response (or write NONE), then output exactly PASS or FAIL on the last line."""
+Quote the evidence from the response and context (or write NONE), then output exactly PASS or FAIL on the last line."""
 
 def grade(item, response, llm):
     """item = {'context':..., 'question':..., 'criteria': [item-specific criterion names]}"""

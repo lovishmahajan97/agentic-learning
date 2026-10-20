@@ -5,6 +5,7 @@ name: Planning
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/task-decomposition
@@ -100,15 +101,15 @@ A plan-then-execute loop with structured steps, a verification check per step, a
 observation.
 
 ```python
-import json
-
 MAX_REPLANS, MAX_STEPS = 3, 20
 
-def make_plan(goal, history=""):
+def make_plan(goal, done=(), history=""):
+    finished = [s["goal"] for s in done]
     return llm_json(f"""Goal: {goal}
+Already completed, do not repeat: {finished or 'none'}
 Previous attempts and failures: {history or 'none'}
 Return JSON: {{"steps":[{{"id":1,"goal":"...","done_when":"...","depends_on":[]}}]}}
-Keep steps independently verifiable; at most 8 steps.""")["steps"]
+Plan only the remaining work; steps independently verifiable; at most 8.""")["steps"]
 
 def verify(step, observation):
     return llm_json(f'Step goal: {step["goal"]}\nDone when: {step["done_when"]}\n'
@@ -132,19 +133,23 @@ def agent(goal):
                 break                      # leave the inner loop and replan
         else:
             return {"status": "complete", "plan": plan}
+        if replan == MAX_REPLANS:
+            break                          # no replans left; do not pay for an unused plan
         done = [s for s in plan if s.get("status") == "done"]
-        plan = done + make_plan(goal, "\n".join(history))   # keep finished work, replan the rest
+        plan = done + make_plan(goal, done, "\n".join(history))  # replan only the rest
     return {"status": "gave_up", "plan": plan, "history": history}
 ```
 
 The two deliberate choices are the `done_when` criterion written at planning time, and keeping finished
-steps across replans so the agent never redoes verified work.
+steps across replans *and telling the replanner about them*, so it plans only the remaining work and the
+agent does not redo verified steps.
 
 ## Trade-offs
 - Up-front plans give reviewability and progress tracking, but they are written with the least
   information; in highly uncertain environments interleaved planning wastes fewer steps on wrong plans.
 - ReWOO-style placeholder plans cut model calls to a handful, yet they cannot react to surprising tool
-  output; the moment steps depend on unknown intermediate results, interleaving wins back its cost.
+  output; placeholders can pass an unknown result into a later step's arguments, but the moment *which*
+  step comes next depends on what a result says, interleaving wins back its cost.
 - Search over plans improves hard-problem success substantially, but only with a trustworthy evaluator;
   with a noisy value prompt you pay branching-factor times the cost for little gain.
 - Structured JSON plans enable parallelism and validation, at the cost of a stricter planner prompt and
@@ -206,14 +211,15 @@ from roughly O(n²) tokens to O(n), and replans are bounded to a few per batch.
 ### Q: When is a ReWOO-style plan with placeholder variables a poor choice?
 - [ ] When tool calls are expensive
 - [ ] When the task has many independent steps
-- [x] When later steps depend on the content of earlier observations that cannot be predicted
+- [x] When which steps to run, not just their arguments, depends on what earlier observations turn out to contain
 - [ ] When the model supports structured outputs
-> Placeholder plans are written before any observation and never revisited by the planner. If step 3's
-> arguments depend on what step 1 returns in an unpredictable way, the plan cannot adapt and fails.
+> Placeholder plans are written before any observation and never revisited by the planner. A variable
+> like `#E1` can carry step 1's output into step 3's arguments, but if step 1's result should change
+> *what* step 3 is (or whether it runs), the fixed plan cannot adapt. Many independent steps suit ReWOO well.
 
 ### Q: Which trigger is a sound reason to replan rather than retry?
 - [ ] Any tool returning an error once
-- [ ] The user sending a new message
+- [ ] The user sending any new message, even one that leaves the goal unchanged
 - [x] An observation contradicting an assumption the plan was built on, or a step failing repeatedly
 - [ ] Every ten steps regardless of progress
 > Replanning is for when the plan's premises are wrong. Single transient errors deserve a retry, and

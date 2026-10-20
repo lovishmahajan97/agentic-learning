@@ -5,7 +5,7 @@ name: Caching (semantic, prompt)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/prefix-caching
   - prompting/prompt-caching
@@ -59,17 +59,26 @@ invalidate on change. Product semantics decide whether a cached answer is accept
 zero; a "regenerate" action must bypass it.
 
 ### Layer 2: semantic cache
-Embed the incoming query (and optionally a normalised context), run a nearest-neighbour search over past
-queries, and if the best match's similarity exceeds a threshold τ, return its stored answer. GPTCache is a
-well-known open-source implementation. The mechanism has four load-bearing parts. The threshold is a
-precision/recall knob: "how do I cancel my order" and "how do I cancel my subscription" embed close
-together and have different answers, so a threshold tuned only for hit rate ships wrong answers. The scope
-must include tenant, corpus version and prompt version, because a similar question in a different
-tenant's context must never hit. Invalidation must fire when the underlying knowledge changes, since the
-cache does not know the policy page was edited. And measurement must track hit *precision* (the fraction
-of hits judged correct) alongside hit rate, because the failure mode is a confident wrong answer. A cheap
-verifier call ("does this cached answer answer this question?") can raise precision at some latency cost.
-It fits FAQ-like, high-repeat, low-personalisation traffic, and fits chat with history or user-specific
+GPTCache is a well-known open-source implementation; the data flow is the same in any of them:
+1. **Scope.** Build a namespace from tenant, corpus or knowledge-base version, prompt version and
+   model, *because* a similar question asked against a different tenant's data or an older policy must
+   never hit. Lookups only search inside the namespace.
+2. **Embed.** Embed the normalised query, usually the latest user message with any context that changes
+   the answer folded in. Embedding only the last message is what makes "and for business accounts?"
+   match an unrelated earlier question.
+3. **Search.** Nearest-neighbour lookup over stored queries in the namespace; take the best match and
+   its similarity.
+4. **Decide.** Hit if similarity ≥ τ. The threshold is a precision/recall knob: "how do I cancel my
+   order" and "how do I cancel my subscription" embed close together and have different answers, so a
+   threshold tuned only for hit rate ships wrong answers. A cheap verifier call ("does this stored answer
+   answer this question?") can raise precision at some latency cost.
+5. **Fill and expire.** On a miss, generate, then store query, embedding and answer with a TTL, and
+   delete the namespace (or bump its version) when the underlying knowledge changes, because the cache
+   does not know the policy page was edited.
+
+Measurement must track hit *precision* (the fraction of sampled hits a human or judge rates correct)
+alongside hit rate, because the failure mode is a confident wrong answer that no error metric sees. It
+fits FAQ-like, high-repeat, low-personalisation traffic, and fits chat with history or user-specific
 context poorly.
 
 ### Layer 3: prompt caching (prefix KV reuse)
@@ -90,9 +99,9 @@ once the writing request has begun responding, so N parallel identical requests 
 Vendor specifics at the time of writing, which change: Anthropic uses explicit `cache_control`
 breakpoints (up to four per request) with a default five-minute TTL refreshed on every read and an
 optional one-hour TTL; cache writes cost more than ordinary input (1.25× for five minutes, 2× for one
-hour) and reads cost a fraction of input (around 0.1×, lower on newer models); the minimum cacheable
-prefix is model-dependent, from a few hundred to a few thousand tokens, and shorter prefixes silently do
-not cache. OpenAI caches automatically for prompts above a minimum length and discounts cached input
+hour) and reads cost a fraction of input (around 0.1×); the minimum cacheable prefix is
+model-dependent, on the order of one to a few thousand tokens, and shorter prefixes silently do not
+cache. OpenAI caches automatically for prompts above a minimum length and discounts cached input
 tokens. On both, caching reduces input cost and time to first token; it does nothing for output tokens or
 decode speed.
 

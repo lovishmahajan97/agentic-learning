@@ -5,6 +5,7 @@ name: Evaluation frameworks
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/eval-harness
   - evals/tooling
@@ -42,8 +43,8 @@ a model alias that has since been updated.
 The naive alternatives each fail in a specific way. Evaluating in notebooks is not repeatable, so
 Friday's number cannot be compared with Tuesday's. A spreadsheet of hand-checked outputs is honest but
 stale within a sprint and cannot gate a pipeline. Public benchmarks (MMLU, HumanEval and friends) measure
-the base model, not your prompt, retrieval, tools and guardrails, and are contaminated for most frontier
-models anyway. Buying a dashboard and declaring the problem solved fails more quietly: without dataset
+the base model, not your prompt, retrieval, tools and guardrails, and the popular ones are widely
+suspected to have leaked into frontier-model training data. Buying a dashboard and declaring the problem solved fails more quietly: without dataset
 discipline, scorers calibrated to your task and a runner that pins every version, the dashboard renders
 noise with good typography.
 
@@ -71,7 +72,7 @@ per-PR evaluation affordable, and every score links back to the trace that produ
    changes. Every score is stored as `{item_id, scorer, scorer_version, value, rationale}`, the version
    *because* a judge upgrade changes scores without any change to the application.
 4. **Runner.** Executes dataset × target with concurrency, retries and timeouts, caches model calls keyed
-   by `(model, prompt version, params, input)`, writes raw outputs *before* scoring, and records a
+   by the exact request sent (model id, decoding params, rendered messages), writes raw outputs *before* scoring, and records a
    manifest of every pin. Raw outputs first *because* scorers change: re-scoring stored outputs with a new
    judge should cost judge calls only, never a re-run of the target. Timeouts are recorded as errors, not
    as zero scores, so a provider incident does not masquerade as a regression.
@@ -146,14 +147,16 @@ def run(dataset_version: str, items: list[Item], target: Target, scorers: list[S
     manifest = {"dataset": dataset_version, "bundle": bundle,
                 "scorers": [f"{s.name}@{s.version}" for s in scorers]}
     run_id = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:12]
-    rows = []
+    rows, raw = [], open(f"{run_id}.raw.jsonl", "a")   # raw outputs survive a scorer crash or a re-score
     for it in items:
-        out = target(it.input)                          # raw output persisted before scoring
+        out = target(it.input)
+        raw.write(json.dumps({"id": it.id, "output": out}) + "\n"); raw.flush()   # persisted before scoring
         scores = []
         for s in scorers:
             value, rationale = s.fn(it, out)            # one call per scorer: a judge call costs money
             scores.append({"scorer": f"{s.name}@{s.version}", "value": value, "rationale": rationale})
         rows.append({"item": asdict(it), "output": out, "scores": scores})
+    raw.close()
     return {"run_id": run_id, "manifest": manifest, "started": time.time(), "rows": rows}
 ```
 
@@ -226,11 +229,11 @@ aggregate numbers computed by four different rubrics, or from runs whose judge v
 > The decision depends on how the model behaves inside your prompt, retrieval and formatting; only your
 > dataset and scorers measure that. Benchmarks and leaderboards measure the base model on other tasks.
 
-### Q: All scores rise five points overnight with no change to code, prompts or model. What is the most likely cause?
+### Q: All scores rise five points overnight with no change to code, prompts, model or dataset version. What is the most likely cause?
 - [ ] The cache served stale outputs from a previous run
 - [ ] The golden set gained easier items
 - [x] The judge scorer's model or rubric changed, which is why scorers carry a version
 - [ ] Production traffic shifted toward easier queries
 > A model-graded scorer is itself a model; if its snapshot or rubric moves, every candidate and champion
 > shifts together. Pinning the judge version and re-baselining the champion under the same scorer is the
-> defence; a cache would reproduce old scores, not new ones.
+> defence; a cache would reproduce old scores, not new ones, and an unchanged dataset version rules out new items.

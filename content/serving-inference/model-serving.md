@@ -5,7 +5,7 @@ name: Model serving
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/engines
   - serving-inference/prefill-vs-decode
@@ -46,8 +46,11 @@ state lives on the GPU for the life of the request and grows every step. Memory,
 caps how many requests a card can hold.
 
 Third, GPUs are efficient only when busy with large matrix multiplications. A single request in decode
-reads all the weights to produce one token, which leaves the arithmetic units almost idle. Only batching
-many requests into each step recovers that efficiency, and batching variable-length, variable-lifetime
+reads all the weights to produce one token: for an 8B model in fp16 that is ~16 GB moved per token, so a
+GPU with ~3 TB/s of memory bandwidth cannot exceed roughly 200 tokens/s for that request no matter how
+many FLOPs it has, and its arithmetic units sit almost idle. Put 32 requests in the same step and the
+weights are still read once, so the same ~16 GB now yields 32 tokens. Only batching many requests into
+each step recovers that efficiency, and batching variable-length, variable-lifetime
 loops is a scheduling problem the one-request-one-pass model never had to solve. The whole module exists
 to work through those three facts; this lesson is the map.
 
@@ -94,6 +97,15 @@ whole GPU but lengthens each user's TPOT, because each decode step now reads mor
 `max_model_len` admits longer documents but reduces how many requests fit. Quantizing weights or cache
 frees memory and bandwidth at a quality cost you must measure. Speculative decoding spends extra compute to
 cut per-token latency. The point of the rest of this module is to make each of those trades deliberately.
+
+### Startup, cold start and scaling
+Before an engine serves its first token it must load tens of gigabytes of weights (from local disk,
+network storage or a model hub), profile a worst-case forward pass to size the cache pool, and usually
+capture CUDA graphs. Depending on model size and storage this takes from tens of seconds to several
+minutes, which is why LLM replicas cannot be autoscaled like stateless web pods: a spike is over before a
+new replica is warm. The usual answers are a warm floor of replicas sized for normal peak, weights
+pre-staged on local NVMe or baked into the image, and scaling on queue depth or cache utilization (which
+lead) rather than CPU or request count (which lag or mislead).
 
 ### Managed API versus self-hosting
 Calling a provider's API is serving outsourced: the same machinery runs on their side, and their pricing,
@@ -164,6 +176,11 @@ print(f"TTFT={first*1000:.0f} ms, chunks={n}, "
   and starving the queue, visible as TTFT spikes unrelated to request rate.
 - Ignoring client disconnects; symptom is GPU time spent generating tokens nobody reads, showing up as
   throughput that does not translate into completed requests.
+- Serving an instruct model with a chat template other than the one it was trained with (often a
+  hand-built prompt string); symptom is no error at all, just answers that ramble, ignore the system
+  prompt or fail to stop, because the model never sees the role markers it expects.
+- Autoscaling replicas on CPU utilization or request count; symptom is new replicas becoming ready
+  minutes after the queue already blew through the TTFT budget, then idling after the spike.
 
 ## When to use
 You meet serving the moment a model leaves a notebook. Use this lesson as the map: when a question is

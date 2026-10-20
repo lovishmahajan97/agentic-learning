@@ -5,6 +5,7 @@ name: Event loop & microtask queue
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
   - node-ts-for-ai/worker-threads-for-cpu-bound-tasks
@@ -58,6 +59,7 @@ each:
 1. **timers** — callbacks of `setTimeout`/`setInterval` whose threshold has elapsed. A timer is a
    *minimum* delay, not a schedule; it runs when the loop gets here.
 2. **pending callbacks** — deferred I/O callbacks from the previous iteration (some system errors).
+   libuv then runs internal idle/prepare hooks; nothing in user code schedules there.
 3. **poll** — the heart of the loop: block waiting for I/O (with a timeout derived from the nearest
    timer), then run the callbacks for completed I/O: socket data, HTTP responses, file reads.
 4. **check** — `setImmediate` callbacks. It exists so that code can say "run right after the I/O I just
@@ -82,6 +84,11 @@ the same drain. Two consequences:
   keeps the drain going forever, and the poll phase never gets a turn. The symptom is a process that is
   busy but handles no requests. `setImmediate` is the safe way to yield to I/O.
 
+One trap: the top level of an **ES module** is itself evaluated inside a promise job, so code queued
+there sees the promise queue drained *before* the `nextTick` queue (`.then` prints before `nextTick`).
+The "nextTick first" rule holds in CommonJS modules and inside ordinary callbacks such as a request
+handler, which is where it usually matters.
+
 `setTimeout(fn, 0)` versus `setImmediate(fn)` from the main module is non-deterministic (it depends on
 whether 1 ms has elapsed by the time the timers phase is checked); inside an I/O callback, `setImmediate`
 always runs first because check comes before the next timers phase.
@@ -98,8 +105,9 @@ remedies, in order: make it async in chunks (`await setImmediate`-style yielding
 thread, or move it out of the process.
 
 ## Example
-The ordering rules and a lag monitor in one script. Run with `node --import tsx script.ts` or compile
-with `tsc` first.
+The ordering rules and a lag monitor in one script. Run it as CommonJS (for example compile with `tsc`
+to `module: commonjs`, or run with `tsx` in a package without `"type": "module"`); as an ES module
+lines 3 and 4 swap, for the reason given above.
 
 ```ts
 import { monitorEventLoopDelay } from "node:perf_hooks";
@@ -111,7 +119,8 @@ setImmediate(() => console.log("6 immediate (check phase)"));
 Promise.resolve().then(() => console.log("4 promise microtask"));
 process.nextTick(() => console.log("3 nextTick (drained before promises)"));
 console.log("2 sync");
-// Prints 1,2,3,4 then 5,6 (5/6 order may swap from the main module; never from an I/O callback).
+// CommonJS: 1,2,3,4 then 5,6 (5/6 may swap from the main module; never from an I/O callback).
+// ESM top level: 1,2,4,3 then 5,6, because module evaluation itself runs inside a promise job.
 
 // Event-loop lag: sample the histogram and alert when p99 is high.
 const h = monitorEventLoopDelay({ resolution: 10 });
@@ -194,14 +203,15 @@ work to a worker thread (or a separate service) if it is sustained, or by chunki
 yields if it is occasional, and keep a loop-lag alert so regressions are caught before users notice.
 
 ## Quiz
-### Q: In what order do these run: a `setTimeout(fn, 0)`, a resolved promise's `.then`, and a `process.nextTick` callback queued from the same synchronous block?
+### Q: In what order do these run: a `setTimeout(fn, 0)`, a resolved promise's `.then`, and a `process.nextTick` callback queued from the same synchronous block inside an HTTP request handler?
 - [ ] setTimeout, then nextTick, then the promise callback
 - [ ] promise callback, then nextTick, then setTimeout
 - [x] nextTick, then the promise callback, then setTimeout
 - [ ] All three run in the order they were queued
 > After the synchronous block finishes, Node drains the nextTick queue, then the promise microtask queue,
 > and only then advances the loop to the timers phase where the setTimeout fires. Queue order matters
-> only within a single queue.
+> only within a single queue. (At the top level of an ES module the promise callback runs first, because
+> module evaluation is itself a promise job; inside a handler callback the nextTick-first rule holds.)
 
 ### Q: Why does a loop that re-queues itself with `process.nextTick` prevent the server from accepting connections?
 - [ ] nextTick callbacks run on the libuv thread pool, which fills up

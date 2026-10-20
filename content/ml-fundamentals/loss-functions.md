@@ -5,7 +5,7 @@ name: Loss functions (cross-entropy, contrastive)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/regression
@@ -43,7 +43,9 @@ its output probability, p = σ(z). The gradient with respect to the logit is (p 
 model is confidently wrong, p is near 0 for the true class, the factor p(1 − p) is near 0, and the
 gradient vanishes exactly when the correction should be largest. The model is stuck precisely because it
 is wrong. Cross-entropy removes that factor, which is the mathematical reason it replaced squared error
-for classification.
+for classification. In numbers, for a true label y = 1 (squared error taken as ½(p − y)²): at p = 0.5 the
+logit gradient is −0.125 under squared error and −0.5 under cross-entropy; at p = 0.01, confidently
+wrong, it is about −0.0098 versus −0.99. The more wrong the model, the more the two diverge.
 
 Embeddings pose a different problem: there is no label to compare against, only relations. You know
 that a query and the document that answered it belong together and that most other documents do not.
@@ -56,8 +58,8 @@ trained with them.
 The model outputs a distribution q over K classes; the data gives the true class y. The likelihood of a
 dataset is Π q(y_i). Maximising its log is minimising −Σ log q(y_i), and −log q(y) is the cross-entropy
 H(p, q) = −Σ_k p_k log q_k with p the one-hot target. Since H(p, q) = H(p) + KL(p ‖ q) and H(p) does not
-depend on the model, minimising cross-entropy is minimising the KL divergence from the data distribution
-to the model's. It is not an arbitrary choice; it is the loss that makes "probability" mean something.
+depend on the model, minimising cross-entropy is minimising KL(p_data ‖ q), the divergence of the model's
+distribution from the data's. It is not an arbitrary choice; it is the loss that makes "probability" mean something.
 
 The gradient is the useful part. With q = softmax(z), log q_y = z_y − log Σ_j exp(z_j), and
 differentiating with respect to z_k gives ∂L/∂z_k = q_k − 1[k = y]. The gradient on each logit is the

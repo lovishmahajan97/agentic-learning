@@ -5,6 +5,7 @@ name: Vitest / Jest & integration testing
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - node-ts-for-ai/dependency-injection
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -58,15 +59,18 @@ largely Jest-compatible. They differ in how code reaches the test. Jest predates
 TypeScript in Node; it runs each file through a transform you configure (`ts-jest`, `babel-jest` or an
 swc plugin) and its ESM support has long sat behind an experimental flag, which is why Jest projects
 accumulate `moduleNameMapper` and `transformIgnorePatterns` entries. Vitest reuses the Vite pipeline:
-esbuild strips types in milliseconds, ESM is the default, `vite.config.ts` aliases apply to tests too,
+Vite's transformer (esbuild, or Oxc in recent Vite releases) strips types without type-checking, so
+run `tsc --noEmit` separately; ESM is the default, `vite.config.ts` aliases apply to tests too,
 and watch mode re-runs only the files whose import graph changed. For a TypeScript-first AI service
 started today, Vitest is the default; Jest remains the right answer when the repo already runs on it,
 because migrating a large suite buys little.
 
-Both run test files in parallel workers with an isolated module registry per file, *because* module
-state (a cached client, a memoised config) would otherwise leak between tests. That isolation is also
-why `vi.mock` / `jest.mock` calls are hoisted above imports by the transform: ESM imports resolve
-before any statement runs, so a mock registered in normal source order would arrive too late.
+Both run test files in parallel workers with an isolated module registry per file (Vitest's default
+`isolate: true`), *because* module state (a cached client, a memoised config) would otherwise leak
+between files. Separately, `vi.mock` / `jest.mock` calls are hoisted above imports by the transform:
+ESM imports resolve before any statement runs, so a mock registered in normal source order would
+arrive too late. (Jest's hoisting is a Babel/ts-jest transform for CommonJS output; under native ESM
+Jest you need `jest.unstable_mockModule` plus a dynamic `import()` instead.)
 
 ### Three kinds of double for the model
 1. **An injected fake.** Define the narrowest interface your code needs (`complete(prompt): Promise<string>`,
@@ -77,7 +81,8 @@ before any statement runs, so a mock registered in normal source order would arr
    (`setupServer` from `msw/node`), `nock`, or undici's `MockAgent`. Now the request body you assert on
    is the exact JSON the provider would receive, and the response you return is parsed by the real SDK
    code. This is the layer that catches a wrong field name or a stream-event handler that never fires.
-   Set `maxRetries: 0` on the client so a deliberate 500 does not trigger three retries with backoff.
+   Set `maxRetries: 0` on the client so a deliberate 500 does not trigger the SDK's default two
+   retries (three attempts) with backoff.
 3. **Recorded fixtures.** Capture a handful of real responses once (including tool-call turns and a
    full stream transcript), store them as JSON, and replay them through the interceptor. They are the
    only cheap way to test against the real response shape of a provider, and the only way to notice
@@ -145,8 +150,8 @@ describe("summarize (unit, injected fake)", () => {
 const server = setupServer(
   http.post("https://api.anthropic.com/v1/messages", async ({ request }) => {
     const body = (await request.json()) as { max_tokens: number; messages: unknown[] };
-    expect(body.max_tokens).toBeGreaterThan(0);               // asserts the real wire shape
-    expect(body.messages).toHaveLength(1);
+    expect(body.max_tokens).toBeGreaterThan(0);   // asserts the real wire shape; a failing expect here
+    expect(body.messages).toHaveLength(1);        // surfaces as a 500 from msw, so the SDK call rejects
     return HttpResponse.json({
       id: "msg_test", type: "message", role: "assistant", model: "test",
       content: [{ type: "text", text: '{"bullets":["x"]}' }],
@@ -189,7 +194,7 @@ describe("summarize (integration, real SDK over intercepted HTTP)", () => {
 - Testing backoff with real timers; the symptom is a retry test that takes a minute or hits the default
   test timeout, which then gets raised instead of fixed.
 - Forgetting `maxRetries: 0` on the client under test; the symptom is a test of a 500 response that
-  takes several seconds and asserts on the wrong number of calls.
+  is slowed by real backoff sleeps and sees three requests where it expected one.
 - Snapshotting model text; the symptom is a snapshot file updated with `-u` on every change, so the
   test no longer tests anything.
 - Leaving `onUnhandledRequest` at its default; the symptom is a test that silently hit the real

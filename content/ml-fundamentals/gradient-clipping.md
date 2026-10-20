@@ -5,7 +5,7 @@ name: Gradient clipping
 kind: practice
 difficulty: core
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/backpropagation
   - ml-fundamentals/optimizers
@@ -63,15 +63,31 @@ Two design choices matter. First, the norm is *global*, across all parameters, n
 clipping would rescale layers by different factors and change the direction of the overall step; global
 clipping multiplies everything by the same scalar, so the step points exactly where backprop said and is
 merely shorter. Second, the operation is a no-op when `total_norm ≤ max_norm`. On a healthy run clipping
-should fire on a minority of steps; if it fires on almost every step, the threshold is acting as a
-constant learning-rate reduction and the real problem is elsewhere, usually the peak learning rate or a
-missing warmup.
+should fire on a minority of steps. What it means when it fires on almost every step depends on the
+optimizer. Under SGD the update is `η × g`, so persistent clipping is a hidden learning-rate cut that varies
+with the norm. Under Adam a uniform rescale of the gradient largely cancels in `m̂/√v̂` (scale every
+gradient by `c` and `m` scales by `c`, `√v` by `c`), so persistent clipping barely changes step size; it
+turns the run into Adam on unit-norm gradients, discarding the information in how large each batch's
+gradient was. In both cases the clip has stopped being an outlier filter, and the persistent high norm is
+itself a finding: a loss summed rather than averaged, a learning rate too high, or a threshold copied from
+a setup with a different parameter count (the global norm sums over every parameter, so its typical
+value depends on model size).
 
 ### Value clipping
 `clip_grad_value_` instead clamps each element to `[−c, c]`. It is cheaper to reason about but changes
 the direction of the gradient, since large components are flattened while small ones are untouched. It
-survives mostly in older RNN code; transformer recipes use norm clipping, almost universally with
+survives mostly in older RNN code; transformer recipes use global norm clipping, most commonly with
 `max_norm = 1.0`.
+
+### Adaptive variants and what clipping cannot do
+A fixed threshold is a guess about the typical norm. Adaptive clipping replaces the guess with a
+relative rule: adaptive gradient clipping (AGC, from the normalizer-free ResNets work) clips each unit's
+gradient when it is large relative to that unit's weight norm, and other schemes clip against a running
+statistic of recent norms, so the threshold follows the norm as it drifts over training. Clipping also has
+a hard limit: it bounds each step, not a *sequence* of bad steps. Large pre-training runs that hit a loss
+spike which clipping did not prevent typically rewind to a checkpoint from before the spike and skip or
+reshuffle the batches around it, because a few hundred clipped-but-wrong steps can still push the model
+somewhere it does not recover from.
 
 ### Where it sits in the step
 Clipping must happen after the full gradient for the optimizer step exists and before the optimizer uses
@@ -135,7 +151,8 @@ With bf16 there is no scaler; drop the `scaler` calls and call `clip_grad_norm_`
 
 ## Trade-offs
 - Clipping bounds the damage of rare outlier batches at no cost on normal steps, but if the threshold is
-  far below the typical norm it becomes a hidden learning-rate cut that slows the whole run.
+  far below the typical norm it becomes a hidden learning-rate cut under SGD, or, under Adam, a switch to
+  normalized gradients that silently changes the recipe you tuned.
 - Global-norm clipping preserves update direction, while value clipping is simpler and cheaper but distorts
   the direction whenever a few coordinates dominate.
 - A tighter threshold buys stability for aggressive learning rates and large models, but it masks
@@ -145,7 +162,8 @@ With bf16 there is no scaler; drop the `scaler` calls and call `clip_grad_norm_`
 
 ## Pitfalls
 - Clipping before `unscale_()` under fp16: every step is clipped to near zero and the loss barely moves
-  while nothing reports an error.
+  while nothing reports an error. (Adam does not rescue this: once per-element gradients fall far below
+  its `ε`, the denominator stops tracking them and the step shrinks with them.)
 - Clipping after `optimizer.step()` or before `backward()`: the call succeeds, does nothing useful, and
   the first real gradient spike still corrupts the run.
 - Clipping each micro-batch in a gradient-accumulation loop, which changes the direction of the summed
@@ -178,15 +196,19 @@ step sizes.
 ## Check yourself
 **Q:** A team trains with Adam, warmup, bf16 and clipping at 1.0. Their logs show clipping fired on 97% of
 steps for the entire run, yet the loss decreased steadily and nothing diverged. Is this fine?
-**A:** It is not a failure, but it is a sign that the configuration is not what they think it is. If
-the norm is above 1.0 almost every step, clipping is acting as a constant rescaling of the gradient
-rather than a safety net, so the effective learning rate is lower than the configured one and varies
-with the gradient norm from step to step. The run converged, but probably slower than it could have, and
-the schedule they tuned is not the schedule that actually ran. The usual causes are a learning rate set
-too high for the model size, a loss that is summed instead of averaged over tokens so its scale is large,
-or a threshold copied from a different setup. The fix is to look at the pre-clip norm distribution and
-either raise the threshold to sit above the typical norm or correct the loss scaling and learning rate so
-clipping fires only on outliers.
+**A:** It is not a failure, but the configuration is not doing what they think, and the optimizer
+decides what that means. Had this been SGD, clipping every step would be a hidden learning-rate cut that
+fluctuates with the norm. With Adam the effect is different: rescaling a gradient by `c` scales `m` by `c`
+and `√v` by `c`, so the step size is roughly unchanged, and what they are actually running is Adam on
+unit-norm gradients, in which a batch with a genuinely large gradient gets the same weight in the moment
+estimates as an ordinary one. That evidently trains, but it is not the recipe they tuned, and the
+"fraction clipped" metric is now useless as an alarm: a real spike looks like every other step, so only
+the pre-clip norm trace can reveal it. The persistent high norm is also a clue worth chasing: a loss summed
+over tokens instead of averaged (the norm then scales with tokens per batch), a learning rate high enough
+to keep the model in sharp regions, or a threshold copied from a smaller model whose global norm was lower.
+The fix is to plot the pre-clip norm distribution, correct the loss normalization if that is the cause,
+and set the threshold above the bulk of healthy steps so it fires only on outliers; a short A/B run with
+the new threshold tells them whether the clip was changing the outcome.
 
 ## Quiz
 ### Q: Why is global-norm clipping preferred over clamping each gradient element to a fixed range?
@@ -211,4 +233,5 @@ clipping fires only on outliers.
 - [x] A single huge gradient still enters Adam's moment estimates and distorts updates for many subsequent steps
 - [ ] Adam's normalization only applies to the first layer of the network
 > Adam's second moment has a long memory, so one outlier inflates it and shrinks later updates for that
-> parameter; clipping keeps the outlier out of the statistics in the first place.
+> parameter; clipping keeps the outlier out of the statistics in the first place. Adam's normalization
+> limits the size of the immediate step, not the damage to its running statistics.

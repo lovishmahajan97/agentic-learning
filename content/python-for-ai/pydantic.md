@@ -5,6 +5,7 @@ name: Pydantic
 kind: tool
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/type-hints
   - python-for-ai/dataclasses

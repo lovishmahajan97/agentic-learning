@@ -5,6 +5,7 @@ name: State & checkpoint stores
 kind: decision
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -40,8 +41,10 @@ records may need to be kept for years.
 The naive choice is whichever store is already there. A Redis instance is fast and has TTLs, so teams
 start there and discover that its persistence settings were never tuned, that multi-megabyte blobs
 eat memory, and that "the agent forgot everything after the cache restarted" is now a support ticket.
-Or they pick a document database for flexibility and discover they cannot write a checkpoint and a
-run status update in one transaction, leaving half-updated runs after crashes. The store has to be
+Or they pick a document database for flexibility, write the checkpoint and the run status update as
+two independent operations because multi-document transactions are off the default path (MongoDB
+needs a replica set for them, DynamoDB's transactional writes are capped per call and cost extra
+capacity), and get half-updated runs after crashes. The store has to be
 chosen against the actual access pattern and durability needs, not convenience.
 
 ## How it works
@@ -70,7 +73,8 @@ worker dies; a lock would not. Renew on a heartbeat and stop working if renewal 
 worker may have taken over.
 
 ### The options
-- **In-memory** (a dict, LangGraph's `MemorySaver`): zero latency, zero durability. Tests and
+- **In-memory** (a dict, LangGraph's `InMemorySaver`, formerly `MemorySaver`): zero latency, zero
+  durability. Tests and
   notebooks only.
 - **Redis**: sub-millisecond writes, native TTL, good for leases, rate counters and resumable stream
   buffers. As the checkpoint store only if persistence is configured deliberately (append-only file
@@ -81,8 +85,9 @@ worker may have taken over.
   backups, low-millisecond writes on a local network. The default for most teams; LangGraph ships
   both a Postgres checkpointer and a SQLite one for local use.
 - **Document and wide-column stores** (DynamoDB, MongoDB, Cassandra): horizontal scale and per-item
-  TTL, and key-value access matches run id lookups; cross-item transactions are weaker and the
-  operational knowledge heavier. Choose them when a single relational primary becomes the bottleneck.
+  TTL, and key-value access matches run id lookups; cross-item transactions are more limited
+  (bounded in size, extra cost, or single-partition only in Cassandra) and the operational knowledge
+  heavier. Choose them when a single relational primary becomes the bottleneck.
 - **Object storage** (S3-style): cheap and effectively unlimited but slower and unqueryable. For blobs
   and long-term archive of event logs, never alone on the hot path.
 - **Workflow engines** (Temporal and similar): own the event history and the resume logic; you store
@@ -103,13 +108,13 @@ of JSONB before blobs, comfortably within a single Postgres for a long time; the
 grows unexpectedly.
 
 ## Example
-One transaction per step writes the events (offloading large payloads to object storage behind a
-reference), upserts the small snapshot and touches the run; `claim` takes an expiring lease so only
-one worker resumes a given run.
+One transaction per step first checks that this worker still holds the lease (a fencing check, so a
+worker whose lease expired cannot overwrite its successor), then writes the events (offloading large
+payloads to object storage behind a reference) and upserts the small snapshot; `claim` takes an
+expiring lease so only one worker resumes a given run. Every table carries `tenant_id`.
 
 ```python
-import json
-import psycopg
+import json, psycopg
 
 DDL = """
 create table if not exists runs (
@@ -117,11 +122,14 @@ create table if not exists runs (
   status text not null, owner text, lease_until timestamptz,
   schema_version int not null default 1, updated_at timestamptz default now());
 create table if not exists events (
-  run_id text references runs, seq int, type text, payload jsonb, blob_key text,
-  created_at timestamptz default now(), primary key (run_id, seq));
+  run_id text references runs, tenant_id text not null, seq int, type text, payload jsonb,
+  blob_key text, created_at timestamptz default now(), primary key (run_id, seq));
 create table if not exists checkpoints (
-  run_id text references runs, step int, state jsonb, primary key (run_id, step));
+  run_id text references runs, tenant_id text not null, step int, state jsonb,
+  primary key (run_id, step));
 """
+# conn = psycopg.connect(dsn, autocommit=True): claim() commits at once and
+# conn.transaction() below is a real BEGIN/COMMIT rather than a savepoint
 
 def claim(conn, run_id, worker, ttl_s=30) -> bool:
     row = conn.execute(
@@ -130,21 +138,25 @@ def claim(conn, run_id, worker, ttl_s=30) -> bool:
            returning run_id""", (worker, ttl_s, run_id)).fetchone()
     return row is not None
 
-def save_step(conn, run_id, tenant_id, step, new_events, state, blobs, big=64_000):
+def save_step(conn, run_id, tenant_id, worker, step, new_events, state, blobs, big=64_000):
     with conn.transaction():                              # all or nothing
+        if conn.execute("""update runs set updated_at = now() where run_id = %s
+                           and owner = %s and lease_until > now()""",
+                        (run_id, worker)).rowcount == 0:
+            raise RuntimeError("lease lost: stop, another worker owns this run")
         for ev in new_events:
             raw, key = json.dumps(ev["payload"]), None
             if len(raw) > big:                            # offload large outputs
                 key = f"{tenant_id}/{run_id}/{ev['seq']}.json"
                 blobs.put(key, raw)
                 raw = json.dumps({"ref": key, "bytes": len(raw)})
-            conn.execute("""insert into events (run_id, seq, type, payload, blob_key)
-                            values (%s, %s, %s, %s::jsonb, %s)""",
-                         (run_id, ev["seq"], ev["type"], raw, key))
-        conn.execute("""insert into checkpoints (run_id, step, state) values (%s, %s, %s::jsonb)
-                        on conflict (run_id, step) do update set state = excluded.state""",
-                     (run_id, step, json.dumps(state)))
-        conn.execute("update runs set updated_at = now() where run_id = %s", (run_id,))
+            conn.execute("""insert into events (run_id, tenant_id, seq, type, payload, blob_key)
+                            values (%s, %s, %s, %s, %s::jsonb, %s)""",
+                         (run_id, tenant_id, ev["seq"], ev["type"], raw, key))
+        conn.execute("""insert into checkpoints (run_id, tenant_id, step, state)
+                        values (%s, %s, %s, %s::jsonb) on conflict (run_id, step)
+                        do update set state = excluded.state""",
+                     (run_id, tenant_id, step, json.dumps(state)))
 ```
 
 ## Trade-offs

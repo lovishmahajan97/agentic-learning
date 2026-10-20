@@ -5,6 +5,7 @@ name: Prompt caching
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - prompting/system-prompt
   - prompting/prompt-templates
@@ -28,7 +29,8 @@ when a later request starts with the same bytes, cutting input cost and time-to-
 works on exact prefixes, so the layout of your prompt decides whether you get the discount.
 
 ## Why it exists
-Prefill is compute-bound and linear in prompt length. Take a support assistant with a 20,000-token
+Prefill is compute-bound and grows at least linearly with prompt length (the attention part
+quadratically). Take a support assistant with a 20,000-token
 system prompt (policies, tone rules, worked examples) plus 2,000 tokens that vary per request. At 1,000
 requests an hour, that is 20 million tokens an hour of prefill whose result is identical every time:
 the same tokens, through the same weights, produce the same keys and values in every layer. You pay for
@@ -55,9 +57,9 @@ APIs describe caching as a prefix match and why one stray timestamp at the top o
 defeats it entirely.
 
 ### Render order and breakpoints
-A request is rendered in a fixed order: tool definitions, then the system prompt, then the messages.
-On Anthropic's API you mark where a cacheable prefix ends with `cache_control: {"type": "ephemeral"}`
-on a content block (up to four breakpoints per request); a breakpoint caches everything from the start
+On Anthropic's API a request is rendered in a fixed order: tool definitions, then the system prompt,
+then the messages (other providers have their own fixed order). There you mark where a cacheable
+prefix ends with `cache_control: {"type": "ephemeral"}` on a content block (up to four breakpoints per request); a breakpoint caches everything from the start
 of the request up to and including that block. A top-level `cache_control` on the request instead places
 the breakpoint automatically on the last cacheable block, which suits growing conversations. Each
 breakpoint looks back a bounded number of blocks for an earlier entry to extend, so very long turns can
@@ -85,7 +87,8 @@ definitions (adding, removing, reordering) invalidates tools, system and message
 prompt keeps the tools entry but invalidates system and messages. Changing a message invalidates from
 that message onward. Changing the model is a full miss, since caches are model-scoped. Changing
 generation configuration that is rendered into the prompt, such as thinking or effort settings, also
-invalidates the messages tier, so pin those per route rather than varying them per request.
+invalidates the messages tier (and on some models the earlier tiers too), so pin those per route rather
+than varying them per request.
 
 ### Observing it
 The response `usage` block reports three input counts: `input_tokens` (uncached remainder),
@@ -100,9 +103,10 @@ parallel all miss and all pay the write premium. For fan-out, send one request, 
 then send the rest.
 
 ### Self-hosted equivalents
-vLLM's automatic prefix caching and SGLang's RadixAttention do the same thing inside the serving engine:
-KV blocks are shared between requests whose token prefixes match, organised in a radix tree so that any
-common prefix, not only a marked one, is reused. The serving module covers the memory side.
+vLLM's automatic prefix caching and SGLang's RadixAttention do the same thing inside the serving engine,
+with no markers: any common token prefix is reused. vLLM hashes each fixed-size KV block together with
+everything before it and shares blocks whose hashes match (so reuse is at block granularity); SGLang
+keeps the cached prefixes in a radix tree and matches the longest one. The serving module covers the memory side.
 
 ## Example
 Two calls with the same 20k-token policy document and tool list, different questions. Stable content is
@@ -133,11 +137,11 @@ def ask(question: str):
 ask("Can a Basic-plan customer get a refund after 45 days?")
 # illustrative: uncached=~20  written=~20000  read=0        -> paid the 1.25x write once
 ask("Does the 14-day trial convert to a paid plan automatically?")
-# illustrative: uncached=~20  written=0       read=~20000   -> prefix served at ~0.1x
+# illustrative: uncached=~20  written=0       read=~20000   -> prefix at the read rate (0.1x on most models)
 ```
 
 Arithmetic for 1,000 requests an hour with a 20k stable prefix and 2k variable tail, at an illustrative
-$3 per million input tokens: uncached, each request bills 22k tokens, about $0.066, so $66 an hour.
+$3 per million input tokens and the common 0.1× read rate: uncached, each request bills 22k tokens, about $0.066, so $66 an hour.
 Cached, each request bills 2k at full price plus 20k at 0.1×, equivalent to 4k tokens, about $0.012, so
 $12 an hour, with the occasional write after an idle gap adding a few cents. Roughly an 80% cut in input
 cost, and time-to-first-token drops because 20k tokens of prefill are skipped.

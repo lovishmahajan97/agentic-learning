@@ -5,6 +5,7 @@ name: PostgreSQL transactions & isolation levels
 kind: concept
 difficulty: core
 est_minutes: 18
+status: fact-checked
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -75,9 +76,11 @@ because MVCC never exposes uncommitted data):
    each read a condition, both see it true, each writes a *different* row, and the combined result
    violates the condition.
 3. **SERIALIZABLE.** Serializable snapshot isolation (SSI) tracks read/write dependencies between
-   concurrent transactions and aborts one when a cycle would make the outcome non-serializable. The
-   result is as if transactions ran one at a time, with no explicit locking, at the cost of extra
-   bookkeeping and more `40001` aborts under contention. Any code using it must retry.
+   concurrent transactions and aborts one when it sees the "dangerous structure" (two consecutive
+   read-write dependencies) that any non-serializable cycle must contain. The check is conservative, so it
+   sometimes aborts transactions that would have been fine. The result is as if transactions ran one at
+   a time, with no explicit locking, at the cost of extra bookkeeping and more `40001` aborts under
+   contention. Any code using it must retry.
 
 ### The lost update, concretely
 Tenant budget 1,000,000 tokens, 999,000 used. Two requests costing 800 each run `SELECT tokens_used`,
@@ -86,8 +89,9 @@ both read 999,000, both compute 999,800 ≤ 1,000,000, both `UPDATE tokens_used 
 fully allowed. Three fixes, each with a different cost:
 - **Atomic update:** `UPDATE tenants SET tokens_used = tokens_used + 800 WHERE id = $1 AND
   tokens_used + 800 <= budget RETURNING tokens_used`. The check and the write are one statement that
-  waits for the row lock, re-evaluates, and returns zero rows if the budget is now blown. Cheapest, works
-  at any level.
+  waits for the row lock, re-evaluates, and returns zero rows if the budget is now blown. Cheapest, and
+  needs no retry at READ COMMITTED; at REPEATABLE READ or SERIALIZABLE the second statement gets `40001`
+  instead of re-evaluating, so it is still safe but must be retried.
 - **Pessimistic lock:** `SELECT ... FOR UPDATE` locks the row for the transaction, so the second request
   waits until the first commits, then reads the new value. Simple, but the lock is held for the whole
   transaction, so never hold it across a network call.
@@ -106,7 +110,9 @@ different orders, and the usual fix is a consistent ordering (sort ids before lo
 - After any error inside a transaction, PostgreSQL rejects every further statement until `ROLLBACK`
   (or rollback to a `SAVEPOINT`). Catching the exception in code and continuing does not help.
 - Transaction-level connection poolers (PgBouncer in transaction mode) reuse server connections between
-  transactions, so session state such as `SET`, advisory locks and prepared statements leaks or vanishes.
+  transactions, so session state such as `SET` and session-level advisory locks leaks or vanishes.
+  Prepared statements were in the same list until PgBouncer 1.21 added protocol-level support
+  (`max_prepared_statements`); check your pooler version and setting.
 - Isolation level is per transaction: `BEGIN ISOLATION LEVEL SERIALIZABLE` or `SET TRANSACTION` as the
   first statement; a `SET default_transaction_isolation` changes the session default.
 
@@ -131,7 +137,7 @@ def reserve_atomic(conn, tenant_id, cost):
 def reserve_serializable(conn, tenant_id, cost, run_id, attempts=5):
     for attempt in range(attempts):
         try:
-            with conn.transaction():
+            with conn.transaction():          # call on an idle connection: SET must come first
                 conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
                 used, budget = conn.execute(
                     "SELECT tokens_used, budget FROM tenants WHERE id = %s",
@@ -153,8 +159,10 @@ with psycopg.connect(DSN) as conn:
     print("reserved" if ok else "over budget")
 ```
 
-Run two copies of either function concurrently against a tenant at 999,000 of 1,000,000: the atomic
-version lets exactly one through; the naive select-then-update version lets both through.
+Run two copies of either function concurrently against a tenant at 999,000 of 1,000,000 with a cost of
+800: each lets exactly one through (the atomic version by re-evaluating its `WHERE`, the serializable one
+by aborting and retrying the loser, which then sees the budget is exhausted). The naive select-then-update
+at READ COMMITTED, the same body as `reserve_serializable` without the isolation level, lets both through.
 
 ## Trade-offs
 - READ COMMITTED gives high throughput and almost no aborts, but every read-modify-write in application
@@ -214,8 +222,10 @@ rather than updating a row the other touched, so neither conflicts with the othe
 both commit, giving four or five runs. Fix one: run the transaction at SERIALIZABLE and retry on `40001`;
 SSI detects the read-write dependency between the count and the inserts and aborts one. Fix two: make
 the conflict explicit by locking something shared, for example `SELECT ... FROM tenants WHERE id = $1
-FOR UPDATE` before counting, or a per-tenant advisory lock, so the second transaction waits and recounts
-after the first commits. A third option is to keep an `active_runs` counter on the tenant row and use a
+FOR UPDATE` before counting, or a per-tenant `pg_advisory_xact_lock`, and drop to READ COMMITTED, so the
+second transaction waits and its count statement takes a fresh snapshot after the first commits. At
+REPEATABLE READ the lock alone is not enough: the snapshot was taken by the locking statement before it
+waited, so the recount still cannot see the other transaction's insert. A third option is to keep an `active_runs` counter on the tenant row and use a
 single conditional `UPDATE ... WHERE active_runs < 3`, which turns the invariant into one atomic
 statement and avoids retries entirely.
 
@@ -241,5 +251,6 @@ statement and avoids retries entirely.
 - [x] Its snapshot keeps old row versions alive, so VACUUM cannot reclaim dead tuples and tables bloat
 - [ ] It consumes all available connections in the pool
 - [ ] PostgreSQL pauses checkpoints while any transaction is open
-> MVCC keeps a row version until no snapshot can see it. An old open snapshot pins dead versions
-> everywhere, so tables and indexes grow and scans read more pages; this is why idle-in-transaction is monitored.
+> MVCC keeps a row version until no snapshot can see it. An old open snapshot (or an old assigned
+> transaction id) holds back the cleanup horizon for the whole database, so dead versions accumulate in
+> every table, indexes grow and scans read more pages; this is why idle-in-transaction is monitored.

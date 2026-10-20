@@ -4,8 +4,8 @@ module: training-adaptation
 name: Supervised fine-tuning (SFT)
 kind: concept
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - training-adaptation/instruction-tuning
   - training-adaptation/post-training
@@ -63,6 +63,26 @@ assistant tokens. This matters *because* the model should not spend capacity lea
 questions, and because in multi-turn data the user turns are often noisy or adversarial. In multi-turn
 conversations every assistant turn is a target and every earlier turn is context.
 
+The end-of-turn token (`<|im_end|>` above, or the model's EOS) must sit *inside* the supervised span.
+It is the only thing that teaches the model to stop; mask it out with the prompt and the fine-tuned
+model rambles past its answer into an invented next turn.
+
+### How the loss is averaged
+With masking, examples contribute very different numbers of supervised tokens: a 20-token answer and
+a 600-token answer in the same batch. Averaging over all supervised tokens in the batch (the default
+in most trainers) weights each *token* equally, so long responses dominate the gradient; averaging per
+example first weights each *conversation* equally. Neither is wrong, but the choice changes what the
+model learns when lengths are skewed: token-averaging over-trains the long-form style, and
+gradient-accumulation code that averages per micro-batch and then across micro-batches silently mixes
+the two. Check which one your trainer does before comparing runs.
+
+### Where demonstrations come from
+Human-written responses are the gold standard but scarce. Most practical SFT sets are partly
+*distilled*: a stronger model drafts responses, humans or filters reject the bad ones, and the student
+is trained on the survivors. A variant, rejection-sampling fine-tuning, samples several responses from
+the model itself and keeps the ones a verifier or reward model scores best. Both are still SFT; only the
+provenance of the targets changes, and the student inherits whatever errors survive the filter.
+
 ### Full fine-tuning versus parameter-efficient
 Full SFT updates every weight. With AdamW in mixed precision that costs about 16 bytes per parameter
 for weights, gradients and optimiser state, so a 7B model needs over 100 GB before activations.
@@ -115,7 +135,8 @@ example = [
 prompt = tok.apply_chat_template(example[:-1], tokenize=False, add_generation_prompt=True)
 full = tok.apply_chat_template(example, tokenize=False)
 ids = tok(full, return_tensors="pt").input_ids.cuda()            # [1, T]
-n_prompt = len(tok(prompt).input_ids)
+n_prompt = len(tok(prompt).input_ids)   # valid because the prompt ends at a template boundary,
+                                        # so its tokens are an exact prefix of the full sequence
 
 labels = ids.clone()
 labels[:, :n_prompt] = -100                                      # prompt tokens are context, not targets
@@ -129,7 +150,12 @@ print(f"trained on {(labels != -100).sum().item()} of {ids.numel()} tokens, loss
 
 With a few thousand such examples, two epochs and a cosine schedule, the model learns the two-sentence
 support voice; the masked count printed on each batch is the quickest check that the template and
-masking line up.
+masking line up. Read it critically: here the system prompt, question and role markers (a few dozen
+tokens) are context, and only the answer plus its end-of-turn marker are targets, so the count should be
+roughly half the sequence. If the supervised count equals
+the full length, masking is off; if it is zero, the prompt length was computed on a different template
+and every label is −100, which trains nothing while the loop runs without error. Decoding
+`ids[0][labels[0] != -100]` back to text and eyeballing it is the one-minute test that catches both.
 
 ## Trade-offs
 - Demonstrations give precise control over format and style, but authoring them is the most expensive
@@ -155,6 +181,8 @@ masking line up.
   measurably worse on general reasoning or coding benchmarks after a single round.
 - Judging success by training loss; a low loss on memorised examples says nothing about generalisation,
   so hold out prompts by topic, not just by row.
+- Masking the end-of-turn token along with the prompt; the symptom is a model that answers correctly and
+  then keeps going, generating a fake user turn or repeating itself until the token limit.
 
 ## When to use
 Reach for SFT when the behaviour you want is consistent and describable by examples: a fixed output

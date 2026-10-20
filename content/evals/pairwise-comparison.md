@@ -5,6 +5,7 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias

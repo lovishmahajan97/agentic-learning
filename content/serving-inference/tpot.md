@@ -5,7 +5,7 @@ name: TPOT (time per output token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/ttft
   - serving-inference/tokens-sec
@@ -51,7 +51,10 @@ makes the difference visible and tells you which engine behaviour caused it.
 ### Definition and its sibling
 TPOT is a per-request mean: total decode time divided by the number of gaps. Inter-token latency
 (ITL) is the distribution of the individual gaps; its p99 catches the stalls that the mean hides.
-Both exclude TTFT on purpose, so a long prompt does not pollute the decode measurement.
+Both exclude TTFT on purpose, so a long prompt does not pollute the decode measurement. Tools are
+not consistent about the names: some dashboards call the per-request mean "ITL", and some quote a
+"latency per token" of `end_to_end / n_out`, which silently folds TTFT back in. Check the formula
+before comparing two reports.
 
 ### The bandwidth floor
 In one decode step for a batch of *B* sequences, the GPU reads every weight matrix once (the same
@@ -73,9 +76,14 @@ similar bandwidth and double the FLOPs gives nearly the same TPOT at low batch.
 The weight read is paid once per step regardless of *B*, so going from 1 to 16 concurrent sequences
 multiplies the arithmetic by 16 but adds only the KV-cache reads to the bytes moved. Per-request
 TPOT rises gently while aggregate throughput rises almost linearly. This continues until one of two
-things happens: the arithmetic finally catches up with the bandwidth (the compute-bound crossover,
-typically at batch sizes in the hundreds for large models) or the KV cache of all the sequences no
-longer fits in memory. Long contexts pull that second limit in fast, because KV bytes scale with
+things happens: the arithmetic finally catches up with the bandwidth, or the KV cache of all the
+sequences no longer fits in memory. The first crossover can be estimated. Counting only the weight
+matmuls, a step does `2 × N × B` FLOPs while reading `N × bytes_per_param` bytes, so arithmetic
+intensity is `2B / bytes_per_param` FLOPs per byte. The GPU becomes compute-bound when that reaches
+its ratio of peak FLOP/s to bandwidth, roughly 1e15 / 3.35e12 ≈ 300 for an H100 in bf16. With fp16
+weights that is a batch near 300, independent of model size; with int8 weights it halves, because
+each byte read now feeds twice the arithmetic. KV reads add bytes without much arithmetic, which
+pushes the real crossover later still. Long contexts pull that second limit in fast, because KV bytes scale with
 `B × context_length`, and at long contexts the KV reads, not the weights, dominate the step.
 
 ### Levers that move TPOT
@@ -90,7 +98,9 @@ longer fits in memory. Long contexts pull that second limit in fast, because KV 
 - **More tokens per step.** Speculative decoding drafts several tokens cheaply and verifies them in one
   forward pass of the big model, so a step that costs one weight read can yield two or three accepted
   tokens. Effective TPOT falls at low batch; at high batch the wasted verification compute can lower
-  throughput instead.
+  throughput instead. It also changes the shape of ITL: accepted tokens arrive in bursts of several
+  per step, so the gap distribution becomes lumpy (near-zero gaps inside a burst, a full step between
+  bursts) even when the mean improves.
 - **A smaller model.** Halving parameters roughly halves bytes per step; whether quality survives is
   an eval question, not a serving one.
 

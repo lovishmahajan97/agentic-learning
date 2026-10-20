@@ -5,7 +5,7 @@ name: Tensor parallelism at inference
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/distributed-training
   - model-internals/grouped-query-attention
@@ -36,10 +36,10 @@ that costs per token.
 Pipeline parallelism splits by layers: GPU 0 runs layers 1–40, GPU 1 runs 41–80. It fits the model, but
 a single request still passes through the GPUs one after another, so per-token latency does not improve,
 and keeping both GPUs busy needs several requests in flight at different stages. Offloading keeps part of
-the weights in CPU memory and streams them in, but PCIe bandwidth is roughly two orders of magnitude
-below HBM, so decode slows to seconds per token. Quantization halves or quarters the bytes but costs
-quality, and a 4-bit 70B model still needs about 40 GB, which fits an 80 GB card but leaves no room on
-the 24–48 GB cards most teams have.
+the weights in CPU memory and streams them in, but PCIe moves data roughly 50–100× slower than HBM,
+so decode slows to seconds per token. Quantization halves or quarters the bytes but costs quality, and a
+4-bit 70B model still needs about 40 GB: it fits an 80 GB card, does not fit a 24 GB one, and leaves
+little cache room on a 48 GB one.
 
 Tensor parallelism splits *inside* each layer. Every GPU works on the same token at the same time on its
 slice of every matrix, so the memory bandwidth of N GPUs is pooled: decode, which is bandwidth-bound,
@@ -83,6 +83,27 @@ of overhead per step is acceptable when the step itself is 10 ms, but on PCIe-on
 is slower, and across nodes over Ethernet or even InfiniBand the latency multiplied by 160 per token is
 ruinous. Hence the rule: tensor parallel within a node, pipeline parallel (or independent replicas)
 across nodes.
+
+A step-time model makes the limit explicit:
+
+```
+t_step(N) ≈ (weight_bytes + kv_bytes_read) / (N × HBM_bw)  +  2 × n_layers × t_allreduce(N)  +  overhead
+```
+
+The first term shrinks as 1/N; the second does not shrink at all, and grows slightly with N because a
+ring all-reduce takes 2(N − 1) communication steps (each GPU sends about 2(N − 1)/N of the message in
+total, so bandwidth cost is nearly flat in N while latency is not). Speedup therefore saturates once the
+collectives are comparable to the memory term. Illustratively, for a 70B bf16 model on H100-class GPUs
+the memory term is about 141 GB ÷ (4 × 3.35 TB/s) ≈ 10.5 ms at TP = 4 and 5.3 ms at TP = 8; add 160
+all-reduces at an assumed 20 µs each (3.2 ms) and the step goes from about 13.7 ms to 8.5 ms, a 1.6×
+gain for 2× the GPUs. Engines fight the second term directly: vLLM, for example, ships a custom
+all-reduce kernel for small messages over NVLink, and CUDA graphs remove per-kernel launch overhead from
+the decode step.
+
+Prefill is a different regime. Its all-reduce messages are [prompt_tokens, hidden]: 4,096 × 8,192 × 2
+bytes = 64 MiB each for the model above, so the collectives become bandwidth-bound rather than
+latency-bound. NVLink's bandwidth hides them behind prefill's large matmuls; over PCIe they can become a
+large share of time to first token.
 
 ### When TP speeds up a model that already fits
 TP = 2 on a model that fits one GPU roughly halves the weight bytes each GPU reads per step, so
@@ -136,9 +157,10 @@ dist.destroy_process_group()
 A sizing check for the same idea at scale: a Llama-3-70B-class model (80 layers, 8 KV heads, head_dim
 128) has 320 KB of fp16 KV per token. At TP = 4 on 80 GB GPUs, each holds about 35 GB of weights and 80
 KB of KV per token; with a 0.9 budget and an illustrative 2 GB activation reserve, about 35 GB per GPU
-remains for cache, roughly 450k tokens. The weight-read floor per step is 35 GB ÷ 3.35 TB/s ≈ 10 ms, so
-single-stream decode cannot exceed about 95 tokens/s before all-reduce overhead. At TP = 2 the same
-model leaves about 2 GB per GPU for cache, which is not a usable deployment in bf16.
+remains for cache, roughly 450k tokens. The weight-read floor per step on an H100-class GPU is 35 GB ÷
+3.35 TB/s ≈ 10 ms, so single-stream decode cannot exceed about 95 tokens/s before all-reduce overhead.
+At TP = 2 each GPU holds about 70 GB of weights against a 72 GB budget, leaving essentially nothing for
+cache once the activation reserve is taken: not a usable deployment in bf16.
 
 ## Trade-offs
 - Per-token latency falls with TP because bandwidth is pooled, but each extra GPU adds all-reduce

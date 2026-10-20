@@ -5,7 +5,7 @@ name: Latency percentiles (p50/p95/p99)
 kind: metric
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - observability/monitoring
   - observability/tracing
@@ -61,7 +61,7 @@ At 1,000 requests per second one endpoint produces 86 million latencies a day. T
 exist, and both are chosen for the same property: they can be **merged** across hosts and across time.
 
 1. **Fixed-bucket histograms** (Prometheus-style `_bucket` series with `le` boundaries). Each sample
-   increments the counter of every bucket whose upper bound it is below. A quantile is estimated by
+   increments the counter of every bucket whose upper bound is at or above it (the counts are cumulative). A quantile is estimated by
    finding the bucket where the cumulative count crosses p × n and interpolating linearly inside it, so
    the error is the bucket width. Put bucket edges on your SLO thresholds (say 0.5, 1, 2, 5, 10 s),
    because the number you need exactly is "what fraction finished under the threshold", and that is exact
@@ -69,6 +69,12 @@ exist, and both are chosen for the same property: they can be **merged** across 
 2. **Quantile sketches** (t-digest, HDR Histogram, DDSketch, OpenTelemetry's exponential histogram).
    Buckets grow geometrically, giving bounded *relative* error from 1 ms to 10 minutes with a few hundred
    counters, which suits LLM calls whose latencies span four orders of magnitude. Also mergeable.
+
+The tempting third option is to compute the quantile inside each process and export the number (a
+Prometheus *summary*, or a `p99` gauge from an in-process library). It is precise per process and useless
+for the fleet, because the raw distribution is gone by the time it reaches the backend: you cannot combine
+40 per-process p99s into one fleet p99, for the reason in the next subsection. Use summaries only for a
+single process you will never aggregate.
 
 ### Why you merge first and quantile last
 Percentiles do not compose. The fleet p99 is not the mean of per-host p99s, nor a traffic-weighted mean of
@@ -95,6 +101,17 @@ size and context length; provider rate limits turn into 429s plus backoff. Most 
 latency is roughly TTFT + output_tokens × seconds_per_token, so its "tail" is often just long answers.
 Measure three distributions, TTFT, inter-token latency (or tokens/s) and total, and when total regresses,
 look at the output-length distribution before blaming infrastructure.
+
+### Cutting the tail
+Once you know where the tail comes from, the standard remedies follow from the arithmetic. **Hedged
+requests** send a duplicate to another replica only if the first has not answered by about the p95 delay,
+so at most roughly 5% of requests are duplicated while the slowest ones get a second chance; firing the
+duplicate immediately would double load to fix 1% of requests. **Timeouts with one retry** do the same for
+idempotent calls, but the retry adds the full timeout to that request, so set the timeout from the
+measured distribution, not a round number. **Admission control** (rejecting or queueing work above a
+utilisation target) attacks the ρ/(1−ρ) term directly. For LLM calls, capping `max_tokens` and streaming
+change what users perceive more than any infrastructure fix, because they shorten or hide the decode term.
+None of these is free near saturation: every duplicate is extra load arriving exactly when queues are long.
 
 ### Where you measure
 Server-side timers miss load-balancer queueing, TLS handshakes, network and client retries. Measure at the
@@ -192,8 +209,8 @@ aggregate percentiles across hosts, and how fan-out turns a dependency's p99 int
 GPU utilisation is unchanged, and no infrastructure changed. How do you find the cause, and what do you
 report?
 **A:** First decompose the metric. Compare the output-token length distribution before and after: a prompt
-edit that makes answers longer raises total latency with no change in speed, which matches an unchanged
-mean-ish picture and unchanged GPU load. Then split TTFT from inter-token latency; if per-token speed and
+edit that makes a minority of answers much longer raises the tail of total latency with no change in speed,
+which fits a small move in the mean and unchanged GPU load. Then split TTFT from inter-token latency; if per-token speed and
 TTFT are flat, it is length. Next slice by model, endpoint and tenant: a new feature sending 3% of traffic
 to a slower model or a longer system prompt appears only above p97. Check retry and timeout settings in the
 release, since a new retry adds a full timeout to the tail, and check the gateway queue-time span. Finally

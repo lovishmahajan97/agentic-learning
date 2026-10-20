@@ -5,6 +5,7 @@ name: Chain-of-thought prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - prompting/zero-shot
   - prompting/few-shot
@@ -34,8 +35,10 @@ Ask a model for the final answer to a multi-step word problem and it often fails
 first and it often succeeds, with the same weights and the same question. The explanation is
 architectural. Generating one token runs the input through a fixed number of layers once. There is no
 loop, no scratchpad, no way to do step three after step two inside that single pass. A problem with more
-sequential dependencies than the network's depth can absorb is simply not computable in one token,
-however large the model. Writing intermediate steps changes the computation: every emitted token is
+sequential dependencies than a given network's depth can absorb cannot be solved in one token by that
+network; theoretical work on bounded-depth transformers shows that some inherently serial problems are out
+of reach without intermediate tokens (under standard complexity assumptions) and become solvable with
+them. Writing intermediate steps changes the computation: every emitted token is
 another full pass, conditioned on all the previous ones, so serial compute grows with the length of the
 chain and partial results become visible to later steps through attention.
 
@@ -88,9 +91,10 @@ confidently wrong.
 
 ### Operational details
 Reasoning needs room: size `max_tokens` for the chain, not the answer, or the output truncates mid-chain
-with no answer at all. Parse only the delimited answer. Decide whether end users should see the chain; it
+with no answer at all. On models with built-in reasoning the hidden thinking tokens typically count
+against the same limit and are billed as output even when you never see them. Parse only the delimited answer. Decide whether end users should see the chain; it
 can leak the contents of the context and it reads as authoritative even when unfaithful. Count the
-tokens: output tokens are priced above input tokens, and a chain can multiply output length by an order
+tokens: output tokens are typically priced several times above input tokens, and a chain can multiply output length by an order
 of magnitude.
 
 ## Example
@@ -110,9 +114,9 @@ COT = ("First work through the problem inside <reasoning></reasoning> tags, one 
        "Then give the final number inside <answer></answer> tags. Nothing after the answer tag.")
 
 def ask(style):
-    r = client.messages.create(model=MODEL, max_tokens=1024, system=style,     # room for the chain
+    r = client.messages.create(model=MODEL, max_tokens=2048, system=style,     # room for the chain
                                messages=[{"role": "user", "content": QUESTION}])
-    text = next(b.text for b in r.content if b.type == "text")
+    text = next((b.text for b in r.content if b.type == "text"), "")
     m = re.search(r"<answer>\s*(-?\d+)\s*</answer>", text)                    # parse only the answer
     return (m.group(1) if m else "PARSE_FAIL"), text
 
@@ -120,9 +124,10 @@ for style in (DIRECT, COT):
     votes = collections.Counter(ask(style)[0] for _ in range(5))             # self-consistency: 5 chains
     answer, n = votes.most_common(1)[0]
     print(f"{'direct' if style is DIRECT else 'cot':<7} majority={answer} ({n}/5) votes={dict(votes)}")
-# Expected: 4*3 + 8*3 - 5 = 31. On a model with built-in reasoning the gap between the two
-# styles narrows, because the hidden chain already supplies the computation; the ordering and
-# parsing discipline shown here still applies to any model.
+# Expected: 4*3 + 8*3 - 5 = 31. The model named here always reasons internally, so expect
+# little gap: the hidden chain already supplies the computation. To see the classic CoT effect,
+# run both styles on a model without built-in reasoning. The ordering and parsing discipline
+# shown here applies to any model.
 ```
 
 ## Trade-offs
@@ -204,5 +209,6 @@ instead of adding a trigger. Keeping CoT would require a measured gain, not a hu
 - [x] Different chains make different mistakes, so wrong answers scatter while the correct answer is reached repeatedly
 - [ ] The longest chain is usually the correct one
 - [ ] Repeated sampling triggers the API's caching layer, which stores verified answers
-> Voting exploits the fact that errors are less correlated than correct derivations. It costs k times the
-> tokens and needs a discrete answer to vote on, which is why it is used selectively.
+> Correct chains converge on the same answer while wrong chains tend to disagree with each other, so the
+> majority is usually right when single-chain accuracy is reasonable. It fails when the model makes the
+> same mistake consistently, costs k times the tokens and needs a discrete answer to vote on.

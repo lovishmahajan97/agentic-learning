@@ -5,6 +5,7 @@ name: Task completion rate
 kind: metric
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - agent-reliability/agent-trajectory-evaluation
   - agent-reliability/tool-call-success-rate
@@ -103,7 +104,10 @@ abandoned tasks, the denominator is 180 and the per-attempt rate is 150/180 = 83
 interval is roughly 77% to 88%. The agent runs unattended, so the team also estimates pass^3 ≈ 0.833³ ≈
 58% under independence, and segments: billing tasks 92% (n = 90), code tasks 74% (n = 90). The headline is
 not "83%"; it is "billing is shippable, code is not, and consistency across attempts is below the bar".
-The second block in the code shows the unbiased pass^k estimate from repeated per-task trials.
+The 58% is only a first look: raising a pooled rate to the k-th power assumes every task has the same
+success probability. The second block in the code shows the proper estimate, from five repeated trials per
+task: there the per-attempt rate is 88.9% but pass^3 is 75.6%, far above 0.889³ ≈ 70%, because the
+failures concentrate on 60 of the 180 tasks. Per-task pass^k is what goes in the release report.
 
 ```python
 from math import sqrt, comb
@@ -117,20 +121,21 @@ def wilson(c: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, centre - half), min(1.0, centre + half))
 
 def pass_hat_k(trials: list[tuple[int, int]], k: int) -> float:
-    """trials: per-task (successes c, attempts n). Unbiased pass^k averaged over tasks."""
-    return sum(comb(c, k) / comb(n, k) for c, n in trials if n >= k) / len(trials)
+    """trials: per-task (successes c, attempts n). Unbiased pass^k averaged over tasks with n >= k."""
+    usable = [(c, n) for c, n in trials if n >= k]
+    return sum(comb(c, k) / comb(n, k) for c, n in usable) / len(usable)
 
 results = {"verified_success": 150, "failed": 30, "abandoned": 12, "declined": 8}
 n = results["verified_success"] + results["failed"]           # denominator policy: exclude abandoned, declined
 p = results["verified_success"] / n
 lo, hi = wilson(results["verified_success"], n)
 print(f"completion {p:.1%}  95% CI [{lo:.1%}, {hi:.1%}]  n={n}")
-print(f"scope rate {1 - results['declined'] / 200:.1%}   abandonment {results['abandoned'] / 200:.1%}")
+print(f"declined {results['declined'] / 200:.1%}   abandonment {results['abandoned'] / 200:.1%}")
 
 # per-task repeated trials for the unattended bar: (successes, attempts)
 trials = [(5, 5)] * 120 + [(4, 5)] * 40 + [(2, 5)] * 20
 print(f"pass^1 {pass_hat_k(trials, 1):.1%}  pass^3 {pass_hat_k(trials, 3):.1%}")
-# -> completion 83.3%  95% CI [77.2%, 88.1%]  n=180 ; pass^1 88.9%  pass^3 75.6%
+# -> completion 83.3%  95% CI [77.2%, 88.1%]  n=180 ; declined 4.0% ; pass^1 88.9%  pass^3 75.6%
 ```
 
 ## Trade-offs
@@ -142,8 +147,8 @@ print(f"pass^1 {pass_hat_k(trials, 1):.1%}  pass^3 {pass_hat_k(trials, 3):.1%}")
   improving.
 - Excluding declined and abandoned tasks from the denominator isolates agent quality, but an agent that
   declines aggressively will look better while helping less; report scope and abandonment rates beside it.
-- pass^k is the honest number for unattended agents and it is always lower than the per-attempt rate,
-  which makes it unpopular; the condition that justifies reporting pass@k instead is a real verifier or
+- pass^k is the honest number for unattended agents and it is never higher than the per-attempt rate
+  (equal only for tasks that always or never succeed), which makes it unpopular; the condition that justifies reporting pass@k instead is a real verifier or
   human choosing among attempts.
 
 ## Pitfalls
@@ -202,11 +207,11 @@ support organisation.
 
 ### Q: An agent succeeds on 90% of attempts. Roughly what is its pass^3, and why does it matter?
 - [ ] 90%, because pass^k equals the per-attempt rate
-- [ ] About 97%, because three attempts give more chances to succeed
+- [ ] About 99.9%, because three attempts give more chances to succeed
 - [x] About 73%, because all three attempts must succeed and unattended users each get one attempt
 - [ ] About 30%, because pass^k divides the rate by k
 > Under independence pass^k ≈ p^k, so 0.9³ ≈ 0.73; it measures consistency, which is what a user who gets
-> a single run experiences. The 97% figure would be pass@3.
+> a single run experiences. The 99.9% figure, 1 − 0.1³, would be pass@3.
 
 ### Q: Which denominator policy best isolates agent quality while staying honest?
 - [ ] Count every session, including out-of-scope requests, as a task

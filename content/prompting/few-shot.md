@@ -5,6 +5,7 @@ name: Few-shot prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - prompting/zero-shot
   - prompting/prompt-engineering
@@ -41,8 +42,8 @@ because the model had never been trained to learn from examples; the ability eme
 prediction over text that itself contains many lists, tables and repeated structures.
 
 Two naive alternatives bracket few-shot. Writing more rules fails because rules cannot enumerate a shape.
-Fine-tuning fails on loop time: hours to days per iteration versus seconds, and it needs hundreds of
-examples before it beats a handful in context. Few-shot is the middle: show the shape, measure, adjust the
+Fine-tuning fails on loop time: hours to days per iteration versus seconds, and it typically needs far
+more labelled examples than the handful that works in context before it pays off. Few-shot is the middle: show the shape, measure, adjust the
 examples, and only bake them into weights once volume makes the per-call token cost the larger bill.
 
 ## How it works
@@ -77,7 +78,9 @@ among the demonstrations), recency bias (the last example's label is over-predic
 bias (labels that are frequent words get a head start). Order alone can swing accuracy substantially on
 the same set of examples. Mitigations: balance labels, choose an order by eval rather than by accident,
 restate the instruction after the examples, and for classification, calibrate by measuring the model's
-output on a content-free input and correcting the decision for the skew it reveals.
+output on a content-free input (such as "N/A") and correcting the decision for the skew it reveals. The
+original method rescales the label probabilities, so it needs an API that exposes log-probabilities;
+without them you can only approximate it from sampled label frequencies.
 
 ### Where the examples live in a chat API
 Two placements work. Inside the system prompt as delimited `<example>` blocks, which is simple and clearly
@@ -86,15 +89,16 @@ which matches the structure the model was fine-tuned on and tends to anchor form
 risk that the model treats them as real conversation history. Either way, label them as examples and keep
 the instructions distinct from them.
 
-### Examples beat instructions when they conflict
-If an instruction says "respond in one sentence" and the examples show three, the model will produce
-three. The demonstrated pattern is the stronger signal, so every example must comply with every rule.
+### Examples usually beat instructions when they conflict
+If an instruction says "respond in one sentence" and the examples show three, the model will usually
+produce three. The demonstrated pattern tends to be the stronger signal (how strongly varies by model),
+so every example must comply with every rule rather than relying on the instruction to win.
 
 ## Example
 Dynamic few-shot selection: a small labelled pool is embedded once, the four nearest neighbours of each
-incoming ticket are rendered as user/assistant pairs ahead of the real request, and the model copies
-their format. In production the pool would be a few hundred curated boundary cases, balanced by label,
-and the embedding lookup would be a vector index rather than a dot product over a list.
+incoming ticket are rendered as user/assistant pairs ahead of the real request, most similar last so it
+sits nearest the query, and the model copies their format. In production the pool would be a few
+hundred curated boundary cases, balanced by label, and the embedding lookup would be a vector index rather than a dot product over a list.
 
 ```python
 import anthropic, json
@@ -116,15 +120,19 @@ SYSTEM = ("Classify the ticket into one of: billing, bug, feature_request, other
 
 def classify(ticket, k=4):
     q = embedder.encode([ticket], normalize_embeddings=True)[0]
-    nearest = np.argsort(-(POOL_VECS @ q))[:k]                     # cosine similarity, top-k
+    nearest = np.argsort(-(POOL_VECS @ q))[:k][::-1]               # cosine top-k, most similar last
     messages = []
     for i in nearest:                                             # demonstrations as user/assistant pairs
         text, label = POOL[i]
         messages += [{"role": "user", "content": f"<ticket>{text}</ticket>"},
                      {"role": "assistant", "content": json.dumps({"label": label})}]
     messages.append({"role": "user", "content": f"<ticket>{ticket}</ticket>"})
-    r = client.messages.create(model=MODEL, max_tokens=64, system=SYSTEM, messages=messages)
-    return json.loads(next(b.text for b in r.content if b.type == "text"))["label"]
+    r = client.messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, messages=messages)
+    text = next((b.text for b in r.content if b.type == "text"), "")  # thinking counts toward max_tokens
+    try:
+        return json.loads(text)["label"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return "FORMAT_ERROR"
 
 print(classify("My invoice total is wrong and the PDF download is broken"))
 # Inspect the neighbours' labels before trusting a result: if all k share one label,
@@ -184,8 +192,8 @@ label, so "do the same thing" favours it before the input is even read. Recency 
 last, its label gets a further boost. The fix is to balance the set, at least one strong example per label
 and more for the labels with fuzzy boundaries, choose the order by eval rather than leaving it to chance,
 and restate the label definitions after the examples. For a classification task I would also calibrate:
-send a content-free input, observe the label distribution it produces, and correct the decision for that
-skew. Verification is a per-label confusion matrix on a held-out set containing none of the
+send a content-free input, observe the label probabilities it produces (or, without log-probabilities,
+the label frequencies over repeated samples), and correct the decision for that skew. Verification is a per-label confusion matrix on a held-out set containing none of the
 demonstrations, compared against the zero-shot baseline, plus a check that the examples are rendered in a
 stable prefix so caching still works.
 
@@ -212,5 +220,6 @@ stable prefix so caching still works.
 - [x] Answer in a paragraph, because the demonstrated pattern is the stronger signal
 - [ ] Refuse because the prompt is contradictory
 - [ ] Alternate between the two formats
-> Pattern continuation is what the model does natively; a demonstrated format dominates a described one.
-> Every example must comply with every rule, or the rule is effectively overwritten.
+> Pattern continuation is what the model does natively, so a demonstrated format usually dominates a
+> described one; there is no fixed rule that instructions outrank examples. Every example must comply with
+> every rule, or the rule is effectively overwritten.

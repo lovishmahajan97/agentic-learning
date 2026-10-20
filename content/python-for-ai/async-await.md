@@ -5,6 +5,7 @@ name: async / await
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -76,7 +77,9 @@ together as an `ExceptionGroup`. Prefer it for fan-out where a partial result is
 ### Limits and timeouts
 Unbounded fan-out against a provider turns into a rate-limit storm. `asyncio.Semaphore(n)` with
 `async with sem:` around the call caps in-flight requests at `n`, which is the knob that matches
-your provider's concurrency allowance. `async with asyncio.timeout(seconds):` (3.11; earlier,
+your provider's concurrency allowance. It bounds concurrency, not rate: five slots with half-second
+calls still allow about ten requests per second, so a requests- or tokens-per-minute quota needs a
+token-bucket limiter alongside it. `async with asyncio.timeout(seconds):` (3.11; earlier,
 `asyncio.wait_for`) cancels the awaited work when the budget expires and raises `TimeoutError`,
 which is how you stop a hung stream from holding a slot forever.
 
@@ -131,7 +134,7 @@ async def main() -> None:
     t0 = time.perf_counter()
     results = await fan_out([f"q{i}" for i in range(20)])
     print(f"{len(results)} results in {time.perf_counter() - t0:.2f}s, peak in-flight={peak}")
-    # roughly: 20 results in ~1.7s, peak in-flight=5  (sequential would be ~8s)
+    # roughly: 20 results in ~1.7-1.9s, peak in-flight=5  (sequential ~8s)
     async for tok in stream_tokens("tokens arrive as the model produces them"):
         print(tok, end=" ", flush=True)
     print()
@@ -158,13 +161,14 @@ time with `peak in-flight=1`: the blocking call never yields, so no other corout
 
 ## Pitfalls
 - Calling a coroutine without `await` (`client.chat(...)` instead of `await client.chat(...)`);
-  nothing runs, and the only hint is a `RuntimeWarning: coroutine ... was never awaited` at exit.
+  nothing runs, and the only hint is a `RuntimeWarning: coroutine ... was never awaited`, emitted
+  when the unused coroutine object is garbage-collected (often right away, sometimes much later).
 - Using a synchronous SDK client or `requests` inside an async endpoint; the symptom is every
   endpoint's p99 latency rising together under modest load.
 - Creating tasks with `create_task` and discarding the result; the loop holds only a weak reference,
   so the task can be garbage-collected mid-execution and silently disappear.
 - Firing `gather` over thousands of provider calls with no semaphore; the symptom is a burst of 429
-  responses followed by a retry storm that is slower than running sequentially.
+  responses followed by a retry storm that can end up slower than running sequentially.
 - Calling `asyncio.run()` from inside a running loop (notebooks, some frameworks); it raises
   `RuntimeError`, and the fix is to `await` directly or use the framework's loop.
 - Catching `BaseException` or bare `except:` around awaits; it swallows `CancelledError` and
@@ -185,7 +189,7 @@ against a rate limit.
 - **Engineer:** Writes agent loops and eval harnesses with `create_task`, `gather`, semaphores and
   timeouts, and keeps every call in the request path on an async client.
 - **Architect:** Decides which services run on the event loop versus thread or process pools, and
-  sets concurrency caps per provider so fan-out never exceeds negotiated rate limits.
+  sets concurrency caps and rate limiters per provider so fan-out stays inside negotiated quotas.
 - **FDE:** Finds the one synchronous call (a legacy auth client, a sync database driver) stalling a
   customer's async service and moves it to `to_thread` or an async driver.
 
@@ -221,7 +225,8 @@ fix the unrelated endpoint's latency should no longer move.
 ### Q: What is the purpose of wrapping each provider call in `async with asyncio.Semaphore(5)`?
 - [ ] To make the calls run in parallel on five CPU cores
 - [ ] To retry each call up to five times
-- [x] To cap the number of in-flight calls at five so fan-out does not exceed the provider's rate limit
+- [x] To cap the number of in-flight calls at five so fan-out cannot flood the provider all at once
 - [ ] To guarantee results are returned in order
 > A semaphore bounds concurrency: the sixth call waits until one of the five completes. `gather`
-> alone would start all calls at once and trigger 429 responses.
+> alone would start all calls at once and trigger 429 responses. Note it limits calls in flight, not
+> requests per minute; a requests- or tokens-per-minute quota needs a rate limiter on top.

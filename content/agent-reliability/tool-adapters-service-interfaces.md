@@ -5,6 +5,7 @@ name: Tool adapters / service interfaces
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agent-reliability/tool-permissions-and-least-privilege
   - agent-reliability/idempotent-tool-execution
@@ -110,14 +111,15 @@ class CreateTicketArgs(BaseModel):
     project: Literal["billing", "platform", "support"]     # enum for the model, ID for the vendor
 
 class TicketAdapter:
-    def __init__(self, client: httpx.Client, project_ids: dict[str, int], vault):
+    def __init__(self, client: httpx.Client, project_ids: dict[str, int], vault, web_base: str):
         self.client, self.project_ids, self.vault = client, project_ids, vault
+        self.web_base = web_base.rstrip("/")                 # UI host, not the API base_url
 
     def create_ticket(self, raw_args: dict, *, user: str, idempotency_key: str) -> dict:
         try:
             a = CreateTicketArgs.model_validate(raw_args)                  # 1. validate before side effects
-        except ValidationError as e:
-            return {"ok": False, "error": "invalid_arguments", "retryable": True,
+        except ValidationError as e:     # same args will fail again: the model must fix them
+            return {"ok": False, "error": "invalid_arguments", "retryable": False,
                     "detail": [f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()]}
         payload = {"summary": a.title, "description": a.body,            # 3. translate to vendor shape
                    "priority_code": {"low": 3, "normal": 2, "high": 1}[a.priority],
@@ -128,15 +130,18 @@ class TicketAdapter:
             r = self.client.post("/v2/tickets", json=payload, headers=headers, timeout=10.0)
         except httpx.TimeoutException:
             return {"ok": False, "error": "upstream_timeout", "retryable": True}
-        if r.status_code == 429:
+        except httpx.TransportError:                       # DNS, refused, reset: never raise to the loop
+            return {"ok": False, "error": "upstream_error", "retryable": True}
+        if r.status_code == 429:                  # Retry-After may be seconds or an HTTP date
+            ra = r.headers.get("Retry-After", "")
             return {"ok": False, "error": "rate_limited", "retryable": True,
-                    "retry_after_s": int(r.headers.get("Retry-After", "5"))}
+                    "retry_after_s": int(ra) if ra.isdigit() else 5}
         if r.status_code >= 400:                                          # 6. one error vocabulary
             return {"ok": False, "error": "upstream_error", "retryable": r.status_code >= 500,
-                    "detail": r.text[:200]}
+                    "http_status": r.status_code}       # raw vendor body goes to the trace, not the model
         d = r.json()                                                       # 7. project the response
         return {"ok": True, "ticket_id": d["id"], "status": d["status"],
-                "url": f"{self.client.base_url}/tickets/{d['id']}"}
+                "url": f"{self.web_base}/tickets/{d['id']}"}
 ```
 
 ## Trade-offs
@@ -194,8 +199,9 @@ list at perhaps ten entries with a cursor for more, and puts nothing else in con
 a `get_contact(contact_id, fields=[...])` when it needs detail. The update adapter validates `status`
 against an enum, checks the run's policy, injects a per-user token, sends the PATCH with a timeout and an
 idempotency key, and maps 429 to `rate_limited` with the server's retry-after so the runtime, not the
-model, handles backoff. A client-side token bucket at 10 requests per second protects the shared limit
-across concurrent runs. Every outcome returns in the same `ok/error/retryable` envelope and is recorded
+model, handles backoff. A client-side token bucket at slightly under 10 requests per second protects the
+shared limit across concurrent runs, but only if it is shared by all of them (process-wide, or backed by
+Redis when runs span workers); a bucket per run lets ten concurrent runs send ten times the limit. Every outcome returns in the same `ok/error/retryable` envelope and is recorded
 with its error class so success rate per tool is visible from day one.
 
 ## Quiz

@@ -5,7 +5,7 @@ name: Retry strategies
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/timeouts
   - serving-inference/idempotency
@@ -67,7 +67,9 @@ backoff, which is why full jitter is a common library default.
 
 ### Honour the server's schedule
 If the response carries `Retry-After`, use it instead of your own schedule: the server knows when
-capacity returns, and waiting less is wasted load that may count against you. Providers also return
+capacity returns, and waiting less is wasted load that may count against you. The header may be a
+number of seconds or an HTTP date, so parse both, and still cap it: a `Retry-After` longer than the
+request's remaining deadline means "give up or fall back now", not "sleep". Providers also return
 remaining-quota and reset headers; an outbound rate limiter can read them to slow down *before* the
 first 429.
 
@@ -76,7 +78,18 @@ Per request: a maximum attempt count (two or three) and a total deadline that in
 sleeps, so a 30-second provider timeout cannot become a two-minute wait. Per client: a retry budget,
 retries allowed only while they stay below roughly 10% of recent requests (the figure the SRE book uses).
 The per-request cap bounds the worst case for one call; the budget bounds aggregate amplification during
-an incident to about 1.1× instead of 3×.
+an incident to about 1.1× instead of 3×. A common implementation is itself a token bucket: every
+successful request deposits 0.1 tokens, every retry spends one, and retries stop when the bucket is
+empty. In normal operation the bucket stays full and nothing changes; in an outage, where nothing
+succeeds, it drains after a few retries and the client degrades to one attempt per request, which is
+exactly the behaviour you want from a fleet hammering a saturated provider.
+
+Worked numbers make the point. A fleet sends 200 requests per second; the provider goes fully down.
+With three attempts per request and no budget, it receives 600 requests per second while it is trying
+to recover. With a 10% budget it receives about 220. As the provider recovers, every request it rejects
+from the first fleet comes back twice more, so partial recovery is met with up to triple load and can
+stay pinned in overload; the second fleet's offered load is near its real demand from the start, and
+successes refill the budget only as the provider actually heals.
 
 ### Retry at one layer
 Know what the SDK does. The official Anthropic and OpenAI SDKs retry twice by default with exponential

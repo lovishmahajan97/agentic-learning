@@ -5,6 +5,7 @@ name: Hallucination evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - evals/faithfulness-groundedness
   - model-internals/hallucination
@@ -135,18 +136,21 @@ def score_response(text: str) -> dict:
     labels = Counter()
     for c in claims:
         evidence = "\n---\n".join(search(c))
-        labels[call_model(VERIFY.format(evidence=evidence, claim=c)).strip().upper()] += 1
-    n = max(len(claims), 1)
-    return {"n_claims": len(claims), "abstained": is_abstention(text),
-            "claim_precision": labels["SUPPORTED"] / n,
+        labels[call_model(VERIFY.format(evidence=evidence, claim=c)).strip(" .\n").upper()] += 1
+    n = len(claims)                     # an abstention has no claims: precision is undefined, not 0
+    return {"n_claims": n, "abstained": is_abstention(text),
+            "claim_precision": labels["SUPPORTED"] / n if n else None,
             "hallucinated": labels["CONTRADICTED"] > 0,
-            "unsupported_rate": (labels["CONTRADICTED"] + labels["UNVERIFIABLE"]) / n}
+            "unsupported_rate": (labels["CONTRADICTED"] + labels["UNVERIFIABLE"]) / n if n else None}
+
+def mean(rows: list[dict], key: str) -> float:     # skips undefined values; bools count as 0/1
+    vals = [float(r[key]) for r in rows if r.get(key) is not None]
+    return sum(vals) / len(vals) if vals else float("nan")
 
 def evaluate(items: list[dict]) -> dict:   # item: {"question", "answerable": bool, "response"}
     rows = [{**it, **score_response(it["response"])} for it in items]
-    ans = [r for r in rows if r["answerable"]] or [{}]
-    unans = [r for r in rows if not r["answerable"]] or [{}]
-    mean = lambda rs, key: sum(r.get(key, 0) for r in rs) / len(rs)   # bools count as 0/1
+    ans = [r for r in rows if r["answerable"]]
+    unans = [r for r in rows if not r["answerable"]]
     return {"claim_precision": mean(ans, "claim_precision"),
             "response_hallucination_rate": mean(ans, "hallucinated"),
             "false_abstention": mean(ans, "abstained"),

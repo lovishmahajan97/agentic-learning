@@ -5,6 +5,7 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agents/agent-loop
   - agents/tool-schemas-and-argument-validation
@@ -46,8 +47,9 @@ to connect to real systems, and it is why "the model can call tools" really mean
 ### Declaration
 Each tool is declared with a `name`, a `description`, and an `input_schema` (JSON Schema, normally an
 object with typed properties, a `required` list and `enum` where the values are fixed). The declarations
-are rendered into the prompt ahead of the system prompt and messages, so they consume input tokens on
-every request and form part of the cacheable prefix. The description is the single most important field:
+are rendered into the prompt on every request (on the Claude API they sit at the very front: the cache
+order is tools, then system, then messages), so they consume input tokens every time and form part of
+the cacheable prefix; changing one tool invalidates the cache for everything after it. The description is the single most important field:
 it is all the model has to decide *whether* and *when* to call the tool, so it should state trigger
 conditions ("call this when the user asks about an order's status") and not only what the tool does.
 
@@ -56,9 +58,10 @@ Given the prompt, the model chooses among plain text, one or more tool calls, or
 A call arrives as a `tool_use` content block with a unique `id`, the `name`, and `input` already parsed
 into JSON, and the response's `stop_reason` is `tool_use`, which is the harness's signal that work is
 expected. A `tool_choice` parameter steers the decision: `auto` (the default), `none` (never call), and
-on models that support it `any` or a named tool to force a call. Some current models reject forced
-choice and expect the instruction in the prompt instead, so treat forcing as model-dependent and always
-check that a `tool_use` block actually came back. With `strict: true` on the declaration (and
+`any` or a named tool to force a call (OpenAI spells these `auto`, `none`, `required` and a named
+function). Forcing is not always available: on the Claude API, requests with extended thinking enabled
+accept only `auto` and `none`, so there the instruction has to go in the prompt. Treat forcing as
+model- and mode-dependent and always check that a `tool_use` block actually came back. With `strict: true` on the declaration (and
 `additionalProperties: false` in the schema) the API guarantees the arguments validate against the
 schema, which removes a class of parsing failures but says nothing about whether the values make sense.
 
@@ -67,7 +70,9 @@ For each `tool_use` block you execute the matching function with `input` as its 
 a user message containing a `tool_result` block with the same `tool_use_id` and a `content` (a string,
 or a list of text and image blocks). If the tool failed, set `is_error: true` and put a readable message
 in `content`; models are trained to treat such results as recoverable and will retry, adjust arguments
-or explain. Several calls in one turn get several `tool_result` blocks in a single message. The model is
+or explain. Several calls in one turn get several `tool_result` blocks in a single message, and on the
+Claude API the `tool_result` blocks must come first in that message's content, before any text you add.
+(OpenAI's Chat Completions API differs: one `role: "tool"` message per call, keyed by `tool_call_id`.) The model is
 then called again with the extended history, which is one iteration of the agent loop.
 
 ### Client-side versus server-side tools
@@ -138,8 +143,8 @@ print(next(b.text for b in final.content if b.type == "text"))   # "250 EUR is a
 - Server-side tools cut latency and hosting work but move execution, data and credentials to the
   provider; when the tool touches internal systems or needs approval gates, client-side execution is the
   only option.
-- `strict` schemas guarantee argument shape at the cost of a restricted schema vocabulary (no recursion,
-  limited constraints); when you need rich validation, keep the schema simple and validate the meaning
+- `strict` schemas guarantee argument shape at the cost of a restricted, provider-specific schema
+  vocabulary (support for recursion and numeric or length constraints varies); when you need rich validation, keep the schema simple and validate the meaning
   of the values in your handler.
 
 ## Pitfalls
@@ -151,15 +156,16 @@ print(next(b.text for b in final.content if b.type == "text"))   # "250 EUR is a
   retry with corrected arguments would have succeeded.
 - Matching on the serialized `input` string (in tests or caches) rather than the parsed object; the
   symptom is spurious mismatches when the model escapes Unicode or slashes differently between runs.
-- Sending results for several calls as separate user messages; the symptom is an API error about
-  message ordering, or a model that quietly stops batching independent calls.
+- On the Claude API, sending results for several calls as separate user messages, or putting text
+  before the `tool_result` blocks; the symptom is a validation error about unanswered `tool_use` ids,
+  or a model that quietly stops batching independent calls.
 
 ## When to use
 Use tool calling whenever the answer depends on data the model does not have or on an effect it cannot
 cause: lookups, calculations that must be exact, writes to systems, anything time-sensitive. Do not use
 it merely to get structured output from a model that is not acting; a JSON schema on the response
-(structured outputs) is the right tool there, and forcing a "function" just to extract JSON is a
-leftover habit. Measure three things: how often the model calls when it should and refrains when it
+(structured outputs) is the right tool there where the provider supports it, and forcing a "function"
+just to extract JSON is a leftover habit from before that existed. Measure three things: how often the model calls when it should and refrains when it
 should not, how often arguments validate, and tokens per completed task. Day to day the work is writing
 descriptions, keeping schemas small, shaping results and handling `is_error`. In interviews, be able to
 draw the request and response shapes from memory and explain why the model never executes anything

@@ -5,6 +5,7 @@ name: Regression tests
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -118,23 +119,23 @@ def results():
     pathlib.Path("evals/candidate_results.json").write_text(json.dumps(r, indent=1))
     # a separate step diffs candidate vs baseline per slice and runs McNemar on the flips
 
-def pass_rate(case):
-    passes = 0
+def passes(case) -> int:                      # integer count avoids float edge cases like 2/3 < 1 - 1/3
+    n = 0
     for _ in range(K):
         out = answer(case["input"], context=case.get("context"), model=case["pinned_model"])
-        passes += all(GRADERS[g["type"]](out, g) for g in case["graders"])
-    return passes / K
+        n += all(GRADERS[g["type"]](out, g) for g in case["graders"])
+    return n
 
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
 def test_no_regression(case, results):
-    rate = pass_rate(case)
-    results[case["id"]] = rate
+    n = passes(case)
+    results[case["id"]] = n / K
     if "critical" in case["tags"]:
-        assert rate == 1.0, f"critical case {case['id']} failed {round((1 - rate) * K)}/{K} runs"
+        assert n == K, f"critical case {case['id']} failed {K - n}/{K} runs"
     else:
-        base = BASELINE.get(case["id"], 0.0)
+        base = round(BASELINE.get(case["id"], 0.0) * K)   # baseline pass count at the same K
         # tolerate one sample of noise; a drop larger than that is a real per-item regression
-        assert rate >= base - 1 / K, f"{case['id']} regressed: {base:.2f} -> {rate:.2f}"
+        assert n >= base - 1, f"{case['id']} regressed: {base}/{K} -> {n}/{K}"
 ```
 
 ## Trade-offs

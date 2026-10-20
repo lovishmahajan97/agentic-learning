@@ -5,6 +5,7 @@ name: ANN indexes (HNSW, IVF)
 kind: concept
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - rag-retrieval/similarity-search
   - rag-retrieval/vector-databases
@@ -98,8 +99,8 @@ recall cost you recover partly by re-ranking the top few hundred PQ candidates w
 ### Choosing between them
 - HNSW: best recall at a given latency, incremental inserts, no training step; costs the most RAM and the
   longest build.
-- IVF-Flat: fast to build, simple, needs training and periodic re-training; recall drops faster under
-  restrictive filters.
+- IVF-Flat: faster to build and simpler, needs training and periodic re-training; at equal recall it
+  usually computes more distances per query than HNSW, because whole cells are scanned.
 - IVF-PQ: smallest footprint by far, GPU-friendly; lowest raw recall, so pair it with exact re-ranking.
 
 ### Filters interact badly with both
@@ -131,7 +132,8 @@ hnsw.hnsw.efConstruction = 200
 hnsw.add(xb)                                         # no training; inserts one by one
 
 nlist = 1024                                         # ~2.3 * sqrt(N) cells
-ivf = faiss.IndexIVFFlat(faiss.IndexFlatL2(d), d, nlist)
+quantizer = faiss.IndexFlatL2(d)                     # holds the centroids; keep a reference
+ivf = faiss.IndexIVFFlat(quantizer, d, nlist)
 ivf.train(xb[:50_000]); ivf.add(xb)                  # k-means needs a training sample first
 
 def report(index):
@@ -148,16 +150,19 @@ print("flat", report(flat))
 ```
 
 Expect recall to climb toward 1.0 as `efSearch` or `nprobe` grows while per-query time grows with it,
-and `flat` to sit at recall 1.0 with the highest latency.
+and `flat` to sit at exactly 1.0. Two caveats on the timings: they are batch throughput divided by 500
+(FAISS parallelizes across queries), not single-query latency, and batched flat search runs as one BLAS
+matrix multiply, so at a mere 200k vectors it can be surprisingly competitive. That is the point of the
+"start with exact search" advice; the gap opens as N grows, because flat cost is linear in N.
 
 ## Trade-offs
 - HNSW buys the best recall per millisecond with incremental updates, but every vector plus its links
   must sit in RAM; the moment the corpus outgrows memory you move to IVF-PQ or a disk-oriented graph
   index.
-- IVF indexes build in minutes and quantize well, at the cost of a training step whose centroids go stale
+- IVF indexes build faster than HNSW and quantize well, at the cost of a training step whose centroids go stale
   as data drifts; the trade flips against IVF when documents are inserted continuously and re-training
   windows are hard to schedule.
-- Product quantization shrinks storage by an order of magnitude and makes GPU search feasible, but raw
+- Product quantization shrinks storage by an order of magnitude or more and makes GPU search feasible, but raw
   PQ recall is noticeably lower; it only pays when you re-rank the PQ shortlist with exact vectors.
 - Raising `efSearch` or `nprobe` improves recall with roughly linear latency cost; once recall@k is above
   what downstream answer quality can detect, further increases are pure waste and the budget should go

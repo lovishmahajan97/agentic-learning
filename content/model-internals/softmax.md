@@ -5,7 +5,7 @@ name: Softmax
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - model-internals/logits
   - model-internals/attention-mechanism
@@ -41,9 +41,9 @@ distribution for any real input; it is smooth, so every score receives a gradien
 so ranking is preserved. The result is the "soft" version of argmax: as the gap between the best score
 and the rest grows, the output approaches a one-hot, and as scores converge it approaches uniform. Paired
 with cross-entropy loss, the gradient with respect to the logits is simply `p − y`, prediction minus
-target, which is as clean a training signal as exists. Softmax also has a principled reading: it is the
-maximum-entropy distribution consistent with the scores as expected energies, the same form as the
-Boltzmann distribution in physics, which is where the word "temperature" comes from.
+target, which is as clean a training signal as exists. Softmax also has a principled reading: among all distributions with a given expected score, it is
+the one with maximum entropy, the same form as the Boltzmann distribution in physics, which is where the
+word "temperature" comes from.
 
 ## How it works
 ### The function and its properties
@@ -72,7 +72,11 @@ log p_i = z_i / T − logsumexp(z / T)
 The vocabulary softmax converts the last position's logits into the next-token distribution over tens
 of thousands of entries. Because every entry stays positive, the distribution has a long tail of
 individually tiny but collectively significant probabilities; sampling from the full distribution will
-eventually draw one of them, which is why top-k and top-p truncation exist. Temperature here is a
+eventually draw one of them, which is why top-k and top-p truncation exist. The output softmax also caps
+expressiveness: log-probabilities are a linear function of a `d_model`-dimensional hidden state (up to
+the normalizer), so the matrix of log-probabilities across many contexts has rank at most about
+`d_model`. Yang et al. (2018) named this the "softmax bottleneck"; in practice a large `d_model` keeps
+it from biting, but it is why the output layer is not a fully general distribution. Temperature here is a
 user-facing knob; temperature inside attention is not.
 
 ### Inside attention
@@ -87,8 +91,19 @@ that evict old tokens must keep the sink tokens or quality collapses.
 
 ### Computing it efficiently
 A naive softmax over a long row needs the whole row in memory to find the max and the sum. The online
-formulation keeps a running maximum and rescales the running sum when the maximum changes, so the result
-can be accumulated in tiles that never leave fast on-chip memory. That trick is the heart of
+formulation keeps a running maximum *m* and a running sum *s* and updates both in one pass:
+
+```
+for each score x:   m_new = max(m, x)
+                    s     = s · exp(m − m_new) + exp(x − m_new)
+                    m     = m_new
+softmax(x_i) = exp(x_i − m) / s
+```
+
+When a larger maximum arrives, the rescaling factor `exp(m − m_new)` converts everything summed so far to
+the new reference point, so the result is exact, not approximate, and it can be accumulated in tiles
+that never leave fast on-chip memory. The same rescaling applies to a partial weighted sum of value
+vectors. That trick is the heart of
 FlashAttention: exact attention without materializing the full `n × n` score matrix.
 
 ## Example
@@ -141,6 +156,9 @@ all three cases; only the confidence changed.
   as −1e4 that underflows to nothing in fp16, shows up as attention leaking to masked positions.
 - Treating "99% probability" as 99% correctness; softmax outputs are scores shaped by training, and
   calibration must be measured rather than assumed.
+- Letting a row be masked entirely, for example a padding query whose every key is masked; the row is
+  all `−∞`, softmax computes `0/0`, and the symptom is NaNs that appear only in batches with padding.
+  Kernels guard this case explicitly, and hand-written attention must too.
 - Evicting the first tokens of a long context to save KV memory; attention weights that used to land on
   the sink get redistributed and output quality degrades sharply.
 - Reusing an output-layer temperature inside attention or vice versa; they are separate knobs with

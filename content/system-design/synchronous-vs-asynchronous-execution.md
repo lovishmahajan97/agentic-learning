@@ -5,7 +5,7 @@ name: Synchronous vs asynchronous execution
 kind: decision
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - system-design/event-driven-architecture
   - fastapi-for-ai/job-queues-and-durable-workers
@@ -40,9 +40,11 @@ working on the original request. Now the same expensive run executes twice, you 
 and if the run has side effects (it posted a comment, it charged a card) they happen twice.
 
 Capacity is the second problem. By Little's law, concurrent in-flight requests ≈ arrival rate × time in
-system. At 10 requests per second averaging 30 seconds each, every instance holds 300 open connections,
-each with a goroutine, thread or coroutine, its buffers and its partial state. Scale-out is driven by
-connection count rather than by useful work.
+system. At 10 requests per second averaging 30 seconds each, the fleet holds about 300 open connections
+at any moment, each with a goroutine, thread or coroutine, its buffers and its partial state; double the
+run time and the count doubles even though the useful work per run is unchanged. Scale-out is driven by
+connection count rather than by useful work, and a deploy that restarts an instance drops every run it
+was holding.
 
 The third problem is loss. If the server process restarts mid-request, a synchronous run vanishes; the
 client learns only that the socket closed. There is no record that the work existed, so there is
@@ -78,7 +80,9 @@ sequence 812") or it re-runs the generation.
    it, persists a job record (`status=queued`, inputs, key, tenant, created_at) and returns `202 Accepted`
    with a job id and a status URL. The write to the job store is the only thing that must succeed inside
    the request, so the request is fast and the work survives a process restart *because* it exists in
-   durable storage before anyone starts on it.
+   durable storage before anyone starts on it. A repeated key returns the existing job; a repeated key
+   with a *different* body is rejected (`409` or `422`), because silently returning the old job would
+   hand the client a result for a request it did not make.
 2. **Execute.** A worker claims the job from a queue (Redis, SQS, Postgres with `SKIP LOCKED`), marks it
    `running` with a lease or heartbeat, performs the work, and writes the result and `succeeded` or
    `failed` status. A lease matters because a worker that dies mid-job must have its job reclaimed by
@@ -91,6 +95,15 @@ sequence 812") or it re-runs the generation.
 The status model is a small state machine: `queued → running → succeeded | failed | cancelled`, often
 with a `progress` field and an `attempt` counter. Results need a retention policy; a job store that keeps
 every result forever becomes the biggest table in the system.
+
+### Cancellation is a request, not a guarantee
+Once work is detached from the connection, closing the browser tab no longer stops it, so the job API
+needs an explicit `POST /jobs/{id}/cancel`. The server can only set `cancel_requested`; the worker checks
+the flag between steps (between tool calls, between batches of documents) and stops at the next safe
+point, *because* interrupting mid-step can leave a half-applied side effect. Side effects already
+performed stay performed, so a cancelled agent run may still have created a ticket; cancellation of
+multi-step work with effects is really a saga question (compensate or leave), and the final status
+should say which steps completed.
 
 ### The hybrid: respond if fast, otherwise hand back a job
 Many APIs accept a `wait` budget: the server runs the job and, if it finishes within, say, 20 seconds,
@@ -140,6 +153,8 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/analyses", status_code=202)
 async def submit(body: dict, response: Response):
     job_id = body.get("idempotency_key") or str(uuid.uuid4())
+    if job_id in jobs and jobs[job_id]["input"] != body["text"]:
+        raise HTTPException(409, "idempotency key reused with a different body")
     if job_id not in jobs:              # a retried submit returns the same job
         jobs[job_id] = {"status": "queued", "input": body["text"]}
         try:
@@ -157,7 +172,14 @@ async def status(job_id: str):
 ```
 
 A client retrying the `POST` with the same `idempotency_key` gets the same job back instead of a second
-five-second run; a full queue is refused immediately rather than silently growing.
+five-second run; a full queue is refused immediately rather than silently growing. Trace one request:
+`POST {"text": "...", "idempotency_key": "k1"}` returns `202` with `Location: /analyses/k1` in a few
+milliseconds; a `GET` one second later shows `running`; the client's network drops and it re-sends the
+same `POST`, which returns the same job, still `running`, rather than enqueuing a second; a `GET` after
+five seconds returns `succeeded` with the result. What the sketch omits is exactly what production
+needs: a restart loses `jobs` and the queue (so both must be durable), a crashed worker leaves the job
+`running` forever (so claims need a lease), and a key held only in memory cannot deduplicate across
+instances (so the key needs a unique constraint in the job table).
 
 ## Trade-offs
 - Synchronous calls are simple to build, test and reason about, but their reliability is bounded by the
@@ -184,6 +206,9 @@ five-second run; a full queue is refused immediately rather than silently growin
   source and the database behind them the bottleneck, which is the cue to add push delivery or backoff.
 - Results kept forever with no TTL and no size limit; the jobs table becomes the largest and slowest
   table and its backups the longest.
+- Treating a disconnect or a cancel as "the work stopped"; the symptom is tickets or emails produced by
+  runs the UI reports as cancelled, because the worker never checked the cancel flag or the effect had
+  already happened.
 
 ## When to use
 Decide from the p99 of the work, not the median, against the smallest timeout in the path and against

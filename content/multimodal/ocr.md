@@ -5,7 +5,7 @@ name: OCR
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - multimodal/document-understanding
   - multimodal/vision-language-models
@@ -66,11 +66,24 @@ the most common reason columns get interleaved.
 Each detected line or word image is recognised as a sequence. The dominant design is a CNN or
 transformer feature extractor over the image width, producing one feature vector per horizontal slice,
 followed by a sequence model and the CTC loss (Connectionist Temporal Classification). CTC lets the
-network emit a character or a "blank" at every slice without knowing character boundaries in advance;
-repeated characters are collapsed first and blanks removed afterwards, so "hh-e-l-blank-ll-o" over
-slices becomes "hello", whereas "h-e-l-l-o" with no blank between the l's collapses to "helo"; the blank
-is what lets the network express a genuine double letter. Tesseract moved to an LSTM-plus-CTC recogniser in
-version 4. Transformer encoder-decoder recognisers (TrOCR) drop CTC and generate characters
+network emit a character or a blank (written ∅ here) at every slice without knowing character
+boundaries in advance. Decoding applies two rules in order: collapse runs of the same symbol, then delete
+blanks.
+
+```
+slices:          h h e ∅ l l ∅ l o o
+collapse runs:   h e ∅ l ∅ l o
+drop blanks:     h e l l o          -> "hello"
+without the ∅ between the l's, "h e l l l o" collapses to "helo"
+```
+
+The blank is therefore what lets the network express a genuine double letter. Training works because
+many slice sequences decode to the same string; CTC's loss is the negative log of the *sum* of the
+probabilities of all of them, computed efficiently with a forward-backward dynamic programme, so the
+network is never told which slice holds which glyph. The design choice matters for failure analysis:
+because each slice is predicted largely independently, a CTC recogniser has no strong notion of which
+character sequences are plausible, which is why a separate language model is bolted on afterwards.
+Tesseract moved to an LSTM-plus-CTC recogniser in version 4. Transformer encoder-decoder recognisers (TrOCR) drop CTC and generate characters
 autoregressively, which handles handwriting and irregular text better at higher cost.
 
 ### Stage 4: post-processing and output
@@ -148,6 +161,9 @@ for w in low[:5]:
   with no column header, so the LLM attaches the wrong label to the right value.
 - Ignoring confidence and treating OCR as truth; the symptom is "1O2.5O" style errors reaching a database
   where a quick confidence gate would have flagged them.
+- Treating an engine's confidence as a calibrated probability or comparing it across engines; the
+  symptom is a "95-confidence" field that is wrong far more often than 5% of the time, found only when
+  you plot error rate against confidence on a labelled sample and set the threshold from that curve.
 - Forgetting that OCR text is untrusted input; the symptom is an agent that follows instructions printed
   on a scanned document, a prompt-injection path via images.
 - Assuming the PDF has no text layer and OCR-ing born-digital pages; the symptom is avoidable errors and

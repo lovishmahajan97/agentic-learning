@@ -5,6 +5,7 @@ name: Docker
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - backend-fundamentals/kubernetes
   - backend-fundamentals/ci-cd
@@ -34,8 +35,9 @@ libraries such as glibc and OpenSSL, compiled wheels built against a specific CU
 settings, environment variables. Installing all of that by hand or by script onto a VM drifts: two
 servers provisioned three months apart differ in ways nobody recorded, "works on my machine" is a
 literal description of the problem, and rolling back means uninstalling. Virtual machines fix
-isolation, but a VM image is gigabytes with its own kernel, boots in minutes, and running one per
-service wastes memory and makes dev/prod parity painful, so people share VMs and the drift returns.
+isolation, but a VM image is gigabytes with its own kernel, boots in tens of seconds to minutes,
+and running one per service wastes memory and makes dev/prod parity painful, so people share VMs
+and the drift returns.
 
 The insight behind containers is that a process does not need its own kernel to be isolated. The Linux
 kernel already has namespaces (what a process can *see*: its own process tree, network interfaces,
@@ -82,7 +84,8 @@ The container's main process is PID 1 in its namespace, and the kernel treats PI
 signal dispositions do not apply, so a process without an explicit SIGTERM handler ignores
 `docker stop` and is SIGKILLed when the grace period (10 seconds by default) expires. Two consequences:
 use the exec form `CMD ["uvicorn", ...]` rather than the shell form `CMD uvicorn ...`, because the
-shell form wraps the command in `/bin/sh -c` and the shell, now PID 1, does not forward the signal;
+shell form wraps the command in `/bin/sh -c`, and unless that shell happens to `exec` the command
+(behaviour varies by shell and command), the shell is PID 1 and does not forward the signal;
 and if the app spawns children, run under `--init` or `tini` so zombies are reaped. This plumbing is
 what makes graceful draining of an in-flight streaming response possible later in Kubernetes.
 
@@ -219,7 +222,7 @@ measurements, because the second needs a startup probe and a weight cache rather
 - [ ] Because installing dependencies after the source makes the final image larger
 > The cache is keyed on each instruction and its inputs, in order. Source changes on every commit,
 > dependencies rarely, so installing first means a code change rebuilds only the cheap final layers.
-> Image size does not depend on instruction order.
+> Swapping these two steps leaves the final image essentially the same size; only rebuild time changes.
 
 ### Q: A container ignores `docker stop` and is killed after ten seconds. What is the most likely cause?
 - [ ] The container's memory limit is set too low
@@ -227,7 +230,7 @@ measurements, because the second needs a startup probe and a weight cache rather
 - [x] The main process is PID 1 and does not handle SIGTERM, for example because `CMD` used shell form so `/bin/sh` received the signal
 - [ ] The container is running as root
 > PID 1 has no default signal handlers, so SIGTERM is dropped unless the process installs one, and the
-> shell form inserts a shell that never forwards it. Memory limits produce OOM kills, not stop
+> shell form typically leaves a shell as PID 1 that does not forward it. Memory limits produce OOM kills, not stop
 > timeouts, and health checks do not affect signal delivery.
 
 ### Q: What does a container share with its host that a virtual machine does not?

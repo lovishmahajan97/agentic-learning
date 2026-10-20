@@ -5,6 +5,7 @@ name: Checkpointing
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - training-adaptation/gradient-checkpointing
   - training-adaptation/distributed-training
@@ -34,8 +35,9 @@ Training is a long, stateful computation on hardware that fails. A single-GPU fi
 a spot instance that can be reclaimed at any minute; a pretraining run occupies thousands of accelerators
 for weeks, and with that many parts, hardware faults are routine rather than exceptional. The Llama 3
 report, for example, counts hundreds of job interruptions during a 54-day pretraining window, most of
-them unexpected. Without checkpoints every failure restarts from zero, and the expected time to finish
-a run longer than the mean time between failures diverges: you never finish. With checkpoints every *T*
+them unexpected. Without checkpoints every failure restarts from zero; with independent failures the
+expected time to finish grows exponentially in the ratio of run length to mean time between failures
+(roughly `MTBF·(e^(L/MTBF) − 1)`), so a run many times longer than the MTBF effectively never finishes. With checkpoints every *T*
 minutes, a failure costs on average *T/2* minutes of recomputation plus the restart time.
 
 Resumability is the forcing reason; two more follow from having the artefacts. Model selection: the best
@@ -51,10 +53,11 @@ nothing to roll back to.
 Resuming means continuing the exact same trajectory, so everything that influences the next step must be
 saved:
 - **Model weights**, in the training precision plus fp32 master weights under mixed precision.
-- **Optimizer state.** AdamW keeps two fp32 moments per parameter. Using the ZeRO accounting of about 16
-  bytes per parameter for weights, gradients and Adam state in mixed precision, a 7B model carries
-  roughly 100 GB of training state, most of it optimizer moments. Dropping them and resuming with fresh
-  moments produces a loss spike, because Adam's first steps after a reset are badly scaled.
+- **Optimizer state.** AdamW keeps two fp32 moments per parameter. In mixed precision a checkpoint holds
+  about 14 bytes per parameter: 2 for bf16/fp16 weights plus 12 for the fp32 master copy and the two
+  moments (ZeRO's often-quoted 16 bytes also counts the 2-byte gradients, which live only in memory). A 7B
+  model's resumable state is therefore roughly 100 GB, most of it fp32 optimizer state. Dropping it and
+  resuming with fresh moments produces a loss spike, because Adam's first steps after a reset are badly scaled.
 - **Scheduler state and step counter**, so the learning rate continues from where it was instead of
   restarting warmup.
 - **Mixed-precision loss-scaler state**, where used.
@@ -67,8 +70,10 @@ saved:
 The expected loss from a failure is half the interval, and each save costs write time during which the
 GPUs may idle. Saving a 100 GB state over a 1 GB/s link is about 100 seconds; saving every 30 minutes
 costs about 5% of throughput in exchange for losing at most 30 minutes. Two techniques shrink the cost:
-asynchronous checkpointing copies the state to host memory in milliseconds and writes to storage in the
-background while training continues, and incremental schemes save only what changed. Pick the interval
+asynchronous checkpointing snapshots the state to host memory (a stall of seconds or less per GPU, bounded
+by device-to-host bandwidth) and writes to storage in the background while training continues; incremental
+or differential schemes save only what changed, which pays off mainly when much of the state is static,
+such as large sparse embedding tables. Pick the interval
 from failure rate, save cost and the value of lost minutes, and save more often near the end of a run.
 
 ### Distributed layout
@@ -90,7 +95,7 @@ Record the validation metric with each checkpoint so "best" is a lookup, not a r
 the weights of the last several checkpoints is a cheap, old trick that often improves the final model;
 the original Transformer paper averaged the last 5 (base) or 20 (big) checkpoints. For export, prefer
 `safetensors` over pickled `torch.save` files: a pickle can execute arbitrary code on load, which is why
-`torch.load` now defaults to `weights_only=True` and why weights from untrusted sources should never be
+`torch.load` defaults to `weights_only=True` since PyTorch 2.6 and why weights from untrusted sources should never be
 unpickled. With adapters, the checkpoint is the adapter weights plus an exact reference (name and hash)
 to the base model they were trained on; without that reference the adapter is unusable.
 

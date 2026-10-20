@@ -5,7 +5,7 @@ name: RAG architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/hybrid-search
@@ -70,7 +70,13 @@ architecture exists to make that selection fast, fresh, permission-aware and mea
    conversation, split multi-part questions. The raw user message is often a poor search query.
 2. **Retrieve.** Run dense and sparse search with metadata and ACL filters applied *inside* the search,
    not after, *because* filtering after top-k can leave a user with zero permitted results and leaks the
-   existence of forbidden ones. Fuse the ranked lists; reciprocal rank fusion is the common default.
+   existence of forbidden ones. Fuse the ranked lists; reciprocal rank fusion is the common default:
+   `score(d) = Σ_lists 1 / (k + rank_list(d))` with k ≈ 60. It fuses *ranks*, not raw scores,
+   *because* a BM25 score and a cosine similarity live on different scales and cannot be added. With
+   k = 60, a chunk ranked 1st by dense search only scores 1/61 ≈ 0.0164, while a chunk ranked 3rd in
+   both lists scores 2/63 ≈ 0.0317: agreement between two independent retrievers beats a single
+   strong vote, which is exactly the behaviour you want from fusion. The large k flattens the curve so
+   that rank 1 versus rank 5 matters little and presence in a list matters a lot.
 3. **Rerank.** A cross-encoder scores (query, chunk) pairs jointly and reorders the top 50–100
    candidates. First-stage retrieval optimizes recall cheaply; the reranker buys precision for the
    handful of chunks you will actually pay to put in the prompt.
@@ -82,6 +88,15 @@ architecture exists to make that selection fast, fresh, permission-aware and mea
 6. **Observe.** Log the query, retrieved ids, scores, the final prompt and the answer under one trace
    id. Without this you cannot distinguish "retrieval missed" from "model ignored the passage", and
    those are fixed in different places.
+
+### Single-shot versus iterative retrieval
+The pipeline above retrieves once per question, which is right for most lookups and keeps latency and
+cost predictable. It fails on multi-hop questions ("which of our customers on the legacy plan were
+affected by last week's incident?") because the second hop's query depends on the first hop's answer,
+and no single embedding of the original question finds both. The architectural answer is to expose
+`search` as a tool and let a model call it in a loop (agentic RAG), or to run a fixed decompose →
+retrieve-per-sub-question → merge chain. Both multiply retrieval calls and latency per question, so
+route to them only when a classifier or the first pass signals that one retrieval was not enough.
 
 ### Where the boundaries go
 Treat retrieval as its own service with a typed interface, roughly `search(query, user, filters, k)
@@ -167,6 +182,9 @@ def answer(query, user, store, reranker, llm):
 - Judging the system by end-to-end answer quality alone; without recall@k on a labeled query set you
   cannot tell retrieval failures from generation failures, and you end up tuning prompts to fix an index
   problem.
+- Raising the number of chunks in the prompt to paper over retrieval misses; the symptom is cost
+  per question climbing while faithfulness falls, because the right passage is now buried among
+  near-misses and the model blends them.
 - Letting the index become the system of record (hand-edited chunks, data that exists nowhere else); the
   symptom is a re-chunking project that nobody dares to run.
 

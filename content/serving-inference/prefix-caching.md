@@ -5,7 +5,7 @@ name: Prefix caching
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - prompting/prompt-caching
   - serving-inference/kv-cache-paging-and-eviction
@@ -61,6 +61,15 @@ blocks are attached to the new request's block table with their reference counts
 runs only over the remaining tokens (and, in some engines, a partial last block is always recomputed
 because only full blocks are cached). TTFT drops in proportion to the fraction of the prompt that hit.
 
+### Two payoffs: compute and memory
+The obvious saving is prefill compute. For an 8B model, a 3,000-token prefix is about
+2 × 8e9 × 3,000 ≈ 48 TFLOPs, on the order of 50 ms on one GPU at illustrative peak rates, against a
+millisecond or two for a 50-token question; with a hit, TTFT is dominated by the question and the queue.
+The less obvious saving is capacity. Requests that share a prefix point their block tables at the same
+physical blocks, so 100 concurrent requests with that 3,000-token prefix (at 128 KB per token, ~390 MB
+each) hold one copy instead of 100: roughly 39 GB of pool returned to live sequences. On workloads with
+long shared prefixes, that is often worth more than the TTFT gain, because it raises the batch size.
+
 ### Lifetime and eviction
 When a request finishes, its blocks' reference counts drop. Blocks with zero references are not returned
 to the free list immediately; they stay in the cache table, reclaimable in LRU order when live sequences
@@ -76,7 +85,9 @@ results near the top of the prompt. The rule for prompt layout is: stable conten
 tool definitions, few-shot examples), then slowly changing content (conversation history, document), then
 the volatile part (the current question). Chat templates must also be stable: a template that emits the
 date, or that formats the system prompt differently depending on the presence of tools, silently breaks
-sharing.
+sharing. The key must also cover everything else that changes K and V for the same tokens: a different
+LoRA adapter, or different image inputs in a multimodal prompt, produce different caches, so engines mix
+those identities into the block hash, and two tenants on different adapters never share.
 
 ### Multi-replica serving
 A cache lives on one GPU. With several replicas behind a load balancer, the second request for a tenant
@@ -112,7 +123,7 @@ llm = LLM("meta-llama/Meta-Llama-3-8B-Instruct", enable_prefix_caching=True,
           max_model_len=8192, gpu_memory_utilization=0.9)
 sp = SamplingParams(temperature=0, max_tokens=32)
 
-system = "You are a contracts assistant.\n" + ("Policy clause.\n" * 400)   # ~2k tokens, stable
+system = "You are a contracts assistant.\n" + ("Policy clause.\n" * 400)   # ~1.2k+ tokens, stable
 questions = [f"Question {i}: does clause {i} allow early termination?" for i in range(20)]
 
 def run(prompts):
@@ -125,9 +136,9 @@ bad  = [f"Request-id: {i}\n{system}\n{q}" for i, q in enumerate(questions)]  # v
 
 print(f"stable-first : {run(good)*1000:.0f} ms/request")
 print(f"volatile-first: {run(bad)*1000:.0f} ms/request")
-# Expect the stable-first layout to be markedly faster per request: the 2k-token
+# Expect the stable-first layout to be markedly faster per request: the >1k-token
 # policy block hits the cache on every call. The volatile-first layout misses on
-# every block because the first few tokens differ, so every request re-prefills ~2k tokens.
+# every block because the first few tokens differ, so every request re-prefills the whole block.
 # llm.llm_engine metrics (or the server's /metrics endpoint) expose the prefix hit rate.
 ```
 
@@ -152,6 +163,10 @@ print(f"volatile-first: {run(bad)*1000:.0f} ms/request")
   hits and production showing 20%, because real conversations diverge after the system prompt.
 - Assuming the cache stores responses; symptom is confusion when the same prompt yields different text
   at non-zero temperature, which is expected because only K and V are reused.
+- Sharing one prefix cache across mutually untrusted tenants; the symptom is invisible in metrics, but a
+  hit is measurably faster than a miss, so a tenant can probe whether someone else recently sent a given
+  prefix (a timing side channel). Where that matters, isolate tenants by replica or mix a per-tenant salt
+  into the block hash, which some engines support, at the cost of cross-tenant hits.
 
 ## When to use
 Turn it on whenever prompts share a long common beginning: product system prompts, few-shot blocks, tool

@@ -5,6 +5,7 @@ name: Observability stack
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - observability/tracing
   - observability/opentelemetry
@@ -80,6 +81,8 @@ Three signals, three stores, chosen by cardinality and retention. **Traces** (hi
 weeks of retention) go to a trace store. **Metrics** (low cardinality, long retention) go to a time
 series database; a spanmetrics connector in the collector derives request rate, error rate and
 latency histograms per model, bundle and tenant from the spans, so nobody hand-instruments counters.
+It does not sum attribute values, so token and cost series come from a token-usage metric emitted by
+the instrumentation or from a job over the trace store.
 **Payloads**, the prompts and completions, are the sensitive, bulky part and live in a store with
 their own access control and retention, referenced from spans by id. A full RAG trace with retrieved
 chunks can be tens of kilobytes; at a million requests a day that is tens of gigabytes a day
@@ -108,7 +111,9 @@ thumbs-down land on the same trace; and the ability to swap any backend by chang
 Instrumenting one request with the OpenTelemetry SDK: a root span for the request, child spans for
 retrieval and the model call, GenAI attributes on the model span, and the platform's mandatory keys.
 `retrieve` and `call_model` are the application's existing functions; the exporter sends to a
-collector whose address comes from the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable.
+collector whose address comes from the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable. The
+completion preview is a custom event rather than a semantic-convention one, because the conventions'
+content-capture names have changed several times and content capture is opt-in.
 
 ```python
 from opentelemetry import trace
@@ -124,13 +129,13 @@ tracer = trace.get_tracer("support-assistant")
 MODEL = "model-id-from-bundle"          # pinned in the bundle, never hard-coded here
 
 def answer(question, tenant, bundle="support-assistant@41", config_version=118):
-    with tracer.start_as_current_span("answer") as root:              # one trace per request
-        root.set_attributes({"app.tenant": tenant, "app.bundle": bundle,
-                             "app.config_version": config_version})   # mandatory platform keys
-        with tracer.start_as_current_span("retrieve") as s:
+    keys = {"app.tenant": tenant, "app.bundle": bundle,               # mandatory platform keys,
+            "app.config_version": config_version}                     # on every span: attributes
+    with tracer.start_as_current_span("answer", attributes=keys):    # are not inherited by children
+        with tracer.start_as_current_span("retrieve", attributes=keys) as s:
             docs = retrieve(question)
             s.set_attribute("retrieval.doc_count", len(docs))
-        with tracer.start_as_current_span(f"chat {MODEL}") as s:      # GenAI span naming convention
+        with tracer.start_as_current_span(f"chat {MODEL}", attributes=keys) as s:  # GenAI span name
             s.set_attributes({"gen_ai.operation.name": "chat",
                               "gen_ai.provider.name": "anthropic",     # 'gen_ai.system' in older versions
                               "gen_ai.request.model": MODEL})
@@ -138,7 +143,7 @@ def answer(question, tenant, bundle="support-assistant@41", config_version=118):
             s.set_attributes({"gen_ai.response.model": resp.model,
                               "gen_ai.usage.input_tokens": resp.usage.input_tokens,
                               "gen_ai.usage.output_tokens": resp.usage.output_tokens})
-            s.add_event("gen_ai.content.completion", {"preview": resp.text[:200]})  # redacted downstream
+            s.add_event("app.completion_preview", {"preview": resp.text[:200]})  # redacted downstream
         return resp.text
 ```
 
@@ -200,8 +205,9 @@ Compliance separately asks whether any prompt containing a customer's account nu
 Which parts of a well-built observability stack answer each question, and what is missing if they
 cannot?
 **A:** The spend gap is a cost-attribution question answered by spans: every model span carries
-tokens, model and tenant and bundle attributes, and the spanmetrics-derived cost series groups by
-them. If the sum does not match the invoice, either some spans lack tenant or bundle, which means the
+tokens, model and tenant and bundle attributes, and a cost series is computed from those token counts
+(a query or job over the trace store, or a token-usage metric emitted by the instrumentation, since
+spanmetrics only derives call counts and durations) priced per model and grouped by tenant and bundle. If the sum does not match the invoice, either some spans lack tenant or bundle, which means the
 mandatory attributes are not enforced, or some calls bypass the instrumented path, which means keys
 exist outside the gateway. The compliance question is answered by the collector's redaction policy
 and the payload store: if account numbers are redacted before export for the relevant classification,

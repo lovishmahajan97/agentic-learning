@@ -5,6 +5,7 @@ name: Sandboxing
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agents/computer-use
   - agents/approval-gates-for-consequential-actions
@@ -92,8 +93,8 @@ only the broker's endpoint. Where a token must be inside, make it per-run, least
 so exfiltration buys minutes of access to one project rather than years of access to everything.
 
 ### Resources and time
-CPU and memory limits, a process-count limit (fork bombs are a classic model mistake, not just an
-attack), disk quotas, output-size caps so a `cat` of a huge file cannot flood the transcript, and a
+CPU and memory limits, a process-count limit (runaway process creation, such as an unbounded
+multiprocessing pool or a recursive shell script, happens by mistake as well as by attack), disk quotas, output-size caps so a `cat` of a huge file cannot flood the transcript, and a
 wall-clock timeout per command and per run. These protect availability and cost, and they bound the
 damage of ordinary bugs.
 
@@ -112,7 +113,8 @@ other.
 ## Example
 A minimal container sandbox for running model-written Python: ephemeral, read-only root, no network,
 resource-limited, non-root, with a hard timeout that also kills the container. The working directory
-must be writable by the unprivileged uid. Stronger isolation swaps the `docker` command for a microVM
+must be writable by the unprivileged uid, and the bind-mount source must be an absolute path (a bare
+name after `-v` is interpreted as a named volume, not a host directory). Stronger isolation swaps the `docker` command for a microVM
 launcher; the policy stays the same.
 
 ```python
@@ -128,7 +130,7 @@ def run_in_sandbox(code: str, workdir: pathlib.Path, timeout_s: int = 60) -> dic
         "--read-only", "--tmpfs", "/tmp:size=64m",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
         "--user", "65534:65534",                   # unprivileged uid inside the container
-        "-v", f"{workdir}:/work:rw", "-w", "/work",
+        "-v", f"{workdir.resolve()}:/work:rw", "-w", "/work",   # absolute path, or docker treats it as a volume name
         "python:3.12-slim", "python", "-I", "main.py",
     ]
     try:

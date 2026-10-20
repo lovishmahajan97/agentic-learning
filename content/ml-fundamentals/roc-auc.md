@@ -5,7 +5,7 @@ name: ROC-AUC
 kind: metric
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/precision-recall-f1
@@ -82,11 +82,31 @@ ROC space if and only if it does so in PR space, but the *areas* weight regions 
 positives the PR curve is far more sensitive to differences in the low-FPR region, which is the only
 region you can afford.
 
+### From curve to operating point
+The curve is a menu; costs and prevalence pick the item. With prevalence π, a miss costing C_FN and a
+false alarm costing C_FP, the expected cost per item at a point on the curve is
+
+```
+cost = pi * (1 - TPR) * C_FN + (1 - pi) * FPR * C_FP
+```
+
+Lines of equal cost in ROC space are straight with slope (1 − π)·C_FP / (π·C_FN), and the optimal
+threshold is where a line of that slope touches the curve from the upper left. This is where
+prevalence re-enters even though AUC ignores it: at π = 0.01 and equal costs the slope is 99, so the
+best point sits in the steep bottom-left corner, at a very low FPR. Two consequences follow. A model
+whose curve is higher in that corner is the better product even with a lower total area. And any point
+on the straight segment between two achievable operating points can also be achieved, by randomly
+choosing between their thresholds, which is why the upper convex hull of the curve is the set of
+points worth considering.
+
 ### Reading the number
 0.5 is random, 1.0 is perfect separation, and nothing about 0.8 means "80% correct". Scale is
 task-dependent, so compare models on the same data, not AUCs across problems. Differences of 0.01 can
 be noise with few positives, because each positive contributes one full row of the pair matrix; report
-a bootstrap confidence interval. When only a slice of operating points is feasible, use partial AUC
+a bootstrap confidence interval, and when two models are scored on the same items compare them with a
+paired method (a paired bootstrap, or DeLong's test) because their errors are correlated. Credit
+scoring and some ML libraries report the Gini coefficient instead, Gini = 2·AUC − 1, which is the same
+information rescaled so that random is 0 and perfect is 1. When only a slice of operating points is feasible, use partial AUC
 over FPR ≤ your budget, or simply read TPR at that FPR.
 
 ### Multi-class

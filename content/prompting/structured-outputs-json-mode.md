@@ -5,6 +5,7 @@ name: Structured outputs / JSON mode
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - prompting/function-tool-calling
   - prompting/prompt-templates
@@ -79,8 +80,10 @@ own validation for anything it cannot express.
 Generation is left to right, so a field that appears earlier is produced before, and conditions, a field
 that appears later. Putting an `evidence` or `reasoning` field before the `label` field lets the model
 commit to the answer after it has written its justification; putting the label first produces a label
-followed by a rationalisation. This is chain-of-thought expressed as schema layout, and it is the single
-most effective lever once the format is fixed. Where the task needs long free reasoning, reason first in
+followed by a rationalisation. This is chain-of-thought expressed as schema layout, and it is often the
+most effective lever once the format is fixed. The effect is smaller on models run with extended or
+adaptive thinking, which reason in a separate block before the first output token, but it costs nothing
+and still helps when that reasoning is short. Where the task needs long free reasoning, reason first in
 an unconstrained step (or with extended thinking) and extract in a second, constrained call.
 
 ### Tool calling as structured output
@@ -123,7 +126,7 @@ client = anthropic.Anthropic()
 
 def triage(ticket: str) -> Triage:
     r = client.messages.parse(
-        model="claude-opus-5-5", max_tokens=1024,
+        model="claude-opus-5-5", max_tokens=4096,   # thinking tokens also count against this cap
         system="Classify support tickets. Quote evidence before deciding.",
         messages=[{"role": "user", "content": ticket}],
         output_format=Triage,          # schema compiled server-side; decoding is constrained to it
@@ -137,7 +140,7 @@ def triage(ticket: str) -> Triage:
 
 print(triage("Checkout returns 500 for every EU customer since 09:00 UTC. We are an enterprise account."))
 # Triage(evidence=['Checkout returns 500 for every EU customer'], product_area='checkout',
-#        severity=<Severity.high>, customer_tier='enterprise', needs_human=True)
+#        severity=<Severity.high: 'high'>, customer_tier='enterprise', needs_human=True)  (illustrative)
 ```
 
 ## Trade-offs

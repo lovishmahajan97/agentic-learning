@@ -5,6 +5,7 @@ name: Max-step budgets
 kind: pattern
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/loop-detection
@@ -49,7 +50,9 @@ path that preserves state instead of discarding it.
 - **Tokens**: cumulative input plus output. Because the input is re-sent each turn, cumulative input
   grows roughly quadratically with steps when context is not compacted. Illustrative arithmetic: if
   each step adds about 2k tokens of context, twenty steps re-send about 2k × (1 + 2 + … + 20) ≈ 420k
-  input tokens. This is why token budgets, not step budgets, are what protect cost.
+  input tokens. This is why token budgets, not step budgets, are what protect cost. Prompt caching,
+  where the provider offers it, discounts the re-sent prefix but does not shrink the token count or
+  the context-window limit, so the budget should still count tokens and price them separately.
 - **Wall-clock**: bounds user-facing latency and protects against tools that hang. It must be paired
   with per-call timeouts; a ten-minute budget does nothing if a single tool call blocks for thirty.
 - **Money**: tokens × price plus tool costs (paid APIs, compute). The dimension finance cares about.
@@ -123,9 +126,9 @@ class Budget:
 
     def child(self, share: float = 0.25) -> "Budget":   # sub-agent allocation
         left = max(0.0, 1 - self.fraction_used()) * share
-        return Budget(max_steps=int(self.max_steps * left),
-                      max_tokens=int(self.max_tokens * left),
-                      max_seconds=self.max_seconds * left)
+        return Budget(max_steps=max(1, int(self.max_steps * left)),   # never 0: avoids
+                      max_tokens=max(1, int(self.max_tokens * left)), # division by zero
+                      max_seconds=max(1.0, self.max_seconds * left))  # in fraction_used
 
 def run(state, model, budget: Budget):
     while True:
@@ -186,9 +189,13 @@ when the limit fires.
 **Q:** Your agent's step cap is 15. Finance reports that cost per run doubled last month while median
 steps rose only from 8 to 10. What is happening, and what do you change?
 **A:** Cost is driven by cumulative tokens, and cumulative input grows roughly with the square of the
-step count when the whole history is re-sent on every call; larger tool outputs or a bigger system
-prompt amplify that further. So a modest rise in steps, or a change in what each step carries, can
-double tokens. First confirm with per-run token accounting split by input and output and by step.
+step count when the whole history is re-sent on every call. Do the arithmetic, though: with a constant
+amount added per step, input scales with n(n+1)/2, which goes from 36 to 55 units between 8 and 10
+steps, about 1.5x. So the step rise explains part of the doubling, not all of it. The rest has to come
+from what each step carries (larger tool outputs, a bigger system prompt, a dropped cache) or from the
+tail: cost per run is a mean, and a few long runs near the cap move it far more than the median
+reveals. First confirm with per-run token accounting split by input and output, by step and by
+percentile.
 Then add a token budget alongside the step cap, with a soft warning, and attack the cause: truncate
 or compact tool outputs, summarize older context, and check whether a tool started returning much
 larger payloads. Report the exhaustion rate by task class rather than lowering the step cap blindly.

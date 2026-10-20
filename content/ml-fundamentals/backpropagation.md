@@ -5,7 +5,7 @@ name: Backpropagation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/loss-functions
@@ -58,6 +58,20 @@ x̄ᵢ += ȳ · ∂f/∂xᵢ. The products are vector–Jacobian products, never
 the cost linear. The addition matters: a value used in several places collects a contribution from each
 use, which is the multivariable chain rule. When the sweep reaches the parameters, their adjoints are the
 gradient.
+
+A three-line case makes the fan-out rule concrete. Let a = 3, b = a², c = 2a, L = b + c. Forward:
+b = 9, c = 6, L = 15. Backward: L̄ = 1, so b̄ = 1 and c̄ = 1; a receives b̄·2a = 6 from the square and
+c̄·2 = 2 from the doubling, so ā = 8, which matches dL/da = 2a + 2 = 8. Forgetting the "+=" and keeping
+only the last contribution would give 2 or 6, a silently wrong gradient.
+
+### What the framework actually does
+In PyTorch the graph is recorded during the forward pass itself: every tensor produced by a
+differentiable op carries a `grad_fn` pointing at the op and the values it saved. `loss.backward()`
+walks those pointers in reverse, writes each parameter's adjoint into `.grad`, and then frees the graph
+and its saved tensors (unless `retain_graph=True`). `.grad` is *added to*, not overwritten, which is the
+same += rule applied across calls; that is why `zero_grad()` is needed between steps and why gradient
+accumulation over several micro-batches works by simply calling `backward()` several times before
+`step()`.
 
 ### Why reverse rather than forward
 Forward mode costs one pass per input direction; reverse mode costs one pass per output. With one

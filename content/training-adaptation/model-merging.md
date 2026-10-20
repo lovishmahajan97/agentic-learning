@@ -5,7 +5,7 @@ name: Model merging
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/peft
   - training-adaptation/supervised-fine-tuning
@@ -88,6 +88,16 @@ cancels useful movement. The method does three things, in order, because each re
    sign(Σ_i τ_i) after trimming. This decides which direction the merged model will move.
 3. **Disjoint merge.** Average only the task vectors that agree with the elected sign at that parameter,
    ignoring the dissenters instead of letting them cancel the majority. Then θ = θ_base + λ τ_merged.
+
+A four-parameter walkthrough makes the effect visible. Take τ_A = [+0.30, −0.02, +0.10, −0.40],
+τ_B = [−0.25, +0.01, +0.12, −0.05] and τ_C = [+0.05, 0.00, −0.08, −0.30]. The plain mean is
+[+0.03, 0.00, +0.05, −0.25]: on parameter 1, A's strong push and B's strong pull have cancelled to almost
+nothing. Trimming each vector to its top 50% (two entries) leaves A = [+0.30, 0, 0, −0.40],
+B = [−0.25, 0, +0.12, 0] and C = [0, 0, −0.08, −0.30]. The summed signs are [+, 0, +, −], and the disjoint
+means give τ_merged = [+0.30, 0, +0.12, −0.35]. Two lessons follow. Movement that the tasks agree on
+survives at full strength rather than being divided by the number of tasks, which is why λ for TIES sits
+near 1 rather than 1/N. And conflicts are not resolved, only decided: on parameter 1, B loses outright
+because A's magnitude was larger, so B's skill pays for the merge wherever it depended on that weight.
 
 ### DARE: drop and rescale
 DARE starts from the observation that SFT deltas are extremely redundant: you can set a random 90% (or

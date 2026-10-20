@@ -5,7 +5,7 @@ name: Pruning
 kind: concept
 difficulty: advanced
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/quantization
   - training-adaptation/knowledge-distillation
@@ -92,14 +92,19 @@ pattern. So the central design question of pruning is not "which weights are uni
 ### When you prune and how you recover
 One-shot methods (Wanda, SparseGPT) prune a finished model and stop; they are the right tool for a quick
 50% result. Classic iterative pruning alternates prune → fine-tune → prune with a sparsity schedule that
-ramps gradually, because the network needs time to reroute around each cut. For structured pruning of LLMs
+ramps gradually, because the network needs time to reroute around each cut. That loop is also where the
+lottery-ticket hypothesis came from: iterative magnitude pruning of small vision networks found sparse
+subnetworks that, rewound to their early-training weights, train to full accuracy on their own. It is a
+useful intuition for *why* over-parameterised training works, but it has not become a practical recipe for
+LLMs, where finding the ticket costs more than training the dense model. For structured pruning of LLMs
 the recipe that works is prune, then **distil from the unpruned parent**: the pruned model is an excellent
 initialisation, and token-level distillation provides a dense signal that repairs it with a small
 fraction of a pretraining budget. Reported findings from that line of work: width pruning (heads, MLP,
 embedding channels) tends to preserve quality better than depth pruning at equal parameter count, while
 depth pruning gives the bigger latency win because fewer sequential layers means fewer kernel launches
-per token. Mixture-of-experts can be read as learned, input-dependent structured sparsity, which is where
-most of the industry's compute savings actually came from; see that lesson.
+per token. Contrast mixture-of-experts: it is structured sparsity designed in and *learned during
+pretraining* (each token activates a few experts), rather than carved out afterwards, and at frontier scale
+it has been the more widely adopted way to cut FLOPs per token; see that lesson.
 
 ## Example
 Wanda-style pruning of one linear layer in PyTorch, compared with magnitude pruning, in both unstructured

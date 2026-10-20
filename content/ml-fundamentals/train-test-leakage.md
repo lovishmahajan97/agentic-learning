@@ -5,7 +5,7 @@ name: Train/test leakage
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/train-val-test-split
   - training-adaptation/overfitting
@@ -69,6 +69,17 @@ is to split on the unit of independence: `GroupKFold` by entity id, or a time-or
 validation strictly follows training. The gap between random-split and group- or time-split scores
 is itself a measurement of how much you were leaking.
 
+Two refinements matter in practice. First, a time split needs a **gap** when labels or features span
+a window. If the label is "churns within 30 days" and training ends on 31 March, the labels of late-March
+training rows were decided by events in April, which is the validation period; leave at least one label
+horizon between the end of training and the start of validation (scikit-learn's `TimeSeriesSplit` has a
+`gap` argument; finance calls this purging and embargo). Second, entities are not always labelled for
+you. Exact duplicates, near-duplicates (the same support ticket re-sent, the same paragraph in two
+documents, an image and its crop) and templated rows behave like one entity in two places. Hash for
+exact matches and use a near-duplicate method such as MinHash or embedding similarity across the split
+boundary, *because* a random split of a corpus with 5% near-duplicates silently gives the model an
+open-book exam on that 5%.
+
 ### Preprocessing leakage: fitted on everything, evaluated on part
 Anything with a `fit` step learns from the rows it sees. Fit a scaler on all rows, then cross-validate,
 and each fold's model trained on inputs normalized with statistics that include the fold's test rows.
@@ -111,13 +122,21 @@ The classic demonstration: 100 rows, 10,000 pure-noise features, labels unrelate
 feature selection on the full dataset before cross-validating produces impressive accuracy on data
 that contains no signal at all, because the selector peeked at every fold's test labels. Putting the
 selector inside the pipeline, so it is refitted on each fold's training rows, returns the metric to
-chance where it belongs.
+chance where it belongs. The arithmetic of why: with 10,000 noise columns and 100 rows, a few dozen
+columns correlate with the labels by luck alone, and the leaky selector picks exactly those, *using the
+labels of the rows it will later be scored on*.
+
+The second half shows row leakage. Each of 40 patients contributes ten visits that share a feature
+fingerprint, and the label is a coin flip per patient, so nothing generalizes to a new patient. A
+random row split almost always puts a sibling visit in training, and a 1-nearest-neighbour model scores
+near-perfectly by looking it up. Splitting by patient exposes the truth.
 
 ```python
 import numpy as np
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, GroupKFold, cross_val_score
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import StratifiedKFold, KFold, GroupKFold, cross_val_score
 from sklearn.pipeline import make_pipeline
 
 rng = np.random.default_rng(0)
@@ -133,12 +152,20 @@ leaky = cross_val_score(clf, X_sel, y, cv=cv).mean()
 # RIGHT: selection is a pipeline step, refitted on each fold's training rows only
 pipe = make_pipeline(SelectKBest(f_classif, k=20), LogisticRegression(max_iter=1000))
 clean = cross_val_score(pipe, X, y, cv=cv).mean()
-print(f"leaky CV accuracy: {leaky:.2f}   clean CV accuracy: {clean:.2f}")
-# Expect the leaky number far above 0.5 on data with no signal, and the clean one near 0.5.
+print(f"leaky CV accuracy: {leaky:.2f}   clean CV accuracy: {clean:.2f}")   # ~0.87 vs ~0.47
 
-# Same principle for the split key: if rows share an entity, hold out whole entities
-groups = rng.integers(0, 20, size=100)                 # e.g. 20 customers, several rows each
-grouped = cross_val_score(pipe, X, y, cv=GroupKFold(5), groups=groups).mean()
+# Row leakage: 40 patients x 10 visits; each patient has a feature "fingerprint" and one
+# random label, so the features carry no information about the label of an unseen patient.
+groups = np.repeat(np.arange(40), 10)
+fingerprint = rng.normal(size=(40, 8))
+Xp = fingerprint[groups] + 0.3 * rng.normal(size=(400, 8))
+yp = rng.integers(0, 2, size=40)[groups]
+knn = KNeighborsClassifier(n_neighbors=1)              # a pure memorizer makes the leak obvious
+by_row = cross_val_score(knn, Xp, yp, cv=KFold(5, shuffle=True, random_state=0)).mean()
+by_patient = cross_val_score(knn, Xp, yp, cv=GroupKFold(5), groups=groups).mean()
+print(f"random-row CV: {by_row:.2f}   patient-grouped CV: {by_patient:.2f}")
+# Expect ~0.98 by row (a sibling visit is always in training) and near 0.5 by patient,
+# noisy because there are only 40 independent units, not 400.
 ```
 
 ## Trade-offs
@@ -158,6 +185,9 @@ grouped = cross_val_score(pipe, X, y, cv=GroupKFold(5), groups=groups).mean()
   cross-validation scores that are higher than the score on a truly fresh batch of data.
 - Random row splits on data with repeated entities or a time axis; the symptom is a large drop when
   you rerun with `GroupKFold` or a time-ordered split.
+- A time-ordered split with no gap when labels look ahead (30-day churn, 90-day default); the
+  symptom is a score that drops when you insert a one-horizon gap, and the earliest validation rows
+  scoring best because their outcomes overlap training labels.
 - A single feature with implausibly high importance; the symptom is that removing it drops the metric
   to a mundane level, and its provenance turns out to be post-outcome.
 - Tuning prompts, retrieval settings or thresholds against the same set you report; the symptom is

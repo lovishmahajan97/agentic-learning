@@ -5,6 +5,7 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - rag-retrieval/recall-vs-precision-trade-off
   - rag-retrieval/reranking
@@ -146,8 +147,8 @@ the number that predicts the wrong answer.
   agreement than binary labels; with a small labeling budget, binary judgments and recall are safer.
 - A larger k raises recall but adds tokens and distractors; once answer quality stops improving with k,
   the extra recall is paying for nothing.
-- LLM-generated qrels scale far beyond SME labeling but inherit the judge's preference for lexical
-  overlap; when the retriever under test is lexical, audit a human-labeled slice before trusting them.
+- LLM-generated qrels scale far beyond SME labeling but can over-credit passages that merely repeat the
+  query's terms; when the retriever under test is lexical, audit a human-labeled slice before trusting them.
 
 ## Pitfalls
 - Incomplete qrels, with unjudged chunks counted as irrelevant; the symptom is a new retriever that finds

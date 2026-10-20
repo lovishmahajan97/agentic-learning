@@ -5,7 +5,7 @@ name: Mixture of experts (MoE)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - model-internals/transformer
   - model-internals/llm-architecture
@@ -22,11 +22,11 @@ sources:
 ---
 
 ## TL;DR
-A mixture-of-experts transformer replaces the dense feed-forward block in each layer with several
-parallel "expert" FFNs plus a small router that sends each token to only one or two of them. The model
-therefore holds many more parameters than it uses for any given token: quality tracks total parameters
-while compute per token tracks active parameters. The price is that every expert must sit in memory,
-routing must be kept balanced during training, and the serving arithmetic changes with batch size.
+A mixture-of-experts transformer replaces each layer's dense feed-forward block with several parallel
+"expert" FFNs and a small router that sends each token to one or two of them. Compute per token tracks the
+active parameters, while quality lands well above a dense model of that active size, though usually below
+a dense model of the full size. The price: every expert must sit in memory, routing must be kept balanced,
+and serving economics shift with batch size.
 
 ## Why it exists
 Scaling laws say loss keeps falling as parameters grow, but in a dense transformer every parameter is
@@ -75,8 +75,10 @@ rather than simply summed: without the multiplication the router would receive n
 Count Mixtral 8x7B: 8 experts per layer, top-2 routing. The total is about 47B parameters, not 8 × 7 =
 56B, because attention, embeddings and norms are shared across experts. Per token only 2 of the 8 FFNs run,
 so roughly 13B parameters are active. Training FLOPs per token and the weight bytes read per decode step at
-batch 1 both track the 13B figure; loss tracks something much closer to the 47B figure. That gap is the
-whole point of the architecture.
+batch 1 both track the 13B figure, while quality is far better than a dense 13B model's. It is not free
+capacity, though: at equal total parameters a dense model is generally stronger, because every one of its
+parameters sees every token. An MoE sits between its active and total sizes, and buying that position at
+active-size compute is the whole point of the architecture.
 
 ### Load balancing
 Left alone, routers collapse. A few experts that happen to be slightly better early in training receive
@@ -86,12 +88,27 @@ mechanisms counter this:
 - **An auxiliary load-balancing loss** (Switch style). For each expert, multiply the fraction of tokens
   routed to it, f_i, by the mean router probability it received, P_i; sum over experts and scale by N. The
   sum is minimised when both are uniform, and because P_i is differentiable it pushes the router toward
-  spreading tokens. DeepSeek-V3 instead adds a per-expert bias to the routing scores and nudges it after each
-  step, which balances load without the small quality penalty an auxiliary loss costs.
+  spreading tokens. DeepSeek-V3 instead adds a per-expert bias to the scores used for
+  top-k selection (not to the gating weights) and nudges it after each step, raising it for underloaded
+  experts and lowering it for overloaded ones; that avoids most of the quality penalty a strong auxiliary
+  loss costs, and only a very small sequence-level balance loss remains.
+- **Router stability.** Router logits can grow until the softmax saturates and training diverges; ST-MoE
+  (Zoph et al., 2022) added a small "router z-loss" that penalises large logits, and routers are commonly
+  computed in fp32 even when the rest of the model runs in bf16, because tiny rounding differences flip
+  top-k choices.
 - **Expert capacity.** Each expert accepts at most `capacity_factor × tokens / N` tokens per batch.
   Overflow tokens are dropped from that expert (they pass through the residual connection only) or sent to
   their next choice. This exists because experts run as fixed-size batched matrix multiplications, often
   on different devices, and one overloaded expert would stall all the others.
+
+### Routing variants
+The scheme above is *token choice*: each token picks its top-k experts, so balance must be encouraged.
+Shazeer et al.'s original gate added tunable noise to the router logits before top-k, so that experts
+which were rarely chosen still got sampled and could learn. *Expert choice* inverts the selection: each
+expert takes its top-scoring tokens from the batch up to a fixed capacity, which balances load by
+construction but lets a token receive zero or many experts, and makes a token's routing depend on the other
+tokens in the batch. That dependence is awkward for autoregressive decoding, where the batch is a handful of
+unrelated requests, which is one reason open decoder LLMs use token choice.
 
 ### Why memory and parallelism change
 Every expert's weights must be resident, because the next token might be routed anywhere. Mixtral 8x7B
@@ -110,7 +127,9 @@ from bandwidth to FLOPs. Capacity planning for an MoE must be done at the concur
 ## Example
 A minimal top-k MoE layer with a Switch-style balancing loss. With `d_model=512, d_ff=2048` one FFN has
 2 × 512 × 2048 ≈ 2.1M parameters; eight experts hold ≈ 16.8M in total, but each token runs through two,
-so ≈ 4.2M are active per token. The `aux` value is smallest when tokens are spread evenly.
+so ≈ 4.2M are active per token. With f_i normalised to sum to 1, `aux` is about 1.0 when tokens and
+probability are spread evenly and rises toward N as routing concentrates on one expert, so printing it on
+random inputs (an untrained router is close to uniform) should give a value near 1.
 
 ```python
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -136,7 +155,7 @@ class MoELayer(nn.Module):
                 continue
             w = (topv * hit)[rows].sum(-1, keepdim=True)   # router weight for expert e
             out[rows] += w * self.experts[e](x[rows])      # gradient reaches the router via w
-        frac = F.one_hot(topi, self.n).float().sum(1).mean(0)   # f_i: share of tokens sent to each expert
+        frac = F.one_hot(topi, self.n).float().sum(1).mean(0) / self.k   # f_i: share of routings per expert
         mean_p = probs.mean(0)                                  # P_i: mean router probability per expert
         aux = self.n * (frac * mean_p).sum()                    # balancing loss, add lambda * aux to LM loss
         return out, aux

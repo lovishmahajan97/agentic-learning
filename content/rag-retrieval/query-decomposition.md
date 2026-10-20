@@ -5,6 +5,7 @@ name: Query decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/multi-hop-retrieval
@@ -117,7 +118,9 @@ async def decomposed_search(question, k_each=5):
     return subs, evidence
 
 ANSWER = """Original question: {q}
-Sub-questions and evidence (each chunk is tagged with the sub-question that retrieved it):
+Sub-questions:
+{subs}
+Evidence (each chunk is tagged with the sub-question that retrieved it):
 {ev}
 Answer the original question. Cite chunk ids. If a sub-question has no supporting chunk,
 say so instead of guessing."""
@@ -125,7 +128,8 @@ say so instead of guessing."""
 async def answer(question):
     subs, evidence = await decomposed_search(question)
     ev = "\n".join(f"[{e['id']}] ({e['sub']}) {e['text']}" for e in evidence)
-    return llm(ANSWER.format(q=question, ev=ev))
+    # list every sub-question, so one whose chunks are absent or irrelevant is still visible
+    return llm(ANSWER.format(q=question, subs="\n".join(subs), ev=ev))
 
 print(asyncio.run(answer(
     "Compare the refund windows of the Standard and Enterprise plans for EU customers.")))

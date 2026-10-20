@@ -5,6 +5,7 @@ name: Promises & async error propagation
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/abortcontroller-and-cancellation
@@ -67,7 +68,10 @@ the two are equivalent apart from a stack frame.
 ### Unhandled rejections
 A rejected promise with no handler attached by the end of the current microtask drain triggers
 `'unhandledRejection'`. Since Node 15 the default mode is `throw`: the rejection is raised as an uncaught
-exception and the process exits. The usual cause is a *floating promise*: `logToSink(event)` called
+exception and the process exits (unless an `'unhandledRejection'` listener is installed, which
+suppresses the throw). The crash output is the original error and its stack when the reason is an
+`Error`; only a non-Error reason (a thrown string, say) is wrapped in an error with code
+`ERR_UNHANDLED_REJECTION`, which then carries no useful stack. The usual cause is a *floating promise*: `logToSink(event)` called
 without `await` or `.catch`, or a `.then` with no rejection branch. Fix the cause, not the symptom:
 every promise must be awaited, returned, passed to a combinator, or given an explicit `.catch` that
 decides what to do. Lint for it (`@typescript-eslint/no-floating-promises`). Installing a global
@@ -129,9 +133,12 @@ async function callProvider(name: string, prompt: string, signal: AbortSignal): 
 async function bestEffort(prompt: string) {
   const ac = new AbortController();
   const names = ["alpha", "beta", "gamma"];
-  const results = await Promise.allSettled(names.map((n) => callProvider(n, prompt, ac.signal)));
-  const ok = results.find((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled");
-  if (ok) { ac.abort(); return ok.value; }   // stop the losers; they are billed per token
+  let winner: string | undefined;
+  const calls = names.map((n) => callProvider(n, prompt, ac.signal).then((text) => {
+    winner ??= text; ac.abort(); return text;   // first success aborts the losers mid-flight
+  }));
+  const results = await Promise.allSettled(calls); // losers now settle quickly with AbortError
+  if (winner !== undefined) return winner;
   const reasons = results.map((r) => (r as PromiseRejectedResult).reason);
   const retryable = reasons.every((r) => r instanceof ProviderError && r.retryable);
   throw new AggregateError(reasons, retryable ? "all providers failed (retryable)" : "all providers failed");
@@ -155,8 +162,9 @@ void (async () => { /* audit sink */ })().catch((e) => console.error("audit sink
 
 ## Pitfalls
 - Forgetting `await` on a call whose result you do not use (logging, metrics, cache writes); the symptom
-  is a process exiting with `ERR_UNHANDLED_REJECTION` minutes after the real error, or data that never
-  arrives.
+  is a process crash whose stack points into a logging or cache helper rather than the request that
+  started it (or `ERR_UNHANDLED_REJECTION` with no stack when a non-Error was thrown), or data that
+  never arrives.
 - `return promise` inside `try` instead of `return await promise`; the symptom is a `catch` block that
   "never runs" while the error surfaces in the caller.
 - Awaiting sequentially what could run concurrently (`const a = await x(); const b = await y();`); the
@@ -169,7 +177,8 @@ void (async () => { /* audit sink */ })().catch((e) => console.error("audit sink
 ## When to use
 Use `async`/`await` with `try`/`catch` as the default for all I/O, and reach for combinators only at
 explicit fan-out points: `all` for all-or-nothing, `allSettled` for partial results, `any` for racing
-equivalent providers, always paired with an `AbortController` so losers stop consuming tokens. Define
+equivalent providers, always paired with an `AbortController` so losers stop consuming resources
+(whether a provider stops generating, and billing, when the client disconnects is vendor-dependent). Define
 one error class per boundary (provider, tool, validation) carrying status and retryability, and wrap
 with `cause`. Enforce `no-floating-promises` in lint and keep the default crash-on-unhandled-rejection
 behaviour so bugs surface in staging. Measure the rate of unhandled rejections and of errors without a
@@ -214,11 +223,12 @@ can decide whether a retry is even appropriate.
 > paid model calls and side effects, continues. Cancellation must be done cooperatively through an
 > `AbortSignal` passed into each call.
 
-### Q: A service exits with `ERR_UNHANDLED_REJECTION` even though every `await` is inside a `try`. What is the most likely cause?
+### Q: A service crashes on an unhandled promise rejection even though every `await` is inside a `try`. What is the most likely cause?
 - [ ] A `catch` block rethrew the error
 - [x] A promise was created without being awaited, returned, or given a `.catch`, and it rejected
 - [ ] `Promise.allSettled` rejected because all inputs rejected
 - [ ] The error object was not an instance of `Error`
 > A rejection with no handler attached by the end of the microtask drain is unhandled, and Node's default
 > is to raise it as a fatal exception. Floating promises from fire-and-forget calls are the usual source.
-> `allSettled` never rejects, and non-Error reasons are still handled normally when awaited.
+> `allSettled` never rejects, and a non-Error reason only changes how the crash is reported
+> (`ERR_UNHANDLED_REJECTION` without a stack), not whether it happens.

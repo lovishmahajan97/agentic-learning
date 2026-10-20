@@ -5,7 +5,7 @@ name: TTFT (time to first token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/streaming
@@ -47,7 +47,8 @@ suddenly feels slow: the answer is in the prefill arithmetic, which this metric 
 
 ## How it works
 ### What is inside the number
-From the client's clock, TTFT is the sum of: network to the server; time spent waiting for
+From the client's clock, TTFT is the sum of: network to the server (plus TCP and TLS handshakes,
+several round trips, unless the client reuses a pooled connection); time spent waiting for
 admission (a free slot in the batch and free KV-cache memory); tokenisation; the prefill forward
 pass over all prompt tokens; sampling the first token from the logits of the last prompt position
 (the first token falls out of the prefill pass itself, there is no separate decode step for it);
@@ -157,6 +158,8 @@ for words in (50, 500, 5000):
   "got slow when we added RAG" with no change in the serving stack.
 - Ignoring hidden reasoning tokens; TTFT is fine but the user sees a blank screen for ten seconds, so
   measure time to first visible token separately.
+- Opening a new HTTPS connection per request from a distant region; the symptom is a TTFT floor of
+  a few hundred milliseconds even for tiny prompts, which disappears with a reused client.
 - Counting cold starts (model load on a fresh replica, serverless GPU wake-up) inside TTFT; the
   symptom is a p99 dominated by a handful of 30-second outliers after each scale-out.
 

@@ -5,6 +5,7 @@ name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/model-evaluation
   - evals/task-specific-acceptance-criteria
@@ -77,8 +78,9 @@ Four sources, in rough order of value per item:
 Write labeling guidelines before labeling; they become the task definition. Double-label a subset and
 measure agreement (see inter-annotator agreement). Where experts legitimately disagree, the item is
 either ambiguous (fix the guideline or drop it) or multi-answer (store all acceptable answers). Low
-agreement is a property of the task definition, not of the labelers, and a grader cannot be more
-reliable than the labels it is checked against.
+agreement among qualified labelers is usually a property of the task definition rather than of the
+people (check labeler expertise and training too), and a grader cannot be more reliable than the
+labels it is checked against.
 
 ### Size and statistics
 For a pass rate *p* on *n* items the standard error is √(p(1−p)/n). At p = 0.8: n = 100 gives ±4
@@ -147,8 +149,9 @@ are inside the noise, and the billing slice alone cannot resolve anything under 
   the production mix; report per slice, or weight by traffic when you need a headline number.
 - Real-traffic items are realistic but need privacy review and redaction before they can sit in a
   repository; synthetic items avoid that at the cost of sharing the generator's phrasing and blind spots.
-- A held-out split protects against overfitting prompts, but it halves the items available for
-  iteration; with small sets, rotate the split periodically rather than fixing it forever.
+- A held-out split protects against overfitting prompts, but it removes a share of the items from
+  iteration (30% in the example above); with small sets, rotate the split periodically rather than
+  fixing it forever.
 - Expert labeling is expensive and slow, but cheap labels (crowd, or the model itself) move the error
   from the system into the reference, where it is harder to notice and impossible to fix by prompting.
 
@@ -220,6 +223,6 @@ version the result. A few hundred such items will say more than two thousand syn
 - [ ] The model will also fail those items, so they are good hard cases
 - [x] The task definition or labeling guideline is ambiguous and must be fixed before grading means anything
 - [ ] The set needs more items to average out the disagreement
-> Low agreement is a property of the task definition. A grader cannot be more reliable than its
-> labels, so the guideline must be sharpened, ambiguous items dropped or made multi-answer, and
+> Disagreement between qualified experts usually points at the task definition, not the people. A
+> grader cannot be more reliable than its labels, so the guideline must be sharpened, ambiguous items dropped or made multi-answer, and
 > agreement re-measured before the set is used.

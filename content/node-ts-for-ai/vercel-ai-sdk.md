@@ -5,6 +5,7 @@ name: Vercel AI SDK
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - node-ts-for-ai/openai-anthropic-node-sdks
   - node-ts-for-ai/streams-and-backpressure
@@ -41,9 +42,9 @@ Calling the native SDKs directly is the right choice when you use one provider a
 surface, but it does not solve either problem; it is the thing the adapter would wrap. Picking a
 heavyweight agent framework solves them at the cost of owning its abstractions for everything else.
 The AI SDK is deliberately narrower: it standardises the model call and the UI stream and stops
-there. Its design bet is that the unified call can cover the common 90 percent (messages, tools,
-structured output, streaming, usage) and that the remaining 10 percent can be reached through typed
-provider options rather than by abandoning the layer. Whether that bet holds for your use case is
+there. Its design bet is that the unified call can cover the large common core (messages, tools,
+structured output, streaming, usage) and that the provider-specific long tail can be reached through
+typed provider options rather than by abandoning the layer. Whether that bet holds for your use case is
 exactly the decision this lesson is about.
 
 ## How it works
@@ -69,36 +70,45 @@ unified call; they simply do nothing on a provider that lacks them.
 - `tool({ description, inputSchema, execute })` defines a tool from a Zod (or JSON) schema; the schema
   becomes the provider's tool definition and the model's arguments are validated against it before
   `execute` runs, which is the same contract-as-value idea as the schema-validation lesson. When
-  `execute` is present the SDK runs the model/tool loop itself: it calls the tool, appends the result,
-  and calls the model again until a stop condition such as `stepCountIs(n)` is reached. Omit `execute`
-  to receive the tool call and run it yourself, for approvals or client-side tools.
+  `execute` is present the SDK runs the tool and records its result, and if you set `stopWhen` (for
+  example `stepCountIs(n)`) it appends the result and calls the model again, looping until the condition
+  holds or the model stops calling tools. The default for `generateText` / `streamText` is a single
+  step (`stepCountIs(1)`), so without `stopWhen` the tool runs but the model never sees its result and
+  never writes the final answer. Omit `execute` to receive the tool call and run it yourself, for
+  approvals or client-side tools.
 - `generateObject` and `streamObject` take a Zod schema and return a typed, validated object (or a
-  stream of partial objects). Under the hood the SDK picks the provider's best mechanism, a JSON
-  schema response format, a forced tool call, or an instruction, and validates the result against the
-  schema, so a non-conforming answer surfaces as an error rather than a mis-typed value.
+  stream of partial objects). Under the hood the provider package picks its best mechanism, a JSON
+  schema response format, a forced tool call, or an instruction, and the SDK validates the result
+  against the schema, so a non-conforming answer surfaces as an error (`NoObjectGeneratedError`) rather
+  than a mis-typed value.
 - `embed` and `embedMany` do the same unification for embedding models.
 
 ### The UI half and its protocol
 `useChat` on the client keeps the message list, sends it to your route on submit, and appends parts as
 they stream: text, tool invocations with their state, and custom data. The server route returns the
-result's response helper, which encodes the unified stream parts into the SDK's message-stream wire
-format (a line-delimited protocol carried over HTTP, consumed by the hook); a plain text alternative
-exists when you only need tokens. This is the piece that lets a tool call started on the server render
+result's response helper, which encodes the unified stream parts into the SDK's UI message stream
+(in v5, JSON parts sent as server-sent events and marked by a protocol-version header; v4 used a
+line-prefixed "data stream" format), consumed by the hook; a plain text alternative exists when you
+only need tokens. This is the piece that lets a tool call started on the server render
 as a progress card in the browser without you writing the protocol. The client and server packages
 must agree on the protocol version, which is why the two sides are upgraded together.
 
 ### Middleware and telemetry
 `wrapLanguageModel` wraps any model with middleware that can transform the prompt, intercept the
 result or short-circuit the call: logging, caching, guardrails and default settings live here instead
-of at every call site. Built-in OpenTelemetry support emits spans for each call with token usage, which
-plugs into the same tracing pipeline as the rest of the service.
+of at every call site. OpenTelemetry support, switched on per call with the `experimental_telemetry`
+option, emits spans for each call and step with token usage, which plugs into the same tracing
+pipeline as the rest of the service.
 
 ### Runtime fit
 The core runs anywhere `fetch` exists: Node, Bun, Deno, edge runtimes, and inside Express, Fastify,
 Hono or Next.js route handlers. Nothing requires Vercel's platform; the UI hooks require a framework
-only on the client side. Note that names have shifted across major versions (for example tool
-`parameters` became `inputSchema`, `maxSteps` became `stopWhen`, and message conversion helpers were
-renamed), so check the version you install against the docs rather than copying old snippets.
+only on the client side. Note that names have shifted across major versions: in v5 tool `parameters`
+became `inputSchema`, `maxTokens` became `maxOutputTokens`, `maxSteps` became `stopWhen`, and
+`convertToCoreMessages` became `convertToModelMessages`. v6 then deprecated `generateObject` /
+`streamObject` in favour of `generateText` / `streamText` with an `output` setting and added an agent
+abstraction, and its migration guide lists further signature changes. Check the version you install
+against its docs rather than copying old snippets.
 
 ## Example
 A route handler that streams a tool-using answer to a `useChat` client, and a separate function that
@@ -127,8 +137,9 @@ export async function chatHandler(req: Request): Promise<Response> {
       }),
     },
     stopWhen: stepCountIs(4),          // at most 4 model/tool rounds per request
-    abortSignal: req.signal,           // client disconnect stops generation and billing
-    onFinish: ({ usage, steps }) => console.log({ usage, toolCalls: steps.length }),
+    abortSignal: req.signal,           // client disconnect stops generation and further billing
+    onFinish: ({ totalUsage, steps }) =>   // `usage` here is the last step only; totalUsage sums all
+      console.log({ totalUsage, steps: steps.length, toolCalls: steps.flatMap((s) => s.toolCalls).length }),
   });
   return result.toUIMessageStreamResponse();   // tokens, tool state and data to the browser
 }
@@ -162,8 +173,10 @@ export async function classify(text: string) {
 ## Pitfalls
 - Assuming `generateObject` removes the need to handle failure; the symptom is an unhandled schema
   validation error in production when the model returns a value outside the enum.
-- Letting the agent loop run without a step limit or with a generous one; the symptom is a request
-  that makes a dozen tool calls, times out at the proxy and bills for every round.
+- Setting a generous `stopWhen` limit, or using an agent abstraction with a high default, without a
+  budget; the symptom is a request that makes a dozen tool calls, times out at the proxy and bills for
+  every round. The opposite mistake, omitting `stopWhen`, shows up as a tool that runs but a reply that
+  ends with no answer text.
 - Forgetting to pass `abortSignal` from the request; the symptom is server logs showing completions
   finishing minutes after users closed the tab.
 - Upgrading `ai` on the server without the client package; the symptom is a UI that renders nothing
@@ -230,4 +243,4 @@ provider-specific economics.
 - [ ] It streams the object to the client automatically
 > `JSON.parse` gives you `unknown` from whatever the model wrote. `generateObject` constrains the
 > generation where the provider supports it and validates against the schema, so a non-conforming
-> value becomes an explicit error you must handle rather than a silently wrong object.
+> value becomes an explicit error you must handle rather than a silently wrong object. It does not guarantee success, cache results or stream to the client.

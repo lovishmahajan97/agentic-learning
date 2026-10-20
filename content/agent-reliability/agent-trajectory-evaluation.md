@@ -5,6 +5,7 @@ name: Agent trajectory evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agent-reliability/task-completion-rate
   - agent-reliability/tool-call-success-rate
@@ -76,8 +77,11 @@ are different. pass@k is the probability that at least one of k attempts succeed
 number when a human or a verifier will pick the best attempt. pass^k is the probability that all k
 attempts succeed, which is the right number for an agent that runs unattended, because the user who gets
 attempt three does not care that attempt one would have worked. With per-run success p and independence,
-pass^k ≈ p^k: an agent at 80% per run is at about 51% for pass^3. The unbiased estimate from n trials
-with c successes per task is C(c, k) / C(n, k), averaged over tasks. Report confidence intervals; with ten
+pass^k = p^k for that task: a task the agent solves 80% of the time is at about 51% for pass^3. The
+unbiased estimate from n trials with c successes on a task is C(c, k) / C(n, k), computed per task and then
+averaged over tasks. Do not raise the pooled suite rate to the k-th power: success rates differ across
+tasks, and the mean of p^k is at least (mean p)^k, so the pooled shortcut understates pass^k on a suite
+where some tasks always pass and others always fail. Report confidence intervals; with ten
 tasks and three runs each you cannot distinguish 70% from 80%.
 
 ### Reference trajectories without brittleness
@@ -102,7 +106,9 @@ Scorers over a recorded trajectory and an aggregate over repeated runs. The outc
 state; the process checks are computed from events; the ordered-subsequence check accepts any valid path.
 
 ```python
+import json
 from collections import Counter
+from math import comb
 
 def ok_subsequence(actions: list[str], required: list[str]) -> bool:
     """required actions appear in order; other actions may be interleaved."""
@@ -115,7 +121,8 @@ def score_run(trajectory: list[dict], task: dict, end_state: dict) -> dict:
     actions = [c["name"] for c in calls]
     violations = [a for a in actions if a in task["forbidden_tools"]]
     outcome = task["success"](end_state) and not violations          # policy violation zeroes the run
-    redundant = sum(v - 1 for v in Counter((c["name"], str(c["arguments"])) for c in calls).values())
+    sigs = Counter((c["name"], json.dumps(c["arguments"], sort_keys=True)) for c in calls)
+    redundant = sum(v - 1 for v in sigs.values())    # approximation: ignores state changes in between
     return {
         "success": bool(outcome),
         "steps": len(calls),
@@ -127,8 +134,9 @@ def score_run(trajectory: list[dict], task: dict, end_state: dict) -> dict:
     }
 
 def aggregate(runs: list[dict], k: int = 3) -> dict:
-    n = len(runs); p = sum(r["success"] for r in runs) / n
-    return {"n": n, "pass_rate": p, "pass_hat_k": p ** k,             # pass^k under independence
+    """Runs of ONE task. Average pass_hat_k over tasks for the suite figure."""
+    n = len(runs); c = sum(r["success"] for r in runs)
+    return {"n": n, "pass_rate": c / n, "pass_hat_k": comb(c, k) / comb(n, k),   # unbiased pass^k
             "mean_steps": sum(r["steps"] for r in runs) / n,
             "violation_runs": sum(r["violations"] > 0 for r in runs)}
 
@@ -136,7 +144,7 @@ task = {"forbidden_tools": {"delete_order"}, "reference_steps": 3,
         "required_order": ["lookup_order", "refund"],
         "success": lambda s: s["orders"]["A1"]["refunded"] == 40.0}
 # runs = [score_run(record(agent, task), task, env.state()) for _ in range(10)]
-# aggregate(runs) -> e.g. {"pass_rate": 0.8, "pass_hat_k": 0.512, "mean_steps": 3.4, ...}
+# aggregate(runs) with 8 of 10 successes -> {"pass_rate": 0.8, "pass_hat_k": 0.467 (56/120), ...}
 ```
 
 ## Trade-offs
@@ -191,7 +199,8 @@ roughly ten points either side, so 85% is not distinguishable from 75% or 93%, a
 move it by noise alone. It is also the wrong statistic for an unattended agent: users get one attempt, so
 the relevant question is consistency, pass^k, not the per-run average. And outcome alone hides policy
 violations and expensive paths. Rerun the suite with at least five runs per task, report the pass rate
-with an interval, report pass^3 (an 85% per-run agent is around 61% under independence), report the
+with an interval, report pass^3 per task averaged over the suite (a task solved 85% of the time independently is around 61%
+for pass^3, and the per-task view shows which tasks drag the figure down), report the
 number of runs with a policy violation, which should be zero, and show the failure-class histogram so the
 decision is about the specific failures, not a single number. Then ship against a stated bar on those
 figures.
@@ -202,8 +211,9 @@ figures.
 - [x] Unattended users get one attempt, so consistency across attempts matters; pass^k requires all k runs to succeed while pass@k rewards any one success
 - [ ] pass@k only applies to code generation benchmarks
 - [ ] pass^k includes policy violations and pass@k does not
-> pass@k models "a verifier picks the best of k"; without a verifier or a human choosing, the probability
-> that every attempt succeeds is the one users experience.
+> pass@k models "a verifier picks the best of k". An unattended agent meets the same kind of task again and
+> again with nobody choosing among attempts, so the question is whether it succeeds every time, which is
+> what pass^k measures and why it falls as k grows while pass@k rises.
 
 ### Q: An agent reaches the correct end state but called a forbidden `delete_order` tool along the way. How should the run be scored?
 - [ ] Success, because the end state is correct

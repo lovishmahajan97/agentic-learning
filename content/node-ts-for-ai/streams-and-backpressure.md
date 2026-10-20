@@ -5,6 +5,7 @@ name: Streams & backpressure
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - node-ts-for-ai/abortcontroller-and-cancellation
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -27,7 +28,8 @@ and WHATWG Web Streams, used by `fetch`), and `pipeline`/`pipeTo` are what wire 
 error propagation and backpressure intact.
 
 ## Why it exists
-An LLM answer of 800 tokens takes several seconds to generate. Waiting for the whole thing and then
+An LLM answer of 800 tokens takes on the order of ten seconds to generate at typical decode rates of
+tens of tokens per second. Waiting for the whole thing and then
 sending it makes the user stare at a blank screen for the full duration; streaming each token as it is
 produced turns the same latency into a visibly "typing" response with time-to-first-token measured in
 hundreds of milliseconds. The same shape appears everywhere in AI systems: a 300 MB PDF corpus to chunk
@@ -68,9 +70,10 @@ why hand-written `on('data', chunk => res.write(chunk))` loops are the classic b
 `false` return and buffer without bound.
 
 ### `pipe` versus `pipeline`
-`readable.pipe(writable)` implements the pause/drain dance for you, but it does not forward errors: if
-the destination errors, the source keeps reading and is never destroyed, leaking file descriptors and
-memory. `stream.pipeline(src, ...transforms, dest, cb)` (or its promise form in `node:stream/promises`)
+`readable.pipe(writable)` implements the pause/drain dance for you, but it does not forward errors or
+clean up: if the destination errors or closes, the source is merely unpiped and left paused, never
+destroyed, so its file descriptor or upstream HTTP connection stays open; if the source errors, the
+destination is not closed. Both leak. `stream.pipeline(src, ...transforms, dest, cb)` (or its promise form in `node:stream/promises`)
 wires backpressure *and* error propagation *and* cleanup: an error or early close anywhere destroys
 every stream in the chain and the callback receives the error. There is almost no reason to use `pipe`
 in a server.
@@ -84,7 +87,7 @@ awaits `drain` when needed.
 
 ### Web Streams
 `fetch` in Node returns `response.body` as a WHATWG `ReadableStream`, the same API as browsers and the
-one the AI SDKs expose. It has the same ideas with different names: a queuing strategy with a
+one many AI SDKs expose. It has the same ideas with different names: a queuing strategy with a
 `highWaterMark`, `pipeThrough(transformStream)`, `pipeTo(writable)` with error and abort propagation,
 and `reader.read()` for manual pulling. `Readable.fromWeb()` and `Readable.toWeb()` convert between the
 two worlds, which you need when a provider SDK hands you a Web stream and your HTTP framework wants a
@@ -93,44 +96,51 @@ Node stream (or the reverse). Both kinds are async-iterable, so `for await` work
 ### Framing on the wire: SSE and chunked bodies
 A token stream has no natural chunk boundaries at the TCP level; a chunk may contain half a JSON
 event. Providers therefore frame events with Server-Sent Events (`data: {...}\n\n`), and a Transform
-on your side must buffer partial lines until a blank line arrives. The transform is where
-backpressure is easiest to break: if it parses one input chunk into fifty output events and pushes
-them all, it has just bypassed the destination's threshold for that chunk. `push()`'s return value and
-`transform` callback timing exist so you can respect it.
+on your side must buffer partial lines until a blank line arrives, and must decode bytes with a
+`StringDecoder` (or `TextDecoderStream`) because a chunk boundary can fall inside a multi-byte UTF-8
+character. A `Transform` enforces backpressure at chunk granularity for you: it does not call
+`_transform` with the next chunk until its readable side has been drained below `highWaterMark`. One
+chunk that expands into fifty events overshoots the threshold by that one chunk's output, which is
+bounded. Backpressure truly breaks in a hand-written `Readable` or event-driven producer that keeps
+calling `push()` after it has returned `false`; that buffer has no bound.
 
 ## Example
 A Transform that reframes a provider's SSE stream into newline-delimited JSON for the browser, wired
-with `pipeline` so a client disconnect or upstream error tears down the whole chain. `pipeline` also
-destroys the upstream body on client disconnect, which (through the `AbortSignal` and TCP) stops the
-provider from generating billed tokens for nobody.
+with `pipeline` so a client disconnect or upstream error tears down the whole chain. On client
+disconnect the `AbortSignal` cancels the upstream `fetch` and closes that connection; most providers
+stop generating when the connection drops, but whether partial output is still billed is
+vendor-specific.
 
 ```ts
-import { Transform, Readable } from "node:stream";
+import { Transform, Readable, type TransformCallback } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { StringDecoder } from "node:string_decoder";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 class SseToNdjson extends Transform {
   private buf = "";
-  constructor() { super({ readableObjectMode: false }); }
-  override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null) => void) {
-    this.buf += chunk.toString("utf8");
+  private dec = new StringDecoder("utf8");   // never splits a multi-byte character across chunks
+  override _transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback) {
+    this.buf += this.dec.write(chunk).replace(/\r\n/g, "\n");   // SSE also allows CRLF
     let idx: number;
-    while ((idx = this.buf.indexOf("\n\n")) !== -1) {       // one complete SSE event
-      const event = this.buf.slice(0, idx); this.buf = this.buf.slice(idx + 2);
-      for (const line of event.split("\n")) {
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") { this.push(null); return cb(); }
-        this.push(JSON.stringify({ t: JSON.parse(data).delta ?? "" }) + "\n");
+    try {
+      while ((idx = this.buf.indexOf("\n\n")) !== -1) {           // one complete SSE event
+        const event = this.buf.slice(0, idx); this.buf = this.buf.slice(idx + 2);
+        for (const line of event.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;                         // stream ends when upstream ends
+          this.push(JSON.stringify({ t: JSON.parse(data).delta ?? "" }) + "\n");
+        }
       }
-    }
-    cb();                                                     // ask for the next chunk only now
+    } catch (e) { return cb(e as Error); }  // report parse errors to pipeline instead of throwing
+    cb();                                    // Transform waits for the reader before the next chunk
   }
 }
 
 export async function proxy(req: IncomingMessage, res: ServerResponse) {
   const ac = new AbortController();
-  res.on("close", () => ac.abort());                          // client went away -> stop upstream
+  res.on("close", () => ac.abort());          // client went away -> stop upstream (no-op if finished)
   const upstream = await fetch("https://provider.example/v1/stream", {
     method: "POST", body: JSON.stringify({ prompt: "hi", stream: true }), signal: ac.signal,
   });
@@ -139,7 +149,7 @@ export async function proxy(req: IncomingMessage, res: ServerResponse) {
   try {
     await pipeline(Readable.fromWeb(upstream.body as any), new SseToNdjson(), res, { signal: ac.signal });
   } catch (e) {
-    if ((e as Error).name !== "AbortError") console.error("stream failed", e);  // disconnect is normal
+    if (!ac.signal.aborted) console.error("stream failed", e);   // disconnect is normal
   }
 }
 ```
@@ -163,14 +173,17 @@ export async function proxy(req: IncomingMessage, res: ServerResponse) {
 - Ignoring the `false` return of `write()` in a manual `'data'` handler; the symptom is heap growth
   proportional to the number of slow clients and eventual out-of-memory under load.
 - Using `pipe` instead of `pipeline`, so an error on the response does not destroy the upstream body;
-  the symptom is leaked connections and provider calls that keep generating after users disconnect.
-- Pushing many parsed events from one input chunk without regard to the destination; the symptom is
-  backpressure that "works in tests" but buffers unboundedly on real token streams.
+  the symptom is leaked file descriptors and upstream connections held open after users disconnect.
+- Writing a custom `Readable` (for example, one fed by an SDK's event callbacks) that keeps calling
+  `push()` after it returns `false`; the symptom is backpressure that "works in tests" but buffers
+  unboundedly when real clients are slow.
+- Decoding each chunk with `chunk.toString()` in a streaming parser; the symptom is occasional `\uFFFD`
+  replacement characters in non-English or emoji output where a character straddled two chunks.
 - Buffering a whole stream (`await res.text()`) to parse it, then streaming it to the client; the
   symptom is time-to-first-token equal to total generation time.
 - Reverse proxies or compression middleware buffering the response; the symptom is tokens arriving in
-  one burst at the end even though the server wrote them incrementally (hence `X-Accel-Buffering: no`
-  and disabling compression for streamed routes).
+  one burst at the end even though the server wrote them incrementally (hence nginx's `X-Accel-Buffering: no`
+  header, or the equivalent setting in your proxy, and disabling compression for streamed routes).
 - Not listening for client disconnect and aborting upstream; the symptom is token spend on responses
   nobody receives.
 
@@ -218,11 +231,11 @@ visible.
 
 ### Q: Why is `stream.pipeline` preferred over `readable.pipe(writable)` in a server?
 - [ ] `pipeline` is faster because it skips the internal buffer
-- [x] `pipeline` propagates errors and early closes to every stream in the chain and destroys them, while `pipe` leaves the source running
+- [x] `pipeline` propagates errors and early closes to every stream in the chain and destroys them, while `pipe` leaves the source open
 - [ ] `pipe` does not implement backpressure
 - [ ] `pipeline` works with Web Streams and `pipe` does not
 > `pipe` handles pause and drain correctly but does not forward errors or destroy the source when the
-> destination fails, which leaks connections and keeps upstream model calls generating. `pipeline` ties
+> destination fails, which leaves the source paused but open and leaks upstream connections. `pipeline` ties
 > the lifetimes together and reports a single error.
 
 ### Q: A provider SDK returns a WHATWG `ReadableStream`, and the HTTP framework expects a Node `Readable`. What is the right bridge?

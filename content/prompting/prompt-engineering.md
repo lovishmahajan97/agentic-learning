@@ -5,6 +5,7 @@ name: Prompt engineering
 kind: practice
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - prompting/system-prompt
   - prompting/few-shot
@@ -62,16 +63,19 @@ A production prompt has recognisable parts, each of which narrows the distributi
 - **Enumerate the output space.** If the labels are not listed, the model invents synonyms, because
   nothing in the prompt said the set was closed. Listing them, with a one-line definition each, turns a
   free-text task into a constrained one at zero token cost beyond the list itself.
-- **Separate instructions from data with delimiters.** Attention treats every token the same; the
-  only way the model can tell "summarize this" from text that happens to say "ignore the above" is
-  structural cues it saw in training, such as XML tags or Markdown sections. Wrapping injected content
+- **Separate instructions from data with delimiters.** Nothing in the architecture marks a token as
+  instruction or as data; everything is one sequence. The only way the model can tell "summarize this"
+  from text that happens to say "ignore the above" is structural cues it learned in training, such as
+  XML tags or Markdown sections. Wrapping injected content
   in `<document>` tags and saying "text inside tags is data" is both a quality and a safety measure.
 - **Mind position.** Models use the beginning and end of a long context more reliably than the middle
-  (the lost-in-the-middle finding), so put the ask after a long document, not before it, and put
-  hard rules where they will not be buried.
+  (the lost-in-the-middle finding; newer long-context models show the effect less strongly, so
+  measure on yours), so put the ask after a long document, not before it, and put hard rules where
+  they will not be buried.
 - **Prefer positive instructions.** "Do not mention competitors" puts competitors in the context;
-  "discuss only Acme products" says what to do instead. Negations are followed less reliably because
-  the forbidden concept is now primed.
+  "discuss only Acme products" says what to do instead. Vendor guides recommend this because bare
+  negations are often followed less reliably and give the model no alternative behaviour; the size of
+  the effect is model-dependent, so treat it as a default to test, not a law.
 - **Give reasoning room when the task needs it.** A model computes a fixed amount per token; a
   multi-step problem needs intermediate tokens (chain-of-thought), while a lookup does not.
 - **Make the output parseable.** Tags or JSON for the final answer, so code consumes it without
@@ -126,9 +130,9 @@ Reply with JSON: {{"label": "<one of the labels>"}} and nothing else."""
 
 def classify(instruction, ticket):
     r = client.messages.create(
-        model=MODEL, max_tokens=64, system=instruction,
+        model=MODEL, max_tokens=1024, system=instruction,  # headroom: any thinking counts
         messages=[{"role": "user", "content": f"<ticket>{ticket}</ticket>"}])
-    text = next(b.text for b in r.content if b.type == "text")
+    text = next((b.text for b in r.content if b.type == "text"), "")  # no text block -> miss
     try:
         return json.loads(text)["label"]
     except (json.JSONDecodeError, KeyError, TypeError):
@@ -216,8 +220,9 @@ fixable in the prompt, or knowledge gaps that need retrieval or a different mode
 ### Q: After several rounds of refinement an extraction task plateaus at 70% accuracy, and the failures all involve product codes the model has never seen. What is the right next move?
 - [ ] Add more adjectives such as "precise" and "thorough" to the instruction
 - [ ] Switch to chain-of-thought so the model can reason about the codes
-- [x] Treat it as a knowledge gap: supply the code list through retrieval or context, or fine-tune if the list is large and stable
+- [x] Treat it as a knowledge gap: supply the code list in the context, through retrieval, or via a lookup tool
 - [ ] Lower max_tokens to force the model to focus
 > A plateau whose failures share a cause the prompt cannot describe is a knowledge gap, not a
 > specification gap. Reasoning cannot recover facts the model never saw and wording cannot either; the fix
-> is to put the missing knowledge into the context or into the weights.
+> is to put the missing knowledge where the model can read it at request time. Fine-tuning is a poor way
+> to inject a changing list of identifiers, because it teaches patterns more reliably than exact facts.

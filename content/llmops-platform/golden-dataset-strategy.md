@@ -5,6 +5,7 @@ name: Golden dataset strategy
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/golden-dataset
   - evals/dataset-contamination
@@ -33,7 +34,7 @@ Most teams start with one file of fifty examples the first engineer wrote in an 
 quarter, then fails in four predictable ways. It goes *stale*: the product adds a refunds flow and a
 second language, traffic shifts, and the set still measures last quarter's product, so the eval stays
 green while users complain. It *leaks*: someone copies the best examples into the few-shot prompt, then
-into the fine-tuning data, and from then on the set measures memorisation; the score climbs to 100% and
+into the fine-tuning data, and from then on the set measures memorisation; the score climbs toward 100% and
 stops carrying information. It has the *wrong size*: fifty items cannot distinguish a two-point regression
 from noise, so engineers learn that the number wobbles and ignore it; the fix, growing it to five thousand
 items, makes a full run cost real money and an hour of wall-clock, so the run is skipped on busy days,
@@ -193,7 +194,8 @@ What has most likely gone wrong, and what is your plan for the next two sprints?
 **A:** Three candidates, checked in order. Leakage: grep prompts, few-shot banks and fine-tuning data for
 golden inputs; if found, the 94% measures memorisation. Staleness: compare the set's slice mix with current
 traffic and the product's recent changes; a set built before the refunds flow cannot see refunds failing.
-Size: at n = 120 the half-width is roughly ±7 points, so a real drop could hide. Plan: cut a new version
+Size: at n = 120 and p ≈ 0.94 the 95% half-width is roughly ±4 points (it would be about ±7 near p = 0.8),
+and each slice holds only a fraction of the 120 items, so a real drop on one slice can hide in the noise. Plan: cut a new version
 with per-slice quotas sampled from recent traces stratified by negative outcomes, add regression items
 from the complaints, carve out a sealed holdout the prompt authors never see, record the new baseline
 for the champion on that version, and put slice floors into the gate.

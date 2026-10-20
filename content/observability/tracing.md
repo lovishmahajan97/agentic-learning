@@ -5,7 +5,7 @@ name: Tracing
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - observability/spans
   - observability/distributed-tracing-across-services
@@ -86,6 +86,24 @@ This design exists *because* the alternative, passing a span object everywhere, 
 library code you do not own. It is also the mechanism that breaks when you hop thread pools or cross
 a network boundary; the distributed-tracing lesson covers that.
 
+### Reading a trace: self time and the critical path
+The waterfall answers latency questions through two derived quantities. A span's **self time** is
+its duration minus the time covered by its children. Large self time on a parent means work happened
+there that nobody instrumented (prompt assembly, history compaction, JSON parsing, waiting on a lock
+or a connection pool), and it is the signal that tells you where the next span belongs. The
+**critical path** is the chain of spans that actually determines the root's duration. Sequential
+children add up; parallel children (fan-out to three retrievers, concurrent tool calls) cost only the
+slowest one, so shaving 200 ms off a child that is not on the critical path changes nothing the user
+sees. Both are only computable *because* every span has a parent and exact start and end times.
+
+### Turns, sessions and how big a trace should be
+A conversation can last days and an agent task hours, but tracing backends assume a trace finishes
+within minutes: they render it as one waterfall, and tail-based samplers must buffer it until it
+ends. So LLM systems usually make **one trace per user turn or task** and link the traces of a
+conversation with a session or conversation id attribute; LLM-focused tools expose this grouping as
+"sessions" or "threads". Long-running or resumed work keeps a durable execution id as well, because
+the trace store will have expired the earlier turns long before the conversation is over.
+
 ### Sampling, export and storage
 Recording every span of every request is expensive at volume, so SDKs support sampling: decide at
 the root (head-based) and carry the decision to children so a trace is all-or-nothing, or keep
@@ -104,7 +122,12 @@ straight from the trace view, and why error analysis usually starts by reading t
 The entire mechanism in about thirty lines: a `span` context manager that discovers its parent
 through a context variable, records timing and attributes, and appends itself to an in-memory
 exporter. Nothing is passed between `answer`, the retrieval step and the generation step; the parent
-is found through the context variable, which is exactly what production SDKs do.
+is found through the context variable, which is exactly what production SDKs do. The sleeps stand in
+for a 120 ms search, 250 ms of untraced prompt assembly and a 600 ms model call. The printout is
+roughly `chat.turn total 970 ms self 250 ms`, `retrieval 120/120`, `generation 600/600`: the root's
+250 ms of self time is the gap no span explains, which is exactly where you would add a
+`prompt.build` span next. (Summing children is correct here because they run sequentially; with
+parallel children you subtract the union of their intervals instead.)
 
 ```python
 import time, uuid, contextvars
@@ -130,19 +153,20 @@ def span(name, **attrs):
         s["end"] = time.perf_counter(); _current.reset(token); SPANS.append(s)
 
 def answer(question):
-    with span("chat.turn", question=question):
+    with span("chat.turn", session_id="conv-17", question=question):
         with span("retrieval", top_k=4) as r:
-            chunks = ["order #881 shipped 2 May", "returns take 5 days"]  # stand-in hits
-            r["attrs"]["chunk_ids"] = [11, 42]
+            time.sleep(0.12); r["attrs"]["chunk_ids"] = [11, 42]      # stand-in search
+        time.sleep(0.25)                  # prompt assembly + history compaction, untraced
         with span("generation", model="example-model") as g:
-            prompt = f"Context: {chunks}\nQ: {question}"
-            g["attrs"].update(prompt_chars=len(prompt), input_tokens=312, output_tokens=48)
-            return "Your order shipped on 2 May."       # stand-in completion and usage
+            time.sleep(0.60); g["attrs"].update(input_tokens=312, output_tokens=48)
+            return "Your order shipped on 2 May."                       # stand-in completion
 
 answer("Where is my order?")
+ms = lambda s: (s["end"] - s["start"]) * 1000
 for s in sorted(SPANS, key=lambda s: s["start"]):
-    indent = "" if s["parent_id"] is None else "  "
-    print(f'{indent}{s["name"]:<12}{(s["end"]-s["start"])*1000:7.2f} ms  {s["attrs"]}')
+    kids = sum(ms(c) for c in SPANS if c["parent_id"] == s["span_id"])
+    pad = "  " if s["parent_id"] else ""
+    print(f'{pad}{s["name"]:<12} total {ms(s):5.0f} ms  self {ms(s) - kids:5.0f} ms')
 ```
 
 ## Trade-offs
@@ -167,6 +191,8 @@ for s in sorted(SPANS, key=lambda s: s["start"]):
   is a compliance question you cannot answer three months later.
 - Recording raw prompts or free-text user identifiers as indexed attributes; the symptom is a backend
   bill or cardinality warnings, followed by a privacy review that halts the project.
+- Opening one trace for a whole conversation or long agent task; the symptom is traces that never
+  "finish", so tail sampling drops or truncates them and the viewer shows a waterfall too long to read.
 - Reading traces only when something breaks; teams that never sample healthy traces miss slow drift
   in prompt size, tool usage and retry rates until the cost or latency graph moves.
 

@@ -5,7 +5,7 @@ name: SLM vs LLM trade-offs
 kind: decision
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - model-internals/small-language-models
   - model-internals/scaling-laws
@@ -67,7 +67,9 @@ reads the model's active weights once, so single-stream tokens per second are ap
 divided by weight bytes, and a model ten times smaller generates roughly ten times faster on the same
 card (approximate; batching, KV-cache traffic and mixture-of-experts designs change the constant). The
 KV cache is smaller too, since there are fewer layers and heads. This is why SLMs win on latency and
-on edge deployment, not only on price.
+on edge deployment, not only on price. Mixture-of-experts models blur the size label: decode speed
+tracks the *active* parameters read per token, but memory must hold *all* experts, so an MoE with a
+small active count decodes like a small model while needing the memory footprint of a large one.
 
 ### Closing the gap: fine-tuning and distillation
 The standard path is to use the large model as a teacher: run it over your task's inputs to produce
@@ -92,8 +94,15 @@ than teacher-labelled.
 ### The hybrid
 A cascade runs the SLM first and escalates to the LLM on low confidence, failed validation, or a
 trigger condition. It captures most of the saving while giving LLM quality on the tail, at the price of
-a confidence signal that itself needs calibration. Routing and cascading have their own lesson; the
-point here is that the choice is rarely binary.
+a confidence signal that itself needs calibration. For classification with a self-hosted SLM the
+signal is cheap: the probability the model assigns to its chosen label, read from the logits. Raw
+probabilities from fine-tuned models are often overconfident, so the threshold is set empirically: on
+a held-out human-labelled set, sort predictions by confidence and pick the cut-off at which accuracy on
+the accepted items still meets the bar. Everything below it escalates, so the threshold directly sets
+the trade between escalation rate (cost) and accepted-item accuracy (quality). For free-form output,
+the signal comes from validators instead: schema checks, citation checks, or agreement between two
+samples. Routing and cascading have their own lesson; the point here is that the choice is rarely
+binary.
 
 ## Example
 A worked scenario with **illustrative figures**. A support platform classifies 5,000,000 inbound
@@ -106,6 +115,12 @@ human-verified) scores 96%, with a 95% interval of about ±1 point.
 Cost per day. API at an illustrative 1 unit per million input tokens and 3 per million output:
 5M × (300×1 + 10×3)/10⁶ = 1,650 units. Self-hosted SLM on a GPU node at an illustrative fixed 100 units
 per day, capacity-planned separately. Naive saving: 1,550 units, about 94%.
+
+Check the break-even and the load before trusting that. An API request costs 330 / 10⁶ ≈ 0.00033
+units, so the GPU's fixed 100 units a day only pays for itself above about 300,000 requests a day; at
+5M the SLM wins on cost, at 100k it would lose. And 5M a day is about 58 requests a second on average,
+roughly 17,000 input tokens a second of prefill, with peaks well above that. Whether one node carries
+the peak must be load-tested; if it takes two, the fixed term doubles and the break-even moves with it.
 
 Now price the quality gap. One point of accuracy on 5M messages is 50,000 misrouted messages a day. If
 each costs 0.02 units of human rework, the SLM-only path's extra point of error costs 1,000 units a
@@ -188,7 +203,7 @@ a human review queue for low-confidence outputs, or budget a larger open-weight 
 > compliance and simple instruction following are narrow pattern behaviours that small models retain,
 > especially after fine-tuning.
 
-### Q: Why does a 7B model generate tokens roughly ten times faster than a 70B model on the same GPU?
+### Q: Why does a dense 7B model generate tokens roughly ten times faster than a dense 70B model on the same hardware at batch size 1?
 - [ ] It uses a smaller vocabulary, so each token is shorter
 - [ ] It produces fewer output tokens for the same prompt
 - [x] Decode is memory-bandwidth bound and each token reads all the weights once, so ten times fewer weight bytes means roughly ten times more tokens per second

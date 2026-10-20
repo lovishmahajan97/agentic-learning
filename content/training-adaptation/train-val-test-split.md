@@ -5,6 +5,7 @@ name: Train / validation / test split
 kind: practice
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - ml-fundamentals/train-test-leakage
   - training-adaptation/data-curation
@@ -59,7 +60,8 @@ held-out sets, because the standard error of a measured accuracy *p* on *n* exam
 `sqrt(p·(1−p)/n)`. At p = 0.9 that is ±3 points for n = 100, ±0.95 points for n = 1,000 and ±0.3 points
 for n = 10,000. So a 1,000-example test set cannot separate two models one point apart, however large the
 training set is. With ten million rows a 1% test set is 100,000 rows, far more than needed; with 2,000
-fine-tuning examples a 10% slice is 200 rows and barely resolves a two-point difference. Choose held-out
+fine-tuning examples a 10% slice is 200 rows with a standard error of about ±2 points, so it cannot
+reliably separate two models two points apart. Choose held-out
 sizes from the effect you need to detect, then give everything else to training.
 
 ### Ways to cut
@@ -71,7 +73,8 @@ sizes from the effect you need to detect, then give everything else to training.
 3. **Grouped.** Assign whole groups (conversation, user, document, source repository) to a single split.
    Hashing the group id into a bucket makes the assignment deterministic and stable as new data arrives.
 4. **Temporal.** Train on the past, validate on the recent past, test on the newest period. Mandatory when
-   the deployed model will face the future, which it always does; it also exposes drift early.
+   the data changes over time and the deployed model will serve the future, which covers most production
+   systems; it also exposes drift early.
 5. **Cross-validation.** *k* folds rotate the validation role, giving *k* estimates at *k* times the
    training cost. Worth it when data is small and training is cheap (classical models, small heads),
    rarely for LLM fine-tunes.
@@ -178,9 +181,11 @@ would you re-split, and how large should the held-out sets be?
 customer-specific signals (product names, signatures, phrasing) and the 94% measured recognition, not
 classification. Re-split by hashing the customer id so each customer is entirely in one set, and
 consider a temporal cut as well if ticket mix drifts. The honest number will fall toward 78%, which is
-the number that matters. Sizing: 4,000 held-out tickets gives a standard error near 0.4 points at 90%
-accuracy, but the effective sample is closer to 300 customers, so expect wider error bars and stratify by
-category so rare ticket types appear in every split. Finally, keep the test set untouched until the final
+the number that matters. Sizing: 4,000 held-out tickets would give a standard error of about 0.5 points
+at 90% accuracy if tickets were independent, but tickets from one customer are correlated, so the
+effective sample lies somewhere between the ~300 held-out customers and the 4,000 tickets; expect wider
+error bars (a customer-level bootstrap measures them) and stratify by category so rare ticket types
+appear in every split. Finally, keep the test set untouched until the final
 comparison.
 
 ## Quiz
@@ -196,11 +201,11 @@ comparison.
 ### Q: You are predicting next month's churn from per-user event logs. Which split is appropriate?
 - [ ] A random 80/10/10 split over events
 - [ ] A stratified split over events by churn label
-- [x] A temporal split with whole users assigned to one side
+- [x] A temporal split: build features and train on earlier months, evaluate on a later month
 - [ ] Ten-fold cross-validation over events
-> The model will face future months and new users, so the split must respect time and keep each user's
-> events together; any event-level split leaks user identity and future information into training, and
-> stratification alone does not fix either.
+> The model will be applied to a future month, so evaluation must come after all training data; any
+> event-level random split puts a user's later events (and their churn outcome) into training, and
+> stratification does not fix that. If the model must also serve users never seen, hold out whole users too.
 
 ### Q: Roughly how precisely does a 1,000-example test set measure accuracy near 90%?
 - [ ] About ±0.1 percentage points

@@ -5,7 +5,7 @@ name: Modular monolith vs microservices
 kind: decision
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - system-design/domain-driven-design-and-bounded-contexts
   - system-design/event-driven-architecture
@@ -91,6 +91,23 @@ same every time:
 
 None of these are reasons never to split; they are the price, and the price is paid per boundary.
 
+### The arithmetic of a hop
+Two pieces of arithmetic explain why that price compounds rather than adds up linearly.
+
+**Availability multiplies along a synchronous chain.** If a request must pass through *n* services in
+series and each is available a fraction *a* of the time, the request succeeds roughly *aⁿ* of the time.
+Five services at 99.9% give 0.999⁵ ≈ 99.5%: the ~43 minutes of monthly downtime one service is allowed
+becomes ~3.6 hours for the path. Real failures are correlated, so treat this as the shape rather than a
+forecast. Five modules in one process fail together but do not multiply. This is *why* service designs
+lean on asynchronous messaging, caches and fallbacks: each one cuts a link out of the synchronous chain.
+
+**Fan-out amplifies tail latency.** If a request calls *n* services in parallel and waits for all of
+them, it is slow whenever any one of them is. With each call exceeding its own p99 1% of the time, the
+request exceeds that threshold with probability 1 − 0.99ⁿ, about 10% at *n* = 10, so the callees' p99
+becomes the caller's p90 (Dean and Barroso's "The Tail at Scale" is the classic treatment). Timeouts with
+partial results and hedged requests are the standard mitigations, and both are extra code a modular
+monolith never needs.
+
 ### The reasons that justify paying it
 A boundary is worth a service when at least one of these holds and the modular monolith cannot deliver
 it:
@@ -101,7 +118,8 @@ it:
 - **Different failure domain.** An ingestion worker that can OOM on a 400-page PDF must not take the
   chat API down with it.
 - **Different team and release cadence.** Conway's law is descriptive: when two teams own two things,
-  their interface will become a service boundary whether or not you planned it.
+  their interface will become a service boundary whether or not you planned it. The "inverse Conway
+  manoeuvre" runs it the other way: shape the teams around the boundaries you want, then split.
 - **Different security or compliance envelope.** A component that handles raw PII or runs untrusted
   agent code may need its own network segment and credentials.
 - **Different runtime.** Python for the ML path and TypeScript for the product surface is a common and
@@ -199,7 +217,9 @@ from the same artifact. Keep the model-serving tier separate from the start when
 its hardware and scaling profile are provably different. Add a service boundary when you can name the
 specific independence you need (team, scaling, blast radius, compliance) and have measured that the
 monolith cannot provide it. Measure before and after: deploy frequency per module, change failure rate,
-p99 latency per request path, and how many repositories a typical feature touches. In interviews, the
+p99 latency per request path, the number of synchronous hops on the critical path, and how many
+repositories a typical feature touches; a rising count of coordinated multi-service deploys is the
+earliest sign of a distributed monolith. In interviews, the
 expected answer is not "monolith" or "microservices" but a sequence: which boundaries, in what order,
 justified by which observed pressure, and how the extraction is kept reversible.
 

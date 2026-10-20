@@ -5,7 +5,7 @@ name: Build vs buy
 kind: decision
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - strategy/vendor-evaluation
   - security-governance-compliance/vendor-exit-strategy
@@ -51,8 +51,9 @@ be decomposed before it can be made.
 ## How it works
 ### Decompose the stack into layers
 1. **Foundation model.** Rent through an API or run open weights; training from scratch is for a
-   handful of organisations. The real choice here is self-host versus API and open-weight versus
-   proprietary, each with its own lesson.
+   handful of organisations. The "build" option that is actually open to most teams is *adaptation*:
+   fine-tuning or distilling a rented or open base for a narrow task. The other real choices here are
+   self-host versus API and open-weight versus proprietary, each with its own lesson.
 2. **Serving.** Buy (the API) or build on open-source engines if self-hosting; rarely write your own.
 3. **Gateway and routing.** Buy, adopt open source, or a thin build; commodity, but you must own the
    configuration because it encodes your portfolio and budgets.
@@ -81,7 +82,17 @@ be decomposed before it can be made.
   ongoing maintenance, which is a material fraction of the build cost every year, plus the opportunity
   cost of what those engineers did not ship. Buy cost is licence plus integration (routinely
   underestimated) plus the lock-in premium at renewal plus the exit cost: data migration, prompt
-  re-tuning, user retraining. Compare over three years, not year one.
+  re-tuning, user retraining. Compare over three years, not year one:
+
+```
+TCO_build = build effort + 3 × annual maintenance + infrastructure + usage + opportunity cost
+TCO_buy   = licence over 3 years (at projected seats or usage) + integration
+            + P(switch) × exit cost
+```
+
+  Writing it out exposes the terms people drop: maintenance and opportunity cost on the build side,
+  integration and exit on the buy side, and the fact that the licence term grows with adoption while
+  most of the build side is fixed. That asymmetry is why the answer often flips with scale.
 
 ### Patterns that come out of the questions
 - **Buy then build.** Adopt a vendor to learn the real requirements, then replace the differentiating
@@ -121,13 +132,17 @@ about 3,500 tokens each ≈ 50 billion tokens, at 1 unit per million ≈ 50,400.
 The team owns the eval set, the access-control filter that lets the restricted source in, and the
 model seam.
 
-**C. Fully self-host open weights.** Option B plus a 24/7 GPU footprint at 8,000 per month = 288,000
-and additional operations effort of perhaps 180,000 over three years, roughly 800,000 units. Justified
-only if residency rules forbid the API, which they do not here.
+**C. Fully self-host open weights.** Option B without the API usage, plus a 24/7 GPU footprint at
+8,000 per month = 288,000 and additional operations effort of perhaps 180,000 over three years:
+332,000 − 50,400 + 288,000 + 180,000 ≈ 750,000 units. At this volume the GPUs cost almost six times
+the tokens they replace, so C is justified only if residency rules forbid the API, which they do not
+here.
 
 Decision: B. The useful insight is the flip point. Option A costs 720 units per seat over three years
-and B is dominated by about 282,000 of fixed cost plus roughly 25 units per seat of usage, so the two
-cross near 400 seats. Below that, buy; above it, build on managed components. The restricted data
+plus about 30,000 of integration (two engineer-months); B is dominated by about 282,000 of fixed cost
+plus roughly 25 units per seat of usage. Setting 720s + 30,000 = 282,000 + 25s gives s ≈ 360 seats.
+Below that, buy; above it, build on managed components. The exact number matters less than its order
+of magnitude, and it moves if B's infrastructure grows with seats or the vendor discounts at volume. The restricted data
 source would have forced B regardless, which is the compliance question overriding the cost question.
 
 ## Trade-offs

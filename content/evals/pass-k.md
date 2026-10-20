@@ -5,6 +5,7 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - evals/benchmarking
   - evals/eval-harness
@@ -64,8 +65,9 @@ The logic: among the C(n, k) possible k-subsets of your n samples, the ones cont
 sample are the k-subsets of the n − c failures, C(n − c, k) of them. The ratio is the probability a
 random k-subset fails entirely, and its expectation over the sampling is exactly (1 − p)^k because the
 n samples are independent draws. Averaging over all k-subsets instead of looking at one is what cuts
-the variance; Chen et al. used n = 200 samples per problem to report k up to 100. Factorials of 200
-overflow, so the implementation uses the product form:
+the variance; Chen et al. used n = 200 samples per problem to report k up to 100. Computing the
+binomials through floating-point factorials overflows (200! ≈ 7.9 × 10^374, far beyond float64's
+≈ 1.8 × 10^308), so the standard implementation uses the numerically stable product form:
 
 ```
 pass@k ≈ 1 − Π_{i = n − c + 1}^{n} (1 − k / i)
@@ -87,7 +89,9 @@ either solves a problem reliably or not at all, and the lever is the model or th
 
 ### Relatives that answer different questions
 - **maj@k** (majority vote over k samples) and **best-of-n with a verifier** measure what a deployable
-  selection strategy actually achieves, between pass@1 and pass@k.
+  selection strategy actually achieves. Both are bounded above by pass@k and usually sit between pass@1
+  and pass@k, though maj@k can fall below pass@1 when the wrong answers agree with each other more often
+  than the right ones do.
 - **pass^k** (introduced for agent benchmarks in τ-bench) is the probability that *all* k attempts
   succeed: p^k per problem, estimated by C(c, k) / C(n, k). It measures reliability. A customer who uses
   an agent every day experiences pass^k, not pass@k; the two diverge sharply as k grows.
@@ -141,8 +145,9 @@ its zero across the other problems as if sampling could.
   pass@1 to the last decimal.
 - Pooling c and n across problems; the symptom is a pass@k that does not reproduce when someone recomputes
   it per problem.
-- Using factorials or `math.comb` on n = 200 without the product form; the symptom is overflow or a NaN
-  in the report.
+- Computing the binomials with floating-point factorials (or a float `comb`) at n = 200; the symptom is
+  `inf` or a NaN in the report. Python's exact-integer `math.comb` avoids this, but the product form is
+  simpler and vectorises.
 - Comparing pass@1 numbers from reports that used different temperatures or sample counts; the symptom
   is a model "winning" by a margin that vanishes under one protocol.
 - Describing agent reliability with pass@k; the symptom is pass@5 = 90% on the slide while customers who
@@ -181,7 +186,7 @@ rerun similar queries daily, report pass^k as well, since reliability is what th
 ## Quiz
 ### Q: With n = 20 samples of which 4 passed, why is 1 − C(16, 5) / C(20, 5) preferred over drawing 5 samples and checking whether any passed?
 - [ ] It corrects for test leakage between samples
-- [x] It averages over every possible 5-subset of the 20 samples, so it has lower variance at the same cost while staying unbiased
+- [x] It averages over every possible 5-subset of the 20 samples, so it has much lower variance than one 5-sample draw while staying unbiased
 - [ ] It is biased upward, which gives a more optimistic figure
 - [ ] It allows k to be larger than n
 > Both estimators are unbiased, but the single draw is one coin flip per problem; the combinatorial
@@ -190,10 +195,11 @@ rerun similar queries daily, report pass^k as well, since reliability is what th
 ### Q: Your benchmark shows pass@1 = 30% and pass@10 = 31%. What does that tell you?
 - [ ] The tests are broken and need rewriting
 - [ ] The sampling temperature was too high
-- [x] The model either solves a problem reliably or not at all, so sampling plus verification has little headroom; improve the model or the prompt
+- [x] Provided the samples were drawn at a normal sampling temperature, the model either solves a problem reliably or not at all, so sampling plus verification has little headroom; improve the model or the prompt
 - [ ] A verifier would roughly double accuracy
-> A tiny pass@k − pass@1 gap means extra samples rarely find a solution the first sample missed. That is
-> the opposite of the case where a verifier pays off.
+> A tiny pass@k − pass@1 gap means extra samples rarely find a solution the first sample missed, the
+> opposite of the case where a verifier pays off. Rule out near-greedy sampling first: identical samples
+> also produce this gap, and a high temperature would widen it, not shrink it.
 
 ### Q: Which metric describes "the agent completes the task on every one of k repeated attempts"?
 - [ ] pass@k

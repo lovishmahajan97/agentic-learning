@@ -5,6 +5,7 @@ name: Authentication vs authorization
 kind: concept
 difficulty: intro
 est_minutes: 14
+status: fact-checked
 related:
   - backend-fundamentals/oauth-2-0-oidc
   - backend-fundamentals/rbac
@@ -33,8 +34,8 @@ The forcing problem is the second user. With one user, "logged in" and "allowed"
 With two, a request for `/documents/42` from a logged-in user says nothing about whether document 42 is
 theirs, and the moment the server stops asking, user A reads user B's data by editing a number in the
 URL. That single mistake, a valid identity treated as sufficient permission, is what OWASP ranks as the
-most common web vulnerability class (broken access control), and it is the finding that opens nearly
-every penetration test report.
+top web application risk in its 2021 Top 10 (broken access control), and it is a staple finding of
+penetration tests.
 
 The naive alternative is to fold the two together: check at login, then trust everything after. It
 fails because the questions have different inputs and change at different rates. Identity is
@@ -65,11 +66,14 @@ at GPU speed. After login the browser holds a **session** cookie: an opaque id l
 store, which makes revocation instant but requires every server to reach the store. API clients send a
 **bearer token**: either opaque (looked up like a session) or a self-contained **JWT**, which the server
 verifies locally with the issuer's public key. A JWT check must cover four things: signature, issuer,
-audience and expiry. Audience is the one people skip, and skipping it means a token minted for another
-service is accepted by yours. Because a JWT cannot be revoked before it expires without server state,
-access tokens are short-lived and paired with a refresh token. **API keys** identify machines, are
-stored hashed like passwords and compared in constant time, and should carry a prefix so a leaked key can
-be identified without exposing the secret. Service-to-service calls use mutual TLS or platform
+audience and expiry. Signature verification includes pinning the accepted algorithm rather than trusting
+the token's own `alg` header, which is how `none`-algorithm and key-confusion attacks get in. Audience is
+the one people skip, and skipping it means a token minted for another service is accepted by yours. Because a JWT cannot be revoked before it expires without server state,
+access tokens are short-lived and paired with a refresh token. **API keys** identify machines and are
+stored only as a hash. Unlike passwords they are long random strings, so a fast hash such as SHA-256 or
+an HMAC is enough (a slow password hash would add latency to every request for no gain); compare in
+constant time, and give keys a recognisable prefix so secret scanners can spot a leaked key and you can
+tell which key it is without exposing the secret. Service-to-service calls use mutual TLS or platform
 identities. Single sign-on delegates all of this to an identity provider through OIDC or SAML; the
 OAuth/OIDC lesson covers the flows.
 
@@ -114,7 +118,8 @@ made at a different time, by a different decider.
 ## Example
 A FastAPI endpoint with the two concerns in two places. `current_principal` is the authentication
 chokepoint: it verifies signature, issuer, audience and expiry of a JWT via the identity provider's
-published keys (PyJWT). `authorize` is the decision function: tenant match first (returning 404 so other
+published keys (PyJWT). PyJWT checks `exp` only if the claim is present, so `require` makes its absence
+an error too. `authorize` is the decision function: tenant match first (returning 404 so other
 tenants' ids are not discoverable), then ownership or an explicit permission.
 
 ```python
@@ -137,8 +142,9 @@ def current_principal(request: Request) -> Principal:        # AUTHENTICATION
     token = auth.removeprefix("Bearer ")
     try:
         key = JWKS.get_signing_key_from_jwt(token).key
-        claims = jwt.decode(token, key, algorithms=["RS256"],
-                            issuer="https://idp.example.com", audience="docs-api")
+        claims = jwt.decode(token, key, algorithms=["RS256"],     # pinned, never from the header
+                            issuer="https://idp.example.com", audience="docs-api",
+                            options={"require": ["exp", "sub", "tenant"]})
     except jwt.PyJWTError:                                   # bad signature, issuer, audience or expiry
         raise HTTPException(401, headers={"WWW-Authenticate": "Bearer"})
     return Principal(claims)
@@ -188,8 +194,8 @@ no identity logic in the handler, and the tenant check runs before any content-d
   still working minutes or hours later.
 - Treating "valid API key" as "known tenant" without binding keys to tenants and filtering every query;
   the symptom is cross-tenant data appearing in search or RAG results.
-- Storing API keys or passwords in plaintext or comparing them with ordinary string equality; the
-  symptom is that one database dump exposes every customer's credentials.
+- Storing API keys or passwords in plaintext, or passwords under a fast unsalted hash; the symptom is
+  that one database dump exposes every customer's credentials.
 - Returning 403 for an unauthenticated request; the symptom is clients that never retry with
   credentials because the status told them they were already identified.
 

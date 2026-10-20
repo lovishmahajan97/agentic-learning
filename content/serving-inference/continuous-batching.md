@@ -5,7 +5,7 @@ name: Continuous batching
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/prefill-vs-decode
@@ -88,7 +88,10 @@ Per-step time grows slowly with batch size (weights are read once; cache reads a
 number of tokens), while tokens produced per step grow linearly. So throughput rises steeply with
 concurrency until the step becomes compute- or cache-bound, and every user's TPOT rises along the way.
 `max_num_seqs` and the token budget are the two dials: raise them to sell throughput, lower them to sell
-latency. Queueing theory applies in front of the loop: if arrivals exceed what the loop retires, the
+latency. Queueing theory applies in front of the loop. Little's law sizes the batch you will actually
+need: running sequences ≈ arrival rate × time each spends generating. At 5 requests/s and 300 output
+tokens at ~20 ms TPOT (6 s each), about 30 sequences are in flight on average, so a `max_num_seqs` of 16
+guarantees a growing queue however fast each step is. And if arrivals exceed what the loop retires, the
 queue grows without bound and TTFT explodes, which is the signal for backpressure or more replicas.
 
 ### What it does not fix
@@ -112,13 +115,12 @@ def step_ms(n_tokens):               # illustrative: 5 ms weight read + 0.02 ms 
     return 5.0 + 0.02 * n_tokens
 
 def static_batching():
-    t, done = 0.0, 0
+    t = 0.0
     for i in range(0, N, MAX_SEQS):
         batch = lengths[i:i + MAX_SEQS]
         for step in range(max(batch)):                       # batch lives until its longest finishes
             active = sum(1 for L in batch if L > step)       # idle slots are wasted
             t += step_ms(active)
-        done += len(batch)
     return t
 
 def continuous_batching():
@@ -135,8 +137,9 @@ total_tokens = sum(lengths)
 for name, fn in (("static", static_batching), ("continuous", continuous_batching)):
     ms = fn()
     print(f"{name:11s}: {ms/1000:6.1f} s total, {total_tokens/ms*1000:8.0f} tok/s")
-# Expected shape: continuous finishes the same work several times faster, because
-# static batches spend most steps at low occupancy waiting for the 1500-token outliers.
+# With this seed: static ~54 s (~1.6k tok/s), continuous ~20 s (~4.5k tok/s), close to 3x,
+# because static batches spend most steps at low occupancy waiting for the 1500-token
+# outliers. Make the length skew harsher and the gap widens; make lengths uniform and it vanishes.
 ```
 
 The simulation ignores prefill and memory, which is exactly why it is clean: it isolates the one effect
@@ -184,11 +187,12 @@ memory, and what chunked prefill adds is the expected narrative.
   their stutter by injecting long prompts into a loaded replica before proposing chunked prefill.
 
 ## Check yourself
-**Q:** A team's engine shows 85% GPU memory utilization, average batch size 12, and users report that
+**Q:** A team's engine shows 85% KV-cache utilization, average batch size 12, and users report that
 responses stream fast at night and slowly during the day. Request rate doubles during the day. Explain
 what the scheduler is doing and how you would tune it without buying hardware.
-**A:** At night the running batch is small, so each decode step reads the weights plus a few caches and
-TPOT sits near the bandwidth floor. During the day the loop admits more sequences up to `max_num_seqs` or
+**A:** (Note the metric: KV-cache utilization, not GPU memory, which an engine pre-allocates and which
+therefore always reads ~90%.) At night the running batch is small, so each decode step reads the
+weights plus a few caches and TPOT sits near the bandwidth floor. During the day the loop admits more sequences up to `max_num_seqs` or
 the memory limit; average batch 12 is a daily average hiding daytime batches several times larger. Each
 step now reads many caches and carries newcomers' prefill, so TPOT grows and streaming slows; that is the
 expected throughput-for-latency trade, not a bug. First, put TPOT and batch size per step on the

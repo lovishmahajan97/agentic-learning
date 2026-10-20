@@ -5,7 +5,7 @@ name: Cross-language API contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agents/typed-tool-contracts
   - agents/tool-schemas-and-argument-validation
@@ -83,11 +83,24 @@ interoperate without sharing code.
   to omit absent fields and forbid `null` unless it carries meaning ("clear this value").
 - **Enums**: closed enums break the moment a producer adds a value. Model them as strings with a known set
   and have consumers map unknown values to a fallback rather than throw.
-- **Floats**: `NaN` and `Infinity` are not JSON; decide on `null` or an error. Money is never a float.
+- **Floats**: `NaN` and `Infinity` are not JSON, yet Python's `json.dumps` emits them by default and
+  JavaScript's `JSON.parse` rejects the whole document; serialise with `allow_nan=False` and decide on
+  `null` or an error. Money is never a float: use integer minor units or a decimal string.
 - **Bytes**: base64 in a string field, with the encoding stated in the schema description.
 - **Unknown fields**: service-to-service consumers ignore them (tolerant reader) so producers can add
   fields; model-to-executor arguments *forbid* them, because an extra field from a model is a hallucination,
   not an upgrade.
+
+### The model is a consumer with its own dialect
+The schema sent to the model is not always the schema your validator uses. Providers that constrain
+generation to a schema (strict tool calling, structured outputs) typically support only a subset of JSON
+Schema, and the subset is vendor-specific: some require every property to be listed as required with
+nullability expressed in the type, some require `additionalProperties: false`, and keywords such as
+`format`, `maxLength` or `$ref` may be ignored or rejected. Generate the model-facing schema as a
+*projection* of the contract for each provider, keep the full contract for the executor's validator, and
+test both from the same fixtures. Otherwise the model is shown constraints it does not enforce (a 200-char
+limit it ignores) and the executor rejects the result, or a provider switch silently changes which
+constraints are enforced during generation.
 
 ### Evolution without breaking anyone
 Additive changes only: new optional fields, new event types that old consumers can skip, new enum values
@@ -144,7 +157,13 @@ class ToolResultEvent(BaseModel):
     run_id: str; call_id: str; ok: bool
     output: dict | None = None; error_code: str | None = None
 
-Event = TypeAdapter(Annotated[Union[ToolCallEvent, ToolResultEvent], Field(discriminator="type")])
+_Event = TypeAdapter(Annotated[Union[ToolCallEvent, ToolResultEvent], Field(discriminator="type")])
+KNOWN = {"tool_call", "tool_result"}
+
+def parse_event(raw: dict):
+    if raw.get("type") not in KNOWN:
+        return None                                  # new event type from a newer producer: skip, don't crash
+    return _Event.validate_python(raw)
 
 # One definition, three consumers.
 tool_spec = {"name": "create_ticket", "input_schema": CreateTicketArgs.model_json_schema()}  # to the model
@@ -152,9 +171,19 @@ with open("contracts/agent.schema.json", "w") as f:                             
     json.dump({"CreateTicketArgs": CreateTicketArgs.model_json_schema(),
                "ToolResultEvent": ToolResultEvent.model_json_schema()}, f, indent=2)
 args = CreateTicketArgs.model_validate({"title": "Renewal", "account_id": "9007199254740993"})  # executor
-evt = Event.validate_python({"type": "tool_result", "run_id": "r1", "call_id": "c1", "ok": True})
+evt = parse_event({"type": "tool_result", "run_id": "r1", "call_id": "c1", "ok": True, "cost_usd": 0.01})
+assert parse_event({"type": "approval_requested", "run_id": "r1"}) is None
 # TS side: generate types from contracts/agent.schema.json and validate the same file with ajv in CI.
 ```
+
+What each line defends against, concretely. `account_id` is `"9007199254740993"` (2^53 + 1) as a string; as a
+number, `JSON.parse` in the TypeScript server would return 9007199254740992 and the ticket would attach to
+the neighbouring account. A model that adds `"assignee": "bob"` to `create_ticket` is rejected by
+`extra="forbid"`, so the hallucinated field never reaches the tool. The `tool_result` event carrying a
+`cost_usd` field from a newer producer validates, because events ignore extras, and an `approval_requested`
+event this consumer has never heard of is skipped rather than crashing the stream reader. A `due_at` of
+`2026-11-03T09:00:00` without an offset fails at the producer, where the bug is, instead of becoming a
+five-hour shift in a browser in another timezone.
 
 ## Trade-offs
 - JSON Schema and OpenAPI are universal, readable and identical to what models consume, but they are
@@ -179,6 +208,9 @@ evt = Event.validate_python({"type": "tool_result", "run_id": "r1", "call_id": "
   moment the producer deploys, with no code change on their side.
 - Letting the model's tool schema and the executor's validator diverge; the symptom is a falling tool-call
   success rate with "invalid arguments" errors on calls that match the schema the model was shown.
+- Sending the full contract schema to a provider whose strict mode supports only a subset; the symptom is
+  tool definitions rejected at request time, or constraints like `maxLength` silently unenforced during
+  generation and then failing in the executor's validator.
 - Closed enums on the consumer; the symptom is a crash on the first new status value, usually at night.
 - Treating `null` and missing as interchangeable on one side only; the symptom is validation errors or
   values silently cleared when a field round-trips through the other language.

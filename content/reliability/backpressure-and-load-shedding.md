@@ -4,8 +4,8 @@ module: reliability
 name: Backpressure & load shedding
 kind: pattern
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - fastapi-for-ai/backpressure
   - serving-inference/backpressure
@@ -38,6 +38,12 @@ wait before service even starts. If the client timeout is 10 seconds, every one 
 already dead on arrival, yet the server will still spend full effort serving them to clients that
 have hung up and retried. Now the real arrival rate is 60 plus the retries. This is congestive
 collapse: throughput of *useful* work (goodput) falls toward zero while the machines run at 100%.
+
+Trouble starts well before arrival exceeds capacity. In the simplest queueing model (M/M/1: random
+arrivals, one server), mean time in system is `W = S / (1 − ρ)`, where `S` is the service time and
+`ρ` the utilisation. At 50% load a request spends 2× its service time in the system; at 90%, 10×; at
+95%, 20×. Real services are not M/M/1, but the shape, latency exploding as utilisation approaches 1, is
+general, and it is why a service that looks fine at 70% falls apart during a 30% surge.
 
 The naive alternative, "add a bigger queue", makes it worse, *because* queue depth converts directly
 into latency and buys nothing once wait time exceeds what callers will tolerate. "Autoscale" helps
@@ -91,6 +97,16 @@ because the retries are themselves rejected, total attempts can approach four ti
 traffic before the budget runs out. Shedding only works if clients back off on 429/503 with jitter, honour `Retry-After`, and keep a
 retry budget. Circuit breakers on the client side stop the storm entirely once rejection rates are
 high; bulkheads keep one overloaded dependency from consuming every worker.
+
+### Metastable failure: why overload outlives its cause
+Bronson et al. describe a class of outage in which a temporary trigger (a surge, a brief dependency
+slowdown, a cold cache after a deploy) pushes the system into overload, and then a **sustaining
+effect** keeps it there after the trigger is gone. Retries are the classic sustaining effect: requests
+time out, clients retry, the retries add load, more requests time out. Others are cache misses that
+make every request more expensive, and work done for abandoned requests. The system has two stable
+states at the same offered load, healthy and collapsed, and returning to healthy needs load to drop
+well below normal, not just back to normal. Backpressure and shedding are how you break the loop:
+early rejection stops wasted work, and client backoff and retry budgets remove the amplification.
 
 ### Goodput, not throughput
 The metric that tells you whether this is working is successful requests completed within the SLO per
@@ -174,6 +190,9 @@ flat goodput line instead of a cliff.
   faster than traffic.
 - Using CPU or request count as the overload signal for GPU-bound work; the GPU is saturated at 20% CPU
   and queue wait time was the signal all along.
+- Waiting for the trigger to pass in a metastable collapse: the surge ends but errors stay high
+  because retries keep load above capacity; the symptom is an outage that outlasts its cause and
+  ends only when someone sheds hard or disables retries.
 - Health checks sharing the shed queue, so under load the load balancer marks healthy nodes dead and
   removes capacity exactly when it is needed, turning overload into an outage.
 
@@ -201,9 +220,10 @@ deriving queue size from Little's law and explaining why early rejection raises 
 a second. A marketing email sends 90 requests per second for ten minutes. Clients time out at 8
 seconds and retry twice. Describe what happens without protection, then design the protection and
 justify each number.
-**A:** The queue grows by 50 requests per second, so after 8 seconds the oldest waiting request has
-already exceeded the client timeout; from then on the server serves abandoned requests while clients
-add two retries each, pushing effective arrival toward 270 per second. Goodput falls near zero though
+**A:** The queue grows by 50 requests per second, so a request arriving *t* seconds into the surge
+finds about 50*t* ahead of it and waits roughly 50*t* ÷ 40 ≈ 1.25*t* seconds. From about 6.4 seconds
+in, new arrivals cannot be served before their 8-second timeout, and the server spends its capacity on
+abandoned requests while clients add two retries each, pushing effective arrival toward 270 per second. Goodput falls near zero though
 the GPUs are fully busy, and the collapse can outlast the ten-minute surge because retries keep it
 fed, the metastable pattern. Protection: bound the queue by wait time, around 40 × (8 s minus
 service time), so no admitted request can miss its deadline; shed above that at the front door with

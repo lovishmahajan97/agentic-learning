@@ -5,6 +5,7 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - evals/a-b-testing
   - evals/golden-dataset
@@ -69,7 +70,8 @@ cause the difference".
    multi-turn effects where the user's next message depends on the candidate's reply.
 4. **Canary** (a small percentage of users): guardrail metrics such as error rate, latency, cost,
    refusal rate and safety flags, with automatic rollback. It exists to catch catastrophes, not to
-   measure quality; a 2% slice is too small to detect a modest quality change.
+   measure quality; a slice of a few percent watched for hours or a day collects far too few
+   conversations to detect a modest quality change.
 5. **A/B test** (randomised, sized in advance for the primary metric): the causal answer about
    outcomes.
 6. **Monitoring** (ongoing): drift alerts on input mix, sampled judging, outcome dashboards.
@@ -121,7 +123,9 @@ iteration. Had the team shipped on the 86%, they would have paid 35% more for no
 - Shadow mode gives the real input distribution with no user risk, but it cannot see user reaction or
   multi-turn effects, which matters more the more conversational the product.
 - A/B tests give causal answers about outcomes, but they need traffic, time and tolerance for exposing
-  users to a worse variant; below a few thousand conversations per week they rarely reach significance.
+  users to a worse variant; detecting a 3-point change in a 60% resolution rate needs roughly 4,000
+  conversations per arm (80% power, α = 0.05) and a 1-point change roughly 37,000, so low-traffic
+  products rarely get a conclusive answer.
 - Sampled online judging is continuous and cheap, but it inherits every judge bias and must be
   re-validated against outcomes, or it becomes a second offline metric with a live data feed.
 - Canaries catch catastrophes fast but detect nothing subtle, so a team that relies on them alone will
@@ -179,7 +183,7 @@ calls the candidate flat, the evaluation stack is consistent again and the next 
 > and users are safe. Because nobody sees the candidate, there is no behavioural signal and no user
 > follow-up turn conditioned on its reply.
 
-### Q: Offline scores rise after a change, but the A/B test shows no outcome improvement. What is the right response?
+### Q: Offline scores rise after a change, but an A/B test sized in advance for that effect shows no outcome improvement. What is the right response?
 - [ ] Ship the change, since offline evals are more precise than noisy online metrics
 - [ ] Extend the A/B test until it confirms the offline result
 - [x] Treat the offline metric as broken, diagnose what it rewards that users do not, and fix the grader

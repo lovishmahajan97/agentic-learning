@@ -5,7 +5,7 @@ name: Normalization (LayerNorm, RMSNorm)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/residual-connections
   - ml-fundamentals/warmup
@@ -36,7 +36,9 @@ gradient was computed for inputs it no longer receives. The deeper the stack, th
 and the outcome is a learning rate that must be tiny to be safe, activations that drift toward saturation
 or explosion, and training that is exquisitely sensitive to initialization. Batch normalization (2015)
 was the fix that made very deep networks routinely trainable, by standardizing each feature over the
-mini-batch.
+mini-batch. That "shifting inputs" story was its original motivation; later analysis argued the larger
+effect is a smoother, better-conditioned loss surface that tolerates bigger learning rates, which is the
+scale-invariance mechanism described below. The explanations differ, the practical outcome does not.
 
 Transformers could not use it. BatchNorm's statistics depend on which examples share a batch: in sequence
 models that means padding tokens, wildly different sequence lengths and small per-device micro-batches all
@@ -121,9 +123,12 @@ input and the output of each sublayer, normalizing queries and keys before the a
 branches.
 
 ### Numerics
-Under mixed precision the variance is a sum of thousands of squares; in bf16 that sum loses its small
-terms, and in fp16 it can overflow. Autocast therefore runs `layer_norm` in fp32 and returns fp32, and a
-hand-written RMSNorm should upcast before squaring. `ε` must also survive the dtype: 1e-8 is below fp16's
+Under mixed precision the statistics are the fragile part. The variance is a sum of thousands of squares:
+in fp16 any activation above 256 overflows when squared (65,504 is the ceiling), and residual streams in
+large models do carry values that big; in bf16 the squares, the mean, the reciprocal square root and the
+normalized output are each rounded to about three significant digits, and a long sum accumulated in bf16
+loses its small terms. Autocast therefore runs `layer_norm` in fp32 and returns fp32, and a hand-written
+RMSNorm should upcast before squaring and cast back only at the end. `ε` must also survive the dtype: 1e-8 is below fp16's
 smallest subnormal and becomes exactly zero if the norm runs in fp16, so a padding token's all-zero
 vector divides by zero.
 

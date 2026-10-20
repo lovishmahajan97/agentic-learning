@@ -5,6 +5,7 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - evals/golden-dataset
   - evals/llm-as-a-judge
@@ -120,22 +121,27 @@ def run_eval(items, target, config: dict, out_path: str, workers=8, retries=3):
     manifest = {**config, "dataset_sha": hashlib.sha256(json.dumps(items, sort_keys=True).encode()).hexdigest()[:12],
                 "prompt_sha": hashlib.sha256(config["prompt"].encode()).hexdigest()[:12], "started": time.time()}
 
-    def one(item):
+    def one(item):                                      # run only: retries cover the call, not grading
+        last = None
         for attempt in range(retries):
             try:
                 t0 = time.time(); out = target(item, config)
-                ok = GRADERS[item["grader"]](out, item)
-                return {"id": item["id"], "slice": item["slice"], "output": out, "pass": ok,
+                return {"id": item["id"], "slice": item["slice"], "output": out,
                         "latency_s": round(time.time() - t0, 3), "error": None}
-            except Exception as e:                      # rate limit, timeout, parse error
-                time.sleep(2 ** attempt); last = repr(e)
-        return {"id": item["id"], "slice": item["slice"], "output": None, "pass": None, "error": last}
+            except Exception as e:                      # rate limit, timeout, transient error
+                last = repr(e)
+                if attempt < retries - 1: time.sleep(2 ** attempt)
+        return {"id": item["id"], "slice": item["slice"], "output": None, "error": last}
 
     with ThreadPoolExecutor(workers) as ex:
         results = list(ex.map(one, items))
     with open(out_path, "w") as f:                      # raw outputs first; grading can be redone later
         f.write(json.dumps({"manifest": manifest}) + "\n")
         for r in results: f.write(json.dumps(r) + "\n")
+    by_id = {it["id"]: it for it in items}              # separate grading pass over the stored outputs
+    for r in results:
+        it = by_id[r["id"]]
+        r["pass"] = None if r["error"] else GRADERS[it["grader"]](r["output"], it)
     return summarize(results)
 
 def summarize(results):
@@ -169,8 +175,8 @@ in that slice needs the paired flipped-item view or more items, not a victory la
   provider has an outage, because the hardest, longest items are the ones that timed out.
 - Changing the grader and the system in the same run; the symptom is a score movement nobody can
   attribute, visible as two manifest fields differing at once.
-- Running one sample per item at temperature 0.7; the symptom is a score that moves 3 to 5 points
-  between identical runs, which the team reads as regressions and improvements.
+- Running one sample per item at temperature 0.7; the symptom is a score that moves by several points
+  between identical runs on a few-hundred-item set, which the team reads as regressions and improvements.
 - Grading inside the run loop and never storing outputs; the symptom is a rubric fix that forces a
   full, expensive re-run just to see new scores.
 - Reporting the overall pass rate without intervals or slices; the symptom is a merged prompt change
@@ -217,7 +223,7 @@ per-slice interval that says whether six points at that n is signal at all.
 > and failures can be inspected. Skipping passed items would bias future runs, which is the opposite of
 > the goal.
 
-### Q: During a run, 6% of items fail with timeouts. What should the harness do with them?
+### Q: During a run, 6% of items fail with provider-side timeouts (the API, not your system, is overloaded). What should the harness do with them?
 - [ ] Exclude them from the denominator so the score reflects completed items
 - [ ] Mark them as failed, since a timeout is a bad user experience
 - [x] Report them as errors with their count, separate from the pass rate, and retry them
@@ -226,11 +232,11 @@ per-slice interval that says whether six points at that n is signal at all.
 > failed mixes an infrastructure problem into a quality metric. Reporting and retrying keeps both
 > signals honest.
 
-### Q: Two runs differ only in that one used the model alias "latest" and the other a dated snapshot. The scores differ by four points. What is the harness design flaw?
-- [ ] The dataset was too small to detect four points
-- [x] The manifest did not pin the model snapshot, so a provider-side change is indistinguishable from a code change
+### Q: A nightly run with no code, prompt, dataset or grader change scores four points below last night's. The manifest records the model as the alias "latest". What is the harness design flaw?
+- [ ] The harness should have reused last night's cached outputs, since nothing in the repository changed
+- [x] The manifest pins an alias rather than a dated snapshot, so a provider-side model update cannot be told apart from noise
 - [ ] The grader should have been an LLM judge
 - [ ] Concurrency was too high and caused rate limiting
-> A manifest must pin every value that can move the score. An alias resolves to different weights over
-> time, so an empty code diff produced a score diff that cannot be attributed; pinning the snapshot
-> makes the cause visible.
+> A manifest must pin every value that can move the score. An alias can resolve to different weights
+> over time, so an empty diff cannot rule out a model change; pinning the snapshot makes the cause
+> attributable. Reusing cached outputs keyed on the alias would be worse: it would hide the change.

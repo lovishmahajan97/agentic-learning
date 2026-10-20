@@ -5,6 +5,7 @@ name: Multi-agent patterns (orchestrator-worker, handoffs)
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - agents/task-decomposition
   - agents/planning
@@ -42,8 +43,10 @@ search tool and a brief; it does not need the conversation history or the paymen
 specialist needs the invoice tools and the last few turns; it does not need the triage prompt.
 
 Multi-agent patterns are also how you buy parallelism: ten workers researching ten sources finish in
-the time of one. But the write-ups from teams that built these systems are candid that cost rises
-steeply (they report multi-agent runs consuming many times the tokens of a single chat) and that
+roughly the time of the slowest one plus orchestration, not ten times one. But the write-ups from teams
+that built these systems are candid that cost rises steeply (Anthropic's research-system write-up
+reports agents using about 4x the tokens of a chat interaction and its multi-agent system about 15x)
+and that
 coordination failures (duplicated work, conflicting results, lost context at boundaries) are the main
 source of bugs. So the pattern exists for tasks whose value justifies that bill and whose structure
 tolerates partition.
@@ -66,8 +69,9 @@ orchestrator also becomes the natural place for human approval and for the trace
 
 Practical rules that the research-system write-ups emphasise: tell workers how much effort a subtask
 deserves (number of searches or tool calls), because workers cannot infer scale; give each worker a
-distinct, non-overlapping objective, or they converge on the same sources; start wide and narrow, which
-is cheaper than many narrow workers up front; and make the orchestrator robust to a worker failing,
+distinct, non-overlapping objective, or they converge on the same sources; have searches start with
+short, broad queries and then narrow, rather than opening with long, specific queries that return
+little; and make the orchestrator robust to a worker failing,
 since with parallelism, failures are routine.
 
 ### Handoffs
@@ -99,8 +103,9 @@ enforces, since each worker will happily spend its own.
 ### The cost model
 If a single agent spends T tokens, an orchestrator with k workers spends roughly the orchestrator's
 own tokens plus k worker runs plus synthesis; it is the parallelism, not the token count, that
-improves. Expect an order of magnitude more tokens for research-style tasks (illustrative; measure your
-own) and plan the budget accordingly.
+improves. Using the published 4x (single agent) and 15x (multi-agent) figures relative to a chat turn,
+expect a multi-agent research run to cost several times a single-agent run on the same task. These are
+one vendor's research-task numbers, not a constant; measure your own and budget accordingly.
 
 ## Example
 A minimal handoff runtime. Each agent is a prompt plus a tool list; transfers are tools; the loop
@@ -135,6 +140,7 @@ def run(messages, agent="triage", max_turns=20):
                 messages.append(tool_result(call["id"], f"transferred to {agent}"))
                 messages = handoff_history(messages) # filtered context crosses the boundary
                 log_event(trace_id=TRACE, event="handoff", to=agent)
+                break                                # drop the rest of this reply's calls
             else:
                 out = TOOLS[call["name"]](**call["arguments"])
                 messages.append(tool_result(call["id"], out))
@@ -142,13 +148,16 @@ def run(messages, agent="triage", max_turns=20):
 ```
 
 The two deliberate choices are that a transfer is just a tool call the model can make, and that the
-history is filtered at the boundary so the specialist starts with a small, relevant context.
+history is filtered at the boundary so the specialist starts with a small, relevant context. The
+`break` matters: the filter removes the assistant message that issued the calls, so executing its other
+tool calls afterwards would run them under the wrong agent and append results that reference a tool-call
+id no longer in the history, which most chat APIs reject.
 
 ## Trade-offs
 - Context isolation lets each agent stay focused and keeps tool lists short, but every boundary is a
   place where information is lost; when subtasks need most of the same context, a single agent is better.
 - Parallel workers cut wall-clock time for research-style tasks, yet total tokens and API concurrency
-  rise with the number of workers, so cost per task can grow by an order of magnitude.
+  rise with the number of workers, so cost per task grows several-fold over a single agent.
 - Handoffs keep user-facing conversations coherent with one active specialist, at the cost of no
   parallelism and a history-filtering decision that can drop what the specialist needed.
 - Separate agents allow separate credentials and least privilege per role, but the orchestrator now

@@ -5,6 +5,7 @@ name: Node.js / TypeScript
 kind: tool
 difficulty: intro
 est_minutes: 11
+status: fact-checked
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/runtime-schema-validation
@@ -36,7 +37,8 @@ product cannot avoid TypeScript, and putting the request path that talks to the 
 in the same language removes a translation layer, a deployment and a second on-call rota.
 
 The naive "everything in Python" plan fails at the edge: the frontend team does not write Python,
-SSR frameworks are TypeScript, and edge runtimes do not run CPython. The naive "everything in
+SSR frameworks are TypeScript, and edge runtimes are built around V8 and JavaScript (where Python is
+offered at all, it runs through WebAssembly with a restricted package set). The naive "everything in
 TypeScript" plan fails at the core: training, fine-tuning, evaluation harnesses, tokenizers, vector
 and data tooling are Python-first, and rewriting them is not a project any product team wants. The
 honest outcome is a two-language system, and the real engineering question becomes where the boundary
@@ -45,8 +47,8 @@ sits and how its contract is kept honest.
 Node fits the edge role for a mechanical reason. Its single-threaded event loop with non-blocking I/O
 handles thousands of concurrent streaming connections cheaply, which is what a chat gateway does all
 day: open an upstream stream, relay chunks, apply backpressure, close. What it does badly is the same
-thing Python does badly, CPU-bound work on the main thread, and it has no GIL-free native ML stack to
-hand that work to.
+thing Python does badly, CPU-bound work on the main thread, and unlike Python it has no deep native ML
+ecosystem (NumPy, PyTorch) to hand that work to.
 
 ## How it works
 ### The event loop
@@ -59,10 +61,12 @@ core, *because* nothing on the main thread can preempt a running function.
 
 ### Streams and backpressure
 Node 18 and later ship `fetch` and the Web Streams API globally, so a handler can read an upstream
-model stream chunk by chunk and write it to the client as it arrives. Writes return `false` when the
-client's buffer is full; honouring that signal (wait for `drain`) is what keeps memory flat when a
-slow browser consumes a fast model, and ignoring it is the classic way a streaming proxy runs out of
-memory.
+model stream chunk by chunk and write it to the client as it arrives. On the Node side, `res.write()`
+returns `false` once the response's internal buffer passes its high-water mark, meaning the client is
+reading slower than you are writing; honouring that signal (stop pulling from upstream, wait for
+`drain`) is what keeps memory flat when a slow browser consumes a fast model, and ignoring it is the
+classic way a streaming proxy runs out of memory. Web Streams express the same idea through
+`desiredSize` and pull-based reads, and `pipeTo` handles it for you.
 
 ### TypeScript: static types, no runtime
 TypeScript's types are erased at compile time. Inside your code they catch mistakes; at the boundary

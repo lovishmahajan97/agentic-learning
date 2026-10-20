@@ -5,7 +5,7 @@ name: Agentic architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -57,7 +57,18 @@ The unit of execution is a loop: build the context (instructions, task, state, r
 call the model with a set of tool definitions, and then branch. If the model returns a tool call,
 validate the arguments, execute the tool, append the result as an observation and repeat. If it returns
 a final answer, stop. ReAct-style interleaving of reasoning and acting is the pattern underneath; every
-agent framework is a wrapper around this loop plus the boundaries below.
+agent framework is a wrapper around this loop plus the boundaries below. A common variant,
+plan-and-execute, asks the model for an explicit plan first and then runs steps against it, re-planning
+when an observation contradicts the plan; it costs an extra call but gives the runtime something to
+checkpoint, show a human and compare progress against, which a pure ReAct loop does not.
+
+### The cost shape of the loop
+Each step re-sends the accumulated context, so input tokens grow with the *sum* of context sizes, not the
+final size. Illustratively, a run that starts at 3k tokens and adds 1k per step sends
+Σ(3k + i·1k) for i = 0…11 ≈ 102k input tokens over 12 steps, though its final context is only 14k. That
+near-quadratic growth is why the architecture caps steps, stores large tool outputs as references, and
+keeps the stable prefix (instructions, tool definitions) byte-identical so provider prompt caching can
+discount it.
 
 ### The layers around the loop
 1. **Interface layer.** Where tasks enter (chat UI, API, event, schedule) and where results and
@@ -98,6 +109,9 @@ deterministic sub-workflow as a tool, are the norm in production, not the except
 ### Stopping
 Every agent needs explicit termination: a final-answer action, a maximum number of steps, a budget, and
 a stuck detector. Without all four, the loop's failure mode is not a wrong answer but an unbounded one.
+Each terminal state should be distinct in the run record (`done`, `budget_exhausted`, `stuck`,
+`awaiting_approval`, `cancelled`) *because* they demand different follow-ups: a retry, a human, or a
+bug report.
 
 ## Example
 A minimal runtime that shows the boundaries rather than the cleverness: a budget, schema-validated
@@ -106,45 +120,61 @@ blocks, and a checkpoint after every step. `call_model` is whatever model API yo
 a tool call or a final answer; `validate` is a JSON Schema check.
 
 ```python
-import json, time
+import json
 
-TOOLS = {   # name -> (input schema, consequential?, implementation)
+TOOLS = {   # name -> (input schema, needs_approval(args), implementation(args, idem_key))
     "search_tickets": ({"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
-                       False, lambda a: tickets.search(a["q"])),
+                       lambda a: False, lambda a, key: tickets.search(a["q"])),
     "issue_refund":   ({"type": "object", "properties": {"ticket": {"type": "string"},
-                        "amount": {"type": "number", "maximum": 500}}, "required": ["ticket", "amount"]},
-                       True, lambda a: payments.refund(a["ticket"], a["amount"])),
+                        "amount": {"type": "number", "exclusiveMinimum": 0, "maximum": 5000}},
+                        "required": ["ticket", "amount"]},
+                       lambda a: a["amount"] > 500,          # policy threshold, enforced in code
+                       lambda a, key: payments.refund(a["ticket"], a["amount"], idempotency_key=key)),
 }
+
+def execute(run_id, state, name, args):
+    if name not in TOOLS:
+        return {"error": f"unknown tool {name}"}               # an observation, not a crash
+    schema, needs_approval, fn = TOOLS[name]
+    validate(args, schema)                                     # rejects amount > 5000 outright
+    if needs_approval(args) and not approvals.granted(run_id, name, args):
+        return "PAUSE"
+    try:
+        return fn(args, f"{run_id}:{state['step']}")         # same key on retry -> no double refund
+    except TransientError as e:
+        return {"error": str(e), "retryable": True}           # the model decides: retry or give up
 
 def run(run_id, task, store, max_steps=12, budget_usd=0.50):
     state = store.load(run_id) or {"messages": [{"role": "user", "content": task}], "step": 0, "cost": 0.0}
     while state["step"] < max_steps and state["cost"] < budget_usd:
-        reply = call_model(state["messages"], tools=[{"name": n, "schema": s} for n, (s, _, _) in TOOLS.items()])
-        state["cost"] += reply.cost_usd
-        if reply.final is not None:
-            store.save(run_id, {**state, "status": "done", "answer": reply.final}); return reply.final
-        name, args = reply.tool_name, reply.tool_args
-        schema, consequential, fn = TOOLS[name]
-        validate(args, schema)                                    # reject bad calls before anything executes
-        if consequential and not approvals.granted(run_id, name, args):
-            store.save(run_id, {**state, "status": "awaiting_approval", "pending": [name, args]})
-            return None                                           # resume later from this checkpoint
-        try:
-            result = fn(args)
-        except TransientError as e:
-            result = {"error": str(e), "retryable": True}         # let the model decide to retry or stop
-        state["messages"] += [reply.as_message(),
-                              {"role": "tool", "name": name, "content": json.dumps(result)[:4000]}]
+        if state.get("pending"):                              # resuming after a pause: no new model call
+            msg, name, args = state["pending"]
+        else:
+            reply = call_model(state["messages"], tools=[{"name": n, "schema": t[0]} for n, t in TOOLS.items()])
+            state["cost"] += reply.cost_usd
+            if reply.final is not None:
+                store.save(run_id, {**state, "status": "done", "answer": reply.final}); return reply.final
+            msg, name, args = reply.as_message(), reply.tool_name, reply.tool_args
+        result = execute(run_id, state, name, args)
+        if result == "PAUSE":
+            store.save(run_id, {**state, "status": "awaiting_approval", "pending": [msg, name, args]})
+            return None                                        # interrupt; an approval event re-invokes run()
+        state.pop("pending", None)
+        state["messages"] += [msg, {"role": "tool", "name": name, "content": json.dumps(result)[:4000]}]
         state["step"] += 1
-        store.save(run_id, state)                                 # checkpoint: a crash here loses nothing
-        emit(run_id, step=state["step"], tool=name, cost=state["cost"], at=time.time())
+        store.save(run_id, state)                              # checkpoint: a crash here loses nothing
     store.save(run_id, {**state, "status": "budget_exhausted"})
-    return None
 ```
 
-Note that `maximum: 500` lives in the tool schema, so an attempt to refund more is rejected by
-validation however persuasively the model argued for it, and the approval gate interrupts the run
-instead of holding a thread while a human decides.
+Three boundaries are visible. The hard cap (`maximum: 5000`) lives in the schema, so a larger refund is
+rejected however persuasively the model argued for it. The policy threshold (above 500 needs approval) is
+a predicate in code, and the gate *interrupts* the run, saving the exact pending call, rather than holding
+a thread while a human decides; on resume the approved call runs without asking the model again, so the
+human approved precisely what executes. And the idempotency key is derived from run id and step, so a
+worker that crashes after the refund but before the checkpoint re-executes the step without paying twice.
+Walk one run: step 0 searches tickets (read-only, runs), step 1 proposes a 750 refund, the predicate
+fires, the run is saved as `awaiting_approval` with zero further cost; an approver accepts, `run()` is
+re-invoked, the refund executes with key `run_id:1`, and the model writes the final answer at step 2.
 
 ## Trade-offs
 - Flexibility on unknown task paths versus predictability and testability; when the path is known in
@@ -166,6 +196,8 @@ instead of holding a thread while a human decides.
   the same failing tool call.
 - Trusting the model to enforce permissions ("only refund if the policy allows"); the symptom is a
   prompt-injected document that convinces the agent to call a write tool, which then succeeds.
+- Letting the model re-propose an action after approval instead of executing the stored pending call;
+  the symptom is an approved 750 refund that executes as 800, because the second model call differed.
 - Pasting full tool outputs into context; the symptom is cost growing step over step and quality falling
   as the window fills with raw JSON.
 - Treating a demo loop as the architecture; the symptom is that the first production requirement

@@ -5,6 +5,7 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - agent-reliability/structured-event-streams
   - agent-reliability/deterministic-replay-and-reproducibility
@@ -75,11 +76,16 @@ outcome (ok | error class), prev_hash, hash
 ```
 
 Each design choice has a reason. It stores an `args_hash` and a reference rather than the arguments
-themselves, so the log can be retained for years without holding PII, while the referenced payload can be
-deleted on schedule. It is append-only in a separate store with narrower write permissions than the
+themselves, so the log can be retained for years without holding the content, while the referenced payload
+can be deleted on schedule. The hash must be keyed (an HMAC with a secret held outside the log), *because*
+arguments are often low-entropy (a customer id and an amount) and a plain SHA-256 of them can be recovered
+by enumerating candidates; a keyed hash is pseudonymous data, not anonymous, so keep `actor` and `target`
+as internal ids rather than names or emails. It is append-only in a separate store with narrower write permissions than the
 application, *because* the whole point is that the people and systems being audited cannot edit it.
 `prev_hash` and `hash` chain the records so deletion or modification is detectable; this is cheap and
-turns the log into evidence. It is complete, never sampled, *because* "we dropped that one" is not an
+turns the log into evidence, provided the latest hash is periodically anchored somewhere the writer cannot
+touch (a WORM bucket, a separate account, a signed checkpoint), because anyone able to rewrite every row
+could also recompute the whole chain. It is complete, never sampled, *because* "we dropped that one" is not an
 acceptable answer in an incident review. And it is queryable by actor, action, target and time, which
 means a table with indexes, not a text file.
 
@@ -104,18 +110,25 @@ A tool-execution wrapper that emits a trace span and an append-only, hash-chaine
 same call. Arguments are hashed into the audit row and stored by reference for the trace.
 
 ```python
-import hashlib, json, time
+import hashlib, hmac, json, os, time
 from opentelemetry import trace
 
 tracer = trace.get_tracer("agent")
+ARGS_KEY = os.environ["AUDIT_HMAC_KEY"].encode()      # held outside the audit store
 
-def _h(obj) -> str:
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
+def _canon(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, default=str).encode()
+
+def _h(obj) -> str:                                    # chain hash: plain SHA-256 is fine
+    return hashlib.sha256(_canon(obj)).hexdigest()
+
+def _args_hash(args) -> str:                           # keyed, so low-entropy args cannot be guessed
+    return hmac.new(ARGS_KEY, _canon(args), hashlib.sha256).hexdigest()
 
 class AuditLog:
-    """Append-only, hash-chained. The writer role has INSERT only; nobody has UPDATE or DELETE."""
+    """Append-only, hash-chained, one writer per chain. The role has INSERT only, no UPDATE/DELETE."""
     def __init__(self, store):
-        self.store, self.prev = store, "0" * 64
+        self.store, self.prev = store, store.last_hash() or "0" * 64    # resume the chain on restart
     def write(self, **rec) -> str:
         rec["prev_hash"] = self.prev
         rec["hash"] = _h(rec)
@@ -130,13 +143,15 @@ def run_tool(name, args, *, ctx, policy, tools, blobs, audit: AuditLog):
         span.set_attributes({"agent.tool.name": name, "agent.args_ref": args_ref,
                              "agent.permission": decision, "agent.policy_version": policy.version})
         t0 = time.time()
+        # "ask" would go to an approval flow (omitted); here only "allow" executes
         result = tools[name](**args) if decision == "allow" else {"ok": False, "error": decision}
         span.set_attributes({"agent.ok": bool(result.get("ok")),
                              "agent.error": result.get("error", ""),
                              "agent.latency_ms": int((time.time() - t0) * 1000)})
         audit.write(ts=time.time(), run_id=ctx.run_id, step_id=ctx.step_id,
                     actor=ctx.user_id, principal=ctx.agent_id, action=name,
-                    target=args.get("id"), args_hash=_h(args), policy_version=policy.version,
+                    target=args.get("id"), args_hash=_args_hash(args), args_ref=args_ref,
+                    policy_version=policy.version,
                     decision=decision, credential_id=ctx.credential_id,
                     outcome="ok" if result.get("ok") else result.get("error", "error"))
         return result
@@ -190,14 +205,15 @@ accountability and must be complete, attributable and tamper-evident.
 specific refund, and prove nobody altered that record". Design the logging to satisfy them without
 retaining customer PII for two years.
 **A:** Separate the artifacts. The audit log keeps a small, fixed-shape record per authority-bearing event:
-user, agent identity, tool, target id, argument hash, policy version, decision, approval id, credential id,
+internal user id, agent identity, tool, target id, keyed argument hash, policy version, decision, approval id, credential id,
 outcome, and a hash chain linking rows; it is append-only, written with an insert-only role, retained for
 the two years, and contains no free text. The trace holds the prompt reference, model id, token counts
 and tool results by reference; its payloads live in a blob store with a shorter retention and per-record
 deletion. To prove "why", the audit row gives the prompt hash and registry version, which resolve to the
 exact template text kept in the prompt registry (not PII) and the policy that allowed the call; the
-customer-specific inputs are provable by hash even after the content is purged. To prove integrity,
-recompute the chain. The identifiers are shared, so a row leads to the trace while it exists.
+customer-specific inputs remain verifiable against a candidate by recomputing the keyed hash even after
+the content is purged. To prove integrity, recompute the chain and compare it with the externally anchored
+head hashes. The identifiers are shared, so a row leads to the trace while it exists.
 
 ## Quiz
 ### Q: What most distinguishes an audit log from an execution trace?
@@ -211,10 +227,10 @@ recompute the chain. The identifiers are shared, so a row leads to the trace whi
 ### Q: Why store an argument hash and a payload reference in the audit row instead of the arguments themselves?
 - [ ] Hashes are faster for the model to read
 - [ ] Because audit rows have a fixed 256-byte size limit
-- [x] So the long-lived audit record carries no PII while still proving which exact arguments were used
+- [x] So the long-lived audit record holds no argument content while still proving which exact arguments were used
 - [ ] Because arguments are non-deterministic and cannot be stored
-> The hash proves the identity of the arguments without holding their content; the content lives under a
-> separate, shorter retention policy with per-record deletion.
+> The (keyed) hash proves the identity of the arguments without holding their content; the content lives
+> under a separate, shorter retention policy with per-record deletion.
 
 ### Q: A team samples traces at 10% to control cost. Which runs should be exempt from sampling?
 - [ ] Runs shorter than one second

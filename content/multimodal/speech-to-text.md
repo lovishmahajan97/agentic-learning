@@ -5,7 +5,7 @@ name: Speech-to-text (Whisper)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - multimodal/tts
   - multimodal/vision-language-models
@@ -58,8 +58,18 @@ Mel scale mimics human frequency sensitivity, and the log makes loud and quiet s
 result is a 2-D array of 3,000 frames × 80 features, an "image" of the sound that a transformer can read.
 
 ### Encoder-decoder
-Two convolutional layers shrink the time axis to 1,500 positions and then a transformer encoder produces
-a contextual representation of the whole window. The decoder is a standard autoregressive text
+Two convolutional layers (the second with stride 2) shrink the time axis to 1,500 positions and then a
+transformer encoder produces a contextual representation of the whole window. Following the shapes makes
+several later behaviours obvious:
+
+```
+30 s × 16,000 samples/s           = 480,000 samples
+hop of 10 ms (160 samples)        → 3,000 spectrogram frames × 80 (or 128) Mel bands
+conv stack, stride 2              → 1,500 encoder positions, each covering 20 ms
+```
+
+Each encoder position spans 20 ms, which is exactly the resolution of the timestamp tokens, and the window
+length is fixed by the encoder's positional embeddings, which is why audio cannot simply be fed longer. The decoder is a standard autoregressive text
 transformer that cross-attends to the encoder output and emits text tokens from a byte-pair vocabulary.
 This is the same architecture as translation: audio in one "language", text out in another, and it is
 why Whisper can translate to English as a decoding task rather than a separate model.
@@ -76,7 +86,9 @@ checkpoint serves many languages and tasks.
 ### Long-form audio and decoding heuristics
 Because the encoder sees exactly 30 seconds, longer audio is processed as a sliding sequence of windows:
 transcribe a window, read the last predicted timestamp, advance the window to that point, and carry the
-previous text as decoder context for consistency. This is also where failures concentrate. The decoder is
+previous text as decoder context for consistency (the decoder's text context is small, so this carried
+prompt, like an `initial_prompt`, is truncated to roughly the last couple of hundred tokens). This is also
+where failures concentrate. The decoder is
 a language model, so on silence, music or garbled audio it can hallucinate fluent text or loop on a
 phrase. The reference implementation guards against this with heuristics: if the output's compression
 ratio is too high (repetition), or the average log-probability too low, decoding is retried at higher
@@ -127,13 +139,16 @@ print(f"language={info.language} p={info.language_probability:.2f} duration={inf
 
 transcript = []
 for seg in segments:                       # a generator: decoding happens as you iterate
+    # Same signals the reference decoder uses for fallback: low avg log-prob or repetitive output.
     flag = " [low-conf]" if seg.avg_logprob < -1.0 or seg.compression_ratio > 2.4 else ""
-    transcript.append(f"[{seg.start:7.2f} -> {seg.end:7.2f}]{flag} {seg.text.strip()}")
-    for w in seg.words or []:
-        pass                               # w.start, w.end, w.word, w.probability for alignment/redaction
+    shaky = [w.word.strip() for w in (seg.words or []) if w.probability < 0.5]  # review candidates
+    transcript.append(f"[{seg.start:7.2f} -> {seg.end:7.2f}]{flag} {seg.text.strip()}"
+                      + (f"  (check: {', '.join(shaky)})" if shaky else ""))
 
 open("support_call.txt", "w").write("\n".join(transcript))
 print(len(transcript), "segments")
+# Throughput: real-time factor = wall time / info.duration; at RTF 0.05 one GPU stream clears an hour of
+# audio in ~3 minutes (illustrative), and that, times concurrency, is what you size hardware against.
 # WER check (on a labelled sample): normalise both texts (case, punctuation, numerals) before scoring,
 # e.g. with the jiwer package; report per-domain WER and separately the error rate on entity names.
 ```
@@ -159,6 +174,9 @@ print(len(transcript), "segments")
   because it wrote numerals and punctuation differently from the reference.
 - Feeding 8 kHz telephone audio without considering bandwidth; the symptom is a higher error rate on
   calls than on meetings with no code change, because half the spectrum the model expects is missing.
+- Treating a transcript as speaker-attributed when it is not; the symptom is a summary that credits the
+  customer with the agent's promise, because Whisper emits one undifferentiated stream and diarization
+  (who spoke when) is a separate model whose errors cluster at fast turn-taking and crosstalk.
 - Forgetting the transcript contains PII; the symptom is a compliance finding over stored call text that
   nobody classified, since the audio was treated as the sensitive asset and the text was not.
 

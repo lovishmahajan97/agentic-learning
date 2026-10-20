@@ -5,6 +5,7 @@ name: API & SDK integration
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -43,9 +44,10 @@ is blocked waiting on one vendor and the dashboard shows zero errors.
 
 The opposite naive version is "the SDK handles it". It partly does: official SDKs retry on 429 and
 5xx with backoff, parse streams and type the responses. But SDK defaults are generic. Automatic
-retries silently double the cost and latency of a slow outage; default timeouts in provider SDKs are
-long enough to let one stuck call hold a request for minutes; and an SDK upgrade can change the API
-version it speaks. You still need a layer that owns those decisions explicitly.
+retries silently multiply the latency of a slow outage, and the cost too whenever an attempt the
+provider already processed is abandoned and resent; default timeouts in provider SDKs (on the order of
+ten minutes in the major Python LLM SDKs at the time of writing) are long enough to let one stuck call
+hold a request for minutes; and an SDK upgrade can change the API version it speaks. You still need a layer that owns those decisions explicitly.
 
 ## How it works
 ### Raw HTTP versus SDK
@@ -61,19 +63,22 @@ Wrap each external system in one module that exposes your own types and raises y
 This exists *because* vendor types and errors leak otherwise, and swapping or adding a provider becomes
 a rewrite. Inside the adapter, classify failures into a taxonomy:
 
-- **Retryable:** 429, 502/503/504, connection errors, timeouts, truncated streams.
+- **Retryable:** 429, 5xx (most often 502/503/504), connection errors, timeouts, truncated streams.
 - **Terminal:** 400/422 (your request is wrong), 401/403 (credentials), 404, content-policy refusals.
 - **Ambiguous:** a timeout on a non-idempotent call; the request may have completed.
 
 ### Timeouts
-Set connect, read and total timeouts separately. For model calls, the read timeout governs
-time-to-first-token on a stream and the whole response otherwise; a streaming call may legitimately
-run for minutes while each chunk arrives within a second, so budget per-chunk rather than per-call.
-Tie the total to what the user-facing request can afford, not to what the provider allows.
+Set connect, read and total timeouts separately. In httpx and most HTTP clients the read timeout is
+the longest allowed gap between received bytes, not a deadline for the whole response: on a stream it
+bounds time-to-first-token and every inter-chunk gap, and on a non-streaming model call (where the
+server sends nothing until generation finishes) it effectively bounds generation time. A streaming call
+may legitimately run for minutes while each chunk arrives within a second, so the read timeout is a
+per-chunk budget. A total deadline needs a separate wrapper (`asyncio.timeout` around the call); tie it
+to what the user-facing request can afford, not to what the provider allows.
 
 ### Retries, idempotency and budgets
-Retry retryable errors with exponential backoff and full jitter (`base × 2^n + random`), capped, and
-honour `Retry-After` when present, *because* synchronized retries from many clients create a thundering
+Retry retryable errors with exponential backoff and full jitter (sleep a uniform random time in
+`[0, min(cap, base × 2^n)]`), and honour `Retry-After` when present, *because* synchronized retries from many clients create a thundering
 herd. Retry only operations that are idempotent or carry an idempotency key; an LLM completion is
 usually safe to re-run (it costs money, not correctness), while a tool call that sends an email is
 not. Bound retries per request and per time window so an outage does not triple your traffic.
@@ -128,7 +133,7 @@ async def complete(payload: dict, idem_key: str, attempts: int = 4) -> dict:
             if n == attempts - 1:
                 raise
             hinted = getattr(e, "retry_after", None)
-            delay = hinted if hinted else min(30.0, 2 ** n + random.uniform(0, 1))  # backoff + jitter
+            delay = hinted if hinted else random.uniform(0, min(30.0, 2 ** n))  # full jitter, capped
             await asyncio.sleep(delay)
     raise RuntimeError("unreachable")
 ```
@@ -176,11 +181,13 @@ observability in that order.
 
 ## Check yourself
 **Q:** Your service calls a model provider through its official SDK with defaults. During a provider
-incident, user requests take four minutes to fail and your bill for the hour triples. Explain what
-happened and how you would configure the integration differently.
-**A:** The SDK retried each failing call several times with backoff, and its default timeout let each
-attempt wait minutes, so one user request became multiple long attempts; the retries also resent
-full prompts, which is the cost spike. I would set an explicit total timeout tied to the user-facing
+incident, user requests take four minutes to fail and your token spend for the hour jumps well above
+normal. Explain what happened and how you would configure the integration differently.
+**A:** The SDK retried each failing call (twice by default in the major LLM SDKs) with backoff, and its
+long default timeout let each attempt wait minutes, so one user request became several long attempts.
+Each retry resent the full prompt, and attempts the provider had partly or fully processed before the
+connection died or the client gave up are generally still billed, while users who saw failures retried
+on top; that is the cost spike (exactly which failed requests are billed is provider-specific). I would set an explicit total timeout tied to the user-facing
 budget, cap retries to one or two with jitter and honour `Retry-After`, add a circuit breaker that
 fails fast or routes to a fallback model after consecutive failures, and emit attempt-count and
 latency metrics so the behaviour is visible. Idempotency keys would make the remaining retries safe

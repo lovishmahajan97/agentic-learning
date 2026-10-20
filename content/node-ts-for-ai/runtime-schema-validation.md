@@ -5,6 +5,7 @@ name: Runtime schema validation (Zod)
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -70,16 +71,22 @@ shape.
 By default Zod *strips* unknown keys from objects. `.strict()` rejects them, which is what you want for
 tool arguments (an unexpected key usually means the model misread the schema) and for request bodies
 where silently dropping a typo'd field hides a client bug. `.passthrough()` keeps them, useful for
-forwarding provider payloads you do not fully model. Discriminated unions (`z.discriminatedUnion("type",
+forwarding provider payloads you do not fully model. (Zod 4 keeps these methods but prefers the
+equivalent `z.strictObject()` and `z.looseObject()` constructors.) Discriminated unions (`z.discriminatedUnion("type",
 [...])`) validate tagged variants like stream events and give the compiler the same narrowing that a
 hand-written union would.
 
 ### From schema to the model, and back
 Tool calling and structured outputs require a JSON Schema describing the arguments or the response.
 Generating it from the Zod schema (Zod 4 ships `z.toJSONSchema`; earlier versions use the
-`zod-to-json-schema` package, and the provider SDKs and the Vercel AI SDK accept Zod schemas directly)
-guarantees the model sees the same contract the code enforces, with `.describe()` strings becoming the
-field descriptions the model reads. The round trip is: schema → JSON Schema → model → JSON text →
+`zod-to-json-schema` package; the OpenAI Node SDK has Zod helpers and the Vercel AI SDK accepts Zod
+schemas directly)
+keeps the model's contract and the code's in sync, with `.describe()` strings becoming the field
+descriptions the model reads. Two details matter: a field with `.default()` is optional on input but
+present on output, so generate the *input* schema for the model (`{ io: "input" }` in Zod 4); and
+providers' strict structured-output modes accept only a subset of JSON Schema (some reject or ignore
+keywords such as `format` or length bounds, and some require every property to be listed as
+required), so check what your provider supports rather than assuming the whole schema is enforced. The round trip is: schema → JSON Schema → model → JSON text →
 `safeParse` → typed value. Even with provider-side constrained decoding, keep the parse: it is the only
 check for `refine` rules, it guards against provider bugs, and it is where a failed parse becomes a
 repair prompt ("the field `due_date` must be ISO 8601; you returned `tomorrow`").
@@ -100,7 +107,8 @@ import { z } from "zod";
 
 const ScheduleArgs = z.object({
   title: z.string().min(1).describe("Short title for the calendar event"),
-  start: z.string().datetime().describe("ISO 8601 start time with timezone offset"),
+  start: z.string().datetime({ offset: true })            // default accepts only a trailing "Z"
+    .describe("ISO 8601 start time with timezone offset"),
   durationMinutes: z.number().int().min(5).max(480).default(30),
   attendees: z.array(z.string().email()).max(20).default([]),
 }).strict();
@@ -109,7 +117,8 @@ type ScheduleArgs = z.infer<typeof ScheduleArgs>;       // { title: string; star
 export const scheduleTool = {
   name: "schedule_event",
   description: "Create a calendar event",
-  parameters: z.toJSONSchema(ScheduleArgs),             // Zod 4; use zod-to-json-schema on Zod 3
+  // Zod 4 (zod-to-json-schema on Zod 3). io "input": defaulted fields are optional for the model.
+  parameters: z.toJSONSchema(ScheduleArgs, { io: "input" }),
   run: async (args: ScheduleArgs) => ({ id: "evt_123", ...args }),
 };
 
@@ -118,11 +127,11 @@ type ModelCall = (messages: Array<{ role: string; content: string }>) => Promise
 export async function callToolWithRepair(rawArgs: string, model: ModelCall, maxRepairs = 2) {
   let text = rawArgs;
   for (let attempt = 0; attempt <= maxRepairs; attempt++) {
-    let json: unknown;
-    try { json = JSON.parse(text); } catch { json = undefined; }
+    let json: unknown = undefined;
+    try { json = JSON.parse(text); } catch { /* reported as a syntax problem below */ }
     const result = ScheduleArgs.safeParse(json);
     if (result.success) return scheduleTool.run(result.data);   // result.data is typed and trusted
-    const issues = result.error.issues
+    const issues = json === undefined ? "(root): not valid JSON" : result.error.issues
       .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("\n");
     if (attempt === maxRepairs) throw new Error(`tool args invalid after repairs:\n${issues}`);
     text = await model([
@@ -187,7 +196,9 @@ are insufficient, how a Zod schema becomes a tool definition, and how to handle 
 validating the model's JSON with Zod on their side is redundant work. What do you tell them?
 **A:** Constrained decoding makes the output syntactically match the JSON Schema, which removes most
 failures, but it does not remove the need to parse. First, the JSON Schema cannot express everything the
-Zod schema checks: cross-field `refine` rules, date validity, semantic ranges. Second, the parse is what
+Zod schema checks: cross-field `refine` rules, date validity, semantic ranges; and providers' strict
+modes support only a subset of JSON Schema, so some keywords you did write may not be enforced. Output
+cut off by the max-token limit, or a refusal, can still arrive as invalid JSON. Second, the parse is what
 produces a typed value; without it the code is still operating on `unknown` or on an `as` cast, so the
 compiler cannot help. Third, the provider is an external system that can change or have bugs, and the
 parse is the only place that failure is caught before a tool runs with bad arguments. Finally, the

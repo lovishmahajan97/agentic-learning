@@ -5,7 +5,7 @@ name: Arize Phoenix
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -75,6 +75,10 @@ conventions still arrive but render with less structure.
 `phoenix.evals` is a DataFrame-oriented runner. `llm_classify` applies a judge prompt template to each row
 with a model wrapper (`OpenAIModel`, `AnthropicModel`, `LiteLLMModel`, …), constrains the answer to a set of
 rails such as `["factual", "hallucinated"]`, optionally asks for an explanation, and runs rows concurrently.
+The rails exist *because* a judge's free-text verdict cannot be counted: the output is snapped to one of the
+allowed labels (or marked unparseable), so a column of labels can become a rate, a filter and a trend line.
+The explanation is the opposite trade, unaggregatable but the only way a human can audit why the judge
+decided, which is what calibration needs.
 Pre-built evaluators (`HallucinationEvaluator`, `QAEvaluator`, `RelevanceEvaluator`,
 `ToxicityEvaluator`, …) wrap tested templates; `run_evals(dataframe, evaluators)` returns one DataFrame per
 evaluator. Helper queries build the rows from traces: `get_qa_with_reference` yields one row per answered
@@ -152,10 +156,20 @@ In the UI the trace reads `support.answer` → `retrieve` and `support.answer` �
 span now carries a `Hallucination` label with the judge's explanation, and the project view lets you filter
 to the hallucinated ones.
 
+The join is the part worth understanding. `get_qa_with_reference` returns a DataFrame indexed by the span id
+of each root span that has an input and an output, with `reference` built by concatenating the document
+contents found on the retriever spans of the same trace. For this request that is one row: input "How do I reset
+my password?", the model's answer, and the one-sentence reference. The judge receives all three in its
+template and returns a row with `label` (`factual` or `hallucinated`), a numeric `score` derived from the label and an
+`explanation`, still indexed by span id, and `log_evaluations` attaches that row to exactly that span. Run
+it over a day with 2,000 answered questions and you get 2,000 labels; if 140 are `hallucinated`, the
+project shows a 7% rate you can filter, open and read. If the retriever span had carried no documents, the
+reference would be empty and the judge would be grading against nothing, the pitfall listed below.
+
 ## Trade-offs
-- OTel-native ingestion means no lock-in and one instrumentation for every backend, against less product
-  polish on per-user cost accounting and prompt-release workflows than Langfuse or LangSmith offer at the
-  time of writing; flips when the team wants a managed product loop more than portability.
+- OTel-native ingestion means no lock-in and one instrumentation for every backend, against a less mature
+  product loop for per-user cost accounting and prompt-release workflows than Langfuse or LangSmith offer at
+  the time of writing (Phoenix has been adding these, so check the current release); flips when the team wants a managed product loop more than portability.
 - A single container with SQLite is zero-ops for development, but production needs Postgres and you own
   retention, backups and access control; multi-team scale and RBAC are what the commercial platform sells.
 - Evaluations as DataFrames in notebooks are flexible, scriptable and cheap to iterate, but the loop is one

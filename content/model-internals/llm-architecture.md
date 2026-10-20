@@ -5,7 +5,7 @@ name: LLM architecture (encoder–decoder vs decoder-only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - model-internals/transformer
   - model-internals/attention-mechanism
@@ -52,11 +52,15 @@ compounded.
 ### Three families
 - **Encoder-only** (BERT and descendants). Bidirectional self-attention, trained by masking tokens and
   predicting them. Produces representations, not text. Used for classification, token tagging, embedding
-  models and cross-encoder rerankers, where the job is to *read* an input and score it.
+  models and cross-encoder rerankers, where the job is to *read* an input and score it. (Some recent
+  embedding models are fine-tuned decoder-only LLMs with last-token pooling; the family describes the
+  attention pattern, not a fixed job.)
 - **Encoder–decoder** (T5, BART, mT5, Whisper). The encoder is bidirectional; the decoder is causal and
   adds a cross-attention block in every layer whose queries come from the decoder state and whose keys
-  and values come from the encoder's final output. T5 was pre-trained with span corruption: hide spans of
-  the input, generate them in the output.
+  and values come from the encoder's final output. Because the encoder output never changes during
+  generation, each layer's cross-attention K and V are projected once and cached for the whole decode,
+  next to the decoder's ordinary self-attention cache, which grows with the output. T5 was pre-trained
+  with span corruption: hide spans of the input, generate them in the output.
 - **Decoder-only** (the GPT line, Llama, Mistral, and essentially every frontier chat model). One causal
   stack. Prompt, retrieved documents, tool results and the model's own answer are a single token sequence;
   the only difference between "input" and "output" is which positions the loss was computed on.
@@ -80,6 +84,12 @@ wall-clock terms because all prompt positions run in parallel, but in FLOPs per 
 the same full stack as "writing"; there is no smaller encoder to delegate it to. The compensation is that
 nothing has to be re-encoded when the conversation grows: the cache from turn one is still valid for turn
 two.
+
+Parameter counts mislead when comparing the two. Each token passes through only one stack of an
+encoder–decoder, so a model with 2N parameters split evenly across encoder and decoder costs roughly
+the FLOPs per token of an N-parameter decoder-only model (Raffel et al. make this comparison when
+choosing T5's baseline). "T5-11B versus a 7B decoder" is therefore not an apples-to-apples cost
+comparison; compare FLOPs per token and memory, not headline size.
 
 ### Why decoder-only scaled better for general use
 - **Objective density.** Every position in a causal stream contributes a loss term. Span-corruption and
@@ -141,9 +151,10 @@ print(g_tok.decode(ids[0]))
   gap matters for small models on reading-heavy tasks and shrinks as decoder-only models scale.
 - A single next-token objective is dense and label-free, but it bakes in left-to-right generation; tasks
   that are naturally classification or scoring are served more cheaply by an encoder with a head.
-- Cross-attention gives an explicit source-to-output alignment that is useful for attribution, at the
-  cost of a second attention block per layer and a design that must be retrained to change the input
-  modality.
+- Cross-attention gives an explicit source-to-output alignment (Whisper's word-level timestamps are
+  derived from cross-attention weights), at the cost of a second attention block per layer; the
+  advantage disappears when the "source" keeps changing, as in multi-turn use, because the alignment
+  target has to be re-encoded every time it grows.
 
 ## Pitfalls
 - Reaching for a decoder-only chat model to do bulk classification or reranking; cost per item is far
@@ -151,7 +162,10 @@ print(g_tok.decode(ids[0]))
 - Assuming an encoder–decoder can "continue the conversation" cheaply; the transcript must be re-encoded
   every turn, so latency grows with history even for short replies.
 - Treating the prompt as if the model read it bidirectionally; instructions placed after a long document
-  cannot influence how earlier tokens were represented, which is why instruction placement matters.
+  cannot influence how earlier tokens were represented. The symptom is extraction that misses fields the
+  task asked for because the document was "read" before the model knew what to look for. Vendor
+  guidance on placement differs (several recommend the question after long documents), so stating the
+  task before the document and repeating it after is a common hedge; measure on your task.
 - Confusing the architecture family with the training recipe; a decoder-only base model that was never
   instruction-tuned will happily continue your prompt instead of answering it.
 
@@ -182,7 +196,10 @@ cheap per token and well aligned to the source. The chat half is multi-turn with
 calls and open-ended answers, which is exactly what a decoder-only model handles by appending tokens and
 reusing its KV cache. One model for both would either force the chat model to consume audio tokens it was
 not trained on, or force the transcription model to re-encode the whole transcript plus conversation on
-every turn. Two models, with the transcript passed as text, is cheaper and better at each job.
+every turn. Two models, with the transcript passed as text, is cheaper and better at each job. If the
+customer already uses a natively audio-capable chat model, the argument becomes one of cost: audio
+typically consumes several times more tokens per second of speech than its transcript, and every chat
+turn would pay prefill over it unless it is prefix-cached, so transcribing once is still usually cheaper.
 
 ## Quiz
 ### Q: What does cross-attention in an encoder–decoder connect?

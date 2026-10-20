@@ -5,6 +5,7 @@ name: ReAct (reason + act)
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - prompting/chain-of-thought
   - prompting/function-tool-calling
@@ -38,9 +39,13 @@ a query, cannot notice that a result contradicts its goal and cannot re-plan whe
 
 ReAct's claim was that the two failure modes are complementary. Reasoning tells the agent what to do next
 and how to use what it just saw; acting grounds the reasoning in retrieved or computed facts.
-Interleaving them, thought then action then observation, repeated, improved on both pure reasoning and
-pure acting across question answering, fact verification and interactive environment tasks in the
-original study.
+Interleaving them, thought then action then observation, repeated, was tested on multi-hop question
+answering (HotpotQA), fact verification (FEVER) and interactive tasks (ALFWorld, WebShop) in the original
+study. It beat action-only prompting throughout and beat chain-of-thought on fact verification, with large
+gains on the interactive tasks. The result was not uniform: on HotpotQA plain ReAct trailed
+chain-of-thought slightly (its error analysis blamed uninformative searches and the agent repeating
+itself in loops), and the best numbers came from combining the two, falling back from one to the
+other when it got stuck. The lesson is complementarity, not that interleaving always wins.
 
 Two naive alternatives still look tempting. Single-shot retrieval followed by CoT (retrieve once, then
 reason) fails on multi-hop questions where the second query depends on the first answer. Planning
@@ -123,7 +128,7 @@ SYSTEM = ("Answer using the tools. Before each tool call, say in one sentence wh
 def run(question, max_steps=8):
     messages = [{"role": "user", "content": question}]
     for step in range(max_steps):
-        r = client.messages.create(model=MODEL, max_tokens=2048, system=SYSTEM, tools=TOOLS, messages=messages)
+        r = client.messages.create(model=MODEL, max_tokens=4096, system=SYSTEM, tools=TOOLS, messages=messages)
         messages.append({"role": "assistant", "content": r.content})      # Thought + Action stay in the trajectory
         if r.stop_reason != "tool_use":
             return "".join(b.text for b in r.content if b.type == "text")

@@ -5,7 +5,7 @@ name: Rate limiting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/backpressure
   - serving-inference/retry-strategies
@@ -73,8 +73,19 @@ which you only learn when generation ends but which are bounded by `max_tokens`.
 *reserves* input plus an output estimate at admission and *settles* when the response arrives, refunding
 the difference. Reserving the full `max_tokens` never overshoots but under-uses quota when clients set
 generous limits; reserving an expected output length uses quota well but occasionally overshoots and
-takes a provider 429. Which is right depends on how expensive an overshoot is for you. Either way,
-clients who set `max_tokens` far above their needs shrink everyone's headroom.
+takes a provider 429. Which is right depends on how expensive an overshoot is for you. If you reserve an
+estimate, settlement must also *debit* when the actual exceeds it, letting the bucket go into debt that
+later refill pays off; refunding only in one direction turns every underestimate into silent overspend.
+Either way, clients who set `max_tokens` far above their needs shrink everyone's headroom. Check how your
+provider counts before sizing reservations: some count cached prompt tokens differently toward their
+input-token limits, and the exact accounting is vendor-specific.
+
+The numbers interact. In a bucket with 80,000 tokens of capacity, a request reserving a 20,000-token prompt plus
+`max_tokens` 4,000 takes 30% of the burst at once; if it actually generates 600 tokens, settlement
+returns 3,400. Three such requests arriving together hold 72,000 of the 80,000 and the fourth waits for
+refill (or for the first three to settle and refund), which is the limiter doing its job. A single 100,000-token request, by contrast, can never fit; the
+limiter must reject it with a non-retryable error or the bucket must be sized above the largest request
+you intend to accept.
 
 ### Distributed enforcement
 Several application replicas share one provider quota, so the limiter's state must be shared, or the
@@ -118,6 +129,8 @@ class TokenBucket:
         self.updated = now
     def try_reserve(self, cost: float) -> float:
         """Reserve `cost` now. Returns 0 if admitted, else seconds until it would fit."""
+        if cost > self.capacity:              # would never fit: reject outright, do not say "retry later"
+            raise ValueError("request larger than bucket capacity")
         with self.lock:
             self._refill()
             if self.level >= cost:
@@ -125,8 +138,8 @@ class TokenBucket:
                 return 0.0
             return (cost - self.level) / self.rate
     def settle(self, reserved: float, actual: float):
-        with self.lock:                       # refund what the model did not actually use
-            self.level = min(self.capacity, self.level + max(0.0, reserved - actual))
+        with self.lock:                       # refund unused quota, or debit an overshoot (level may go
+            self.level = min(self.capacity, self.level + reserved - actual)   # negative = a debt)
 
 # Illustrative provider limit of 400k tokens/minute; run at 80% to leave headroom for retries.
 TPM = 400_000 * 0.8
@@ -162,6 +175,8 @@ def call_llm(prompt_tokens: int, max_tokens: int):
   and vanishes in single-instance tests.
 - Never refunding reservations; the symptom is sustained throughput far below quota while the limiter
   reports itself full.
+- Bucket capacity smaller than the largest legitimate request; the symptom is a few long-document
+  requests receiving `Retry-After` indefinitely while everything else flows, because they can never fit.
 - Limiting after expensive work (retrieval, prompt assembly); the symptom is CPU and vector-store load
   that does not fall when requests are rejected.
 - Counting tokens with the wrong tokenizer; the symptom is systematic under- or over-reservation that

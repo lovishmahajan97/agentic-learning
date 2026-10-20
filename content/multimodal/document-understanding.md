@@ -5,7 +5,7 @@ name: Document understanding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - multimodal/ocr
   - multimodal/vision-language-models
@@ -51,8 +51,13 @@ exists to put layout back into the model's input and to put verification around 
 ## How it works
 ### Three model families
 1. **OCR plus layout-aware encoder (LayoutLM family).** OCR provides words and bounding boxes. The model
-   embeds each token with its text, its 2-D position (normalised box coordinates as extra embeddings)
-   and, in later versions, image patch features of the page. Pretraining masks text and image regions
+   embeds each token with its text, its 2-D position and, in later versions, image patch features of
+   the page. Concretely, box coordinates are normalised to a 0–1000 grid regardless of page size, and
+   learned embeddings for x0, y0, x1, y1 (plus width and height in v2) are summed with the token
+   embedding: `e = E_tok(w) + E_x(x0) + E_y(y0) + E_x(x1) + E_y(y1) + E_pos(i)`. Normalising to a grid
+   is a deliberate choice, because it makes "top-right corner" mean the same thing on an A4 scan and a
+   phone photo, and summing rather than concatenating lets self-attention compare positions with the
+   same dot products it uses for meaning. Pretraining masks text and image regions
    so the model learns to associate words with positions and appearance. Fine-tuned heads then do token
    classification for key information extraction (label each word as invoice_number, total, none),
    page classification, or extractive question answering. It inherits OCR's errors but also its
@@ -86,6 +91,15 @@ systems of record (a vendor ID that exists), and consistency across pages. Each 
 reason to route the document to review. This is the layer that converts a probabilistic model into a
 process with a known error budget, and the straight-through-processing rate (documents needing no human
 touch) is the business metric that falls out of it.
+
+### Getting a confidence signal back
+Families 2 and 3 return values without confidence, and review routing needs one. Practical substitutes,
+in rising cost: ask for provenance (the page number and the verbatim source text or box for each field)
+and check that the quoted text really exists in the OCR or text layer, which catches most invented
+values cheaply; read token log-probabilities for the value tokens where the serving stack exposes them;
+run two extractions (two prompts, two models, or VLM versus OCR-plus-layout) and treat disagreement as
+low confidence. None of these is calibrated out of the box, so plot error rate against the signal on a
+labelled sample before choosing a routing threshold.
 
 ### Evaluation
 Field-level exact match or F1 for extraction, with per-field breakdown because "total" and "notes" do
@@ -144,6 +158,9 @@ def extract(pdf_path, page_no=0):
         issues.append("lines do not sum to subtotal")
     if None not in (inv.subtotal, inv.tax, inv.total) and abs(inv.subtotal + inv.tax - inv.total) > 0.01:
         issues.append("subtotal + tax != total")
+    text = page.get_text().replace(",", "") if has_text_layer else ""
+    if text and inv.total is not None and f"{inv.total:.2f}" not in text:
+        issues.append("total not found verbatim in text layer")    # cheap provenance check
     return inv, issues                                          # issues non-empty -> human review queue
 
 inv, issues = extract("po_2024_0417.pdf")
@@ -171,6 +188,9 @@ print(inv.total if inv else None, issues)
   line items merged, especially on tables with wrapped descriptions.
 - Measuring an average accuracy only; the symptom is a release that improved overall F1 while getting
   worse on the one field, the total, that drives the business outcome.
+- Accepting VLM-extracted values with no provenance; the symptom is reviewers spending minutes hunting
+  for where a field came from, and invented values that pass every format check because nothing ties
+  them to a location on the page.
 - Assuming the document is trustworthy input; the symptom is an extraction agent obeying instructions
   printed in a submitted PDF, the document-borne form of prompt injection.
 

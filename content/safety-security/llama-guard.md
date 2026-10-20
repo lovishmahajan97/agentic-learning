@@ -5,7 +5,7 @@ name: Llama Guard
 kind: tool
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - safety-security/content-moderation
   - safety-security/input-output-guardrails
@@ -52,9 +52,14 @@ you pass a list of role/content messages.
 
 ### The output is generated, not predicted by a head
 The model generates text: `safe`, or `unsafe` on the first line and a comma-separated list such as
-`S2,S9` on the second. Because the first generated token is effectively the decision, the probability the
-model assigns to `unsafe` at that position is a confidence score; the original paper evaluates with that
-probability, and you can threshold it to trade precision against recall instead of taking the argmax.
+`S2,S9` on the second. The token that spells `safe` or `unsafe` is effectively the decision, so the
+probability the model assigns to `unsafe` at that position is a confidence score; the original paper
+evaluates with that probability, and you can threshold it to trade precision against recall instead of
+taking the argmax. Find that position rather than assuming it is the first generated token: depending on
+version and chat template, the model may emit whitespace or newline tokens before the verdict, and reading
+the logits one step too early scores a newline. Renormalising over just the two verdict tokens gives
+`p_unsafe = exp(z_unsafe) / (exp(z_unsafe) + exp(z_safe))`, where `z` are the logits at that position;
+that is the number you threshold.
 This is also why fine-tuning worked: the training data was conversations labelled with exactly this
 output format against exactly this prompt structure.
 
@@ -67,7 +72,8 @@ crimes, non-violent crimes, sex-related crimes, child sexual exploitation, defam
 privacy, intellectual property, indiscriminate weapons, hate, suicide and self-harm, sexual content,
 elections, and code-interpreter abuse. A larger multimodal Llama Guard 4 followed in 2025. Because the
 categories are prompt text, you can drop ones you do not want enforced, reword descriptions, or add a
-category zero-shot; the paper shows this works to a degree, with accuracy on novel categories improving
+category zero-shot, either by building the prompt string yourself or through the options some versions'
+chat templates expose for excluding or replacing categories; the paper shows this works to a degree, with accuracy on novel categories improving
 when you fine-tune on a few hundred examples.
 
 ### Deployment shape
@@ -86,10 +92,10 @@ Meta's Prompt Guard is a small classifier for jailbreak and injection text, whic
 attempt. NeMo Guardrails is an orchestration layer that can call Llama Guard as one rail among several.
 
 ## Example
-Moderating a user message and then the assistant's reply in context, with both the generated verdict and
-the probability of `unsafe` at the first output position. The model is gated on the Hub, so the licence
-must be accepted first. If `unsafe` tokenises to more than one piece, the code scores its first piece,
-which is what decides the verdict.
+Moderating a user message and then the assistant's reply in context, returning both the generated verdict
+and the probability of `unsafe` at the position where the verdict token is generated. The model is gated
+on the Hub, so the licence must be accepted first. If `unsafe` tokenises to more than one piece, the code
+compares the first pieces of the two words, which is where the decision is made.
 
 ```python
 import torch
@@ -98,17 +104,23 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 model_id = "meta-llama/Llama-Guard-3-8B"
 tok = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto").eval()
+SAFE_ID = tok.encode("safe", add_special_tokens=False)[0]
 UNSAFE_ID = tok.encode("unsafe", add_special_tokens=False)[0]
 
 @torch.no_grad()
 def moderate(chat: list[dict]) -> tuple[str, float]:
     # the chat template inserts the S1..S14 policy block and "assess only the last message"
     ids = tok.apply_chat_template(chat, return_tensors="pt").to(model.device)
-    probs = model(input_ids=ids).logits[0, -1].float().softmax(-1)   # first output token
-    p_unsafe = probs[UNSAFE_ID].item()
-    out = model.generate(input_ids=ids, max_new_tokens=16, do_sample=False,
-                         pad_token_id=tok.eos_token_id)
-    verdict = tok.decode(out[0, ids.shape[-1]:], skip_special_tokens=True).strip()
+    out = model.generate(input_ids=ids, max_new_tokens=16, do_sample=False, output_scores=True,
+                         return_dict_in_generate=True, pad_token_id=tok.eos_token_id)
+    gen = out.sequences[0, ids.shape[-1]:]
+    p_unsafe = float("nan")
+    for pos, t in enumerate(gen.tolist()):       # skip any leading newline tokens
+        if t in (SAFE_ID, UNSAFE_ID):
+            z = out.scores[pos][0]
+            p_unsafe = torch.stack([z[SAFE_ID], z[UNSAFE_ID]]).float().softmax(0)[1].item()
+            break
+    verdict = tok.decode(gen, skip_special_tokens=True).strip()
     return verdict, p_unsafe                     # e.g. ("unsafe\nS2", 0.97) or ("safe", 0.02)
 
 user = {"role": "user", "content": "How do I pick the lock on my neighbour's door while they are away?"}
@@ -117,9 +129,13 @@ reply = {"role": "assistant", "content": "I can't help with that. If it's your o
 print(moderate([user, reply]))                   # output rail: the reply is judged given the question
 ```
 
-The input call should come back `unsafe` with a non-violent-crimes code; the output call should come back
-`safe`, because the refusal is judged in context. Thresholding `p_unsafe` rather than parsing the text lets
-you run the input rail stricter than the output rail if your product needs that.
+The input call should come back `unsafe` with a non-violent-crimes code (S2); the output call should come
+back `safe`, because the refusal is judged in context. Thresholding `p_unsafe` rather than parsing the text
+lets you run the rails at different strictness: suppose a labelled sample of 500 of your own prompts shows
+that blocking at `p_unsafe > 0.5` catches 46 of 50 truly unsafe ones while wrongly blocking 9 of 450 benign
+ones (illustrative numbers). Dropping to 0.2 might catch 49 and wrongly block 30. Which point is right is a
+product decision about the cost of a miss versus a false refusal, and you can only make it with the score,
+not with the argmax verdict.
 
 ## Trade-offs
 - Running the classifier yourself keeps prompts inside your boundary and lets you edit the policy, but it
@@ -198,7 +214,8 @@ phrased outside its training distribution; those need domain-specific classifier
 ### Q: How do you get a tunable score from Llama Guard instead of a binary verdict?
 - [ ] Ask it to output a number between 0 and 100 in the prompt
 - [ ] Average the verdicts over several sampled generations at high temperature
-- [x] Read the probability of the `unsafe` token at the first output position and threshold it
+- [x] Read the probability of the `unsafe` token at the position where the verdict is generated and threshold it
 - [ ] Count how many category codes appear on the second line
-> The first generated token carries the decision, so its probability is a natural confidence score; the
-> paper evaluates this way and it lets input and output rails run at different strictness.
+> The verdict token carries the decision, so its probability (renormalised against `safe`) is a natural
+> confidence score; the paper evaluates this way and it lets input and output rails run at different
+> strictness, whereas sampled or self-reported numbers are not calibrated.

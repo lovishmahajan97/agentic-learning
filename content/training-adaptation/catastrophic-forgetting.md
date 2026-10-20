@@ -5,6 +5,7 @@ name: Catastrophic forgetting
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - training-adaptation/overfitting
   - training-adaptation/supervised-fine-tuning
@@ -34,8 +35,9 @@ A neural network stores everything in one shared set of weights. There is no reg
 a new dataset computes the gradient of the new loss alone, and that gradient has no term for the old
 tasks. Any weight that the new task wants to move will move, however important it was to something the
 loss cannot see. The phenomenon was named in the connectionist literature in the late 1980s as the
-sequential learning problem, and nothing about scale removes it; larger models have more capacity and
-more redundant features, which slows forgetting per step, but a small dataset repeated for several epochs
+sequential learning problem, and nothing about scale removes it. Some studies find larger models forget
+less per step, others find the opposite over the scales they test, so treat model size as no protection;
+either way, a small dataset repeated for several epochs
 at a healthy learning rate drags the whole network toward those rows.
 
 For LLMs the problem has a sharper edge because the capabilities you are forgetting are the product.
@@ -50,8 +52,9 @@ these regressions reach production: the metric that would have caught them was n
 Let θ* be the weights after pretraining and alignment. Fine-tuning minimises *L_new(θ)*. Its gradient
 moves θ along directions that reduce *L_new*; where those directions also raise *L_old* the old loss
 rises, and nothing in the update notices. A useful picture is curvature: directions in which *L_old* is
-sharply curved are the ones that matter to the old tasks (the Fisher information measures this), and a
-step of size η along such a direction costs roughly `½·F·η²` of old loss. Forgetting is therefore a
+sharply curved are the ones that matter to the old tasks (the Fisher information approximates this
+curvature), and near the old optimum, where the old gradient is roughly zero, a displacement δ along such
+a direction costs roughly `½·F·δ²` of old loss. Forgetting is therefore a
 function of three things: how far you move (steps × learning rate), in which directions (what the data
 asks for), and how sharp the old loss is there.
 

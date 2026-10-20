@@ -5,7 +5,7 @@ name: Clustering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/supervised-vs-unsupervised-vs-self-supervised-learning
   - ml-fundamentals/classification
@@ -71,6 +71,16 @@ millions of points, and mini-batch variants scale further. The assumptions are t
 roughly spherical, similar in size, and you choose k. Choosing k is by the elbow of the objective curve,
 by silhouette, or, most honestly, by what the result is for: 20 for a taxonomy draft, 2,000 for
 deduplication buckets.
+
+### Lloyd's algorithm by hand, and why seeding matters
+Six 1-D points in three obvious pairs, {0, 1}, {10, 11}, {20, 21}, and k = 3. Seed the centroids badly at
+0, 1 and 15. Assign: 0 goes to 0, 1 goes to 1, and 10, 11, 20, 21 are all nearer 15 than 1. Update: the
+third centroid moves to (10 + 11 + 20 + 21) / 4 = 15.5. Reassign: 10 is still 5.5 from 15.5 but 9 from 1,
+so nothing changes and the algorithm has converged, with a sum of squares of 101 against 1.5 for the
+obvious solution (centroids 0.5, 10.5, 20.5). Every step lowered the objective; it simply started in the
+wrong basin. k-means++ makes that start unlikely: after picking 0 first, the chance that the next seed
+is 1 is its squared distance over the total, 1 / (1 + 100 + 121 + 400 + 441) ≈ 0.1%, so seeds land in
+different groups almost always. Restarts with different seeds (`n_init`) cover the remaining cases.
 
 ### Hierarchical (agglomerative)
 Start with every point as its own cluster and repeatedly merge the closest pair under a linkage rule:

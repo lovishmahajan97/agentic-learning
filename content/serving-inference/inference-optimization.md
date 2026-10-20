@@ -5,7 +5,7 @@ name: Inference optimization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/continuous-batching
@@ -76,10 +76,16 @@ length tokens, so it sits on the right-hand, compute-bound side. Each lever belo
   and stop sequences stop decode from generating tokens nobody uses.
 - **Speculative decoding**: a small draft model (or a lightweight head) proposes several tokens; the large
   model verifies them in one forward pass. Verification of *k* tokens costs barely more than one decode
-  step because that step was bandwidth-bound anyway, so accepted drafts come almost free. It helps when
-  the batch is small and the draft is accurate; at large batch the GPU is already busy and it can hurt.
-- **Early exit on structure**: constrained decoding with a grammar removes retries for invalid JSON, which is
-  an optimization at the request level rather than the kernel level.
+  step because that step was bandwidth-bound anyway, so accepted drafts come almost free. If each drafted
+  token is accepted with probability *α* and *k* are drafted, the expected tokens produced per target
+  pass is (1 − α^(k+1)) / (1 − α): with α = 0.8 and k = 4 that is about 3.4 tokens per pass instead of 1,
+  minus the draft's own cost. The output distribution is unchanged, because rejection sampling corrects
+  every draft to the target model's distribution. It helps when the batch is small and the draft is
+  accurate (acceptance falls on creative or unusual text); at large batch the GPU is already busy and
+  it can hurt.
+- **Constrained decoding**: masking logits with a grammar or JSON schema removes retries for invalid
+  output, an optimization at the request level rather than the kernel level. Computing the mask is CPU
+  work per step, so a slow grammar engine can itself become the bottleneck at high batch.
 
 ### Levers that fit more work into the same bytes
 - **Continuous batching**: keep the running batch full by admitting and retiring requests every iteration.
@@ -88,6 +94,9 @@ length tokens, so it sits on the right-hand, compute-bound side. Each lever belo
   large batches reachable.
 - **Chunked prefill**: split long prompts into chunks interleaved with decode steps so prefill's compute
   and decode's bandwidth demand overlap rather than queue.
+- **Disaggregated prefill and decode**: run the phases on separate GPU pools and ship the KV cache
+  between them, so long prefills stop stalling decode batches and each pool is sized for its own bound.
+  It pays at large scale with mixed traffic; below that, chunked prefill gets most of the benefit.
 - **Tensor parallelism**: shard weights across GPUs so each reads a fraction of *W* per step; adds
   all-reduce communication per layer, so it pays off when a model does not fit or when per-GPU bandwidth is
   the limit.
@@ -168,6 +177,9 @@ batch sizes, which is when KV quantization and GQA start to pay.
   dominating TTFT no matter what engine flags change.
 - Reading vendor peak FLOPS as a throughput promise; symptom is utilization in the single digits and a
   purchase order for faster GPUs that do not help decode.
+- Load-testing with a prompt/output length mix that differs from production (say, 500 in / 100 out when
+  real traffic is 6k in / 800 out); symptom is a lever that won in the benchmark doing nothing, or harm,
+  in production, because the benchmark sat in a different regime.
 
 ## When to use
 Reach for optimization when a measured number misses a target: TTFT above the budget, TPOT making text

@@ -5,6 +5,7 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - fastapi-for-ai/redis-caching
   - node-ts-for-ai/redis
@@ -73,9 +74,11 @@ of, and put anything that must survive in a database.
 ### Memory limits and eviction
 `maxmemory` caps the dataset; when it is reached, the eviction policy decides what happens:
 `noeviction` (writes fail), `allkeys-lru` (evict least recently used anything), `volatile-lru` and
-`volatile-ttl` (evict only keys with a TTL). A cache wants `allkeys-lru`; a queue or lock store wants
-`noeviction`, because evicting a job silently is worse than failing loudly. This is why mixing a cache
-and a queue in one instance is a design error.
+`volatile-ttl` (evict only keys with a TTL), plus LFU and random variants. LRU is approximated by sampling
+a few keys rather than tracking exact order. A cache wants `allkeys-lru` or `allkeys-lfu`; a queue or lock
+store wants `noeviction`, because evicting a job silently is worse than failing loudly. `maxmemory` and
+the policy apply to the whole instance, including every numbered logical database, which is why mixing a
+cache and a queue in one instance is a design error.
 
 ### Replication, Sentinel and Cluster
 A primary replicates asynchronously to replicas; Sentinel monitors and promotes a replica on failure.
@@ -83,8 +86,9 @@ Because replication is asynchronous, a failover can lose the last writes, which 
 queues. Redis Cluster shards keys across nodes by hashing the key into 16,384 slots; multi-key commands
 then only work when all keys hash to the same slot, which you control with hash tags such as
 `{tenant42}:limit`. Managed offerings (ElastiCache, Memorystore, Upstash, Redis Cloud) run these for you.
-Note that Redis changed its licence in 2024 and the community fork Valkey appeared; the commands are the
-same, but check which one your platform ships.
+Note that Redis changed its licence in 2024 (to source-available terms) and the Linux Foundation fork
+Valkey appeared; Redis 8 in 2025 added AGPLv3 as an option. The core commands are the same, but newer
+features diverge, so check which one your platform ships.
 
 ### The patterns that matter in AI backends
 - **Cache-aside:** look up `cache:{model}:{sha256(prompt+params)}`; on miss, call the model, `SET` with
@@ -200,14 +204,17 @@ and where an expiring lock is unsafe.
 ## Check yourself
 **Q:** A team uses one Redis instance with `allkeys-lru` for both the LLM response cache and the Celery
 job queue. Jobs occasionally disappear under load. Explain the mechanism and the fix.
-**A:** Under memory pressure `allkeys-lru` evicts whichever keys were least recently used, and a queued
-job that has been waiting is exactly that: untouched since it was enqueued. The cache fills memory with
-fresh entries, the eviction policy removes the oldest keys, and some of those are queue entries or task
-metadata, so jobs vanish without an error. The fix is separation: a dedicated instance (or at least a
-separate logical database with its own memory policy) for the queue configured with `noeviction` and
-AOF persistence, so running out of memory fails enqueues loudly instead of silently discarding work, and
-a cache instance with `allkeys-lru` and TTLs on every key. If loss is still unacceptable, move the queue
-to a durable broker or a database-backed queue.
+**A:** Under memory pressure `allkeys-lru` evicts keys that have not been touched recently, regardless of
+what they are. Queue libraries keep state in many keys besides the main queue list: Celery keeps
+unacknowledged and scheduled (ETA) messages and task results in separate keys, and libraries such as RQ
+and BullMQ store one hash per job. A job that has been waiting is untouched since it was enqueued, and
+a queue for a rarely used task type may be idle as a whole. The cache fills memory with fresh entries,
+eviction samples and removes idle keys, and some of those are queue state, so jobs vanish without an
+error. The fix is separation into two instances: numbered logical databases do not help, because
+`maxmemory` and the eviction policy are instance-wide. The queue instance gets `noeviction` and AOF
+persistence, so running out of memory fails enqueues loudly instead of silently discarding work; the
+cache instance gets `allkeys-lru` and TTLs on every key. If loss is still unacceptable, move the queue to
+a durable broker or a database-backed queue.
 
 ## Quiz
 ### Q: Why can a plain INCR in Redis be used as a correct rate-limit counter across many application servers?
@@ -232,4 +239,4 @@ to a durable broker or a database-backed queue.
 - [x] AOF persistence with noeviction, so a full instance fails writes rather than discarding jobs
 - [ ] AOF persistence with allkeys-lru, so old jobs make room for new ones
 > A queue must fail loudly, never drop work silently. noeviction makes memory exhaustion an error the
-> producer sees, and AOF limits what a crash loses; LRU policies would evict waiting jobs first.
+> producer sees, and AOF limits what a crash loses; LRU policies would evict idle waiting jobs.

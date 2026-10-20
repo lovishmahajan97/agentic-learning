@@ -5,7 +5,7 @@ name: Confusion matrix
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/precision-recall-f1
@@ -105,6 +105,17 @@ from FN into TP and from TN into FP at the same time. The matrix therefore descr
 point*; ROC and precision–recall curves are the matrix evaluated at every threshold. Comparing two
 models by their matrices at the default 0.5 compares two arbitrary points.
 
+### From cells to a decision: the cost matrix
+The table becomes a decision tool once each cell has a price. Write a cost matrix with the same layout
+(usually zero on the diagonal, C_FP and C_FN off it) and the expected cost of a model is the sum of
+cell count times cell cost. This is the only principled way to rank two matrices with different error
+mixes, and it is what every single-number metric approximates with a hidden, fixed cost ratio:
+accuracy assumes C_FP = C_FN, F1 assumes the two errors are equally bad and TN are free. For multi-class
+problems the cost matrix is k × k, because confusing "refund" with "cancel" may be cheap while confusing
+"cancel" with "legal complaint" is not. For multi-label problems (each item can carry several labels)
+there is no single k × k table; you get one 2 × 2 matrix per label (scikit-learn's
+`multilabel_confusion_matrix`) and aggregate as with per-class metrics.
+
 ## Example
 A fraud screen on 10,000 transactions where 1% (100) are fraud. The model flags 270 of them: 70 real
 frauds and 200 legitimate ones, and misses 30 frauds. Reading the table: recall = 70/100 = 0.70;
@@ -112,6 +123,13 @@ precision = 70/270 ≈ 0.26; specificity = 9,700/9,900 ≈ 0.98; FPR ≈ 0.02; a
 0.977. That accuracy is *worse* than the 0.99 you would get by never flagging anything, which is the
 whole argument against accuracy on imbalanced data. Balanced accuracy is 0.84 and MCC ≈ 0.42, both of
 which say "useful but far from done", which is what the table says too.
+
+Now price the cells, with illustrative costs: a missed fraud loses $500 and a false decline costs $10
+in support time and goodwill. The model costs 30 × 500 + 200 × 10 = $17,000; "never flag" costs
+100 × 500 = $50,000. The model with the *lower* accuracy is the far cheaper one. Flip the costs (a
+false decline costs $500 because these are high-value customers, a missed fraud $10 because it is
+insured) and the model costs 30 × 10 + 200 × 500 = $100,300 against $1,000 for never flagging. Same
+table, opposite verdict: the cost of the cells, not the table, decides.
 
 ```python
 import numpy as np
@@ -151,6 +169,9 @@ averages. Note how the "legit" row looks excellent and the weighted average inhe
 - One matrix equals one threshold: cheap to compute and easy to explain, but comparing models at a
   default threshold compares arbitrary points; use curves when the threshold is tunable and matrices
   when the product has fixed it.
+- A cost matrix turns the table into a clear decision, but its prices are estimates; when they are
+  uncertain by more than the gap between candidate models, show the verdict across a range of cost
+  ratios instead of one number.
 - Multi-class matrices grow as k², readable at ten classes and unreadable at two hundred; past that
   you summarise (per-class recall sorted, top confused pairs) and lose the full picture.
 

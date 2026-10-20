@@ -5,7 +5,7 @@ name: Fine-tune vs RAG vs prompt decision
 kind: decision
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/peft
@@ -36,7 +36,8 @@ expensive and usually wrong for the first request. Fine-tuning on a pile of docu
 make a model recall their contents: the loss is next-token prediction over a handful of phrasings, which
 is nothing like the massive repetition and paraphrase that got facts into the model during pretraining.
 Ovadia et al. compared knowledge injection methods and found retrieval consistently beat unsupervised
-fine-tuning on new facts. Even when fine-tuned knowledge does stick, it is frozen at training time,
+fine-tuning on new facts; fine-tuning improved when each fact was shown in many paraphrases, which
+supports the diagnosis that the problem is exposure and phrasing, not effort. Even when fine-tuned knowledge does stick, it is frozen at training time,
 cannot be scoped per tenant or deleted, carries no citation, and has to be redone when the base model is
 upgraded.
 
@@ -90,6 +91,22 @@ puts the fact in the context window, where attention can copy it directly, so th
 memorisation at all. This is also why fine-tuned "knowledge" fails silently: the model produces
 plausible details in the style of the training data rather than refusing.
 
+### The economics, as arithmetic
+The cost case for fine-tuning is a break-even, not a feeling:
+
+```
+monthly saving   = tokens removed per request × requests per month × price per input token
+                   − (any extra per-token or hosting cost of serving the tuned model)
+cost per cycle   = data review + training runs + eval runs, repeated at every base-model upgrade
+fine-tune pays   when monthly saving × months between upgrades > cost per cycle
+```
+
+The second term of the saving is the one people forget. Some hosted fine-tuning products price tuned
+models above the base model per token, and a self-hosted tuned model needs its own GPUs unless the serving
+stack can load many LoRA adapters onto one shared base (multi-adapter serving). Prompt caching shrinks the
+first term, because a cached prefix is already billed at a discount. Run the numbers with your vendor's
+current prices before arguing either way.
+
 ### Reversibility and the upgrade tax
 A prompt change is one deploy with instant rollback and transfers largely unchanged to a newer base
 model. A RAG index is updated incrementally and supports deletion, and it transfers to any model.
@@ -106,13 +123,17 @@ runs 2 million requests a month with a 5,000-token prompt of instructions and tw
 Sort the gaps. The docs are a knowledge gap: build RAG over the docs with weekly re-indexing, so new
 pages are answerable the day they ship and retired pages stop being cited. Voice and JSON are behaviour
 gaps: tighten the system prompt, enable structured-output mode, and measure on 200 reviewed cases.
-Suppose that reaches 97% valid JSON and a tone score of 4.1/5 on a rubric, against targets of 99.5% and
-4.5. The prompt has plateaued, so fine-tune: a LoRA SFT on 1,500 reviewed answers reaches 99.7% and 4.6,
+Structured output guarantees the JSON parses and matches the schema, but not that the right fields carry
+the right content, so the metric is field-level correctness (right `category` enum, `escalate` set when
+policy requires it). Suppose that reaches 97% field-level correctness and a tone score of 4.1/5 on a
+rubric, against targets of 99.5% and 4.5. The prompt has plateaued, so fine-tune: a LoRA SFT on 1,500 reviewed answers reaches 99.7% and 4.6,
 and the twelve examples can leave the prompt, which shrinks to 800 tokens.
 
 Now the economics. Input tokens drop from 5,000 × 2M = 10 billion to 800 × 2M = 1.6 billion per month,
 about 6× fewer; with prompt caching the cached share is discounted, so the realised saving is smaller
-but still material. The fine-tune costs a few GPU-hours per iteration plus the eval harness, repeated at
+but still material. Before celebrating, plug the tuned model's serving price or hosting cost into the
+break-even above: if the tuned model costs more per token, part of that 8.4-billion-token saving is
+handed straight back. The fine-tune costs a few GPU-hours per iteration plus the eval harness, repeated at
 each base-model upgrade. Knowledge stayed in the index; the weights only learned behaviour; the system
 prompt still carries per-customer configuration.
 

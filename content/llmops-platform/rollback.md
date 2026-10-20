@@ -5,6 +5,7 @@ name: Rollback
 kind: practice
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - llmops-platform/canary-shadow-deployments
   - llmops-platform/model-registry
@@ -37,8 +38,10 @@ of them without the others yields a combination that was never evaluated: yester
 today's model is a new version, not the old one.
 
 Second, some changes destroy their own undo path. Re-embedding a corpus in place with a new embedding
-model overwrites the vectors the old prompt was tuned against. Replacing a fine-tuned model on a
-provider that keeps only the latest job leaves nothing to return to. A vendor retiring the previous
+model overwrites the vectors the old prompt was tuned against, and the old query-embedding model
+cannot be used against the new vectors at all, because the two models' vector spaces are not
+comparable. Overwriting a fine-tuned checkpoint or adapter without retaining the previous one leaves
+nothing to return to. A vendor retiring the previous
 snapshot removes the old model entirely.
 
 Third, the failures that justify a rollback are usually quality regressions, visible only through
@@ -186,9 +189,10 @@ has to be true beforehand for a pointer flip to actually restore behaviour.
 Two days later answer quality drops. Walk through what rollback can and cannot do here and what you
 would change for next time.
 **A:** The prompt can be rolled back instantly if it is versioned in a registry and the environment
-alias can be repointed. The index cannot: re-embedding in place destroyed the old vectors, so the
-old prompt would now run against a corpus embedded by the new model, which is a combination never
-evaluated and possibly worse. The honest options are to rebuild the old index from source (hours),
+alias can be repointed. The index cannot: re-embedding in place destroyed the old vectors, and the
+query side cannot go back to the old embedding model either, because old-model query vectors are
+meaningless against new-model document vectors. So a prompt-only rollback runs the old prompt against
+retrieval from the new model, a combination never evaluated and possibly worse. The honest options are to rebuild the old index from source (hours),
 or to keep the new index and fix the prompt forward with a proper canary. For next time: treat the
 bundle as one manifest, build the new index blue/green beside the old and switch an alias, keep the old
 index through a bake window, key any response cache by manifest id, and define the quality trigger

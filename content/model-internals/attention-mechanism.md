@@ -5,7 +5,7 @@ name: Attention mechanism
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - model-internals/self-attention
   - model-internals/multi-head-attention
@@ -67,8 +67,10 @@ output  = Σ_i α_i · v_i
 The choice of *f* is the main design decision:
 - **Additive** (Bahdanau): `vᵀ·tanh(W₁q + W₂k)`, a tiny MLP per (query, key) pair. Expressive, but it
   cannot be written as one matrix multiplication over all keys.
-- **Dot-product** (Luong): `qᵀk`. All scores for a query come from a single matrix–vector product, and
-  all queries at once from a matrix–matrix product, which is exactly what GPUs do fastest.
+- **Dot-product** (Luong): `qᵀk`, or the "general" form `qᵀ·W·k`. All scores for a query come from a
+  single matrix–vector product, and all queries at once from a matrix–matrix product, which is exactly
+  what GPUs do fastest. The transformer's `(x·W_Q)·(y·W_K)ᵀ = x·(W_Q·W_Kᵀ)·yᵀ` is this general form with
+  W factored into two thin matrices, so each head learns a similarity of rank at most d_k.
 - **Scaled dot-product** (Vaswani): `qᵀk / √d_k`. If the components of **q** and **k** are roughly
   independent with zero mean and unit variance, `qᵀk` has variance d_k, so with d_k = 64 the scores have
   standard deviation 8. Softmax of numbers spread that widely is nearly one-hot, its gradient is close to
@@ -115,7 +117,7 @@ def attention(q, K, V, scale=True):
     w = np.exp(scores - scores.max()); w /= w.sum()    # numerically stable softmax
     return w, w @ V
 
-# Three memories; the query points along the first key, half-way toward the third.
+# Three memories; the query equals the first key, half-matches the third, is orthogonal to the second.
 K = np.array([[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]])
 V = np.array([[10.0, 0.0], [0.0, 10.0], [5.0, 5.0]])
 q = np.array([1.0, 0.0])
@@ -131,9 +133,9 @@ for s in (False, True):
     w, _ = attention(q, K, V, scale=s)
     entropy = -(w * np.log(w + 1e-12)).sum()
     print("scaled" if s else "raw   ", f"max weight {w.max():.3f}  entropy {entropy:.2f} (uniform = {np.log(n):.2f})")
-# raw    max weight 0.778  entropy 0.65 (uniform = 2.77)  <- almost all mass on 2-3 keys; near one-hot, gradients vanish
-# scaled max weight 0.176  entropy 2.53 (uniform = 2.77)  <- a real distribution the model can learn to sharpen
-# (exact values depend on the seed; the ratio of entropies is the point)
+# Typical result: raw max weight ~0.8, entropy well under 1 (uniform = 2.77) <- near one-hot, gradients vanish
+#                 scaled max weight ~0.2, entropy ~2.4                       <- a distribution the model can sharpen
+# Exact values depend on the draw; the gap in entropy is the point.
 ```
 
 ## Trade-offs

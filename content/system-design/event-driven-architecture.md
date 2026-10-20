@@ -5,7 +5,7 @@ name: Event-driven architecture
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - system-design/synchronous-vs-asynchronous-execution
   - system-design/outbox-inbox-patterns
@@ -85,6 +85,22 @@ by making the effect naturally repeatable. Exactly-once is a property you build 
 the broker gives you end to end: Kafka's transactional producers cover only Kafka-to-Kafka read-process-write
 loops, and any effect outside the log (a database write, an HTTP call) still needs idempotence.
 
+Partitions are also the unit of parallelism: within one consumer group each partition is read by at most
+one consumer at a time, so a topic with 12 partitions can keep at most 12 consumers of a group busy.
+Choosing the partition count is therefore a capacity decision you make up front, because adding
+partitions later changes which partition a key hashes to and breaks per-key ordering across the change.
+
+### When a consumer cannot process an event
+A message that fails every time (a malformed payload, a PDF that crashes the parser) is a **poison
+message**, and the way you retry it decides what you lose. Retrying in place preserves order but blocks
+the whole partition behind it: every later event on that partition, for every document that hashes
+there, waits. Moving it to a retry topic or dead-letter queue (DLQ) unblocks the partition, but if a
+later event for the *same* key is processed while the failed one sits in the DLQ, that key's order is
+broken (an `Updated` overtakes its `Created`). The careful middle path is to park the key: record it as
+blocked, divert its subsequent events to the side as well, and release them in order once the head
+event is fixed or discarded. Which of the three is right depends on whether per-key order or partition
+throughput matters more for that event type, and it should be decided per topic, not discovered.
+
 ### Producing reliably
 The producer writes its own database row and publishes the event. Doing those as two separate operations
 is the **dual-write problem**: a crash between them loses the event or emits one for a rolled-back
@@ -125,23 +141,31 @@ def on_upload(doc_id, storage_uri, tenant_id, trace_id, publish):
                     {"uri": storage_uri, "tenant_id": tenant_id}, trace_id)
     publish(topic="documents", key=doc_id, value=json.dumps(ev))
 
-# consumer: embedder reacts, and tolerates redelivery
-seen = set()   # in production: an inbox table in the same DB transaction as the effect
-
-def on_document_uploaded(raw, embed_and_index, publish):
+# consumer: embedder reacts, and tolerates redelivery. The vector store is not in the same
+# transaction as any dedupe table, so idempotence comes from the effect itself: chunk ids are
+# deterministic (doc_id:chunk_no), and re-indexing the same document upserts the same rows.
+def on_document_uploaded(raw, chunk_and_embed, vector_upsert, publish):
     ev = json.loads(raw)
-    if ev["event_id"] in seen:            # at-least-once delivery => duplicates happen
-        return
-    chunk_count = embed_and_index(ev["payload"]["uri"], ev["payload"]["tenant_id"])
-    seen.add(ev["event_id"])
-    publish(topic="documents", key=ev["aggregate_id"], value=json.dumps(
+    doc_id = ev["aggregate_id"]
+    chunks = chunk_and_embed(ev["payload"]["uri"])          # list of (text, vector)
+    vector_upsert([{"id": f"{doc_id}:{i}", "vector": v, "text": t,
+                    "tenant_id": ev["payload"]["tenant_id"]} for i, (t, v) in enumerate(chunks)])
+    chunk_count = len(chunks)
+    # crash here => redelivery re-embeds and overwrites identical ids (wasted work, no duplicates)
+    publish(topic="documents", key=doc_id, value=json.dumps(
         make_event("DocumentIndexed", ev["aggregate_id"],
                    {"chunks": chunk_count}, ev["trace_id"])))
 ```
 
 Adding a billing meter later means one more consumer of `DocumentIndexed`; the upload service and the
 embedder do not change. If the embedder is down for an hour, the events wait on the topic and are
-processed when it returns, in per-document order.
+processed when it returns, in per-document order. Two details carry the design. A random chunk id would
+make every redelivery add a second copy of the document to the index; the deterministic id turns the
+redelivery into an overwrite. And the downstream `publish` after the upsert can itself be lost or
+duplicated, which is acceptable only because the next consumer is idempotent too; if it were not, the
+embedder would need its own outbox. Note one gap the sketch leaves: if a re-upload produces *fewer*
+chunks, the old high-numbered chunks survive, so a real indexer deletes `doc_id:*` ids beyond the new
+count or versions chunks by document revision.
 
 ## Trade-offs
 - Producers gain independence from consumers, but you lose the synchronous answer: the uploader cannot
@@ -172,6 +196,8 @@ processed when it returns, in per-document order.
   reading consumer code.
 - Treating the broker as infinitely fast: a slow consumer accumulates lag silently until a dashboard
   shows events processed hours after they occurred; consumer lag must be a first-class alert.
+- Retrying a poison message in place forever; the symptom is lag climbing on one partition while every
+  other partition of the group sits at zero, and the same offset appearing in the error log on a loop.
 
 ## When to use
 Reach for events when more than one party cares about a fact, when consumers may be down while
@@ -203,8 +229,10 @@ outbox row for `DocumentUploaded` keyed by document id; a relay publishes it, so
 "received" response and the event cannot be lost. Parser, chunker, embedder and indexer are consumer
 groups on the same topic chain, each emitting its own completion event; keying every event by document
 id keeps per-document order. Audit and Slack are additional consumers of those events, so they add no
-latency and no failure modes to the pipeline. Each consumer records processed event ids in an inbox
-table inside the same transaction as its effect, because the broker delivers at least once. The
+latency and no failure modes to the pipeline. Every consumer is idempotent because the broker delivers
+at least once: stages whose effect is a database write record the event id in an inbox table in the same
+transaction, and the indexer, whose effect lands in a vector store outside that transaction, upserts
+chunks under deterministic ids so a redelivery overwrites rather than duplicates. The
 notification consumer in particular must be idempotent, or every restart re-pings Slack. Failures go to
 a dead-letter topic with alerts; lag per consumer group is the health metric. If the customer also needs
 "ask questions immediately after upload", the UI waits for `DocumentIndexed` via a push channel rather

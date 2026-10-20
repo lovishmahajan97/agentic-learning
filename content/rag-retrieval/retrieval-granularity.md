@@ -5,6 +5,7 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/chunk-overlap
@@ -86,8 +87,8 @@ systems retrieve more parents than needed and let a cross-encoder reranker, whic
 parent text together, settle the order.
 
 ### Interaction with the context budget
-With a budget of, say, 4,000 tokens of evidence, you can fit forty 100-token sentences, eight 500-token
-passages or two 2,000-token sections. The generator's ability to use the evidence degrades as the
+With a budget of, say, 4,000 tokens of evidence, you can fit forty 100-token sentence windows, eight
+500-token passages or two 2,000-token sections. The generator's ability to use the evidence degrades as the
 prompt grows and as relevant facts move away from the beginning and end, so returning fewer, larger,
 well-chosen parents is usually better than filling the budget with many small fragments. Granularity
 is thus also a lever on lost-in-the-middle effects.
@@ -133,13 +134,15 @@ for hit in retrieve("how much can fees be capped at?"):
 ```
 
 ## Trade-offs
-- Finer match units sharpen retrieval but multiply the number of vectors; a sentence index can be five
-  to ten times larger than a passage index, which matters once the corpus is tens of millions of units.
+- Finer match units sharpen retrieval but multiply the number of vectors; a sentence index holds
+  roughly (passage length / sentence length) times as many vectors as a passage index, often an order
+  of magnitude more for few-hundred-token passages, which matters at tens of millions of units.
 - Larger return units give the generator context but spend the budget faster and push facts toward
   the middle of the prompt, where models use them least reliably; the flip point is your context budget.
 - Max-child parent scoring is simple and good for pointed factual questions, while sum-based scoring
   rewards depth and suits explanatory questions; choose per query type or let a reranker decide.
-- Proposition rewriting yields self-contained units and strong QA gains, but costs an LLM pass over
+- Proposition rewriting yields self-contained units and reported retrieval and QA gains (largest for
+  retrievers not trained on the target domain), but costs an LLM pass over
   the whole corpus at indexing time and again on every update; it flips to "not worth it" on large,
   fast-changing corpora.
 - Two-level summary-then-chunk retrieval scales well on large corpora with repeated vocabulary, but

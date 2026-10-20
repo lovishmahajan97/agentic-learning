@@ -5,6 +5,7 @@ name: Conversation / execution identifiers
 kind: concept
 difficulty: core
 est_minutes: 11
+status: fact-checked
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
   - agent-reliability/idempotent-tool-execution
@@ -63,8 +64,10 @@ tenant_id — user_id — conversation_id — turn_id — run_id — step — to
   and leases.
 - **step**: the index of the model call within the run; with run_id it addresses a checkpoint.
 - **tool_call_id**: assigned by the model API to each requested call (both the Claude and OpenAI
-  APIs include one) and echoed back on the result so the API can pair them. Unique within a
-  response; combine with run_id and step for global uniqueness.
+  APIs include one) and echoed back on the result so the API can pair them. It is an opaque,
+  vendor-formatted string whose only documented job is pairing within the conversation, and it is
+  stable across a resume only if the response that carried it was persisted; scope it with run_id
+  and step rather than relying on it alone for global uniqueness.
 - **idempotency_key**: derived rather than minted, for example `f"{run_id}:{step}:{call_index}"`
   hashed, so a resumed step regenerates the same key.
 - **trace_id / span_id**: OpenTelemetry ids propagated across services (gateway, agent, tool
@@ -108,7 +111,7 @@ index so a resumed step reproduces it exactly.
 
 ```python
 import contextvars, hashlib, logging, uuid
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +131,7 @@ class Ids:
         return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
     def fields(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if v}
+        return {k: v for k, v in asdict(self).items() if v != ""}   # keep step=0
 
 CURRENT: contextvars.ContextVar[Ids] = contextvars.ContextVar("ids")
 
@@ -216,9 +219,9 @@ which are intended.
 - [ ] A fresh random UUID per execution of the tool
 - [ ] A hash of the tool's arguments only
 - [x] Derived deterministically from run id, step and call index, so a crash resume regenerates the same key
-- [ ] The model's tool_call_id on its own
-> A resume must reproduce the key to dedupe the re-execution; random keys change and argument-only
-> hashes collide across legitimate repeats. tool_call_id is unique per response, not globally.
+- [ ] A per-process counter incremented on each tool dispatch
+> A resume must reproduce the key to dedupe the re-execution; random keys change, a process counter
+> restarts from zero on a new worker, and argument-only hashes collide across legitimate repeats.
 
 ### Q: What distinguishes a run id from a conversation id?
 - [ ] Run ids are numeric while conversation ids are UUIDs

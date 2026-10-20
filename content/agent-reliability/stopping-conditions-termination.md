@@ -5,6 +5,7 @@ name: Stopping conditions / termination
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - agent-reliability/max-step-budgets
   - agent-reliability/loop-detection
@@ -52,10 +53,13 @@ every exit must record *why* it exited.
 ### Sources of stop signals
 1. **API stop reason.** Claude returns `stop_reason`: `tool_use` (the model wants tools run),
    `end_turn` (it finished its turn), `max_tokens` (output was cut off at the limit) and
-   `stop_sequence`. OpenAI's `finish_reason` has the analogous `tool_calls`, `stop`, `length` and
-   `content_filter`. The loop must branch on these values, not on "was there a tool call", because
-   `max_tokens` / `length` means truncation, not completion. Treating truncation as done is one of
-   the most common silent bugs in agent code.
+   `stop_sequence`; newer API versions add values such as `pause_turn` (a long server-side tool turn
+   was paused and should be sent back to continue) and `refusal`, so the set is vendor- and
+   version-specific and an unknown value should fail closed. OpenAI's Chat Completions
+   `finish_reason` has the analogous `tool_calls`, `stop`, `length` and `content_filter`. The loop
+   must branch on these values, not on "was there a tool call", because `max_tokens` / `length` means
+   truncation, not completion. Treating truncation as done is one of the most common silent bugs in
+   agent code.
 2. **Terminal tool.** Give the model a `submit_result(answer, confidence, open_issues)` tool and
    define "done" as "the model called it". Because it is a tool call with a schema, it is
    structured, validated, logged, and cannot be emitted by accident in the middle of prose. The
@@ -117,7 +121,8 @@ def decide(state, resp, verify) -> Outcome | None:
         ok, detail = verify(submit.args)             # independent check
         if ok:
             return Outcome("succeeded", "verified", submit.args)
-        state.push_user(f"submit_result rejected: {detail}. Keep working.")
+        # every tool call needs a matching result, or the next API request is rejected
+        state.push_tool_result(submit, f"rejected: {detail}. Keep working.")
         return None
     if resp.stop_reason == "end_turn":               # stopped talking, did not submit
         if state.nudged:
@@ -134,7 +139,7 @@ def run(state, model, tools, verify):
         if out:
             return out
         for call in resp.tool_calls:
-            if call.name != "submit_result":
+            if call.name != "submit_result":     # a rejected submit already got its result
                 state.push_tool_result(call, tools[call.name](**call.args))
 ```
 

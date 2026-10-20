@@ -5,7 +5,7 @@ name: Supervised vs unsupervised vs self-supervised learning
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/regression
@@ -22,12 +22,12 @@ sources:
 ---
 
 ## TL;DR
-The three paradigms differ in exactly one thing: where the training signal comes from. Supervised
-learning pays humans for (input, label) pairs. Unsupervised learning has inputs only and optimises a
-property of the data itself, such as how tightly points group. Self-supervised learning manufactures
-labels from the input (predict the hidden next token, the masked word, the matching caption), so the
-signal is free and unlimited. Modern LLMs exist because self-supervision turned the whole internet into
-training labels, with human supervision added only at the end.
+The three paradigms differ in one thing: where the training signal comes from. Supervised learning takes
+each label from outside the input, usually a paid human. Unsupervised learning has inputs only and
+optimises a property of the data, such as how tightly points group. Self-supervised learning
+manufactures labels from the input (the next token, the masked word, the matching caption), so the
+signal is free and unlimited. Modern LLMs exist because self-supervision turned the internet into
+training labels, with human supervision added at the end.
 
 ## Why it exists
 Every learning algorithm minimises a loss, and a loss needs something to compare the model's output
@@ -61,8 +61,8 @@ regression lessons). Gradient descent pushes θ toward reproducing the human jud
 consequences follow directly. Generalisation depends on the labelled set covering the distribution you
 will see in production, because the model has no signal about anything else. And the quality ceiling is
 the label quality: if two annotators disagree on 15% of examples, a model cannot agree with both of them
-on more than about 85% of examples, and whichever annotator's labels you score against, roughly that
-much of the "error" is label noise rather than model error.
+on more than 85% of examples, so when scored against either one, up to 15 points of apparent "error"
+can be annotator disagreement rather than model error. Measure agreement before blaming the model.
 
 ### Unsupervised: the target is a property of the data
 Only x is available. The objective is defined on the data itself. k-means minimises the distance from
@@ -97,9 +97,24 @@ Supervised fine-tuning teaches instruction following on thousands to millions of
 (prompt, response) pairs. Preference optimisation (RLHF, DPO) uses human *comparisons* between
 responses, a form of supervision at the level of preferences rather than exact outputs. Underneath,
 unsupervised methods run constantly: clustering embeddings of production traffic to discover what to
-label next, deduplicating training data, finding outliers. Reinforcement learning, where the signal is a
+label next, deduplicating training data, finding outliers. Between supervised and unsupervised sit two
+pragmatic hybrids: **semi-supervised** learning trains on a few labels plus many unlabelled inputs (for
+example pseudo-labelling, where a model's confident predictions on unlabelled data are added as labels,
+which works only if those confident predictions are mostly right), and **weak supervision**, where noisy
+labels come cheaply from heuristics, metadata or an LLM and are cleaned or combined before training.
+Reinforcement learning, where the signal is a
 scalar reward from an environment rather than a label, is the fourth paradigm and underlies the RL part
 of RLHF; it is covered in the training module.
+
+### Where the boundary blurs
+The labels are conventions, not laws, and an expert should know where they leak. Next-token prediction
+is literally maximum-likelihood density estimation of p(text), which is the textbook definition of an
+unsupervised objective; it is called self-supervised because the computation is a per-position
+classification with a known target. Autoencoders, which reconstruct their own input, are filed under
+either heading depending on the author. A useful working test: if the loss compares each example's
+output with a specific target, whatever produced that target, the supervised toolkit (cross-entropy,
+held-out accuracy, label-noise reasoning) applies; if the loss scores a global property such as
+cluster compactness, it does not, and evaluation becomes a judgement call.
 
 ## Example
 A support organisation has about 2,000,000 historical tickets and budget to hand-label roughly 5,000 of
@@ -118,7 +133,7 @@ Self-supervised: the sentence encoder used above was itself trained contrastivel
 millions of unlabelled text pairs, which is why its notion of "similar" is useful at all. If the tickets
 average 60 tokens, continued pre-training on them with the next-token objective would create about
 120,000,000 training targets from the same data, for free. Fine-tuning that adapted model on the 5,000
-labels gives the best classifier of the three, because the supervised step only has to teach the
+labels usually gives the best classifier of the three, because the supervised step only has to teach the
 category boundaries, not the language of the domain.
 
 The code shows the one operation that makes self-supervision different: the labels are produced by a
@@ -215,7 +230,8 @@ categories theirs; the unsupervised step makes the labelling cheap.
 - [ ] Because the tokens were labelled during tokenisation
 > The objective is ordinary cross-entropy against a known correct token, exactly like supervised
 > classification; the only difference from supervised learning is that the label came from the text
-> rather than from an annotator. Unsupervised objectives have no per-example target at all.
+> rather than from an annotator. Classical unsupervised objectives such as k-means score a global
+> property of the data instead of a per-example target.
 
 ### Q: A team receives about 200,000 labelled examples per day for free, because agents pick a final category when they close each ticket. Which paradigm fits a routing model best?
 - [ ] Unsupervised, because labels produced by a system rather than annotators cannot be trusted

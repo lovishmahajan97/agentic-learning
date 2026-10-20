@@ -5,7 +5,7 @@ name: Approval & authorization boundaries
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agents/human-in-the-loop
   - agents/approval-gates-for-consequential-actions
@@ -89,8 +89,23 @@ When the approval event arrives, the runtime resumes and re-checks three things 
 fingerprint of the call it is about to dispatch equals the approved fingerprint (so the model cannot
 "adjust" the arguments after approval), the approval has not expired (a TTL bounds how stale the human's
 context can be), and authorization still holds (permissions may have been revoked while parked). Only then
-does it dispatch. The approval record, the approver's identity and the final decision are appended to the
-run's log, which turns the audit question "who authorised this?" into a lookup.
+does it dispatch, and it marks the approval **consumed** in the same write that records the dispatch.
+Single use matters because a fingerprint covers arguments, not occurrences: without consumption, one
+approval of `refund(order=812, amount=400)` would also authorise an identical second refund later in the
+same run, which is exactly what a looping or injected agent produces. The approval record, the approver's
+identity and the final decision are appended to the run's log, which turns the audit question "who
+authorised this?" into a lookup.
+
+### Who approves, and through what channel
+Two different controls hide under the word "approval". **User confirmation** (the person driving the run
+confirms the action) defeats prompt injection, because the user sees the real arguments and the injected
+instruction did not come from them; it does nothing against a user who wants the harmful action.
+**Independent approval** (a manager, a finance reviewer) adds separation of duties, and the runtime must
+then enforce that the approver is not the requester. Pick per tier: confirmation for "is this what you
+meant", independent approval where the organisation would require it for a human doing the same thing.
+Either way the approval prompt is rendered by the runtime from the stored arguments and delivered through
+a channel the model cannot write to; if the model's chat output is the approval UI, an injection can
+simply print a fake "approved" or a misleading summary.
 
 ### Avoiding approval fatigue
 A gate that asks too often trains approvers to click yes, which is worse than no gate. Mitigations that
@@ -130,16 +145,28 @@ def gate(run, call, approvals):
     if tier in ("auto", "log"):
         return ("allow", tier)
     fp = fingerprint(call)
-    rec = approvals.get(run.id, fp)          # keyed by run AND fingerprint
-    if rec and rec["expires_at"] > time.time() and rec["decision"] == "approved":
-        return ("allow", f"approved by {rec['approver']}")
+    rec = approvals.get(run.id, fp)          # keyed by run AND fingerprint, ignores consumed records
+    live = rec is not None and rec["expires_at"] > time.time()
     if rec and rec["decision"] == "rejected":
         return ("deny", f"rejected by {rec['approver']}")
-    if rec and rec["decision"] == "pending":
+    if live and rec["decision"] == "approved":
+        approvals.consume(rec)               # single use: an identical second call asks again
+        return ("allow", f"approved by {rec['approver']}")
+    if live and rec["decision"] == "pending":
         return ("wait", fp)                  # already asked; do not spam approvers with duplicates
     approvals.create(run.id, fp, call, ttl_s=4 * 3600)   # new or expired: park the run, a human decides
     return ("wait", fp)
+# run.user_scopes is re-read from the identity provider when a parked run resumes, so the first check
+# above is also the re-authorization; a cached copy from run start would let a revoked user's run finish.
 ```
+
+Trace three calls from one support agent run. `refund_payment(order=812, amount=30)` passes the scope
+check, tiers to `log`, and executes. `refund_payment(order=812, amount=400)` tiers to `approve`; no record
+exists, so a request with a 4-hour TTL is created and the run parks. The approver sees amount 400 and order
+812, approves; on resume the same canonical call hashes to the same `fp`, the record is live and approved,
+it is consumed and the refund executes. If the model then emits the identical call again, `get` finds no
+unconsumed record and a new approval is required. Had the model swapped in `amount=4000` after approval,
+the hash would differ and the run would simply park again.
 
 ## Trade-offs
 - Intersecting user and agent scopes gives least privilege and clean audit attribution, but requires
@@ -166,6 +193,8 @@ def gate(run, call, approvals):
   different run's call on Friday after the business context changed.
 - Resuming after approval without re-authorizing; the symptom is a revoked user whose parked runs still
   complete their actions hours after offboarding.
+- Approvals that are not consumed on use; the symptom is one approved refund appearing two or three times
+  in the payment ledger when the agent retried or looped with identical arguments.
 - Unknown tools defaulting to `allow`; the symptom is a newly added tool executing consequential actions
   before anyone classified it.
 

@@ -5,6 +5,7 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/parent-document-retrieval
@@ -68,8 +69,11 @@ text and must not be quoted as if it were.
 Naively, contextualising a document with c chunks and d tokens costs about c × d input tokens, since
 each call carries the full document: a 100-chunk document means the document is read 100 times. Prompt
 caching changes this. The document is placed as a fixed prefix, the chunk and instruction vary, and
-after the first call the prefix is served from cache at a much lower rate. The post's own estimate was
-roughly one dollar per million document tokens with caching; treat the exact figure as model- and
+after the first call the prefix is served from cache at a much lower rate (on Anthropic's API at the time,
+cache reads were billed at about a tenth of the base input price). The total is still proportional to
+c × d, but with a constant roughly an order of magnitude smaller, so the per-chunk output and the chunk
+itself become a large share of the bill. Caches expire after minutes, so process one document's chunks
+back to back. The post's own estimate was roughly one dollar per million document tokens with caching; treat the exact figure as model- and
 pricing-dependent, but the order of magnitude is what makes "an LLM call per chunk" acceptable.
 
 ### What was reported
@@ -139,11 +143,13 @@ chunk = "The company's revenue grew by 3% over the previous quarter."
 - Embedding only the context or only the chunk instead of the concatenation; the symptom is no measurable
   improvement after a costly ingestion run.
 - Applying contexts to the dense index but not to BM25; the symptom is that exact-term queries naming the
-  entity still miss, and roughly half the reported gain is absent.
+  entity still miss, and part of the reported gain is absent (a 35% versus 49% failure reduction in the
+  post).
 - Contexts that are too long; the symptom is that every chunk from one document looks alike and retrieval
   returns clusters of neighbours from the same document instead of the specific passage.
-- Running ingestion without prompt caching; the symptom is an ingestion bill many times higher than
-  expected, scaling with document length squared.
+- Running ingestion without prompt caching; the symptom is an ingestion bill several times to an order
+  of magnitude higher than the cached estimate, growing with chunks × document length, which is roughly
+  document length squared.
 - Documents longer than the model's context being silently truncated; the symptom is contexts for late
   chunks that refer to the wrong section or entity.
 - Displaying the contextualised text as a quotation; the symptom is "cited" sentences that do not exist in
@@ -179,7 +185,9 @@ quarter live elsewhere in the document, so BM25 has no matching terms and the em
 revenue-growth vector shared with every other filing. Fix at ingestion: for each chunk, have an LLM read
 the whole filing and write a one- or two-sentence context naming the company, period and section;
 prepend it to the chunk; embed and BM25-index the concatenation; keep the original chunk for citations.
-Use prompt caching with the document as the fixed prefix so cost is roughly linear in document tokens.
+Use prompt caching with the document as the fixed prefix, so the repeated document reads are billed at
+a fraction of the normal input rate (still proportional to chunks × document length, but roughly an
+order of magnitude cheaper).
 Costs: an LLM call per chunk at ingestion, document-level re-indexing on edits, and the risk of a wrong
 generated context, so validate on a golden set and try title-plus-heading prefixes first as the cheap
 baseline.
@@ -198,8 +206,9 @@ baseline.
 - [ ] Sending only the chunk and asking the model to infer the document
 - [x] Prompt caching the document as a fixed prefix so each call pays mainly for the chunk and the output
 - [ ] Batching all chunks into a single call per document
-> Without caching, cost scales with chunks × document length; with the document cached as a prefix, each
-> call re-reads it at a much lower rate, which is what turns a quadratic bill into a near-linear one.
+> Without caching, cost scales with chunks × document length at the full input price; with the document
+> cached as a prefix, each call re-reads it at a fraction of that price, cutting the dominant term by
+> roughly an order of magnitude. Batching all chunks into one call risks dropped or misaligned outputs.
 
 ### Q: Every chunk from a given document is now retrieved together and the specific passage ranks no higher than its neighbours. What most likely went wrong?
 - [ ] The reranker was trained on a different domain

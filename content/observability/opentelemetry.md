@@ -5,7 +5,7 @@ name: OpenTelemetry
 kind: tool
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - observability/tracing
   - observability/spans
@@ -75,11 +75,16 @@ nested `start_as_current_span` parents itself automatically. Across processes, a
 W3C `traceparent` header, `00-<32 hex trace id>-<16 hex parent span id>-<2 hex flags>`, plus optional
 `tracestate` and `baggage`, into outgoing requests, and the server side extracts it and continues the
 trace. Because the format is a W3C standard, a Go gateway, a Python service and a Node tool server join one
-trace without agreeing on anything else.
+trace without agreeing on anything else. Queues are the awkward boundary: the producer injects
+`traceparent` into message headers, and the consumer either continues that trace as a child or, when one
+consumer span processes a batch of messages from many traces, records **span links** to each of them,
+because a span can have only one parent.
 
 ### Sampling
 **Head sampling** decides at the root: `ParentBased(TraceIdRatioBased(p))` keeps a fraction of traces and
-records the decision in the trace flags so every child follows it. It is cheap and consistent but blind,
+records the decision in the trace flags so every child follows it. The ratio sampler derives its decision
+deterministically from the trace id rather than from a random draw, so two services configured with the
+same ratio agree about the same trace even without seeing each other's flags. It is cheap and consistent but blind,
 since it decides before anyone knows the trace will error or take 30 seconds. **Tail sampling** keeps whole
 traces that match a policy (error status, latency over a threshold, a tenant attribute) and requires a
 Collector that buffers complete traces, which in turn requires every span of a trace to reach the same
@@ -90,14 +95,18 @@ A standalone process with **receivers** (OTLP, Prometheus scrape, …), **proces
 memory limiter, attribute redaction, filtering, tail sampling, transforms) and **exporters** (OTLP to one
 or several backends, Prometheus, files). It exists so that changing backends, scrubbing PII, sampling at
 the tail and fanning out to two systems are configuration changes, not application redeploys. Typical
-layout: an agent per host or pod plus a central gateway tier.
+layout: an agent per host or pod (cheap batching, redaction, host metadata) plus a central gateway tier.
+Tail sampling has to live in the gateway tier, because an agent only sees the spans emitted on its own host
+and a trace that crosses five services is never complete there.
 
 ### Semantic conventions and generative AI
 Attribute names are standardised so dashboards work across services: `http.request.method`,
 `db.system`, `server.address`. The **GenAI semantic conventions** add `gen_ai.provider.name`
 (formerly `gen_ai.system`), `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`,
 `gen_ai.usage.output_tokens` and `gen_ai.operation.name` with values such as `chat`, and recommend the span
-name `{operation} {model}`. Prompt and completion content is opt-in (off by default) because it is
+name `{operation} {model}`. They also define client metrics, notably a `gen_ai.client.token.usage`
+histogram and a `gen_ai.client.operation.duration` histogram, so token and latency dashboards can be built
+from metrics without querying spans. Prompt and completion content is opt-in (off by default) because it is
 sensitive and large. At the time of writing these conventions are still marked experimental and names have
 already changed more than once (the token-count attributes were renamed from `prompt`/`completion` to
 `input`/`output`, then `gen_ai.system` became `gen_ai.provider.name`), so pin your instrumentation library
@@ -155,6 +164,14 @@ def answer(question: str) -> str:
 # provider.force_flush(); provider.shutdown()
 ```
 
+What crosses the wire is small. If `retrieve` called a vector service over instrumented HTTP, the request
+would carry a header such as `traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`: version
+`00`, the 32-hex trace id shared by all three spans, the 16-hex id of the calling span, and flags `01`
+meaning "sampled". Three quarters of requests carry `-00` instead; downstream services see that and record
+nothing, which is how one root decision keeps a trace all-or-nothing. On the export side, the batch
+processor holds finished spans in a bounded queue and ships them every few seconds or when a batch fills;
+if the queue overflows under load it drops spans rather than block your request.
+
 If an instrumented HTTP client makes the model call, the `CLIENT` span and `traceparent` injection appear
 without the manual span; you would keep the GenAI attributes on a wrapping span or let an LLM
 instrumentation library set them.
@@ -183,6 +200,9 @@ instrumentation library set them.
   explosion in Prometheus or a surprise bill, followed by slow dashboards.
 - Instrumenting after the client library was imported or instantiated, when the instrumentor patches at
   instrument time; the symptom is HTTP spans present but model-call spans absent.
+- Wrapping a streaming model call in a span that ends when the call returns the stream object; the
+  symptom is model spans of a few milliseconds and no token counts while users wait ten seconds. End the
+  span when the stream is exhausted and record first-token time as an event or attribute.
 - Building dashboards on experimental GenAI attribute names without pinning versions; the symptom is token
   and cost panels going blank after a dependency upgrade renames an attribute.
 

@@ -5,6 +5,7 @@ name: Agent memory (short-term, long-term, episodic)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agents/memory-retrieval-update-deletion-policies
   - agents/context-compaction-summarization
@@ -36,7 +37,8 @@ day. Inside one session the problem is the mirror image: the context fills with 
 the window is full something must go, so the agent "forgets" the start of the task it is still doing.
 
 The naive fix is to keep everything in context. It fails on three axes. Cost: every token is re-read
-on every step, so a 100k-token history makes each step expensive. Capacity: the window is finite and
+on every step, so a 100k-token history makes each step expensive (prompt caching discounts a repeated
+prefix, but cached tokens are still billed and still add latency). Capacity: the window is finite and
 long sessions exceed it. Quality: attention over very long contexts is uneven, so a relevant fact in
 the middle of a huge history is attended to less reliably than the same fact placed near the question.
 
@@ -92,17 +94,17 @@ so recent and significant events outrank old trivia.
 ### Model-managed memory
 MemGPT-style designs expose memory operations as tools: the model itself decides to save a fact,
 search archival memory or page old context out. This works *because* the model knows what it will
-need, but it costs tool calls and is only as reliable as the model's judgement; most systems combine a
-small model-managed "core" block with automatic extraction and retrieval.
+need, but it costs tool calls and is only as reliable as the model's judgement; many production
+systems combine a small model-managed "core" block with automatic extraction and retrieval.
 
 ## Example
 A minimal memory layer: extract facts at session end, store them with embeddings and timestamps,
 retrieve by cosine similarity weighted by recency, and inject them into the next session's prompt.
 
 ```python
-import time, json, numpy as np
+import time, numpy as np
 
-store = []                                       # [{text, vec, ts, source, kind}]
+store = []                                       # [{user, text, vec, ts, source, kind}]
 
 def embed(text):                                 # any embedding model; returns unit vector
     v = np.asarray(embedding_model(text), dtype=float)
@@ -113,8 +115,11 @@ def write_memories(user_id, transcript):
                      f"environment as a JSON list of short statements. Ignore chit-chat.\n{transcript}")
     for f in facts:
         vec = embed(f)
-        if any(float(vec @ m["vec"]) > 0.92 for m in store if m["user"] == user_id):
-            continue                             # near-duplicate: handled properly by an update policy
+        mine = [m for m in store if m["user"] == user_id]
+        near = max(mine, key=lambda m: float(vec @ m["vec"]), default=None)
+        if near is not None and float(vec @ near["vec"]) > 0.92:   # threshold is model-specific
+            near.update(text=f, vec=vec, ts=time.time())  # crude "newest wins" supersede
+            continue
         store.append({"user": user_id, "text": f, "vec": vec, "ts": time.time(),
                       "source": "user_conversation", "kind": "semantic"})
 
@@ -135,8 +140,12 @@ system = "You are a deployment assistant.\n\nKnown about this user (may be stale
          + recall("u42", "help me ship the payments service")
 ```
 
-The weights and half-life are illustrative; the shape to copy is scoping by user before scoring,
-blending relevance with recency, and surfacing timestamps so the model can discount old facts.
+The weights, the 0.92 threshold and the half-life are illustrative; the shape to copy is scoping by
+user before scoring, blending relevance with recency, and surfacing timestamps so the model can discount
+old facts. Note the write path: "plan is Pro" and "plan is Basic" embed as near-duplicates, so simply
+*skipping* near-duplicates would keep the stale fact and drop the new one. The crude fix here lets the
+newest statement supersede; the update-policy lesson replaces it with an explicit add/update/ignore
+decision and keeps the superseded value for audit.
 
 ## Trade-offs
 - Externalising memory keeps the context small and cheap, but every retrieval is a chance to miss the

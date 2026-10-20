@@ -5,6 +5,7 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
+status: fact-checked
 related:
   - agents/model-context-protocol
   - agents/a2a-protocol
@@ -22,10 +23,10 @@ sources:
 ---
 
 ## TL;DR
-MCP defines how a host talks to a tool server (JSON-RPC over stdio or Streamable HTTP) but a tool
-call is only safe if the server knows *who* is asking and *what* they may do. For local stdio servers
-the operating-system process boundary is the security model. For remote HTTP servers the spec layers
-OAuth 2.1 on top: discovery, PKCE, audience-bound tokens, scopes. The model is never the trust
+MCP defines how a host talks to a tool server (JSON-RPC over stdio or Streamable HTTP), but a tool
+call is only safe if the server knows *who* asks and *what* they may do. For local stdio servers
+the operating-system process boundary is the security model. For remote HTTP servers the spec defines
+an optional OAuth 2.1 layer: discovery, PKCE, audience-bound tokens, scopes. The model is never the trust
 boundary; a prompt-injected agent will ask for anything, so every check must live below it.
 
 ## Why it exists
@@ -68,15 +69,21 @@ validate the `Origin` header on every request, and bind local servers to `127.0.
 hostname at `127.0.0.1` and have the browser call a local MCP server that trusts localhost.
 
 ### Authentication: proving who is calling
-Since the 2025-03-26 revision (tightened in 2025-06-18), an HTTP MCP server is an **OAuth 2.0
-resource server**. The flow a compliant client follows:
+Authorization is formally *optional* in MCP, but when an HTTP server implements it the spec is precise.
+The 2025-03-26 revision first introduced OAuth 2.1-based authorization (and let the MCP server act as its
+own authorization server); the 2025-06-18 revision restructured it so the MCP server is purely an
+**OAuth 2.0 resource server** and the authorization server is a separate, discoverable party. The
+flow a compliant client follows (spec details move between revisions, so check the one you target):
 
 1. Call the server without a token. It replies `401` with a `WWW-Authenticate` header pointing at its
    **protected resource metadata** (RFC 9728, served at `/.well-known/oauth-protected-resource`).
 2. That document lists the authorization server(s) that can issue tokens for this resource. The client
    fetches the authorization server's metadata (RFC 8414) to learn its endpoints.
-3. If the client has no client ID there, it uses **dynamic client registration** (RFC 7591). This is
-   needed *because* an agent host cannot be pre-registered with every MCP server on the internet.
+3. If the client has no client ID there, it needs a way to get one without manual setup, *because* an
+   agent host cannot be pre-registered with every MCP server on the internet. The 2025-06-18 revision
+   recommends **dynamic client registration** (RFC 7591); the 2025-11-25 revision adds **Client ID
+   Metadata Documents** (the client ID is an HTTPS URL the authorization server fetches) as the
+   preferred option and keeps DCR as a fallback.
 4. The client runs the **authorization code flow with PKCE** (mandatory, since desktop hosts are public
    clients that cannot keep a secret) and passes the server's canonical URI as the `resource`
    parameter (RFC 8707).
@@ -109,7 +116,8 @@ redirect without a fresh consent screen. The spec's answer is to require user co
 registered client.
 
 ## Example
-A framework-agnostic ASGI middleware sketch that sits in front of a Streamable HTTP MCP endpoint. It
+A Starlette-style HTTP middleware sketch (register with `@app.middleware("http")` in FastAPI or
+Starlette, PyJWT for tokens) that sits in front of a Streamable HTTP MCP endpoint. It
 rejects bad origins, validates the bearer token's signature, issuer and audience, enforces a per-method
 scope, and attaches the authenticated subject so tool handlers never trust a model-supplied user ID.
 
@@ -142,17 +150,22 @@ async def mcp_auth(request, call_next):
                             audience=AUDIENCE, issuer=ISSUER)   # audience check is mandatory
     except jwt.PyJWTError as exc:
         return unauthorized(f"invalid token: {exc}")
-    body = await request.json()
-    needed = SCOPE_FOR.get(body.get("method"))
-    if needed and needed not in claims.get("scope", "").split():
-        return JSONResponse({"error": "insufficient_scope"}, status_code=403)
+    if request.method == "POST":                           # GET opens an SSE stream, no body
+        body = await request.json()
+        needed = SCOPE_FOR.get(body.get("method")) if isinstance(body, dict) else None
+        if needed and needed not in claims.get("scope", "").split():
+            return JSONResponse({"error": "insufficient_scope"}, status_code=403,
+                headers={"WWW-Authenticate": f'Bearer error="insufficient_scope", scope="{needed}"'})
     request.state.subject = claims["sub"]                  # tool handlers read this, not an argument
     request.state.tenant = claims.get("tenant")
     return await call_next(request)
 ```
 
-In production the middleware would also cache JWKS keys, check `exp` skew, and log the subject and
-method on every call so the audit trail names a person, not "the agent".
+`jwt.decode` already rejects expired tokens and `PyJWKClient` caches fetched keys; in production you
+would also discover the JWKS URL from the authorization server's metadata instead of hard-coding it,
+pass a small `leeway` for clock skew, and log the subject and method on every call so the audit trail
+names a person, not "the agent". (Reading the body in middleware is safe on current Starlette, which
+caches it for the endpoint; very old versions hung on that.)
 
 ## Trade-offs
 - OAuth 2.1 with discovery gives per-user identity, consent and revocation, but costs a browser-based
@@ -224,7 +237,8 @@ exchanged specifically for that upstream, logging the authenticated subject on e
 - [x] DNS rebinding, where a web page in the user's browser reaches the local server
 - [ ] Downgrade from Streamable HTTP to stdio
 > A malicious page can resolve its hostname to the user's machine and have the browser call the local
-> server, which trusts local traffic. Checking `Origin` and binding to loopback are the defenses.
+> server, which trusts local traffic. Validating `Origin` is the rebinding defense; binding to loopback
+> additionally stops other machines on the network from reaching the port at all.
 
 ### Q: Which statement about the stdio transport is correct?
 - [ ] It requires OAuth 2.1 with PKCE like any other MCP transport

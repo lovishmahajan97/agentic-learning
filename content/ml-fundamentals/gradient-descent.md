@@ -5,7 +5,7 @@ name: Gradient descent
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/loss-functions
   - ml-fundamentals/backpropagation
@@ -25,7 +25,8 @@ sources:
 ## TL;DR
 Gradient descent minimises a loss by repeatedly moving the parameters a small step against the
 gradient: θ ← θ − η∇L(θ). It is the only practical way to fit models with millions to billions of
-parameters, because the gradient costs about as much as a forward pass regardless of parameter count.
+parameters, because the gradient costs a small constant multiple of a forward pass regardless of
+parameter count.
 Stochastic (mini-batch) gradient descent uses a noisy estimate from a few examples, trading precision per
 step for many more steps per second, and that noise turns out to help rather than hurt.
 
@@ -40,7 +41,11 @@ The gradient is the escape. A first-order Taylor expansion says L(θ + δ) ≈ L
 steps δ of a fixed small length, the one that decreases L the most points exactly along −∇L. Backpropagation
 delivers all P components of that direction in one backward pass costing roughly twice a forward pass. So
 each iteration buys a P-dimensional improvement direction for a constant factor over evaluating the loss
-once. Nothing else offers that ratio.
+once. Nothing else offers that ratio. Second-order methods look better on paper: Newton's step
+δ = −H⁻¹∇L rescales every curvature direction at once and removes the conditioning problem below. But
+the Hessian H has P² entries, 10¹⁸ for a billion parameters, and inverting it costs O(P³), so at scale
+second-order information is only ever approximated cheaply, which is what adaptive optimizers do with a
+per-parameter diagonal.
 
 Two problems remain. The approximation is local, so the step must be small enough for it to hold; that
 is the learning rate, and getting it wrong is the most common training failure. And computing the exact
@@ -75,7 +80,8 @@ Heavy-ball momentum keeps a running velocity: v ← μv + g, θ ← θ − ηv. 
 moving average of gradients. In a steep direction where the gradient flips sign every step (zig-zagging
 across a valley), successive terms cancel and the effective step shrinks; in a consistent direction they
 accumulate, up to a factor of 1/(1 − μ), ten times with μ = 0.9. The net effect is a smaller effective
-κ. Nesterov momentum evaluates the gradient at the look-ahead point θ − ημv; the practical difference is
+κ: on a quadratic, with η and μ tuned to the curvature range, the iterations needed scale with √κ instead
+of κ, so at κ = 10,000 the steps needed for a fixed reduction in error drop from order 10,000 to order 100. Nesterov momentum evaluates the gradient at the look-ahead point θ − ημv; the practical difference is
 usually small.
 
 ### Non-convexity

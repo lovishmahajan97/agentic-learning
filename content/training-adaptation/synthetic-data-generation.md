@@ -5,7 +5,7 @@ name: Synthetic data generation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/data-curation
   - training-adaptation/knowledge-distillation
@@ -173,6 +173,10 @@ print(f"kept {len(kept)}/{len(examples)}")
 ## Pitfalls
 - No verification step: the student learns the generator's errors as truth, so the symptom is a fine-tuned
   model that is confidently wrong in exactly the same places as the generator.
+- Letting a model-based verifier define "correct" without auditing its rejects: a round-trip or judge
+  filter keeps what the checker can already handle, so hard-but-valid examples are discarded and the set
+  drifts toward easy cases; the symptom is a high pass rate with little eval gain on the hardest real
+  inputs. Read the rejects, and rescue valid ones with a stronger checker or a human.
 - Low diversity: the same four names, the same opening sentence, the same structure; the symptom is a low
   distinct-n-gram ratio in the dataset and a model that handles the template and fails real inputs.
 - Evaluating on data from the same generator and prompt as the training set: the symptom is an eval score
@@ -212,7 +216,9 @@ schema, write a program that samples valid records for each type, and use a mode
 into realistic filled forms in several personas and styles, varying layout noise. The label is the sampled
 record, so it is correct by construction; a separate extraction pass must recover it exactly, and only
 round-trip successes survive. I would near-deduplicate, balance across form types, and keep the thirty
-human-labelled examples strictly as evaluation, never training. Trust comes from three measurements: the
+human-labelled examples strictly as evaluation, never training or few-shot prompts. Thirty examples
+cannot cover forty types, though, so I would ask the SMEs to label a handful more for each uncovered type,
+or report those types as unmeasured rather than averaging them away. Trust comes from three measurements: the
 round-trip pass rate per form type, SME review of a stratified sample of kept and rejected items, and the
 eval score on the thirty real examples, with any gap between synthetic and real scores treated as the
 pipeline's error bar, not noise.

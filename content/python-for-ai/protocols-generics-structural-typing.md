@@ -5,6 +5,7 @@ name: Protocols, generics and structural typing
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/type-hints
   - python-for-ai/dependency-injection-and-interface-boundaries
@@ -55,6 +56,7 @@ structurally by checkers: any class with `__iter__` is an `Iterable`, no registr
 `Protocol` class lets you define your own such interfaces:
 
 ```python
+from collections.abc import Sequence
 from typing import Protocol
 class Embedder(Protocol):
     dim: int
@@ -62,9 +64,11 @@ class Embedder(Protocol):
 ```
 
 Any class with an `int` attribute `dim` and a compatible `embed` method is an `Embedder` to the
-checker. Compatibility is checked member by member, including parameter names, because a caller
-might pass `texts=` by keyword; declare parameters positional-only with `/` when names should not
-matter. The checker verifies the match at the point where an object is used as an `Embedder`, which
+checker. Compatibility is checked member by member: attribute types, then each method's parameter
+and return types. Parameter *names* are checker-dependent: pyright rejects an implementation that
+renames `texts`, because a caller might pass `texts=` by keyword, while mypy deliberately ignores
+positional parameter names when matching protocol methods. Declare parameters positional-only with
+`/` when names should not matter, and both checkers agree. The checker verifies the match at the point where an object is used as an `Embedder`, which
 is *why* errors show up at call sites rather than at the implementing class: the implementation
 never declared any intent. Adding `impl: Embedder = MyEmbedder()` in a test moves the error earlier.
 
@@ -114,7 +118,7 @@ stores, and a signature-preserving decorator. On Python 3.12+ the `Generic[T]` b
 by `class Index[T]:`.
 
 ```python
-import functools
+import functools, zlib
 from collections.abc import Callable, Sequence
 from typing import Generic, ParamSpec, Protocol, TypeVar, runtime_checkable
 
@@ -124,9 +128,13 @@ class Embedder(Protocol):
     def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 
 class HashEmbedder:                       # no inheritance from Embedder anywhere
-    dim = 8
+    dim = 16
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return [[float((hash(t) >> i) & 1) for i in range(self.dim)] for t in texts]
+        return [self._one(t) for t in texts]
+    def _one(self, text: str) -> list[float]:
+        v = [0.0] * self.dim              # bag of words; crc32 is stable across runs, hash() is not
+        for w in text.lower().split(): v[zlib.crc32(w.encode()) % self.dim] += 1.0
+        return v
 
 class OpenAIEmbedder:                     # wraps a vendor SDK; also structurally an Embedder
     dim = 1536
@@ -138,7 +146,9 @@ class OpenAIEmbedder:                     # wraps a vendor SDK; also structurall
 T = TypeVar("T")
 class Index(Generic[T]):
     def __init__(self, embedder: Embedder) -> None:
-        self.embedder, self.items, self.vecs = embedder, [], []
+        self.embedder = embedder
+        self.items: list[T] = []                    # annotated, or the checker sees list[Any]
+        self.vecs: list[list[float]] = []
     def add(self, item: T, text: str) -> None:
         self.items.append(item); self.vecs.append(self.embedder.embed([text])[0])
     def nearest(self, text: str) -> T:              # the checker knows this is a T
@@ -159,7 +169,8 @@ print(idx.nearest("answer"))                       # 42 (int, per the checker)
 print(isinstance(HashEmbedder(), Embedder))        # True: attribute presence only
 ```
 
-Change `nearest` to return `self.vecs[0]` and the checker reports `list[float]` is not `T`; pass
+Change `nearest` to return `self.vecs[0]` and the checker reports `list[float]` is not `T` (only
+because `self.vecs` is annotated; an unannotated `[]` would leak `Any` and hide the error); pass
 `idx: Index[int] = Index(object())` and it reports `object` is missing `embed`.
 
 ## Trade-offs
@@ -179,13 +190,14 @@ Change `nearest` to return `self.vecs[0]` and the checker reports `list[float]` 
 ## Pitfalls
 - Declaring an input as `list[Message]` and getting "incompatible type list[ToolMessage]" from
   callers; the cause is invariance of mutable containers, the fix is `Sequence[Message]`.
-- Implementing a Protocol method with a different parameter name (`def embed(self, docs)`) and
-  seeing "incompatible with protocol" errors; parameter names are part of the signature unless
-  declared positional-only.
+- Implementing a Protocol method with a different parameter name (`def embed(self, docs)`); pyright
+  reports it as incompatible with the protocol while mypy accepts it, so a team using both sees
+  CI disagree. Match the names or declare the protocol's parameters positional-only.
 - Relying on `isinstance(x, SomeProtocol)` to confirm a vendor object is safe to call; the check
   passes with the wrong signature and the failure appears later as a `TypeError` inside the call.
 - Using a bare `TypeVar` in a signature where it appears only once (`def f(x: T) -> None`); it
-  binds to nothing and checkers warn that it is meaningless, usually a sign `object` was intended.
+  it relates nothing to anything (pyright warns about exactly this), usually a sign `object` was
+  intended.
 - Writing a decorator typed `Callable[..., Any]` and wondering why mypy never catches wrong
   arguments to decorated LLM-call functions; the signature was erased.
 
@@ -216,7 +228,8 @@ you give up?
 **A:** Define `Retriever` as a `Protocol` with the `search` signature; the vendor class then
 satisfies it structurally with no wrapper, and the checker verifies the signature match at the
 call site. What you give up is the ABC's instantiation-time enforcement and any shared default
-methods, and you must make sure parameter names match or declare them positional-only. A common
+methods, and you should make parameter names match or declare them positional-only (pyright checks
+names; mypy does not). A common
 compromise is both: a Protocol for consumers to depend on, and an ABC that your own
 implementations inherit for shared behaviour, which still satisfies the Protocol.
 

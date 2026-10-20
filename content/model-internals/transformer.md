@@ -5,7 +5,7 @@ name: Transformer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - model-internals/attention-mechanism
   - model-internals/self-attention
@@ -62,9 +62,10 @@ sub-layers:
    different subspaces.
 2. **Feed-forward sub-layer (MLP).** Applied to every position independently with the same weights:
    `FFN(x) = W₂·act(W₁·x)`, with an inner width of about 4×d_model (or roughly 2.7× when a gated SwiGLU
-   with three matrices is used, as in Llama). Attention is linear in the values once the weights are
-   fixed, so the nonlinearity and most of the parameters live here; the MLP holds roughly two thirds of a
-   layer's weights.
+   with three matrices is used, as in Llama). Attention's only nonlinearity is the softmax over scores,
+   and its output is a weighted average of linearly projected values, so it can route and blend
+   information but cannot compute a new feature of a single token. That per-position computation, and
+   most of the parameters, live in the MLP; it holds roughly two thirds of a layer's weights.
 
 Each sub-layer is wrapped as `x = x + SubLayer(Norm(x))`. The residual connection exists because it gives
 gradients an identity path through 30–100 layers; the useful picture is a *residual stream* of width
@@ -73,6 +74,12 @@ d_model that each sub-layer reads from and writes a small update into. The origi
 (pre-norm) because it keeps the identity path clean and trains deep stacks without delicate warmup
 schedules. Llama-style models replace LayerNorm with RMSNorm, which drops the mean-centering step
 because it is cheaper and works as well.
+
+### Data flow with shapes
+For one sequence of *n* tokens: ids `[n]` → embedding `[n, d]` → *L* blocks, each mapping `[n, d]` to
+`[n, d]` (attention internally builds `[h, n, n]` scores; the MLP briefly widens to `[n, d_ff]`) →
+final norm `[n, d]` → LM head `[n, V]`. Because every block preserves the shape, depth is just a loop,
+and every block can read and write the same residual stream.
 
 ### The head
 After the last block: a final norm, then a linear map from d_model to the vocabulary size (the LM head,
@@ -97,8 +104,10 @@ Per layer with hidden size *d*: the four attention projections cost 4d² paramet
 a SwiGLU MLP costs 3·d·d_ff. For Llama-2-7B (d = 4096, L = 32, d_ff = 11008, vocab 32,000): attention
 67.1M and MLP 135.3M per layer, 202.4M × 32 = 6.48B, plus two untied 131M embedding matrices, ≈ 6.74B.
 Forward compute is about 2 FLOPs per parameter per token (each weight takes part in one
-multiply-accumulate) plus an attention-score term of roughly 4·n·d per layer per token that stays
-small until *n* approaches *d*. Hence the rules of thumb: inference ≈ 2N FLOPs per token, training ≈ 6N
+multiply-accumulate) plus an attention-score term of roughly 4·n·d per layer per token (QKᵀ and AV
+against *n* earlier positions). Against a standard block's 12d² weights, that is 24d² versus 4·n·d, so
+the attention term reaches a sixth of the weight FLOPs at n = d and equals them at n ≈ 6d, about 24k
+tokens for d = 4096. Hence the rules of thumb: inference ≈ 2N FLOPs per token, training ≈ 6N
 per token (forward plus a backward that costs about twice the forward). These two numbers let you
 estimate cost before touching a GPU.
 
@@ -232,5 +241,5 @@ encoder–decoder processes the input once and cross-attends to it cheaply from 
 - [ ] About 6N
 - [ ] About N²
 > Every weight participates in one multiply-accumulate per token, which is two FLOPs, giving ≈2N; the
-> attention-score term adds little until context approaches the hidden size. 6N is the training
-> estimate, which includes the backward pass.
+> attention-score term (about 4·n·d per layer) stays minor until context is several times the hidden
+> size. 6N is the training estimate, which includes the backward pass.

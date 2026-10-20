@@ -5,7 +5,7 @@ name: Multi-head attention
 kind: concept
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - model-internals/self-attention
   - model-internals/attention-mechanism
@@ -45,8 +45,10 @@ could be parallel and deepens the network. Widening d_k does not help at all, be
 yields one weighting. The transformer paper's answer was to project the input into *h* = 8 subspaces of
 64 dimensions each, attend independently in each, concatenate the eight 64-dimensional outputs back to
 512, and mix them with an output projection. Since each head's score computation costs n²·d_k and
-h·d_k = d_model, the total matches a single full-width head, and the paper found that several heads with
-the same parameter budget beat one head measurably. The design has survived unchanged in its essentials.
+h·d_k = d_model, the total matches a single full-width head. The paper's ablation found that one head
+at the same budget was measurably worse, and also that quality dropped again with too many heads, which
+is the first hint that the split is a trade-off rather than "more is better". The design has survived
+unchanged in its essentials.
 
 ## How it works
 ### Shapes
@@ -59,7 +61,9 @@ over the head axis does all heads in one kernel. The heads are a *view* of one b
 small modules.
 
 Typical sizes: d_k = 64 in the 2017 paper; 128 in Llama-2-7B (4096 / 32), Llama-3-8B and most current
-open models, partly because fused attention kernels are tuned for head dimensions of 64, 128 and 256.
+open models. Fused attention kernels support a bounded set of head dimensions (FlashAttention-2 goes up
+to 256) and are most heavily exercised and tuned at 64 and 128, which is part of why designers choose
+d_k first and derive *h* from it.
 
 ### Why the output projection
 Concatenation only lays the heads' outputs side by side. Without `W_O`, head *i* could write only into
@@ -73,8 +77,8 @@ FLOPs are h × 2·n²·d_k = 2·n²·d, again independent of *h*. Three things d
 - the materialized attention-probability tensor, `[B, h, n, n]`, grows linearly with *h*; at h = 32,
   n = 8,192, fp16 it is about 4.3 GB per layer per sequence, which is why fused kernels that never
   materialize it matter;
-- the rank of each head's attention pattern is bounded by d_k, so more heads means each is individually
-  weaker;
+- each head's score matrix `Q_i·K_iᵀ` is `[n, n]` but has rank at most d_k (the low-rank bottleneck
+  Bhojanapalli et al. analyse), so more, thinner heads means each can express less intricate patterns;
 - the KV cache per token per layer is 2·(number of KV heads)·d_k, which equals 2d for full multi-head
   attention and is only reduced when KV heads are shared, the subject of grouped-query attention.
 
@@ -126,15 +130,15 @@ for h in (1, 8, 64):
     y, attn = m(x)
     print(f"h={h:2d} head_dim={512 // h:3d} params={sum(p.numel() for p in m.parameters()):,} "
           f"attn={tuple(attn.shape)} out={tuple(y.shape)}")
-# h= 1 head_dim=512 params=1,048,576 attn=(2, 1, 10, 10)  out=(2, 10, 512)
-# h= 8 head_dim= 64 params=1,048,576 attn=(2, 8, 10, 10)  out=(2, 10, 512)
+# h= 1 head_dim=512 params=1,048,576 attn=(2, 1, 10, 10) out=(2, 10, 512)
+# h= 8 head_dim= 64 params=1,048,576 attn=(2, 8, 10, 10) out=(2, 10, 512)
 # h=64 head_dim=  8 params=1,048,576 attn=(2, 64, 10, 10) out=(2, 10, 512)
 ```
 
 ## Trade-offs
-- More heads give more parallel relations per layer, but each head's attention matrix has rank at most
-  d_k, so past a point extra heads buy diversity at the price of per-head expressiveness; most current
-  models settle at d_k = 128.
+- More heads give more parallel relations per layer, but each head's score matrix has rank at most
+  d_k, so past a point extra heads buy diversity at the price of per-head expressiveness (the 2017
+  ablation saw quality fall at 32 heads of width 16); most current models settle at d_k = 128.
 - Same FLOPs and parameters as a single wide head, yet the attention-probability tensor is *h* times
   larger; this is harmless with fused kernels and a memory wall without them.
 - Heads shard across GPUs with no communication inside attention, which makes tensor parallelism
@@ -147,9 +151,9 @@ for h in (1, 8, 64):
 - Reshaping `[B, n, h·d_k]` straight to `[B, h, n, d_k]` without the transpose, so heads mix positions
   instead of channels; the symptom is a model that trains without error but learns slowly and produces
   incoherent output.
-- Picking a head dimension the attention kernels are not tuned for (anything outside 64/128/256, or
-  not a multiple of 8); the symptom is a silent fall-back to a slow path and throughput several times
-  lower than the same model at d_k = 128.
+- Picking a head dimension the fused kernels do not support (above 256, or not a multiple of 8 for
+  PyTorch's flash backend); the symptom is a silent fall-back to the math path, attention memory that
+  grows with n² and much lower throughput. Force the backend in a test to make it fail loudly.
 - Leaving out `W_O`, or applying it per head; the symptom is subtle, usually that adding heads stops
   helping because they cannot combine.
 - Explaining a prediction with one head's attention map; the symptom is contradictory stories from
@@ -180,8 +184,8 @@ parameter count, the FLOPs, the attention memory and the per-head expressiveness
 the same matrices. FLOPs stay the same because h × 2·n²·d_k = 2·n²·d regardless of the split. The
 materialized attention tensor `[B, h, n, n]` grows four times, from 8 to 32 n×n maps, which matters if
 you use a kernel that writes it to memory and is irrelevant with FlashAttention. Each head's d_k drops
-from 512 to 128, so each attention pattern is lower rank and individually less expressive, but there are
-four times as many of them. The KV cache per token is 2d either way for full multi-head attention; it
+from 512 to 128, so each head's score matrix is capped at rank 128 instead of 512 and each pattern is
+individually less expressive, but there are four times as many of them. The KV cache per token is 2d either way for full multi-head attention; it
 only shrinks if you reduce KV heads through GQA, which the question did not do.
 
 ## Quiz

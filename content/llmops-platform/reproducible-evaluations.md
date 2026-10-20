@@ -5,6 +5,7 @@ name: Reproducible evaluations
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - llmops-platform/experiment-tracking
   - llmops-platform/evaluation-frameworks
@@ -51,7 +52,8 @@ noise in what cannot, and recording both.
 ## How it works
 ### Three levels, and which one you actually need
 *Bit-exact* reproduction (identical outputs) is achievable with locally served open-weight models at
-temperature zero with fixed batching, and rarely through a hosted API. *Statistical* reproduction (the
+temperature zero with fixed batching and deterministic kernels (at some throughput cost), and rarely
+through a hosted API. *Statistical* reproduction (the
 same score distribution within a measured noise band) is the practical target for every decision eval.
 *Re-derivable* (anyone can reconstruct the run from its manifest, even if the provider has since changed)
 is the minimum bar for any eval that is cited in a release.
@@ -151,8 +153,8 @@ def comparable(a: dict, b: dict) -> tuple[bool, dict]:
   delta but breaks every absolute floor in the gate.
 - Datasets referenced by file name; the symptom is two runs "on golden.jsonl" disagreeing on the item count.
 - Timeouts counted as zero scores; the symptom is eval scores that correlate with the provider's status page.
-- Assuming temperature zero means deterministic; the symptom is a bug report that one to a few percent of
-  outputs differ between identical runs, filed as a regression.
+- Assuming temperature zero means deterministic; the symptom is a bug report that some outputs differ
+  between identical runs (how many depends on the provider, output length and load), filed as a regression.
 - Comparing runs scored by different judge versions; the symptom is a "regression" that vanishes when both
   runs are re-scored from stored outputs with the same judge.
 
@@ -183,7 +185,8 @@ noise floor was ever measured. Three weeks is long enough for the provider, the 
 have moved, so the 0.05 may belong to any of them. Then run champion and candidate side by side now, with
 manifests identical except for the prompt version, cache disabled, three repeats each, paired on identical
 items, and report the mean difference with a confidence interval. If the interval excludes zero and the
-delta exceeds the measured floor, the improvement is real; otherwise it is not yet a result.
+delta exceeds the measured floor, treat the improvement as real (and confirm it on the slices that matter);
+otherwise it is not yet a result.
 
 ## Quiz
 ### Q: Why must the judge model's snapshot be part of the eval manifest?

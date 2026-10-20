@@ -5,6 +5,7 @@ name: Secrets management
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agent-runtime-architecture/secrets-and-credential-isolation
   - backend-fundamentals/oauth-2-0-oidc
@@ -35,7 +36,8 @@ LLM, an exception trace that logs the request headers, a notebook checked into g
 the environment. For AI teams the stakes are specific: a model-provider key is a billing key, and keys
 pushed to public repositories are routinely found and abused by scanners within minutes (illustrative;
 the exact window varies), turning into unexpected bills, exhausted quotas and rate limits for your real
-traffic. Most provider keys are also organisation-wide by default, so one leak exposes every project.
+traffic. Unless you deliberately create narrower project- or workspace-scoped keys, a provider key often
+reaches a whole organisation's quota and data, so one leak exposes every project.
 
 The naive answers each fail in a specific way. Environment variables are a delivery mechanism, not a
 store: they are inherited by every child process, readable from `/proc/<pid>/environ`, and dumped into
@@ -57,19 +59,22 @@ have is one you never rotate or leak.
 
 ### 2. Store in a manager backed by a KMS
 Vault, AWS Secrets Manager or Parameter Store, GCP Secret Manager and Azure Key Vault all do the same
-core job: values are encrypted with a data key, the data key is encrypted by a hardware-backed master
-key the service never exposes (envelope encryption), access is an IAM policy per identity per secret
-path, every version is kept, and every read is audited. Kubernetes `Secret` objects are *not* this:
+core job: values are encrypted with a data key, the data key is encrypted by a root key the service
+never exposes (envelope encryption; the cloud services hold it in an HSM-backed KMS, while Vault
+protects it through its seal, which can itself be a cloud KMS or HSM), access is an IAM policy per
+identity per secret path, recent versions are kept for rollback, and every read is audited. Kubernetes `Secret` objects are *not* this:
 they are base64-encoded, stored in etcd unencrypted unless an `EncryptionConfiguration` with a KMS
-provider is enabled, and readable by anyone with `get secrets` in the namespace. Treat them as the last
+provider is enabled, and readable by anyone with `get secrets` in the namespace, and in effect by
+anyone who can create a Pod there, since a Pod can mount any Secret in its namespace. Treat them as the last
 hop, populated from a real manager by the External Secrets Operator, the Secrets Store CSI driver or a
 Vault agent sidecar.
 
 ### 3. Authenticate the workload: the secret-zero problem
 To fetch secrets a workload needs a credential, and if that credential is a static key you have gained
 nothing. The way out is identity that the platform can attest without a stored secret: an EC2 instance
-profile; IAM Roles for Service Accounts or Pod Identity on EKS, where the pod's projected service-account
-token is exchanged for a role via OIDC; GKE Workload Identity; Azure managed identity; Vault's Kubernetes
+profile; on EKS, IAM Roles for Service Accounts (the pod's projected service-account token is
+exchanged for a role via OIDC federation) or EKS Pod Identity (a node agent exchanges the same token
+through the EKS Auth API); GKE Workload Identity; Azure managed identity; Vault's Kubernetes
 and JWT auth methods; and in CI, GitHub Actions' `id-token: write`, which lets a job present a short-lived
 OIDC token that a cloud role trusts for a specific repository and branch. Trust now lives in
 configuration (`sub = repo:org/app:ref:refs/heads/main`) instead of in a key, so keep those conditions
@@ -110,6 +115,7 @@ TTL so rotations take effect without restarts, and installs a logging filter tha
 
 ```python
 import logging, os, time, boto3
+from requests import post
 
 class Secrets:
     """No static credential anywhere: boto3 picks up the IAM role from the environment (IRSA / instance profile)."""
@@ -140,7 +146,9 @@ class Redact(logging.Filter):
 
 secrets = Secrets()
 LLM_KEY = secrets.get("prod/llm-gateway/api-key")        # per-service key with a spend cap
-logging.getLogger().addFilter(Redact([LLM_KEY]))
+logging.basicConfig(level=logging.INFO)
+for h in logging.getLogger().handlers:                   # on handlers: logger filters skip propagated records
+    h.addFilter(Redact([LLM_KEY]))                       # re-register with the new value after a rotation
 
 def call_provider(payload):
     key = secrets.get("prod/llm-gateway/api-key")        # cheap: served from cache until ttl

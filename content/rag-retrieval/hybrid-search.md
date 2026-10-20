@@ -5,6 +5,7 @@ name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - rag-retrieval/dense-vs-sparse-retrieval
   - rag-retrieval/bm25-internals
@@ -36,8 +37,8 @@ cannot answer from a chunk that was never retrieved, so first-stage recall is th
 downstream; hybrid raises that ceiling cheaply.
 
 The naive merge, "concatenate both lists and sort by score", fails because the scores are
-incommensurable. A BM25 score is an unbounded sum that grows with query length and term rarity, routinely
-in the range of 5 to 30 for a multi-term query; a cosine similarity sits in a narrow model-specific band.
+incommensurable. A BM25 score is an unbounded sum that grows with query length and term rarity, often
+in the single or double digits for a multi-term query (the exact range depends on corpus and engine); a cosine similarity sits in a narrow model-specific band.
 Sorting them together just returns the BM25 list followed by the dense list. Even normalizing each list
 to [0, 1] per query is fragile: the top BM25 hit for a one-word query may be a weak match normalized to
 1.0. Fusion methods exist to combine evidence from rankers that do not share a scale.
@@ -63,8 +64,10 @@ k damps the top: without it, rank 1 would be worth 1.0 and rank 2 only 0.5, whic
 top hit dominate. With k = 60, rank 1 scores 1/61 ≈ 0.0164 and rank 10 scores 1/70 ≈ 0.0143, so a
 document that is rank 10 in both arms (≈ 0.0286) beats one that is rank 1 in a single arm (≈ 0.0164).
 That is the design intent: agreement between retrievers is stronger evidence than a confident vote from
-one. RRF needs no tuning, no normalization and no knowledge of the score scales, which is why Elasticsearch,
-OpenSearch, Weaviate and most RAG frameworks ship it and many use it as the default. Its weakness is that
+one. RRF needs no tuning, no normalization and no knowledge of the score scales, which is why most engines
+with hybrid search offer it (Elasticsearch, OpenSearch, Qdrant and Weaviate among them, in recent versions)
+and many RAG frameworks use it by default. Defaults differ and change between releases, so check yours:
+Weaviate, for example, moved its default to a normalized score fusion. Its weakness is that
 it throws away magnitude: a dense hit at cosine 0.92 and the next at 0.55 are treated as adjacent ranks.
 
 ### Weighted score fusion
@@ -79,8 +82,10 @@ Elasticsearch's RRF and weighted retrievers.
 ### Where the arms live
 - **One engine, two indexes.** Elasticsearch and OpenSearch hold a BM25 field and a dense vector field in
   the same document, run both queries and fuse server-side. Postgres with pgvector plus `tsvector` does
-  the same with two indexes and a SQL join plus RRF in the query. Qdrant and Weaviate store sparse vectors
-  (BM25 or learned sparse) beside dense ones.
+  the same with two indexes and a SQL join plus RRF in the query, with one caveat: Postgres's built-in
+  `ts_rank` is not BM25 (it has no IDF and no saturation in the BM25 sense), so a true BM25 arm needs an
+  extension that implements it. Qdrant stores sparse vectors (BM25-style or learned sparse) beside dense
+  ones, and Weaviate keeps a BM25 inverted index beside its vector index.
 - **Two engines.** A search engine for lexical, a vector database for dense, fused in the application.
   More moving parts and two consistency boundaries, but each engine is used for what it is best at.
 
@@ -181,13 +186,19 @@ summed, how RRF rewards agreement, and where the reranker sits.
 **Q:** You are adding BM25 to an existing dense-only RAG system in Postgres with pgvector. Describe the
 retrieval query, how you would merge the two result sets, what could go wrong with filters and deletes,
 and how you would prove the change helped.
-**A:** Add a `tsvector` column with a GIN index beside the existing vector column, and at query time run
+**A:** First, note that Postgres's native `ts_rank` is a term-frequency ranking without IDF, not BM25;
+either accept it as the lexical arm (often good enough for identifier matching, which is what the dense arm
+lacks) or install an extension that implements real BM25. With the native route, add a `tsvector` column
+with a GIN index beside the existing vector column, and at query time run
 two subqueries limited to the same tenant and document filters: one ordered by the full-text rank over
 the `tsvector`, one ordered by cosine distance on the embedding, each returning its top 50 with a row
 number. Join them on chunk id with a full outer join and compute reciprocal rank fusion, 1/(60 + rank)
 summed across arms, ordering by that sum and taking the top 10 for the reranker or the prompt. Because
 both arms live in one table, deletes and filters are naturally consistent, which is a real advantage over
-a separate search engine; the risk is forgetting to apply the same `WHERE` clause to both subqueries. To
+a separate search engine; the risks are forgetting to apply the same `WHERE` clause to both subqueries,
+and a selective filter starving the HNSW arm, since pgvector applies the filter after the graph search and
+can return fewer than 50 rows unless iterative index scans (pgvector 0.8 and later) are enabled. Also note
+the GIN index accelerates only the match; `ts_rank` is computed for every matching row before sorting. To
 prove it helped, run the labeled query set through dense-only and hybrid, compare recall@10 overall and
 per query type, inspect queries that regressed, and check p95 latency, since the second subquery adds
 time.

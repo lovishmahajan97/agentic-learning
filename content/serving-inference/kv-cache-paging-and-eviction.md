@@ -5,7 +5,7 @@ name: KV-cache paging & eviction
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/pagedattention
   - serving-inference/kv-cache-memory-estimation
@@ -78,12 +78,18 @@ When the free list is empty and a running sequence needs a new block, something 
 at the granularity of whole sequences because a sequence needs all of its blocks to take even one step;
 freeing half of one helps nobody. Two mechanisms:
 - **Recomputation.** Free the victim's blocks entirely, put it back in the waiting queue, and when it is
-  readmitted re-run prefill over its prompt plus the tokens it had generated so far. Cheap to implement,
-  costs prefill compute, and it is the common default because recomputing is usually faster than moving
-  memory.
+  readmitted re-run prefill over its prompt plus the tokens it had generated so far. It needs no host
+  memory or transfer machinery, and the re-prefill is a compute-bound pass that batches well, which is
+  why it is vLLM's default.
 - **Swapping.** Copy the victim's blocks to pinned CPU memory and copy them back on resumption. Saves
-  compute but is limited by PCIe bandwidth and host memory, and becomes attractive mainly for very long
-  sequences whose prefill would be expensive.
+  compute but is limited by PCIe bandwidth and host memory, and copying many small blocks is less
+  efficient than one large transfer.
+
+Which is cheaper is arithmetic, not doctrine. Recompute costs roughly `2 × params` FLOPs per token plus
+an attention term that grows with the square of the sequence length; swap costs `bytes_per_token` over
+PCIe, twice. Swap therefore gains as sequences get long (the quadratic attention term) and as the cache
+per token gets small relative to the model (GQA, fp8 cache); recompute gains when the cache is fat (MHA)
+or the host link is slow or shared. Measure resume latency for both on your hardware before choosing.
 
 Victim selection is typically the most recently admitted sequences first (so that older requests, which
 have already consumed the most resources, finish), and preemption is all-or-nothing per sequence. The
@@ -93,7 +99,9 @@ request.
 ### Running out: evicting cached prefixes
 Blocks kept alive for prefix reuse have a reference count of zero and are reclaimable. The engine evicts
 them before preempting anything, usually in LRU order, so a prefix cache degrades gracefully under memory
-pressure: hit rate falls, nobody is preempted. SGLang organizes cached prefixes as a radix tree and evicts
+pressure: hit rate falls, nobody is preempted. Some deployments add a tier below VRAM, demoting evicted
+prefix blocks to host memory or local disk instead of discarding them, which turns a miss into a
+transfer rather than a full re-prefill; it pays when prefixes are long and reused across minutes. SGLang organizes cached prefixes as a radix tree and evicts
 leaves least-recently-used, which keeps shared ancestors (the system prompt) resident longest.
 
 ### Eviction inside a sequence
@@ -158,17 +166,24 @@ except MemoryError as e:
 ```
 
 With 4 blocks of 16 tokens the pool holds 64 tokens, and internal waste is the 8 empty slots in `a`'s
-last block, not 64 minus whatever a contiguous reservation would have pinned. If `a` had finished and its
-blocks had been released with a content hash, `b`'s next allocation would have evicted the
-least-recently-used of them instead of raising.
+last block. If `a` had finished and its blocks had been released with a content hash, `b`'s next
+allocation would have evicted the least-recently-used of them instead of raising.
+
+Scale the same bookkeeping to a real deployment: `max_model_len` 8,192, an 8B GQA model at 128 KB per
+token, and a request that stops after 600 tokens. A contiguous allocator reserves 8,192 slots (1 GB) for
+it; the request uses 600 (75 MB), so over 90% of the reservation is dead for the request's whole life.
+Paged, it holds 38 blocks = 608 slots, wasting 8. On a ~50 GB pool that is the difference between about
+50 resident requests and, if typical requests look like this one, several hundred, which is why paging
+is what made large continuous batches possible at all.
 
 ## Trade-offs
 - Smaller blocks cut internal waste and make prefix matching finer-grained, but enlarge block tables and
   reduce kernel efficiency; the balance flips toward larger blocks on long contexts with few sequences.
 - Optimistic admission packs many more sequences per GPU, but makes preemption possible; it flips to
   harmful when sequence lengths are long-tailed and preemption storms recompute more than they save.
-- Recomputation-based preemption is simple and usually fast, but wastes prefill compute; swapping saves
-  compute at the cost of PCIe traffic and host memory, which wins only for very long sequences.
+- Recomputation-based preemption is simple and batches well, but wastes prefill compute; swapping saves
+  compute at the cost of PCIe traffic and host memory, and wins as sequences grow long, because
+  re-prefill cost grows faster than linearly with length while transfer cost grows linearly.
 - Keeping finished prefixes resident raises hit rate but competes with live sequences for blocks; under
   sustained load the LRU eviction turns prefix caching into a weak benefit rather than a guarantee.
 - Token-level eviction inside a sequence bounds memory for unbounded streams but changes outputs; it
