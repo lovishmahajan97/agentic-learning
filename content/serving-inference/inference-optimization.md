@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 Inference optimization is the set of levers that make a fixed model cheaper or faster. Nearly all attack
-one of two bounds: decode is memory-bandwidth bound, prefill is compute bound. Learn the roofline that
-tells them apart, not a list of tricks.
+one of two bounds: decode is memory-bandwidth bound (each token re-reads weights and cache), prefill is
+compute bound. Learn the roofline that tells them apart.
 
 ## Why it exists
 - **GPUs have a fixed compute-to-bandwidth ratio.** An H100 does on the order of a thousand teraFLOPs of
@@ -233,18 +233,18 @@ for alpha in (0.5, 0.7, 0.8, 0.9):
 
 ## Pitfalls
 - **Tuning for batch throughput, shipping to an interactive product.** Symptom: good tokens/sec dashboards
-  alongside user complaints about slow typing.
+  alongside user complaints about slow typing. Fix: set a TPOT p95 target and tune batch limits against it.
 - **Speculative decoding under heavy load.** Symptom: throughput drops while per-request latency barely
-  improves, because verification steals compute from the batch.
+  improves, because verification steals compute from the batch. Fix: keep it to low-batch routes.
 - **Quantizing to 4-bit without a task-specific eval.** Symptom: a regression that only appears on the hard
-  tail of the evaluation set, weeks after deployment.
+  tail of the evaluation set, weeks after deployment. Fix: gate every quantized checkpoint on the task eval.
 - **Chasing kernel gains while prompts carry thousands of tokens of boilerplate.** Symptom: prefill
-  dominates TTFT no matter what engine flags change.
+  dominates TTFT no matter what engine flags change. Fix: trim the prompt or cache its shared prefix first.
 - **Reading vendor peak FLOPS as a throughput promise.** Symptom: utilization in the single digits and a
-  purchase order for faster GPUs that do not help decode.
+  purchase order for faster GPUs that do not help decode. Fix: compare GPUs on memory bandwidth for decode.
 - **Load-testing with the wrong length mix** (say, 500 in / 100 out when real traffic is 6k in / 800 out).
   Symptom: a lever that won in the benchmark does nothing, or harm, in production, because the benchmark
-  sat in a different regime.
+  sat in a different regime. Fix: replay length distributions sampled from production logs.
 
 ## When to use
 - **Use when a measured number misses a target:** TTFT above budget, TPOT making text feel slow, or cost

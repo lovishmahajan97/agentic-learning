@@ -281,7 +281,8 @@ print(bootstrap(judge, human, p_obs=0.82))     # roughly (0.75, 0.85) on this se
 - **Silent vendor upgrades of the judge.** Symptom: a step change in a historical trend chart on the day
   nothing in your system changed. Fix: pin the version and re-calibrate on change.
 - **Reporting only overall accuracy for pass/fail.** Symptom: a judge that "agrees 90%" yet catches few
-  of the failures, visible as a low TNR once human-fail items are counted separately.
+  of the failures, visible as a low TNR once human-fail items are counted separately. Fix: report TPR
+  and TNR side by side.
 - **Leaking metadata into the judge prompt** (model names, "v2", "improved"). Symptom: verdicts flip
   when the labels are swapped while the content stays the same. Fix: strip identifiers.
 - **Judging in one fixed order.** Symptom: a leaderboard that reorders when candidate A and B are

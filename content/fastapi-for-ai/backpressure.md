@@ -5,7 +5,7 @@ name: Backpressure
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/concurrency-limits
   - fastapi-for-ai/streamingresponse
@@ -113,7 +113,7 @@ Solid arrows are work flowing toward the slowest stage; dotted arrows are the ba
 flowing back, each ending in a deliberate wait, slowdown or refusal.
 
 ```mermaid
-flowchart LR
+flowchart TD
     C["Client"] -->|"POST /ingest"| E{"Admission check before body or model"}
     E -->|"full"| R["503 or 429 with Retry-After"]
     R -.->|"retry with backoff"| C
@@ -180,13 +180,16 @@ Numbers (illustrative):
 | Unbounded queue, 30-chunks-per-second burst | grows by 14 chunks every second |
 | After five minutes | about 4,200 chunks, a wait of over four minutes for the newest |
 
-Two details make the bound real:
+Two details make the bound real, plus two caveats:
 - **The worker catches errors,** *because* a worker task that dies on one bad chunk silently cuts drain
   rate, and the queue then fills at a load it used to handle.
 - **Admission checks the whole batch before enqueuing any of it,** so a client never gets a 503 for a
   request that was half accepted.
 - **Caveat:** this in-process queue is lost on restart; work that must survive belongs in a durable job
   queue with the same depth limit.
+- **Caveat:** `body: dict` means FastAPI has already read and parsed the body before the admission check.
+  That is fine for small JSON batches; for large uploads, admit before reading the body, as described
+  above.
 
 ### Runnable: bounded vs unbounded under the same burst
 Thirty arrivals per second against a 16-per-second stage for 300 seconds. Pure Python, no dependencies.

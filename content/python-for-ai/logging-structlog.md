@@ -142,12 +142,13 @@ def sample_debug(logger, method_name, event_dict):
 - **Join them:** put the trace ID in every log event, and do not use logs as your only latency metric.
 
 ## Diagram
-Follow one `log.info` call: request context is merged first, redaction runs before rendering, and the
-rendered line goes to stdout (or a queue) so a slow sink never blocks the event loop.
+Follow one `log.info` call: middleware has already called `clear_contextvars()` then `bind_contextvars(...)`,
+so request context is merged first; redaction runs before rendering; library records join at the renderer;
+and the rendered line goes to stdout (or a queue) so a slow sink never blocks the event loop.
 
 ```mermaid
-flowchart LR
-    M["Middleware: clear, then bind_contextvars request_id"] -.->|"ContextVar copied into each task"| C
+flowchart TD
+    M["Middleware binds request_id"] -.->|"ContextVar copied into each task"| C
     C["log.info llm_call with model, tokens"] --> E["Event dict"]
     E --> P1["merge_contextvars"]
     P1 --> P2["add_log_level and TimeStamper"]
@@ -279,15 +280,15 @@ None of these is possible from `"call failed after 3.2s"`.
 - **`logging.basicConfig` or handlers inside a library.** Symptom: duplicated lines, or log formats that
   change with import order in the host application. Fix: `NullHandler` only.
 - **Request context in a module-level global** instead of contextvars. Symptom: one user's lines carry
-  another user's `request_id` under concurrency.
+  another user's `request_id` under concurrency. Fix: `bind_contextvars`, cleared at request start.
 - **`log.error(str(e))` for exceptions.** Symptom: you know *that* something failed but have no traceback,
-  because only `log.exception` or `exc_info=True` captures it.
+  because only `log.exception` or `exc_info=True` captures it. Fix: `log.exception(...)` inside `except`.
 - **Raw prompts containing API keys, PII or retrieved documents.** Symptom: a security review finds customer
-  data in a log index half the company can query.
+  data in a log index half the company can query. Fix: a redaction processor; log a hash or prompt version.
 - **Logging inside `loop.run_in_executor` work.** Symptom: exactly the thread-pool lines lack `request_id`
   and cannot be joined to their request. Fix: `asyncio.to_thread`, or pass the ID explicitly.
 - **A log line per streamed token.** Symptom: volume and cost scale with output length and the useful summary
-  line drowns in noise.
+  line drowns in noise. Fix: one summary event per call with token counts and latency.
 
 ## When to use
 - **Use stdlib logging everywhere** as the routing backbone.

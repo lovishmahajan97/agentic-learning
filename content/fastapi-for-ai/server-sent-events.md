@@ -5,7 +5,7 @@ name: Server-Sent Events
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/streamingresponse
   - fastapi-for-ai/websockets

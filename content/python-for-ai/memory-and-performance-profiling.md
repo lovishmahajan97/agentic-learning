@@ -24,7 +24,7 @@ sources:
 
 ## TL;DR
 Profiling replaces guessing: CPU profilers show which functions consume time, memory profilers which lines
-allocated the bytes still alive. AI services mostly wait on network or GPU and hold native buffers Python
+allocated the bytes still alive. AI services often wait on network or GPU and hold native buffers Python
 cannot see, so pick the tool by the question.
 
 ## Why it exists
@@ -42,6 +42,8 @@ cannot see, so pick the tool by the question.
 
 ## How it works
 ### Pick the tool by the question
+Three axes decide it: CPU or wall time, Python heap or native memory, dev box or live process.
+
 | Question | Tool |
 |---|---|
 | CPU-bound or waiting? | `time.perf_counter()` vs `time.process_time()` |
@@ -259,17 +261,19 @@ Same facts as Check yourself, walked as a diagnosis.
 - **cProfile on an I/O-bound async service,** then "optimizing" the top entry. Symptom: the selector or event
   loop dominates and latency does not improve. Fix: measure wall vs CPU first, then trace.
 - **Treating high RSS after a peak as a leak.** Symptom: memory plateaus under steady load rather than
-  climbing, which points to fragmentation or a cache, not unbounded growth.
+  climbing, which points to fragmentation or a cache, not unbounded growth. Fix: judge the slope over hours,
+  and recycle workers if it plateaus.
 - **Measuring once, on a cold process.** Symptom: profiles dominated by imports, model loading and JIT or
-  CUDA initialization that never recur in steady state.
+  CUDA initialization that never recur in steady state. Fix: warm up, then profile steady-state traffic.
 - **Timing GPU code without `torch.cuda.synchronize()`.** Symptom: a forward pass "takes 0.2 ms" while an
-  innocent `.item()` or `.cpu()` a few lines later appears to take hundreds of milliseconds.
+  innocent `.item()` or `.cpu()` a few lines later appears to take hundreds of milliseconds. Fix: synchronize
+  before reading the clock, or use `torch.cuda.Event` timers.
 - **Stopping at tracemalloc's allocation line.** Symptom: a fix to the allocating code (a smaller string, a
   copy avoided) shrinks each leaked object but memory climbs at the same slope. Fix: find the retainer.
 - **Reading `nvidia-smi` as tensor usage.** Symptom: apparent "GPU leaks" that are the PyTorch caching
-  allocator holding reserved but free blocks.
+  allocator holding reserved but free blocks. Fix: read `torch.cuda.memory_allocated()` instead.
 - **tracemalloc or a deterministic profiler left on in production.** Symptom: a large, otherwise
-  unexplained latency regression.
+  unexplained latency regression. Fix: keep them to dev and staging; use py-spy sampling in production.
 
 ## When to use
 - **Use when:** before optimizing, and whenever a latency SLO, a cost target or an OOM is in play.

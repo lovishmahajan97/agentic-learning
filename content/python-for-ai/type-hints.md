@@ -115,19 +115,20 @@ Check which version your project runs when a library complains about unresolved 
   behaviours; that is the main practical payoff in AI work.
 
 ## Diagram
-One annotation, three readers: the interpreter only stores it, a checker reads it before the run, and
-runtime libraries turn it into validation. Follow the `Any` edge to see where checking stops.
+One annotation, three readers: the interpreter only stores it in `__annotations__`, a checker reads it
+before the run, and runtime libraries turn it into a validator (coerce `"0.7"`, reject `"hot"`) and a
+JSON Schema for tools and OpenAPI. Follow the dotted `Any` edge to see where checking stops.
 
 ```mermaid
-flowchart LR
-    A["Annotation: temperature float"] --> I["CPython: stores in __annotations__, no check"]
-    A --> C["Static checker: mypy or pyright"]
-    A --> R["Runtime readers: Pydantic, FastAPI"]
+flowchart TD
+    A["Annotation: temperature float"] --> I["CPython: store only"]
+    A --> C["Static checker: mypy, pyright"]
+    A --> R["Runtime: Pydantic, FastAPI"]
     C -->|"declared type plus inference"| N["Narrowing in branches"]
-    N --> E["Errors before any tokens are spent"]
-    C -.->|"value is Any"| H["Hole: downstream errors invisible"]
-    R --> V["Validator coerces 0.7 string, rejects hot"]
-    R --> S["JSON Schema for tools and OpenAPI"]
+    N --> E["Errors before tokens spent"]
+    C -.->|"value is Any"| H["Hole: errors invisible"]
+    R --> V["Validator: coerce or reject"]
+    R --> S["JSON Schema for tools"]
 ```
 
 ## Examples
@@ -179,7 +180,7 @@ Run `mypy` on the file above after each edit.
 | Edit | mypy result | Why |
 |---|---|---|
 | Delete the `if text is None` branch | Error: the optional string has no attribute `strip` | The value proposition, delivered before the first API call |
-| Keep it deleted and also delete `first_text`'s return annotation | Silent | An unannotated function is not checked and returns `Any`; `Any.strip()` is accepted |
+| Keep it deleted and also delete `first_text`'s return annotation | Silent | A missing return annotation defaults to `Any` (a fully unannotated function is not checked at all); `Any.strip()` is accepted |
 | Call `GenConfig(model="x", temperature="0.2")` directly | Runs fine (Pydantic coerces) | A checker that understands Pydantic's `__init__` through `dataclass_transform` flags the `str` argument |
 | Same call with Pydantic's mypy plugin enabled | Silent by default | The plugin deliberately types `__init__` parameters as `Any` unless you set `init_typed = True` |
 
@@ -226,9 +227,10 @@ print(describe(ToolTurn("search", {"q": "kv cache"})))   # call search
 - **Hunt `Any` leaks in CI.** Enable `warn_return_any` and `disallow_any_generics`, and run
   `mypy --strict` on new packages. Watch the error count; a jump after adding a dependency usually means
   missing stubs, so install the `types-*` package rather than `ignore_missing_imports`.
-- **Enable the Pydantic mypy plugin deliberately.** Add `plugins = ["pydantic.mypy"]` and set
-  `init_typed = True` under `[tool.pydantic-mypy]` if you want constructor arguments checked. Without it,
-  the plugin treats `__init__` parameters as `Any`.
+- **Enable the Pydantic mypy plugin deliberately.** In `pyproject.toml` add `plugins = ["pydantic.mypy"]`
+  under `[tool.mypy]` and `init_typed = true` under `[tool.pydantic-mypy]` if you want constructor
+  arguments checked. Without that setting the plugin treats `__init__` parameters as `Any`, so
+  `GenConfig(temperature="0.2")` passes the checker.
 - **Keep heavy imports behind `TYPE_CHECKING`.** Wrap torch or transformers imports used only in
   annotations in `if TYPE_CHECKING:`. Measure import time of your CLI or worker (`python -X importtime`)
   before and after.
@@ -300,12 +302,13 @@ that third-party stubs are installed so SDK calls are not silently `Any` either.
 - **Deliberately so:** near-zero runtime cost and full backward compatibility, with enforcement left to
   static checkers and to libraries such as Pydantic that choose to read the annotations.
 
-### mypy passes in CI but a field rename still broke production. How do you debug that?
-- **Suspect `Any` first.** Run `reveal_type` on the value at the failing line; if it says `Any`, trace it
-  back to `json.loads`, an unannotated helper or an untyped dependency.
-- **Close the hole at the boundary:** validate raw data into a Pydantic model or `TypedDict`, add the
-  missing return annotation, and install the `types-*` stub package.
-- **Stop it recurring:** enable `warn_return_any` and `disallow_any_generics` so new leaks fail CI.
+### You call `if is_tool_turn(turn):` and mypy still says `turn` has no attribute `tool_name`. Why, and what is the fix?
+- **The checker does not look inside helpers.** A `-> bool` return says nothing about the argument, so
+  `turn` keeps its declared union type inside the branch.
+- **Annotate the helper `-> TypeIs[ToolTurn]`** (3.13, or `typing_extensions`). It narrows like
+  `isinstance`: to `ToolTurn` in the true branch and to the remaining members in the else branch.
+- **`TypeGuard` is the older form:** it narrows only the true branch, and does not require the guarded
+  type to be a subtype of the input, so prefer `TypeIs` for plain type tests.
 
 ### When would you choose `object` over `Any` for an unknown input?
 - **`object` keeps checking on.** You may only use what every object supports until you narrow it with

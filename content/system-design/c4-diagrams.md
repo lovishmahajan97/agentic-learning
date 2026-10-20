@@ -243,17 +243,21 @@ A customer's security review for that pilot, mapped to the view that answers eac
 
 ## Pitfalls
 - **Mixing levels in one diagram.** Symptom: a picture shows "Kubernetes" and "the retry helper class" at
-  once, and the review is spent asking what the boxes are.
+  once, and the review is spent asking what the boxes are. Fix: one level per diagram, titled with its
+  level and scope.
 - **Unlabelled or double-headed arrows.** Symptom: a security reviewer asks "which direction does
-  customer data flow here?" and nobody is sure.
+  customer data flow here?" and nobody is sure. Fix: one direction per arrow, labelled with intent and
+  protocol.
 - **Reading *container* as Docker container.** Symptom: a managed database and a hosted model provider
-  are missing because "they are not containers".
+  are missing because "they are not containers". Fix: draw every runnable unit and data store, and
+  every dependency you do not own as an external system.
 - **Leaving the model provider off the Context diagram** because it is "just an API". Symptom: a
-  procurement or privacy review discovers the data egress late.
+  procurement or privacy review discovers the data egress late. Fix: show it as an external system with
+  a labelled arrow.
 - **Diagrams in a slide deck disconnected from the code.** Symptom: a Container view still shows a
-  service deleted two quarters ago.
+  service deleted two quarters ago. Fix: diagrams as code in the repository, rendered in CI.
 - **Drawing everything.** Symptom: a forty-box Container diagram nobody can read, instead of a Container
-  view plus two Dynamic views of the requests that matter.
+  view plus two Dynamic views of the requests that matter. Fix: keep to about twenty elements per view.
 
 ## When to use
 - **Always:** a Context and a Container diagram for every system that more than one team or organisation

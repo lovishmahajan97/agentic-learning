@@ -5,7 +5,7 @@ name: Catastrophic forgetting
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/overfitting
   - training-adaptation/supervised-fine-tuning
@@ -127,9 +127,10 @@ flowchart TD
     T[("Task data")] --> M["Mixed set: task plus about 25 percent replay, shuffled"]
     R[("General, chat-template and safety data")] --> M
     M --> F["Fine-tune from base: LoRA or low LR, few epochs"]
-    S0 --> F
+    B --> F
     F --> E["Evaluate task metric and general suite at each checkpoint"]
     E --> G{"Any suite metric dropped beyond tolerance?"}
+    S0 -.->|"compare against baseline"| G
     G -->|"no"| SH["Promote"]
     G -->|"yes, task checkpoint strong"| I["Interpolate toward base, pick alpha on both evals"]
     I --> G
@@ -180,6 +181,9 @@ When a strong task checkpoint has already regressed, interpolate its weights wit
 mixing coefficient on both evaluations. This works for a full fine-tune of the same architecture; the two
 state dicts must share keys and shapes.
 
+- **For a LoRA adapter,** scale the adapter's contribution by alpha instead: interpolating the merged
+  weights toward the base gives base plus alpha times the adapter delta.
+
 ```python
 import torch
 
@@ -204,8 +208,9 @@ Illustrative sweep (numbers are for shape only, not a benchmark):
 | 0.75 | 82 | 66 | 0.88 |
 | 1.0 (fine-tuned) | 84 | 60 | 0.79 |
 
-- **Reading it.** If the gate allows a 2-point general drop, alpha = 0.5 keeps most of the task gain and
-  passes; 1.0 fails. Use it as a stopgap while a proper replay run is prepared.
+- **Reading it.** If the gate allows a 2-point drop, alpha = 0.5 passes (general −2, refusal −1) and keeps
+  26 of the 32 points of task gain; 0.75 and 1.0 fail. Use it as a stopgap while a proper replay run is
+  prepared.
 
 ## Production patterns
 - **Before/after regression gate in CI.** Fix a general suite (instruction following, a reasoning subset,
@@ -246,15 +251,16 @@ Illustrative sweep (numbers are for shape only, not a benchmark):
 - **Evaluating only on the task.** Symptom: a model that aces the fine-tuning benchmark and fails users on
   anything adjacent, discovered after release. Fix: a general suite before and after.
 - **Training on raw completions without the chat template.** Symptom: the model ignores system prompts or
-  produces malformed turns after the fine-tune.
+  produces malformed turns after the fine-tune. Fix: format every row with the serving template.
 - **Fine-tuning on compliant answers only.** Symptom: a measurable rise in compliance with harmful
   requests even though the data was benign. Fix: include safety examples and a refusal eval.
 - **Chaining fine-tunes v1 → v2 → v3.** Symptom: capabilities from the first batch quietly erode with
   each release. Fix: retrain from base on the union.
 - **Treating LoRA as a guarantee.** Symptom: a high-rank adapter trained for many epochs shows the same
-  regressions as a full fine-tune.
+  regressions as a full fine-tune. Fix: gate adapter runs on the same suite as full fine-tunes.
 - **Diagnosing forgetting as overfitting.** Adding regularisation does not help. Symptom: the task metric
   drops while the general metric does not recover, because the old data is still absent from the loss.
+  Fix: add replay so the loss has a term for the old behaviour.
 
 ## When to use
 Treat forgetting as a risk to manage on every fine-tune, including small adapter runs.
@@ -319,8 +325,8 @@ prepared.
   sweep alpha (0.25, 0.5, 0.75) toward the base and ship the largest value that passes the gate.
 - **Replay is the proper fix,** because it attacks the cause by giving the loss a term for the old
   behaviour; plan it as the next run.
-- **Interpolation needs a full fine-tune of the same architecture,** with state dicts that share keys and
-  shapes.
+- **Interpolation needs matching weights:** a full fine-tune of the same architecture, with state dicts
+  that share keys and shapes. For a LoRA adapter, scaling its contribution by alpha does the same job.
 
 ### A customer chains monthly fine-tunes from last month's model. What breaks and what do you recommend?
 - **What breaks:** each hop forgets a little of every earlier batch, so first-month capabilities erode

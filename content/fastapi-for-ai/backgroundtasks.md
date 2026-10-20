@@ -5,7 +5,7 @@ name: BackgroundTasks
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/job-queues-and-durable-workers
   - fastapi-for-ai/dependency-injection

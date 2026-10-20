@@ -23,7 +23,7 @@ sources:
 ## TL;DR
 The `openai` package is OpenAI's official typed client: sync and async, streaming, tools, structured
 outputs, retries and timeouts. Its Chat Completions shape is the de facto standard, so the same client
-reaches vLLM, Ollama or gateways by changing `base_url`.
+often reaches vLLM, Ollama or gateways by changing `base_url`.
 
 ## Why it exists
 - **Raw HTTP breaks on the details.** 429 rate limits and transient 5xx errors are routine at volume and
@@ -92,10 +92,14 @@ Server-side state (`previous_response_id`, or a conversation object):
 ### Errors, retries, timeouts
 | Exception (all subclass `openai.APIError`) | Meaning |
 |---|---|
-| `APIConnectionError`, `APITimeoutError` | transport |
-| `RateLimitError` | 429 (an `APIStatusError` subclass) |
+| `APIConnectionError`, `APITimeoutError` | transport: no HTTP response arrived |
+| `RateLimitError` | 429 |
 | `BadRequestError` | 400 |
 | `AuthenticationError` | 401 |
+
+- **Status errors share a parent.** `RateLimitError`, `BadRequestError` and `AuthenticationError` are all
+  `APIStatusError` subclasses carrying `status_code`, so catch the specific class first and
+  `APIStatusError` last.
 
 - **Default retries:** connection errors, 408, 409, 429 and 5xx are retried twice (`max_retries=2`) with
   exponential backoff and jitter, honouring a `retry-after` header when sent, because those failures are
@@ -134,7 +138,9 @@ sequenceDiagram
     C-->>A: typed response object
     Note over A: parse arguments, validate, run tool
     A->>C: create again with tool result and tool_call_id
-    C-->>A: final message, log request id and usage
+    C->>S: POST full history plus tool result
+    S-->>C: 200 final message, usage
+    C-->>A: typed final message to log
 ```
 
 ## Examples
@@ -300,8 +306,9 @@ because they need different fixes.
 
 ## Interview questions
 ### Why use the official SDK instead of calling the HTTP API with `requests`?
-- **It encodes the contract once:** generated from the OpenAPI specification, it gives typed parameters
-  and responses, so schema changes surface as type errors instead of `KeyError`s in production.
+- **It encodes the contract once:** generated from the OpenAPI specification, it gives typed,
+  autocompletable parameters and responses that your editor and type checker verify, instead of unchecked
+  dict lookups that fail as `KeyError`s in production.
 - **It ships the hard parts:** connection pooling, retries with exponential backoff and jitter that honour
   `retry-after`, timeouts, server-sent-event parsing and a precise exception hierarchy.
 - **Hand-rolled clients** tend to retry 400s or non-idempotent work, or forget timeouts entirely.

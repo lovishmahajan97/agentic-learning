@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-Synchronous: the caller holds a connection until the result arrives. Asynchronous: it gets a job id and
+Synchronous: the caller holds a connection until the result arrives; asynchronous: it gets a job id and
 the result later. LLM calls take seconds and agent runs minutes, longer than proxies and people wait, so
-most AI work goes asynchronous, with streaming in between.
+most AI work goes asynchronous, or streams when a person is watching.
 
 ## Why it exists
 - **AI work outlives connections.** A classic web request completes in tens of milliseconds, so holding
@@ -83,8 +83,8 @@ most AI work goes asynchronous, with streaming in between.
      or `422`), because returning the old job would hand the client a result for a request it did not make.
 2. **Execute.** A worker claims the job from a queue (Redis, SQS, Postgres with `SKIP LOCKED`), marks it
    `running` with a lease or heartbeat, does the work, and writes the result and `succeeded` or `failed`.
-   The lease matters because a worker that dies mid-job must have its job reclaimed after the lease
-   expires; without it the job stays `running` forever.
+   The lease matters because a worker that dies mid-job must have its job reclaimed by another worker
+   after the lease expires; without it the job stays `running` forever.
 3. **Deliver.** The client learns the outcome by one of:
 
 | Channel | Strength | Cost |
@@ -239,8 +239,8 @@ WHERE id = (
   WHERE status = 'queued'
      OR (status = 'running' AND lease_until < now())   -- reclaim from a dead worker
   ORDER BY created_at
-  FOR UPDATE SKIP LOCKED
   LIMIT 1
+  FOR UPDATE SKIP LOCKED
 )
 RETURNING id, input;
 ```

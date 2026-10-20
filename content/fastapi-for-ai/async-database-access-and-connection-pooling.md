@@ -5,7 +5,7 @@ name: Async database access & connection pooling
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
   - fastapi-for-ai/async-endpoints

@@ -5,7 +5,7 @@ name: Agentic architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents

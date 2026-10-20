@@ -5,7 +5,7 @@ name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/litellm
   - system-design/model-fallback-strategies
@@ -218,7 +218,7 @@ Illustrative numbers for one team key.
 
 | Situation | Arithmetic | Effect |
 |---|---|---|
-| Daily budget $100, 40 requests in flight when it runs out, `max_tokens` 4,000 at $15 per 1M output tokens | 40 × 4,000 × $15 / 1M = $2.40 | Overshoot of up to $2.40, bounded only because `max_tokens` caps each request |
+| Daily budget $100, 40 requests in flight when it runs out, `max_tokens` 4,000 at $15 per 1M output tokens | 40 × 4,000 × $15 / 1M = $2.40 | Overshoot of up to $2.40 in output tokens (plus those requests' input cost), bounded only because `max_tokens` caps each request |
 | Same, but no `max_tokens` ceiling | Unbounded per request | The "hard" cap is not hard |
 | 600 requests/min limit, 3 replicas with in-process counters | 3 × 600 | Effective limit 1,800 per minute; provider 429s while the gateway never trips |
 | Same, counters in Redis | One shared counter | Effective limit 600, as configured |

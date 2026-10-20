@@ -97,7 +97,8 @@ and explicit `cache_control`. Learn them and most integration bugs become obviou
 - **`tool_choice`** controls whether the model may or must call tools (`auto`, `none`, and on some models
   forced `any` or a named tool).
 - **Portable well-formed calls.** Forcing is not supported on every current model, so use `auto` plus a
-  clear instruction, with `strict: true` on the tool so `input` always validates against `input_schema`.
+  clear instruction, with `strict: true` on the tool so `input` always validates against `input_schema`
+  (strict mode needs the schema to list `required` fields and set `additionalProperties: false`).
 
 ### Structured output
 - **Schema-constrained JSON.** `output_config={"format": ...}` with a JSON Schema constrains the response.
@@ -191,9 +192,10 @@ Trace of a typical run:
 
 - **Input grows every iteration**, because each call re-reads the whole history; that is exactly the cost
   caching the stable prefix attacks.
-- **This toy prompt will not cache.** It is far shorter than the minimum cacheable prefix
-  (model-dependent, from a few hundred to a few thousand tokens), so `cache_read_input_tokens` stays at
-  zero. With a realistic multi-thousand-token system prompt and tool list it rises from the second call.
+- **This toy prompt likely will not cache.** Its tools and system prompt are probably shorter than the
+  minimum cacheable prefix (model-dependent, from a few hundred to a few thousand tokens), so expect
+  `cache_read_input_tokens` to stay at zero with no error. With a realistic multi-thousand-token system
+  prompt and tool list it rises from the second call.
 - **A production loop also** caps iterations, validates `block.input` before running a tool, and catches
   `anthropic.RateLimitError`, `anthropic.APIStatusError` and `anthropic.APIConnectionError` separately.
 
@@ -215,8 +217,9 @@ print("\n", final.stop_reason, final.usage.output_tokens)
 
 ### Worked scenario: what caching saves in an agent loop
 A 6,000-token system prompt and tool list, resent on 10 consecutive calls within the cache lifetime.
-Typical multipliers on the base input price: cache writes ~1.25×, cache reads ~0.1× (illustrative; the
-read multiplier is lower on some models, so check current pricing).
+Typical multipliers on the base input price: cache writes ~1.25× with the default 5-minute lifetime (2×
+for the 1-hour option), cache reads ~0.1× (illustrative; the read multiplier is lower on some models, so
+check current pricing).
 
 | | Prefix cost in input-token equivalents |
 |---|---|

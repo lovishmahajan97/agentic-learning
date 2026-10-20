@@ -5,7 +5,7 @@ name: Cross-language API contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - agents/typed-tool-contracts
   - agents/tool-schemas-and-argument-validation
@@ -22,105 +22,116 @@ sources:
 ---
 
 ## TL;DR
-Agent systems are polyglot by construction: Python for the loop, TypeScript for the product and tool
-servers, Go or Java behind them, and the model itself consuming JSON Schema. Tool definitions, event streams
-and run state cross those boundaries constantly. A contract is one machine-readable schema every side
-generates its types and runtime validators from, with explicit rules for what JSON leaves ambiguous (64-bit
-integers, dates, null versus absent, unknown enum values) and for evolving without breaking old consumers.
+Agent systems are polyglot, and the model itself consumes JSON Schema. A contract is one machine-readable
+schema every side generates types and runtime validators from, with explicit rules for JSON's ambiguities
+(int64, dates, null vs absent, enums) and for safe evolution.
 
 ## Why it exists
-Look at what crosses language boundaries in a typical runtime. The Python executor sends the model a tool
-definition as JSON Schema. The model returns arguments. The arguments are dispatched to a tool server
-written in TypeScript. The result flows back as JSON, into the step log, and out over a server-sent event
-stream to a web client. Meanwhile the run's checkpoint is serialised to storage and must be readable by next
-week's deploy. Each arrow is a contract whether or not anyone wrote it down.
-
-When nobody writes it down, the types are hand-maintained on each side and drift. Python renames
-`due_date` to `due_at`; the TypeScript tool still reads `due_date` and gets `undefined`, silently. The JSON
-Schema sent to the model allows `priority: "urgent"` but the executor's validator only knows `low|high`, so
-the model produces a legal call that fails at dispatch, and tool-call success rate degrades with no code
-path to blame. A Python `int` id above 2^53 arrives in JavaScript rounded. A naive `datetime` serialises
-without an offset and shifts by hours in another service. A new event type appears on the stream and an
-old client throws.
-
-The naive alternative, "JSON is self-describing, we'll be careful", fails for the same reason untyped code
-fails at scale: there is no compiler across the boundary. TypeScript types vanish at runtime, Python type
-hints are not enforced, and the model is a third participant that follows whatever schema it was shown.
-Only a shared schema, generated into every language and validated at runtime on both sides, closes the gap.
+- **Every arrow is a contract, written down or not.** Python sends the model a tool definition as JSON
+  Schema; the model returns arguments; a TypeScript tool server runs them; the result flows into the step
+  log and out over a server-sent event stream to a web client. The run's checkpoint must be readable by next
+  week's deploy.
+- **Hand-maintained types drift silently.** Python renames `due_date` to `due_at`; the TypeScript tool still
+  reads `due_date` and gets `undefined`. The model's schema allows `priority: "urgent"` but the validator only
+  knows `low|high`, so legal calls fail at dispatch and tool-call success degrades with no code path to
+  blame.
+- **JSON hides representation bugs.** A Python `int` id above 2^53 arrives in JavaScript rounded. A naive
+  `datetime` serialises without an offset and shifts by hours in another service. A new event type appears
+  on the stream and an old client throws.
+- **"JSON is self-describing, we'll be careful" fails** like untyped code at scale: there is no compiler
+  across the boundary. TypeScript types vanish at runtime, Python hints are not enforced, and the model is a
+  third participant that follows whatever schema it was shown.
+- **Only a shared schema closes the gap:** generated into every language and validated at runtime on both
+  sides.
 
 ## How it works
 ### One source of truth, generated everywhere
-Choose one schema language and generate the rest. The practical options:
+Choose one schema language and generate the rest:
 
-- **JSON Schema**, directly or via **OpenAPI** for HTTP surfaces. It is the natural choice for agent
-  systems because tool definitions sent to models *are* JSON Schema, so the same document can drive the
-  model, the executor's validator and the TypeScript types.
-- **Protocol Buffers** with gRPC for high-volume internal RPC (executor to tool workers, event fan-out).
-  Binary, compact, with strict and well-documented evolution rules; converted to JSON Schema at the edge
-  where the model or browser needs it.
-- **Language-native first**: define models in Pydantic (Python) or Zod (TypeScript), emit JSON Schema from
-  them, and generate the other language's types from that. Ergonomic for two-language teams; it quietly
-  makes one language the owner, which is fine as long as everyone knows which.
+| Option | Strength | Cost |
+|---|---|---|
+| **JSON Schema**, directly or via **OpenAPI** for HTTP | tool definitions sent to models *are* JSON Schema, so one document drives the model, the executor's validator and the TypeScript types | verbose, weak evolution discipline |
+| **Protocol Buffers** with gRPC | binary, compact, strict and well-documented evolution rules; ideal for high-volume internal RPC (executor to tool workers, event fan-out) | converted to JSON Schema at the edge where the model or browser needs it |
+| **Language-native first** (Pydantic or Zod emitting JSON Schema) | ergonomic for two-language teams | quietly makes one language the owner, fine as long as everyone knows which |
 
-Whichever you pick, the rule is the same: the tool schema the model sees, the validator the executor runs
-and the type the tool server compiles against are all derived from one file in one repository, checked by
-CI that regenerates and fails on diff.
+- **The rule is the same whichever you pick:** the tool schema the model sees, the validator the executor
+  runs and the type the tool server compiles against all derive from one file in one repository.
+- **CI enforces it** by regenerating and failing on diff.
 
 ### The contract surfaces in an agent runtime
-Name them explicitly, because each has a different consumer and evolution pace: tool definitions (name,
-argument schema, result schema, error shape); the step event stream (a discriminated union on `type`,
-versioned); run state and checkpoints (versioned, because old checkpoints must load after a deploy);
-internal RPC between loop and workers; and the run context that policy relies on. MCP is itself an
-example: a JSON-RPC contract with a published schema that lets Python and TypeScript servers and clients
-interoperate without sharing code.
+Name them explicitly, because each has a different consumer and evolution pace:
+- **Tool definitions:** name, argument schema, result schema, error shape.
+- **Step event stream:** a discriminated union on `type`, versioned.
+- **Run state and checkpoints:** versioned, because old checkpoints must load after a deploy.
+- **Internal RPC** between loop and workers.
+- **Run context** that policy relies on.
+
+MCP is itself an example: a JSON-RPC contract with a published schema that lets Python and TypeScript
+servers and clients interoperate without sharing code.
 
 ### Representation rules JSON does not give you
-- **64-bit integers**: JavaScript numbers are exact only to 2^53 − 1. Serialise ids and large counts as
-  strings; Protobuf's JSON mapping does this for `int64` by default for the same reason.
-- **Dates and times**: ISO 8601 with an explicit offset, always. Reject naive datetimes at the producer.
-- **Null versus absent**: Python `None`, TypeScript `undefined` and JSON `null` are three things. Decide
-  per field whether "absent" and "null" mean the same, and encode that in the schema; the usual answer is
-  to omit absent fields and forbid `null` unless it carries meaning ("clear this value").
-- **Enums**: closed enums break the moment a producer adds a value. Model them as strings with a known set
-  and have consumers map unknown values to a fallback rather than throw.
-- **Floats**: `NaN` and `Infinity` are not JSON, yet Python's `json.dumps` emits them by default and
-  JavaScript's `JSON.parse` rejects the whole document; serialise with `allow_nan=False` and decide on
-  `null` or an error. Money is never a float: use integer minor units or a decimal string.
-- **Bytes**: base64 in a string field, with the encoding stated in the schema description.
-- **Unknown fields**: service-to-service consumers ignore them (tolerant reader) so producers can add
-  fields; model-to-executor arguments *forbid* them, because an extra field from a model is a hallucination,
-  not an upgrade.
+| Ambiguity | Rule | Because |
+|---|---|---|
+| **64-bit integers** | serialise ids and large counts as strings | JavaScript numbers are exact only to 2^53 − 1; Protobuf's JSON mapping does this for `int64` by default for the same reason |
+| **Dates and times** | ISO 8601 with an explicit offset, always; reject naive datetimes at the producer | a naive value shifts by the reader's offset |
+| **Null vs absent** | decide per field and encode it in the schema; usually omit absent fields and forbid `null` unless it means "clear this value" | Python `None`, TypeScript `undefined` and JSON `null` are three things |
+| **Enums** | strings with a known set; consumers map unknown values to a fallback rather than throw | closed enums break the moment a producer adds a value |
+| **Floats** | serialise with `allow_nan=False` and decide on `null` or an error; money is integer minor units or a decimal string | `NaN` and `Infinity` are not JSON, yet Python's `json.dumps` emits them by default and JavaScript's `JSON.parse` rejects the whole document |
+| **Bytes** | base64 in a string field, encoding stated in the schema description | JSON has no bytes type |
+| **Unknown fields** | service-to-service consumers ignore them (tolerant reader); model-to-executor arguments *forbid* them | producers can add fields, but an extra field from a model is a hallucination, not an upgrade |
 
 ### The model is a consumer with its own dialect
-The schema sent to the model is not always the schema your validator uses. Providers that constrain
-generation to a schema (strict tool calling, structured outputs) typically support only a subset of JSON
-Schema, and the subset is vendor-specific: some require every property to be listed as required with
-nullability expressed in the type, some require `additionalProperties: false`, and keywords such as
-`format`, `maxLength` or `$ref` may be ignored or rejected. Generate the model-facing schema as a
-*projection* of the contract for each provider, keep the full contract for the executor's validator, and
-test both from the same fixtures. Otherwise the model is shown constraints it does not enforce (a 200-char
-limit it ignores) and the executor rejects the result, or a provider switch silently changes which
-constraints are enforced during generation.
+- **The model-facing schema is not always the validator's schema.** Providers that constrain generation to
+  a schema (strict tool calling, structured outputs) typically support only a vendor-specific subset of
+  JSON Schema.
+- **Typical restrictions:** every property listed as required with nullability in the type; required
+  `additionalProperties: false`; keywords such as `format`, `maxLength` or `$ref` ignored or rejected.
+- **So generate a projection per provider,** keep the full contract for the executor's validator, and test
+  both from the same fixtures.
+- **Otherwise two failures appear:** the model is shown constraints it does not enforce (a 200-char limit it
+  ignores) and the executor rejects the result, or a provider switch silently changes which constraints are
+  enforced during generation.
 
 ### Evolution without breaking anyone
-Additive changes only: new optional fields, new event types that old consumers can skip, new enum values
-with a fallback. Breaking changes (renames, type changes, new required fields) get a new version, signalled
-by a `schema_version` field on events and stored state, or by a new endpoint. Never reuse a name or
-Protobuf field number with a different meaning. Keep the old version readable for as long as a checkpoint
-or client of that version can exist, and write the migration code when you introduce the new version, not
-when the first old checkpoint fails to load.
+1. **Additive changes only** in a version: new optional fields, new event types old consumers can skip, new
+   enum values with a fallback.
+2. **Breaking changes get a new version:** renames, type changes, new required fields. Signal it with a
+   `schema_version` field on events and stored state, or a new endpoint.
+3. **Never reuse a name or Protobuf field number** with a different meaning.
+4. **Keep the old version readable** for as long as a checkpoint or client of that version can exist.
+5. **Write the migration when you introduce the version,** not when the first old checkpoint fails to load.
 
 ### Validate at runtime on both sides, and test the contract
-Compile-time types catch programmer errors; only runtime validation catches drift and model output.
-Pydantic on the Python side, Zod or ajv on the TypeScript side, both generated from the same schema. Then
-test the contract itself: a directory of golden JSON fixtures that both CI pipelines must accept, or
-consumer-driven contract tests where each consumer publishes what it relies on and the producer's CI
-verifies it still holds.
+- **Compile-time types catch programmer errors; only runtime validation catches drift and model output.**
+- **Validators on both sides:** Pydantic in Python, Zod or ajv in TypeScript, both generated from the same
+  schema.
+- **Test the contract itself:** a directory of golden JSON fixtures both CI pipelines must accept, or
+  consumer-driven contract tests where each consumer publishes what it relies on and the producer's CI
+  verifies it still holds.
 
-## Example
-Pydantic models are the source of truth here. The same definition yields the tool specification sent to the
-model, the executor's runtime validator and a JSON Schema file consumed by the TypeScript side (types via a
-generator, runtime checks via ajv). Note the representation rules baked into the fields.
+## Diagram
+One contract file feeds all three consumers; note that the model gets a provider-specific projection while
+the executor validates against the full contract.
+
+```mermaid
+flowchart TD
+    C[("contracts/ schema file")] --> PY["Python: Pydantic models"]
+    C --> TS["TypeScript: generated types and ajv"]
+    C --> PJ["Provider projection of schema"]
+    PJ -->|"tool definition"| M["Model"]
+    M -->|"arguments, extra fields forbidden"| EX["Executor validator"]
+    PY --> EX
+    EX -->|"validated call"| TL["TypeScript tool server"]
+    TS --> TL
+    TL -->|"events with schema_version"| UI["Web client, tolerant reader"]
+    G["Golden fixtures in CI"] -.->|"both sides must accept"| C
+```
+
+## Examples
+### Pydantic as the source of truth
+The same definition yields the tool specification sent to the model, the executor's runtime validator and a
+JSON Schema file consumed by the TypeScript side (types via a generator, runtime checks via ajv). Note the
+representation rules baked into the fields.
 
 ```python
 import json
@@ -176,54 +187,108 @@ assert parse_event({"type": "approval_requested", "run_id": "r1"}) is None
 # TS side: generate types from contracts/agent.schema.json and validate the same file with ajv in CI.
 ```
 
-What each line defends against, concretely. `account_id` is `"9007199254740993"` (2^53 + 1) as a string; as a
-number, `JSON.parse` in the TypeScript server would return 9007199254740992 and the ticket would attach to
-the neighbouring account. A model that adds `"assignee": "bob"` to `create_ticket` is rejected by
-`extra="forbid"`, so the hallucinated field never reaches the tool. The `tool_result` event carrying a
-`cost_usd` field from a newer producer validates, because events ignore extras, and an `approval_requested`
-event this consumer has never heard of is skipped rather than crashing the stream reader. A `due_at` of
-`2026-11-03T09:00:00` without an offset fails at the producer, where the bug is, instead of becoming a
-five-hour shift in a browser in another timezone.
+### Worked scenario: what each line defends against
+| Input | Without the rule | With the rule |
+|---|---|---|
+| `account_id` is `"9007199254740993"` (2^53 + 1) | as a number, `JSON.parse` in the TypeScript server returns 9007199254740992 and the ticket attaches to the neighbouring account | the string survives exactly |
+| model adds `"assignee": "bob"` to `create_ticket` | the hallucinated field reaches the tool | rejected by `extra="forbid"` |
+| `tool_result` event carries `cost_usd` from a newer producer | a strict reader fails | validates, because events ignore extras |
+| `approval_requested` event this consumer has never heard of | the stream reader crashes | skipped |
+| `due_at` of `2026-11-03T09:00:00` without an offset | a five-hour shift in a browser in another timezone | fails at the producer, where the bug is |
+
+### Runnable: JSON's ambiguities in four prints
+Pure standard-library Python. Python's `float` is the same IEEE-754 double as a JavaScript number, so it
+reproduces the TypeScript rounding.
+
+```python
+import json
+from datetime import datetime, timezone
+
+# 1. int64: a JS number is an IEEE-754 double; Python's float is the same type
+account_id = 2**53 + 1
+print(account_id, int(float(account_id)))          # 9007199254740993 9007199254740992
+
+# 2. NaN: Python emits it by default, but it is not JSON
+print(json.dumps({"score": float("nan")}))         # {"score": NaN}  <- JSON.parse rejects this
+try:
+    json.dumps({"score": float("nan")}, allow_nan=False)
+except ValueError as e:
+    print("refused:", e)
+
+# 3. naive vs aware datetimes
+print(datetime(2026, 11, 3, 9).isoformat())                       # 2026-11-03T09:00:00 (no offset)
+print(datetime(2026, 11, 3, 9, tzinfo=timezone.utc).isoformat())  # 2026-11-03T09:00:00+00:00
+
+# 4. null vs absent: two wire forms that parse to the same Python value
+for wire in ('{"title": "a"}', '{"title": "a", "due_at": null}'):
+    d = json.loads(wire)
+    print("due_at" in d, d.get("due_at"))          # False None / True None: same value, different meaning
+```
+
+## Production patterns
+- **Generate and diff in CI** — whenever two languages share a contract. Regenerate TypeScript types (for
+  example with json-schema-to-typescript) and any Python models (for example with datamodel-code-generator)
+  from `contracts/`, then run `git diff --exit-code` so an uncommitted regeneration fails the build. Monitor
+  contract CI failures as drift caught early.
+- **Breaking-change detection for Protobuf** — when internal RPC uses gRPC. Run `buf breaking` against the
+  main branch on every pull request, and mark removed field numbers and names as `reserved` so they are never
+  reused. Monitor overridden breaking-change checks.
+- **Golden fixtures in both pipelines** — for tool arguments and events. Keep valid and invalid JSON examples
+  in `contracts/fixtures/`, validated by Pydantic in Python CI and ajv in TypeScript CI, with each rule from
+  the representation table covered. Monitor fixtures added per schema change.
+- **Consumer-driven contracts** — when another team or customer consumes your events. Use a tool such as
+  Pact so each consumer publishes the fields it relies on and the producer's CI verifies them before deploy.
+  Monitor verification failures by consumer.
+- **Per-provider schema projection** — when you call more than one model provider. Write one projection
+  function per provider (for example, strict modes that require every property in `required` and
+  `additionalProperties: false`) and test it from the same fixtures. Monitor argument rejection rate per
+  tool, provider and schema version.
 
 ## Trade-offs
-- JSON Schema and OpenAPI are universal, readable and identical to what models consume, but they are
-  verbose on the wire and weak on evolution discipline; Protobuf and gRPC win for high-volume internal RPC
-  and lose at the model and browser edge, where you convert anyway.
-- Language-native-first schemas (Pydantic, Zod) are the fastest to write and keep in sync for a
-  two-language team, but they make one language the owner; move to a neutral IDL when a third language or an
-  external consumer appears.
-- `extra="forbid"` on model-supplied arguments catches hallucinated fields immediately, while the same
-  setting on service events breaks every additive change; the strictness has to match who the producer is.
-- A codegen pipeline with CI diff checks costs setup time and occasional friction, but it is the only thing
-  that keeps three codebases and a model agreeing after the tenth change.
-- Versioning every event and checkpoint adds a field and migration code you may never need, yet the
-  first time an old checkpoint must load after a schema change you will not have time to add it.
+- **JSON Schema/OpenAPI vs Protobuf/gRPC.** JSON Schema is universal, readable and identical to what models
+  consume, but verbose on the wire and weak on evolution discipline. Protobuf wins for high-volume internal
+  RPC and loses at the model and browser edge, where you convert anyway.
+- **Language-native-first vs neutral IDL.** Pydantic or Zod schemas are fastest to write and keep in sync
+  for a two-language team, but make one language the owner. Move to a neutral IDL when a third language or
+  an external consumer appears.
+- **Strict vs tolerant validation.** `extra="forbid"` on model-supplied arguments catches hallucinated fields
+  immediately, while the same setting on service events breaks every additive change. Strictness has to
+  match who the producer is.
+- **Codegen pipeline vs hand-written types.** CI diff checks cost setup time and occasional friction, but
+  they are the only thing that keeps three codebases and a model agreeing after the tenth change.
+- **Versioning everything vs YAGNI.** A version field on every event and checkpoint adds migration code you
+  may never need, yet the first time an old checkpoint must load after a schema change you will not have
+  time to add it.
 
 ## Pitfalls
-- Serialising 64-bit ids as JSON numbers; the symptom is a TypeScript client that looks up the wrong record
-  by one or two, only for ids above 2^53.
-- Emitting naive datetimes; the symptom is due dates that shift by the producer's UTC offset when read in
-  another service or displayed in the browser.
-- Adding a required field to an event or result; the symptom is old consumers failing validation the
-  moment the producer deploys, with no code change on their side.
-- Letting the model's tool schema and the executor's validator diverge; the symptom is a falling tool-call
-  success rate with "invalid arguments" errors on calls that match the schema the model was shown.
-- Sending the full contract schema to a provider whose strict mode supports only a subset; the symptom is
-  tool definitions rejected at request time, or constraints like `maxLength` silently unenforced during
-  generation and then failing in the executor's validator.
-- Closed enums on the consumer; the symptom is a crash on the first new status value, usually at night.
-- Treating `null` and missing as interchangeable on one side only; the symptom is validation errors or
-  values silently cleared when a field round-trips through the other language.
+- **Serialising 64-bit ids as JSON numbers.** Symptom: a TypeScript client looks up the wrong record by one
+  or two, only for ids above 2^53. Fix: ids as strings.
+- **Emitting naive datetimes.** Symptom: due dates shift by the producer's UTC offset when read in another
+  service or displayed in the browser. Fix: reject naive values at the producer.
+- **Adding a required field to an event or result.** Symptom: old consumers fail validation the moment the
+  producer deploys, with no code change on their side. Fix: optional with a default, or a new version.
+- **Letting the model's tool schema and the executor's validator diverge.** Symptom: a falling tool-call
+  success rate with "invalid arguments" errors on calls that match the schema the model was shown. Fix: derive
+  both from one contract.
+- **Sending the full contract schema to a provider whose strict mode supports only a subset.** Symptom: tool
+  definitions rejected at request time, or `maxLength` silently unenforced during generation and then failing
+  in the executor's validator. Fix: per-provider projection.
+- **Closed enums on the consumer.** Symptom: a crash on the first new status value, usually at night. Fix:
+  map unknown values to a fallback.
+- **Treating `null` and missing as interchangeable on one side only.** Symptom: validation errors or values
+  silently cleared when a field round-trips through the other language. Fix: define it per field in the
+  schema.
 
 ## When to use
-The moment two languages, or one language and a model, exchange structured data, write the schema down and
-generate from it; retrofitting after drift is far more expensive. Start with JSON Schema derived from your
-primary language's models and promote to a neutral IDL when a third consumer arrives. Measure contract CI
-failures (good: they are drift caught early), runtime validation failures per boundary in production
-(bad: they are drift that escaped), and tool-call argument rejection rate as the agent-specific signal. In
-day-to-day work this is a `contracts/` directory, a generate-and-diff step in CI, and validators at every
-ingress. Interviewers probe the JSON ambiguities (int64, dates, null versus absent, enums) and evolution
-rules; a strong answer also notes that the model is a consumer of the contract too.
+- **Use a written contract** the moment two languages, or one language and a model, exchange structured data;
+  retrofitting after drift is far more expensive.
+- **Start** with JSON Schema derived from your primary language's models, and promote to a neutral IDL when a
+  third consumer arrives.
+- **Measure:** contract CI failures (good: drift caught early), runtime validation failures per boundary in
+  production (bad: drift that escaped), and tool-call argument rejection rate as the agent-specific signal.
+- **Day to day:** a `contracts/` directory, a generate-and-diff step in CI, and validators at every ingress.
+- **Interviews:** expect the JSON ambiguities (int64, dates, null versus absent, enums) and evolution rules;
+  a strong answer also notes that the model is a consumer of the contract too.
 
 ## Role lens
 - **Engineer:** Defines schemas once, wires codegen into CI, puts runtime validation at every ingress, and
@@ -246,6 +311,37 @@ in Python, TypeScript types and an ajv validator generated from the same file, a
 any uncommitted regeneration diff. Add golden fixtures both sides must accept, forbid extra fields on
 model-supplied arguments, make enums tolerant on consumers, and alert on argument rejection rate so the next
 drift is caught in minutes.
+
+## Interview questions
+### Why do agent systems need explicit cross-language contracts more than ordinary microservices?
+- **The model is a third consumer:** it follows whatever JSON Schema it was shown, so the tool definition,
+  the executor's validator and the tool server's types must all agree or legal calls fail at dispatch.
+- **Long-lived state crosses deploys:** checkpoints and event streams written today must be readable by next
+  week's code, so versioning is part of the contract, not an afterthought.
+
+### A TypeScript service occasionally attaches records to the wrong account. Where would you look first?
+- **64-bit ids sent as JSON numbers:** values above 2^53 lose precision in `JSON.parse` without an error, so
+  an id can land on its neighbour.
+- **Fix:** serialise ids as strings in the contract, add a golden fixture with an id above 2^53, and
+  validate it in both pipelines so the regression cannot return.
+
+### When would you pick Protobuf and gRPC over JSON Schema for an agent platform?
+- **Protobuf for high-volume internal RPC** between executor and tool workers or event fan-out, where compact
+  binary encoding and strict field-number evolution rules pay off.
+- **JSON Schema at the model and browser edge,** because tool definitions are JSON Schema anyway; with
+  Protobuf you convert at that edge.
+
+### How do you add a field to an event schema without breaking consumers?
+- **Additive and optional:** add it with a default, keep consumers tolerant of unknown fields, and never
+  reuse a name or field number with a different meaning.
+- **Breaking changes get a version:** bump `schema_version` or add an endpoint, keep the old version readable
+  while any checkpoint or client of it exists, and ship the migration with the change.
+
+### What metrics show contract drift in production?
+- **Tool-call argument rejection rate per tool and provider,** the agent-specific signal that the model's
+  schema and the validator have diverged.
+- **Runtime validation failures per boundary,** which are drift that escaped CI, compared against contract CI
+  failures, which are drift caught early.
 
 ## Quiz
 ### Q: Why should 64-bit identifiers be serialised as strings in a JSON contract consumed by a TypeScript service?

@@ -5,7 +5,7 @@ name: Break-even analysis (hosted API vs self-hosting)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - system-design/self-host-vs-api
   - system-design/open-weight-vs-proprietary
@@ -18,7 +18,7 @@ related:
 ---
 
 ## TL;DR
-A hosted API is variable cost; self-hosting is mostly fixed GPU and people cost. Break-even is the monthly
+A hosted API is variable cost, nothing when idle; self-hosting is mostly fixed GPU and people cost. Break-even is the monthly
 volume where the curves cross, and it hinges on achievable utilization and team cost far more than on GPU
 list price.
 
@@ -33,13 +33,14 @@ list price.
 - **Wrong assumption 2: the GPU is the biggest line.** It is only the visible one. Someone has to build and
   run the serving stack, carry the pager, upgrade the model and prove on your evals that an open-weight
   model matches the hosted one.
-- **Wrong assumption 3: like for like.** It compares a hosted frontier model against an open-weight model,
-  at different quality.
+- **Wrong assumption 3: the comparison is like for like.** It compares a hosted frontier model against an
+  open-weight model, at different quality.
 - **"Never self-host, it is a distraction" is equally lazy.** At sustained high volume the fixed cost
   amortizes until the marginal token is nearly free, and data residency, burst rate limits, latency control
-  or a model the vendor does not offer can decide it alone. The analysis replaces both reflexes with a curve
-  and a sensitivity band. Most teams cross break-even much later than per-token arithmetic suggests, and an
-  API price cut can push the crossover to infinity.
+  or a model the vendor does not offer can decide it alone.
+- **What the analysis buys:** a curve and a sensitivity band in place of both reflexes. Most teams cross
+  break-even much later than per-token arithmetic suggests, and an API price cut can push the crossover to
+  infinity.
 
 ## How it works
 ### Two cost curves
@@ -228,7 +229,9 @@ traffic migration).
 
 - **The interactive case is past break-even and still a loss** if the model choice will be revisited
   within a year: the 14-month payback outlives the decision.
-- **The flat 50,000M case pays back inside one quarter,** which survives a price cut or a model change.
+- **The flat 50,000M case pays back in just over a quarter,** so the migration cost is recovered well
+  before a typical model or reservation decision is revisited. It is not immune: a halved API price makes
+  the API $50,000 at this volume against $58,000 self-hosted.
 - **Just past break-even is fragile:** a small monthly saving turns a one-off cost into years of payback.
 
 ## Production patterns
@@ -271,13 +274,14 @@ traffic migration).
 - **Using benchmark peak throughput for capacity.** Symptom: a plan for 20 GPUs becomes 60 once p95 latency
   targets are enforced in load tests. Fix: measure `T_slo`.
 - **Omitting people and platform cost.** Symptom: a GPU bill below the API bill and a total cost above it,
-  discovered when the headcount request lands.
+  discovered when the headcount request lands. Fix: write `F` down as FTE fractions at loaded cost.
 - **Comparing against API list price when committed-use discounts exist.** Symptom: a break-even computed
-  against a price nobody at your volume actually pays.
+  against a price nobody at your volume actually pays. Fix: get a committed-use quote and use it as `p`.
 - **Treating the crossover as permanent.** Symptom: a decision that looked right at one price per million
-  tokens looks wrong after the next provider price cut.
+  tokens looks wrong after the next provider price cut. Fix: re-run the sign test on every price change.
 - **Ignoring the input/output mix.** Symptom: decode-heavy traffic achieves far less than the measured
-  throughput, because decode is bandwidth-bound while the benchmark was prefill-heavy.
+  throughput, because decode is bandwidth-bound while the benchmark was prefill-heavy. Fix: load-test
+  with your real length mix.
 - **Framing it as "frontier API versus our own GPUs".** Symptom: a self-hosting project whose whole saving
   came from the cheaper model, which a managed per-token open-weight endpoint would have delivered without
   the platform team.

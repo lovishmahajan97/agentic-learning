@@ -121,21 +121,23 @@ requests per month × (cost per request on A − cost per request on B)
   frontier tier. If the frontier handles a large fraction of volume, routing or task assignment is wrong.
 
 ## Diagram
-Applications only ever name a role; the gateway resolves it through the registry to a pinned model,
-and models enter and leave the registry only through the entry rule and the deprecation runbook.
+Applications only ever name a role (`workhorse`, `classifier-small`, `embed-v3`); the gateway resolves
+it through the registry (pinned version, data classes, baselines, cost card, owner, fallback) to a
+pinned model. Models enter only by beating an incumbent on a shared eval or unlocking a constraint, and
+leave only through the deprecation runbook (consumers from logs, regression evals, cutover).
 
 ```mermaid
-flowchart LR
-    A["Application"] -->|"calls workhorse, classifier-small, embed-v3"| G["Gateway routing table"]
-    G -->|"lookup logical name"| R[("Registry: pinned version, data classes, baselines, cost card, owner, fallback")]
+flowchart TD
+    A["Application"] -->|"calls a logical name"| G["Gateway routing table"]
+    G -->|"look up name"| R[("Model registry")]
     G --> F["Frontier or reasoning tier"]
     G --> W["Workhorse tier"]
     G --> S["Small and fast tier"]
     G --> E["Embeddings and rerankers"]
-    G -.->|"outage or 429"| B["Second source on another provider"]
-    N["Candidate model"] -->|"beats incumbent on shared eval or unlocks a constraint"| R
-    R -->|"deprecation notice: consumers from logs, regression evals, cutover"| X["Removed"]
-    G -.->|"spend share and frontier share"| M["Monthly concentration report"]
+    G -.->|"outage or 429"| B["Second source, other provider"]
+    N["Candidate model"] -->|"passes entry rule"| R
+    R -->|"deprecation runbook"| X["Removed"]
+    G -.->|"spend and frontier share"| M["Monthly concentration report"]
 ```
 
 ## Examples
@@ -197,9 +199,9 @@ def earns_a_place(req_per_month, cost_a, cost_b, added_errors, cost_per_error, f
     return req_per_month * (cost_a - cost_b) - added_errors * cost_per_error > fixed_monthly
 ```
 
-With an illustrative fixed cost of 2,000 units a month per entry: the classification family (about 21M
-requests a month) saves ≈ 68,600 units a month and clears it easily; a 30,000-request-a-month team task
-with the same per-request saving gains ≈ 98 units and does not.
+With an illustrative fixed cost of 2,000 units a month per entry and no added errors: the
+classification family (about 21M requests a month) saves ≈ 68,600 units a month and clears it easily; a
+30,000-request-a-month team task with the same per-request saving gains ≈ 98 units and does not.
 
 ### A registry record
 Field names are this lesson's schema, not a specific product's format; values are illustrative.
@@ -257,15 +259,18 @@ fallback: classifier-small-secondary
 - **Portfolio on paper, vendor IDs in code.** Symptom: a single deprecation notice turns into code
   changes and releases across a dozen repositories. Fix: logical names enforced at the gateway.
 - **Frontier tier carries bulk traffic because "it works".** Symptom: frontier share of spend far exceeds
-  the share of tasks that need it, and cost grows linearly with adoption.
+  the share of tasks that need it, and cost grows linearly with adoption. Fix: assign easy task
+  families to cheaper tiers after an eval, and route inside mixed families.
 - **Rotating the embedding model like any other model.** Symptom: retrieval quality collapses overnight
-  because the index was not rebuilt with the new model's vectors.
+  because the index was not rebuilt with the new model's vectors. Fix: rotate as a re-index project.
 - **No per-task eval baselines in the registry.** Symptom: a rotation approved on one team's evaluation
-  silently degrades another team's task.
+  silently degrades another team's task. Fix: store a baseline per consuming task family and rerun
+  every one before a cutover.
 - **Too many registered models.** Symptom: the task-by-model evaluation matrix is never fully run, so
-  the quality of most combinations is unknown.
+  the quality of most combinations is unknown. Fix: enforce the entry rule and the sizing rule.
 - **Skipping data-classification approval per model.** Symptom: an audit finds personal data flowing to
-  a model whose terms never permitted it.
+  a model whose terms never permitted it. Fix: approved data classes in each record, checked by the
+  gateway before routing.
 
 ## When to use
 - **Use when:** more than one task family or more than one team uses models; even a single product

@@ -5,7 +5,7 @@ name: Alembic migrations
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
   - fastapi-for-ai/async-database-access-and-connection-pooling
@@ -112,12 +112,12 @@ expand-contract, and CI plus a single pre-deploy job move every database to head
 flowchart TD
     M["Change SQLAlchemy or SQLModel model"] --> G["alembic revision --autogenerate"]
     G --> R{"Human review: rename, data move or hot-table lock?"}
-    R -->|"plain add or drop"| CI["CI: upgrade head from empty, one head, no pending diff"]
-    R -->|"rename or backfill"| X["Rewrite as expand-contract over 3 releases"]
-    R -->|"index on large table"| CC["CONCURRENTLY inside autocommit_block, lock_timeout"]
+    R -->|"plain add or drop"| CI["CI: upgrade from empty, single head"]
+    R -->|"rename or backfill"| X["Expand-contract over 3 releases"]
+    R -->|"index on large table"| CC["CONCURRENTLY in autocommit_block"]
     X --> CI
     CC --> CI
-    CI --> J["Pre-deploy job runs alembic upgrade head once"]
+    CI --> J["Pre-deploy job: upgrade head once"]
     J --> V[("alembic_version row updated")]
     J --> D["Roll out new replicas"]
 ```
@@ -183,7 +183,8 @@ Safe `NOT NULL` on a large table, because a plain `SET NOT NULL` scans the whole
 
 ### Release 2 as a migration
 The sequence above, with each statement in its own transaction so the brief `ACCESS EXCLUSIVE` lock of
-the `ADD CONSTRAINT` is not still held while `VALIDATE` scans.
+the `ADD CONSTRAINT` is not still held while `VALIDATE` scans. The price: a failure midway leaves the
+earlier steps applied (a `NOT VALID` constraint), so drop it before rerunning.
 
 ```python
 def upgrade() -> None:

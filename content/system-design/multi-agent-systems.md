@@ -5,7 +5,7 @@ name: Multi-agent systems
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - agents/multi-agent-patterns
   - agents/task-decomposition

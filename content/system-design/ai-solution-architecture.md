@@ -120,16 +120,15 @@ Follow one request through the six layers: only the gateway talks to models, ret
 permissions before context is built, and every call feeds the trace and eval loop.
 
 ```mermaid
-flowchart LR
-    U["User via UI or API"] --> E["Experience layer: identity, sessions, streaming"]
-    E --> O["Orchestration: context assembly, prompt, routing, tool loop"]
-    O -->|"query with caller entitlements"| K[("Knowledge layer: ACL-aware indexes")]
+flowchart TD
+    U["User via UI or API"] --> E["Experience layer"]
+    E -->|"identity and session"| O["Orchestration layer"]
+    O -->|"query with caller entitlements"| K[("ACL-aware knowledge layer")]
     K -->|"permitted chunks only"| O
-    O --> G["Model gateway: pinned versions, fallback, budgets"]
-    G --> M["Model portfolio"]
-    M --> G
-    G --> C["Control layer: schema validation, guardrails, approval gates"]
-    C -->|"valid output"| E
+    O -->|"rendered prompt"| G["Model gateway"]
+    G -->|"pinned version or fallback"| M["Model portfolio"]
+    M -->|"raw output"| C["Control layer"]
+    C -->|"valid output, streamed"| E
     C -.->|"parse failure: retry once, then fail closed"| O
     O -.->|"trace: tokens, latency, cost"| T[("Traces and golden set")]
     T -.->|"eval gate on every change"| O
@@ -159,7 +158,7 @@ adjusters at about 20 requests each per day, roughly 40k requests per day.
 | Prefill | ≈ 500 ms |
 | Decode, 300-token answer at ≈ 50 tokens/s | 6 s, which blows the 4 s target |
 | Fix 1: stream | user perceives time to first token (≈ 1 s) |
-| Fix 2: cap Q&A answers at 200 tokens | with a "show more" follow-up |
+| Fix 2: cap Q&A answers at 200 tokens | with a "show more" follow-up; decode falls to 4 s, so the full answer (≈ 4.8 s) still leans on streaming |
 
 **Cost and where to optimise:**
 - **Volume.** 40k × 3.2k ≈ 128M input tokens per day, plus 40k × 200 ≈ 8M output tokens.
@@ -244,9 +243,10 @@ print(f"mid ${mid:.5f}  cheap ${cheap:.5f} per successful task")
 - **Designing for average latency.** Symptom: the demo is snappy; production p95 is 15 s because of
   long contexts, retries and queueing on the provider. Fix: budget p95 per layer.
 - **Forgetting the model is rented.** No version pinning, no fallback. Symptom: a provider deprecation
-  or regional outage becomes a product incident with no runbook.
+  or regional outage becomes a product incident with no runbook. Fix: pin dated versions in the
+  gateway, configure a fallback, and write the runbook before launch.
 - **No cost model.** Symptom: usage grows, the bill grows faster, and the feature is throttled or
-  quietly removed.
+  quietly removed. Fix: a cost model tied to expected traffic, tracked as cost per successful task.
 
 ## When to use
 This is less a pattern you choose than the way to think about any system with a model in it, applied

@@ -22,8 +22,8 @@ sources:
 
 ## TL;DR
 Model selection is a funnel: filter by hard constraints, then pick per task the cheapest, fastest model
-that clears a quality bar measured on your data. Quality has a threshold; cost and latency are paid
-linearly on every call.
+that clears a quality bar measured on your data, not a public benchmark's. Quality has a threshold;
+cost and latency are paid linearly on every call.
 
 ## Why it exists
 - **The choice is multiplied by every request.** At any moment dozens of plausible models span one to
@@ -125,21 +125,23 @@ lose its advantage once the denominator and the extra calls are counted.
   building it first.
 
 ## Diagram
-The selection funnel: hard constraints remove candidates before any quality work, and the rule at the
-bottom compares lower confidence bounds with the bar, not leaderboard ranks.
+The selection funnel: hard constraints (modality, context at p95, deployment, terms) remove candidates
+before any quality work, and the rule at the bottom compares lower confidence bounds with the bar, not
+leaderboard ranks.
 
 ```mermaid
 flowchart TD
-    A["All plausible models"] --> F["Step 1: hard constraints - modality, context at p95, deployment, terms"]
-    F -->|"eligible only"| E["Step 2: private task eval set, built first"]
-    E --> R["Step 3: fair runs - equal prompt adaptation, seeds, paired comparison"]
-    R --> C["Step 4: measured tokens, cost per successful task, p95 latency"]
-    C --> P["Step 5: drop dominated models, keep the frontier"]
-    P --> Q{"Cheapest model whose lower bound clears the bar and p95 fits?"}
-    Q -->|"yes"| S["Pin exact version, add second source, write ADR"]
-    Q -->|"cheap model fails only on a tail"| K["Cascade: cheap default, escalate on trigger"]
-    Q -->|"none"| N["Prompt work, retrieval, cascade or fine-tune"]
-    S -.->|"deprecation, new release or cadence"| E
+    A["All plausible models"] -->|"Step 1"| F["Hard-constraint filter"]
+    F -->|"eligible only, Step 2"| E["Private task eval set"]
+    E -->|"Step 3"| R["Fair, paired runs"]
+    R -->|"Step 4"| C["Measured cost and p95"]
+    C -->|"Step 5"| P["Drop dominated models"]
+    P --> Q{"Lower bound clears bar, p95 fits?"}
+    Q -->|"yes, cheapest such model"| S["Pin version, second source, ADR"]
+    Q -->|"no"| T{"Cheap model fails only on a tail?"}
+    T -->|"yes"| K["Cascade with escalation trigger"]
+    T -->|"no"| N["Prompt, retrieval or fine-tune work"]
+    S -.->|"deprecation, release or cadence"| E
 ```
 
 ## Examples
@@ -264,17 +266,20 @@ The per-call price says "save 40%"; the per-successful-task number says the swap
 
 ## Pitfalls
 - **Choosing on public leaderboard rank.** Symptom: the "better" model scores lower on your eval, or wins
-  it and then fails on JSON formatting or tool calls in production.
+  it and then fails on JSON formatting or tool calls in production. Fix: a private task eval that also
+  scores format and tool-call compliance.
 - **Estimating cost from list price without measuring tokens.** Symptom: the bill differs from the
-  forecast by a large fraction because of tokenizer differences or verbose outputs.
+  forecast by a large fraction because of tokenizer differences or verbose outputs. Fix: compute cost
+  from token counts measured in the eval runs.
 - **Comparing single runs and treating a 2-point gap as real.** Symptom: the ranking flips when someone
-  re-runs the comparison the following week.
+  re-runs the comparison the following week. Fix: report intervals, compare paired, and add examples.
 - **Deploying a floating "latest" alias.** Symptom: quality or format changes overnight with no deploy
-  and no entry in the change log.
+  and no entry in the change log. Fix: pin the dated version in config.
 - **Ignoring quotas and rate limits at peak.** Symptom: 429 errors at launch, and the fallback path has
-  never been exercised.
+  never been exercised. Fix: confirm quota for launch peak and exercise the second source beforehand.
 - **Evaluating in English only for a multilingual product.** Symptom: context overflows and higher cost
-  for languages whose tokenization is two to three times less efficient.
+  for languages whose tokenization is two to three times less efficient. Fix: include each supported
+  language in the eval set and the token measurements.
 
 ## When to use
 - **Run the funnel when:** a new task is introduced, a deprecation notice arrives, a model release
@@ -347,8 +352,8 @@ land in the costly category.
 ### When would you deliberately not pick the cheapest model that clears the bar?
 - **When the task drifts often.** The cheapest-that-clears choice leaves little headroom, so buy margin
   with a stronger model or a cascade.
-- **When the misses cluster in a high-cost class,** such as wrong citations on compliance questions, even
-  if the total score is close.
+- **When it has no second source that also clears the bar,** because an outage or deprecation then
+  becomes an emergency migration whose cost can exceed the saving.
 - **When it cannot hold the rate limits or p95 at peak,** because feasibility beats a quality score.
 
 ## Quiz

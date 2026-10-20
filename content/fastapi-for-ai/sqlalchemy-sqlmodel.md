@@ -5,7 +5,7 @@ name: SQLAlchemy / SQLModel
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/async-database-access-and-connection-pooling
   - fastapi-for-ai/alembic-migrations
@@ -20,8 +20,8 @@ sources:
 
 ## TL;DR
 SQLAlchemy is Python's standard SQL toolkit: Core builds safe parameterised SQL, the ORM maps classes to
-tables with a unit of work. SQLModel makes one class both table and Pydantic schema; use it while
-storage and API shapes agree.
+tables with a unit of work. SQLModel makes one class both table and Pydantic schema: use it while
+storage and API shapes agree, plain SQLAlchemy once they diverge.
 
 ## Why it exists
 - **AI backends carry a lot of relational state.** Conversations and messages with JSON tool-call
@@ -111,13 +111,13 @@ One write through the Create/table/Read split: validation happens on the non-tab
 work emits SQL at flush, and the Read schema decides what leaves the API.
 
 ```mermaid
-flowchart LR
+flowchart TD
     B["JSON request body"] --> C["MessageCreate (validates)"]
     C -->|"Message.model_validate(payload, update)"| T["Message table model"]
     T -->|"session.add"| P["Pending in session"]
     P -->|"flush: INSERT in FK order"| DB[("Postgres")]
     P -->|"commit"| E{"expire_on_commit?"}
-    E -->|"True (default)"| X["Attributes expired, reload on access, MissingGreenlet in async"]
+    E -->|"True (default)"| X["Expired: async access raises MissingGreenlet"]
     E -->|"False"| K["Loaded values kept"]
     K --> R["MessageRead via response_model"]
     R --> O["JSON response, hidden columns omitted"]

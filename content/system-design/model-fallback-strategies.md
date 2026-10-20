@@ -5,7 +5,7 @@ name: Model fallback strategies
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/fallbacks
   - serving-inference/retry-strategies
@@ -256,7 +256,7 @@ code (5 failures, 60 s cooldown).
 
 | | No breaker | With breaker |
 |---|---|---|
-| Requests sent to the dead primary | 50 × 2,400 s = 120,000 | ~5 to open it, then one probe per cooldown: about 40 more |
+| Requests sent to the dead primary | 50 × 2,400 s = 120,000 | ~5 to open it if it fails fast (up to ~150 if it times out, since 3 s × 50/s are in flight before any timeout lands), then one probe per 60 s cooldown: about 40 more |
 | Added latency per request | The full 3 s primary timeout, every request | None once open; only probes pay it |
 | Load on the failing provider | All your traffic, plus retries | Near zero |
 | Signal | Error rate looks flat | `fallback_depth` > 0 alert fires as soon as traffic shifts to the next rung |
@@ -370,8 +370,9 @@ alert on fallback share so someone is watching during the outage, not the mornin
 ### During an outage, latency rose to primary timeout plus fallback time for every request. What was missing?
 - **A per-target circuit breaker:** without one, each request waits the full primary timeout before falling
   back, for the whole incident.
-- **With a breaker** (5 failures, 60 s cooldown in the example), the dead primary receives about 5 requests
-  to open it and then one probe per cooldown, instead of 120,000 over 40 minutes at 50 requests per second.
+- **With a breaker** (5 failures, 60 s cooldown in the example), the dead primary receives a few requests
+  to open it (about 5 on fast errors, up to one timeout's worth of traffic if it hangs) and then one probe
+  per cooldown, instead of 120,000 over 40 minutes at 50 requests per second.
 - **Also check** that client errors are not counted, so one buggy caller cannot open the breaker.
 
 ## Quiz

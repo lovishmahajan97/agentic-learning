@@ -5,7 +5,7 @@ name: Domain-driven design & bounded contexts
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - system-design/modular-monolith-vs-microservices
   - system-design/event-driven-architecture
@@ -41,9 +41,10 @@ contexts decide tool boundaries, data ownership and who translates meaning for t
 - **DDD models the inconsistency instead of fixing it.** Each area uses its own language consistently
   inside a boundary; between boundaries, translation is explicit. Conway's observation (systems mirror
   their builders' communication structures) is why it works: a boundary matching a team's responsibility
-  is one that team can own and change alone. AI raises the stakes: an agent reaches across many contexts
-  through tools, retrieval indexes mix vocabularies, and without drawn boundaries the agent resolves every
-  ambiguity by guessing.
+  is one that team can own and change alone.
+- **AI raises the stakes.** An agent reaches across many contexts at once through tools, and retrieval
+  indexes mix documents written in several vocabularies; without drawn boundaries the agent inherits
+  every ambiguity and resolves it by guessing.
 
 ## How it works
 ### Ubiquitous language
@@ -71,7 +72,7 @@ domain events (event storming), then look for seams. Four signals mark one:
 | A term changes meaning | "customer", "active", "account" |
 | Who decides changes | finance owns the dunning rule, support owns the escalation rule |
 | Rate of change differs | pricing rules change weekly, ledger rules almost never |
-| Rules must hold together at the same instant | they belong inside one context |
+| A set of rules must hold together at the same instant | order total and credit limit: that set belongs inside one context, so the seam runs around it |
 
 - **Wrong seam test:** when two candidate contexts must constantly ask each other questions to make any
   decision, the seam is in the wrong place.
@@ -135,7 +136,7 @@ A context map for the support agent in the examples. The agent only speaks its o
 each upstream model is translated in an adapter, and contexts change each other only through events.
 
 ```mermaid
-flowchart LR
+flowchart TD
     AG["Support agent"] -->|"lookup_customer tool"| SC["Support context: SupportCustomer"]
     SC --> ACL1["Billing adapter: anticorruption layer"]
     ACL1 -->|"plan, past_due_since"| BC["Billing context: BillingAccount"]
@@ -293,18 +294,21 @@ except CreditLimitExceeded as e:
 
 ## Pitfalls
 - **One shared database schema behind several "services".** Symptom: a migration in one team's context
-  breaks another team's deployment.
+  breaks another team's deployment. Fix: one schema and role per context, with no cross-context writes.
 - **Contexts drawn by technical layer or by noun** ("the customer service"). Symptom: every feature
-  touches every service and release trains must be coordinated.
+  touches every service and release trains must be coordinated. Fix: redraw by language and
+  responsibility.
 - **An upstream model leaking through without an ACL.** Symptom: vendor field names and enums appear in
-  your prompts, your UI and your tests.
+  your prompts, your UI and your tests. Fix: translate in an adapter at the boundary.
 - **Asking the model to reconcile conflicting vocabularies at runtime.** Symptom: answers mix the billing
-  and support meanings of a term, and evals cannot agree on correctness.
+  and support meanings of a term, and evals cannot agree on correctness. Fix: move translation into tool
+  adapters.
 - **Translation tables with catch-all defaults.** Symptom: a new upstream enum value (a new plan, a new
   status) is quietly mapped to the wrong meaning and found weeks later through customer complaints
-  rather than errors.
+  rather than errors. Fix: raise on unmapped values and alert.
 - **Transactions that span contexts.** Symptom: distributed locks, timeouts under load, and partial
-  updates nobody can compensate.
+  updates nobody can compensate. Fix: one aggregate per transaction, with events or a saga across
+  contexts.
 
 ## When to use
 - **Use when:** more than one team or vocabulary touches the system, an agent must integrate several

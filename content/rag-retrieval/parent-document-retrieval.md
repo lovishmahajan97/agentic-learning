@@ -23,7 +23,7 @@ sources:
 ## TL;DR
 Small chunks match best because they embed as sharp keys; sections answer best because they hold the
 definitions, table headers and caveats. Parent-document retrieval searches small children and hands the
-generator their linked parents: small-chunk recall with big-chunk context, paid for in tokens.
+generator their parents: small-chunk recall with big-chunk context, paid for in tokens.
 
 ## Why it exists
 - **One chunk size is wrong in both directions.** "The limit is 50 requests per minute." alone is an

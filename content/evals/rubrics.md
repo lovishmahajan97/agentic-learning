@@ -126,7 +126,8 @@ Two layers work well:
 
 ## Diagram
 How one graded item becomes a score: applicability first, gates before aggregation, and N/A kept out of
-the denominator. The left branch is how the rubric itself is built and frozen.
+the denominator. The top two boxes are how the rubric itself is built and frozen; the gate check runs
+once per item, after every applicable criterion has been graded.
 
 ```mermaid
 flowchart TD
@@ -135,7 +136,8 @@ flowchart TD
     C --> A{"Applies to this item?"}
     A -->|"no"| NA["N/A: out of denominator"]
     A -->|"yes"| J["Judge call: evidence, then PASS or FAIL"]
-    J --> G{"Any gate failed?"}
+    J -->|"all criteria graded"| G{"Any gate failed?"}
+    NA --> G
     G -->|"yes"| F["Item fails, counted in gate rate"]
     G -->|"no"| S["Score = fraction of applicable checks"]
     S --> D["Per-criterion pass rates"]
@@ -260,7 +262,8 @@ print(aggregate(graded, gates={"no_fabrication"}))
 - **Double-barreled criteria** such as "accurate and complete". Symptom: annotators split on items that
   are accurate but incomplete, and agreement on that criterion collapses. Fix: split it.
 - **Anchors that describe grader feelings** ("excellent", "adequate") instead of output features.
-  Symptom: scores drift between annotators and across weeks for the same outputs.
+  Symptom: scores drift between annotators and across weeks for the same outputs. Fix: rewrite each
+  anchor as an observable property of the output.
 - **Averaging over a gate.** Symptom: an answer with a fabricated citation scores 0.8 and passes the
   release threshold. Fix: gates override the average.
 - **Editing the rubric mid-experiment.** Symptom: an "improvement" that disappears when both arms are

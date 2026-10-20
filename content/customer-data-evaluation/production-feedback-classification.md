@@ -5,7 +5,7 @@ name: Production feedback classification
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - evals/error-analysis
   - evals/llm-as-a-judge
@@ -18,91 +18,123 @@ related:
 ---
 
 ## TL;DR
-Production feedback classification turns raw signals (thumbs-down, comments, edits, escalations,
-tickets) into labelled failure modes, each with a severity and an owning component. It exists because a
-thumbs-down rate tells you something is wrong but not what or who should fix it. The classifier labels
-the whole trace, not just the comment, uses a taxonomy grown from real failures, and is checked against
-human labels.
+Turning raw signals (thumbs-down, comments, edits, escalations, tickets) into labelled failure modes with
+a severity and an owning component. A thumbs-down rate says something is wrong, not what or who fixes
+it; labelling whole traces against a grown taxonomy does.
 
 ## Why it exists
-A live deployment produces far more feedback than anyone can read. Explicit signals are sparse and
-terse: a thumbs-down with no comment, or "wrong again". Implicit signals are plentiful but ambiguous: a
-user regenerating an answer, heavily editing a draft, abandoning a session, or escalating to a human.
-Tickets from the customer's support desk mix model failures with login problems and feature requests.
-
-The naive approaches fail. **Tracking one satisfaction rate** gives a trend line with nothing to act on:
-a rise in thumbs-down could be retrieval missing a newly uploaded policy, a guardrail over-blocking, or
-latency. **Reading feedback ad hoc** gives vivid anecdotes and a priority list set by whoever complained
-most memorably. **Classifying only the comment text** misattributes cause: "this is wrong" says nothing
-about whether the retriever missed the document, the model ignored it, or the source document itself
-was out of date. Those three have three different owners and three different fixes.
-
-Classification makes feedback countable and routable: how many failures of each kind, for which
-customer, in which component, and whether that is rising. It is the input to the regression suite (which
-failures to capture as tests), to the product roadmap, and to the customer conversation.
+- **There is far more feedback than anyone can read.** Explicit signals are sparse and terse: a
+  thumbs-down with no comment, or "wrong again". Implicit signals are plentiful but ambiguous:
+  regenerating, heavily editing a draft, abandoning a session, escalating to a human. Support tickets mix
+  model failures with login problems and feature requests.
+- **One satisfaction rate gives nothing to act on.** A rise in thumbs-down could be retrieval missing a
+  newly uploaded policy, a guardrail over-blocking, or latency.
+- **Reading ad hoc sets priorities by anecdote**, ranked by whoever complained most memorably.
+- **Classifying only the comment misattributes cause.** "This is wrong" does not say whether the retriever
+  missed the document, the model ignored it, or the source itself was out of date: three owners, three
+  fixes.
+- **Classification makes feedback countable and routable:** how many failures of each kind, for which
+  customer, in which component, and whether rising. It feeds the regression suite (which failures become
+  tests), the roadmap and the customer conversation.
 
 ## How it works
 ### 1. Build the taxonomy bottom-up
-Start with error analysis: pull a few hundred negative traces, read each, and write a free-text note on
-what went wrong (open coding). Group the notes into categories. This matters because categories invented
-upfront ("hallucination", "bad answer") are too vague, while categories from real traces map to fixes. A
-typical first taxonomy for a RAG assistant: retrieval miss, ignored context, unsupported claim, wrong
+1. **Pull a few hundred negative traces** and read each (error analysis).
+2. **Write a free-text note** on what went wrong (open coding).
+3. **Group the notes into categories.** Categories invented upfront ("hallucination", "bad answer") are
+   too vague; categories from real traces map to fixes.
+4. **Give each category** a definition, positive and negative examples, and an owning component.
+
+A typical first taxonomy for a RAG assistant: retrieval miss, ignored context, unsupported claim, wrong
 format, over-refusal or over-blocking, outdated source, latency or timeout, out of scope, missing
-capability (a feature request), user error, and other. Each category gets a definition, positive and
-negative examples, and an owning component.
+capability (a feature request), user error, and other.
 
 ### 2. Add severity and owner as separate fields
-Category says what happened; severity says how bad (cosmetic, wrong but harmless, wrong and acted upon,
-safety or compliance); owner says who fixes it (retrieval, prompt, guardrails, ingestion, product,
-customer content). Keeping them separate lets you sort by severity within a category and route by owner.
+| Field | Says | Values |
+|---|---|---|
+| **Category** | What happened | The taxonomy above |
+| **Severity** | How bad | Cosmetic, wrong but harmless, wrong and acted upon, safety or compliance |
+| **Owner** | Who fixes it | Retrieval, prompt, guardrails, ingestion, product, customer content |
+
+- **Why separate:** you can sort by severity within a category and route by owner.
 
 ### 3. Classify the trace, not the comment
-The classifier gets the user input, retrieved passages, tool calls, final output, guardrail events and
-the user's feedback. With retrieval visible it can tell "the answer was in no retrieved passage" (retrieval
-miss) from "it was in passage 2 and the answer contradicts it" (ignored context). An LLM classifier with
-a structured output schema works well here; small fine-tuned classifiers are cheaper once you have
-enough labels.
+- **Input to the classifier:** user input, retrieved passages, tool calls, final output, guardrail events
+  and the user's feedback.
+- **Retrieval visibility is the point.** It separates "the answer was in no retrieved passage" (retrieval
+  miss) from "it was in passage 2 and the answer contradicts it" (ignored context).
+- **Implementation:** an LLM classifier with a structured output schema works well; small fine-tuned
+  classifiers are cheaper once you have enough labels.
 
 ### 4. Calibrate against humans, per class
-Have SMEs label a sample using the same codebook, measure their agreement first (if humans cannot agree,
-the definition is the problem), then measure classifier precision and recall per class. Report per class
-because overall accuracy hides that, for instance, "unsupported claim" is rarely detected. Re-check after
-any taxonomy, prompt or model change.
+1. **SMEs label a sample** with the same codebook.
+2. **Measure their agreement first.** If humans cannot agree, the definition is the problem.
+3. **Measure classifier precision and recall per class**, because overall accuracy hides that, for
+   instance, "unsupported claim" is rarely detected.
+4. **Re-check** after any taxonomy, prompt or model change.
 
 ### 5. Route by confidence
-High-confidence labels flow straight to dashboards and owners' queues. Low-confidence or high-severity
-items go to a human review queue, because those are where a wrong label is most costly.
-
-Be careful where "confidence" comes from. A number an LLM writes into its own JSON is a weak signal and
-is often poorly calibrated, so do not trust the 0.7 cut-off because it looks like a probability. Either
-calibrate it (on the SME-labelled sample, find the score above which labels are, say, 90% correct, and
-use that as the threshold) or derive confidence from agreement: classify each item two or three times,
-or with two different models, and send disagreements to humans. Agreement costs more tokens but is
-measurable.
+- **High-confidence labels** flow straight to dashboards and owners' queues.
+- **Low-confidence or high-severity items** go to a human review queue, because that is where a wrong
+  label costs most.
+- **Self-reported confidence is weak.** A number an LLM writes into its own JSON is often poorly
+  calibrated, so do not trust a 0.7 cut-off because it looks like a probability.
+- **Option 1, calibrate it:** on the SME-labelled sample, find the score above which labels are, say, 90%
+  correct, and use that as the threshold.
+- **Option 2, derive it from agreement:** classify each item two or three times, or with two different
+  models, and send disagreements to humans. It costs more tokens but is measurable.
 
 ### 6. Watch for taxonomy drift
-Track the share of "other" and of low-confidence items. When it rises, a new failure mode has appeared
-(a new document type, a new user population): do another round of open coding and revise the taxonomy,
-with a version number so trends across versions are interpretable.
+- **Track the share of "other" and of low-confidence items.** A rise means a new failure mode (a new
+  document type, a new user population).
+- **Respond with another round of open coding** and a revised taxonomy with a version number, so trends
+  across versions are interpretable.
 
 ### Know the sampling bias
-Feedback comes from users who bother to give it, skewed negative and toward heavy users. Use it to find
-and rank failure modes, then estimate their true prevalence on a random sample of traffic before claiming
-"12% of answers have retrieval misses".
+- **Feedback comes from users who bother to give it**, skewed negative and toward heavy users.
+- **Use it to find and rank failure modes**, then estimate true prevalence on a random traffic sample
+  before claiming "12% of answers have retrieval misses".
 
-Even on a random sample, the classifier's own errors distort the rate. For one category, with recall
-(true-positive rate) *r* and false-positive rate *f* measured against SME labels, the observed share
-*p_obs* relates to the true share *p* by `p_obs = r·p + f·(1 − p)`, so `p ≈ (p_obs − f) / (r − f)`.
-If the classifier flags 3% of a random sample as "unsupported claim" but only catches half of the real
-ones (*r* = 0.5) with a 1% false-positive rate, the true share is about (0.03 − 0.01) / 0.49 ≈ 4%: the
-dashboard understates the category by a quarter. The correction is only as good as the *r* and *f*
-estimates, which is one more reason to keep a labelled calibration sample per customer.
+### Correct for the classifier's own errors
+Even on a random sample, classifier errors distort the rate. For one category, with recall (true-positive
+rate) *r* and false-positive rate *f* measured against SME labels, the observed share *p_obs* relates to
+the true share *p* by:
+
+```
+p_obs = r·p + f·(1 − p)      so      p ≈ (p_obs − f) / (r − f)
+```
+
+- **Worked case:** the classifier flags 3% of a random sample as "unsupported claim" but catches only half
+  the real ones (*r* = 0.5) with a 1% false-positive rate. True share ≈ (0.03 − 0.01) / 0.49 ≈ 4%: the
+  dashboard understates the category by a quarter.
+- **The correction is only as good as the *r* and *f* estimates**, one more reason to keep a labelled
+  calibration sample per customer.
 
 ### Handle it as customer data
-Comments and traces contain personal and confidential information. Classification runs under the same
-data agreement as production, and stored labels inherit the trace's retention and access rules.
+- **Comments and traces contain personal and confidential information.**
+- **Classification runs under the same data agreement as production**, and stored labels inherit the
+  trace's retention and access rules.
 
-## Example
+## Diagram
+Feedback is joined to its full trace before classification; severity and confidence decide whether a
+label goes straight to an owner or to a human first.
+
+```mermaid
+flowchart TD
+    F["Thumbs, comments, edits, tickets"] --> J["Join to trace by id"]
+    J --> C["Trace-level classifier"]
+    C --> L["Category, severity, confidence"]
+    L --> Q{"Severity 3+, low confidence or other?"}
+    Q -->|"yes"| H["Human review queue"]
+    Q -->|"no"| O["Owner queue + dashboard"]
+    H --> O
+    SME[("SME-labelled sample")] -.->|"per-class precision, recall"| C
+    O --> D{"Other share rising?"}
+    D -->|"yes"| T["Open coding, taxonomy vN+1"]
+```
+
+## Examples
+### Trace-level classifier with confidence routing
 A trace-level classifier with a fixed schema and confidence routing. `llm_json` stands for any client call
 that returns JSON validated against the schema.
 
@@ -137,51 +169,97 @@ def classify(trace: dict, codebook: str, llm_json) -> dict:
             "owner": OWNER[label.category.value], "queue": "human" if needs_human else "auto"}
 ```
 
-The routing rule is deliberately asymmetric: severity 3 and above goes to a human whatever the
-confidence, because a confidently wrong label on a compliance failure costs far more than a reviewer's
-minute.
+- **The routing rule is deliberately asymmetric.** Severity 3 and above goes to a human whatever the
+  confidence, because a confidently wrong label on a compliance failure costs far more than a reviewer's
+  minute.
+- **The 0.7 here is a placeholder**; replace it with a calibrated threshold (next example).
 
-Illustrative week (numbers invented for the walkthrough): 1,400 negative signals for one customer. About
-150 are not model failures at all (login problems, feature requests) and route straight to product or
-support. Of the rest, retrieval misses and outdated sources are the largest groups, and roughly
-two-thirds of the outdated-source items cite one policy document the customer replaced last month.
-Ranking by count alone would put that first anyway, but rank by count × severity and a smaller group of
-40 "unsupported claim" items about refund eligibility (severity 3: users acted on them) jumps the queue,
-and every one of them was sent to human review by the severity rule. Two fixes follow: re-ingest the
-replaced policy (an ingestion and customer-content fix, not a model fix) and add the 40 refund cases to
-the customer's regression suite before changing the prompt.
+### Calibrating the threshold and correcting prevalence
+Pure Python on an SME-labelled sample: each item is (classifier confidence, label was correct).
+
+```python
+def calibrated_threshold(scored, target=0.90):
+    """Lowest confidence cut-off at which auto-routed labels are >= target correct."""
+    for t in sorted({c for c, _ in scored}):
+        kept = [ok for c, ok in scored if c >= t]
+        if sum(kept) / len(kept) >= target:
+            return t, len(kept) / len(scored)          # threshold, share auto-routed
+    return None
+
+def corrected_prevalence(p_obs, recall, fpr):
+    return min(1.0, max(0.0, (p_obs - fpr) / (recall - fpr)))
+
+sme = [(0.95, True)] * 50 + [(0.95, False)] * 2 + [(0.9, True)] * 30 + [(0.9, False)] * 4 \
+    + [(0.8, True)] * 20 + [(0.8, False)] * 10 + [(0.7, True)] * 10 + [(0.7, False)] * 14
+print(calibrated_threshold(sme))                       # (0.9, 0.614...): 0.7 would be far too low
+print(round(corrected_prevalence(0.03, 0.5, 0.01), 3)) # 0.041, not the 0.03 the dashboard shows
+```
+
+### Worked week: rank by count × severity
+Illustrative week (numbers invented for the walkthrough): 1,400 negative signals for one customer.
+
+| Group | What the classifier found | Action |
+|---|---|---|
+| Not model failures | About 150 items: login problems, feature requests | Route straight to product or support |
+| Outdated source | A large group; roughly two-thirds cite one policy document the customer replaced last month | Re-ingest the replaced policy: an ingestion and customer-content fix, not a model fix |
+| Retrieval miss | The other largest group | Retrieval owner's queue |
+| Unsupported claim, refund eligibility | Only 40 items, but severity 3: users acted on them | All sent to human review by the severity rule; added to the regression suite before changing the prompt |
+
+- **Count alone** would put outdated sources first anyway; **count × severity** makes the 40 refund cases
+  jump the queue.
+
+## Production patterns
+- **Stable trace ids on every feedback event** — from day one of a deployment. Attach the request's trace
+  id (for example the OpenTelemetry trace id) to thumbs, edits and escalations so feedback joins to
+  retrieval, tool and guardrail spans. Monitor the share of feedback events that fail to join.
+- **Schema-constrained labels** — for the LLM classifier. Validate output against a Pydantic model (as
+  above) or the provider's structured-output mode, and retry or route to humans on validation failure.
+  Monitor validation-failure rate per model version.
+- **Self-consistency routing** — when self-reported confidence is uncalibrated. Classify each item twice
+  (or with two models) and send disagreements to the human queue. Monitor disagreement rate and the
+  human-confirmed error rate on agreed labels.
+- **Weekly calibration sample** — per customer. SMEs label a fixed-size random sample each week; recompute
+  per-class precision, recall, the confidence threshold and corrected prevalence. Monitor per-class recall
+  for rare, severe classes.
+- **"Other" share alert** — always on. Alert when "other" or low-confidence share rises above its usual
+  band, and schedule an open-coding session and taxonomy version bump. Monitor trends only within one
+  taxonomy version.
 
 ## Trade-offs
-- An LLM classifier handles free text and full traces with little setup, but costs tokens per item and
-  drifts with model changes; a small trained classifier is cheaper once you have a few thousand labels.
-- A fine-grained taxonomy points directly at fixes but lowers agreement between annotators; merge
-  categories whose distinction does not change who fixes the problem.
-- Auto-routing high-confidence labels saves reviewer time, but low-frequency severe failures can be
-  mislabelled confidently; always send the top severities to humans regardless of confidence.
-- Implicit signals such as edits and regenerations give far more volume than thumbs, but are noisier;
-  weight them lower and validate their meaning on a sample before using them as targets.
+- **LLM classifier vs small trained classifier.** The LLM handles free text and full traces with little
+  setup, but costs tokens per item and drifts with model changes; a trained classifier is cheaper once you
+  have a few thousand labels.
+- **Fine-grained vs coarse taxonomy.** Fine-grained points directly at fixes but lowers annotator
+  agreement; merge categories whose distinction does not change who fixes the problem.
+- **Auto-routing vs human review.** Auto-routing high-confidence labels saves reviewer time, but rare
+  severe failures can be mislabelled confidently; always send the top severities to humans regardless of
+  confidence.
+- **Implicit vs explicit signals.** Edits and regenerations give far more volume than thumbs, but are
+  noisier; weight them lower and validate their meaning on a sample before using them as targets.
 
 ## Pitfalls
-- Classifying only the user's comment; the symptom is most items labelled "inaccurate answer" with no way to
+- **Classifying only the user's comment.** Symptom: most items labelled "inaccurate answer" with no way to
   tell retrieval failures from generation failures.
-- Inventing the taxonomy upfront; the symptom is a large "other" bucket and categories that do not map to
-  any team's backlog.
-- Reporting overall classifier accuracy only; the symptom is a dashboard where a rare but critical class
-  never appears because the classifier almost never predicts it.
-- Trusting the classifier's self-reported confidence as a probability; the symptom is a human-review
-  queue that rarely catches errors while confidently mislabelled items flow into owners' backlogs.
-- Treating feedback rates as prevalence; the symptom is alarming numbers that a random-sample audit of
+- **Inventing the taxonomy upfront.** Symptom: a large "other" bucket and categories that map to no team's
+  backlog.
+- **Reporting overall classifier accuracy only.** Symptom: a rare but critical class never appears on the
+  dashboard because the classifier almost never predicts it.
+- **Trusting self-reported confidence as a probability.** Symptom: a human-review queue that rarely
+  catches errors while confidently mislabelled items flow into owners' backlogs.
+- **Treating feedback rates as prevalence.** Symptom: alarming numbers that a random-sample audit of
   traffic does not reproduce.
-- Changing the taxonomy without versioning; the symptom is a trend chart with a sudden jump that is a
+- **Changing the taxonomy without versioning.** Symptom: a trend chart with a sudden jump that is a
   relabelling artifact, not a real change.
 
 ## When to use
-Start as soon as a deployment produces more feedback than one person reads in a day; before that, read
-everything yourself and build the first taxonomy from it. Re-run open coding after major launches or new
-customer onboarding. Do not automate classification before humans agree on the codebook. Measure per-
-class precision and recall against SME labels, the "other" share, and time from feedback to routed owner.
-In interviews, trace-level classification and bottom-up taxonomies distinguish real practice from
-dashboard talk.
+- **Start when** a deployment produces more feedback than one person reads in a day; before that, read
+  everything yourself and build the first taxonomy from it.
+- **Re-run open coding** after major launches or new customer onboarding.
+- **Do not automate** classification before humans agree on the codebook.
+- **Measure:** per-class precision and recall against SME labels, the "other" share, and time from
+  feedback to routed owner.
+- **Interviews:** trace-level classification and bottom-up taxonomies distinguish real practice from
+  dashboard talk.
 
 ## Role lens
 - **Engineer:** Builds the trace-level classifier with a strict schema, the routing by confidence and
@@ -200,6 +278,37 @@ from retrieved passages (retrieval changed) or present but contradicted (prompt 
 the release for retrieval, prompt and model changes, run the customer regression suite, and add the
 confirmed failures as cases. Estimate prevalence on a random traffic sample, since feedback is biased,
 then roll back for that tenant if the regression is real and severe.
+
+## Interview questions
+### Why build a feedback taxonomy bottom-up instead of starting from standard categories?
+- **Upfront categories are vague.** "Hallucination" or "bad answer" do not say who fixes what.
+- **Open coding on a few hundred real negative traces** produces categories that map to components and
+  fixes, each with definitions, examples and an owner.
+- **The "other" share then tells you** when the taxonomy needs a new version.
+
+### How would you design the input to a feedback classifier so it attributes cause correctly?
+- **Give it the whole trace:** input, retrieved passages, tool calls, guardrail events, output and the
+  feedback.
+- **That separates** a retrieval miss (answer in no passage) from ignored context (answer in a passage
+  but contradicted), which have different owners.
+- **Store severity and owner as separate fields** from category.
+
+### Your human-review queue rarely finds errors, yet owners keep getting mislabelled items. Why?
+- **The confidence threshold trusts self-reported scores** that are poorly calibrated.
+- **Fix:** calibrate the cut-off on SME labels (the score above which labels are, say, 90% correct), or
+  route on agreement between repeated or dual-model classifications.
+- **Keep severity 3+ in human review** regardless of confidence.
+
+### The dashboard says 3% of answers are unsupported claims. Is that the real rate?
+- **Not if it comes from feedback**, which is self-selected and negatively skewed; measure on a random
+  traffic sample.
+- **Even then correct for classifier error:** p ≈ (p_obs − f) / (r − f). With recall 0.5 and 1%
+  false positives, 3% observed is about 4% true.
+
+### When would you switch from an LLM classifier to a small trained one?
+- **Once you have a few thousand labels** and volume makes per-item tokens expensive.
+- **The trained classifier is cheaper and stable**, but needs retraining when the taxonomy changes; keep
+  the LLM for new categories and low-confidence items.
 
 ## Quiz
 ### Q: Why should the classifier see retrieved passages and tool calls, not only the user's comment?

@@ -5,7 +5,7 @@ name: Memory architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-memory
   - agents/memory-retrieval-update-deletion-policies
@@ -22,8 +22,8 @@ sources:
 
 ## TL;DR
 Models are stateless and windows finite, so anything remembered across turns, sessions or users lives
-outside the model and returns selectively. Memory architecture designs those scoped stores and the
-policies that write, read, update and delete them; the hard part is what to forget.
+outside the model and returns selectively. Memory architecture designs those scoped stores and their
+write, read, update and delete policies; the hard part is what to remember and forget.
 
 ## Why it exists
 - **Every model call starts from zero.** The model knows only what the application puts in the prompt.
@@ -106,7 +106,7 @@ under a token budget:
   into the model.
 - **The trade:** flexibility on open-ended tasks, at the cost of predictability, extra calls, and a model
   that sometimes forgets to remember.
-- **Production default:** a code-driven baseline read plus model-callable memory tools for the rest.
+- **Common production mix:** a code-driven baseline read plus model-callable memory tools for the rest.
 
 ### Scoping and isolation
 - **Every memory row carries** tenant id, user id, the agent or purpose it was collected for, a source
@@ -125,12 +125,12 @@ under a token budget:
   on every call. That flat line is the architectural goal.
 
 ## Diagram
-The write path (top) runs in the background after each turn; the read path (bottom) rebuilds the
-working set for every call. Note that both paths apply tenant, user and purpose scope, and that the
-transcript store stays the source of truth.
+The write path runs down from the user turn into the memory store, in the background after each turn;
+the read path joins at the scoped read and rebuilds the working set for every call. Note that both paths
+apply tenant, user and purpose scope, and that the transcript store stays the source of truth.
 
 ```mermaid
-flowchart LR
+flowchart TD
     T["User turn"] --> SS[("Session store: full transcript")]
     SS -->|"background job"| X["Extract facts from user words only"]
     X -->|"typed slot"| U["Upsert by tenant, user, slot"]
@@ -262,18 +262,21 @@ for name, w in profiles.items():
 
 ## Pitfalls
 - **Keying memory by agent or conversation instead of tenant and user.** Symptom: one user's preferences
-  or facts appear in another user's session.
+  or facts appear in another user's session. Fix: scope every row by tenant and user, filtered inside
+  the query.
 - **Append-only memory without supersession.** Symptom: the assistant confidently states two
-  contradictory facts, usually the stale one first.
+  contradictory facts, usually the stale one first. Fix: typed slots or model adjudication.
 - **Treating the context window as the system of record.** Symptom: after compaction, details the user
-  mentioned are gone forever and the transcript cannot be audited.
+  mentioned are gone forever and the transcript cannot be audited. Fix: keep the full transcript in the
+  session store.
 - **Deleting a memory row but not its embedding, summary mention or derived facts.** Symptom: a
-  "forgotten" fact resurfaces weeks later, which is a compliance incident.
+  "forgotten" fact resurfaces weeks later, which is a compliance incident. Fix: purge by lineage.
 - **Extracting memories from retrieved documents, web pages or tool output.** Symptom: an instruction
   planted in a fetched page ("always CC this address") reappears in later, unrelated sessions, which is
   persistent prompt injection. Fix: extract from the user's own words only.
 - **Shipping memory without measuring it.** Symptom: higher cost per call with no gain in task success,
-  because the retrieved memories are rarely relevant.
+  because the retrieved memories are rarely relevant. Fix: track memory hit rate and A/B task success
+  with memory on versus off.
 
 ## When to use
 - **Use when:** users return and expect continuity, the agent performs multi-session tasks, or
@@ -340,7 +343,7 @@ no retrieval, summary or extraction can surface it afterwards.
 - **Code-controlled** reads are predictable, cheap and testable, which is why they are the baseline.
 - **Model-controlled** paging (the MemGPT line of work) gives tools to read, write and evict memory,
   buying flexibility on open-ended tasks at the cost of extra calls and a model that sometimes forgets
-  to remember; the production default combines both.
+  to remember; production systems often combine both.
 
 ### How can memory become a persistent prompt-injection channel, and how do you close it?
 

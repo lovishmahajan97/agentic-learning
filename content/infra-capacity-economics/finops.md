@@ -5,7 +5,7 @@ name: FinOps
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - observability/token-cost-tracking
   - infra-capacity-economics/cost-allocation-by-tenant-and-feature
@@ -204,9 +204,9 @@ daily_review(EVENTS, {"search": 300, "summarize": 1500}, day_of_month=10)
 - **Tags make the diagnosis one query.** Every event carries `prompt_version` and token counts, so tokens
   per call by prompt version shows that `v12` doubled input tokens. The fix is a prompt rollback, not a
   budget increase.
-- **The simulation is generous to the average.** It runs the whole month-to-date at the new rate. If `v12`
-  shipped on day eight, the month-to-date average would mix in seven cheaper days and understate the
-  overrun; a trailing-days forecast shows it in full (next example).
+- **The simulation flatters the month-to-date forecast.** It runs all ten days at the new rate. If `v12`
+  shipped on day eight, the average would mix in seven cheaper days and understate the overrun; a
+  trailing-days forecast shows it in full (next example).
 - **Where the money is:** each search call costs about $0.00046, and 372 of its 462 micro-dollars are input
   tokens, so context size, not output length, is the lever for that feature.
 
@@ -258,8 +258,8 @@ Run both and alert on either: the average resists noise, the trailing window cat
 - **Gateway chokepoint: complete attribution and enforcement vs one more hop.** It adds latency and a
   single point of failure; the trade flips when teams need provider features the gateway cannot pass
   through.
-- **Chargeback: real accountability vs trust in allocation.** Until allocation is nearly complete, showback
-  produces better decisions with fewer arguments.
+- **Chargeback: real accountability vs needing allocation that teams trust.** Until allocation is nearly
+  complete, showback produces better decisions with fewer arguments.
 - **Hard per-key caps: stop runaway bills vs outages.** They can take a customer-facing feature down
   mid-month. Soft forecast alerts plus rate limiting suit production paths; hard caps suit development and
   evaluation keys.
@@ -275,15 +275,17 @@ Run both and alert on either: the average resists noise, the trailing window cat
 - **Alerting only on a monthly threshold.** Symptom: an alert fires on the 28th, after the budget is gone
   and before anyone can react. Fix: forecast alerts.
 - **Reporting total spend instead of unit cost.** Symptom: a growth month triggers a panic cost cut that
-  damages the product.
+  damages the product. Fix: lead every review with cost per successful task.
 - **Hard-coding prices and never updating them.** Symptom: an internal dashboard disagrees with the invoice
-  by a wide margin and loses everyone's trust.
+  by a wide margin and loses everyone's trust. Fix: a versioned price table and monthly reconciliation.
 - **Ignoring non-production spend.** Symptom: production explains half the bill while evals, load tests
-  and developer experiments own the rest with no owner.
+  and developer experiments own the rest with no owner. Fix: separate keys, a budget and an owner per
+  environment.
 - **Splitting a shared GPU pool or platform cost evenly.** Symptom: a margin report where every tenant
-  looks equally profitable and the heavy tenant's growth never shows up as a cost.
+  looks equally profitable and the heavy tenant's growth never shows up as a cost. Fix: allocate by a
+  written driver such as GPU-seconds.
 - **Agents without step and token budgets.** Symptom: a single stuck loop becomes the largest line item of
-  the day.
+  the day. Fix: a max-steps and max-tokens limit per run, enforced in code.
 
 ## When to use
 - **Start** the day there is a bill worth caring about: for most teams the first month the API invoice

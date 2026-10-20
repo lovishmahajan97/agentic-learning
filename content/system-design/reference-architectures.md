@@ -91,10 +91,12 @@ design document, not a reference.
   starting with the simplest shape that works.
 
 ### Cross-cutting components every shape shares
-- **Evaluation harness and golden set.**
-- **Tracing with cost per call.**
-- **A prompt and model registry.**
-- **A control layer.**
+- **Evaluation harness and golden set,** because every shape's output is probabilistic and quality
+  is only visible over a dataset.
+- **Tracing with cost per call,** so failures and spend can be attributed to a route and a version.
+- **A prompt and model registry,** so what is running in production is versioned, not folklore.
+- **A control layer** for validation and policy, because every shape's output reaches something
+  downstream.
 
 They are drawn once in each reference so that no team can claim they were optional.
 
@@ -130,21 +132,22 @@ composition, not a single box.
 
 ```mermaid
 flowchart TD
-    Q1{"Does it act, or only inform?"} -->|"acts"| AG["Add approval gate and validation contract"]
+    Q1{"Acts, or only informs?"} -->|"acts: add approval gate"| Q2{"Steps known in advance?"}
     Q1 -->|"informs"| Q2
-    AG --> Q2{"Can the steps be enumerated in advance?"}
     Q2 -->|"yes"| WF["Workflow, shape 4"]
-    Q2 -->|"no"| AGT["Agent, shape 3, with step budgets"]
-    WF --> Q3{"Stream of items or a person waiting?"}
+    Q2 -->|"no"| AGT["Agent, shape 3, step budgets"]
+    WF --> Q3{"Items or a person waiting?"}
     AGT --> Q3
-    Q3 -->|"items"| EX["Batch extraction, shape 2, plus review queue"]
-    Q3 -->|"person"| IA["Interactive: latency budget and streaming"]
-    EX --> Q4{"Grounded in an unseen corpus? State across sessions?"}
+    Q3 -->|"items"| EX["Batch extraction, shape 2"]
+    Q3 -->|"person"| IA["Interactive, latency budget"]
+    EX --> Q4{"Needs an unseen corpus?"}
     IA --> Q4
-    Q4 -->|"corpus: retrieval, shape 1 / state: memory, shape 5"| Q5{"More than one team calling models?"}
-    Q5 -->|"yes"| PL["Platform layer, shape 6, underneath"]
-    Q5 -->|"no"| D["Record deviations as ADRs"]
-    PL --> D
+    Q4 -->|"yes: add retrieval, shape 1"| Q5{"State across sessions?"}
+    Q4 -->|"no"| Q5
+    Q5 -->|"yes: add memory, shape 5"| Q6{"Several teams call models?"}
+    Q5 -->|"no"| Q6
+    Q6 -->|"yes: platform layer, shape 6"| D["Record deviations as ADRs"]
+    Q6 -->|"no"| D
 ```
 
 ## Examples
@@ -275,13 +278,16 @@ for line in match_shapes(acts=True, steps_known=True, person_waiting=False,
 - **Agent shape for known steps.** Symptom: unpredictable latency and cost, and debugging sessions that
   end in "the model decided to". Fix: a workflow with contracted nodes.
 - **Dropping the cross-cutting boxes** because "we will add evals later". Symptom: the first model
-  upgrade is a coin flip and nobody can say whether quality moved.
+  upgrade is a coin flip and nobody can say whether quality moved. Fix: the eval set, tracing and
+  gateway are part of the production gate, not a follow-up.
 - **Treating the reference as mandatory in every detail.** Symptom: a 400-document corpus gets a
   reranker, a query rewriter and a multi-hop planner, and the simplest question takes eight seconds.
+  Fix: treat variation points as choices and record each omission as an ADR.
 - **Reference describes a vendor's product, not a shape.** Symptom: switching a component requires
-  rewriting the architecture document, and the exit cost is discovered at renewal.
+  rewriting the architecture document, and the exit cost is discovered at renewal. Fix: keep component
+  names abstract and map vendors onto them per system.
 - **Never recording deviations.** Symptom: six months later nobody knows whether the missing approval
-  gate was a decision or an oversight.
+  gate was a decision or an oversight. Fix: a review that fails any omitted component without an ADR.
 
 ## When to use
 - **Use when:** starting any design, during an architecture review, and when onboarding an engineer to

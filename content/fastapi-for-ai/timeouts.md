@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-FastAPI and uvicorn impose no per-request time limit, so a slow LLM call holds a connection and a
-concurrency slot indefinitely. Set phase timeouts (connect, read, total) on every outbound call, one
-overall request deadline, and make the innermost layer fire first.
+FastAPI and uvicorn impose no per-request time limit, so a slow LLM call holds a connection, memory and
+a concurrency slot for as long as the dependency lets it. Timeouts turn that hang into a fast, known
+error: phase timeouts per call, one request deadline, innermost firing first.
 
 ## Why it exists
 - **An LLM endpoint is mostly waiting.** On the model provider, the vector store, a tool's API. Most
@@ -183,7 +183,7 @@ async def chat(req: Request, body: dict):
 
 | Moment | What happens |
 |---|---|
-| 0.4 s | retrieval returns; the generation call is built with about 7.6 s on every phase |
+| 0.4 s | retrieval returns; the generation call is built with about 7.6 s on read, write and pool (connect stays at 2 s) |
 | 8 s | whichever fires first (httpx's 7.6 s read timeout or the outer `asyncio.timeout`) ends the call and closes the socket |
 | ~8 s | both paths map to *your* 504 with a clear message |
 | 10 s | the proxy would have returned an anonymous 504; you answered two seconds earlier |
@@ -284,8 +284,10 @@ of the second.
   error in your logs, while provider bills show completions that finished after the client had gone.
 - **Treating httpx's `read` as a total limit.** Symptom: a streamed response trickles a token every few
   seconds and runs for minutes, well past what you thought your limit was.
-- **Swallowing `CancelledError`.** Catching broad `Exception` (or `BaseException`) inside a timed block.
-  Symptom: `asyncio.timeout` "doesn't work"; requests overrun the deadline and finish late.
+- **Swallowing `CancelledError`.** A bare `except:`, `except BaseException`, or `except CancelledError`
+  without re-raising inside a timed block. (Since Python 3.8 it derives from `BaseException`, so plain
+  `except Exception` does not catch it.) Symptom: `asyncio.timeout` "doesn't work"; requests overrun the
+  deadline and finish late.
 - **A fresh `httpx.AsyncClient` per request with default timeouts.** Symptom: 5-second `ReadTimeout`
   errors on longer completions, plus connection churn in TLS-handshake latency.
 - **Retrying without checking the remaining budget.** Symptom: a p99 latency that is a multiple of the
@@ -328,11 +330,13 @@ seconds. Detect client disconnects too. For long answers, stream so the proxy se
 retries within the remaining budget.
 
 ## Interview questions
-### Why does a FastAPI service need its own timeouts when the load balancer already has one?
-- **The proxy timeout protects the client, not the server.** When it fires, the proxy returns 504 but
-  your coroutine keeps running, holding its socket, pool slot and semaphore and paying for tokens.
-- **Uvicorn imposes no per-request limit**, so only an application deadline (`asyncio.timeout`) and
-  per-call timeouts actually cancel the upstream work and free resources.
+### What does `asyncio.timeout` actually do when it fires, and how can it silently stop working?
+- **It cancels the current task.** `CancelledError` is raised at whatever `await` the task is parked on,
+  and is converted into `TimeoutError` as it leaves the `async with` block.
+- **Cancellation reaches httpx, which closes the socket.** For a plain completion call that is usually
+  the only stop signal you can send; whether generation halts and is billed depends on the provider.
+- **It breaks if code inside swallows `CancelledError`**, for example a broad `except BaseException`, so
+  the request overruns the deadline and finishes late.
 
 ### Explain the four httpx timeout phases and which one catches a stalled stream.
 - **connect** bounds the TCP and TLS handshake, **write** bounds sending the body, **pool** bounds

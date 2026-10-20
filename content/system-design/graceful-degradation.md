@@ -5,7 +5,7 @@ name: Graceful degradation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - system-design/model-fallback-strategies
   - reliability/backpressure-and-load-shedding
@@ -22,8 +22,8 @@ sources:
 
 ## TL;DR
 When the AI path fails, slows, overspends or overloads, step down to a cheaper, simpler, honestly labelled
-version instead of falling over: a designed ladder with triggers, hysteresis and exercised paths.
-Fallbacks change the provider; degradation changes the function.
+version instead of falling over, using a designed ladder with triggers, hysteresis and exercised paths.
+Fallbacks change the provider; degradation keeps users moving by changing the function.
 
 ## Why it exists
 - **Most AI features enhance a product that already worked:** search, support, editors, dashboards. A

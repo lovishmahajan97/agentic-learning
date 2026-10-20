@@ -22,12 +22,13 @@ sources:
 
 ## TL;DR
 pip installs packages; Poetry and uv manage projects: `pyproject.toml` dependencies, a lockfile,
-environments and builds. AI stacks are deep and fast-moving, so reproducibility matters; uv replaces pip,
-pip-tools, virtualenv, pyenv and pipx, much faster.
+environments and builds. Reproducibility is the point, because "works on my machine" is usually two
+environments resolving different versions; uv replaces pip, pip-tools, virtualenv, pyenv and pipx, much faster.
 
 ## Why it exists
 - **A project needs four things.** A list of what it depends on, an exact resolved set of versions satisfying
-  all constraints, an isolated environment holding them, and a way to build and publish itself.
+  all constraints, an isolated environment holding them, and a way to build and publish itself. An AI
+  service's stack (SDKs, torch, tokenizers) is deep and fast-moving, so drift between machines is the norm.
 - **pip historically did only the install step.** It has a real backtracking resolver, but out of the box it
   records no lockfile, creates no environments, and does not distinguish "what I asked for" from "what I
   ended up with".
@@ -103,20 +104,23 @@ uv is fast *because* of:
 Effect: recreating an environment is cheap enough to do on every CI run and in every Docker build.
 
 ## Diagram
-Humans edit intent, a resolver turns it into an exact lock, and every environment (laptop, CI, Docker) is
-built only from that lock; the resolve step is where markers and wheel tags make the answer platform-specific.
+Humans edit intent, a resolver turns it into an exact lock (`uv.lock`, `poetry.lock` or a pinned
+`requirements.txt`), and every environment (laptop, CI, Docker) is built only from that lock; markers and
+wheel tags are what make the resolve and the artifact choice platform-specific.
 
 ```mermaid
-flowchart LR
-    I["pyproject.toml: direct deps as ranges"] --> C["Collect constraints and markers recursively"]
-    C --> RS["Resolve: backtracking or PubGrub search"]
+flowchart TD
+    I["pyproject.toml: ranges"] --> C["Collect constraints and markers"]
+    C --> RS["Resolve: backtracking or PubGrub"]
     RS -->|"conflict"| X["Explanation chain: fix the constraint"]
-    RS -->|"one version per package"| L[("Lockfile: uv.lock, poetry.lock or pinned requirements.txt")]
-    L --> A["Pick artifacts: matching wheel tag, else build sdist"]
+    RS -->|"one version per package"| L[("Lockfile")]
+    L --> D1["Laptop: uv sync"]
+    L --> D2["CI: uv sync --locked"]
+    L --> D3["Docker: uv sync --locked --no-dev"]
+    D1 --> A["Pick wheel by tag, else build sdist"]
+    D2 --> A
+    D3 --> A
     A --> V["Install into .venv site-packages"]
-    V --> D1["Laptop: uv sync"]
-    V --> D2["CI: uv sync --locked"]
-    V --> D3["Docker: uv sync --locked --no-dev"]
 ```
 
 ## Examples
@@ -129,8 +133,8 @@ dependency.
 | Declare | `requirements.in` with `openai>=1.40`, `httpx`, `torch`; `dev.in` with `-c requirements.txt` and `pytest` | `poetry add openai httpx torch`; `poetry add --group dev pytest` | `uv init`; `uv add openai httpx torch`; `uv add --dev pytest` |
 | Lock | `pip-compile --generate-hashes requirements.in` → pinned, hashed `requirements.txt` | `poetry.lock` | `uv.lock` |
 | CI | `python -m venv .venv` then `pip install --require-hashes -r requirements.txt` | `poetry install` | `uv sync --locked` then `uv run pytest` |
-| Torch CPU index | separate index option | a configured source and an explicit source on that dependency | `[tool.uv.sources]` (below) |
-| Catch | two files per environment; a Mac developer needing different wheels may need a separately compiled file | | |
+| Torch CPU index | an index option in the requirements file; pip cannot scope an index to one package | a configured source and an explicit source on that dependency | `[tool.uv.sources]` (below) |
+| Catch | two files per environment; a Mac developer needing different wheels may need a separately compiled file | slower resolves on large graphs | pin the uv version, since features move quickly |
 
 Route only `torch` to the PyTorch CPU index with uv:
 
@@ -165,7 +169,7 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
-# the project itself
+# the project itself (list .venv in .dockerignore so a local venv is not copied over)
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
@@ -234,13 +238,16 @@ Read the explanation rather than loosening pins at random. Illustrative case:
   permission errors on `pip install`, or (on distro and Homebrew Pythons that adopt PEP 668) pip refusing
   with `externally-managed-environment`. Fix: a project environment.
 - **Committing `pyproject.toml` but not the lockfile** for an application. Symptom: CI and production resolve
-  newer transitive versions than developers tested.
+  newer transitive versions than developers tested. Fix: commit the lock and install with `--locked`.
 - **Mixing tools in one project** (`pip install` inside a uv- or Poetry-managed venv). Symptom: the
   environment drifts from the lock and is silently reset, or reports a different set, on the next sync.
+  Fix: add packages through the project tool (`uv add`, `poetry add`).
 - **`--extra-index-url` for one private package.** Symptom: public and private indexes are treated as equals,
-  so a public package with the same name (and a higher version) can replace yours.
+  so a public package with the same name (and a higher version) can replace yours. Fix: a named index with
+  `explicit = true`, pinned per package.
 - **Letting the default index provide `torch`.** Symptom: a multi-gigabyte CUDA wheel in a CPU-only image, or
-  a CPU-only build on a GPU host, discovered as slow images or `torch.cuda.is_available()` being False.
+  a CPU-only build on a GPU host, discovered as slow images or `torch.cuda.is_available()` being False. Fix:
+  route `torch` to the matching PyTorch index via `[tool.uv.sources]`.
 
 ## When to use
 - **New application or service:** uv is a strong default: one tool for Python versions, environments,

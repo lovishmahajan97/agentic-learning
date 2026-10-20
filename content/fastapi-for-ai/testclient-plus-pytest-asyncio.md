@@ -5,7 +5,7 @@ name: TestClient + pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/pytest
   - python-for-ai/pytest-asyncio
@@ -96,21 +96,23 @@ Two details matter:
 
 ## Diagram
 The decision is about event loops: a synchronous test lets `TestClient` run the app on its own portal
-loop, while a test that awaits must keep the app on the test's loop through `ASGITransport`.
+loop, while a test that awaits must keep the app on the test's loop through `ASGITransport` (under
+pytest-asyncio). Streaming latency needs a real server either way.
 
 ```mermaid
 flowchart TD
-    T["New endpoint test"] --> F["Override the LLM dependency with a fake"]
-    F --> Q{"Does the test await async objects shared with the app?"}
+    T["New endpoint test"] --> L{"Measuring time to first chunk?"}
+    L -->|"yes"| SRV["Real running server, not in-process"]
+    L -->|"no"| F["Override the LLM dependency with a fake"]
+    F --> Q{"Test awaits objects shared with the app?"}
     Q -->|"no"| TC["with TestClient(app) as client"]
-    TC --> PT["App runs on a portal thread with its own loop"]
-    PT --> LS1["Lifespan runs because of the with block"]
-    Q -->|"yes"| AC["AsyncClient with ASGITransport under pytest-asyncio"]
+    TC --> PT["App runs on a portal thread loop"]
+    PT --> LS1["Lifespan runs via the with block"]
+    Q -->|"yes"| AC["AsyncClient plus ASGITransport"]
     AC --> ONE["App runs on the test loop"]
-    ONE --> LS2["Lifespan only via a manager such as asgi-lifespan"]
+    ONE --> LS2["Lifespan only via asgi-lifespan"]
     LS1 --> CLR["Clear dependency_overrides after the test"]
     LS2 --> CLR
-    Q -->|"needs time to first chunk"| SRV["Real running server, not in-process"]
 ```
 
 ## Examples
@@ -253,7 +255,8 @@ def test_unhandled_bug_is_500_for_clients():
 - **Forgetting to clear `app.dependency_overrides`.** Symptom: a later test passes or fails depending on
   test order.
 - **Overriding a different function object from the one in `Depends(...)`.** Symptom: a test that passes
-  slowly, needs network, or fails with an authentication error from the real provider.
+  slowly, needs network, or fails with an authentication error from the real provider. Fix: override the
+  exact function object, and block outbound network in CI so the mistake fails fast.
 - **Expecting a 500 from an unhandled error with default `TestClient` settings.** The test errors with the
   app's exception instead of seeing the status code. Fix: `raise_server_exceptions=False`.
 - **Missing the asyncio marker in strict mode.** The coroutine is never awaited; depending on the pytest

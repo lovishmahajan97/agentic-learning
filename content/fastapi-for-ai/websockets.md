@@ -5,7 +5,7 @@ name: WebSockets
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/server-sent-events
   - fastapi-for-ai/streamingresponse
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 A WebSocket upgrades one HTTP connection into a persistent two-way channel. Use it when the client must
-talk while the server streams (stop buttons, voice, mid-run approvals); you pay in per-connection state,
-hand-rolled auth and resume, and upgrade-aware load balancers. One-way streaming: use SSE.
+talk mid-stream (stop, voice, approvals); you pay in pinned per-connection state, hand-rolled auth and
+resume, and upgrade-aware balancers. One-way streaming: use SSE.
 
 ## Why it exists
 - **HTTP is request then response.** Once the client has sent its body it cannot say anything else on

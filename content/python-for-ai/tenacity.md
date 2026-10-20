@@ -98,8 +98,9 @@ wait_exponential(multiplier=m, max=c):  wait after n-th failure = min(m Â· 2^(nâ
 - **The default retries on any exception,** which is exactly the classification bug above.
 
 ### hooks and the final failure
-- **Log every retry:** `before_sleep=before_sleep_log(logger, logging.WARNING)` logs the attempt number and
-  wait.
+- **Log every retry:** `before_sleep=before_sleep_log(logger, logging.WARNING)` logs the function name, the
+  upcoming wait and the exception (or bad result) that triggered it. For the attempt number, write a small
+  hook that reads `retry_state.attempt_number`.
 - **Final failure:** when the stop fires, tenacity raises `RetryError` wrapping the last attempt. With
   `reraise=True` it re-raises the original exception, which callers and error handlers usually expect.
 - **`RetryCallState`:** every callback receives it (attempt number, elapsed time, `outcome`). Any callable
@@ -115,8 +116,9 @@ def wait_retry_after(state):
 
 - **Why it is safe:** the server knows its own rate window, so its hint beats any guess. The `min` cap stops
   a hostile or buggy header parking a worker for an hour; the `isdigit` check skips the HTTP-date form.
-- **Per-call control:** decorated functions expose `.retry.statistics` and `.retry_with(...)` to override
-  the policy per call site.
+- **Per-call control:** decorated functions expose `.retry_with(...)` to override the policy per call site,
+  and `.statistics` (attempt number, idle time) after a call. Older releases documented
+  `.retry.statistics`; in tenacity 9 that dict stays empty because each call runs on a copy.
 
 ### Async and code blocks
 - **`async def` works directly:** tenacity detects the coroutine and sleeps with the event loop rather than
@@ -132,8 +134,9 @@ def wait_retry_after(state):
 | Vendor SDKs (OpenAI, Anthropic) | retry some errors internally via a `max_retries` setting; account for it before adding your own layer |
 
 ## Diagram
-Each attempt's outcome goes through the `retry` predicate first, then the `stop` check, and only then the
-`wait`; note that the stop is evaluated after a failure, which is why a time budget is soft.
+Each attempt's outcome goes through the `retry` predicate first, then the `stop` check, and only if it does
+not stop does tenacity sleep the `wait`; the stop is evaluated after a failure, which is why a time budget
+is soft.
 
 ```mermaid
 flowchart TD
@@ -143,7 +146,7 @@ flowchart TD
     S -->|"yes, reraise=True"| E1["Re-raise original exception"]
     S -->|"yes, default"| E2["Raise RetryError wrapping last attempt"]
     S -->|"no"| W["wait: jittered exponential, or Retry-After"]
-    W --> H["before_sleep hook logs attempt and wait"]
+    W --> H["before_sleep hook logs wait and error"]
     H --> SL["Sleep, or await asyncio sleep in async code"]
     SL -->|"n plus 1"| A
 ```
@@ -220,8 +223,8 @@ assert lookup() == {"ok": True} and calls["n"] == 3
 ```
 
 ### Worked scenario: stacked retry layers
-An agent loop retries a tool 3 times; the tool function has `@retry(stop=stop_after_attempt(3))`; the SDK
-also retries 3 times internally.
+Each layer makes up to 3 attempts: the agent loop re-runs a failed tool up to 3 times, the tool function has
+`@retry(stop=stop_after_attempt(3))`, and the SDK makes up to 3 attempts internally.
 
 | Layers retrying | Upstream calls per user action, worst case |
 |---|---|
@@ -266,16 +269,17 @@ policy, and the agent loop treats the re-raised error as final.
 - **Bare `@retry` with no arguments.** Symptom: a request hangs forever, spinning with no wait, against an
   endpoint returning a permanent error. Fix: always set stop, wait and retry.
 - **Retrying non-idempotent operations** ("send email", "create ticket") without an idempotency key.
-  Symptom: duplicate side effects after a timeout that actually succeeded upstream.
+  Symptom: duplicate side effects after a timeout that actually succeeded upstream. Fix: an idempotency key,
+  and retry only errors that prove the request was not processed.
 - **Stacked retries** in the SDK, your function and the agent loop. Symptom: with 3 layers of 3 attempts, up
-  to 27 upstream calls per user action and rate limits that get worse under load.
+  to 27 upstream calls per user action and rate limits that get worse under load. Fix: one retry layer.
 - **Forgetting `reraise=True`.** Symptom: handlers catching `RateLimitError` never fire because the
-  exception arriving is a `tenacity.RetryError`.
+  exception arriving is a `tenacity.RetryError`. Fix: set `reraise=True`.
 - **Retrying a bad LLM *result*** (invalid JSON, failed schema) with the identical prompt at temperature 0.
   Symptom: every attempt fails the same way, because the same input tends to reproduce the same output. Fix:
   feed the validation error back into the next attempt, as Instructor does, or change something.
 - **Retrying on `Exception`, and thereby on your own bugs.** Symptom: a `KeyError` in response parsing costs
-  five paid API calls before surfacing.
+  five paid API calls before surfacing. Fix: an explicit `retry_if_exception_type(...)` list.
 
 ## When to use
 - **Use when:** code calls something remote that fails transiently and the operation is safe to repeat:

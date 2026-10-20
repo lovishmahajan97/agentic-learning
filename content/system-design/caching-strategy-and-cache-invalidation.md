@@ -5,7 +5,7 @@ name: Caching strategy & cache invalidation
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/caching
   - prompting/prompt-caching
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Model calls are the slowest, costliest step, and much of their input repeats. Cache at several layers
-(prefix, exact, semantic, embedding, retrieval), each with its own key. The design question is the key:
-what must match for a result to stay correct.
+Model calls are the slowest, costliest step, and their input largely repeats. Cache at several layers
+(prefix, exact, semantic, embedding, retrieval), each with its own key and way of going stale. The key
+is the design: what must match for a result to stay correct.
 
 ## Why it exists
 - **Hits are nearly free; misses are not.** A hit returns in milliseconds and costs almost nothing; a miss

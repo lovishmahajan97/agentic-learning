@@ -37,8 +37,9 @@ decides what the hardware delivers.
   GPU for the life of the request and grows every step. Memory, not compute, usually caps how many
   requests a card can hold.
 - **GPUs are efficient only when busy.** A single decode request reads all weights per token: for an 8B
-  model in fp16 that is ~16 GB per token, so ~3 TB/s of bandwidth caps it near 200 tokens/s with the
-  arithmetic units idle. Put 32 requests in the same step and the same ~16 GB yields 32 tokens.
+  model in fp16 that is ~16 GB per token, so ~3 TB/s of bandwidth caps it near 200 tokens/s no matter how
+  many FLOPs the GPU has, with the arithmetic units idle. Put 32 requests in the same step and the weights
+  are still read once, so the same ~16 GB yields 32 tokens.
 - **Batching loops is a scheduling problem.** Variable-length, variable-lifetime loops are something the
   one-request-one-pass model never had to solve. The whole module works through these three facts; this
   lesson is the map.
@@ -219,19 +220,22 @@ for avg_len in (8192, 2000):
 - **Capacity-planning from weight size alone.** Symptom: the engine admits far fewer concurrent requests
   than expected, or preempts them mid-generation under load. Fix: add the cache to the plan.
 - **Measuring latency with a single request and shipping.** Symptom: TPOT doubles the first time real
-  concurrency arrives, because decode steps now read many caches per iteration.
+  concurrency arrives, because decode steps now read many caches per iteration. Fix: load-test at the
+  expected concurrency and length mix before quoting latency.
 - **A generic HTTP load balancer in front of prefix-cached replicas.** Symptom: fleet-wide prefix hit rate
   far below what one replica achieves, because turn *n* of a conversation lands on a GPU that never
-  prefilled turns 1 to *n−1*.
+  prefilled turns 1 to *n−1*. Fix: route by session or conversation id.
 - **Treating `max_tokens` as cosmetic.** Symptom: a few runaway requests hold cache blocks for minutes and
-  starve the queue, visible as TTFT spikes unrelated to request rate.
+  starve the queue, visible as TTFT spikes unrelated to request rate. Fix: set a per-route default and cap.
 - **Ignoring client disconnects.** Symptom: GPU time spent generating tokens nobody reads, showing up as
-  throughput that does not translate into completed requests.
+  throughput that does not translate into completed requests. Fix: abort the engine request on disconnect.
 - **The wrong chat template.** Serving an instruct model with a template other than the one it was trained
   with (often a hand-built prompt string) raises no error. Symptom: answers that ramble, ignore the system
-  prompt or fail to stop, because the model never sees the role markers it expects.
+  prompt or fail to stop, because the model never sees the role markers it expects. Fix: send messages to
+  the chat endpoint so the engine applies the model's own template.
 - **Autoscaling on CPU utilization or request count.** Symptom: new replicas become ready minutes after
-  the queue already blew through the TTFT budget, then idle after the spike.
+  the queue already blew through the TTFT budget, then idle after the spike. Fix: scale on queue depth or
+  KV-cache utilization, above a warm floor.
 
 ## When to use
 You meet serving the moment a model leaves a notebook. Use this lesson as the map.

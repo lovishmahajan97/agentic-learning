@@ -21,8 +21,8 @@ sources:
 
 ## TL;DR
 PagedAttention stores each request's KV cache in fixed-size blocks (usually 16 tokens) behind a
-per-request block table, so memory is allocated on demand and shared. The recovered memory becomes more
-concurrent requests, which is where vLLM's throughput gains come from.
+per-request block table, so memory is allocated on demand and shared. Decode is memory-bound, so the
+recovered memory becomes more concurrent requests, the source of vLLM's throughput gains.
 
 ## Why it exists
 - **Every token in flight costs memory.** About 0.5 MB per token for a Llama-2-7B-style model in fp16
@@ -121,7 +121,8 @@ triggers one more allocation, and an empty pool triggers preemption.
 flowchart TD
     R["Request admitted with prompt"] --> T["Block table: logical to physical"]
     T --> P[("Physical block pool")]
-    D["Decode: append K, V"] --> F{"Last block full?"}
+    T --> D["Decode: append K, V"]
+    D --> F{"Last block full?"}
     F -->|"no"| W["Write into tail block"]
     F -->|"yes"| A{"Free block available?"}
     A -->|"yes"| N["Allocate one block"]

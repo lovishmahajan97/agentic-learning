@@ -5,7 +5,7 @@ name: Job queues & durable workers (Celery / ARQ + job-status endpoint)
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/message-queues
@@ -140,8 +140,10 @@ sequenceDiagram
 ### FastAPI contract with an ARQ worker
 The job row is committed before enqueueing, the status endpoint hides other users' jobs, and the worker
 checks status first: a redelivered job is a no-op, a retry skips documents already summarised, and only
-transient provider errors are retried. `db` stands for your async data-access layer and
-`TransientLLMError` for however your client signals a 429, 5xx or timeout.
+transient provider errors are retried.
+- **Placeholders:** `db` is your async data-access layer, `TransientLLMError` is however your client
+  signals a 429, 5xx or timeout, and `ctx["llm"]` is a shared client your `on_startup` hook (not shown)
+  puts into `ctx`.
 
 ```python
 import uuid
@@ -197,7 +199,6 @@ async def summarize_corpus(ctx, job_id: str, corpus_id: str):
 class WorkerSettings:
     functions = [summarize_corpus]
     redis_settings = RedisSettings()
-    # on_startup = startup   # your hook that puts the shared LLM client into ctx["llm"]
     max_jobs, job_timeout, max_tries = 10, 1800, 3   # concurrency bound by LLM rate limits, not CPU
 ```
 

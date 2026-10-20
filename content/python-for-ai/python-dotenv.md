@@ -5,7 +5,7 @@ name: python-dotenv
 kind: tool
 difficulty: intro
 est_minutes: 9
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/pydantic-settings
   - backend-fundamentals/secrets-management
@@ -20,8 +20,8 @@ sources:
 
 ## TL;DR
 python-dotenv copies `KEY=value` lines from a gitignored `.env` file into `os.environ`, so code reads
-environment variables everywhere. It is a dev convenience, not a secrets manager, and by default never
-overrides variables already set.
+environment variables everywhere. It is a dev convenience, not a secrets manager (no typing, validation
+or encryption), and by default never overrides variables already set.
 
 ## Why it exists
 - **Config belongs in the environment.** An AI service needs values that differ per environment and must
@@ -49,7 +49,7 @@ overrides variables already set.
 4. No file found: `load_dotenv()` returns `False` rather than raising, because "no file" is the normal
    production case.
 
-Two sharp corners of the walk:
+The walk is a convenience with two sharp corners and one fix:
 - **Monorepos.** It stops at the *first* `.env` going up, so a parent directory's file can be picked up by
   a child project.
 - **Installed packages.** When the calling code lives under `site-packages`, the walk starts there and

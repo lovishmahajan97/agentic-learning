@@ -5,7 +5,7 @@ name: Cancellation on client disconnect
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/streamingresponse
@@ -121,7 +121,7 @@ cancels the task and lets `finally` close upstream and record usage under a boun
 sequenceDiagram
     participant C as Client
     participant S as ASGI server
-    participant W as Disconnect watcher
+    participant W as Handler with watcher
     participant T as Model task
     participant P as Provider
     T->>P: stream or complete request via httpx
@@ -242,6 +242,7 @@ async def main():
 
 asyncio.run(main())
 # ['tg-B cancelled', 'tg-A cancelled', 'bare-A finished', 'bare-B finished']
+# (the order of the two tg lines is not guaranteed)
 ```
 
 ## Production patterns

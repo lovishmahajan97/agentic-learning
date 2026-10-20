@@ -5,7 +5,7 @@ name: Quality–latency–cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - system-design/model-routing-cascading
   - system-design/model-selection
@@ -19,9 +19,9 @@ sources:
 ---
 
 ## TL;DR
-Every LLM feature trades answer quality, user wait and per-request cost, and levers that improve one axis
-usually degrade another. Measure all three per task, discard dominated configurations, and choose from the
-Pareto frontier under the product's hard constraints.
+Every LLM feature trades answer quality, user wait and per-request cost; levers that improve one axis
+almost always degrade another, so you cannot maximize all three. Measure all three per task, discard
+dominated configurations, and choose from the Pareto frontier under hard constraints.
 
 ## Why it exists
 - **The usual history.** A prototype ships on the largest model with a long, example-stuffed prompt. Then
@@ -235,6 +235,7 @@ for s, l in [(0.001, 0.010), (0.005, 0.010)]:   # 10x and 2x price gaps
     for e in (0.1, 0.3, 0.6):
         c = cascade_cost(s, l, e)
         print(f"   e={e:.0%}  cascade ${c:.4f}  vs large ${l:.4f}  -> {'cascade' if c < l else 'large'}")
+# output, condensed to one line per gap:
 # gap 10x  break-even e < 90%   (e=10%: $0.0020, e=30%: $0.0040, e=60%: $0.0070 -> cascade)
 # gap 2x   break-even e < 50%   (e=10%: $0.0060, e=30%: $0.0080 -> cascade; e=60%: $0.0110 -> large)
 ```
@@ -292,15 +293,17 @@ pays both models' latency.
 - **Reporting mean latency.** Symptom: a green dashboard while users report hangs, because the p95 nobody
   plotted is three times the mean. Fix: plot p95 and p99.
 - **Comparing cost per request instead of per successful task.** Symptom: a "cheaper" model whose retries,
-  judge calls and human review make the total higher.
+  judge calls and human review make the total higher. Fix: divide total spend, including verifier and
+  escalation cost, by tasks that passed.
 - **Evaluating on a handful of hand-picked prompts.** Symptom: a configuration that shines in the demo and
   degrades on the real traffic distribution. Fix: add a traffic replay.
 - **Reading a one- or two-point eval difference as a real win.** Symptom: the "winning" configuration swaps
   places with the runner-up every time the eval is re-run or re-sampled. Fix: paired test or a bigger eval.
 - **Leaving output length unconstrained.** Symptom: cost and decode latency creep up after a prompt or
-  model change made the model chattier.
+  model change made the model chattier. Fix: a per-route output cap and an alert on output-token p95.
 - **Treating the frontier as static.** Symptom: a once-optimal setup became dominated after a provider
-  price cut or model update that nobody re-tested.
+  price cut or model update that nobody re-tested. Fix: re-run the frontier on a cadence and on every
+  model, price or prompt change.
 
 ## When to use
 - **Use when** a feature first approaches production scale, whenever a new model or price list appears,

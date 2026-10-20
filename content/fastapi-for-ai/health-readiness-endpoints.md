@@ -184,7 +184,7 @@ readinessProbe:
   reaches only one of them, so use one worker per pod or a shared signal such as a file.
 
 ### Cached, time-boxed pool check for readiness
-Checks only what this instance can lose on its own, at most once every 5 seconds, and never waits past
+Checks the database through this instance's own pool at most once every 5 seconds, and never waits past
 the probe's 1 s timeout. Uses `asyncio.timeout` (Python 3.11+) and an SQLAlchemy async engine.
 
 ```python
@@ -208,6 +208,13 @@ async def pool_ok(engine, ttl_s=5.0, budget_s=0.3) -> bool:
     return ok
 ```
 
+- **What the cache and budget buy:** at most one `SELECT 1` per process per 5 s, however often the kubelet,
+  an external balancer and dashboards call it, and a slow database fails the check in 0.3 s instead of
+  hanging the probe past its timeout.
+- **What it does not buy:** `SELECT 1` still travels to the shared database, so a database-wide outage
+  fails it on every replica at once. Gate readiness on it only when no route can serve anything without
+  the database; if cached or fallback routes exist, keep it out, as in the incident below.
+
 ### Worked incident: one `/health` vs separate probes
 Illustrative: 12 replicas, a 40-second shared-database blip, the 60-90 s model load from above.
 
@@ -228,9 +235,10 @@ A 40-second blip becomes a two-minute outage when liveness checks a shared depen
 - **Startup probe sized from measured load time.** Take the slowest observed model load on the slowest node
   type, add margin, and set `failureThreshold × periodSeconds` above it. Monitor: time from container start
   to ready, per node type, and CrashLoopBackOff events.
-- **Readiness from lifespan flags plus one cached local check.** Flags for model and pools, the cached pool
-  check above for the database. Monitor: readiness flaps per pod; many pods flapping together means a
-  shared dependency leaked into the probe.
+- **Readiness from lifespan flags, plus a cached check only where it earns its place.** Flags for model,
+  pools and draining; add the cached pool check above only if no route can serve without the database.
+  Monitor: readiness flaps per pod; many pods flapping together means a shared dependency leaked into the
+  probe.
 - **Alert on restarts, not just errors.** Track container restarts per pod (for example
   `kube_pod_container_status_restarts_total` from kube-state-metrics). Monitor: restarts on every replica
   at once, the signature of a liveness probe that checks a shared dependency.
@@ -320,8 +328,10 @@ endpoint serves dashboards.
 - **Flip to gating** only when the instance truly has nothing useful to return without the provider.
 
 ### Your readiness probe checks the database. How do you keep it from becoming a problem?
-- **Check only this instance's own pool**, the thing it can lose alone, not the shared database as a whole.
-- **Bound and cache it:** a 0.3 s budget inside the default 1 s `timeoutSeconds`, and a cached result for
+- **First ask whether it should:** a check that reaches a shared database fails on every replica at once
+  during an outage, pulling them all, so keep it only if no route can serve without the database.
+- **Prefer instance-local signals** (lifespan flags, this instance's own pool state) over a round trip.
+- **If you keep it, bound and cache it:** a 0.3 s budget inside the default 1 s `timeoutSeconds`, and a cached result for
   5 seconds, so probes are not load on the database.
 - **Watch for many pods flapping together**, which means a shared dependency has leaked into the probe.
 

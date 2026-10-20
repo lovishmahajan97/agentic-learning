@@ -5,7 +5,7 @@ name: pydantic-settings
 kind: tool
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/pydantic
   - python-for-ai/python-dotenv
@@ -20,9 +20,9 @@ sources:
 ---
 
 ## TL;DR
-pydantic-settings is a Pydantic model filled from environment variables, `.env` files and secret files.
-Declare config once with types and constraints; the app starts fully validated or refuses to start,
-moving config mistakes from 2 a.m. runtime failures to deploy-time crashes.
+pydantic-settings is a Pydantic model filled from env vars, `.env` files and secret files. Declare
+config once with types, defaults and constraints; the app starts validated or refuses to start
+naming the bad field, turning 2 a.m. runtime failures into deploy-time crashes.
 
 ## Why it exists
 - **Everything is a string.** With `os.environ.get` scattered through the code, `TIMEOUT="30"` must be
@@ -108,12 +108,12 @@ yields a typed object or fails startup with every bad field listed.
 
 ```mermaid
 flowchart TD
-    I["1. Init kwargs"] --> M["Deep-merge dicts, higher priority wins per key"]
-    E["2. Environment variables"] --> M
-    D["3. Dotenv files"] --> M
-    S["4. secrets_dir files"] --> M
+    I["Init kwargs (priority 1)"] --> M["Deep-merge dicts, higher priority wins per key"]
+    E["Environment variables (priority 2)"] --> M
+    D["Dotenv files (priority 3)"] --> M
+    S["secrets_dir files (priority 4)"] --> M
     M --> V["One Pydantic validation pass"]
-    F["5. Field defaults"] -->|"fill fields no source set"| V
+    F["Field defaults (priority 5)"] -->|"fill fields no source set"| V
     V -->|"all fields valid"| OK["Typed Settings, built once and cached"]
     V -->|"any field invalid"| ERR["One ValidationError listing every bad field"]
     ERR --> X["Startup fails before serving traffic"]

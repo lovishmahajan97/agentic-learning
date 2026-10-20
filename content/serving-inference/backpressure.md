@@ -313,10 +313,13 @@ control for a different problem.
 - **Reject for interactive traffic,** because once a reply takes longer than the user will wait, finishing
   it is wasted GPU time.
 
-### Your server is full but the caller is within quota. Which status do you return, and what else matters?
-- **503 with `Retry-After`,** because the server is the bottleneck; 429 would wrongly blame the caller.
-- **The header prevents a synchronized retry storm,** especially when clients add jitter.
-- **Do it before prefill** so the rejection costs microseconds, not GPU time.
+### Traffic is 6 req/s at 5 s mean latency, and users abandon after 8 s. How do you size the gate?
+- **Concurrency from Little's law:** 6 × 5 = 30 in flight, then lower it under a load test until the
+  engine's own waiting queue stays near zero.
+- **Wait budget from the latency budget:** 8 s minus 5 s of generation leaves at most 3 s; pick 1.5–2 s
+  to leave headroom for long requests, and shed the rest with 503 plus `Retry-After`.
+- **Autoscale on p95 queue wait** crossing part of that budget, because GPU utilisation reads the same
+  whether the queue is empty or exploding.
 
 ### Why can a single concurrency number not protect a mixed workload?
 - **Costs differ by orders of magnitude.** One 100k-token document displaces about fifty chat turns, so a

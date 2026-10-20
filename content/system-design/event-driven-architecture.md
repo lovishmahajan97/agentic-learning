@@ -224,15 +224,17 @@ print(naive(deliveries), idempotent(deliveries))   # 13 8
 | Event on a broker | producer + broker | 0.999² ≈ 99.8% | producer write + one broker append |
 
 The six consumers still do the same work, but their outages show up as consumer lag instead of failed
-uploads (illustrative arithmetic, assuming independent failures).
+uploads (illustrative arithmetic, assuming independent failures). The 99.4% in "Why it exists" counts
+only the six downstream services; counting the producer too gives the 99.3% here.
 
 ## Production patterns
 - **Outbox relay instead of dual writes.** When a service changes its database and must emit an event,
   write the event row in the same transaction and relay it with a poller or change-data capture (for
   example Debezium reading the outbox table). Monitor outbox backlog age; alert when the oldest
   unpublished row exceeds your freshness budget.
-- **Idempotent producer settings on Kafka.** Set `acks=all` and `enable.idempotence=true` so broker-side
-  retries do not duplicate or reorder within a partition. This does not make consumers exactly-once;
+- **Idempotent producer settings on Kafka.** Set `acks=all` and `enable.idempotence=true` (the default
+  since Kafka 3.0, but set it explicitly) so the producer's own send retries do not duplicate or reorder
+  within a partition. This does not make consumers exactly-once;
   monitor producer retry and error rates.
 - **Schema registry with compatibility checks.** Register every event schema and enforce a compatibility
   mode (for example backward compatibility in Confluent Schema Registry) in CI, so a breaking payload
@@ -271,11 +273,13 @@ uploads (illustrative arithmetic, assuming independent failures).
 - **Non-idempotent consumers.** Duplicate embeddings, double-counted billing and repeated notifications
   appear after any consumer restart or broker rebalance. Fix: inbox table or deterministic ids.
 - **Event soup.** Dozens of topics with no owner, no schema registry and no documented consumers. Symptom:
-  nobody dares delete or change anything, and behaviour is discovered by reading consumer code.
+  nobody dares delete or change anything, and behaviour is discovered by reading consumer code. Fix: one
+  owning team per topic, every schema in a registry, and a catalogue of known consumers.
 - **Treating the broker as infinitely fast.** A slow consumer accumulates lag silently until a dashboard
   shows events processed hours after they occurred. Fix: consumer lag as a first-class alert.
 - **Retrying a poison message in place forever.** Symptom: lag climbing on one partition while every other
-  partition of the group sits at zero, and the same offset looping in the error log.
+  partition of the group sits at zero, and the same offset looping in the error log. Fix: bounded retries,
+  then a DLQ or a parked key, chosen per topic.
 
 ## When to use
 - **Use when:** more than one party cares about a fact, consumers may be down while producers are up, you

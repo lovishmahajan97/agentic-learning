@@ -5,7 +5,7 @@ name: Speech-to-text (Whisper)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - multimodal/tts
   - multimodal/vision-language-models
@@ -23,44 +23,38 @@ sources:
 ---
 
 ## TL;DR
-Speech-to-text (automatic speech recognition, ASR) converts audio into a transcript. Whisper is an
-encoder-decoder transformer that reads a log-Mel spectrogram of a 30-second window and generates text
-tokens, trained on roughly 680,000 hours of weakly labelled web audio so it transcribes, identifies
-languages and translates robustly across accents and noise without per-domain tuning. It exists because
-earlier systems needed carefully aligned data per language and domain and broke outside their training
-conditions.
+Speech-to-text (ASR) turns audio into a transcript. Whisper, an encoder-decoder transformer, reads a
+30-second log-Mel spectrogram and generates text; trained on roughly 680,000 hours of weakly labelled
+audio, it is robust across accents, noise and languages.
 
 ## Why it exists
-Voice is the input modality for call centres, meetings, dictation, voice agents and accessibility, and
-all of it is useless to text systems until transcribed. Classic ASR pipelines (acoustic model plus
-pronunciation lexicon plus language model, as in Kaldi-era systems) delivered good accuracy on the
-conditions they were tuned for and fell apart on a new microphone, accent or vocabulary. They needed
-phonetically aligned data and expert tuning per language, which few teams had.
-
-End-to-end neural models (CTC and RNN-transducer models) removed the lexicon but were trained on
-curated, human-transcribed corpora of a few thousand hours, so they were excellent on their benchmark
-and brittle elsewhere: a model that scores superbly on read audiobook speech can double its error rate
-on a noisy phone call. The naive fix, "fine-tune on your domain", only works if you have transcribed
-audio, which is exactly what you were trying to produce.
-
-Whisper's bet was scale with weak supervision: collect hundreds of thousands of hours of audio paired
-with whatever transcripts existed on the web, filter out machine-generated ones, and train one model to
-do transcription, translation to English and language identification. The pay-off was zero-shot
-robustness: strong results on datasets it never trained on, which is what a product shipping to unknown
-users actually needs.
+- **Voice is useless to text systems until transcribed.** Call centres, meetings, dictation, voice agents
+  and accessibility all start with audio.
+- **Classic pipelines were brittle.** Acoustic model plus pronunciation lexicon plus language model
+  (Kaldi-era systems) did well on tuned conditions and fell apart on a new microphone, accent or
+  vocabulary; they needed phonetically aligned data and expert tuning per language.
+- **Early end-to-end models overfit their benchmark.** CTC and RNN-transducer models removed the lexicon
+  but trained on curated corpora of a few thousand hours. A model superb on read audiobook speech can
+  double its error rate on a noisy phone call.
+- **"Fine-tune on your domain" is circular.** It needs transcribed audio, which is exactly what you were
+  trying to produce.
+- **Whisper bet on weak supervision at scale.** Hundreds of thousands of hours of web audio with whatever
+  transcripts existed, machine-generated ones filtered out, one model for transcription, translation to
+  English and language identification. The pay-off: zero-shot robustness on datasets it never trained on.
 
 ## How it works
 ### Input: audio becomes a spectrogram
-Audio is resampled to 16 kHz mono and cut into 30-second windows (padded with silence if shorter). Each
-window is converted to a log-Mel spectrogram: a short-time Fourier transform with 25 ms frames every
-10 ms, mapped onto 80 Mel-scaled frequency bands (128 in large-v3), log-compressed and normalised. The
-Mel scale mimics human frequency sensitivity, and the log makes loud and quiet speech comparable. The
-result is a 2-D array of 3,000 frames × 80 features, an "image" of the sound that a transformer can read.
+1. **Resample** to 16 kHz mono.
+2. **Window** into 30-second chunks, padded with silence if shorter.
+3. **Short-time Fourier transform** with 25 ms frames every 10 ms.
+4. **Mel bands.** Map onto 80 Mel-scaled frequency bands (128 in large-v3), *because* the Mel scale mimics
+  human frequency sensitivity.
+5. **Log-compress and normalise,** so loud and quiet speech become comparable.
+- **Result:** a 2-D array of 3,000 frames × 80 features, an "image" of the sound a transformer can read.
 
 ### Encoder-decoder
-Two convolutional layers (the second with stride 2) shrink the time axis to 1,500 positions and then a
-transformer encoder produces a contextual representation of the whole window. Following the shapes makes
-several later behaviours obvious:
+Two convolutional layers (the second with stride 2) shrink the time axis to 1,500 positions, then a
+transformer encoder produces a contextual representation of the whole window. Follow the shapes:
 
 ```
 30 s × 16,000 samples/s           = 480,000 samples
@@ -68,55 +62,88 @@ hop of 10 ms (160 samples)        → 3,000 spectrogram frames × 80 (or 128) Me
 conv stack, stride 2              → 1,500 encoder positions, each covering 20 ms
 ```
 
-Each encoder position spans 20 ms, which is exactly the resolution of the timestamp tokens, and the window
-length is fixed by the encoder's positional embeddings, which is why audio cannot simply be fed longer. The decoder is a standard autoregressive text
-transformer that cross-attends to the encoder output and emits text tokens from a byte-pair vocabulary.
-This is the same architecture as translation: audio in one "language", text out in another, and it is
-why Whisper can translate to English as a decoding task rather than a separate model.
+- **20 ms per position** is exactly the resolution of the timestamp tokens.
+- **The window is fixed** by the encoder's positional embeddings, which is why audio cannot simply be fed
+  longer.
+- **The decoder** is a standard autoregressive text transformer that cross-attends to the encoder output
+  and emits tokens from a byte-pair vocabulary.
+- **Same shape as translation:** audio in one "language", text out in another. That is why Whisper can
+  translate to English as a decoding task rather than a separate model.
 
 ### The multitask token format
-Whisper controls behaviour through special tokens in the decoder prompt rather than separate heads: a
-start token, then a language token (predicted if not given, which is how language identification
-works), then a task token (transcribe or translate), then optionally a no-timestamps token. During
-transcription the decoder can interleave timestamp tokens with text, quantised to 20 ms, which is what
-gives segment start and end times. A dedicated no-speech token lets the model declare that the window
-is silence or music. Everything the model can do is one sequence-to-sequence problem, which is why one
-checkpoint serves many languages and tasks.
+Behaviour is controlled by special tokens in the decoder prompt rather than separate heads:
+1. **Start token.**
+2. **Language token,** predicted if not given; this is how language identification works.
+3. **Task token:** transcribe or translate.
+4. **Optional no-timestamps token.**
+- **Timestamps.** During transcription the decoder can interleave timestamp tokens with text, quantised
+  to 20 ms, giving segment start and end times.
+- **No-speech.** A dedicated token lets the model declare the window is silence or music.
+- **Why one checkpoint does it all.** Everything is one sequence-to-sequence problem, so one model serves
+  many languages and tasks.
 
 ### Long-form audio and decoding heuristics
-Because the encoder sees exactly 30 seconds, longer audio is processed as a sliding sequence of windows:
-transcribe a window, read the last predicted timestamp, advance the window to that point, and carry the
-previous text as decoder context for consistency (the decoder's text context is small, so this carried
-prompt, like an `initial_prompt`, is truncated to roughly the last couple of hundred tokens). This is also
-where failures concentrate. The decoder is
-a language model, so on silence, music or garbled audio it can hallucinate fluent text or loop on a
-phrase. The reference implementation guards against this with heuristics: if the output's compression
-ratio is too high (repetition), or the average log-probability too low, decoding is retried at higher
-temperature; if the no-speech probability is high (and, in the reference implementation, the average
-log-probability is also low) the window is treated as silence and skipped. Voice activity detection
-(VAD) before transcription removes most of the silence that triggers hallucinations.
+The encoder sees exactly 30 seconds, so longer audio is a sliding sequence of windows:
+1. Transcribe a window.
+2. Read the last predicted timestamp and advance the window to that point.
+3. Carry the previous text as decoder context for consistency. The decoder's text context is small, so
+   this carried prompt, like an `initial_prompt`, is truncated to roughly the last couple of hundred
+   tokens.
+
+Failures concentrate here, because the decoder is a language model: on silence, music or garbled audio it
+can hallucinate fluent text or loop on a phrase. The reference implementation's guards:
+- **Compression ratio too high** (repetition) or **average log-probability too low:** retry decoding at
+  higher temperature.
+- **No-speech probability high** (and, in the reference implementation, average log-probability also
+  low): treat the window as silence and skip it.
+- **Voice activity detection (VAD) first** removes most of the silence that triggers hallucinations.
 
 ### Model sizes and runtimes
-Whisper ships from tiny (tens of millions of parameters) to large (about 1.5 billion). Smaller models
-are several times faster and noticeably less accurate, especially on accents and non-English speech.
-Optimised runtimes (faster-whisper on CTranslate2, whisper.cpp for CPUs and Apple silicon) deliver the
-same weights with lower memory and higher throughput; WhisperX adds forced alignment with a phoneme
-model for accurate word timestamps and plugs in speaker diarization, which Whisper itself does not do.
+| Item | Detail |
+|---|---|
+| Sizes | tiny (tens of millions of parameters) to large (about 1.5 billion) |
+| Smaller models | several times faster, noticeably less accurate, especially on accents and non-English |
+| faster-whisper (CTranslate2), whisper.cpp (CPUs, Apple silicon) | same weights, lower memory, higher throughput |
+| WhisperX | forced alignment with a phoneme model for accurate word timestamps, plus speaker diarization, which Whisper itself does not do |
 
 ### Streaming is not native
-A 30-second encoder window means Whisper is a batch model. "Streaming" with it means chunking audio into
-short pieces with overlap and re-decoding, which adds latency and can flicker. Models built for
-streaming (RNN-transducer or chunked-attention encoders, as in several managed ASR APIs) emit words as
-they arrive with sub-second delay. If you are building a live voice agent, that difference drives the
-architecture more than the error rate does.
+- **Whisper is a batch model** because of its 30-second encoder window.
+- **"Streaming" with it** means chunking audio into short overlapping pieces and re-decoding, which adds
+  latency and can flicker.
+- **Streaming-native models** (RNN-transducer or chunked-attention encoders, as in several managed ASR
+  APIs) emit words as they arrive with sub-second delay.
+- **For a live voice agent,** that difference drives the architecture more than the error rate does.
 
 ### Measuring it
-Word error rate is (substitutions + deletions + insertions) / reference words, computed after text
-normalisation (casing, punctuation, number formats), otherwise "twenty five" versus "25" counts as two
-errors. Track WER on your own audio by domain, and separately track entity accuracy (names, product
-codes), which WER underweights but users notice most.
+```
+WER = (substitutions + deletions + insertions) / reference words     # after text normalisation
+```
+- **Normalise first** (casing, punctuation, number formats), otherwise "twenty five" versus "25" counts
+  as two errors.
+- **Track WER on your own audio by domain.**
+- **Track entity accuracy separately** (names, product codes), which WER underweights but users notice
+  most.
 
-## Example
+## Diagram
+Follow one window from samples to text, then the loop that advances through long audio; the VAD and
+fallback checks are where hallucinations are stopped.
+
+```mermaid
+flowchart TD
+    A["Audio file or stream"] --> V["VAD: drop silence and music"]
+    V --> W["Resample 16 kHz, 30 s window"]
+    W --> S["Log-Mel: 3,000 frames x 80 bands"]
+    S --> E["Conv + encoder: 1,500 positions"]
+    E --> D["Decoder: language, task, text, timestamps"]
+    D --> G{"Repetitive or low log-prob?"}
+    G -->|"yes"| T["Retry at higher temperature"]
+    T --> D
+    G -->|"no"| O["Segment with start and end times"]
+    O -->|"advance to last timestamp"| W
+```
+
+## Examples
+### Transcribing a call with faster-whisper
 Transcribe a call recording with faster-whisper, using VAD to suppress silence hallucinations and word
 timestamps for alignment, then write out segments. The `initial_prompt` seeds the decoder with domain
 vocabulary so product names are spelled consistently.
@@ -153,42 +180,107 @@ print(len(transcript), "segments")
 # e.g. with the jiwer package; report per-domain WER and separately the error rate on entity names.
 ```
 
+### Normalised WER in plain Python
+Runnable with no dependencies. The same transcript scores 0.6 on raw strings and 0.111 after
+normalisation, which is why unnormalised WER misleads model comparisons.
+
+```python
+import re
+
+SPOKEN = {"twenty five": "25", "per cent": "%"}      # extend with your domain's spoken forms
+
+def normalise(text):
+    text = text.lower()
+    for spoken, written in SPOKEN.items():
+        text = text.replace(spoken, written)
+    return re.sub(r"[^\w\s%]", " ", text).split()    # drop punctuation, split on whitespace
+
+def wer(ref_words, hyp_words):
+    d = list(range(len(hyp_words) + 1))             # Levenshtein over words
+    for i, r in enumerate(ref_words, 1):
+        prev, d[0] = d[0], i
+        for j, h in enumerate(hyp_words, 1):
+            prev, d[j] = d[j], min(d[j] + 1, d[j - 1] + 1, prev + (r != h))
+    return d[-1] / len(ref_words)
+
+ref = "Your ticket ID is twenty five, raised against Acme Cloud."
+hyp = "your ticket id is 25 raised against acne cloud"
+print(round(wer(ref.split(), hyp.split()), 3))           # 0.6: casing, punctuation, numerals count
+print(round(wer(normalise(ref), normalise(hyp)), 3))     # 0.111: 1 real error (acme -> acne) in 9 words
+```
+
+The remaining error is an entity, "Acme" heard as "acne": exactly what an entity-accuracy metric and an
+`initial_prompt` with product names are for.
+
+### Worked scenario: sizing GPUs for call analytics
+Illustrative numbers; measure RTF on your own hardware and audio before committing.
+
+| Quantity | Value |
+|---|---|
+| Recorded call audio per day | 2,000 hours |
+| Real-time factor per stream | 0.05, so one hour of audio takes ~3 minutes |
+| GPU-hours of decoding per day | 2,000 × 0.05 = 100 |
+| GPUs at one stream each, running 24 hours | 100 ÷ 24 ≈ 4.2, so plan 5 plus headroom |
+| Effect of VAD removing 30% hold and silence | 70 GPU-hours, ~3 GPUs |
+
+VAD here is both a quality fix (fewer hallucinations) and a cost cut, because silence is decoded at the
+same price as speech.
+
+## Production patterns
+- **VAD in front of every batch job.** When: recordings with hold music, silence or long pauses. How:
+  `vad_filter=True` with `min_silence_duration_ms` tuned on sample calls. Monitor: share of audio removed
+  and hallucination rate on known-silent clips.
+- **Flag, do not trust, shaky segments.** When: transcripts feed search, summaries or compliance. How:
+  mark segments with `avg_logprob < -1.0`, `compression_ratio > 2.4` or high `no_speech_prob`, and words
+  with `probability < 0.5`, for review or exclusion. Monitor: flagged-segment rate per audio source.
+- **Vocabulary prompt plus entity map.** When: product names and codes matter. How: an `initial_prompt`
+  listing domain terms, then a post-transcription replacement map for known misspellings. Monitor:
+  entity accuracy on a labelled sample.
+- **Separate surfaces by latency.** When: the same company has call analytics and a live agent. How:
+  Whisper-class batch models for recordings, a streaming-native model or managed streaming API for live
+  turns. Monitor: WER per surface and partial-result latency for live audio.
+- **Redact PII in transcripts before storage.** When: calls carry names, card or account details. How:
+  run PII detection on transcript text with word timestamps, so the same spans can also be muted in the
+  audio. Monitor: redaction recall on a labelled sample.
+
 ## Trade-offs
-- Weak supervision at scale buys zero-shot robustness, but a model fine-tuned on a few hundred hours of
-  your domain's audio will still beat it on your jargon when you can afford the transcription work.
-- Larger checkpoints cut error rate, especially off-English, at several times the compute; for clean
-  English narration a small model is often indistinguishable and far cheaper.
-- Batch encoder-decoder design gives high accuracy with context, while native streaming models give
-  sub-second partial results; a live agent needs the latter even at a slightly higher WER.
-- Conditioning on previous text improves consistency across windows but propagates repetition loops; turn
-  it off when inputs contain long silences or music.
+- **Zero-shot robustness vs domain fine-tuning.** Weak supervision at scale buys robustness, but a model
+  fine-tuned on a few hundred hours of your domain's audio will still beat it on your jargon when you can
+  afford the transcription work.
+- **Large vs small checkpoints.** Larger ones cut error rate, especially off-English, at several times
+  the compute; for clean English narration a small model is often indistinguishable and far cheaper.
+- **Batch accuracy vs streaming latency.** The encoder-decoder design gives high accuracy with context,
+  while native streaming models give sub-second partial results; a live agent needs the latter even at a
+  slightly higher WER.
+- **Context vs loops.** Conditioning on previous text improves consistency across windows but propagates
+  repetition loops; turn it off when inputs contain long silences or music.
 
 ## Pitfalls
-- Transcribing without VAD; the symptom is fluent sentences appearing in silent stretches, often generic
-  phrases that never occurred in the audio.
-- Letting language detection run on the first 30 seconds only; the symptom is a bilingual call transcribed
-  in the wrong language, or a translation when you wanted a transcription.
-- Trusting Whisper's own segment timestamps for word-level alignment; the symptom is subtitles or
-  redactions offset by a second or more, fixed by forced alignment (WhisperX-style).
-- Scoring WER without normalisation; the symptom is a model that reads better to humans but "scores worse"
+- **Transcribing without VAD.** Symptom: fluent sentences in silent stretches, often generic phrases that
+  never occurred in the audio.
+- **Language detection on the first 30 seconds only.** Symptom: a bilingual call transcribed in the wrong
+  language, or a translation when you wanted a transcription. Fix: set the language explicitly.
+- **Trusting segment timestamps for word-level alignment.** Symptom: subtitles or redactions offset by a
+  second or more. Fix: forced alignment (WhisperX-style).
+- **Scoring WER without normalisation.** Symptom: a model that reads better to humans "scores worse"
   because it wrote numerals and punctuation differently from the reference.
-- Feeding 8 kHz telephone audio without considering bandwidth; the symptom is a higher error rate on
-  calls than on meetings with no code change, because half the spectrum the model expects is missing.
-- Treating a transcript as speaker-attributed when it is not; the symptom is a summary that credits the
-  customer with the agent's promise, because Whisper emits one undifferentiated stream and diarization
-  (who spoke when) is a separate model whose errors cluster at fast turn-taking and crosstalk.
-- Forgetting the transcript contains PII; the symptom is a compliance finding over stored call text that
-  nobody classified, since the audio was treated as the sensitive asset and the text was not.
+- **Feeding 8 kHz telephone audio without considering bandwidth.** Symptom: higher error on calls than on
+  meetings with no code change, because half the spectrum the model expects is missing.
+- **Treating a transcript as speaker-attributed.** Whisper emits one undifferentiated stream; diarization
+  (who spoke when) is a separate model whose errors cluster at fast turn-taking and crosstalk. Symptom: a
+  summary that credits the customer with the agent's promise.
+- **Forgetting the transcript contains PII.** Symptom: a compliance finding over stored call text nobody
+  classified, since the audio was treated as the sensitive asset and the text was not.
 
 ## When to use
-Use Whisper-class models for offline or near-real-time transcription where accuracy across accents,
-noise and languages matters more than sub-second latency: call analytics, meeting notes, media
-indexing, voice memos, and as the first stage before an LLM summarises or extracts. Choose a
-streaming-native model or managed streaming API for live voice agents and captions. Measure WER on
-your own normalised audio per domain, entity accuracy, hallucination rate on silence, and real-time
-factor (processing time divided by audio duration) at your target concurrency. In interviews, be able
-to explain the spectrogram-encoder-decoder flow, why 30-second windows cause both the long-form
-heuristics and the streaming problem, and what weak supervision bought.
+- **Use Whisper-class models** for offline or near-real-time transcription where accuracy across
+  accents, noise and languages matters more than sub-second latency: call analytics, meeting notes, media
+  indexing, voice memos, and as the first stage before an LLM summarises or extracts.
+- **Choose a streaming-native model** or managed streaming API for live voice agents and captions.
+- **Measure:** WER on your own normalised audio per domain, entity accuracy, hallucination rate on
+  silence, and real-time factor (processing time divided by audio duration) at your target concurrency.
+- **Interviews:** explain the spectrogram-encoder-decoder flow, why 30-second windows cause both the
+  long-form heuristics and the streaming problem, and what weak supervision bought.
 
 ## Role lens
 - **Engineer:** Wires VAD, chunking and decoding options, aligns timestamps for downstream features, and
@@ -211,6 +303,36 @@ no prior; seed the decoder with an initial prompt that contains the product name
 terms, and apply a post-transcription normalisation map for known entities. Add entity accuracy on a
 labelled sample as a metric beside normalised WER, because WER barely moves on a single misspelled
 product name while users and search break on it.
+
+## Interview questions
+### Walk me through Whisper from audio samples to text tokens.
+- **Spectrogram.** 16 kHz audio in 30-second windows becomes 3,000 log-Mel frames of 80 bands (25 ms
+  frames every 10 ms).
+- **Encoder-decoder.** A stride-2 conv stack gives 1,500 positions of 20 ms; the encoder contextualises
+  them and an autoregressive decoder cross-attends to emit text, language, task and timestamp tokens.
+
+### Why can't you use Whisper directly for a live voice agent?
+- **The window is fixed at 30 seconds.** The model is batch by design, so pseudo-streaming means
+  overlapping chunks and re-decoding, which adds latency and flickering partial results.
+- **Use a streaming-native model** (RNN-transducer or chunked attention) for live turns, accepting
+  slightly higher WER for sub-second partials.
+
+### Transcripts contain sentences nobody said during hold music. What is happening and how do you fix it?
+- **Decoder hallucination.** The decoder is a language model; given non-speech it keeps generating
+  fluent text or loops.
+- **Fixes.** VAD before decoding, keep compression-ratio and log-prob fallbacks, drop no-speech segments,
+  and disable conditioning on previous text for audio with long silences.
+
+### Your WER looks worse for the model users prefer. What is going on?
+- **Normalisation.** Without lowercasing, stripping punctuation and mapping numerals, "twenty five" versus
+  "25" counts as errors; the same transcript can score 0.6 raw and 0.111 normalised.
+- **Add entity accuracy.** WER underweights names and product codes, which users notice most.
+
+### How would you size hardware for 2,000 hours of calls a day?
+- **Use real-time factor.** GPU-hours equal audio hours × RTF; at an illustrative RTF of 0.05 that is
+  100 GPU-hours, about 4 to 5 GPUs running around the clock at one stream each.
+- **Cut input first.** VAD removes silence that costs the same to decode as speech; measure RTF on your
+  own audio and concurrency before buying.
 
 ## Quiz
 ### Q: Why does Whisper process audio in fixed 30-second windows?

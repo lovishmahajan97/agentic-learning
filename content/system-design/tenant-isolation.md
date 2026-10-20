@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Tenant isolation layers independent controls (scoped credentials, database row policies, partitioned
-indexes and caches, quotas, tagged telemetry) so one bug cannot leak data or performance across tenants.
-In AI systems the prompt is a new exfiltration path.
+Tenant isolation keeps tenants apart even when application code is wrong, by layering independent
+controls (scoped credentials, row policies, partitioned indexes and caches, quotas, tagged telemetry).
+In AI systems the prompt is an exfiltration path: whatever is retrieved under the wrong key is read out.
 
 ## Why it exists
 - **Some layer, some day, will not respect the tenant.** Multi-tenancy tells every layer to; isolation is
@@ -275,15 +275,19 @@ print("unfiltered:", len(find_leaks(unfiltered, tenants, markers, qs)), "leaks")
 
 ## Pitfalls
 - **Enabling RLS but connecting as the table owner or a superuser.** Symptom: tests pass, and a manual
-  check with the production role shows every tenant's rows.
+  check with the production role shows every tenant's rows. Fix: a dedicated non-owner app role with
+  `NOBYPASSRLS`, plus `FORCE ROW LEVEL SECURITY`.
 - **Using session-level `SET` behind a transaction-pooling proxy.** Symptom: intermittent, unreproducible
-  cases where a request sees a previous request's tenant.
+  cases where a request sees a previous request's tenant. Fix: `SET LOCAL` inside the request transaction.
 - **Applying the tenant filter after top-k in vector search.** Symptom: queries return fewer than k
-  results for small tenants, followed by someone raising k to compensate.
+  results for small tenants, followed by someone raising k to compensate. Fix: a hard pre-filter or a
+  namespace per tenant.
 - **Putting customer connector tokens into the system prompt** so the agent can "use them". Symptom: a
-  token appears in a trace, an eval sample or a model response.
+  token appears in a trace, an eval sample or a model response. Fix: inject them into the tool adapter
+  for that run only.
 - **Trusting the vector database's metadata filter without making it mandatory in the client.** Symptom:
-  one new call site omits the filter and passes review because the code "looks like the others".
+  one new call site omits the filter and passes review because the code "looks like the others". Fix: a
+  required tenant parameter in the retrieval client, and no direct SDK calls.
 - **Reading through views or `SECURITY DEFINER` functions owned by a superuser or a `BYPASSRLS` role.**
   Symptom: a reporting view returns every tenant's rows although the base table has a policy, because a
   view checks policies as its owner unless created with `security_invoker` (PostgreSQL 15+).
@@ -291,7 +295,8 @@ print("unfiltered:", len(find_leaks(unfiltered, tenants, markers, qs)), "leaks")
   already registered" on a globally unique column tells tenant A a value exists in tenant B. Symptom: an
   enumeration finding in a pen test. Fix: scope unique constraints to `(tenant_id, …)`.
 - **Logging full prompts to a shared log store without tenant tags and access control.** Symptom: support
-  engineers read tenant data they are not cleared for, which is itself a reportable breach.
+  engineers read tenant data they are not cleared for, which is itself a reportable breach. Fix: tag
+  every log and trace with the tenant and gate access to them by it.
 
 ## When to use
 - **Baseline:** every multi-tenant AI system needs at least two independent isolation layers for data and
@@ -357,12 +362,13 @@ if any marker is ever retrieved or generated for another tenant.
 - **Bound the blast radius:** scope tokens to one tenant, and split model-provider keys per tenant or tier
   so a leak is contained and spend is attributable.
 
-### How would you prove isolation to an auditor?
-- **Show the controls:** policy definitions, role grants with no `BYPASSRLS` on the app role, and the
-  retrieval client signature that requires a tenant.
-- **Show the tests:** CI negative tests calling every data function as tenant A with tenant B's IDs.
-- **Show live evidence:** canary probe results over time and a zero count of queries run without a tenant
-  setting.
+### After enabling RLS, queries on a large pooled table got much slower. Why, and what do you change?
+- **Cause:** the policy adds `tenant_id = …` to every query, so indexes that do not lead with `tenant_id`
+  force scans that the policy then filters row by row.
+- **Fix:** composite indexes that lead with `tenant_id` (for example `(tenant_id, created_at)`), and a
+  partition or partial vector index for the largest tenants.
+- **Verify:** compare `EXPLAIN ANALYZE` plans as the app role with the tenant set, because a superuser
+  bypasses the policy and shows a misleading plan.
 
 ## Quiz
 ### Q: Why is `SET LOCAL app.tenant_id` preferred over a session-level `SET` when using row-level security?

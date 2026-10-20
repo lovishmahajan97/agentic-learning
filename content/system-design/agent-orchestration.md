@@ -5,7 +5,7 @@ name: Agent orchestration
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - agents/workflows-vs-agents
   - agents/state-machines
@@ -31,14 +31,15 @@ deterministic code versus left to the model.
   model outputs, and something must own ordering, state, retries, concurrency and interruption.
 - **A plain Python function becomes an accidental orchestrator.** A tool times out at step four: redo
   steps one to three, with their side effects? The user closes the tab during approval: where is the run?
-  Traffic triples: which steps can run concurrently? Each answer bolts on another ad-hoc mechanism,
-  untested and undocumented.
+  Traffic triples: which steps can run concurrently? What did the agent do for last Tuesday's ticket:
+  which log line was that? Each answer bolts on another ad-hoc mechanism, untested and undocumented.
 - **Letting the model orchestrate everything is wrong for fixed steps.** Right for genuinely open-ended
   steps; wrong for steps that must happen (validation, logging, a compliance check), must not happen
   twice (payments), or must happen in a fixed order. Model-chosen paths are also the hardest to evaluate.
 - **A deliberate layer makes control flow explicit.** State is a typed object, steps are nodes,
   transitions are fixed edges or router decisions, and a runtime adds persistence, events and policies.
-  As with any explicit state machine, you can inspect, resume, test and reason about what is written down.
+  As with any explicit state machine, you can inspect, resume, test and reason about what is written down,
+  and you can do none of that with control flow buried in prompts.
 
 ## How it works
 ### State, nodes, edges
@@ -189,6 +190,8 @@ def run(run_id, store, max_steps=10):
 
 - **Crash after `send` sends but before its checkpoint:** resume re-runs `send`, and the idempotency key
   `ticket:send` turns the second send into a no-op.
+- **Key choice in the sketch:** `f"{s.ticket}:send"` is built from the ticket text, so two tickets with
+  identical text would collide. In production derive it from the run id (`f"{run_id}:send"`).
 - **Two independent bounds on the revise cycle, one per level:** the `s.step < 6` guard in the router and
   `max_steps` in the loop.
 
@@ -224,14 +227,14 @@ print(len(asyncio.run(fan_out(append_reducer))["findings"]))    # 3
   stable `thread_id` per run in the config. Monitor run counts by status and runs with no checkpoint
   write for longer than their expected duration.
 - **Approval as an interrupt, resumed by event.** Pause in the approval node (LangGraph offers an
-  `interrupt()` call, resumed later with a resume command), return immediately, and resume from the
+  `interrupt()` call, resumed later by invoking the graph with `Command(resume=...)` on the same thread), return immediately, and resume from the
   approval service's event. Monitor time spent waiting, approval and rejection rates, and expired
   approvals.
 - **Declared reducers for every fan-out field.** Any state key written by parallel branches gets an
   explicit merge rule, for example `Annotated[list, operator.add]` in a LangGraph state type. Monitor in
   tests: assert the joined result contains one entry per branch.
-- **Idempotency keys on every side-effecting node.** Derive the key from run id and node (as in
-  `ticket:send`) and pass it to the downstream API, because node execution is at-least-once. Monitor
+- **Idempotency keys on every side-effecting node.** Derive the key from run id and node (for
+  example `f"{run_id}:send"`) and pass it to the downstream API, because node execution is at-least-once. Monitor
   duplicate side effects detected by the downstream system.
 - **Per-run event stream to clients and traces.** Stream node started, tool result, waiting and done
   events to the UI (for example over server-sent events) and to tracing under the run id. Alert on
@@ -255,15 +258,15 @@ print(len(asyncio.run(fan_out(append_reducer))["findings"]))    # 3
 - **Hiding control flow in prompts** ("after you search, always validate, then..."). Symptom: runs that
   skip required steps and no way to assert they happened. Fix: make required steps nodes.
 - **Retrying a side-effecting node without an idempotency key.** Symptom: duplicate emails, tickets or
-  payments after a transient failure.
+  payments after a transient failure. Fix: a key from run id and node, passed to the downstream API.
 - **Unbounded evaluator–optimizer or self-correction loops.** Symptom: a run that revises forever at
   increasing cost with no termination. Fix: bound at the router and the loop.
 - **Human approval as a blocking call in a worker.** Symptom: held connections, worker exhaustion and
   runs lost when the process restarts. Fix: checkpoint, return, resume on event.
 - **Parallel branches writing one state key without a reducer.** Symptom: a fan-out of three searches
-  whose joined result contains only one branch's findings, varying run to run.
+  whose joined result contains only one branch's findings, varying run to run. Fix: declare a reducer.
 - **No per-run event stream.** Symptom: users see a spinner for minutes and operators cannot say which
-  node a stuck run is in.
+  node a stuck run is in. Fix: emit structured events per node under the run id.
 
 ## When to use
 - **Use when:** a feature has more than one model call with dependencies, any tool with side effects, or
@@ -316,8 +319,9 @@ can wait days, a durable workflow engine is the natural executor.
 
 - **Missing reducer.** Parallel branches write the same state key with no merge rule, so the branch that
   finishes last silently overwrites the others, varying run to run.
-- **Fix:** declare an explicit merge (append to a list, take the max, last-writer-wins), for example
-  `Annotated[list, operator.add]` in a LangGraph state type, and assert one entry per branch in tests.
+- **Fix:** declare an explicit merge rule that keeps every branch (append to a list, or take the max for
+  a score), for example `Annotated[list, operator.add]` in a LangGraph state type, rather than the
+  implicit last-writer-wins, and assert one entry per branch in tests.
 
 ### Why must side-effecting nodes be idempotent even with checkpoints after every node?
 

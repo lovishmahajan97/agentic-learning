@@ -5,7 +5,7 @@ name: Multi-model architecture
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - system-design/model-portfolio
   - system-design/model-routing-cascading
@@ -109,18 +109,19 @@ Routing within a job (see model routing / cascading) is orthogonal to decomposit
 - **A stage upgrade is a release,** with a canary, not a config edit.
 
 ## Diagram
-A typical RAG pipeline as stages: guard and embed run concurrently, each later stage depends on the
-previous one's typed output, and the sampled judge sits off the hot path.
+A typical RAG pipeline as stages, matching the code below: guard and embed run concurrently and join at
+the gate, each later stage depends on the previous one's typed output, and the sampled judge sits off the
+hot path.
 
 ```mermaid
-flowchart LR
+flowchart TD
     Q["User question"] --> G["Guard: fast safety classifier"]
     Q --> E["Embed: embedding model"]
     G -->|"verdict allow or block"| GATE{"Allowed?"}
-    E -->|"query vector"| VS[("Vector search, k=50")]
+    E -->|"query vector"| GATE
     GATE -->|"block"| REF["Refusal"]
-    GATE -->|"allow"| RR["Rerank: cross-encoder, top 5"]
-    VS -->|"50 candidates"| RR
+    GATE -->|"allow"| VS[("Vector search, k=50")]
+    VS -->|"50 candidates"| RR["Rerank: cross-encoder, top 5"]
     RR -->|"typed passages"| GEN["Generate: frontier model"]
     GEN --> A["Answer plus sources"]
     GEN -.->|"5% sample, async"| J["Judge: small model"]

@@ -63,8 +63,8 @@ any that exit.
 |---|---|---|---|
 | **`--timeout`** | 30 s | kills and replaces a worker that misses its heartbeat that long | async heartbeat runs on the event loop, so a blocking handler (a synchronous model call) gets its worker killed |
 | **`--graceful-timeout`** | 30 s | time to finish in-flight requests on shutdown or reload | must cover your longest normal request |
-| **`--max-requests` + `--max-requests-jitter`** | | recycle each worker after a number of requests | blunt but effective cure for slow native-library leaks; jitter stops all workers restarting at once |
-| **`--preload`** | | import the app in the master before forking, sharing read-only pages copy-on-write | refcounting writes erode sharing over time; CUDA must not be initialised before a fork, so preloading a GPU model is a trap |
+| **`--max-requests` + `--max-requests-jitter`** | 0, off | recycle each worker after a number of requests | blunt but effective cure for slow native-library leaks; jitter stops all workers restarting at once |
+| **`--preload`** | off | import the app in the master before forking, sharing read-only pages copy-on-write | refcounting writes erode sharing over time; CUDA must not be initialised before a fork, so preloading a GPU model is a trap |
 
 - **Import path changed.** Since Uvicorn 0.30 the built-in `uvicorn.workers` module is deprecated in
   favour of the separate `uvicorn-worker` package (`-k uvicorn_worker.UvicornWorker`). The old path still
@@ -92,7 +92,8 @@ workers per GPU: usually 1, because each process would load its own copy of the 
   reserved for the model) is significant.
 
 ## Diagram
-The Gunicorn master serves nothing: it forks workers, watches their heartbeats and replaces them. Each
+The Gunicorn master serves nothing: it forks workers, watches their heartbeats and replaces any that are
+killed or exit (a worker that hits `--max-requests` exits by itself and the master forks a fresh one). Each
 worker is a full process with its own event loop, pools and model copy, which is why memory caps the count.
 
 ```mermaid
@@ -105,8 +106,8 @@ flowchart TD
     W2 -.->|"heartbeat"| M
     M --> T{"Heartbeat missed for the timeout, 30 s default?"}
     T -->|"yes, loop blocked"| X["Kill and replace worker"]
-    M --> R{"Served max requests plus jitter?"}
-    R -->|"yes"| G["Graceful recycle within the graceful timeout"]
+    W2 --> R{"This worker served max requests plus jitter?"}
+    R -->|"yes, worker exits gracefully"| M
     W1 -->|"RSS adds up"| L["Pod memory limit"]
     W2 -->|"RSS adds up"| L
 ```

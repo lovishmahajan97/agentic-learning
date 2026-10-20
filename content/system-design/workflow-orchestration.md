@@ -5,7 +5,7 @@ name: Workflow orchestration (Temporal, Prefect, Airflow)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - reliability/durable-workflow-execution
   - agent-reliability/durable-execution-and-checkpointing
@@ -290,13 +290,15 @@ reembed_daily()
 - **Assuming the orchestrator makes side effects exactly-once.** Symptom: duplicate emails or writes
   after a retry, fixed only by idempotency keys in the activity or task.
 - **Airflow for per-request or event-driven work.** Symptom: noticeable scheduler latency between tasks
-  (it was built for batch, not milliseconds) and DAG files sprouting conditionals to fake dynamism.
+  (it was built for batch, not milliseconds) and DAG files sprouting conditionals to fake dynamism. Fix:
+  keep Airflow for scheduled batch and move event-driven work to Prefect, Temporal or in-process code.
 - **Airflow tasks that append rather than overwrite their interval's output.** Symptom: doubled rows for
-  exactly the days that were retried or backfilled.
+  exactly the days that were retried or backfilled. Fix: overwrite the interval's partition.
 - **Megabytes of document text or embeddings through task results or workflow history.** Symptom: slow
   UIs, size limits being hit, and failed runs on large documents. Fix: pass references.
 - **Deploying changed workflow code with runs in flight and no versioning.** Symptom: those runs fail or
-  take a different path on replay than they did originally.
+  take a different path on replay than they did originally. Fix: guard the change with
+  `workflow.patched`, or let old runs drain on the old code first.
 
 ## When to use
 - **Use an orchestrator when:** a process has multiple steps with independent failure, runs longer than a

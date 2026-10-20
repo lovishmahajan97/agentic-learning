@@ -5,7 +5,7 @@ name: Dataset contamination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/benchmarking
   - evals/golden-dataset
@@ -117,20 +117,21 @@ Most of the time you have only the model, so detection is behavioural:
 
 ## Diagram
 The detection path splits on one question, whether you can see the training data; both branches end in
-a scoped claim, never "clean".
+a scoped claim, never "clean". The control is a comparable model that could not have seen the corpus;
+the probes are completion, masked option, perturbation and canary checks.
 
 ```mermaid
 flowchart TD
     S["Suspicious score"] --> Q{"Access to the training corpus?"}
     Q -->|"yes"| NG["13-gram shingle overlap per item"]
-    NG --> SP["Score clean and flagged subsets separately"]
-    SP --> CT["Compare the gap with a control model that could not have seen it"]
-    Q -->|"no"| BP["Behavioural probes: completion, masked option, perturbation, canary"]
+    NG --> SP["Score clean and flagged subsets"]
+    SP --> CT["Compare gap with a control model"]
+    Q -->|"no"| BP["Behavioural probes"]
     BP --> FR["Fresh-equivalent or post-cutoff items"]
     CT --> V{"Gap beyond control or interval?"}
     FR --> V
-    V -->|"yes"| M["Memorization signal: quote the clean score, purge training data"]
-    V -->|"no"| ND["Not detectably contaminated, by these routes only"]
+    V -->|"yes"| M["Memorization signal: quote clean score"]
+    V -->|"no"| ND["Not detectably contaminated, these routes only"]
 ```
 
 ## Examples
@@ -187,18 +188,18 @@ print(split_scores(eval_items, flagged, model_correct))
   result is "not detectably contaminated", not "clean".
 
 ### Worked scenario: is the 15-point gap memorization?
-Same flagged/clean split, scored on the suspect model and on a control with an earlier cutoff
-(illustrative numbers).
+Same flagged/clean split, scored on the suspect model and on a control with an earlier cutoff. The two
+control rows are alternative outcomes of that one control run, not two models (illustrative numbers).
 
 | Model | Clean subset | Flagged subset | Gap |
 |---|---|---|---|
 | Suspect (trained on the corpus) | 0.78 | 0.93 | 15 points |
-| Control A (could not have seen it) | 0.70 | 0.85 | 15 points |
-| Control B (could not have seen it) | 0.70 | 0.74 | 4 points |
+| Control, outcome A | 0.70 | 0.85 | 15 points |
+| Control, outcome B | 0.70 | 0.74 | 4 points |
 
-- **Against control A:** the gap is the same, so flagged items are simply easier; no evidence of
+- **If outcome A:** the gap is the same, so flagged items are simply easier; no evidence of
   memorization.
-- **Against control B:** the suspect's gap exceeds the control's by 11 points, a memorization signal;
+- **If outcome B:** the suspect's gap exceeds the control's by 11 points, a memorization signal;
   quote the clean-subset score and remove flagged items from fine-tuning data.
 
 ### Leak guard before a fine-tuning job
@@ -244,7 +245,8 @@ raise SystemExit(1 if hits else 0)                # block the fine-tuning job on
   counts per data source; a recurring source needs filtering upstream.
 - **Canary per eval file, probed per model.** Put a unique canary in the header of every eval file that
   leaves the repository, and when a new model snapshot arrives, prompt it with the canary prefix to see
-  whether it completes the rest. Monitor any completion as a confirmed leak.
+  whether it completes the rest. Treat any completion as strong evidence of a leak; a miss does not
+  prove the file was unseen, since memorization of any one string is not guaranteed.
 - **Private held-out under no-training terms.** Keep one split that is never published, and run it only
   through providers or settings whose data-use terms exclude your traffic from training. Monitor the
   gap between public-benchmark and private-split scores across model versions.

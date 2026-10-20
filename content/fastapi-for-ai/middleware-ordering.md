@@ -27,10 +27,11 @@ and whether timing sees exceptions.
 ## Why it exists
 - **Cross-cutting concerns need one chain.** Request IDs, auth, CORS, compression, timing, tracing and
   body-size limits do not belong in every endpoint, so every request passes through a shared chain.
-- **The concerns depend on each other.** A request-ID layer must run before anything that logs. CORS
-  must wrap auth, or the browser gets a 401 with no `Access-Control-Allow-Origin` and reports an opaque
-  "CORS error". A body-size limit must run before anything reads the body. A tracing span should open
-  before auth so rejected requests are still traced.
+- **The concerns depend on each other.** A request-ID layer must run before anything that logs, or early
+  log lines have no ID. CORS must wrap auth, or the browser gets a 401 with no
+  `Access-Control-Allow-Origin` and reports an opaque "CORS error" instead of "unauthorized".
+- **Limits and tracing have positions too.** A body-size limit must run before anything reads the body.
+  A tracing span should open before auth so rejected requests are still traced.
 - **"Independent filters" is the wrong model.** Middleware is nested function calls: each layer gets the
   request from the layer outside it and the response from the layer inside it. Inner headers added on the
   way out are visible to outer layers; outer values set on the way in are visible to inner layers; nothing
@@ -117,7 +118,7 @@ Follow a request inward from the server and its response back outward: auth shor
 that still passes back through CORS, while a crash caught by `ServerErrorMiddleware` never does.
 
 ```mermaid
-flowchart LR
+flowchart TD
     W["Server"] --> SE["ServerErrorMiddleware (fixed, outermost)"]
     SE --> RID["RequestID"]
     RID --> CO["CORS"]
@@ -215,8 +216,8 @@ A file calls `add_middleware(CORS)`, then `add_middleware(ApiKey)`, then `add_mi
 
 ## Production patterns
 - **Declare the stack in one list.** Use for every service: pass `FastAPI(middleware=[...])` in
-  outermost-first order so reviewers read execution order directly. Monitor nothing at runtime; enforce in
-  code review that `add_middleware` is not mixed in elsewhere.
+  outermost-first order so reviewers read execution order directly. There is nothing to monitor at runtime;
+  enforce in code review that `add_middleware` is not mixed in elsewhere.
 - **Pin order with contract tests.** Use whenever CORS, auth or timing middleware exist: one test sends a
   bad key with an `Origin` header and asserts `access-control-allow-origin`, another raises in an
   endpoint and asserts the timing log line. Run them in CI on every Starlette upgrade.

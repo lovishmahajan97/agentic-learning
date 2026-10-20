@@ -5,7 +5,7 @@ name: StreamingResponse
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/server-sent-events
   - fastapi-for-ai/websockets

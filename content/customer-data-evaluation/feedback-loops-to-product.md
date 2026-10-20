@@ -5,7 +5,7 @@ name: Feedback loops to product
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - customer-data-evaluation/production-feedback-classification
   - customer-data-evaluation/customer-specific-regression-suites
@@ -18,142 +18,220 @@ related:
 ---
 
 ## TL;DR
-A feedback loop to product carries what is learned in customer deployments back into the shared
-product: classified failures and requests become evidence-backed issues, a regular triage decides
-fix-in-config, fix-in-product or roadmap, every fix lands with a regression case, and the reporting
-customer hears what changed. Without the loop, field teams patch the same problem separately in each
-deployment, and the product never learns from its users.
+Carrying what deployments learn back into the shared product: evidence-backed issue clusters, regular
+triage into config, product fix or roadmap, a regression case per fix, and a reply to the reporter.
+Without it, field teams patch the same problem separately everywhere.
 
 ## Why it exists
-Forward-deployed teams sit closest to real usage. They see that the date parser fails on one
-customer's European formats, that the retriever cannot handle scanned tables, that users at three banks
-all want the same approval step. Under delivery pressure the rational move is a local fix: a prompt
-override, a pre-processing script, a customer-specific branch. The customer is happy this week.
-
-Repeated across customers, that rationality turns into a mess. The same date-parsing problem is solved
-four times, four slightly different ways, in four deployments. The product team, which owns the shared
-roadmap, never sees the pattern, because each instance was closed locally. When the platform changes,
-every local patch is a potential break. And customers notice something else: they reported a problem,
-it was patched for them, but the next release reintroduced it, or they reported a gap and never heard
-back. After a few rounds they stop reporting, which removes the signal entirely.
-
-The naive fix, "FDEs should file tickets", fails because a ticket per complaint is noise: a product
-manager cannot weigh 300 one-line tickets against each other. What works is a deliberate loop with a
-unit of evidence a product team can act on, a cadence, decision rules, and a closing step back to the
-customer.
+- **Field teams see real usage first.** The date parser fails on one customer's European formats, the
+  retriever cannot handle scanned tables, users at three banks all want the same approval step.
+- **Under delivery pressure, the local fix is rational.** A prompt override, a pre-processing script, a
+  customer-specific branch: the customer is happy this week.
+- **Repeated across customers, it becomes a mess.** The same date problem is solved four times, four
+  slightly different ways, in four deployments. Product never sees the pattern, because each instance
+  closed locally, and every local patch is a potential break when the platform changes.
+- **Customers stop reporting.** A patched problem returns in the next release, or a reported gap never gets
+  a reply; after a few rounds they stop, which removes the signal entirely.
+- **"FDEs should file tickets" is noise.** A product manager cannot weigh 300 one-line tickets against each
+  other. What works is a deliberate loop: a unit of evidence, a cadence, decision rules and a closing step
+  back to the customer.
 
 ## How it works
 ### 1. The unit is an issue cluster with evidence
-Classified feedback (see production feedback classification) is grouped into clusters: one failure
-mode or request, with linked traces, counts, the customers affected, severity, the current workaround,
-and its cost (hours spent, deals blocked, workaround maintenance). A cluster lets the product team
-compare items on the same terms, which raw tickets never do.
+Classified feedback (see production feedback classification) is grouped into clusters: one failure mode
+or request, with:
+- **linked traces** and **counts**;
+- **customers affected** and **severity**;
+- **the current workaround** and **its cost** (hours spent, deals blocked, workaround maintenance).
+
+A cluster lets the product team compare items on the same terms, which raw tickets never do.
 
 ### 2. Aggregate across customers
-The same cluster is merged across deployments, with per-customer counts kept. This is where patterns
-appear: a problem that is a quirk for one customer is a product gap when it appears in four. Because
-customer data cannot be pooled freely, clusters carry redacted or synthetic examples plus links to the
-traces held under each customer's data rules.
+- **Merge the same cluster across deployments**, keeping per-customer counts.
+- **This is where patterns appear:** a quirk for one customer is a product gap when it appears in four.
+- **Respect data boundaries.** Customer data cannot be pooled freely, so clusters carry redacted or
+  synthetic examples plus links to traces held under each customer's data rules.
 
 ### 3. Triage on a cadence with decision rules
 A regular (for example weekly) triage between field and product leads decides each cluster:
-- **Customer configuration:** the behaviour is customer-specific and legitimate; express it as tenant
-  config, not code.
-- **Product fix:** the cause is in shared code, prompts or models; it goes on the product backlog.
-- **Roadmap candidate:** a missing capability, ranked with the roadmap rather than squeezed in.
-- **No change:** user error or out of scope, answered with documentation or training.
-Decision rules make triage predictable, for example: anything severe is a product fix; anything seen in
-several customers is reviewed for productisation; a local workaround is allowed only with a tracking issue
-and an expiry.
 
-The config-versus-product line is the decision people get wrong most. The test is whether the
-behaviour is *correct but different* or *wrong*. "Dates in this market are day-first" is a legitimate,
-stable customer difference, so it is configuration. "The parser guesses the order and is sometimes
-wrong" is a defect, and hiding it behind a per-customer flag leaves it live for every customer who has
-not set the flag yet.
+| Outcome | When | What happens |
+|---|---|---|
+| **Customer configuration** | Behaviour is customer-specific and legitimate | Expressed as tenant config, not code |
+| **Product fix** | Cause is in shared code, prompts or models | Goes on the product backlog |
+| **Roadmap candidate** | A missing capability | Ranked with the roadmap rather than squeezed in |
+| **No change** | User error or out of scope | Answered with documentation or training |
+
+Decision rules make triage predictable, for example:
+- **Anything severe** is a product fix.
+- **Anything seen in several customers** is reviewed for productisation.
+- **A local workaround is allowed** only with a tracking issue and an expiry.
+
+### Config or product: the decision people get wrong most
+- **The test:** is the behaviour *correct but different*, or *wrong*?
+- **Correct but different is configuration.** "Dates in this market are day-first" is a legitimate,
+  stable customer difference.
+- **Wrong is a defect.** "The parser guesses the order and is sometimes wrong" hidden behind a
+  per-customer flag stays live for every customer who has not set the flag yet.
 
 ### Rank clusters on comparable terms
-Triage needs a way to compare clusters that does not reward volume of complaint. One reasonable scheme
-(a convention to adapt, not a standard) scores each cluster as:
+Triage needs a ranking that does not reward volume of complaint. One reasonable scheme (a convention to
+adapt, not a standard):
 
 `priority = Σ over affected customers of (affected share of that customer's traffic × severity weight) + workaround cost`
 
-with severity weights such as 1 cosmetic, 3 wrong-but-harmless, 10 acted-upon, 30 compliance, and
-workaround cost expressed on the same scale (for example one point per engineer-day per quarter).
-Using *share of traffic* rather than *number of tickets* is the point: a customer whose users complain
-loudly about a cosmetic issue on 20% of requests scores 0.2 × 1 = 0.2, while a silent acted-upon error on
-3% of requests at each of three customers scores 3 × 0.03 × 10 = 0.9. Whatever the exact weights, writing
-them down makes the trade-off arguable, and strategic-account weight becomes an explicit term rather than
-a side conversation.
+- **Severity weights** such as 1 cosmetic, 3 wrong-but-harmless, 10 acted-upon, 30 compliance.
+- **Workaround cost on the same scale**, for example one point per engineer-day per quarter.
+- **Share of traffic, not number of tickets, is the point.** Loud complaints about a cosmetic issue on 20%
+  of one customer's requests score 0.2 × 1 = 0.2; a silent acted-upon error on 3% of requests at each of
+  three customers scores 3 × 0.03 × 10 = 0.9.
+- **Writing the weights down makes the trade-off arguable**, and strategic-account weight becomes an
+  explicit term rather than a side conversation.
 
 ### 4. Every fix closes three things
-A resolved cluster: (a) adds regression cases to each affected customer's suite and, if general, to the
-shared suite, so it cannot silently return; (b) retires the local workarounds, which is how the deployments
-converge back onto the product; (c) is communicated to the customers who reported it, with the release it
-shipped in. The third step is what keeps customers reporting.
+1. **Regression cases** go into each affected customer's suite and, if general, the shared suite, so the
+   problem cannot silently return.
+2. **Local workarounds are retired**, which is how deployments converge back onto the product.
+3. **Reporting customers are told**, with the release it shipped in. This step is what keeps customers
+   reporting.
 
 ### 5. Measure the loop itself
-Track time from first report to decision and to shipped fix; recurrence rate (clusters that reopen);
-number of open local workarounds and their age; share of field patches upstreamed; and feedback volume
-per active user over time. Falling feedback with flat usage often means people gave up, not that quality
-improved.
+- **Speed:** time from first report to decision and to shipped fix.
+- **Recurrence rate:** clusters that reopen.
+- **Workaround debt:** number of open local workarounds and their age; share of field patches upstreamed.
+- **Feedback volume per active user over time.** Falling feedback with flat usage often means people gave
+  up, not that quality improved.
 
 ### Watch the loop's own failure modes
-Loud customers dominate unless clusters are weighted by breadth and severity. Optimising a single signal
-such as thumbs-up rate invites changes that please users without helping them (Goodhart's law). And
-using accepted outputs as training data needs both permission and care: users often accept plausible
-but wrong answers, so the model can drift toward its own errors.
+- **Loud customers dominate** unless clusters are weighted by breadth and severity.
+- **Optimising one signal** such as thumbs-up rate invites changes that please users without helping them
+  (Goodhart's law).
+- **Accepted outputs as training data** need both permission and care: users often accept plausible but
+  wrong answers, so the model can drift toward its own errors.
 
-## Example
-Worked scenario. Four FDE teams run a document-extraction product at four insurers. Over a quarter, the
-classified feedback contains a cluster "dates parsed with month and day swapped" in three deployments.
-Each team wrote its own fix: one a prompt line ("dates are DD/MM/YYYY"), one a regex post-processor, one
-a customer-specific parser branch. The fourth insurer has the same problem undetected, because its users
-correct dates by hand and never complain.
+## Diagram
+Feedback from every deployment merges into one cluster, triage picks one of four outcomes, and a product
+fix only counts as done when all three closing steps happen.
 
-At triage, the cluster shows three customers, linked traces, a severity of "wrong and acted upon" (dates
-drive claim deadlines) and roughly a week of combined engineering time spent on three workarounds
-(illustrative). The rule "severe and seen in more than one customer" makes it a product fix: the
-extraction schema gains a locale field in tenant config, and the parser uses it. Each of the four
-customers' regression suites gets day-first date cases; the shared suite gets cases for both orders.
-The three local workarounds are deleted, one of which, the regex, had been mangling ISO dates. The fourth
-insurer's edit-rate data, checked because the cluster prompted it, confirms the silent problem, and their
-config is set too. All four receive a release note naming the fix. The next quarter, the cluster stays
-closed and the number of open workarounds goes down by three.
+```mermaid
+flowchart TD
+    F["Classified feedback, all deployments"] --> C["Cluster: traces, customers, severity, cost"]
+    C --> T{"Weekly triage with decision rules"}
+    T -->|"correct but different"| CFG["Tenant config"]
+    T -->|"defect in shared code"| P["Product fix"]
+    T -->|"missing capability"| R["Roadmap candidate"]
+    T -->|"user error"| D["Docs or training"]
+    P --> RC["Add regression cases"]
+    RC --> W["Retire local workarounds"]
+    W --> N["Tell reporting customers"]
+    N -.->|"they keep reporting"| F
+```
+
+## Examples
+### Worked scenario: swapped dates at four insurers
+Four FDE teams run a document-extraction product at four insurers. Over a quarter, classified feedback
+contains a cluster "dates parsed with month and day swapped" in three deployments.
+
+| Deployment | Before the loop |
+|---|---|
+| Insurer 1 | Prompt line: "dates are DD/MM/YYYY" |
+| Insurer 2 | Regex post-processor |
+| Insurer 3 | Customer-specific parser branch |
+| Insurer 4 | Same problem, undetected: users correct dates by hand and never complain |
+
+1. **Triage sees the cluster:** three customers, linked traces, severity "wrong and acted upon" (dates
+   drive claim deadlines), and roughly a week of combined engineering time on three workarounds
+   (illustrative).
+2. **The rule "severe and seen in more than one customer" makes it a product fix.** The extraction schema
+   gains a locale field in tenant config, and the parser uses it.
+3. **Regression cases:** each of the four customers' suites gets day-first date cases; the shared suite
+   gets cases for both orders.
+4. **Workarounds deleted:** all three, one of which, the regex, had been mangling ISO dates.
+5. **The silent customer is found.** The fourth insurer's edit-rate data, checked because the cluster
+   prompted it, confirms the problem, and their config is set too.
+6. **Loop closed:** all four receive a release note naming the fix. Next quarter the cluster stays closed
+   and open workarounds go down by three.
+
+### Priority scoring and a workaround expiry check
+The ranking formula and the "tracking issue plus expiry" rule as code a triage tool or CI job can run.
+
+```python
+from datetime import date
+
+SEVERITY = {"cosmetic": 1, "wrong_harmless": 3, "acted_upon": 10, "compliance": 30}
+
+def priority(cluster):
+    traffic = sum(share * SEVERITY[cluster["severity"]] for share in cluster["affected_share"].values())
+    return round(traffic + cluster.get("workaround_points", 0), 2)
+
+loud = {"name": "logo misaligned", "severity": "cosmetic", "affected_share": {"A": 0.20}}
+dates = {"name": "day/month swapped", "severity": "acted_upon",
+         "affected_share": {"B": 0.03, "C": 0.03, "D": 0.03}}
+print(priority(loud), priority(dates))        # 0.2 0.9: the quiet, severe cluster wins
+
+def overdue(workarounds, today):
+    """Workarounds with no tracking issue or past their expiry: fail the build or page the owner."""
+    return [w["id"] for w in workarounds if not w.get("tracking_issue") or w["expires"] < today]
+
+ws = [{"id": "b-date-regex", "tracking_issue": "PROD-812", "expires": date(2026, 9, 30)},
+      {"id": "c-date-prompt", "tracking_issue": None, "expires": date(2026, 12, 31)},
+      {"id": "d-parser-branch", "tracking_issue": "PROD-812", "expires": date(2026, 12, 31)}]
+print(overdue(ws, date(2026, 10, 20)))        # ['b-date-regex', 'c-date-prompt']
+```
+
+## Production patterns
+- **Workaround registry checked in CI** — whenever field teams can patch locally. Keep every tenant
+  override in a versioned file with owner, tracking issue and expiry, and fail CI (or open a ticket) on a
+  missing issue or past expiry, as in the snippet above. Monitor open workaround count and median age.
+- **Auto-clustering from classifier labels** — once feedback is classified. Group by category and owner,
+  then cluster evidence text (for example embedding similarity) and merge across tenants, attaching counts
+  and redacted examples. FDEs add only context and cost. Monitor cluster count per week and unclustered
+  share.
+- **Written triage rules and a fixed weekly slot** — when more than one field team exists. Publish the
+  decision rules and severity weights, record each decision with its rule, and revisit weights quarterly.
+  Monitor time from first report to decision.
+- **Cluster-to-release linking** — for closing the loop. Link each cluster to the release that fixed it
+  and generate per-customer release notes listing fixes they reported. Monitor the share of reporters who
+  were told, and recurrence of closed clusters.
+- **Feedback-per-active-user with a sample check** — on the loop dashboard. Plot feedback volume divided
+  by active users, and when it falls with flat usage, audit a random traffic sample before calling it a
+  quality gain. Monitor renewal risk for quiet customers.
 
 ## Trade-offs
-- Upstreaming fixes removes duplicate work and patch drift, but is slower than a local fix; allow local
-  workarounds when a customer is blocked, provided each has a tracking issue and an expiry.
-- Weighting clusters by breadth protects the roadmap from the loudest customer, but can starve a single
-  strategic customer's real need; give account strategy an explicit, visible weight instead of a backdoor.
-- Rich clusters with traces and cost make decisions easy, but take FDE time to assemble; automate
+- **Upstreaming vs speed.** It removes duplicate work and patch drift but is slower than a local fix; allow
+  local workarounds when a customer is blocked, provided each has a tracking issue and an expiry.
+- **Breadth weighting vs strategic accounts.** It protects the roadmap from the loudest customer but can
+  starve a single strategic customer's real need; give account strategy an explicit, visible weight
+  instead of a backdoor.
+- **Rich clusters vs FDE time.** Traces and cost make decisions easy but take time to assemble; automate
   clustering from the feedback classifier so FDEs only add context and cost.
-- Expressing customer differences as tenant config instead of branches keeps one codebase, but each flag
-  multiplies the combinations that must be tested; once flags interact, prefer a few vetted presets and
-  retire flags nobody has changed in months.
-- Closing the loop with every reporter builds trust and keeps feedback flowing, but adds communication
-  work; batch it into release notes per customer rather than individual replies.
+- **Tenant config vs branches.** Config keeps one codebase, but each flag multiplies the combinations to
+  test; once flags interact, prefer a few vetted presets and retire flags nobody has changed in months.
+- **Closing the loop vs communication work.** Replying to every reporter builds trust and keeps feedback
+  flowing; batch it into release notes per customer rather than individual replies.
 
 ## Pitfalls
-- Fixing locally and closing the ticket; the symptom is the same failure mode appearing as "new" in each
-  new customer deployment.
-- Sending raw tickets to product instead of evidence clusters; the symptom is a product backlog nobody
+- **Fixing locally and closing the ticket.** Symptom: the same failure mode appears as "new" in each new
+  customer deployment.
+- **Sending raw tickets to product instead of evidence clusters.** Symptom: a product backlog nobody
   triages and field teams saying "product never listens".
-- Shipping product fixes without regression cases; the symptom is a customer reporting the same problem
-  again after a later release.
-- Never retiring workarounds after the product fix; the symptom is local patches conflicting with the new
+- **Shipping product fixes without regression cases.** Symptom: a customer reports the same problem again
+  after a later release.
+- **Never retiring workarounds after the product fix.** Symptom: local patches conflict with the new
   behaviour, like a post-processor double-correcting fixed output.
-- Turning a defect into a per-customer config flag because that ships fastest; the symptom is a new
-  customer hitting the "already fixed" bug on day one because nobody set their flag.
-- Reading falling feedback volume as rising quality; the symptom is churn or low renewal from a customer
+- **Turning a defect into a per-customer config flag because it ships fastest.** Symptom: a new customer
+  hits the "already fixed" bug on day one because nobody set their flag.
+- **Reading falling feedback volume as rising quality.** Symptom: churn or low renewal from a customer
   whose dashboards looked quiet.
 
 ## When to use
-Set up the loop once a product has more than one customer deployment or field team, and well before
-local workarounds become a maintenance burden. A single pilot needs only a shared list between the FDE
-and the product owner. Measure time to decision and to fix, recurrence, open workaround count and age,
-and feedback per active user. In interviews for FDE and architect roles, describing how field learning
-reaches the product, and how you avoid forking the product per customer, is a strong signal.
+- **Use once** a product has more than one customer deployment or field team, and well before local
+  workarounds become a maintenance burden.
+- **A single pilot** needs only a shared list between the FDE and the product owner.
+- **Measure:** time to decision and to fix, recurrence, open workaround count and age, and feedback per
+  active user.
+- **Interviews:** for FDE and architect roles, describing how field learning reaches the product, and how
+  you avoid forking the product per customer, is a strong signal.
 
 ## Role lens
 - **Engineer:** Upstreams fixes behind tenant config instead of customer branches, adds the regression
@@ -172,6 +250,37 @@ and a weekly triage with field and product leads applies explicit rules: severe 
 become product fixes, customer-specific behaviour becomes tenant config. Each product fix must add
 regression cases and delete the matching workarounds. I would track open workaround count and age and time
 to upstream, and send customers release notes when their issue ships so they keep reporting.
+
+## Interview questions
+### Why does "FDEs should file tickets" not create a working feedback loop?
+- **One ticket per complaint is noise.** A product manager cannot weigh hundreds of one-line tickets.
+- **The workable unit is an evidence cluster:** one failure mode with traces, affected customers,
+  severity and workaround cost, merged across deployments.
+- **Plus a cadence, decision rules and a closing step** back to the customer.
+
+### How do you decide between a tenant config flag and a product fix?
+- **Ask whether the behaviour is correct but different, or wrong.** Day-first dates in one market are a
+  legitimate difference: config.
+- **A parser that guesses date order is a defect.** A per-customer flag leaves it live for every customer
+  who has not set it, so it is a product fix.
+
+### How would you stop the loudest customer from owning the roadmap?
+- **Score clusters by share of traffic × severity weight**, summed across affected customers, plus
+  workaround cost.
+- **Example:** a cosmetic issue on 20% of one customer's requests scores 0.2, while an acted-upon error on
+  3% at three customers scores 0.9.
+- **Give strategic accounts an explicit weight** so the trade-off is visible, not a backdoor.
+
+### Feedback volume per active user is falling while usage is flat. Good news?
+- **Not necessarily.** It matches users giving up on a loop that never closes.
+- **Check a random traffic sample** for failure prevalence, and whether reporters heard back about their
+  issues.
+- **Watch renewal risk** for quiet customers.
+
+### What does "done" mean for a product fix that came from the field?
+- **Regression cases** in each affected customer's suite and, if general, the shared suite.
+- **Local workarounds retired**, so deployments converge and stale patches cannot double-correct.
+- **Reporters told**, with the release it shipped in; track recurrence to confirm it stayed fixed.
 
 ## Quiz
 ### Q: What is the most useful unit for passing field feedback to a product team?

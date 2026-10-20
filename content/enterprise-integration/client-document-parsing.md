@@ -5,7 +5,7 @@ name: Client document parsing (PDF, scans, OCR)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/document-parsing
   - multimodal/ocr
@@ -21,105 +21,132 @@ sources:
 ---
 
 ## TL;DR
-A client's document estate is a mix: born-digital PDFs with a text layer, scanned PDFs that are only
-images, faxes, photos of forms, password-protected files and decades of templates. Parsing it well is
-less about one parser than about triage: detect what each file is, route it to the cheapest method that
-handles it (text extraction, OCR, or a layout or vision model), score confidence per page, send the
-doubtful pages to review, and keep page and position provenance for citations.
+Client documents mix born-digital PDFs, scans, faxes and protected files. Parse them by triage: detect
+each page's type, route it to the cheapest working method (text extraction, OCR, layout or vision model),
+score confidence, review doubtful pages, and keep page provenance.
 
 ## Why it exists
-Most enterprise knowledge an AI system is asked about lives in documents: contracts, claims files,
-policies, invoices, engineering reports. In a demo the corpus is a dozen clean PDFs exported from Word.
-At a client it is hundreds of thousands of files accumulated over years, and the share that is scanned,
-skewed, stamped, handwritten on, or exported by an old system with a broken font encoding is often large.
-How large is unknown until it is profiled, which is why parsing is a per-client problem rather than a
-solved library choice.
-
-The naive approach is to run one text extractor over everything. It fails silently. A scanned PDF has
-no text layer, so the extractor returns an empty string and the document disappears from the index
-without an error. A born-digital PDF with a bad character map returns plausible-looking garbage that is
-embedded and retrieved. A two-column contract is read across the columns, interleaving clauses. A table
-of policy limits becomes a run of numbers no longer attached to their headers, so the model answers with
-the wrong limit and cites a real page. The opposite naive approach, sending every page through OCR or a
-vision-language model, is slow and expensive at enterprise volume and can degrade born-digital text that
-was already exact.
-
-The mechanics of OCR, layout analysis and table extraction are covered in the RAG document-parsing and
-multimodal OCR lessons. This lesson is about applying them to a specific client's corpus: triage,
-routing, confidence, review and provenance.
+- **Enterprise knowledge lives in messy documents.** Contracts, claims files, policies, invoices and
+  engineering reports. A demo corpus is a dozen clean PDFs exported from Word; a client's is hundreds of
+  thousands of files accumulated over years, with a large share scanned, skewed, stamped, handwritten on,
+  or exported by an old system with a broken font encoding.
+- **The mix is unknown until profiled,** which is why parsing is a per-client problem rather than a solved
+  library choice.
+- **One text extractor fails silently:**
+  - A scanned PDF has no text layer, so the extractor returns an empty string and the document disappears
+    from the index without an error.
+  - A born-digital PDF with a bad character map returns plausible-looking garbage that is embedded and
+    retrieved.
+  - A two-column contract is read across the columns, interleaving clauses.
+  - A table of policy limits becomes a run of numbers detached from their headers, so the model answers
+    with the wrong limit and cites a real page.
+- **OCR or a vision model on every page is the opposite mistake:** slow and expensive at enterprise
+  volume, and it can degrade born-digital text that was already exact.
+- **Scope of this lesson.** The mechanics of OCR, layout analysis and table extraction are in the RAG
+  document-parsing and multimodal OCR lessons. This lesson applies them to one client's corpus: triage,
+  routing, confidence, review and provenance.
 
 ## How it works
 ### 1. Profile the corpus first
 From a stratified sample, measure file type mix, share of PDFs with a usable text layer, encrypted or
-corrupt files, page counts, languages, and recurring templates (the same form from the same system).
-This sets the routing rules and the cost and time estimate for the backfill.
+corrupt files, page counts, languages, and recurring templates (the same form from the same system). This
+sets the routing rules and the cost and time estimate for the backfill.
 
 ### 2. Triage each file, ideally each page
-- **Encrypted or corrupt:** report to the client with the file list; only they can supply passwords or
-  exclude files.
-- **Born-digital with a text layer:** extract directly. This is the cheapest and most exact route,
-  *because* the characters are already in the file.
-- **Image-only pages:** route to OCR. Hybrid PDFs (a scanned contract with a digital cover page) are
-  common, so decide per page, not per file.
-- **Text layer present but unusable:** detect it with a quality check, such as the share of characters
-  that are letters, the share of tokens found in a dictionary for the expected language, or replacement
-  and private-use characters. Broken font encodings produce text that exists but means nothing; treat
-  those pages as images.
-- **Text layer that is itself old OCR:** many scanners and document-management systems save
-  "searchable PDFs" with an invisible OCR layer under the page image, produced by whatever engine and
-  settings were in use at the time. It passes a naive "has text" test, but its quality is unknown, so
-  give it the same quality check, and re-OCR when it fails.
-- **Text plus embedded images:** a born-digital page can carry a pasted scan, a screenshot of a table or
-  a stamped signature block as an image. The text check passes and the image's content is lost. Measure
-  the share of the page area covered by images (PDF libraries expose image bounding boxes) and send
-  those regions, or the whole page, to OCR when it is large.
+| Case | Route | Why |
+|---|---|---|
+| **Encrypted or corrupt** | report to the client with the file list | only they can supply passwords or exclude files |
+| **Born-digital with a text layer** | extract directly | cheapest and most exact, *because* the characters are already in the file |
+| **Image-only pages** | OCR | hybrid PDFs (a scanned contract with a digital cover page) are common, so decide per page, not per file |
+| **Text layer present but unusable** | treat as image | broken font encodings produce text that exists but means nothing |
+| **Text layer that is itself old OCR** | quality check; re-OCR on failure | passes a naive "has text" test, but its quality is unknown |
+| **Text plus embedded images** | OCR the image regions or the page | the text check passes and the image's content is lost |
+
+The details behind the harder rows:
+- **Detect unusable text** with a quality check: the share of characters that are letters, the share of
+  tokens found in a dictionary for the expected language, or replacement and private-use characters.
+- **Old OCR layers are common.** Many scanners and document-management systems save "searchable PDFs" with
+  an invisible OCR layer under the page image, produced by whatever engine and settings were in use at the
+  time. Give it the same quality check.
+- **Embedded images hide content.** A born-digital page can carry a pasted scan, a screenshot of a table
+  or a stamped signature block as an image. Measure the share of page area covered by images (PDF
+  libraries expose image bounding boxes) and send those regions, or the whole page, to OCR when it is
+  large.
 
 ### 3. OCR with preprocessing and confidence
-Render pages at sufficient resolution (Tesseract's documentation recommends at least 300 DPI), deskew,
-and set the expected languages explicitly, *because* OCR accuracy depends heavily on image quality and on
-the language model the engine applies. Keep word-level confidence: OCR engines report it, and the page's
-mean or low-percentile confidence is the signal for routing. Treat it as a ranking signal, not a
-probability: an engine's confidence is not calibrated against your documents, and it can be high on a
-confidently misread stamp or low on a perfectly read unusual font. The routing threshold is therefore
-set by plotting confidence against measured error rate on labelled pages from this client and choosing
-the point where the error becomes unacceptable for the use case.
+1. **Render at sufficient resolution** (Tesseract's documentation recommends at least 300 DPI), deskew,
+   and set the expected languages explicitly, *because* OCR accuracy depends heavily on image quality and
+   on the language model the engine applies.
+2. **Keep word-level confidence.** OCR engines report it, and the page's mean or low-percentile confidence
+   is the routing signal.
+3. **Treat confidence as a ranking, not a probability.** It is not calibrated against your documents: it
+   can be high on a confidently misread stamp or low on a perfectly read unusual font.
+4. **Set the threshold from data.** Plot confidence against measured error rate on labelled pages from
+   this client and choose the point where the error becomes unacceptable for the use case.
 
 ### 4. Escalate the hard pages
-Pages with low OCR confidence, complex layouts, dense tables, handwriting or stamps go to a stronger and
-more expensive route: a layout-aware document model, a cloud document-AI service if the data may leave
-the boundary, or a vision-language model prompted to transcribe; and, below a further threshold, to human
-review. A tiered route spends the cost where it buys accuracy, instead of on every page.
+- **What escalates:** pages with low OCR confidence, complex layouts, dense tables, handwriting or stamps.
+- **Where to:** a layout-aware document model, a cloud document-AI service if the data may leave the
+  boundary, or a vision-language model prompted to transcribe; below a further threshold, human review.
+- **Why tiers:** a tiered route spends the cost where it buys accuracy, instead of on every page.
 
 ### 5. Recover structure
-Keep reading order, headings, list items and tables (cells tied to row and column headers), and drop
-repeated headers, footers and page numbers, *because* chunking and retrieval quality depend on structure.
-Recurring client templates are worth a dedicated extraction rule or schema; one form type can be a large
-share of a corpus.
+- **Keep** reading order, headings, list items and tables (cells tied to row and column headers).
+- **Drop** repeated headers, footers and page numbers, *because* chunking and retrieval quality depend on
+  structure.
+- **Write rules for recurring templates.** A dedicated extraction rule or schema is worth it, since one
+  form type can be a large share of a corpus.
 
 ### 6. Keep provenance
-Store for each text span the source file, page number and, where available, bounding box and parse route
-and confidence. Citations then point to a page the user can open, and a later parser improvement can
-target exactly the pages that used the weak route.
+- **Store per text span:** source file, page number and, where available, bounding box, parse route and
+  confidence.
+- **Citations then point to a page the user can open,** and a later parser improvement can target exactly
+  the pages that used the weak route.
 
 ### 7. Evaluate on the client's documents
-Build a small labelled set from their corpus, stratified by route and template, and measure text accuracy
-against a human transcription, table cell accuracy and, end to end, whether retrieval finds the right
-page. Character error rate is the edit distance between output and reference divided by the reference
-length: `CER = (S + D + I) / N`, counting substituted, deleted and inserted characters against *N*
-reference characters (word error rate is the same over words). Because insertions count, CER can exceed
-100% on a page of hallucinated text. Report it per route and per template, not only averaged, and add a
-field-level check for the values the use case depends on (amounts, dates, policy numbers), since a 1%
-CER that lands on the digits of a limit is worse than 5% spread over boilerplate. Rerun the set when you
-change a parser or a threshold.
+- **Build a small labelled set** from their corpus, stratified by route and template, and measure text
+  accuracy against a human transcription, table cell accuracy and, end to end, whether retrieval finds the
+  right page.
+- **Character error rate** is the edit distance between output and reference divided by the reference
+  length: `CER = (S + D + I) / N`, counting substituted, deleted and inserted characters against *N*
+  reference characters (word error rate is the same over words). Because insertions count, CER can exceed
+  100% on a page of hallucinated text.
+- **Report per route and per template,** not only averaged.
+- **Add a field-level check** for values the use case depends on (amounts, dates, policy numbers), since a
+  1% CER that lands on the digits of a limit is worse than 5% spread over boilerplate.
+- **Rerun the set** when you change a parser or a threshold.
 
 ### Boundary and sensitivity
 Scanned documents frequently contain signatures, ID numbers and health or financial details. Where
 residency or contract requires it, OCR and any vision model must run inside the client's boundary, which
 constrains which services you can use; settle this before choosing tools.
 
-## Example
-Per-page triage with pdfplumber and Tesseract, routing each page to text extraction, OCR, or escalation.
-Thresholds are illustrative and should be tuned on a labelled sample.
+## Diagram
+Each page takes the cheapest route that passes its quality gate; low confidence escalates to stronger
+and costlier routes, and every route writes text with page provenance.
+
+```mermaid
+flowchart TD
+    F["Client file"] --> E{"Encrypted or corrupt?"}
+    E -->|"yes"| R["Report to client"]
+    E -->|"no"| P["Split into pages"]
+    P --> T{"Text layer passes quality check?"}
+    T -->|"yes"| X["Extract text directly"]
+    T -->|"no"| O["Render 300 DPI, OCR with languages"]
+    O --> C{"Confidence above tuned threshold?"}
+    C -->|"yes"| S["Recover structure"]
+    C -->|"no"| V["Layout or vision model"]
+    V -->|"still doubtful"| H["Human review"]
+    X --> S
+    V --> S
+    H --> S
+    S --> I[("Index with file, page, box, route")]
+```
+
+## Examples
+### Per-page triage with pdfplumber and Tesseract
+Per-page triage routing each page to text extraction, OCR, or escalation. Thresholds are illustrative
+and should be tuned on a labelled sample.
 
 ```python
 import pdfplumber, pytesseract
@@ -150,55 +177,115 @@ for p in parse_pdf("claim_88213.pdf"):
     print(p["page"], p["route"], p["conf"], len(p["text"]))
 ```
 
-On a typical scanned claim file this might print a text-layer cover page, several OCR pages in the
-80s, and one handwritten page in the 40s routed to escalation. Across the backfill, the share of pages
-per route becomes a cost forecast, and the escalation queue size tells you how much review capacity the
-client must provide. The crude usability check has its own failure mode to tune for: a born-digital rate
-table or invoice is mostly digits and punctuation, falls under the alphabetic threshold, and gets sent to
-OCR, which can only make its exact text worse, so count digits as valid characters for such templates.
-Two more simplifications to remove before production: joining OCR words with spaces discards the line
-and block numbers Tesseract returns, which is where reading order and table rows live, and the
-200-character floor sends short but genuine digital pages (a signature page) to OCR for no gain.
+- **Typical output.** On a scanned claim file this might print a text-layer cover page, several OCR pages
+  in the 80s, and one handwritten page in the 40s routed to escalation.
+- **Routes become a forecast.** Across the backfill, the share of pages per route becomes a cost forecast,
+  and the escalation queue size tells you how much review capacity the client must provide.
+- **The usability check has its own failure mode.** A born-digital rate table or invoice is mostly digits
+  and punctuation, falls under the alphabetic threshold, and gets sent to OCR, which can only make its
+  exact text worse, so count digits as valid characters for such templates.
+- **Two more simplifications to remove before production.** Joining OCR words with spaces discards the
+  line and block numbers Tesseract returns, which is where reading order and table rows live; and the
+  200-character floor sends short but genuine digital pages (a signature page) to OCR for no gain.
+
+### Measuring CER, and why field checks matter
+A runnable, dependency-free CER computation showing that a low overall rate can still corrupt the one
+value that matters.
+
+```python
+def edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+def cer(output: str, reference: str) -> float:
+    return edit_distance(output, reference) / len(reference)   # (S + D + I) / N
+
+ref = "Liability limit per occurrence: EUR 2,500,000. Deductible: EUR 5,000."
+ocr = "Liability limit per occurrence: EUR 2,800,000. Deductible: EUR 5,000."
+print(f"CER {cer(ocr, ref):.1%}")                 # 1.4%: one substituted character
+print("limit ok:", "2,500,000" in ocr)            # False: the one field that matters is wrong
+print(f"hallucinated page CER {cer(ref * 3, ref):.0%}")  # 200%: insertions push CER past 100%
+```
+
+### Worked scenario: route mix as a cost and staffing forecast
+Profiling a 1,500-document sample of an archive (illustrative numbers) gives a page-route mix to plan the
+backfill.
+
+| Route | Share of pages | Relative cost per page | Note |
+|---|---|---|---|
+| Text layer | 55% | lowest | includes digital cover pages of hybrid PDFs |
+| OCR, confident | 35% | low | scans at 300 DPI with language set |
+| Vision or layout model | 8% | high | tables, stamps, low-confidence scans |
+| Human review | 2% | highest | handwriting and limits or amounts below threshold |
+
+Running the vision route on everything would multiply cost on the 90% of pages that cheaper routes handle;
+the 2% review share tells the client how many reviewer hours to book.
+
+## Production patterns
+- **Per-page route tagging.** Use on every corpus. Store route, confidence and parser version on each
+  page and chunk. Monitor the share of pages per route per batch; a jump in OCR share often means a new
+  scanner or source.
+- **Empty-extraction coverage alert.** Use for every batch. Count files and pages that produced zero or
+  near-zero text, grouped by folder and year, and alert above a baseline. Monitor this as a coverage
+  metric next to ingestion counts.
+- **Threshold tuned on a client labelled set.** Use before the backfill. Label a stratified set of pages,
+  plot OCR confidence against CER, and set the escalation threshold where error becomes unacceptable.
+  Monitor CER per route and template on the set after each parser change.
+- **Field-level validation for critical values.** Use when answers cite amounts, dates or policy numbers.
+  Re-check extracted values against format rules or a second route, and send mismatches to review. Monitor
+  mismatch rate per template.
+- **In-boundary OCR where residency requires it.** Use when images may not leave the client network. Run a
+  self-hosted engine (for example Tesseract) next to the data and reserve hosted services for approved
+  classes. Monitor throughput against the backfill window, since self-hosted capacity is the bottleneck.
 
 ## Trade-offs
-- Per-page routing spends expensive OCR and vision calls only where they are needed, but adds triage
-  logic and thresholds to maintain; for a small corpus, running the strongest route on everything can be
-  simpler and still affordable.
-- Vision-language models handle messy layouts, tables and handwriting better than classic OCR in many
-  cases, but are slower, costlier, and can produce fluent transcriptions of text that is not there; use
-  them where classic OCR confidence is low and verify on a labelled sample.
-- Cloud document-AI services are accurate and low-effort, but send document images outside the client's
-  boundary; residency or contractual limits flip the choice to a self-hosted engine inside the boundary.
-- Human review of low-confidence pages gives the highest accuracy, but costs client staff time; reserve it
+- **Per-page routing vs simplicity.** It spends expensive OCR and vision calls only where needed, but adds
+  triage logic and thresholds to maintain; for a small corpus, running the strongest route on everything
+  can be simpler and still affordable.
+- **Vision-language models vs classic OCR.** They handle messy layouts, tables and handwriting better in
+  many cases, but are slower, costlier, and can produce fluent transcriptions of text that is not there;
+  use them where classic OCR confidence is low and verify on a labelled sample.
+- **Cloud document-AI vs the boundary.** Hosted services are accurate and low-effort, but send document
+  images outside the client's boundary; residency or contractual limits flip the choice to a self-hosted
+  engine inside the boundary.
+- **Human review vs client staff time.** It gives the highest accuracy but costs client time; reserve it
   for pages that matter to the use case, such as limits, amounts and signatures, rather than every page.
-- Template-specific extraction rules are very accurate for recurring forms, but break when the client
-  changes the form; detect template version and fall back to the generic route on a mismatch.
+- **Template rules vs form changes.** Template-specific extraction is very accurate for recurring forms,
+  but breaks when the client changes the form; detect template version and fall back to the generic route
+  on a mismatch.
 
 ## Pitfalls
-- Treating empty extraction as an empty document; the symptom is a coverage gap of scanned files that
-  never appear in retrieval, found only when a user asks about one.
-- Trusting any non-empty text layer; the symptom is garbled text from broken font encodings embedded and
+- **Treating empty extraction as an empty document.** Symptom: a coverage gap of scanned files that never
+  appear in retrieval, found only when a user asks about one.
+- **Trusting any non-empty text layer.** Symptom: garbled text from broken font encodings embedded and
   retrieved, producing confident answers grounded in nonsense.
-- Treating OCR confidence as an accuracy guarantee, with a threshold never checked against labelled
-  pages; the symptom is
-  a page that passed at high confidence with a misread amount, found by a user comparing the answer with
-  the original scan.
-- Deciding route per file instead of per page; the symptom is hybrid PDFs where the digital cover page is
+- **Treating OCR confidence as an accuracy guarantee,** with a threshold never checked against labelled
+  pages. Symptom: a page that passed at high confidence with a misread amount, found by a user comparing
+  the answer with the original scan.
+- **Deciding route per file instead of per page.** Symptom: hybrid PDFs where the digital cover page is
   indexed and the scanned body is lost.
-- OCR with the wrong language setting; the symptom is high error rates on accented and non-Latin
-  characters, which also breaks keyword search on names and terms.
-- Discarding page numbers and positions; the symptom is citations that point to a whole 200-page file,
-  so users cannot verify answers and stop trusting them.
-- Evaluating the parser on public sample PDFs; the symptom is a parser that looked accurate in testing
-  and fails on the client's faxed, stamped and skewed originals.
+- **OCR with the wrong language setting.** Symptom: high error rates on accented and non-Latin characters,
+  which also breaks keyword search on names and terms.
+- **Discarding page numbers and positions.** Symptom: citations that point to a whole 200-page file, so
+  users cannot verify answers and stop trusting them.
+- **Evaluating the parser on public sample PDFs.** Symptom: a parser that looked accurate in testing and
+  fails on the client's faxed, stamped and skewed originals.
 
 ## When to use
-Apply this triage whenever a client corpus is more than a handful of born-digital files, which in
-enterprise work is nearly always. Start by profiling a stratified sample to learn the route mix, then set
-thresholds on a small labelled set from the client's own documents. Measure share of pages per route,
-OCR confidence distribution, escalation queue size, parse failures, and end-to-end retrieval of the right
-page. Revisit routing when a new document source or template appears. In interviews, the strong answer
-names silent failures (empty and garbled text layers) and per-page routing rather than a favourite parser.
+- **Apply this triage** whenever a client corpus is more than a handful of born-digital files, which in
+  enterprise work is nearly always.
+- **Start by profiling** a stratified sample to learn the route mix, then set thresholds on a small
+  labelled set from the client's own documents.
+- **Measure:** share of pages per route, OCR confidence distribution, escalation queue size, parse
+  failures, and end-to-end retrieval of the right page.
+- **Revisit routing** when a new document source or template appears.
+- **Interviews:** the strong answer names silent failures (empty and garbled text layers) and per-page
+  routing rather than a favourite parser.
 
 ## Role lens
 - **Engineer:** Implements per-page triage, text-layer quality checks, OCR with confidence capture and an
@@ -218,6 +305,39 @@ garbled text layers by measuring alphabetic ratio and dictionary hit rate, inclu
 layers that older scanners wrote, which "have text" but may be too poor to retrieve on. The fix is per-page triage:
 route image-only and unusable pages to OCR with the right languages, escalate low-confidence pages, and
 reprocess from the stored raw files. Then add a coverage check per batch so empty extractions alert.
+
+## Interview questions
+### Why not just run one PDF text extractor over the whole client corpus?
+- **It fails silently.** Scans return empty strings and vanish from the index, broken font encodings
+  return garbage that gets embedded, and multi-column layouts and tables lose their structure.
+- **Triage instead:** detect each page's type and route it to direct extraction, OCR, or a stronger model,
+  with quality and confidence gates between them.
+
+### How do you set the OCR confidence threshold for escalation?
+- **Not from the engine's number alone,** because confidence is a ranking signal, not a calibrated
+  probability on your documents.
+- **Label a stratified set of the client's pages,** plot confidence against measured CER or field errors,
+  and pick the point where error becomes unacceptable for the use case.
+- **Re-tune** when a new source, scanner or template appears.
+
+### A user found an answer citing the wrong policy limit, though the cited page is correct. How do you debug it?
+- **Check the page's route and confidence in provenance;** a table read as a run of numbers, or a
+  confidently misread digit, both produce this.
+- **Compare the extracted table to the scan** to see whether cells lost their headers.
+- **Fix with structure recovery or escalation** for dense tables, plus a field-level check on amounts,
+  since a 1% CER on a limit's digits is worse than 5% on boilerplate.
+
+### When would you send every page through a vision-language model?
+- **For a small corpus,** where per-page triage adds more maintenance than it saves and the cost is still
+  affordable.
+- **Not at enterprise volume,** because it is slow and expensive, can degrade exact born-digital text, and
+  can fluently transcribe text that is not there.
+
+### The client forbids document images leaving their network. What changes?
+- **Hosted OCR and document-AI services are out** for those classes, because they send page images to a
+  third party.
+- **Run OCR and any vision model inside the boundary,** and plan backfill time around self-hosted
+  capacity; text-layer extraction and chunking can still run wherever approved.
 
 ## Quiz
 ### Q: Why should the parsing route be decided per page rather than per file?

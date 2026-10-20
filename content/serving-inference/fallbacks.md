@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 A fallback is a pre-decided alternative path when the primary fails or is too slow: another endpoint, a
-smaller model, a cached answer, or an honest "unavailable". The hard parts are deciding fast, staying
-compatible, and not crushing the backup.
+smaller model, a cached answer, or an honest "unavailable". Retrying a broken target only burns the
+latency budget; the hard parts are deciding fast, staying compatible, and not crushing the backup.
 
 ## Why it exists
 - **Hosted models fail in ways a retry cannot fix.** A provider returns 529 overloaded or 429 for minutes
@@ -36,10 +36,16 @@ compatible, and not crushing the backup.
   30-second timeout is a 90-second path to the same error.
 - **The alternative is an error.** Sometimes right (a medical triage assistant should fail closed), but
   for most product surfaces a slightly worse answer beats none.
-- **A naive `try/except` that calls model B fails in production.** B may lack your tool schema, JSON mode
-  or context length; your evals never ran on B; B's unprovisioned rate limit is exceeded in seconds (the
-  fallback storm); a timeout may fire after A ran a side effect; and streamed tokens cannot switch
-  mid-sentence. Fallbacks are a designed subsystem, not an exception handler.
+- **A naive `try/except` that calls model B fails in production,** for reasons you discover only when A
+  is already down (table below). Fallbacks are a designed subsystem, not an exception handler.
+
+| Naive assumption | What actually happens |
+|---|---|
+| B accepts the same request | B may not support your tool schema, JSON mode or context length |
+| B is good enough | your eval suite never ran on B, so fallback quality is unknown |
+| B has room | A fails for all traffic at once and B's unprovisioned rate limit is exceeded in seconds: the fallback storm |
+| A did nothing | A's timeout may fire after it executed a side effect inside an agent loop, so B duplicates it |
+| B can take over a stream | tokens already streamed from A cannot switch models mid-sentence |
 
 ## How it works
 ### The ladder
@@ -130,8 +136,9 @@ flowchart TD
     P -->|"400, auth, policy"| ERR["Raise, no failover"]
     P -->|"429, 5xx, 529, timeout"| B2
     B2 -->|"yes"| S["Same model, other region"]
+    B2 -->|"open"| SM["Smaller evaluated model"]
     S -->|"ok"| OK
-    S -->|"transient or open"| SM["Smaller evaluated model"]
+    S -->|"transient error"| SM
     SM -->|"ok"| OK
     SM -->|"fails or deadline spent"| DG["Degraded answer or honest error"]
 ```

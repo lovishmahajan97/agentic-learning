@@ -5,7 +5,7 @@ name: LLM-as-a-judge
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - evals/judge-calibration-and-bias
   - evals/rubrics
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-LLM-as-a-judge has a model grade open-ended outputs against a rubric, often with a reference, in place
-of a human. It scales grading but is only as good as its measured agreement with humans, because
-judges are biased.
+LLM-as-a-judge has a model grade open outputs against a rubric, often with a reference. It scales
+grading, but is only as good as its measured agreement with humans: judges carry position, verbosity
+and self-preference biases and grade confidently, right or wrong.
 
 ## Why it exists
 - **Open-ended outputs have no exact match.** A summarizer, a support reply or an agent's final report
@@ -118,13 +118,14 @@ true ≈ (observed + r_fail − 1) / (r_pass + r_fail − 1)
 
 ## Diagram
 The path a criterion takes to become a trusted grader: deterministic checks first, then a judge that
-must pass calibration before it may gate.
+must pass calibration before it may gate. The judge prompt grades one criterion, sees the reference or
+retrieved context, and writes its reason before a JSON verdict.
 
 ```mermaid
 flowchart TD
     C["Criterion to grade"] --> D{"Checkable by test, schema or regex?"}
     D -->|"yes"| X["Deterministic grader, no judge"]
-    D -->|"no"| P["Judge prompt: one criterion, reference or context, reason then JSON verdict"]
+    D -->|"no"| P["Single-criterion judge prompt"]
     P --> H["Run on human-labeled calibration set"]
     H --> K["Agreement, kappa, recall on failures"]
     K --> T{"Failure recall above the gate threshold?"}

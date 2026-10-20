@@ -5,7 +5,7 @@ name: Integration tests with real dependencies
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/testclient-plus-pytest-asyncio
   - python-for-ai/integration-and-end-to-end-testing
@@ -96,17 +96,18 @@ Every test must start from a known state. Options, in order of speed:
 - **A small, separately scheduled contract suite** hits the real provider to catch API and schema drift.
 
 ## Diagram
-Expensive work happens once per session (containers, readiness, migrations); each test only opens and
-rolls back a transaction, and the LLM stays outside the loop as recordings.
+Expensive work happens once per session (pgvector Postgres and Redis containers at production tags,
+readiness, migrations); each test only points the app at them, opens and rolls back a transaction, and the
+LLM stays outside the loop as recordings.
 
 ```mermaid
 flowchart TD
-    S["pytest session starts"] --> C["Start Postgres pgvector and Redis containers, same tags as prod"]
+    S["pytest session starts"] --> C["Start Postgres and Redis at prod tags"]
     C --> R{"Readiness check passed?"}
     R -->|"not yet"| R
     R -->|"ready"| M["alembic upgrade head"]
     M --> B["Per test: connect and begin outer transaction"]
-    B --> O["Override get_session and settings to point at containers"]
+    B --> O["Override get_session and settings"]
     O --> T["Drive the app with TestClient or ASGITransport"]
     T --> RB["Rollback outer transaction and FLUSHDB"]
     RB -->|"next test"| B
@@ -213,7 +214,11 @@ def test_lock_is_exclusive(r):
 | One session, commits on it | Yes (savepoints) | Yes | Yes |
 | Commits on separate connections | No | Yes | Yes |
 | A worker reads rows the endpoint wrote | No | Yes | Yes |
-| Parallel `pytest-xdist` workers on one server | Per-worker DB needed | Per-worker DB needed | Yes |
+| Parallel `pytest-xdist` workers on one database | Mostly, but same-key inserts can block across workers | No: a truncate wipes other workers' data | Yes |
+
+- **Why rollback mostly survives parallelism:** each test's rows stay uncommitted and invisible to other
+  workers, but two workers inserting the same unique key wait on each other's locks, so a per-worker
+  database is the safe default once you parallelise.
 
 ## Production patterns
 - **Compose healthchecks gate the test job.** When CI starts dependencies with Compose, give Postgres a
@@ -246,10 +251,12 @@ def test_lock_is_exclusive(r):
 ## Pitfalls
 - **Testing against SQLite while production runs Postgres.** The suite passes and production fails on
   JSONB operators, row locking (`SELECT ... FOR UPDATE`), Postgres-specific `ON CONFLICT` behaviour or
-  pgvector, which SQLite either lacks or implements differently.
+  pgvector, which SQLite either lacks or implements differently. Fix: a Postgres container at the
+  production image tag.
 - **Creating tables with `create_all()` instead of running migrations.** A missing or broken migration
   ships, and the symptom is the first deploy failing on `alembic upgrade`.
-- **No per-test isolation.** Tests pass alone and fail together, or depend on execution order.
+- **No per-test isolation.** Tests pass alone and fail together, or depend on execution order. Fix: pick
+  rollback, truncation or a per-test database from the table above.
 - **A different image or major version from production,** such as the latest Postgres image. Symptom: a
   bug that reproduces only in production or only in CI.
 - **Calling the real LLM in every integration test.** The suite becomes slow, flaky on rate limits and

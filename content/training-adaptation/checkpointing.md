@@ -5,7 +5,7 @@ name: Checkpointing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/gradient-checkpointing
   - training-adaptation/distributed-training
@@ -25,7 +25,7 @@ sources:
 ## TL;DR
 Checkpointing saves the full training state (weights, optimizer, scheduler, RNG, data position) durably
 so runs can resume, roll back and pick the best step. A 7B checkpoint is ~100 GB, so frequency, format
-and retention are engineering decisions. Unrelated to gradient checkpointing.
+and retention are engineering decisions. Not gradient checkpointing, which recomputes activations.
 
 ## Why it exists
 - **Long runs on failing hardware.** A single-GPU fine-tune runs for hours on a spot instance that can be
@@ -181,6 +181,11 @@ def load_checkpoint(path, model, opt, sched, scaler):
 
 - **The part most hand-written loops forget:** the caller restores data order by reseeding the sampler
   with the saved epoch seed and skipping the consumed batches.
+- **What the sketch leaves out: the flush.** `os.replace` makes the rename atomic but not durable against
+  power loss. On a local or network disk, save through an open file and call `f.flush()` and
+  `os.fsync(f.fileno())` before the rename.
+- **Retention here is keep-last-*k* only.** A best-on-validation checkpoint must be copied to a separate
+  name, or this loop will eventually delete it.
 
 ### Choosing the save interval
 A runnable Young–Daly calculator. The third scenario is a spot-GPU fine-tune with a three-minute
@@ -244,18 +249,20 @@ for name, (c, m) in scenarios.items():
 
 ## Pitfalls
 - **Saving only weights and resuming with a fresh optimizer.** Symptom: a loss spike immediately after
-  resume and a resumed run that never rejoins the original curve.
+  resume and a resumed run that never rejoins the original curve. Fix: save optimizer, scheduler and
+  scaler state in every checkpoint.
 - **Not saving the data-loader position.** Symptom: examples seen twice or never in the resumed epoch, and
-  a loss curve after resume that differs from an uninterrupted run.
+  a loss curve after resume that differs from an uninterrupted run. Fix: save epoch, batches consumed and
+  sampler seed.
 - **Writing checkpoints in place without a temporary file and rename.** Symptom: a truncated latest
-  checkpoint after a crash and no resumable state at all.
+  checkpoint after a crash and no resumable state at all. Fix: temp path, flush, rename (or manifest last).
 - **Letting the checkpoint directory fill the disk.** Symptom: the run dies during a save, often taking
-  the latest good checkpoint with it.
+  the latest good checkpoint with it. Fix: a retention policy and a free-disk alert.
 - **A retention rule that deletes the best checkpoint because it is old.** Symptom: a final model worse
   than one that existed an hour earlier. The Hugging Face `Trainer` retains the best checkpoint when
   `load_best_model_at_end` is set; hand-written loops must do the same explicitly.
 - **Saving adapters without the base model's exact version.** Symptom: an adapter that loads without error
-  onto a different base and produces garbage.
+  onto a different base and produces garbage. Fix: store the base model's name and hash with the adapter.
 - **Loading pickled checkpoints from untrusted sources.** Symptom: arbitrary code running on load. Fix:
   `safetensors`, and `weights_only=True`.
 

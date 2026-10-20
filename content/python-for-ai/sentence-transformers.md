@@ -112,16 +112,17 @@ loss_i = -log( exp(s·cos(aᵢ, pᵢ)) / Σⱼ exp(s·cos(aᵢ, pⱼ)) )      # 
 - **That limit, not the model's theoretical context, decides your chunk size.**
 
 ## Diagram
-Retrieve-then-rerank: documents are embedded once offline, each query costs one bi-encoder pass plus a
-nearest-neighbour lookup, and only the k candidates pay for a cross-encoder pass.
+Retrieve-then-rerank: documents are embedded once offline (transformer, mask-aware mean pooling,
+normalize), each query costs one bi-encoder pass plus a nearest-neighbour lookup, and only the k
+candidates pay for a cross-encoder pass over the (query, document) pair.
 
 ```mermaid
-flowchart LR
-    D["Documents, chunked under max_seq_length"] -->|"encode with passage prompt, offline"| BI["Bi-encoder: transformer, mask-aware pooling, normalize"]
-    BI --> IDX[("Vector index, model version stored")]
-    Q["User query"] -->|"encode with query prompt"| QE["Query vector"]
+flowchart TD
+    D["Chunks under max_seq_length"] -->|"passage prompt, offline"| BI["Bi-encoder: pool, normalize"]
+    BI --> IDX[("Vector index with model version")]
+    Q["User query"] -->|"query prompt, one pass"| QE["Query vector"]
     QE -->|"dot product equals cosine"| IDX
-    IDX -->|"top 50 to 200 candidates"| CE["CrossEncoder scores each query, doc pair"]
+    IDX -->|"top 50 to 200 candidates"| CE["CrossEncoder scores each pair"]
     CE -->|"keep fixed top-k such as 5"| OUT["Passages sent to the LLM"]
 ```
 
@@ -172,7 +173,7 @@ from sentence_transformers import (SentenceTransformer, SentenceTransformerTrain
 from sentence_transformers.training_args import BatchSamplers
 
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-train = Dataset.from_dict({
+train = Dataset.from_dict({                        # toy data: real runs use thousands of pairs
     "anchor":   ["how long do refunds take", "reset my password"],
     "positive": ["Refunds are issued within 14 days of a returned item being received.",
                  "To reset your password, use the link on the sign-in page."],

@@ -215,6 +215,7 @@ for hops in (1, 3, 5, 10):
     print(f"{hops:>2} hops: {a:.3%} available, ~{h:.1f} h/month down, "
           f"fan-out slow {fanout_slow(hops):.1%}")
 #  1 hops: 99.900% available, ~0.7 h/month down, fan-out slow 1.0%
+#  3 hops: 99.700% available, ~2.2 h/month down, fan-out slow 3.0%
 #  5 hops: 99.501% available, ~3.6 h/month down, fan-out slow 4.9%
 # 10 hops: 99.004% available, ~7.2 h/month down, fan-out slow 9.6%
 ```
@@ -271,9 +272,10 @@ data store) for any further split.
   another team's deploy with no compiler to warn anyone. Fix: one owner per table, access via API or events.
 - **"Modular" without CI enforcement.** Symptom: six months later the dependency graph is a single strongly
   connected component. Fix: boundary lint as a required check.
-- **Splitting because components *feel* different.** Then most requests fan out across three services.
-  Symptom: p99 latency dominated by hop count and retries, and incidents that need three on-call rotations
-  to debug.
+- **Splitting early because components *feel* different.** Then most requests fan out across three
+  services. Symptom: p99 latency dominated by hop count and retries, and incidents that need three on-call
+  rotations to debug. Fix: require a named, measured independence (hardware, failure domain, team) before
+  any split.
 - **Model server as "just another module" of the API process.** Symptom: a GPU box running web handlers at
   5% GPU utilisation, or an API deploy that evicts a loaded model. Fix: separate serving tier.
 

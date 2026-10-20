@@ -5,7 +5,7 @@ name: TTS (text-to-speech)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - multimodal/speech-to-text
   - serving-inference/streaming
@@ -21,104 +21,146 @@ sources:
 ---
 
 ## TL;DR
-Text-to-speech turns a string into a waveform. Modern systems normalise the text, predict a compact
-acoustic representation (a mel-spectrogram or neural-codec tokens) with prosody, and then a vocoder or
-codec decoder turns that into audio. It exists because the output side of every voice product, agents,
-accessibility, IVR, narration, needs speech that is intelligible, natural and generated fast enough to
-feel conversational, and concatenating recorded fragments cannot do that for arbitrary text.
+Text-to-speech turns a string into a waveform: normalise the text, predict a compact acoustic
+representation (mel-spectrogram or codec tokens) with prosody, then decode it to audio, fast enough that
+a voice agent feels conversational.
 
 ## Why it exists
-A voice agent that can hear but not speak is a chatbot. The first generations of synthesis either
-glued recorded snippets together (concatenative) or simulated the vocal tract with rules (formant
-synthesis). Concatenation sounds human on the exact phrases that were recorded and seams badly between
-them; rules are intelligible but unmistakably robotic. Neither can voice an LLM's unbounded, freshly
-generated sentences with natural rhythm and emphasis.
-
-The problem has three hard parts that a naive "look up each word's sound" approach ignores. First,
-the text is ambiguous before it is pronounced: "read" has two sounds, "1/2" might be a date or a
-fraction, "St." might be street or saint. Second, prosody (timing, pitch, loudness) carries meaning,
-and it depends on the whole sentence, not the word. Third, producing raw audio is expensive: 24,000
-samples per second, each depending on the ones before. Early neural vocoders that generated sample by
-sample sounded excellent and were far too slow for anything interactive.
-
-Neural TTS exists because learned models solve the first two problems from data and the third by
-splitting the job into a cheap sequence model over a compressed representation plus a fast decoder.
-For an AI engineer the stakes are concrete: time-to-first-audio and pronunciation errors are what make a
-voice agent feel broken, regardless of how good the LLM behind it is.
+- **A voice agent that cannot speak is a chatbot.** Agents, accessibility, IVR and narration all need
+  speech that is intelligible, natural and fast.
+- **Old methods could not voice arbitrary text.** Concatenative synthesis glued recorded snippets: human
+  on recorded phrases, seams badly between them. Formant synthesis simulated the vocal tract with rules:
+  intelligible but unmistakably robotic. Neither can voice an LLM's unbounded fresh sentences.
+- **Hard part one: text is ambiguous before it is spoken.** "read" has two sounds, "1/2" might be a date
+  or a fraction, "St." might be street or saint.
+- **Hard part two: prosody carries meaning.** Timing, pitch and loudness depend on the whole sentence,
+  not the word.
+- **Hard part three: raw audio is expensive.** 24,000 samples per second, each depending on the ones
+  before; early sample-by-sample neural vocoders sounded excellent and were far too slow for interactive
+  use. Neural TTS learns the first two from data and splits the third into a cheap sequence model plus a
+  fast decoder. Time-to-first-audio and pronunciation errors make an agent feel broken, however good the
+  LLM.
 
 ## How it works
 ### Stage 1: text normalisation and front end
-The raw text is rewritten into what should be *said*: numbers expanded ("$1,250.50" to "one thousand two
-hundred fifty dollars and fifty cents", "2024" as a year or a quantity depending on context),
-abbreviations resolved, symbols and markdown removed, sentence boundaries found. A grapheme-to-phoneme
-step then converts words to phonemes using a lexicon plus a learned model for unseen words. This stage
-is rule-heavy and language-specific, and it is where most "the voice said something wrong" bugs live;
-neural models downstream faithfully pronounce whatever the front end hands them.
+1. **Rewrite into what should be *said*.** Expand numbers ("$1,250.50" to "one thousand two hundred fifty
+   dollars and fifty cents"; "2024" as a year or a quantity depending on context), resolve abbreviations,
+   remove symbols and markdown, find sentence boundaries.
+2. **Grapheme-to-phoneme.** Convert words to phonemes with a lexicon plus a learned model for unseen
+   words.
+- **Where the bugs live.** This stage is rule-heavy and language-specific, and it is where most "the
+  voice said something wrong" bugs live, *because* neural models downstream faithfully pronounce whatever
+  the front end hands them.
 
 ### Stage 2: acoustic model
-The phoneme (or character) sequence is mapped to an intermediate acoustic representation, classically
-a mel-spectrogram: a time-frequency picture at roughly 80 bands per frame and on the order of a hundred
-frames per second of speech (a 10–12.5 ms hop). At 24 kHz that is a couple of hundred times fewer
-*time steps* than the waveform; each step is a vector of ~80 values, so the raw value count is only a few
-times smaller. The saving that matters is sequence length, because that is what an attention or
-autoregressive model pays for, and the smooth spectral envelope is far easier to predict than
-individual samples with their phase. Two designs matter. Autoregressive models (Tacotron 2) generate frames one at a time
-with attention over the input text; natural, but slow and prone to skipping or repeating words when
-attention wanders. Non-autoregressive models (FastSpeech 2) first predict each phoneme's *duration*,
-expand the sequence accordingly, predict pitch and energy per phoneme, and then generate all frames in
-parallel. They exist because explicit duration makes synthesis fast, controllable and immune to the
-skipping failure, at the cost of a slightly flatter delivery unless the prosody predictors are good.
+The phoneme (or character) sequence is mapped to an intermediate representation, classically a
+mel-spectrogram:
+
+| Property | Value |
+|---|---|
+| Bands per frame | roughly 80 |
+| Frame rate | on the order of a hundred frames per second (a 10–12.5 ms hop) |
+| Time steps vs 24 kHz waveform | a couple of hundred times fewer |
+| Raw value count | only a few times smaller (each step is a vector of ~80 values) |
+
+- **Why the saving matters.** Sequence length is what an attention or autoregressive model pays for, and
+  the smooth spectral envelope is far easier to predict than individual samples with their phase.
+
+| Design | Example | How | Gain | Cost |
+|---|---|---|---|---|
+| **Autoregressive** | Tacotron 2 | frames one at a time, attention over the input text | natural | slow; skips or repeats words when attention wanders |
+| **Non-autoregressive** | FastSpeech 2 | predict each phoneme's *duration*, expand, predict pitch and energy per phoneme, generate all frames in parallel | fast, controllable, immune to skipping | slightly flatter delivery unless the prosody predictors are good |
 
 ### Stage 3: vocoder
-The spectrogram is an abstraction without phase; a vocoder reconstructs the waveform. WaveNet did it
-autoregressively per sample with superb quality and impractical latency. GAN vocoders (HiFi-GAN) upsample
-the spectrogram with convolutions in one pass, trained with a discriminator that judges realism; they run
-far faster than real time on a GPU and are the default in production pipelines.
+- **Why it exists.** The spectrogram is an abstraction without phase; a vocoder reconstructs the
+  waveform.
+- **WaveNet** did it autoregressively per sample: superb quality, impractical latency.
+- **GAN vocoders (HiFi-GAN)** upsample the spectrogram with convolutions in one pass, trained against a
+  discriminator that judges realism. They run far faster than real time on a GPU and are the default in
+  production pipelines.
 
 ### End-to-end and codec-language-model designs
-VITS trains acoustic model and vocoder jointly as one variational model with normalising flows, removing
-the spectrogram seam and the quality loss from mismatched stages. The more recent family (VALL-E and its
-descendants, and most "voice cloning" products) treats TTS as language modelling: a neural audio codec
-(EnCodec-style) compresses audio into discrete tokens at a low frame rate, and a decoder-only transformer
-predicts audio tokens conditioned on text tokens plus a few seconds of reference audio. Because the
-reference is just a prompt, the model clones an unseen voice zero-shot, with the same hallucination and
-repetition risks as any autoregressive LM. The codec decoder then turns tokens back into waveform.
+- **VITS** trains acoustic model and vocoder jointly as one variational model with normalising flows,
+  removing the spectrogram seam and the quality loss from mismatched stages.
+- **Codec language models** (VALL-E and descendants, most "voice cloning" products) treat TTS as
+  language modelling. A neural audio codec (EnCodec-style) compresses audio into discrete tokens at a low
+  frame rate; a decoder-only transformer predicts audio tokens from text tokens plus a few seconds of
+  reference audio; the codec decoder turns tokens back into waveform.
+- **Zero-shot cloning, with LM risks.** The reference is just a prompt, so an unseen voice is cloned
+  zero-shot, with the same hallucination and repetition risks as any autoregressive LM.
 
-The token arithmetic explains the architectures. A codec such as EnCodec at 24 kHz emits 75 frames per
-second, and residual vector quantisation stacks several codebooks per frame, each refining the residual
-error of the previous one (8 codebooks of 1,024 entries give 75 × 8 × 10 bits = 6 kbps). Ten seconds of
-speech is then 750 frames × 8 = 6,000 tokens, too many to generate one by one at conversational speed.
-VALL-E therefore predicts only the first, coarsest codebook autoregressively (it carries most of the
-content and prosody) and fills in the other seven non-autoregressively in parallel; later models use
-interleaving or "delay" patterns across codebooks for the same reason.
+The token arithmetic explains the architectures:
+- **Codec rate.** EnCodec at 24 kHz emits 75 frames per second. Residual vector quantisation stacks
+  several codebooks per frame, each refining the residual error of the previous one: 8 codebooks of
+  1,024 entries give 75 × 8 × 10 bits = 6 kbps.
+- **Too many tokens.** Ten seconds of speech is 750 frames × 8 = 6,000 tokens, too many to generate one
+  by one at conversational speed.
+- **VALL-E's split.** It predicts only the first, coarsest codebook autoregressively (it carries most of
+  the content and prosody) and fills in the other seven non-autoregressively in parallel; later models
+  use interleaving or "delay" patterns across codebooks for the same reason.
 
 ### Streaming and latency
-A conversational agent cannot wait for the whole reply to be synthesised. The pipeline is streamed at
-two levels: the LLM's text is split at sentence or clause boundaries as it arrives, and each piece is
-synthesised and played while the next is produced; within a piece, chunked vocoding emits audio in
-small frames. The metrics are time-to-first-audio (TTFA) and real-time factor (RTF = synthesis time /
-audio duration; below 1 means faster than real time, and the margin is your concurrency headroom).
-Barge-in, stopping playback and generation when the user starts talking, is a product requirement that
-the architecture must support, which means cancellable synthesis.
+A conversational agent cannot wait for the whole reply to be synthesised, so streaming happens at two
+levels:
+1. **Across pieces.** The LLM's text is split at sentence or clause boundaries as it arrives; each piece
+   is synthesised and played while the next is produced.
+2. **Within a piece.** Chunked vocoding emits audio in small frames.
+- **Metrics.** Time-to-first-audio (TTFA) and real-time factor (RTF = synthesis time / audio duration;
+  below 1 means faster than real time, and the margin is your concurrency headroom).
+- **Barge-in is a requirement.** Stopping playback and generation when the user starts talking means the
+  architecture needs cancellable synthesis.
 
-A worked budget shows why sentence streaming is non-negotiable (illustrative numbers): end-of-speech
-detection 300 ms, final ASR 200 ms, LLM first token 400 ms, first clause of ~12 tokens at 50 tokens/s
-240 ms, TTS first chunk 150 ms, network and jitter buffer 100 ms gives roughly 1.4 s to first audio.
-If TTS instead waits for a 150-token reply, the LLM alone adds about 3 s before synthesis starts. The
-lever with the most leverage is usually how early the splitter releases the first chunk (a clause
-boundary rather than a full sentence), not the vocoder.
+A worked budget (illustrative numbers) shows why sentence streaming is non-negotiable:
+
+| Step | ms |
+|---|---|
+| End-of-speech detection | 300 |
+| Final ASR | 200 |
+| LLM first token | 400 |
+| First clause of ~12 tokens at 50 tokens/s | 240 |
+| TTS first chunk | 150 |
+| Network and jitter buffer | 100 |
+| **Time to first audio** | **roughly 1.4 s** |
+
+- **Without streaming,** waiting for a 150-token reply makes the LLM alone add about 3 s before synthesis
+  starts.
+- **The biggest lever** is usually how early the splitter releases the first chunk (a clause boundary
+  rather than a full sentence), not the vocoder.
 
 ### Quality and control
-Naturalness is measured by mean opinion score (MOS, listeners rate 1 to 5), intelligibility by running
-ASR on the output and computing WER against the input text, and cloning fidelity by cosine similarity
-in a speaker-embedding space. Control comes from SSML-style markup (breaks, emphasis, say-as for
-digits and dates, explicit phonemes) or from style prompts in newer models.
+| What | How it is measured |
+|---|---|
+| Naturalness | mean opinion score (MOS): listeners rate 1 to 5 |
+| Intelligibility | run ASR on the output, compute WER against the input text |
+| Cloning fidelity | cosine similarity in a speaker-embedding space |
 
-## Example
+- **Control** comes from SSML-style markup (breaks, emphasis, say-as for digits and dates, explicit
+  phonemes) or from style prompts in newer models.
+
+## Diagram
+Text flows down through normalisation, an acoustic model and a decoder; in a voice agent this runs per
+clause so the first chunk plays while later ones are still being made, and barge-in cancels it.
+
+```mermaid
+flowchart TD
+    L["LLM token stream"] --> SP["Splitter: clause or sentence"]
+    SP --> N["Normalise: numbers, markdown, lexicon"]
+    N --> G["Grapheme to phoneme"]
+    G --> A["Acoustic model: mel or codec tokens"]
+    A --> V["Vocoder or codec decoder"]
+    V --> P["Play chunk, measure TTFA"]
+    P -->|"next clause"| SP
+    U["User starts talking"] -.->|"barge-in: cancel"| V
+    U -.->|"cancel"| L
+```
+
+## Examples
+### Normalise, split and stream any synthesiser
 The engineering around TTS matters as much as the model: normalise text an LLM produced (markdown,
-currency, acronyms), chunk at sentence boundaries, and stream chunks through any synthesiser so
-time-to-first-audio is bounded by the first sentence, not the whole reply. `synthesize` is any function
-returning PCM bytes for a string; the timing code is what you would ship as metrics.
+currency, acronyms), chunk at sentence boundaries, and stream chunks through any synthesiser.
+- Time-to-first-audio is then bounded by the first sentence, not the whole reply.
+- `synthesize` is any function returning PCM bytes for a string; the timing code is what you would ship
+  as metrics.
 
 ```python
 import re, time
@@ -152,38 +194,80 @@ for chunk in stream_speech(reply, synthesize=lambda s: b"\x00" * 48_000):   # st
     pass   # in production: write chunk to the WebSocket / audio device
 ```
 
+### Latency budget and codec token calculator
+Pure Python, runnable as is. Change one stage at a time to see which lever moves time-to-first-audio,
+and why codec models cannot generate every token autoregressively.
+
+```python
+def ttfa_ms(eos=300, asr=200, llm_first=400, first_chunk_tokens=12, tok_per_s=50,
+            tts_first=150, network=100):
+    gen = first_chunk_tokens / tok_per_s * 1000      # time to generate the first chunk's text
+    return eos + asr + llm_first + gen + tts_first + network
+
+def codec_tokens(seconds, frames_per_s=75, codebooks=8):
+    return int(seconds * frames_per_s * codebooks)
+
+print(ttfa_ms())                              # 1390.0: clause streaming, ~1.4 s
+print(ttfa_ms(first_chunk_tokens=150))        # 4150.0: wait for the whole 150-token reply
+print(ttfa_ms(tts_first=75))                  # 1315.0: halving TTS first chunk saves only 75 ms
+print(codec_tokens(10), 75 * 8 * 10 / 1000)   # 6000 tokens, 6.0 kbps with 1,024-entry codebooks
+```
+
+## Production patterns
+- **Clause-level splitter on the LLM stream.** When: any conversational agent. How: release the first
+  chunk at the first clause or sentence boundary past a minimum length, then sentence by sentence.
+  Monitor: TTFA p50 and p95 from end of user speech, not from request start.
+- **Cancellable synthesis for barge-in.** When: full-duplex voice. How: run synthesis and playback as
+  cancellable tasks (for example an `asyncio` task you `cancel()` on a VAD speech-start event) and stop
+  LLM generation too. Monitor: overlap seconds after user speech starts.
+- **Pronunciation lexicon with ASR round-trip tests.** When: customer, product and people names. How:
+  keep a per-tenant lexicon or SSML phoneme overrides, synthesise every entry in CI and run ASR to compute
+  WER against the text. Monitor: mispronunciation rate on the entity list.
+- **Match the transport format at the edge.** When: telephony. How: resample and encode once to what the
+  line expects, for example 8 kHz μ-law (with ffmpeg, `-ar 8000 -acodec pcm_mulaw`). Monitor: sample-rate
+  mismatches and audio duration versus expected.
+- **Cache fixed phrases.** When: greetings, disclaimers and menu prompts repeat. How: key cached audio by
+  normalised text, voice and model version; synthesise only dynamic parts. Monitor: cache hit rate and
+  synthesis cost per call.
+
 ## Trade-offs
-- Non-autoregressive acoustic models give fast, stable, controllable synthesis, while autoregressive and
-  codec-LM models give richer prosody and zero-shot cloning at higher latency and hallucination risk.
-- Sentence-level streaming minimises time-to-first-audio but loses cross-sentence prosody; it flips when
-  the content is narration rather than dialogue, where whole-paragraph synthesis sounds better.
-- Managed TTS APIs deliver quality and voices without GPUs, but per-character pricing, data residency
-  and vendor voice licensing push high-volume or regulated deployments toward self-hosting.
-- Voice cloning from seconds of audio is a product feature and a liability; consent, verification and
-  watermarking cost engineering effort that a fixed stock voice does not.
+- **Non-autoregressive speed vs codec-LM richness.** Non-autoregressive acoustic models give fast,
+  stable, controllable synthesis; autoregressive and codec-LM models give richer prosody and zero-shot
+  cloning at higher latency and hallucination risk.
+- **Sentence streaming vs cross-sentence prosody.** Streaming minimises time-to-first-audio but loses
+  prosody across sentences; it flips for narration rather than dialogue, where whole-paragraph synthesis
+  sounds better.
+- **Managed API vs self-hosting.** Managed TTS delivers quality and voices without GPUs, but
+  per-character pricing, data residency and vendor voice licensing push high-volume or regulated
+  deployments toward self-hosting.
+- **Voice cloning: feature vs liability.** Cloning from seconds of audio needs consent, verification and
+  watermarking, engineering effort a fixed stock voice does not.
 
 ## Pitfalls
-- Sending raw LLM output to the synthesiser; the symptom is the voice reading "asterisk asterisk" or
-  spelling out URLs and JSON keys that should never have reached speech.
-- Skipping number and date normalisation; the symptom is "two thousand twenty-four" for a year, phone
-  numbers read as large integers, and "1/2" spoken as a date.
-- Synthesising the whole reply before playback; the symptom is a multi-second pause before every answer
+- **Sending raw LLM output to the synthesiser.** Symptom: the voice reads "asterisk asterisk" or spells
+  out URLs and JSON keys that should never have reached speech.
+- **Skipping number and date normalisation.** Symptom: "two thousand twenty-four" for a year, phone
+  numbers read as large integers, "1/2" spoken as a date.
+- **Synthesising the whole reply before playback.** Symptom: a multi-second pause before every answer
   that users read as the agent being broken, even though total synthesis time is fine.
-- Ignoring sample-rate and codec conversion; the symptom is chipmunk or slowed audio on telephony paths
+- **Ignoring sample-rate and codec conversion.** Symptom: chipmunk or slowed audio on telephony paths
   that expect 8 kHz μ-law when the model emitted 24 kHz PCM.
-- No cancellation path for barge-in; the symptom is the agent talking over the user for several seconds
-  after being interrupted.
-- Evaluating only by listening to a few demos; the symptom is mispronounced customer names and product
+- **No cancellation path for barge-in.** Symptom: the agent talks over the user for several seconds after
+  being interrupted.
+- **Evaluating only by listening to a few demos.** Symptom: mispronounced customer names and product
   terms in production that an ASR round-trip WER test on your own vocabulary would have caught.
 
 ## When to use
-Reach for neural TTS whenever text must become speech for dynamic content: voice agents, IVR replacing
-recorded menus, accessibility read-aloud, generated narration and alerts. Use recorded audio when the
-set of phrases is small and fixed and legal sign-off on exact wording matters. Choose a fast
-non-autoregressive or streaming-capable model for interactive use and a higher-quality, slower model for
-offline narration. Measure time-to-first-audio, RTF at target concurrency, ASR round-trip WER on your
-own text, and mispronunciation rate on your entity list. Interviews tend to probe the three-stage
-pipeline, why vocoders exist, and how you would hit a conversational latency budget.
+- **Use neural TTS** whenever text must become speech for dynamic content: voice agents, IVR replacing
+  recorded menus, accessibility read-aloud, generated narration and alerts.
+- **Use recorded audio** when the phrase set is small and fixed and legal sign-off on exact wording
+  matters.
+- **Pick the model by surface:** a fast non-autoregressive or streaming-capable model for interactive
+  use, a higher-quality, slower model for offline narration.
+- **Measure:** time-to-first-audio, RTF at target concurrency, ASR round-trip WER on your own text, and
+  mispronunciation rate on your entity list.
+- **Interviews:** expect the three-stage pipeline, why vocoders exist, and how you would hit a
+  conversational latency budget.
 
 ## Role lens
 - **Engineer:** Owns text normalisation and the lexicon, streams at sentence boundaries, implements
@@ -205,6 +289,38 @@ sentence while the LLM continues, and audio plays while the next sentence render
 then approximates first-sentence LLM latency plus one short synthesis. Add cancellation so barge-in
 stops both generation and playback, normalise each chunk before synthesis, and instrument TTFA as the
 metric that matches what users feel.
+
+## Interview questions
+### Describe a modern TTS pipeline and why it has a vocoder.
+- **Three stages.** Text normalisation and grapheme-to-phoneme, an acoustic model that predicts a
+  mel-spectrogram (or codec tokens), and a vocoder or codec decoder that produces the waveform.
+- **Why the split.** A spectrogram at about 100 frames per second is a far shorter sequence than 24,000
+  samples per second, so the expensive model runs on the short one and a one-pass vocoder like HiFi-GAN
+  fills in the waveform.
+
+### Your voice agent mispronounces customer names. How do you fix and prevent it?
+- **Fix at the front end.** Add a lexicon or SSML phoneme overrides for those names, because the neural
+  model pronounces whatever the front end hands it.
+- **Prevent with a test.** Synthesise every lexicon entry in CI, run ASR on the audio and fail on WER
+  regressions against the text.
+
+### How would you get time-to-first-audio under 1.5 seconds?
+- **Budget each stage.** End-of-speech detection, final ASR, LLM first token, first clause generation,
+  TTS first chunk and network add up to about 1.4 s in an illustrative budget.
+- **Stream by clause.** Releasing the first clause instead of the whole reply saves seconds; halving the
+  TTS first chunk saves tens of milliseconds, so fix sequencing first.
+
+### When would you pick FastSpeech-style TTS over a codec language model?
+- **Interactive and reliability-critical surfaces.** Explicit durations make every phoneme render exactly
+  once, so no skipped or repeated words, and parallel generation keeps latency low.
+- **Pick the codec LM** for zero-shot voice cloning and richer prosody, accepting LM-style hallucination
+  and repetition risk and higher latency.
+
+### Why can't a codec LM generate every audio token autoregressively?
+- **Token count.** At 75 frames per second with 8 codebooks, ten seconds of speech is 6,000 tokens, too
+  slow to emit one by one at conversational speed.
+- **The workaround.** Predict the coarse first codebook autoregressively and the rest in parallel, or use
+  interleaving and delay patterns across codebooks.
 
 ## Quiz
 ### Q: Why do most TTS pipelines predict a mel-spectrogram first and then run a vocoder, instead of generating waveform samples directly from text?

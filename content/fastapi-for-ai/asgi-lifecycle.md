@@ -21,9 +21,9 @@ sources:
 ---
 
 ## TL;DR
-ASGI is the message protocol between an async server (Uvicorn, Hypercorn) and your app, a single
-`async def app(scope, receive, send)`. FastAPI's lifespan, middleware, streaming and disconnect
-detection are all moves in this protocol.
+ASGI is the message protocol between an async server (Uvicorn, Hypercorn) and your app: one
+`async def app(scope, receive, send)` called once per connection, plus one `lifespan` connection per
+process. FastAPI's lifespan, middleware, streaming and disconnect detection are all moves in it.
 
 ## Why it exists
 - **WSGI holds a thread per request.** The previous contract, `app(environ, start_response)`, is a
@@ -253,8 +253,9 @@ inside the stream for failures after it starts.
   model load delays readiness; orchestrators need startup probes tuned to the load time.
 
 ## Pitfalls
-- **Draining `receive()` in a pure ASGI middleware without replaying it.** For example to log the body;
-  `http.request` events are consumed once, so the endpoint hangs or gets an empty body. (Starlette's
+- **Draining `receive()` in a pure ASGI middleware without replaying it.** Reading the body to log it
+  consumes the `http.request` events, which arrive only once, so the endpoint hangs or gets an empty
+  body. (Starlette's
   `Request` caches the body, and current `BaseHTTPMiddleware` replays it, so this bites hand-written ASGI
   layers and older Starlette.) Symptom: 422s or timeouts only when that middleware is enabled.
 - **Assuming a disconnect interrupts every handler.** `StreamingResponse` stops its generator, but a

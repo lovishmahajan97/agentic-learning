@@ -66,7 +66,8 @@ Nothing in a checkpoint file distinguishes "rebuild a tensor" from "call os.syst
   aligned, letting loaders view tensors in place without an alignment copy.
 
 ### Why each choice: "the loader should only ever read"
-- **JSON can only describe data.**
+- **JSON can only describe data.** The header has no way to name a function or class to call, so parsing
+  it cannot run code, unlike a pickle's rebuild instructions.
 - **Validate before touching bytes.** The header is parsed and checked first (offsets in bounds and
   non-overlapping, sizes matching `dtype × shape`), which blocks malformed files that try to trigger
   out-of-bounds reads.
@@ -257,12 +258,12 @@ evaluation before deployment.
   contiguous, write with `save_file` (or `save_model` for tied weights) and ship only the safetensors file.
 - **Then enforce it:** pass `use_safetensors=True` to `from_pretrained` so pickle fallbacks error.
 
-### When would you still use `torch.save` rather than safetensors?
+### When is safetensors not the format you ship?
 - **Internal training-resume checkpoints:** optimizer and scheduler state are Python objects, which
-  safetensors deliberately does not store.
+  safetensors deliberately does not store, so `torch.save` stays common there.
 - **Condition:** only for files your own jobs wrote and never for anything from an untrusted location.
 - **Local llama.cpp-style inference** uses GGUF instead, which also embeds tokenizer metadata and
-  quantized types, so conversion is a separate deployment step.
+  quantized types, so conversion from safetensors is a separate deployment step.
 
 ### How many bytes does each of 8 tensor-parallel ranks read for a 4096 by 4096 BF16 matrix?
 - **Whole matrix:** 4096 × 4096 × 2 = 33,554,432 bytes.

@@ -129,13 +129,12 @@ flowchart TD
 ### Worked failure: an unlocked rebuild breaks every request
 A RAG service declares `openai>=1.0` and `httpx` with no lockfile.
 
-| Without a lock | With a lock |
-|---|---|
-| Image rebuilt for an unrelated config change | Rebuild installs exactly the locked versions; production unaffected |
-| Resolver picks a new minor of the HTTP client that removed a long-deprecated constructor argument | Weekly job runs `uv lock --upgrade`; PR diff shows the HTTP client moving one minor version |
-| The resolved SDK still passes that argument | CI's integration test constructs the real SDK client |
-| Every request fails at client construction with a `TypeError` about an unexpected keyword | Same `TypeError` in CI, so the upgrade is held back |
-| Code, prompts and tests unchanged; only the environment moved | Cause visible as a two-line lock diff, not reconstructed from logs |
+| Step | Without a lock | With a lock |
+|---|---|---|
+| Trigger | image rebuilt for an unrelated config change; the resolver picks a new minor of the HTTP client that removed a long-deprecated constructor argument | rebuild installs exactly the locked versions; production unaffected |
+| Where the new version lands | straight in the production image | in a PR: the weekly `uv lock --upgrade` diff shows the HTTP client moving one minor version |
+| What breaks | the resolved SDK still passes that argument, so every request fails at client construction with a `TypeError` about an unexpected keyword | CI's integration test constructs the real SDK client and hits the same `TypeError`, so the upgrade is held back |
+| Diagnosis | code, prompts and tests unchanged; only the environment moved, reconstructed from logs | cause visible as a two-line lock diff |
 
 - **Real instance:** this pattern hit older OpenAI Python SDK releases when httpx 0.28 removed its `proxies`
   argument.
@@ -175,16 +174,22 @@ from packaging.specifiers import SpecifierSet
 assert SpecifierSet("~=1.4").contains("1.9")             # surprise: 1.9 is allowed
 assert not SpecifierSet("~=1.4.0").contains("1.9")       # patch releases only
 assert SpecifierSet(">=1.40,<2").contains("1.99")
-assert not SpecifierSet(">=1.0").contains("2.0.0rc1")    # pre-releases skipped by default
-assert SpecifierSet(">=1.0").contains("2.0.0rc1", prereleases=True)
+
+candidates = ["1.9", "2.0.0rc1"]                         # what an index offers
+assert list(SpecifierSet(">=1.0").filter(candidates)) == ["1.9"]   # pre-release skipped by default
+assert list(SpecifierSet(">=1.0").filter(candidates, prereleases=True)) == candidates
 ```
+
+Use `filter` to see what a resolver would pick: it drops pre-releases when a final release fits (and keeps
+them only if nothing else matches). Do not test this with `contains("2.0.0rc1")`, whose default changed
+between `packaging` releases (21.x returns False, 26.x returns True).
 
 ## Production patterns
 - **Scheduled, small upgrade PRs.** Run `uv lock --upgrade` weekly (or let Renovate or Dependabot do it, if
   they support your lock format), and use `uv lock --upgrade-package openai` for urgent single fixes. Monitor
   lock age and the number of packages behind latest.
-- **Lock-is-current gate in CI.** Install with `uv sync --locked` (or `poetry install` with a check that the
-  lock is current), so an edited `pyproject.toml` without a re-lock fails fast. Pin the tool version so lock
+- **Lock-is-current gate in CI.** Install with `uv sync --locked` (or run `poetry check --lock` before
+  `poetry install`), so an edited `pyproject.toml` without a re-lock fails fast. Pin the tool version so lock
   diffs carry only real changes.
 - **Integration test that constructs real clients.** A cheap test that builds the actual SDK and HTTP clients
   catches constructor and import breakage from an upgrade before merge, as in the worked failure above.
@@ -210,13 +215,13 @@ assert SpecifierSet(">=1.0").contains("2.0.0rc1", prereleases=True)
 
 ## Pitfalls
 - **Lockfile not committed** (or in `.gitignore`). Symptom: "works locally, fails in CI" with different
-  transitive versions in each environment.
+  transitive versions in each environment. Fix: commit it and install with `uv sync --locked`.
 - **`pip install .` in Docker while the lock sits unused.** Symptom: images containing versions that appear
   nowhere in the lockfile. Fix: install from the lock.
 - **Exact pins in a published library.** Symptom: bug reports saying your package cannot be installed
-  alongside another common package.
+  alongside another common package. Fix: declare the widest tested range.
 - **Locking but never upgrading.** Symptom: a security scan listing many known vulnerabilities whose fixes
-  shipped months ago, then an upgrade that changes dozens of packages at once.
+  shipped months ago, then an upgrade that changes dozens of packages at once. Fix: scheduled upgrade PRs.
 - **Different tool versions locally and in CI** for `uv lock` (or `poetry lock`). Symptom: lock diffs rewriting
   many lines (format revision, metadata) with no dependency change, burying the one real change. Pin the
   tool version alongside the lock.

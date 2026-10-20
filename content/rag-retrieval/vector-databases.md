@@ -5,7 +5,7 @@ name: Vector databases (pgvector, Qdrant, Pinecone, Weaviate, Milvus, Chroma)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/ann-indexes
   - rag-retrieval/similarity-search
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-A vector database stores embeddings with metadata and returns the k nearest vectors under filters, fast
-enough for a request path. pgvector lives in Postgres; Qdrant, Weaviate and Milvus are dedicated engines;
-Pinecone is managed; Chroma is for prototypes. Choose on operations and scale.
+A vector database stores embeddings with metadata and returns the k nearest vectors under filters at
+request-path speed. pgvector lives in Postgres; Qdrant, Weaviate and Milvus are dedicated engines;
+Pinecone is managed; Chroma is for prototypes. Choose on operations and scale, not retrieval quality.
 
 ## Why it exists
 - **Exact search is O(N·d) per query.** Ten million 1536-dimensional vectors is roughly 15 billion
@@ -62,7 +62,10 @@ Pinecone is managed; Chroma is for prototypes. Choose on operations and scale.
 - **pgvector post-filters:** it applies the `WHERE` clause to rows coming out of the index scan, so a
   filtered query can return fewer rows than `LIMIT` asks for.
 - **pgvector 0.8.0 added opt-in iterative index scans** (`hnsw.iterative_scan`) that keep walking the
-  graph until enough matching rows are found.
+  graph until enough matching rows are found, up to the cap set by `hnsw.max_scan_tuples`, so a very
+  selective filter can still come back short.
+- **`relaxed_order` versus `strict_order`:** relaxed is faster but may return rows slightly out of
+  distance order, so re-sort in an outer query (pgvector's docs use a materialized CTE) when order matters.
 - **Knowing your store's behaviour** is the key to debugging "the filtered query returns nothing".
 
 ### The six, briefly

@@ -196,13 +196,17 @@ formatter = structlog.stdlib.ProcessorFormatter(
 handler = logging.StreamHandler()
 handler.setFormatter(formatter)
 root = logging.getLogger()
-root.handlers, root.level = [handler], logging.INFO
+root.handlers = [handler]
+root.setLevel(logging.INFO)                         # setLevel, not .level =, so cached levels reset
 for name in ("uvicorn", "uvicorn.error"):           # Uvicorn ships its own handlers; reroute them
     logging.getLogger(name).handlers = []
     logging.getLogger(name).propagate = True
 ```
 
-Run with `--no-access-log` so the middleware's `request_finished` replaces Uvicorn's text access line.
+- **Run with `--no-access-log`** so the middleware's `request_finished` replaces Uvicorn's text access line.
+- **Mind the order.** Uvicorn applies its own logging config before it imports your app, so running this at
+  import time under the CLI wins. If you call `uvicorn.run(...)` after configuring, pass `log_config=None`
+  or Uvicorn reinstalls its own plain-text handlers on its loggers.
 
 ## Production patterns
 - **One schema, one pipeline.** Route structlog and stdlib through `ProcessorFormatter` as above and pick

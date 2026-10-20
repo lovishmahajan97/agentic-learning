@@ -37,7 +37,8 @@ the graph is built by running plain Python.
   times), independent of parameter count.
 - **Static graphs made that record painful.** TensorFlow 1.x had you declare a graph, then run it in a
   session: easy to optimise, miserable to debug, because errors surfaced inside a runtime you could not
-  step through, and data-dependent loops needed special graph operators.
+  step through, and data-dependent control flow (a loop that runs a variable number of times) needed
+  special graph operators.
 - **Define-by-run fixes it, and is now the lingua franca.** The graph is recorded as Python executes,
   every iteration, so control flow is just Python and you debug with print statements and `pdb`, not a
   separate graph compiler; that is why it won.
@@ -194,7 +195,7 @@ model.eval()                                     # dropout off; does NOT stop au
 @torch.inference_mode()                          # no graph, no saved activations
 def predict(batch):
     logits = model(batch.to(device, non_blocking=True))
-    return logits.argmax(-1).cpu().tolist()      # plain Python values, nothing keeps a graph alive
+    return (logits > 0).squeeze(-1).cpu().tolist()   # binary labels as Python bools, no graph kept alive
 
 before = torch.cuda.memory_allocated()
 for _ in range(100):
@@ -272,7 +273,7 @@ Plain fp32 training with AdamW, before activations:
   training step, inspecting activations, or debugging why a Hugging Face model misbehaves.
 - **Use a library on top when** fine-tuning standard LLMs: Transformers, PEFT and TRL rather than
   hand-written loops.
-- **Avoid for serving at scale:** use an inference engine (vLLM, SGLang, TensorRT-LLM) rather than a
+- **Avoid for serving LLMs at scale:** use an inference engine (vLLM, SGLang, TensorRT-LLM) rather than a
   PyTorch `generate` loop.
 - **Measure:** GPU utilisation, peak memory (`torch.cuda.max_memory_allocated()`) and samples per second.
   A GPU idling at low utilisation usually means the DataLoader is the bottleneck.
@@ -308,15 +309,16 @@ tensors before storing them, and check `torch.cuda.memory_allocated()` stays fla
 ### Training loss diverges after a few steps in a loop a colleague wrote. How do you debug it?
 - **Check gradient zeroing first:** a missing `optimizer.zero_grad()` makes every step's gradients add up,
   which matches divergence after a few steps.
-- **Then check precision and inputs:** fp16 without loss scaling can underflow gradients; NaN or extreme
-  values in the batch also show up as sudden loss spikes.
+- **Then check learning rate, precision and inputs:** a learning rate too high for the batch size
+  diverges the same way; fp16 without loss scaling underflows small gradients to zero and can overflow to
+  inf or NaN; NaN or extreme values in the batch show up as sudden loss spikes.
 - **Confirm with numbers:** log the gradient norm every N steps (using `.item()` sparingly) and compare
   against an fp32 baseline run.
 
 ### When would you not write a raw PyTorch loop?
 - **Fine-tuning standard LLMs:** Transformers, PEFT and TRL already handle mixed precision, checkpointing
   and distributed setup, so a hand-written loop is extra code to maintain and debug.
-- **Serving at scale:** an inference engine such as vLLM, SGLang or TensorRT-LLM batches requests and
+- **Serving LLMs at scale:** an inference engine such as vLLM, SGLang or TensorRT-LLM batches requests and
   manages the KV cache, which a PyTorch `generate` loop does not.
 - **Still drop to raw PyTorch** for a custom loss, a non-standard training step or inspecting activations.
 

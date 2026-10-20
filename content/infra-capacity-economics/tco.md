@@ -5,7 +5,7 @@ name: TCO (total cost of ownership)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - infra-capacity-economics/break-even-analysis
   - infra-capacity-economics/cost-modeling
@@ -154,7 +154,7 @@ for label, users in (("growth", [500, 1000, 1500]), ("flat", [500, 500, 500])):
 # flat: build 1052 (NPV 911)  buy 789 (NPV 662)
 ```
 
-Three readings:
+What the numbers say:
 - **Tokens are a minority of build cost.** Even in year three they are $180k of $394k, and over the three
   years the 0.75 FTE of upkeep ($450k) outweighs tokens ($360k). A 20% token discount would save about
   $72k; trimming upkeep by a quarter of an FTE would save $150k.
@@ -167,7 +167,7 @@ Three readings:
   built pipeline for a second feature, then say which one the recommendation depends on.
 
 ### Worked scenario: find the assumption that flips it
-Append this to the code above to sweep the two assumptions most likely to be wrong: year-three adoption
+Append this to the code above (it reuses `tco`, `buy_saas`, `build_on_api` and `RATE`) to sweep the two assumptions most likely to be wrong: year-three adoption
 and the vendor's seat price.
 
 ```python
@@ -229,15 +229,18 @@ for seat in (0.30, 0.36, 0.45):                         # seat price, thousands 
 
 ## Pitfalls
 - **Comparing the invoice line only,** such as tokens versus GPU hours. Symptom: a "cheaper" option whose
-  first quarter is consumed by unplanned platform and migration work.
+  first quarter is consumed by unplanned platform and migration work. Fix: fill all four buckets.
 - **Leaving out people because they are "already on payroll".** Symptom: roadmap features slip while the
-  team keeps the self-hosted or custom-built stack alive.
+  team keeps the self-hosted or custom-built stack alive. Fix: FTE fractions at loaded cost, plus
+  opportunity cost.
 - **Comparing options at unequal quality.** Symptom: a cheap option that needs a human review queue, or a
-  fine-tuning project, that nobody costed.
+  fine-tuning project, that nobody costed. Fix: price the gap or compare cost per successful task.
 - **Ignoring change costs** such as model deprecations and embedding-model upgrades. Symptom: an urgent
-  re-embedding job or migration sprint arrives on the provider's schedule rather than yours.
+  re-embedding job or migration sprint arrives on the provider's schedule rather than yours. Fix: budget
+  at least one migration per horizon from logged past effort.
 - **Presenting one number with false precision.** Symptom: when one assumption, usually adoption, turns out
-  wrong, stakeholders lose trust in the whole analysis instead of updating the input that moved.
+  wrong, stakeholders lose trust in the whole analysis instead of updating the input that moved. Fix:
+  report a range and name the flip assumption.
 - **Counting sunk costs as a reason to keep something.** Symptom: a business case for keeping an underused
   cluster that only works if its purchase price is counted as a saving.
 - **Never revisiting the model after launch.** Symptom: without FinOps actuals to compare against, the next

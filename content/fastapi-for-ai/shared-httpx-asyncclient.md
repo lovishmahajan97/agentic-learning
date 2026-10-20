@@ -5,7 +5,7 @@ name: Shared httpx AsyncClient
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/httpx
   - fastapi-for-ai/lifespan

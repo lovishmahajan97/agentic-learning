@@ -5,7 +5,7 @@ name: Concurrency limits (semaphores)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/backpressure
   - fastapi-for-ai/rate-limiting
@@ -126,12 +126,12 @@ until the generator's `finally`, not until the endpoint returns.
 
 ```mermaid
 flowchart TD
-    A["Request arrives at one worker"] --> B{"Free slot in this dependency's semaphore?"}
+    A["Request arrives at one worker"] --> B{"Free slot in the dependency semaphore?"}
     B -->|"yes"| C["acquire: counter minus 1"]
     B -->|"no"| W["Wait, bounded by asyncio.timeout"]
     W -->|"slot freed in time"| C
     W -->|"timeout"| R["503 with Retry-After"]
-    C --> S["Return StreamingResponse, call the provider while streaming"]
+    C --> S["Stream response, provider called meanwhile"]
     S --> F["Generator finally: release, counter plus 1"]
     F -->|"wakes one waiter"| W
     N["Fleet cap = workers x n, keep under the provider quota"] -.-> B
@@ -181,6 +181,9 @@ async def chat(body: dict, request: Request):
 - **Ceiling:** with an average generation of 8 seconds, 16 slots per worker sustain about 16 / 8 = 2
   requests per second per worker, 8 across the fleet.
 - **Above that,** requests wait up to 2 seconds and then get 503 instead of piling up.
+- **Not covered here:** the never-started generator edge case above. If the client leaves before the first
+  chunk, `gen()` never runs its `finally` and the slot leaks, so production code adds the release-once
+  guard and an alert on slots that never return.
 
 ### Runnable: a burst against a bounded semaphore
 Twelve requests arrive at once against 4 slots; each call takes 1 second and waiters give up after 0.5

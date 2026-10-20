@@ -22,8 +22,8 @@ sources:
 
 ## TL;DR
 Multi-tenancy is one running system serving many customers while keeping each one's data, configuration,
-quotas and bill separate. A tenant identity set at the edge travels through every layer, including the
-retrieval index, prompt, caches and token meter.
+quotas and bill separate. A tenant identity set at the edge reaches every layer (index, prompt, caches,
+token meter), and each resource is deliberately pooled, bridged or siloed.
 
 ## Why it exists
 - **One deployment per customer does not scale.** Fine for three customers; for three hundred it means
@@ -239,16 +239,17 @@ not a code change.
 | Step | Action | Check before moving on |
 |---|---|---|
 | 1 | Provision a dedicated database and index namespace | Directory still points at the pool |
-| 2 | Copy rows and vectors keyed by the tenant | Row and vector counts match |
-| 3 | Dual-write, or freeze writes for the cut-over window | No writes lost during copy |
+| 2 | Copy rows and vectors keyed by the tenant | Copy completes without errors |
+| 3 | Dual-write, or freeze writes for the cut-over window | Row and vector counts match; no writes lost |
 | 4 | Flip the directory entry | Cached directory lookups expire; traffic lands on the silo |
 | 5 | Delete the tenant's rows from the pool | Pool queries for that tenant return nothing |
 
 ## Production patterns
 - **Row-level security as a backstop.** Use when pooled tables share a schema. Enable PostgreSQL row
   security on each table with a policy comparing `tenant_id` to a per-transaction setting the app sets
-  with `SET LOCAL` from the verified tenant. Remember the table owner bypasses policies unless row
-  security is forced. Monitor queries that run without the setting.
+  with `SET LOCAL` from the verified tenant. The table owner bypasses policies unless row security is
+  forced, and superusers or `BYPASSRLS` roles always do, so the app must not connect as either. Monitor
+  queries that run without the setting.
 - **Tenant on every signal.** Use from day one. Add the tenant ID as a structured log field and a trace
   span attribute on every request and job, and as a metric label while tenant count stays modest
   (thousands of label values strain most metrics backends). Monitor per-tenant p95 latency, errors and
@@ -287,14 +288,19 @@ not a code change.
   tenant in every cache key.
 - **Letting tenant context evaporate at a process or thread boundary.** Queues, cron jobs, thread pools,
   or a sync FastAPI dependency that sets a `ContextVar` in a worker thread. Symptom: background jobs or
-  handlers run as "no tenant" and either fail or write into the wrong partition.
+  handlers run as "no tenant" and either fail or write into the wrong partition. Fix: put the tenant
+  explicitly on every message and job, use `async def` for context-setting dependencies, and fail closed
+  when no tenant is set.
 - **Hard-coding exceptions for a big customer.** Symptom: a release breaks only for them, discovered in
   production because the test suite has no such tenant. Fix: express the difference as tenant
   configuration.
 - **Offboarding by deleting database rows only.** Symptom: a departed customer's document resurfaces
   from the vector index or a cached answer, or a deletion audit finds it in traces and eval samples.
+  Fix: one offboarding workflow that deletes by tenant key in every store, plus crypto-shredding for
+  backups.
 - **Measuring cost per model but not per tenant.** Symptom: a tenant on a flat plan quietly consumes most
-  of the token budget with no alarm until the invoice.
+  of the token budget with no alarm until the invoice. Fix: meter tokens per tenant at the call site and
+  alert on spend against plan.
 
 ## When to use
 - **Design for it from the first commit** of any product that will serve more than a handful of
