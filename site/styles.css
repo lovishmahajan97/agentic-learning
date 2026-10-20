@@ -381,3 +381,18 @@ mark { background: var(--warn-soft); color: inherit; padding: 0 2px; border-radi
 
 .pace { font: inherit; font-size: 13px; border: 0; border-bottom: 1px solid var(--line-strong); background: transparent; color: var(--ink); padding: 0 2px; }
 .topic-list li a { grid-template-rows: auto; }
+
+/* ---------- single track: stages and numbered modules ---------- */
+.stage-label { color: var(--ink-2); text-transform: none; letter-spacing: 0; font-size: 12.5px; gap: 8px; padding-top: 12px; }
+.stage-n { display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 6px; background: var(--ink); color: var(--bg); font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
+.stage-n.big { min-width: 28px; height: 28px; font-size: 14px; border-radius: 8px; }
+.mod-num { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); width: 18px; flex: none; }
+.mod-head .mod-title { padding-left: 0; }
+.mod-bar { margin-left: 48px; }
+.stage-strip { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.stage-strip a { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px 6px 6px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-2); font-size: 13.5px; font-weight: 500; }
+.stage-strip a:hover { background: var(--surface-2); text-decoration: none; color: var(--ink); }
+.mod-card-num { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-3); letter-spacing: .02em; }
+.tier-section { scroll-margin-top: 12px; }
+.list-cards.patterns li .mark { color: var(--good); }
+.list-cards.patterns li { border-left: 3px solid var(--good); }

@@ -415,7 +415,15 @@ def build(report_only=False):
     built = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     (ROOT / "site" / "data").mkdir(exist_ok=True)
     light_modules, total_bytes = [], 0
+    cur = json.loads((ROOT / "curriculum.json").read_text()) if (ROOT / "curriculum.json").exists() else None
+    track = {}
+    if cur:
+        n = 0
+        for si, st in enumerate(cur["stages"]):
+            for mid in st["modules"]:
+                n += 1; track[mid] = {"stage": st["id"], "stage_index": si + 1, "track_order": n}
     for m in out_modules:
+        m.update(track.get(m["id"], {}))
         light = [{k: v for k, v in t.items() if k not in HEAVY} for t in m["topics"]]
         light_modules.append({**m, "topics": light})
         full = [{k: v for k, v in t.items() if k in HEAVY or k == "key"} for t in m["topics"] if t.get("status") != "missing"]
@@ -423,7 +431,9 @@ def build(report_only=False):
         (ROOT / "site" / "data" / f'{m["id"]}.js').write_text(js, encoding="utf-8"); total_bytes += len(js)
     data = {"meta": {"generated_from": TAX["generated_from"], "built_at": built, "build_id": built.replace(" ", "_").replace(":", ""),
                      "topic_count": total, "ok_count": report["ok"]},
-            "tiers": TAX["tiers"], "role_paths": TAX["role_paths"], "modules": light_modules}
+            "tiers": TAX["tiers"], "role_paths": TAX["role_paths"],
+            "stages": [{k: v for k, v in st.items() if k != "modules"} for st in cur["stages"]] if cur else [],
+            "modules": light_modules}
     js = "window.LMS_DATA = " + json.dumps(data, ensure_ascii=False, separators=(",", ":")) + ";\n"
     (ROOT / "site" / "data.js").write_text(js, encoding="utf-8")
     print(f"wrote site/data.js ({len(js)/1e6:.2f} MB index) + site/data/*.js ({total_bytes/1e6:.2f} MB lessons)")

@@ -26,7 +26,15 @@
 
   /* ---------------- index ---------------- */
   const topics = new Map();
-  const modules = D.modules.slice().sort((a, b) => a.order - b.order);
+  const trackKey = m => (m.track_order != null ? m.track_order : 100 + m.order);
+  const modules = D.modules.slice().sort((a, b) => trackKey(a) - trackKey(b));
+  modules.forEach((m, i) => { m.num = i + 1; });
+  const STAGES = (D.stages && D.stages.length ? D.stages : [1, 2, 3].map(t => ({ id: 'tier' + t, title: (D.tiers[t] || {}).title || 'Tier ' + t, blurb: (D.tiers[t] || {}).blurb || '' })))
+    .map((s, i) => ({ ...s, n: i + 1, mods: modules.filter(m => (m.stage || 'tier' + m.tier) === s.id) }))
+    .filter(s => s.mods.length);
+  const stageOf = m => STAGES.find(s => s.mods.includes(m)) || STAGES[0];
+  const ROLE_FOR_TIER = { 1: 'All roles', 2: 'AI Architect', 3: 'FDE' };
+  const pad2 = n => String(n).padStart(2, '0');
   const modById = new Map();
   modules.forEach(m => {
     modById.set(m.id, m);
@@ -63,9 +71,8 @@
   const loadingView = what => `<div class="page-narrow"><div class="empty">Loading ${what}…</div></div>`;
 
   /* ---------------- role paths ---------------- */
-  function pathRules() { const p = D.role_paths[S.path] || D.role_paths.all || { rules: {} }; return p.rules || {}; }
-  function modStatus(m) { const r = pathRules(); if (r['tier' + m.tier] === 'skip') return 'skip'; return r[m.id] || 'core'; }
-  function topicStatus(t) { const ms = modStatus(modById.get(t.module)); if (ms === 'skip') return 'skip'; if (t.caveat && pathRules().caveat === 'skip') return 'skip'; return ms; }
+  function modStatus() { return 'core'; }
+  function topicStatus() { return 'core'; }
   const inPath = t => topicStatus(t) !== 'skip';
 
   /* ---------------- progress helpers ---------------- */
@@ -94,32 +101,27 @@
 
   /* ---------------- chrome: sidebar, counts, theme ---------------- */
   const main = $('#main'), tree = $('#tree'), app = $('#app');
-  function buildPathSelect() {
-    const sel = $('#pathSelect'); sel.innerHTML = Object.entries(D.role_paths).map(([k, p]) => `<option value="${k}">${esc(p.title)}</option>`).join('');
-    sel.value = S.path; sel.onchange = () => { S.path = sel.value; save(); renderTree(); route(); };
-  }
+  function buildPathSelect() { /* the role-path dropdown was removed: one fixed track */ }
   function renderTree(filter) {
     const q = (filter || '').trim().toLowerCase();
-    const tiers = [1, 2, 3]; let html = '';
-    tiers.forEach(tier => {
-      const ms = modules.filter(m => m.tier === tier && modStatus(m) !== 'skip');
-      if (!ms.length) return;
-      const info = D.tiers[tier] || { title: 'Tier ' + tier };
+    let html = '';
+    STAGES.forEach(stg => {
+      const ms = stg.mods;
       let inner = '';
       ms.forEach(m => {
         const items = m.ordered.filter(t => inPath(t) && (!q || (t.name + ' ' + m.title).toLowerCase().includes(q)));
         if (q && !items.length) return;
         const p = modProgress(m), open = q ? true : !!S.open[m.id], st = modStatus(m);
-        inner += `<div class="mod ${open ? 'open' : ''} ${st}" data-mod="${m.id}" style="--tier: var(--t${tier})">
+        inner += `<div class="mod ${open ? 'open' : ''} ${st}" data-mod="${m.id}" style="--tier: var(--t${m.tier})">
           <button class="mod-head" data-toggle="${m.id}" aria-expanded="${open}">
             <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            <span class="mod-title">${esc(m.title)}</span>
+            <span class="mod-num">${pad2(m.num)}</span><span class="mod-title">${esc(m.title)}</span>
             <span class="mod-count">${p.done}/${p.total}</span></button>
           <div class="mod-bar"><i style="width:${p.pct}%"></i></div>
           <ul class="mod-items">${items.map(t => `<li><a href="#t.${m.id}.${t.id}" data-key="${t.key}" class="${t.status !== 'ok' ? 'missing' : ''}"><span class="dot ${topicDot(t)}"></span><span>${esc(t.name)}</span></a></li>`).join('')}</ul></div>`;
       });
       if (!inner) return;
-      html += `<div class="tier-group"><div class="tier-label" style="--tier: var(--t${tier})"><i></i>${esc(info.title.split('—')[0].trim())}<span class="muted" style="font-weight:400;letter-spacing:0;text-transform:none">${esc((info.title.split('—')[1] || '').trim())}</span></div>${inner}</div>`;
+      html += `<div class="tier-group"><div class="tier-label stage-label"><span class="stage-n">${stg.n}</span>${esc(stg.title)}</div>${inner}</div>`;
     });
     tree.innerHTML = html || '<div class="tree-empty">No lessons match.</div>';
     tree.querySelectorAll('[data-toggle]').forEach(b => b.onclick = () => { const id = b.dataset.toggle; S.open[id] = !S.open[id]; save(); b.closest('.mod').classList.toggle('open', S.open[id]); b.setAttribute('aria-expanded', !!S.open[id]); });
@@ -165,7 +167,6 @@
 
   function renderDashboard() {
     touchDay();
-    const path = D.role_paths[S.path] || D.role_paths.all;
     const ts = flat.filter(inPath); const learned = ts.filter(isLearned).length; const due = dueTopics().length;
     const last = S.last && topics.get(S.last);
     const nextUp = ts.filter(t => !isLearned(t) && topicStatus(t) === 'core' && t.status === 'ok').slice(0, 6);
@@ -173,11 +174,10 @@
     const okCount = D.meta.ok_count != null ? D.meta.ok_count : flat.filter(t => t.status === 'ok').length;
     let html = `<div class="page">
       <div class="hero">
-        <div class="eyebrow">AI Roles Skills Taxonomy · ${TOTAL} lessons · 30 modules · 3 tiers</div>
+        <div class="eyebrow">AI Roles Skills Taxonomy · ${TOTAL} lessons · ${modules.length} modules · ${STAGES.length} stages</div>
         <h1>Learn the whole map, one reasoned lesson at a time.</h1>
-        <p class="lede">Every item in the taxonomy is a lesson that explains why it exists, how it works, where it breaks, and how each role meets it. Pick a path, work through the modules in order, and let the review queue bring back what you are about to forget.</p>
-        <div class="paths">${Object.entries(D.role_paths).map(([k, p]) => `<button data-path="${k}" class="${k === S.path ? 'on' : ''}">${esc(p.title)}</button>`).join('')}</div>
-        <div class="path-desc">${esc(path.desc)}</div>
+        <p class="lede">Every item in the taxonomy is a lesson that explains why it exists, how it works, where it breaks, and how each role meets it. Work through the track in order, from Python to customer delivery, and let the review queue bring back what you are about to forget.</p>
+        <ol class="stage-strip">${STAGES.map(s => `<li><a href="#stage-${s.id}"><span class="stage-n">${s.n}</span>${esc(s.title)}</a></li>`).join('')}</ol>
       </div>
       <div class="stats">
         <div class="stat"><div class="label">Learned</div><div class="value">${learned}<span class="muted" style="font-size:16px;font-weight:400"> / ${ts.length}</span></div><div class="sub">${fmtMin(minutesLeft(ts))} of reading left · at <select id="pace" class="pace">${[1, 2, 3, 5, 8].map(n => `<option value="${n}" ${(S.pace || 3) == n ? 'selected' : ''}>${n}</option>`).join('')}</select>/day, done by <b>${paceDate(ts.length - learned)}</b></div><div class="bar"><i style="width:${ts.length ? 100 * learned / ts.length : 0}%"></i></div></div>
@@ -189,40 +189,40 @@
     html += `<div class="row2">
         <div class="card"><h3>${last ? 'Continue' : 'Start here'}</h3>
           ${last ? `<ul class="next-list"><li><a href="#t.${last.module}.${last.id}"><span>${esc(last.name)}<div class="sub">${esc(last.moduleTitle)} · ${last.est_minutes || 12} min</div></span><span class="pill">Resume</span></a></li></ul>` : ''}
-          <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center"><span class="eyebrow">Next up on this path</span><button class="btn sm" id="randomBtn">Random lesson</button></div>
-          <ul class="next-list" style="margin-top:6px">${nextUp.map(t => `<li><a href="#t.${t.module}.${t.id}"><span>${esc(t.name)}<div class="sub">${esc(t.moduleTitle)}</div></span><span class="muted mono" style="font-size:12px">${t.est_minutes || 12} min</span></a></li>`).join('') || '<li class="muted">Everything on this path is learned.</li>'}</ul>
+          <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center"><span class="eyebrow">Next up in the track</span><button class="btn sm" id="randomBtn">Random lesson</button></div>
+          <ul class="next-list" style="margin-top:6px">${nextUp.map(t => `<li><a href="#t.${t.module}.${t.id}"><span>${esc(t.name)}<div class="sub">${esc(t.moduleTitle)}</div></span><span class="muted mono" style="font-size:12px">${t.est_minutes || 12} min</span></a></li>`).join('') || '<li class="muted">Everything in the track is learned.</li>'}</ul>
         </div>
         <div class="card"><h3>How this works</h3>
           <div class="prose" style="font-size:15px">
             <p><strong>Read</strong> a lesson top to bottom: the forcing problem, the mechanism, a concrete example, trade-offs and pitfalls. <strong>Check yourself</strong> with the interview question before revealing the answer, then <strong>take the quiz</strong>. Three correct answers marks the lesson learned and schedules it for review.</p>
-            <p><strong>Interview drill</strong> shuffles the check questions of a module or your whole path so you can rehearse reasoning out loud. The <strong>review queue</strong> uses expanding intervals (1, 3, 7, 14, 30, 60, 120 days). Grade yourself honestly; a miss resets the interval. Each module ends with a <strong>capstone</strong> you can build and a <strong>module quiz</strong> drawn from all its lessons.</p>
+            <p><strong>Interview drill</strong> shuffles the check questions of a module or the whole track so you can rehearse reasoning out loud. The <strong>review queue</strong> uses expanding intervals (1, 3, 7, 14, 30, 60, 120 days). Grade yourself honestly; a miss resets the interval. Each module ends with a <strong>capstone</strong> you can build and a <strong>module quiz</strong> drawn from all its lessons.</p>
             <p>Keys: <span class="kbd">/</span> search · <span class="kbd">n</span> / <span class="kbd">p</span> next / previous lesson · <span class="kbd">l</span> mark learned.</p>
           </div>
         </div>
       </div>`;
-    [1, 2, 3].forEach(tier => {
-      const ms = modules.filter(m => m.tier === tier && modStatus(m) !== 'skip'); if (!ms.length) return;
-      const info = D.tiers[tier] || { title: 'Tier ' + tier, blurb: '' };
-      const tts = ms.flatMap(m => m.topics.filter(inPath)); const tl = tts.filter(isLearned).length;
-      html += `<section class="tier-section" style="--tier: var(--t${tier})">
-        <div class="tier-head"><div><h2><i></i>${esc(info.title)}</h2><div class="muted" style="margin-top:4px;font-size:14px">${esc(info.blurb)}</div></div>
-        <div class="tier-prog"><span>${tl} / ${tts.length} learned</span><div class="bar tier-${tier}"><i style="width:${tts.length ? 100 * tl / tts.length : 0}%"></i></div></div></div>
-        <div class="mod-grid">${ms.map(m => { const p = modProgress(m); const st = modStatus(m); const ready = m.topics.filter(t => t.status === 'ok').length; return `<a class="mod-card ${st}" href="#m.${m.id}">
-            <span class="pct">${p.pct}%</span><h3>${esc(m.title)}</h3>
-            <div class="meta"><span>${p.total} lessons</span><span>·</span><span>${fmtMin(minutesLeft(m.topics.filter(inPath)))} left</span>${ready < m.topics.length ? `<span>·</span><span>${ready} ready</span>` : ''}</div>
-            ${st === 'background' ? '<span class="status pill">background</span>' : ''}
-            <div class="bar tier-${tier}"><i style="width:${p.pct}%"></i></div></a>`; }).join('')}</div></section>`;
+    STAGES.forEach(stg => {
+      const ms = stg.mods;
+      const tts = ms.flatMap(m => m.topics); const tl = tts.filter(isLearned).length;
+      html += `<section class="tier-section" id="stage-${stg.id}">
+        <div class="tier-head"><div><h2><span class="stage-n big">${stg.n}</span>${esc(stg.title)}</h2><div class="muted" style="margin-top:4px;font-size:14px">${esc(stg.blurb || '')}</div></div>
+        <div class="tier-prog"><span>${tl} / ${tts.length} learned</span><div class="bar"><i style="width:${tts.length ? 100 * tl / tts.length : 0}%"></i></div></div></div>
+        <div class="mod-grid">${ms.map(m => { const p = modProgress(m); return `<a class="mod-card" href="#m.${m.id}" style="--tier: var(--t${m.tier})">
+            <span class="pct">${p.pct}%</span><div class="mod-card-num">Module ${pad2(m.num)}</div><h3>${esc(m.title)}</h3>
+            <div class="meta"><span>${p.total} lessons</span><span>·</span><span>${fmtMin(minutesLeft(m.topics))} left</span></div>
+            <div class="topic-meta">${pillTier(m.tier)}<span class="pill">${ROLE_FOR_TIER[m.tier]}</span></div>
+            <div class="bar tier-${m.tier}"><i style="width:${p.pct}%"></i></div></a>`; }).join('')}</div></section>`;
     });
     html += `<details class="about"><summary>About this curriculum and how to read it</summary><div class="prose" style="font-size:15px">
       <p>Tier 1 is the shared core every AI role is expected to know; Tiers 2 and 3 list only what the AI Architect and the Forward Deployed Engineer add on top of it. Each item is a concept, pattern, metric or tool you should be able to explain or use.</p>
       <ul><li><strong>Tools vs concepts.</strong> Names in parentheses after a label (vLLM, RAGAS, LangGraph, Zod…) are tools or frameworks, not concepts. Know one well per category rather than all of them.</li>
-      <li><strong>Caveated items.</strong> Distributed training (Tier 1) and feature stores (Tier 2) are marked; the LLM-app path drops them.</li>
+      <li><strong>Caveated items.</strong> Distributed training (Tier 1) and feature stores (Tier 2) are marked with a caveat tag; skip them for LLM-app roles.</li>
       <li><strong>Shared items appear once, in Tier 1.</strong> Kubernetes, Terraform, RBAC, OAuth, MCP and golden datasets are designed by the Architect, implemented by the Engineer, and mapped into customer environments by the FDE.</li>
       <li><strong>Golden dataset</strong> is the one deliberate repeat: creation and metrics in Tier 1, strategy in Tier 2, customer-specific creation in Tier 3.</li>
+      <li><strong>The track.</strong> Modules run in one order, from Programming foundations through Customer delivery; tier and role tags show who each module is for.</li>
       <li><strong>Trimming per role.</strong> LLM-app AI Engineer: Tier 1 minus ML-fundamentals depth. ML-heavy AI Engineer: Tier 1 in full. AI Architect: Tier 1 breadth plus Tier 2. FDE: Tier 1 plus Tier 3, with Tier 2 Reliability and Security as background reading.</li></ul>
       <p class="muted">Source: AI Roles Skills Taxonomy, Oct 20 2026. Built ${esc(D.meta.built_at || '')}.</p></div></details></div>`;
     main.innerHTML = html;
-    main.querySelectorAll('[data-path]').forEach(b => b.onclick = () => { S.path = b.dataset.path; save(); $('#pathSelect').value = S.path; renderTree(search.value); renderDashboard(); });
+    main.querySelectorAll('.stage-strip a').forEach(x => x.onclick = e => { e.preventDefault(); const el = document.getElementById(x.getAttribute('href').slice(1)); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     const pace = $('#pace'); if (pace) pace.onchange = () => { S.pace = +pace.value; save(); renderDashboard(); };
     const rb = $('#randomBtn'); if (rb) rb.onclick = () => { const pool = ts.filter(t => t.status === 'ok' && !isLearned(t)); const pick = pool.length ? pool[Math.floor(Math.random() * pool.length)] : ts[0]; if (pick) location.hash = `#t.${pick.module}.${pick.id}`; };
   }
@@ -234,9 +234,9 @@
     const first = m.ordered.find(t => inPath(t) && !isLearned(t)) || m.ordered[0];
     const reasons = {}; // suggested-order reasons are not stored separately; order list carries the sequence
     let html = `<div class="page-narrow">
-      <div class="crumbs"><a href="#dashboard">Home</a><i>›</i><span>${esc((D.tiers[m.tier] || {}).title || 'Tier ' + m.tier)}</span></div>
+      <div class="crumbs"><a href="#dashboard">Home</a><i>›</i><span>Stage ${stageOf(m).n}: ${esc(stageOf(m).title)}</span><i>›</i><span>Module ${pad2(m.num)}</span></div>
       <div class="mod-hero" style="--tier: var(--t${m.tier})">
-        <div class="topic-meta">${pillTier(m.tier)}${pillStatus(st)}<span class="pill">${m.topics.length} lessons</span><span class="pill">${fmtMin(m.topics.reduce((a, t) => a + (t.est_minutes || 12), 0))} total</span></div>
+        <div class="topic-meta">${pillTier(m.tier)}<span class="pill">${ROLE_FOR_TIER[m.tier]}</span><span class="pill">${m.topics.length} lessons</span><span class="pill">${fmtMin(m.topics.reduce((a, t) => a + (t.est_minutes || 12), 0))} total</span></div>
         <h1>${esc(m.title)}</h1>
         <div class="bar tier-${m.tier}"><i style="width:${p.pct}%"></i></div>
         <div class="muted">${p.done} of ${p.total} learned${S.modquiz[mid] ? ` · best module quiz ${S.modquiz[mid].best}/${S.modquiz[mid].of}` : ''}</div>
@@ -288,7 +288,8 @@
     const secs = [
       ['why', 'Why it exists', md(t.why)],
       ['how', 'How it works', md(t.how)],
-      ['example', 'Example', md(t.example)],
+      ['example', t.format === 'crisp' ? 'Examples' : 'Example', md(t.example)],
+      ...((t.patterns && t.patterns.length) ? [['patterns', 'Production patterns', `<ul class="list-cards patterns">${t.patterns.map(b => `<li><span class="mark">▸</span><span>${mdi(b)}</span></li>`).join('')}</ul>`]] : []),
       ['tradeoffs', 'Trade-offs', `<ul class="list-cards tradeoffs">${(t.tradeoffs || []).map(b => `<li><span class="mark">⇄</span><span>${mdi(b)}</span></li>`).join('')}</ul>`],
       ['pitfalls', 'Pitfalls', `<ul class="list-cards pitfalls">${(t.pitfalls || []).map(b => `<li><span class="mark">!</span><span>${mdi(b)}</span></li>`).join('')}</ul>`],
       ['when', 'When to use', md(t.when)],
@@ -300,11 +301,11 @@
       ${t.caveat ? `<div class="banner">Caveat: ${esc(t.caveat)}.</div>` : ''}
       <div class="tldr"><div class="eyebrow">In one breath</div><div class="prose">${md(t.tldr)}</div></div>
       ${secs.map(([id, title, body], i) => `<section class="section" id="s-${id}"><h2><span class="num">${String(i + 1).padStart(2, '0')}</span>${title}</h2>${body.startsWith('<ul') || body.startsWith('<div') ? body : `<div class="prose">${body}</div>`}</section>`).join('')}
-      ${related.length ? `<section class="section" id="s-related"><h2><span class="num">08</span>Related lessons</h2><div class="chips">${related.map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${esc(r.moduleTitle)}</span></a>`).join('')}</div></section>` : ''}
-      <section class="section" id="s-check"><h2><span class="num">09</span>Check yourself</h2>
+      ${related.length ? `<section class="section" id="s-related"><h2><span class="num">${pad2(secs.length + 1)}</span>Related lessons</h2><div class="chips">${related.map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${esc(r.moduleTitle)}</span></a>`).join('')}</div></section>` : ''}
+      <section class="section" id="s-check"><h2><span class="num">${pad2(secs.length + 2)}</span>Check yourself</h2>
         <div class="reveal"><div class="q prose">${md(t.check.q)}</div><button class="btn sm" id="revealBtn">Reveal a model answer</button><div class="a prose" id="answer" hidden>${md(t.check.a)}</div></div></section>
-      <section class="section" id="s-quiz"><h2><span class="num">10</span>Quiz</h2><div class="quiz" id="quiz">${(t.quiz || []).map((q, qi) => `<div class="qcard" data-q="${qi}"><div class="q"><span class="n">Q${qi + 1}</span>${mdi(q.q)}</div><div class="opts">${q.options.map((o, oi) => `<button class="opt" data-o="${oi}"><span class="k">${'ABCD'[oi]}</span><span>${mdi(o)}</span></button>`).join('')}</div><div class="expl" hidden></div></div>`).join('')}<div id="quizResult"></div></div></section>
-      <section class="section notes" id="s-notes"><h2><span class="num">11</span>Your notes</h2><textarea id="notes" placeholder="What clicked, what is still fuzzy, how this connects to your own work…">${esc(S.notes[key] || '')}</textarea></section>
+      <section class="section" id="s-quiz"><h2><span class="num">${pad2(secs.length + 3)}</span>Quiz</h2><div class="quiz" id="quiz">${(t.quiz || []).map((q, qi) => `<div class="qcard" data-q="${qi}"><div class="q"><span class="n">Q${qi + 1}</span>${mdi(q.q)}</div><div class="opts">${q.options.map((o, oi) => `<button class="opt" data-o="${oi}"><span class="k">${'ABCD'[oi]}</span><span>${mdi(o)}</span></button>`).join('')}</div><div class="expl" hidden></div></div>`).join('')}<div id="quizResult"></div></div></section>
+      <section class="section notes" id="s-notes"><h2><span class="num">${pad2(secs.length + 4)}</span>Your notes</h2><textarea id="notes" placeholder="What clicked, what is still fuzzy, how this connects to your own work…">${esc(S.notes[key] || '')}</textarea></section>
       ${t.sources && t.sources.length ? `<section class="section"><h2>Sources</h2><ul class="sources">${t.sources.map(s => `<li>${esc(s)}</li>`).join('')}</ul></section>` : ''}
       ${pager(prev, next, m, nextMod)}
     </article>
@@ -421,7 +422,7 @@
     if (need.length) { main.innerHTML = loadingView('drill'); ensureModules(need).then(() => { if (location.hash === (m ? '#drill.' + m.id : '#drill')) renderDrill(mid); }); return; }
     const pool = (m ? m.ordered : flat.filter(inPath)).filter(t => t.status === 'ok' && t.check && t.check.q);
     for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-    const scope = m ? m.title : (D.role_paths[S.path] || {}).title + ' path';
+    const scope = m ? m.title : 'the whole track';
     main.innerHTML = `<div class="page-narrow"><div class="crumbs"><a href="#dashboard">Home</a><i>›</i>${m ? `<a href="#m.${m.id}">${esc(m.title)}</a><i>›</i>` : ''}<span>Interview drill</span></div>
       <h1>Interview drill</h1><p class="lede">${pool.length} questions from <strong>${esc(scope)}</strong>, shuffled. Answer out loud or in writing before you reveal; this does not change your review schedule unless you ask it to.</p>
       ${m ? '' : `<div class="btn-row" style="margin-bottom:16px"><span class="muted" style="font-size:13px">Narrow to a module:</span><select id="drillMod" class="select" style="width:auto"><option value="">Whole path</option>${modules.filter(mm => modStatus(mm) !== 'skip').map(mm => `<option value="${mm.id}">${esc(mm.title)}</option>`).join('')}</select></div>`}
