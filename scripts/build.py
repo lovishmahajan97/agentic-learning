@@ -21,6 +21,10 @@ KINDS = {"concept", "tool", "metric", "pattern", "practice", "decision"}
 DIFFS = {"intro", "core", "advanced"}
 TOPIC_SECTIONS = ["TL;DR", "Why it exists", "How it works", "Example", "Trade-offs", "Pitfalls",
                   "When to use", "Role lens", "Check yourself", "Quiz"]
+TOPIC_SECTIONS_V2 = ["TL;DR", "Why it exists", "How it works", "Example", "Production patterns", "Trade-offs",
+                     "Pitfalls", "When to use", "Role lens", "Check yourself", "Quiz"]
+V2_FORCE = False          # set by --v2: check files against the crisp format even before they are stamped
+PARA_MAX, BULLET_MAX, TLDR_MAX_V2 = 60, 80, 45
 MODULE_SECTIONS = ["Overview", "Why it matters", "Mental model", "Suggested order", "Capstone"]
 
 # ---------------------------------------------------------------- helpers
@@ -33,6 +37,7 @@ def norm_heading(h):
                "example": "Example", "examples": "Example", "worked example": "Example",
                "trade-offs": "Trade-offs", "tradeoffs": "Trade-offs", "trade offs": "Trade-offs",
                "pitfalls": "Pitfalls", "common pitfalls": "Pitfalls",
+               "production patterns": "Production patterns", "in production": "Production patterns",
                "when to use": "When to use", "when to use / decide": "When to use", "when to use it": "When to use",
                "when to use / when not to": "When to use", "when": "When to use",
                "role lens": "Role lens", "check yourself": "Check yourself", "quiz": "Quiz",
@@ -113,6 +118,37 @@ def bullets(md):
         elif out and ln.strip() and (ln.startswith((" ", "\t")) or not re.match(r"^\d+\.", ln)):
             out[-1] += " " + ln.strip()
     return [b for b in out if b]
+
+def long_blocks(md, para_max=PARA_MAX, bullet_max=BULLET_MAX):
+    """Prose paragraphs over para_max words and list items over bullet_max words (code, tables,
+    headings and quotes excluded). Returns a list of (kind, words, first 50 chars)."""
+    out, in_fence, para, item = [], False, [], []
+    def flush_para():
+        if para:
+            w = words("\n".join(para))
+            if w > para_max: out.append(("paragraph", w, " ".join(para)[:50]))
+            para.clear()
+    def flush_item():
+        if item:
+            w = words("\n".join(item))
+            if w > bullet_max: out.append(("bullet", w, " ".join(item)[:50]))
+            item.clear()
+    for ln in md.splitlines():
+        if re.match(r"^\s*(```|~~~)", ln):
+            in_fence = not in_fence; flush_para(); continue
+        if in_fence: continue
+        st = ln.strip()
+        if not st:
+            flush_para(); continue
+        if re.match(r"^([-*+]|\d+[.)])\s+", st) and not ln.startswith((" " * 4, "\t")):
+            flush_para(); flush_item(); item.append(st); continue
+        if st.startswith(("#", "|", ">")):
+            flush_para(); flush_item(); continue
+        if item and (ln.startswith((" ", "\t"))):
+            item.append(st); continue
+        flush_item(); para.append(st)
+    flush_para(); flush_item()
+    return out
 
 def role_lens(md, errs, where):
     res = {}
@@ -205,25 +241,51 @@ def parse_topic(path: Path):
     got = {}
     for h, c in secs.items():
         nh = norm_heading(h)
-        if nh is None: errs.append(f"unknown '## {h}' section; allowed: {TOPIC_SECTIONS}")
+        if nh is None: errs.append(f"unknown '## {h}' section; allowed: {TOPIC_SECTIONS_V2}")
         elif nh in got: errs.append(f"duplicate section '{nh}'")
         else: got[nh] = c
-    for s in TOPIC_SECTIONS:
+    v2 = V2_FORCE or str(fm.get("status", "")).lower().startswith("crisp") or "Production patterns" in got
+    need = TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS
+    for s in need:
         if s not in got: errs.append(f"missing section '## {s}'")
-    if any(s not in got for s in TOPIC_SECTIONS):
+    if any(s not in got for s in need):
         return None, errs, warns
     is_tool = kind == "tool"
-    mins = {"TL;DR": 15, "Why it exists": 120, "How it works": 150 if is_tool else 250,
-            "When to use": 60}
-    for s, mn in mins.items():
-        w = words(got[s])
-        if w < mn: errs.append(f"'{s}' too short: {w} words (min {mn})")
-    if words(got["TL;DR"]) > 90: errs.append("'TL;DR' too long (max 90 words)")
-    if "```" in got["Example"]:
-        if words(got["Example"]) < 20:
-            errs.append("'Example' needs 20+ words of prose around the code block explaining what it shows")
-    elif words(got["Example"]) < 120:
-        errs.append("'Example' needs either a fenced code block or a worked scenario of 120+ words")
+    patterns = []
+    if not v2:
+        mins = {"TL;DR": 15, "Why it exists": 120, "How it works": 150 if is_tool else 250,
+                "When to use": 60}
+        for s, mn in mins.items():
+            w = words(got[s])
+            if w < mn: errs.append(f"'{s}' too short: {w} words (min {mn})")
+        if words(got["TL;DR"]) > 90: errs.append("'TL;DR' too long (max 90 words)")
+        if "```" in got["Example"]:
+            if words(got["Example"]) < 20:
+                errs.append("'Example' needs 20+ words of prose around the code block explaining what it shows")
+        elif words(got["Example"]) < 120:
+            errs.append("'Example' needs either a fenced code block or a worked scenario of 120+ words")
+    else:
+        # ---- crisp format (SPEC v2)
+        tw = words(got["TL;DR"])
+        if tw < 10 or tw > TLDR_MAX_V2: errs.append(f"'TL;DR' must be 10-{TLDR_MAX_V2} words (found {tw})")
+        if len(bullets(got["Why it exists"])) < 3: errs.append("'Why it exists' needs 3-5 bullets")
+        if words(got["Why it exists"]) < 50: errs.append("'Why it exists' too thin (min 50 words)")
+        hm = 80 if is_tool else 120
+        if words(got["How it works"]) < hm: errs.append(f"'How it works' too thin (min {hm} words)")
+        ex, _, _ = split_sections(got["Example"], level=3)
+        if len(ex) < 2: errs.append(f"'Examples' needs at least 2 examples, each under its own '### title' (found {len(ex)})")
+        if "```" not in got["Example"]: errs.append("'Examples' needs at least one fenced code block")
+        patterns = bullets(got["Production patterns"])
+        if len(patterns) < 3: errs.append(f"'Production patterns' needs 3-6 bullets (found {len(patterns)})")
+        for b in patterns:
+            if not b.startswith("**"): errs.append(f"production pattern must start with a **bold name**: {b[:50]!r}")
+            if words(b) < 15: errs.append(f"production pattern too thin (min 15 words): {b[:50]!r}")
+        if len(bullets(got["When to use"])) < 3: errs.append("'When to use' needs bullets (use when / avoid when / measure)")
+        for sec in ("TL;DR", "Why it exists", "How it works", "Example", "Production patterns",
+                    "Trade-offs", "Pitfalls", "When to use"):
+            for kind_, w, head in long_blocks(got[sec]):
+                lim = PARA_MAX if kind_ == "paragraph" else BULLET_MAX
+                errs.append(f"'{sec}': {kind_} of {w} words (max {lim}); split it: {head!r}")
     tr, pf = bullets(got["Trade-offs"]), bullets(got["Pitfalls"])
     if len(tr) < 3: errs.append(f"'Trade-offs' needs at least 3 bullets (found {len(tr)})")
     if len(pf) < 3: errs.append(f"'Pitfalls' needs at least 3 bullets (found {len(pf)})")
@@ -235,7 +297,7 @@ def parse_topic(path: Path):
          "taxonomy_name": tax_t["name"], "kind": kind, "difficulty": diff, "est_minutes": est,
          "related": [r for r in related if r in ALL_KEYS], "sources": sources,
          "tldr": got["TL;DR"], "why": got["Why it exists"], "how": got["How it works"],
-         "example": got["Example"], "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
+         "example": got["Example"], "patterns": patterns, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
          "role_lens": role_lens(got["Role lens"], errs, "Role lens"),
          "check": check_yourself(got["Check yourself"], errs), "quiz": quiz(got["Quiz"], errs)}
     if "caveat" in tax_t: t["caveat"] = tax_t["caveat"]
@@ -281,6 +343,12 @@ def parse_module(path: Path):
         if s not in capn: errs.append(f"Capstone needs '### {s}'")
     if any(s not in capn for s in ("Brief", "Deliverables", "Rubric")): return None, errs
     if words(capn["Brief"]) < 120: errs.append("Capstone brief too short (min 120 words)")
+    if V2_FORCE or str(fm.get("status", "")).lower().startswith("crisp"):
+        for sec, md_ in (("Overview", got["Overview"]), ("Mental model", got["Mental model"]),
+                         ("Capstone brief", capn["Brief"])):
+            for kind_, w, head in long_blocks(md_):
+                lim = PARA_MAX if kind_ == "paragraph" else BULLET_MAX
+                errs.append(f"'{sec}': {kind_} of {w} words (max {lim}); split it: {head!r}")
     dl, rb = bullets(capn["Deliverables"]), bullets(capn["Rubric"])
     if len(dl) < 3: errs.append("Capstone deliverables: at least 3 bullets")
     if len(rb) < 3: errs.append("Capstone rubric: at least 3 bullets")
@@ -343,7 +411,7 @@ def build(report_only=False):
         for k, v in list(report["invalid"].items())[:40]:
             print(f"  ✗ {k}: {v[0]}")
         return
-    HEAVY = ("why", "how", "example", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
+    HEAVY = ("why", "how", "example", "patterns", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
     built = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     (ROOT / "site" / "data").mkdir(exist_ok=True)
     light_modules, total_bytes = [], 0
@@ -369,6 +437,8 @@ def build(report_only=False):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
+    if "--v2" in a:
+        a.remove("--v2"); V2_FORCE = True
     if a[:1] == ["--check"]:
         sys.exit(1 if check_files(a[1:]) else 0)
     if a[:1] == ["--check-module"]:

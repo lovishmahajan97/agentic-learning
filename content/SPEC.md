@@ -1,97 +1,92 @@
-# Lesson authoring spec
+# Lesson authoring spec (v2: crisp format)
 
-One Markdown file per topic at `content/<module>/<slug>.md`. The `<module>` and `<slug>` come from
-`taxonomy.json` (`modules[].id` and `modules[].topics[].id`). Validate every file you write with:
+One Markdown file per topic at `content/<module>/<slug>.md` (`<module>` and `<slug>` from `taxonomy.json`).
+Check every file you write with both tools and fix until both print ✓:
 
-    python3 scripts/build.py --check content/<module>/<slug>.md
+    python3 scripts/build.py --check --v2 content/<module>/<slug>.md      # format and readability
+    python3 scripts/compare_lesson.py content/<module>/<slug>.md          # nothing lost vs tag pre-crisp
 
-and fix until it prints ✓. The exemplar that sets the quality bar is `content/model-internals/kv-cache.md`.
+The exemplar that sets the bar is `content/model-internals/kv-cache.md`. Read it before writing.
 
 ## Audience and voice
 
-The reader is a working software engineer moving into AI engineering, architecture or forward-deployed
-work. They want to *understand*, not memorize: every lesson must explain the reasoning — what problem
-forced this idea into existence, why the obvious alternative fails, what the mechanism actually does,
-and how to decide in practice. Write like a senior colleague explaining at a whiteboard: direct, concrete,
-no filler, no marketing tone. Use second person sparingly. Prefer numbers, formulas and small examples
-to adjectives. Where a claim is contested or model/vendor-dependent, say so.
+A working software engineer moving into AI engineering, architecture or forward-deployed work. They
+read on a laptop between tasks and must be able to **scan** a lesson: bold lead-ins, short bullets,
+numbered steps, small tables, real code. Every point still carries its reason ("X, because Y"). Write
+like a senior colleague at a whiteboard: direct, concrete, numbers over adjectives, no filler.
 
-## File format (strict)
+## Readability rules (enforced)
+
+- No prose paragraph over **60 words**; no bullet over **80 words**. Split, or turn into a list or table.
+- Lead each bullet with a **bold phrase** that states the point; the rest of the bullet explains it.
+- Prefer tables for comparisons and numbers, numbered lists for sequences, bullets for sets.
+- Code is excluded from the word limits.
+
+## File format
 
 ```
 ---
-id: <slug>                      # must equal the file name
-module: <module id>             # must equal the folder name
-name: <display name>            # the taxonomy name, lightly tidied is fine
-kind: concept | tool | metric | pattern | practice | decision
-difficulty: intro | core | advanced
-est_minutes: <integer reading time, 6–25>
-related:
-  - <module>/<slug>             # 2–8 keys that exist in taxonomy.json
-sources:                        # optional, 0–4; names only, NO URLs
-  - Author(s), year — Title     # or "Official docs: <project>"
+(front matter unchanged from the existing lesson, except: status: crisp)
 ---
 
 ## TL;DR
-15–90 words. The whole idea in two or three sentences, including the *why*.
+1-2 sentences, 10-45 words: what it is and why it matters.
 
 ## Why it exists
-120+ words. The problem that made this necessary, what breaks without it, and why the naive
-alternative is not enough. This is the reasoning section — earn the idea before explaining it.
+3-5 bullets: the forcing problem, why the naive fix fails, what this buys (with numbers when possible).
 
 ## How it works
-250+ words for concepts (150+ for tools). The mechanism step by step. Include the math,
-data-flow or algorithm where one exists, and the reasoning behind each design choice
-("it does X *because* Y"). Sub-headings with `###` are allowed inside this section.
+The mechanism as ### subsections, numbered steps, bullets and tables. Keep formulas and algorithms
+in fenced blocks. Every design choice keeps its "because".
 
-## Example
-A fenced code block (Python unless the topic is Node/TS or SQL) **or** a worked numeric /
-scenario walkthrough of 120+ words. Must be concrete: real numbers, real shapes, a real request.
-Code must be correct and runnable in spirit; keep it under ~40 lines.
+## Examples
+At least 2 examples, each under its own `### title`, at least one with a fenced code block:
+- a runnable code example (Python unless the topic is Node/TS or SQL; under ~40 lines);
+- a worked scenario with real numbers, ideally as a short table (a calculation, an incident, a
+  before/after), or a second code example showing a production use.
+
+## Production patterns
+3-6 bullets, each starting with a **bold pattern name**, then: when to use it, how (a concrete
+setting, config flag, library call or snippet), and what to monitor. Patterns must be things teams
+actually do in production; name real tools only when you are sure the setting exists.
 
 ## Trade-offs
-- 3+ bullets, each 8+ words: what you gain vs. what you pay, with the condition under which it flips.
+3+ bullets: **Gain vs cost.** What you gain, what you pay, and the condition under which it flips.
 
 ## Pitfalls
-- 3+ bullets, each 8+ words: the mistakes people actually make, and the symptom that reveals each.
+3+ bullets: **The mistake.** The symptom that reveals it, and the fix.
 
 ## When to use
-60+ words of decision guidance: when to reach for it, when not to, what to measure, how it
-shows up in day-to-day work and in interviews.
+3+ bullets, e.g. **Use when**, **Avoid when**, **Measure**, **Interviews**.
 
-## Role lens
-- **Engineer:** 12+ words — how an AI Engineer meets this in code.
-- **Architect:** 12+ words — the decision or boundary the Architect owns here.
-- **FDE:** 12+ words — how it shows up inside a customer's environment.
-
-## Check yourself
-**Q:** One interview-style question that requires reasoning, not recall.
-**A:** A 60+ word model answer a strong candidate would give.
-
-## Quiz
-### Q: question text
-- [ ] option
-- [x] correct option (exactly one)
-- [ ] option
-- [ ] option
-> 15+ word explanation of why the right answer is right and the tempting one is wrong.
-
-(exactly 3 questions; distractors must be plausible, not silly)
+## Role lens            (unchanged, copy exactly)
+## Check yourself       (unchanged, copy exactly)
+## Quiz                 (unchanged, copy exactly)
 ```
+
+## Rewriting an existing lesson (the no-loss rule)
+
+You are restructuring, not summarising. `compare_lesson.py` fails the rewrite if anything is lost:
+- front matter must be identical except `status` (set it to `crisp` when both checks pass);
+- `## Role lens`, `## Check yourself` and `## Quiz` must stay byte-for-byte the same in content;
+- every original fenced code block must still appear (you may add new ones);
+- every number and every inline `code` span in the original prose must still appear somewhere.
+Move facts into the new structure rather than deleting them. You may add facts, examples and patterns.
 
 ## Hard rules
 
-- Cover the topic as named in the taxonomy, including every item in its parentheses
-  (e.g. "optimizers (Adam, AdamW)" must explain both and the difference).
-- No invented numbers, benchmarks or citations. If you give a figure, make it one you are sure of
-  or label it as an illustrative order of magnitude.
-- `kind: tool` lessons still need reasoning: what problem the tool solves, what it does under the
-  hood, how it compares to the alternatives named in the taxonomy, and its sharp edges.
-- Caveated topics (distributed training, feature stores) must open the TL;DR by stating the caveat.
-- Do not pad. Hitting the word minimums with fluff is a failure; exceed them only with substance.
+- Cover the topic as named in the taxonomy, including every item in its parentheses.
+- No invented numbers, benchmarks, APIs, config flags or citations. Label rough figures as
+  illustrative orders of magnitude.
+- Caveated topics (distributed training, feature stores) keep the caveat first in the TL;DR.
+- Create and edit files with the Write/Edit tools, not shell heredocs.
 - Keep code blocks free of `## ` at line start (it would be read as a section heading).
 
 ## Module file: `content/<module>/_module.md`
+
+Crisp guides set `status: crisp` in front matter and follow the same readability rules (no paragraph
+over 60 words, no bullet over 80) in Overview, Mental model and the Capstone brief. Validate with
+`python3 scripts/build.py --check --v2 content/<module>/_module.md`.
 
 ```
 ---
