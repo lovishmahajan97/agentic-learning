@@ -73,8 +73,9 @@ between the two roles.
 
 ### From Node
 Two mainstream clients: `ioredis` (long the de-facto standard and what BullMQ uses) and `redis`
-(node-redis, the official client). Both are promise-based, pipeline automatically when commands are
-issued without awaiting in between, and support Lua scripts, Cluster and Sentinel. Node-specific rules:
+(node-redis, the official client). Both are promise-based, support pipelining (node-redis batches
+un-awaited commands automatically, ioredis with `enableAutoPipelining` or an explicit `pipeline()`),
+and support Lua scripts, Cluster and Sentinel. Node-specific rules:
 - A connection in subscriber mode or running a blocking command (`BLPOP`, `XREAD BLOCK`) cannot issue
   other commands, so pub/sub and blocking consumers get their own connection; BullMQ needs a dedicated
   connection for the same reason.

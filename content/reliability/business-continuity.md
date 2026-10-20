@@ -5,6 +5,7 @@ name: Business continuity
 kind: practice
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - reliability/disaster-recovery
   - reliability/fmea

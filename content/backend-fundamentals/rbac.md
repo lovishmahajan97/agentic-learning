@@ -24,10 +24,9 @@ sources:
 ## TL;DR
 Role-based access control puts one layer of indirection, the role, between who a caller is and what
 they may do: permissions attach to roles, callers are assigned roles within a scope, and a request is
-allowed only if some role of the caller grants that permission on that scope. It exists because
-assigning permissions directly to users does not survive growth: the assignment table explodes, access
-reviews become impossible and offboarding leaks. In AI systems the same model must also bound what an
-agent can do on a user's behalf and what a retriever may surface.
+allowed only if some role of the caller grants that permission there. It exists because assigning
+permissions directly to users does not survive growth: the assignment table explodes, access reviews
+become impossible and offboarding leaks. The same check must bound what an agent may do for a user.
 
 ## Why it exists
 Authentication answers "who is calling"; every request after that has to answer "may they do this".

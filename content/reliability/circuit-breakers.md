@@ -5,6 +5,7 @@ name: Circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - reliability/bulkheads
   - reliability/fault-tolerance
@@ -253,6 +254,8 @@ utilization should stay flat.
 - [ ] The breaker trips faster because each attempt is counted
 - [x] Each counted call takes roughly three timeouts to register as a failure, delaying the trip while retries triple load on the failing dependency
 - [ ] The retries are skipped automatically once the first attempt fails
-> With retries inside, the breaker sees one slow call per three real attempts, so it accumulates failures
-> three times more slowly and the dependency receives three times the traffic. Put retry outside the
-> breaker and make `CircuitOpen` non-retryable.
+> With retries inside, the breaker records one outcome per request, and only after all three attempts
+> have timed out, so it reaches its minimum-calls threshold a third as fast as when every attempt is
+> counted, and until it trips every request keeps sending three attempts to the dependency. With retry
+> outside and `CircuitOpen` non-retryable, each attempt is counted, the trip comes sooner, and the
+> remaining attempts short-circuit instead of reaching the network.

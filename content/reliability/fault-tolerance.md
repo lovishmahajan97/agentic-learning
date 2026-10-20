@@ -5,6 +5,7 @@ name: Fault tolerance
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - reliability/high-availability
   - reliability/circuit-breakers
@@ -99,9 +100,11 @@ lead. Detection thresholds are therefore a trade between failover speed and the 
 wrong diagnosis.
 
 ## Example
-A provider call wrapped in the first six tools: an overall deadline, per-attempt timeout, retries only
-on transient statuses, full-jitter backoff that honours `Retry-After`, and a fallback that degrades
-instead of failing. It assumes the call itself has no side effects, so repeating it is safe.
+A provider call wrapped in tools 1, 2 and 6 from the list: an overall deadline, per-attempt timeout,
+retries only on transient statuses, full-jitter backoff that honours `Retry-After`, and a fallback that
+degrades instead of failing. It assumes the call itself has no side effects, so repeating it is safe
+(tool 3 satisfied by construction); the breaker and bulkhead (4 and 5) sit around this function, not
+inside it.
 
 ```python
 import random, time
@@ -121,6 +124,8 @@ def tolerant_complete(primary, fallback, req, *, budget_s=45, attempt_timeout_s=
         try:
             return primary(req, timeout_s=min(attempt_timeout_s, remaining))
         except Transient as e:                         # non-transient errors propagate: retrying cannot fix them
+            if attempt == max_attempts - 1:
+                break                                  # no attempts left: do not sleep for nothing
             sleep = e.retry_after if e.retry_after is not None \
                 else random.uniform(0, min(cap_s, base_s * 2 ** attempt))   # full jitter
             if time.monotonic() + sleep >= deadline:

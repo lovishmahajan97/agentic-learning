@@ -25,9 +25,9 @@ sources:
 Adversarial evaluation measures how a system behaves on inputs chosen to make it fail: jailbreaks,
 instructions injected through retrieved content, perturbed or out-of-distribution inputs, and outputs
 crafted to fool the grader. Red teaming discovers such inputs; adversarial evaluation turns them into a
-versioned suite with an attack success rate per attack class, run on every release, and reports it next
-to the over-refusal rate on benign inputs. It exists because average-case evals say nothing about the
-worst case, and the worst case is what attackers and frustrated users find.
+versioned suite with an attack success rate per class, run every release and reported next to the
+over-refusal rate on benign inputs. It exists because average-case evals say nothing about the worst
+case, which is what attackers find.
 
 ## Why it exists
 A golden set sampled from typical traffic measures the centre of the distribution. The failures that

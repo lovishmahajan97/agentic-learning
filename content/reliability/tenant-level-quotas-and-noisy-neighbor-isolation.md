@@ -5,6 +5,7 @@ name: Tenant-level quotas & noisy-neighbor isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - reliability/bulkheads
   - reliability/backpressure-and-load-shedding
