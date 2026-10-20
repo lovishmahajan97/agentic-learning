@@ -5,7 +5,7 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/chunk-overlap
@@ -22,93 +22,113 @@ sources:
 ---
 
 ## TL;DR
-Granularity is the size of the unit you retrieve: sentence, proposition, passage, section or whole
-document. Small units make sharp vectors and precise matches but starve the generator of context;
-large units carry context but blur the vector and crowd the prompt. The resolving move is to separate
-the unit you *match on* from the unit you *return*: index small, return the enclosing parent. The
-right pair depends on the question type and the context budget, and should be measured, not assumed.
+Granularity is the size of the retrieved unit, from sentence to document. Small units match sharply but
+starve the generator; large units carry context but blur vectors. Resolve it by matching on small units
+and returning their parent, measured per question type.
 
 ## Why it exists
-Chunking decides how a document is cut; granularity asks a different question: which cut should be the
-unit of retrieval, scoring and return? The tension is built into dense retrieval. A vector is a fixed
-size summary of its input. Embed a single sentence and the vector says exactly one thing, so a question
-asking that thing matches it sharply. Embed a whole section and the vector says ten things at once, so
-the same question matches it only moderately and may lose to a shorter chunk that mentions the topic
-in passing. Precision at match time therefore favours small units.
-
-The generator wants the opposite. A matched sentence such as "the cap is 12 months of fees" is useless
-without the surrounding clause that says which cap, under which contract, with which exceptions.
-Returning only the sentence produces confident, wrong answers. Returning the whole document fixes the
-context but wastes most of the prompt budget on irrelevant text, and long contexts make models worse at
-using facts buried in the middle. Context at generation time therefore favours large units.
-
-The naive solution, one chunk size chosen as a compromise for both jobs, is exactly that: a compromise
-that is mediocre at both. The insight behind retrieval granularity is that nothing forces the match
-unit and the return unit to be the same object. Match on sentences, return sections, and the compromise
-disappears; what remains is a set of engineering choices about how units point to their parents.
+- **It is a different question from chunking.** Chunking decides how a document is cut; granularity
+  decides which cut is the unit of retrieval, scoring and return.
+- **Matching favours small units.** A vector is a fixed-size summary of its input. A sentence's vector
+  says one thing and matches that question sharply; a section's vector says ten things and may lose to a
+  shorter chunk that mentions the topic in passing.
+- **Generation favours large units.** "The cap is 12 months of fees" is useless without the clause that
+  says which cap, under which contract, with which exceptions; alone it produces confident, wrong
+  answers. A whole document wastes the budget, and long contexts make models worse at using facts buried
+  in the middle.
+- **One compromise size is mediocre at both jobs.** Nothing forces the match unit and the return unit to
+  be the same object. Match on sentences, return sections, and the compromise disappears; what remains
+  is how units point to their parents.
 
 ## How it works
 ### The ladder of units
-From fine to coarse: **propositions** (atomic factual statements, often rewritten by an LLM so each
-stands alone), **sentences**, **windows** (a sentence plus a few neighbours), **passages or chunks**
-(a few hundred tokens), **sections** (heading-delimited), **documents**, and **document summaries**.
-Each level can serve as the match unit, the return unit, or both. Going finer sharpens matching and
-raises the number of vectors (cost, index size); going coarser does the reverse.
+| Unit (fine to coarse) | What it is |
+|---|---|
+| **Propositions** | atomic factual statements, often rewritten by an LLM so each stands alone |
+| **Sentences** | one sentence |
+| **Windows** | a sentence plus a few neighbours |
+| **Passages or chunks** | a few hundred tokens |
+| **Sections** | heading-delimited |
+| **Documents** | the whole file |
+| **Document summaries** | a generated digest per document |
+
+- Each level can be the match unit, the return unit, or both.
+- Finer sharpens matching and raises the number of vectors (cost, index size); coarser does the reverse.
 
 ### Decoupling match from return
-Index the small unit with a pointer to its parent: `{unit_id, text, parent_id, position}`. At query
-time, retrieve the top-N small units, map each to its parent, deduplicate parents (several sentences
-from one section are one hit), score each parent by its best child (or by a sum that rewards sections
-with several matching sentences), and return the top-k parents to the generator. This works *because*
-the sharpness of sentence vectors is preserved for matching while the generator gets the section that
+Index the small unit with a pointer to its parent: `{unit_id, text, parent_id, position}`. At query time:
+1. Retrieve the top-N small units.
+2. Map each to its parent.
+3. Deduplicate parents (several sentences from one section are one hit).
+4. Score each parent by its best child, or by a sum that rewards sections with several matching sentences.
+5. Return the top-k parents to the generator.
+
+This works *because* sentence vectors stay sharp for matching while the generator gets the section that
 makes the sentence interpretable. It is the mechanism behind sentence-window retrieval, parent-document
 retrieval and auto-merging retrievers in common frameworks.
 
 ### Variants
-- **Sentence window:** match on a sentence, return that sentence plus `w` neighbours on each side.
-  Cheap and local; good for factoids where the answer lives within a few sentences.
-- **Parent chunk:** match on small chunks (say 128 tokens), return the enclosing larger chunk (say
-  1,024 tokens) or section. The standard small-to-big setup.
+- **Sentence window:** match a sentence, return it plus `w` neighbours on each side. Cheap and local;
+  good for factoids whose answer lives within a few sentences.
+- **Parent chunk:** match small chunks (say 128 tokens), return the enclosing larger chunk (say 1,024
+  tokens) or section. The standard small-to-big setup.
 - **Auto-merging:** if enough children of one parent are retrieved, replace them with the parent;
   otherwise keep the children. Adapts the returned size to how concentrated the evidence is.
-- **Summary-then-chunk:** match on per-document summaries to pick documents, then on chunks within
-  the chosen documents. A two-level index that scales to large corpora where many documents share
-  vocabulary.
-- **Proposition retrieval:** rewrite text into self-contained statements before embedding, so each
-  unit carries its own subject and no dangling references. Research on this (Chen et al., 2023)
-  reports gains on question answering at the cost of an LLM pass over the whole corpus at indexing
-  time.
-- **Multi-vector (late interaction):** the finest match granularity is the token. ColBERT-style models
-  keep one vector per token and score a passage by summing, over query tokens, each one's best match
-  among the passage tokens. The returned unit stays the passage, so this is decoupling taken to its
-  limit: matching sees fine detail without a separate parent lookup, paid for with an index that holds
-  one vector per token instead of one per chunk.
+- **Summary-then-chunk:** match per-document summaries to pick documents, then chunks within them. A
+  two-level index that scales to large corpora where many documents share vocabulary.
+- **Proposition retrieval:** rewrite text into self-contained statements before embedding, so each unit
+  carries its subject and no dangling references. Chen et al., 2023 report question-answering gains, at
+  the cost of an LLM pass over the whole corpus at indexing time.
+- **Multi-vector (late interaction):** the finest match unit is the token. ColBERT-style models keep one
+  vector per token and score a passage by summing, over query tokens, each one's best match among
+  passage tokens. The return unit stays the passage: decoupling at its limit, paid for with one vector
+  per token instead of one per chunk.
 
 ### Making the small unit self-sufficient
-A sentence like "The cap is twelve months of fees" embeds well only if the vector knows *which* cap.
-Small units therefore benefit most from carrying context into their own embedded text: the heading
-path, the document title, or a short generated description of where the span sits (contextual
-retrieval). The rule of thumb is that the finer the match unit, the more it depends on this, because
-a sentence has less of its own context to lean on than a 500-token passage.
+- **"The cap is twelve months of fees" embeds well only if the vector knows *which* cap.**
+- Carry context into the embedded text: the heading path, the document title, or a short generated
+  description of where the span sits (contextual retrieval).
+- **The finer the match unit, the more it depends on this**, because a sentence has less of its own
+  context to lean on than a 500-token passage.
 
 ### Scoring parents
-Max-child scoring is simple and favours sections with one strongly matching sentence; sum or
-count-based scoring favours sections where the topic is discussed at length. Which is right depends on
-the question: "what is the default timeout" wants max; "explain the retry policy" wants breadth. Many
-systems retrieve more parents than needed and let a cross-encoder reranker, which reads query and
+| Scoring | Favours | Question type |
+|---|---|---|
+| Max child | one strongly matching sentence | "what is the default timeout" |
+| Sum or count | topic discussed at length | "explain the retry policy" |
+
+Many systems retrieve more parents than needed and let a cross-encoder reranker, which reads query and
 parent text together, settle the order.
 
 ### Interaction with the context budget
-With a budget of, say, 4,000 tokens of evidence, you can fit forty 100-token sentence windows, eight
-500-token passages or two 2,000-token sections. The generator's ability to use the evidence degrades as the
-prompt grows and as relevant facts move away from the beginning and end, so returning fewer, larger,
-well-chosen parents is usually better than filling the budget with many small fragments. Granularity
-is thus also a lever on lost-in-the-middle effects.
+- **A budget of, say, 4,000 tokens of evidence** fits forty 100-token sentence windows, eight 500-token
+  passages or two 2,000-token sections.
+- **Usage degrades** as the prompt grows and as relevant facts move away from the beginning and end.
+- **So fewer, larger, well-chosen parents** usually beat filling the budget with small fragments.
+  Granularity is also a lever on lost-in-the-middle effects.
 
-## Example
-Small-to-big retrieval with sentence-level matching and section-level return, using a local embedding
-model. Each sentence carries a `parent` pointer; parents are deduplicated and scored by their best
-sentence.
+## Diagram
+Follow the small-to-big path: small units are matched, mapped to parents, deduplicated and scored, and
+only bounded parents reach the generator's evidence budget.
+
+```mermaid
+flowchart TD
+    Q["Query"] --> V[("Index of small units, each with parent_id")]
+    V -->|"top-N units"| P["Map each unit to its parent"]
+    P --> D["Deduplicate parents"]
+    D --> S{"Question type?"}
+    S -->|"pointed factoid"| MX["Score parent by max child"]
+    S -->|"explain or compare"| SM["Score by sum or count, or auto-merge"]
+    MX --> R["Optional cross-encoder rerank"]
+    SM --> R
+    R --> B["Pack top-k parents into evidence budget"]
+    B --> G["Generator"]
+```
+
+## Examples
+### Small-to-big: match sentences, return sections
+Sentence-level matching and section-level return with a local embedding model. Each sentence carries a
+`parent` pointer; parents are deduplicated and scored by their best sentence.
 
 ```python
 import re, numpy as np
@@ -145,42 +165,94 @@ for hit in retrieve("how much can fees be capped at?"):
 # receives the whole section, including the exclusions it needs to answer correctly.
 ```
 
+### Auto-merging in a few lines
+Return the parent when evidence is concentrated, the children when it is scattered. Pure Python.
+
+```python
+def auto_merge(child_hits, children_of, ratio=0.5):
+    """Replace a parent's retrieved children with the parent when enough of them matched."""
+    out = {}
+    for pid, kids in children_of.items():
+        hit = [c for c in kids if c in child_hits]
+        if not hit:
+            continue
+        if len(hit) / len(kids) >= ratio:                     # evidence concentrated: return parent
+            out[pid] = max(child_hits[c] for c in hit)
+        else:                                                 # scattered: keep the small units
+            out.update({c: child_hits[c] for c in hit})
+    return sorted(out.items(), key=lambda kv: -kv[1])
+
+children_of = {"retry-policy": ["r1", "r2", "r3", "r4"], "timeouts": ["t1", "t2", "t3", "t4"]}
+child_hits = {"r1": 0.71, "r2": 0.74, "r3": 0.69, "t2": 0.66}
+print(auto_merge(child_hits, children_of))
+# [('retry-policy', 0.74), ('t2', 0.66)]: 3 of 4 retry children matched, so return the section
+```
+
+### Worked scenario: spending a 4,000-token evidence budget
+| Return unit | Units that fit | Typical outcome |
+|---|---|---|
+| 100-token sentence windows | 40 | sharp but fragmented; "explain" questions never add up |
+| 500-token passages | 8 | balanced default for mixed question types |
+| 2,000-token sections | 2 | full context; one wrong parent wastes half the budget |
+
+A legal-search team on 1,024-token chunks saw the clause with the liability cap rank fourth. Moving to
+sentence matching with clause-level return put it first, while prompts stayed bounded because parents
+are clauses, not whole contracts.
+
+## Production patterns
+- **Parent-document retriever** — when pointed questions rank diluted chunks above the precise one, use
+  LangChain's `ParentDocumentRetriever` with a small `child_splitter` and a larger `parent_splitter`
+  (children in the vector store, parents in a docstore). Monitor parent-level recall@k and prompt tokens.
+- **Sentence window with metadata replacement** — for factoid-heavy corpora, LlamaIndex's
+  `SentenceWindowNodeParser` stores neighbours in metadata and `MetadataReplacementPostProcessor` swaps
+  them in after retrieval. Monitor answers that miss a qualifier from just outside the window.
+- **Over-retrieve parents, then rerank** — fetch more parents than you will send (for example 20 for a
+  final 5) and let a cross-encoder order them. Monitor reranker latency p95 and the rank of the gold
+  parent before and after reranking.
+- **Hard evidence budget** — pack parents in rank order until a fixed evidence token cap, truncating or
+  dropping the rest rather than growing the prompt. Monitor prompt tokens p95 and truncation rate.
+- **Granularity per question type** — route factoid queries to max-child scoring and explanatory or
+  comparison queries to sum scoring or auto-merging. Monitor eval scores split by query type, not one
+  blended number.
+
 ## Trade-offs
-- Finer match units sharpen retrieval but multiply the number of vectors; a sentence index holds
-  roughly (passage length / sentence length) times as many vectors as a passage index, often an order
-  of magnitude more for few-hundred-token passages, which matters at tens of millions of units.
-- Larger return units give the generator context but spend the budget faster and push facts toward
-  the middle of the prompt, where models use them least reliably; the flip point is your context budget.
-- Max-child parent scoring is simple and good for pointed factual questions, while sum-based scoring
-  rewards depth and suits explanatory questions; choose per query type or let a reranker decide.
-- Proposition rewriting yields self-contained units and reported retrieval and QA gains (largest for
-  retrievers not trained on the target domain), but costs an LLM pass over
-  the whole corpus at indexing time and again on every update; it flips to "not worth it" on large,
-  fast-changing corpora.
-- Two-level summary-then-chunk retrieval scales well on large corpora with repeated vocabulary, but
-  adds a stage whose failure (wrong document chosen) cannot be recovered by the second stage.
+- **Fine match units vs vector count.** A sentence index holds roughly (passage length / sentence
+  length) times as many vectors as a passage index, often an order of magnitude more for few-hundred-
+  token passages, which matters at tens of millions of units.
+- **Large return units vs budget and position.** They give context but spend the budget faster and push
+  facts toward the middle of the prompt, where models use them least reliably; the flip point is your
+  context budget.
+- **Max-child vs sum scoring.** Max is simple and good for pointed factual questions; sum rewards depth
+  and suits explanatory ones. Choose per query type or let a reranker decide.
+- **Propositions vs indexing cost.** Self-contained units brought reported retrieval and QA gains
+  (largest for retrievers not trained on the target domain), but cost an LLM pass over the corpus at
+  indexing time and on every update; not worth it on large, fast-changing corpora.
+- **Summary-then-chunk scale vs unrecoverable misses.** It scales on large corpora with repeated
+  vocabulary, but if the first stage picks the wrong document, the second stage cannot recover.
 
 ## Pitfalls
-- Returning the matched sentence alone; the symptom is answers that quote a fact correctly but attach
-  it to the wrong entity or ignore an exception stated in the next sentence.
-- Not deduplicating parents, so the top-k is three sentences from the same section; the symptom is
-  one source dominating every answer and other relevant sections never appearing.
-- Choosing one chunk size for matching and returning and tuning it endlessly; the symptom is a
-  recall-versus-answer-quality seesaw that no single value settles.
-- Making parents so large that two of them fill the context; the symptom is long prompts, slow and
-  costly generations, and facts in the middle of the prompt being ignored.
-- Treating granularity as fixed across question types; the symptom is factoid queries doing well while
-  "explain" or "compare" queries get fragments that never add up to a complete picture.
+- **Returning the matched sentence alone.** Answers quote a fact correctly but attach it to the wrong
+  entity or ignore an exception stated in the next sentence.
+- **Not deduplicating parents.** The top-k is three sentences from one section; one source dominates
+  every answer and other relevant sections never appear.
+- **One size for matching and returning.** Tuning it endlessly gives a recall-versus-answer-quality
+  seesaw that no single value settles.
+- **Parents so large that two fill the context.** Prompts get long, generations slow and costly, and
+  facts in the middle of the prompt are ignored.
+- **Fixed granularity across question types.** Factoid queries do well while "explain" or "compare"
+  queries get fragments that never add up to a complete picture.
 
 ## When to use
-Decouple matching from returning as soon as you see either precision problems (large chunks scoring
-middling for pointed questions) or context problems (small chunks producing answers that lack
-qualifiers). Start with sentence- or small-chunk matching and section-level return, dedupe parents,
-and score by max child; move to auto-merging or sum scoring when explanatory queries dominate. Keep
-whole-document retrieval for short documents such as FAQs or tickets, where the document is already
-the right unit. Measure recall@k at the parent level, answer faithfulness, and prompt token usage
-together, because granularity moves all three. In interviews, the expected answer to "what chunk size
-should we use" is "which size for matching and which for returning, and why they need not be equal".
+- **Decouple when:** you see precision problems (large chunks scoring middling for pointed questions) or
+  context problems (small chunks producing answers that lack qualifiers).
+- **Start with:** sentence- or small-chunk matching, section-level return, parent dedupe and max-child
+  scoring; move to auto-merging or sum scoring when explanatory queries dominate.
+- **Keep whole-document retrieval:** for short documents such as FAQs or tickets, where the document is
+  already the right unit.
+- **Measure:** parent-level recall@k, answer faithfulness and prompt token usage together, because
+  granularity moves all three.
+- **Interviews:** answer "what chunk size should we use" with "which size for matching and which for
+  returning, and why they need not be equal".
 
 ## Role lens
 - **Engineer:** Stores parent pointers on every unit, implements parent dedupe and scoring in the
@@ -202,6 +274,40 @@ cap together with its exceptions. I would watch three things: index size, which 
 units; parent-level recall@k on a golden set of clause questions, which should rise; and prompt length,
 which should not balloon because parents are bounded clauses rather than whole contracts. If
 explanatory queries regress, I would add sum-based parent scoring or a reranker over the parents.
+
+## Interview questions
+### How is retrieval granularity different from chunking?
+- **Chunking** decides how a document is cut into pieces.
+- **Granularity** decides which unit is matched, scored and returned, and the match unit and return unit
+  need not be the same object.
+- **Why it matters:** small vectors match sharply, large units give the generator context, so separating
+  the two removes the compromise size.
+
+### Design small-to-big retrieval for a product manual. What do you store and what happens at query time?
+- **Store** small units (sentences or about 128-token chunks) with `{unit_id, text, parent_id, position}`,
+  and parents (sections or larger chunks) in a docstore.
+- **Query:** retrieve top-N units, map to parents, deduplicate, score by best child, return the top-k
+  parents.
+- **Make units self-sufficient** by embedding the heading path or title with each small unit.
+
+### When would you not use sentence-level matching?
+- **Short documents** such as FAQs or tickets are already the right unit, so whole-document retrieval is
+  simpler.
+- **Very large corpora:** a sentence index can hold an order of magnitude more vectors than a passage
+  index, which costs storage and latency at tens of millions of units.
+- **Explanatory-heavy traffic** may be better served by passage units with sum scoring or auto-merging.
+
+### You have a 4,000-token evidence budget. How do you decide what to send?
+- **Do the arithmetic:** forty 100-token windows, eight 500-token passages or two 2,000-token sections.
+- **Prefer fewer, well-chosen parents,** because usage degrades as prompts grow and facts drift to the
+  middle.
+- **Over-retrieve and rerank,** then pack in rank order until the cap, and monitor truncation rate and
+  prompt tokens p95.
+
+### Answers quote the right number but miss an exception stated in the next sentence. What is wrong?
+- **The return unit is too small:** the retriever is sending the matched sentence alone.
+- **Fix:** return a sentence window or the parent clause, so the qualifier travels with the fact.
+- **Verify** with faithfulness checks on a golden set of questions whose answers carry exceptions.
 
 ## Quiz
 ### Q: Why does indexing small units and returning larger parents outperform a single compromise chunk size?

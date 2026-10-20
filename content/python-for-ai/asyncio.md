@@ -5,7 +5,7 @@ name: asyncio
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - python-for-ai/async-await
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -21,104 +21,114 @@ sources:
 ---
 
 ## TL;DR
-An AI service spends almost all of its wall-clock time waiting: on an LLM provider, a vector database,
-a tool endpoint. asyncio lets one thread interleave thousands of those waits by running coroutines on
-an event loop that only resumes a coroutine when the thing it awaited is ready. You get high
-concurrency for I/O at near-zero per-task cost, in exchange for a strict contract: nothing on the loop
-may block, or everything stalls.
+asyncio runs coroutines on a single-threaded event loop that resumes each one only when what it awaited
+is ready. An AI service, which mostly waits on LLMs, vector stores and tools, gets thousands of
+concurrent waits cheaply, provided nothing on the loop ever blocks.
 
 ## Why it exists
-Take a chat backend that calls a model with a 3-second median response and streams it back. A
-synchronous handler holds its thread for those 3 seconds doing nothing but waiting on a socket. Serving
-1,000 concurrent chats that way needs 1,000 threads: each costs a kernel object, a reserved stack
-(the platform default ranges from 512 KB on macOS to 8 MB on typical Linux, mostly virtual address space
-rather than resident memory), and scheduler time, and under the GIL
-they cannot even run Python in parallel. Most of that machinery exists only to wait.
-
-The naive fix, a bigger thread pool, moves the ceiling but not the shape of the cost. The sharper
-observation is that a waiting handler needs almost no state: a socket to watch and the point in the
-code to resume from. The operating system already offers a cheap way to watch many sockets at once
-(`epoll` on Linux, `kqueue` on macOS, IOCP on Windows). What Python lacked was a way to suspend a
-function mid-body, keep its locals, and resume it when the socket is ready. Generators had that
-ability since `yield`; PEP 492 gave it dedicated syntax (`async def` / `await`), and asyncio is the
-scheduler that connects those suspended functions to the OS readiness notifications. Callback-style
-frameworks solved the same problem earlier, but the code read as a graph of callbacks; coroutines keep
-it reading top to bottom while behaving the same way underneath.
+- **AI services mostly wait.** A chat backend calling a model with a 3-second median response holds a
+  synchronous thread for those 3 seconds doing nothing but waiting on a socket.
+- **Threads are an expensive way to wait.** 1,000 concurrent chats need 1,000 threads, each with a kernel
+  object, scheduler time and a reserved stack (512 KB on macOS to 8 MB on typical Linux, mostly virtual
+  address space rather than resident memory). Under the GIL they cannot even run Python in parallel.
+- **A bigger pool moves the ceiling, not the cost shape.** A waiting handler needs almost no state: a
+  socket to watch and the point in the code to resume from.
+- **The OS already watches many sockets cheaply** (`epoll` on Linux, `kqueue` on macOS, IOCP on Windows).
+  Python lacked a way to suspend a function mid-body, keep its locals and resume it later. Generators had
+  that since `yield`; PEP 492 gave it syntax (`async def` / `await`); asyncio is the scheduler joining
+  suspended functions to OS readiness events.
+- **Coroutines beat callbacks for readability.** Callback frameworks solved the same problem, but code
+  read as a graph of callbacks; coroutines read top to bottom and behave the same underneath.
 
 ## How it works
 ### The three objects
-- A **coroutine** is what calling an `async def` function returns: a suspended frame that has not
-  started. It runs only when something drives it.
-- A **Future** is a one-shot result holder with callbacks: "when this is set, call these". Socket
-  readiness, timers and thread results all surface as futures.
-- A **Task** wraps a coroutine in a future and drives it. Each time the coroutine `await`s something
-  that is not ready, the task registers a callback on that future and returns control to the loop.
-  When the future resolves, the callback reschedules the task, which resumes the coroutine exactly
-  where it stopped.
+| Object | What it is | Role |
+|---|---|---|
+| **Coroutine** | What calling an `async def` function returns: a suspended frame that has not started | Runs only when something drives it |
+| **Future** | One-shot result holder with callbacks: "when this is set, call these" | Socket readiness, timers and thread results all surface as futures |
+| **Task** | A coroutine wrapped in a future, plus the driver | On each `await` of a not-ready future, registers a callback and returns control to the loop; when the future resolves, the task is rescheduled and resumes exactly where it stopped |
 
 ### One iteration of the loop
 The event loop is a single-threaded `while True`:
-1. Compute how long until the earliest timer (`asyncio.sleep`, timeouts).
-2. Ask the OS selector for sockets that are readable or writable, waiting at most that long. This is
-   the only place the thread blocks, and it blocks on behalf of *all* tasks at once.
-3. For each ready socket or expired timer, queue its handler. Running the handler reads the bytes and
-   resolves the corresponding future, and resolving a future schedules the waiting task's step callback
-   with `call_soon`, so it lands on the ready queue too.
-4. Drain the callbacks that were ready when this iteration began, in FIFO order, running each task
-   until its next `await`. Anything they schedule waits for the next iteration, *because* otherwise a
-   task that keeps rescheduling itself could starve the selector and every timer.
+1. **Find the next deadline.** Compute how long until the earliest timer (`asyncio.sleep`, timeouts).
+2. **Wait on the selector.** Ask the OS for readable or writable sockets, waiting at most that long. This
+   is the only place the thread blocks, and it blocks on behalf of *all* tasks at once.
+3. **Queue handlers.** For each ready socket or expired timer, queue its handler. The handler reads the
+   bytes and resolves the future; resolving schedules the waiting task's step callback with `call_soon`,
+   so it lands on the ready queue too.
+4. **Drain the ready queue.** Run the callbacks that were ready when this iteration began, in FIFO order,
+   each task until its next `await`. New work waits for the next iteration, *because* a task that keeps
+   rescheduling itself could otherwise starve the selector and every timer.
 
-Step 4 is why asyncio is called *cooperative*: a task runs until it voluntarily yields at an `await`
-on a not-yet-ready future. Awaiting an already-complete future, or a plain coroutine that never touches
-I/O, does not yield at all; `await asyncio.sleep(0)` is the explicit "let others run" hint.
+**Why "cooperative":** a task runs until it voluntarily yields at an `await` on a not-yet-ready future.
+- Awaiting an already-complete future, or a plain coroutine that never touches I/O, does not yield at all.
+- `await asyncio.sleep(0)` is the explicit "let others run" hint.
 
 ### Design choices and their reasons
-- **Single thread** *because* it removes data races between awaits: between two `await`s, no other
-  task can touch your state. It does not remove races *across* an await (read, await, write), which is
-  what `asyncio.Lock` is for. The single thread is also why a blocking call (`time.sleep`,
-  `requests.get`, a CPU-heavy loop) freezes every task; there is no other thread to keep the loop turning.
-- **Explicit `await` points** *because* they make interleaving visible in the source. A sync-looking
-  line can never secretly switch tasks, which is the property that makes most asyncio code reasonable
-  without locks.
-- **`create_task` schedules rather than runs** *because* the creator should continue; the new task
-  starts on a later loop iteration. `asyncio.gather(*coros)` wraps each coroutine in a task and
-  returns their results in order; `asyncio.TaskGroup` (3.11+) does the same with structured
-  cancellation.
-- **Blocking work is pushed off the thread** with `asyncio.to_thread(fn, *args)` (a
-  `ThreadPoolExecutor` under the hood) or `loop.run_in_executor(process_pool, fn)`, and the result
-  comes back as a future the loop can await. The loop stays responsive; the work is still serialized by
-  the GIL if it is pure Python.
+- **Single thread**, *because* it removes data races between awaits: between two `await`s, no other task
+  can touch your state. It does not remove races *across* an await (read, await, write); that is what
+  `asyncio.Lock` is for.
+- **The cost of one thread.** A blocking call (`time.sleep`, `requests.get`, a CPU-heavy loop) freezes
+  every task, because there is no other thread to keep the loop turning.
+- **Explicit `await` points**, *because* they make interleaving visible in the source. A sync-looking line
+  can never secretly switch tasks, which is why most asyncio code is reasonable without locks.
+- **`create_task` schedules rather than runs**, *because* the creator should continue; the new task starts
+  on a later loop iteration. `asyncio.gather(*coros)` wraps each coroutine in a task and returns results in
+  order; `asyncio.TaskGroup` (3.11+) does the same with structured cancellation.
+- **Blocking work goes off the thread** with `asyncio.to_thread(fn, *args)` (a `ThreadPoolExecutor` under
+  the hood) or `loop.run_in_executor(process_pool, fn)`; the result comes back as an awaitable future. The
+  loop stays responsive, but pure-Python work is still serialized by the GIL.
 
 ### Coordinating many tasks
 The primitives differ in what they give back and when, which is the real choice:
-- `gather` returns all results in input order once every child is done; use it when you need them all.
-- `as_completed` yields results in finish order, so a UI or a pipeline can act on the fastest answer
-  first instead of waiting for the slowest.
-- `asyncio.wait(..., return_when=FIRST_COMPLETED)` returns `(done, pending)` sets and leaves the
-  pending tasks running, which is the building block for "take the first good answer, cancel the rest".
-- `TaskGroup` is `gather` with structured cleanup: if one child fails, the rest are cancelled.
-- `asyncio.Queue(maxsize=N)` with a fixed number of worker tasks bounds both concurrency and memory,
-  *because* producers block on `put` when consumers fall behind (backpressure), whereas `gather` over
-  10,000 coroutines creates 10,000 tasks up front.
+
+| Primitive | Returns | Use it when |
+|---|---|---|
+| `gather` | All results, input order, once every child is done | You need them all |
+| `as_completed` | Results in finish order | A UI or pipeline should act on the fastest answer first |
+| `asyncio.wait(..., return_when=FIRST_COMPLETED)` | `(done, pending)` sets; pending tasks keep running | "Take the first good answer, cancel the rest" |
+| `TaskGroup` | Like `gather`, with structured cleanup | One child failing should cancel the rest |
+| `asyncio.Queue(maxsize=N)` + fixed workers | Whatever workers produce | You must bound concurrency and memory |
+
+- **Queues give backpressure**, *because* producers block on `put` when consumers fall behind.
+- **`gather` does not**: over 10,000 coroutines it creates 10,000 tasks up front.
 
 ### Measuring loop health
-The number that tells you whether the loop is healthy is **loop lag**: schedule a callback for time *t*
-and record when it actually runs. A task doing `await asyncio.sleep(0.5)` in a loop and logging
-`actual_elapsed − 0.5` measures it directly. Lag near zero means tasks are yielding; lag that tracks
-your slowest synchronous section means something is blocking, and every request on that loop pays it.
+- **Loop lag is the health number:** schedule a callback for time *t* and record when it actually runs.
+- **Measure it directly:** a task doing `await asyncio.sleep(0.5)` in a loop and logging
+  `actual_elapsed − 0.5`.
+- **Read it:** lag near zero means tasks are yielding. Lag that tracks your slowest synchronous section
+  means something is blocking, and every request on that loop pays it.
 
 ### Entry and exit
-`asyncio.run(main())` creates a fresh loop, runs `main` as a task, then cancels any tasks still
-pending, finalizes async generators, and closes the loop. It cannot be called from inside a running
-loop (Jupyter already runs one; use `await main()` there). Debug mode (`PYTHONASYNCIODEBUG=1` or
-`asyncio.run(..., debug=True)`) adds the creation traceback to "coroutine was never awaited" warnings
-and logs callbacks that hog the loop longer than `loop.slow_callback_duration` (100 ms by default),
-which is the first tool for finding accidental blocking.
+- **`asyncio.run(main())`** creates a fresh loop, runs `main` as a task, then cancels still-pending tasks,
+  finalizes async generators and closes the loop.
+- **Not inside a running loop.** It cannot be called there; Jupyter already runs one, so use `await main()`.
+- **Debug mode** (`PYTHONASYNCIODEBUG=1` or `asyncio.run(..., debug=True)`) adds the creation traceback to
+  "coroutine was never awaited" warnings and logs callbacks that hog the loop longer than
+  `loop.slow_callback_duration` (100 ms by default). It is the first tool for finding accidental blocking.
 
-## Example
-Twenty chat completions fanned out concurrently, sharing one HTTP connection pool, with a blocking
-tokenizer step moved to a thread so it cannot stall the loop. Point `API` at any OpenAI-compatible
-server (a local vLLM or Ollama instance works).
+## Diagram
+One loop iteration: the thread blocks only in the selector, then runs each ready task until its next
+`await`. A blocking call inside a task step stops the whole cycle.
+
+```mermaid
+flowchart TD
+    T["Earliest timer deadline"] --> S["Selector waits on all sockets (epoll, kqueue, IOCP)"]
+    S -->|"socket ready or timer expired"| F["Handler resolves the future"]
+    F -->|"call_soon task step"| R["Ready queue (FIFO)"]
+    R --> X["Run task until next await"]
+    X -->|"awaits a not-ready future"| W["Register callback, yield to loop"]
+    W --> T
+    X -->|"blocking call (time.sleep, sync SDK)"| B["Loop frozen: every task waits"]
+    B --> X
+    X -->|"coroutine returns"| D["Task done, result set"]
+```
+
+## Examples
+### Fan out twenty chat completions
+Twenty calls share one HTTP connection pool; a blocking tokenizer step moves to a thread so it cannot
+stall the loop. Point `API` at any OpenAI-compatible server (a local vLLM or Ollama instance works).
 
 ```python
 import asyncio, time
@@ -148,58 +158,103 @@ async def main(questions: list[str]) -> None:
 asyncio.run(main([f"Summarise item {i} in one line." for i in range(20)]))
 ```
 
-Walk the timeline. `gather` wraps the twenty coroutines in tasks; on the next loop iteration each runs
-until `client.post` needs the socket, registers interest and yields, so all twenty requests are in
-flight within a few milliseconds. The loop then blocks once in the selector for all of them. If one
-call takes 1.5 s, sequential code would take about 20 × 1.5 = 30 s; this takes about the slowest single
-call, roughly 1.5 s plus scheduling overhead. Two hidden caps can erase that: the server's own
-parallelism (a local server configured for four parallel requests queues the other sixteen), and the
-client's pool, since `httpx` allows 100 connections by default and request 101 waits for a free one.
+**The timeline:**
+1. `gather` wraps the twenty coroutines in tasks.
+2. On the next loop iteration each runs until `client.post` needs the socket, registers interest and
+   yields, so all twenty requests are in flight within a few milliseconds.
+3. The loop then blocks once in the selector for all of them.
 
-The tokenizer step shows the other half of the contract. Twenty `time.sleep(0.05)` calls made directly
-in the coroutine would run back to back on the loop thread: one full second in which no other task on
-the loop, such as another user's stream in a server, gets a single step. Through `to_thread` they run
-in the default executor (`min(32, cpu_count + 4)` threads, so all twenty at once on an 8-core machine),
-and because `time.sleep` releases the GIL they overlap to roughly 50 ms. Swap the sleep for a
-pure-Python CPU loop and the threads keep the loop responsive but no longer overlap, because the GIL
-serialises them; that is the point where a process pool is the right tool.
+### Worked numbers: what the fan-out buys and what caps it
+| Scenario | Wall time | Why |
+|---|---|---|
+| Sequential, each call 1.5 s | about 20 × 1.5 = 30 s | One call at a time |
+| `gather` over 20 calls | roughly 1.5 s plus scheduling overhead | About the slowest single call |
+| Server allows four parallel requests | the other sixteen queue | Server-side cap |
+| Client pool full | request 101 waits for a free connection | `httpx` allows 100 connections by default |
+| 20 × `time.sleep(0.05)` inline in the coroutine | one full second, back to back | No other task (say another user's stream) gets a single step |
+| Same 20 via `to_thread` | roughly 50 ms | Default executor has `min(32, cpu_count + 4)` threads, so all twenty run at once on an 8-core machine, and `time.sleep` releases the GIL |
+| 20 pure-Python CPU loops via `to_thread` | no overlap | Loop stays responsive but the GIL serialises them; use a process pool |
+
+### A loop-lag probe you can run
+A blocking call is invisible in CPU graphs but obvious in lag. This prints lag every 0.5 s.
+
+```python
+import asyncio, time
+
+async def lag_probe(interval=0.5):
+    while True:
+        t = time.perf_counter()
+        await asyncio.sleep(interval)
+        lag = time.perf_counter() - t - interval
+        print(f"loop lag {lag * 1000:.0f} ms")
+
+async def main():
+    probe = asyncio.create_task(lag_probe())
+    await asyncio.sleep(1.2)
+    time.sleep(1.0)          # blocking call on the loop thread
+    await asyncio.sleep(1.2)
+    probe.cancel()
+
+asyncio.run(main())
+# Prints lag of a few ms, then one reading of about 700 ms (the probe was due mid-block), then a few ms again.
+```
+
+## Production patterns
+- **Bound every fan-out.** When calling a provider for many items, wrap each call in
+  `async with sem:` where `sem = asyncio.Semaphore(32)` (size it to the provider's rate limit), or use a
+  `Queue` with N workers. Monitor 429 rate, in-flight count and queue depth.
+- **One shared client per process.** Create a single `httpx.AsyncClient` at startup (FastAPI lifespan),
+  size it with `httpx.Limits(max_connections=...)`, and close it on shutdown. Monitor pool-wait timeouts
+  and connection errors.
+- **Export loop lag as a metric.** Run the lag probe above as a background task and publish lag as a
+  gauge instead of printing. Alert when p99 lag approaches your latency budget; it fingerprints blocking.
+- **Debug mode in staging.** Run staging with `PYTHONASYNCIODEBUG=1` and a lower
+  `loop.slow_callback_duration` (for example 0.05 s) to log every slow step with its task. Keep it off in
+  production because it adds overhead.
+- **Keep references to background tasks.** Follow the docs pattern: add each task to a set and call
+  `task.add_done_callback(tasks.discard)`, or run them in a `TaskGroup`. Monitor the set's size for leaks.
+- **Timeouts on every external await.** Wrap provider and tool calls in `asyncio.timeout(seconds)`
+  (3.11+) or `asyncio.wait_for`, so one hung socket cannot hold a task forever. Monitor timeout counts per
+  dependency.
 
 ## Trade-offs
-- Thousands of concurrent waits cost kilobytes each instead of a thread apiece, but the moment the work
-  is CPU-bound Python the single loop thread becomes the bottleneck and threads or processes win.
-- Explicit await points make interleaving auditable, but "function colour" is contagious: an async call
-  chain cannot call a blocking library without `to_thread`, so library choice (httpx vs requests, an
-  async database driver vs a sync one) is dictated by the loop.
-- Cooperative scheduling has no preemption overhead and needs no locks for most state, but one
-  misbehaving task (a tight loop, a sync HTTP call) degrades every request on the loop, where a thread
-  pool would only lose one worker.
-- A traceback shows the await chain inside one task but not which task spawned it, and profilers see
-  interleaved task steps under the loop's own frames, which is harder to read than threaded code until
-  you learn asyncio debug mode and named tasks.
+- **Cheap waits vs CPU work.** Thousands of concurrent waits cost kilobytes each instead of a thread
+  apiece, but once the work is CPU-bound Python the single loop thread is the bottleneck and threads or
+  processes win.
+- **Auditable interleaving vs function colour.** Explicit await points make interleaving visible, but
+  "colour" is contagious: an async call chain cannot call a blocking library without `to_thread`, so
+  library choice (httpx vs requests, async vs sync database driver) is dictated by the loop.
+- **No preemption vs blast radius.** Cooperative scheduling has no preemption overhead and needs no locks
+  for most state, but one misbehaving task (a tight loop, a sync HTTP call) degrades every request on the
+  loop, where a thread pool would only lose one worker.
+- **Concurrency vs debuggability.** A traceback shows the await chain inside one task but not which task
+  spawned it, and profilers see interleaved task steps under the loop's frames. It is harder to read than
+  threaded code until you learn debug mode and named tasks.
 
 ## Pitfalls
-- Calling a blocking function inside a coroutine (`time.sleep`, the sync OpenAI client,
-  `pandas.read_csv` on a large file). Symptom: p99 latency climbs under load while CPU sits idle, and
-  debug mode logs "Executing <Task ...> took 2.3 seconds".
-- Forgetting to `await` a coroutine. Nothing runs; the symptom is `RuntimeWarning: coroutine 'x' was
-  never awaited` and a feature that silently does nothing.
-- Fire-and-forget `asyncio.create_task(...)` without keeping a reference. The loop holds tasks weakly,
-  so the task can be garbage-collected mid-flight; the symptom is background work that sometimes
-  vanishes. Store tasks in a set and discard on completion, or use a `TaskGroup`.
-- Calling `asyncio.run` from code that is already inside a loop (a FastAPI handler, a notebook).
-  Symptom: `RuntimeError: asyncio.run() cannot be called from a running event loop`.
-- Treating `gather` as a limiter. Fanning out 5,000 embedding calls at once floods the provider and
-  your own sockets; the symptom is a wave of 429s and connection errors. Bound it with a `Semaphore`.
+- **Blocking inside a coroutine** (`time.sleep`, the sync OpenAI client, `pandas.read_csv` on a large
+  file). Symptom: p99 latency climbs under load while CPU sits idle, and debug mode logs
+  "Executing <Task ...> took 2.3 seconds". Fix: async client or `to_thread`.
+- **Forgetting to `await` a coroutine.** Nothing runs. Symptom: `RuntimeWarning: coroutine 'x' was never
+  awaited` and a feature that silently does nothing.
+- **Fire-and-forget `asyncio.create_task(...)` without a reference.** The loop holds tasks weakly, so a task
+  can be garbage-collected mid-flight. Symptom: background work that sometimes vanishes. Fix: store tasks
+  in a set and discard on completion, or use a `TaskGroup`.
+- **`asyncio.run` inside a running loop** (a FastAPI handler, a notebook). Symptom:
+  `RuntimeError: asyncio.run() cannot be called from a running event loop`. Fix: `await` directly.
+- **Treating `gather` as a limiter.** Fanning out 5,000 embedding calls at once floods the provider and
+  your own sockets. Symptom: a wave of 429s and connection errors. Fix: bound it with a `Semaphore`.
 
 ## When to use
-Reach for asyncio when the program's time is dominated by waiting on many independent network
-operations: LLM and embedding calls, tool and MCP servers, vector stores, streaming responses to many
-clients. That describes most of an AI service, which is why FastAPI, httpx, the OpenAI and Anthropic
-SDKs and the MCP SDK all expose async APIs. Do not reach for it to speed up CPU-bound code; it will
-not, and it makes that code harder to run. Measure event-loop lag (time between scheduling a callback
-and it running) and the number of pending tasks; both tell you whether the loop is healthy. In
-interviews, expect to explain what happens at an `await`, why a blocking call hurts every request, and
-when you would move work to a thread or process instead.
+- **Use when** time is dominated by waiting on many independent network operations: LLM and embedding
+  calls, tool and MCP servers, vector stores, streaming to many clients. That is most of an AI service,
+  which is why FastAPI, httpx, the OpenAI and Anthropic SDKs and the MCP SDK all expose async APIs.
+- **Avoid when** the goal is speeding up CPU-bound code; asyncio will not help and makes that code harder
+  to run.
+- **Measure:** event-loop lag (time between scheduling a callback and it running) and the number of
+  pending tasks; both tell you whether the loop is healthy.
+- **Interviews:** explain what happens at an `await`, why a blocking call hurts every request, and when you
+  would move work to a thread or process instead.
 
 ## Role lens
 - **Engineer:** Writes async handlers and clients, fans out model and tool calls with `gather` or
@@ -224,6 +279,43 @@ thread pool; this is a smaller change, but the pool is bounded (AnyIO, which Fas
 40 threads), so concurrency caps at its size and each call still costs a thread. To confirm the
 diagnosis before fixing, turn on asyncio debug mode or a loop-lag probe: lag of about three seconds per
 request is the fingerprint.
+
+## Interview questions
+### What actually happens when a coroutine hits an await on a network call?
+- **The task registers and yields.** The awaited future is not ready, so the task adds a callback to it
+  and returns control to the event loop; its frame and locals stay suspended in memory.
+- **The loop waits for all sockets at once.** The selector (`epoll`, `kqueue`, IOCP) blocks on behalf of
+  every task, and when the socket is readable the handler resolves the future.
+- **Resolution reschedules the task.** `call_soon` puts its step on the ready queue, and it resumes
+  exactly after the `await` on a later iteration.
+
+### Is asyncio code free of race conditions because it is single-threaded?
+- **Free between awaits, not across them.** No other task can run between two `await`s, so a plain
+  read-modify-write with no await in the middle is safe.
+- **A read, await, write sequence is not safe**, because another task can change the state while the
+  first is suspended. Guard that section with `asyncio.Lock` or restructure so the write does not depend
+  on a stale read.
+
+### You must embed 50,000 chunks through a provider capped at 32 concurrent requests. How do you write it?
+- **Do not `gather` all 50,000 coroutines**, because that creates 50,000 tasks up front, floods the
+  provider with 429s and holds every result and socket in memory.
+- **Bound concurrency:** an `asyncio.Semaphore(32)` around each call, or an `asyncio.Queue(maxsize=N)`
+  with 32 workers, which also gives backpressure to the producer.
+- **Add per-call timeouts and retries**, and monitor in-flight count, 429 rate and queue depth.
+
+### When would you not use asyncio, or move work off the loop?
+- **CPU-bound Python** (re-ranking loops, parsing large files) gains nothing, because the loop thread
+  is the bottleneck; use a process pool via `loop.run_in_executor`.
+- **Blocking libraries with no async version** go through `asyncio.to_thread`, accepting that the default
+  executor has `min(32, cpu_count + 4)` threads and pure-Python work stays GIL-serialized.
+- **Mostly-sync codebases** may be simpler with a thread pool than with function colour everywhere.
+
+### p99 latency rose under load but CPU is low. Which numbers would you look at first?
+- **Event-loop lag:** a probe that sleeps 0.5 s and logs the overshoot. Lag that tracks your slowest
+  synchronous section means something blocks the loop.
+- **Debug mode in staging:** `PYTHONASYNCIODEBUG=1` logs any step slower than
+  `loop.slow_callback_duration` (100 ms by default) with the task name, pointing at the blocking call.
+- **Pending task count and pool waits**, to rule out a full `httpx` pool (100 connections by default).
 
 ## Quiz
 ### Q: A coroutine on the event loop calls `time.sleep(2)`. What happens to the other tasks?

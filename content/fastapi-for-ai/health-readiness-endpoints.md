@@ -5,7 +5,7 @@ name: Health / readiness endpoints
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
@@ -20,65 +20,81 @@ sources:
 ---
 
 ## TL;DR
-A liveness endpoint answers "is this process stuck and worth restarting?"; a readiness endpoint answers
-"should this instance receive traffic right now?"; a startup probe gives slow starters (model loading)
-time before liveness counts. They are separate because the right reaction differs: restarting fixes a
-deadlock but makes a database outage worse, so dependency checks belong in readiness, never liveness.
+Liveness asks "is this process stuck, restart it?"; readiness asks "should it get traffic now?"; a startup
+probe gives slow model loads time. Restarting fixes a deadlock but worsens a database outage, so
+dependency checks belong in readiness, never liveness.
 
 ## Why it exists
-Load balancers and orchestrators need a cheap, automatic way to decide two things about each instance:
-send it requests or not, and kill it or not. Without health endpoints they can only see whether the port
-accepts TCP connections, which stays true while the event loop is wedged, while a 4 GB model is still
-loading, or after the worker lost its database pool. Users get timeouts from instances that look healthy.
-
-The naive fix, one `/health` that checks everything (DB, Redis, vector store, LLM provider) and is used
-for both decisions, is worse than none. When the shared database has a 20-second blip, every replica's
-health fails at once. As readiness, that removes all instances from rotation, turning a partial
-degradation into a total outage. As liveness, it restarts every pod simultaneously; the restarts reload
-models and reopen connection pools, stampeding the database as it recovers, and the service stays down
-longer than the original blip. AI services add a third failure: a model that takes 90 seconds to load
-gets killed by a liveness probe at 30 seconds, forever, in a crash loop. Separate probes with separate
-semantics prevent all three.
+- **Orchestrators need two cheap, automatic decisions per instance:** send it requests or not, and kill
+  it or not.
+- **An open port proves little.** TCP connections are accepted while the event loop is wedged, while a
+  4 GB model is still loading, or after the worker lost its database pool, so users get timeouts from
+  instances that look healthy.
+- **One `/health` for everything is worse than none.** It checks DB, Redis, vector store and LLM provider
+  for both decisions, so a 20-second shared-database blip fails every replica at once.
+  - As readiness, all instances leave rotation: a partial degradation becomes a total outage.
+  - As liveness, every pod restarts together; reloading models and reopening pools stampedes the
+    recovering database, and the service stays down longer than the blip.
+- **AI adds a crash loop.** A model that takes 90 seconds to load is killed by a liveness probe at 30
+  seconds, forever.
+- **Separate probes with separate semantics prevent all three.**
 
 ## How it works
 ### Three questions, three probes
-- **Liveness (`/livez`):** can this process make progress? It should check only things that a restart
-  would fix: the event loop is responsive, the worker is not deadlocked. A trivial `async def` that
-  returns 200 is a good liveness check, because if the event loop is blocked it cannot answer, which is
-  exactly the condition you want to detect. Keep it `async def`: a plain `def` endpoint runs in the
-  thread pool (AnyIO's default limit is 40 threads), so it can fail when blocking work has exhausted the
-  pool even though the loop is fine, restarting a process that only needed to shed load. Failure means: restart the container.
-  With several workers in one pod, each probe reaches whichever worker accepts the connection, so one
+| Probe | Question | On failure |
+|---|---|---|
+| **Liveness (`/livez`)** | can this process make progress? | restart the container |
+| **Readiness (`/readyz`)** | should traffic come here now? | stop routing new requests; keep the process running to recover |
+| **Startup** | has initialisation finished? | keep waiting; liveness and readiness do not run yet |
+
+**Liveness**
+- **Check only what a restart fixes:** the event loop is responsive, the worker is not deadlocked.
+- **A trivial `async def` returning 200 is a good check**, because a blocked event loop cannot answer,
+  which is exactly the condition to detect.
+- **Keep it `async def`.** A plain `def` endpoint runs in the thread pool (AnyIO's default limit is 40
+  threads), so it can fail when blocking work exhausts the pool while the loop is fine, restarting a
+  process that only needed to shed load.
+- **Several workers per pod blur it.** Each probe reaches whichever worker accepts the connection, so one
   wedged worker out of four fails only some probes and rarely produces the consecutive failures that
-  trigger a restart. Per-worker hangs are better caught by Gunicorn's heartbeat timeout, which is one more
-  reason to prefer one worker per pod under Kubernetes.
-- **Readiness (`/readyz`):** should traffic come here now? It reflects local state the instance needs to
-  serve: lifespan finished, model loaded, connection pools created, not draining for shutdown. Failure
-  means: stop routing new requests, but leave the process running so it can recover.
-- **Startup:** has initialisation finished? While the startup probe has not yet succeeded, Kubernetes does
-  not run liveness or readiness, so a slow model load is not mistaken for a hang. Size it as
-  `failureThreshold × periodSeconds ≥ worst-case startup time`.
+  trigger a restart. Gunicorn's heartbeat timeout catches per-worker hangs better, one more reason for one
+  worker per pod under Kubernetes.
+
+**Readiness**
+- Reflects local state the instance needs to serve: lifespan finished, model loaded, connection pools
+  created, not draining for shutdown.
+
+**Startup**
+- While it has not yet succeeded, Kubernetes does not run liveness or readiness, so a slow model load is
+  not mistaken for a hang.
+- Size it as `failureThreshold × periodSeconds ≥ worst-case startup time`.
 
 ### Kubernetes mechanics worth knowing
-Each probe has `periodSeconds`, `timeoutSeconds` and `failureThreshold`; the defaults are 10 s, 1 s and 3.
-So with defaults a liveness failure triggers a restart after roughly 30 seconds of consecutive failures,
-and a probe that takes longer than 1 second counts as failed. That second fact matters: a readiness check
-that awaits a remote dependency inherits that dependency's latency.
+| Field | Default |
+|---|---|
+| `periodSeconds` | 10 s |
+| `timeoutSeconds` | 1 s |
+| `failureThreshold` | 3 |
+
+- **Restart after roughly 30 seconds** of consecutive liveness failures with defaults.
+- **A probe slower than 1 second counts as failed**, so a readiness check that awaits a remote dependency
+  inherits that dependency's latency.
 
 ### What readiness should check
-Prefer state over calls. Lifespan sets flags (`model_loaded`, `pools_ready`) and the probe reads them in
-microseconds. If you check a dependency, check one this instance *alone* can lose (its own pool's ability
-to hand out a connection), with a tight timeout and a cached result, so probes do not themselves become
-load on the database. Shared external dependencies, especially the LLM provider, should usually not gate
-readiness: if the provider is down for everyone, removing every replica removes your ability to serve
-cached answers, fallback models or a clear error message.
+- **Prefer state over calls.** Lifespan sets flags (`model_loaded`, `pools_ready`); the probe reads them in
+  microseconds.
+- **Only dependencies this instance *alone* can lose**, such as its own pool's ability to hand out a
+  connection, with a tight timeout and a cached result, so probes do not become load on the database.
+- **Shared external dependencies, especially the LLM provider, usually should not gate readiness.** If the
+  provider is down for everyone, removing every replica removes your ability to serve cached answers,
+  fallback models or a clear error message.
 
 ### Deep health for humans
-Keep a separate, authenticated `/health/details` that reports each dependency's status and latency for
-dashboards and on-call, without wiring it to any automated restart or routing decision.
+- Keep a separate, authenticated `/health/details` reporting each dependency's status and latency for
+  dashboards and on-call, wired to no automated restart or routing decision.
 
-## Example
-A service that loads an embedding model in lifespan, with liveness, readiness and a draining flag.
+## Examples
+### Liveness, readiness and a draining flag
+A service that loads an embedding model in lifespan.
 
 ```python
 import asyncio
@@ -122,47 +138,121 @@ def load_embedding_model():
 
 Probe configuration to match: `startupProbe` on `/livez` with `periodSeconds: 5, failureThreshold: 30`
 (150 s for model load), `livenessProbe` on `/livez` with defaults, `readinessProbe` on `/readyz` with
-`periodSeconds: 5`. Note the model is loaded inside lifespan, and Uvicorn runs lifespan startup before it
-even binds the port, so every probe gets connection refused until the load finishes; that is why the
-startup probe must cover the whole load. Under Gunicorn or `uvicorn --workers` the parent has already bound
-the socket, so the kernel completes the TCP handshake and the probe instead waits out its `timeoutSeconds`:
-the failure looks like a timeout rather than a refusal, but it counts the same. (The `model` check in `/readyz` matters if you later switch to
-loading in a background task after startup.) The `draining` flag lives in one process's memory: with
-several workers per pod, a preStop `POST` reaches only one of them, so use one worker per pod or a shared
-signal such as a file.
+`periodSeconds: 5`:
+
+```yaml
+startupProbe:
+  httpGet: {path: /livez, port: 8000}
+  periodSeconds: 5
+  failureThreshold: 30          # 5 x 30 = 150 s for model load
+livenessProbe:
+  httpGet: {path: /livez, port: 8000}   # defaults: 10 s period, 1 s timeout, 3 failures
+readinessProbe:
+  httpGet: {path: /readyz, port: 8000}
+  periodSeconds: 5
+```
+
+- **Probes see nothing until the load finishes.** Uvicorn runs lifespan startup before it even binds the
+  port, so every probe gets connection refused; that is why the startup probe must cover the whole load.
+- **Under Gunicorn or `uvicorn --workers`** the parent has already bound the socket, so the kernel
+  completes the TCP handshake and the probe waits out its `timeoutSeconds`. It looks like a timeout rather
+  than a refusal, but counts the same.
+- **The `model` check in `/readyz`** matters if you later switch to loading in a background task after
+  startup.
+- **The `draining` flag lives in one process's memory.** With several workers per pod, a preStop `POST`
+  reaches only one of them, so use one worker per pod or a shared signal such as a file.
+
+### Cached, time-boxed pool check for readiness
+Checks only what this instance can lose on its own, at most once every 5 seconds, and never waits past
+the probe's 1 s timeout. Uses `asyncio.timeout` (Python 3.11+) and an SQLAlchemy async engine.
+
+```python
+import asyncio, time
+from sqlalchemy import text
+
+_cache = {"at": 0.0, "ok": False}
+
+async def pool_ok(engine, ttl_s=5.0, budget_s=0.3) -> bool:
+    now = time.monotonic()
+    if now - _cache["at"] < ttl_s:
+        return _cache["ok"]                       # probes read the cached answer
+    try:
+        async with asyncio.timeout(budget_s):     # stay well inside timeoutSeconds
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+        ok = True
+    except Exception:
+        ok = False
+    _cache.update(at=now, ok=ok)
+    return ok
+```
+
+### Worked incident: one `/health` vs separate probes
+Illustrative: 12 replicas, a 40-second shared-database blip, the 60-90 s model load from above.
+
+| Time | One `/health` as liveness and readiness | Separate `/livez` and `/readyz` |
+|---|---|---|
+| t=0 | DB blip starts; every replica's health fails | `/livez` and `/readyz` stay 200 (local state only) |
+| t≈0-10 | all 12 pods leave rotation: balancer errors for everyone | DB-backed requests fail fast with a clear 503; cached and non-DB routes still work |
+| t≈30 | 3 failed liveness probes: all 12 pods restart together | nothing restarts |
+| t=40 | DB recovers, but pods are reloading models | full service resumes |
+| t≈100-130 | 12 pods reopen pools at once, stampeding the DB | (already recovered) |
+
+A 40-second blip becomes a two-minute outage when liveness checks a shared dependency.
+
+## Production patterns
+- **Keep probes off the middleware path.** Skip auth, rate limiting and access logging for `/livez` and
+  `/readyz` (check the path first in middleware) and mark them `include_in_schema=False`. Monitor: probe
+  401s or 429s, and the share of log lines that are probes.
+- **Startup probe sized from measured load time.** Take the slowest observed model load on the slowest node
+  type, add margin, and set `failureThreshold × periodSeconds` above it. Monitor: time from container start
+  to ready, per node type, and CrashLoopBackOff events.
+- **Readiness from lifespan flags plus one cached local check.** Flags for model and pools, the cached pool
+  check above for the database. Monitor: readiness flaps per pod; many pods flapping together means a
+  shared dependency leaked into the probe.
+- **Alert on restarts, not just errors.** Track container restarts per pod (for example
+  `kube_pod_container_status_restarts_total` from kube-state-metrics). Monitor: restarts on every replica
+  at once, the signature of a liveness probe that checks a shared dependency.
+- **Authenticated details endpoint for on-call.** `/health/details` reports each dependency's status and
+  latency for dashboards, behind auth, with no probe pointed at it. Monitor: dependency latency trends
+  there instead of in probe results.
+- **One worker per pod, or a shared drain signal.** So both liveness and the drain flag mean something for
+  the whole pod. Monitor: readiness still returning 200 during termination.
 
 ## Trade-offs
-- Checking dependencies in readiness removes instances that genuinely cannot serve, but it couples all
-  replicas to shared failures; it is right only for dependencies one instance can lose independently.
-- A trivial liveness endpoint never restarts a pod for someone else's outage, but it misses subtle
-  hangs such as a deadlocked thread pool; add a targeted check only for a hang you have actually observed.
-- Short probe periods detect failure quickly, but every probe is a request; with many replicas and
-  dependency checks, aggressive probing becomes measurable load on the things being checked.
-- Failing readiness when the LLM provider is down protects users from slow errors, but it forfeits
-  fallbacks and cached answers; flip to gating only when the instance truly has nothing useful to return.
+- **Dependency checks in readiness vs coupling.** They remove instances that genuinely cannot serve, but
+  couple all replicas to shared failures; right only for dependencies one instance can lose independently.
+- **Trivial liveness vs subtle hangs.** It never restarts a pod for someone else's outage, but misses
+  subtle hangs such as a deadlocked thread pool; add a targeted check only for a hang you have actually
+  observed.
+- **Short probe periods vs load.** They detect failure quickly, but every probe is a request; with many
+  replicas and dependency checks, aggressive probing becomes measurable load on the things being checked.
+- **Gating readiness on the provider vs fallbacks.** Failing readiness when the LLM provider is down
+  protects users from slow errors, but forfeits fallbacks and cached answers; flip to gating only when the
+  instance truly has nothing useful to return.
 
 ## Pitfalls
-- Using the same endpoint for liveness and readiness; the symptom is all pods restarting together during
-  a database blip and a recovery slower than the outage itself.
-- No startup probe for a slow model load; the symptom is a CrashLoopBackOff where each container is
-  killed at about the same age, before it ever logs "model loaded".
-- Liveness that calls the database or the provider; the symptom is restart storms correlated with
-  upstream incidents, with restart counts climbing on every replica at once.
-- Running synchronous inference on the event loop; the symptom is liveness timeouts and restarts under
-  load only, because probes queue behind the blocking work, killing pods that were merely busy.
-- Setting a drain flag in process memory while running several Uvicorn or Gunicorn workers per pod; the
-  symptom is readiness that keeps returning 200 on most probes during shutdown, because only the worker
-  that received the drain call flipped.
-- Health routes going through auth, rate-limit or logging middleware; the symptom is probes failing with
-  401 or 429, or logs dominated by probe requests every few seconds.
+- **Same endpoint for liveness and readiness.** Symptom: all pods restarting together during a database
+  blip, and a recovery slower than the outage itself.
+- **No startup probe for a slow model load.** Symptom: a CrashLoopBackOff where each container is killed at
+  about the same age, before it ever logs "model loaded".
+- **Liveness that calls the database or the provider.** Symptom: restart storms correlated with upstream
+  incidents, with restart counts climbing on every replica at once.
+- **Synchronous inference on the event loop.** Symptom: liveness timeouts and restarts under load only,
+  because probes queue behind the blocking work, killing pods that were merely busy.
+- **Drain flag in process memory with several workers per pod.** Symptom: readiness keeps returning 200 on
+  most probes during shutdown, because only the worker that received the drain call flipped.
+- **Health routes through auth, rate-limit or logging middleware.** Symptom: probes failing with 401 or
+  429, or logs dominated by probe requests every few seconds.
 
 ## When to use
-Every deployed service behind a balancer or orchestrator needs at least liveness and readiness, and AI
-services that load models need a startup probe too. Decide for each dependency whether losing it means
-"this instance is broken" (readiness), "the whole system is degraded" (serve a fallback, alert, keep
-routing) or "restart fixes it" (rare; liveness). Measure probe latency and failure counts, restarts per
-pod, and time from deploy to ready. In interviews, the strong answer explains why dependency checks in
-liveness cause cascading failures and why readiness is the lever for draining.
+- **Every deployed service** behind a balancer or orchestrator needs at least liveness and readiness;
+  AI services that load models need a startup probe too.
+- **Classify each dependency:** losing it means "this instance is broken" (readiness), "the whole system is
+  degraded" (serve a fallback, alert, keep routing) or "restart fixes it" (rare; liveness).
+- **Measure:** probe latency and failure counts, restarts per pod, and time from deploy to ready.
+- **Interviews:** the strong answer explains why dependency checks in liveness cause cascading failures and
+  why readiness is the lever for draining.
 
 ## Role lens
 - **Engineer:** Implements `/livez` and `/readyz` from lifespan state, keeps them off auth and logging

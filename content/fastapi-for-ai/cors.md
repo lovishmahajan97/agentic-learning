@@ -5,7 +5,7 @@ name: CORS
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/api-keys-oauth2-jwt
@@ -20,92 +20,118 @@ sources:
 ---
 
 ## TL;DR
-Browsers block a page from reading responses from another origin unless that server opts in. CORS is
-the set of response headers that opt in. The browser enforces it, not your server, so CORS controls
-which websites' JavaScript may call your API with a user's browser. It is not authentication. curl,
-scripts and other servers ignore it completely, so your API still needs real auth.
+CORS is the set of response headers by which a server lets another origin's JavaScript read its
+responses. Browsers enforce it, not your server, so it is not authentication: curl, scripts and other
+servers ignore it, and your API still needs real auth.
 
 ## Why it exists
-The same-origin policy is the browser's basic defence: a script loaded from `evil.example` must not
-be able to read your bank's responses using the cookies your browser holds for the bank. An origin is
-the triple (scheme, host, port), so `https://app.acme.com` and `https://api.acme.com` are *different*
-origins, and so are `http://localhost:3000` and `http://localhost:8000`. That is exactly the setup of
-a typical AI product: a React or Next.js chat UI on one origin calling a FastAPI backend on another.
-Without a relaxation mechanism, that legitimate front end can't read its own API's responses.
-
-The naive fixes fail in opposite directions. Turning on "allow everything" (`*` for origins plus
-credentials) would let any website make credentialed calls as your logged-in users, which is what
-the same-origin policy exists to prevent. Browsers refuse that combination, so people then reach for
-"reflect whatever Origin arrives", which recreates the hole on purpose. Proxying everything through
-the front-end server avoids CORS but adds a hop and makes the front end a gateway. CORS is the
-middle path: the server names exactly which origins may read its responses, with which methods,
-headers and credentials, and the browser enforces that list.
-
-The key insight is who CORS protects. It protects *users' browsers* from malicious sites. It does
-not protect your API from attackers, who can call it with any HTTP client and simply ignore CORS
-headers.
+- **The same-origin policy is the browser's basic defence.** A script loaded from `evil.example` must not
+  read your bank's responses using the cookies your browser holds for the bank.
+- **An origin is the triple (scheme, host, port).** So `https://app.acme.com` and `https://api.acme.com`
+  are *different* origins, and so are `http://localhost:3000` and `http://localhost:8000`. That is the
+  typical AI product: a React or Next.js chat UI on one origin calling a FastAPI backend on another,
+  which can't read its own API's responses without a relaxation mechanism.
+- **The naive fixes fail in opposite directions.** "Allow everything" (`*` plus credentials) would let any
+  website make credentialed calls as your users; browsers refuse it, so people "reflect whatever Origin
+  arrives", recreating the hole on purpose. Proxying through the front-end server avoids CORS but adds a
+  hop and makes the front end a gateway.
+- **CORS is the middle path.** The server names exactly which origins may read its responses, with which
+  methods, headers and credentials, and the browser enforces that list.
+- **Know who it protects.** It protects *users' browsers* from malicious sites. It does not protect your
+  API from attackers, who call it with any HTTP client and ignore CORS headers.
 
 ## How it works
 ### Simple requests versus preflight
-For a "simple" request (GET, HEAD or POST with only CORS-safelisted headers and a content type of
-`text/plain`, `multipart/form-data` or `application/x-www-form-urlencoded`), the browser sends it
-directly with an `Origin` header. Then, if the response lacks a matching
-`Access-Control-Allow-Origin`, it hides the response from the script. The request still reached your
-server and still ran. CORS blocks reading, not sending, which is why CSRF protection is a separate
-concern.
+| Request type | What qualifies | What the browser does |
+|---|---|---|
+| **Simple** | GET, HEAD or POST with only CORS-safelisted headers and content type `text/plain`, `multipart/form-data` or `application/x-www-form-urlencoded` | sends it directly with an `Origin` header; hides the response if `Access-Control-Allow-Origin` doesn't match |
+| **Preflighted** | anything else, e.g. `Content-Type: application/json` or an `Authorization` header | sends `OPTIONS` first and only sends the real request if the answer allows it |
 
-Almost every AI API call is *not* simple. `Content-Type: application/json` and an `Authorization`
-header each trigger a **preflight**: before the real request, the browser sends
-`OPTIONS /v1/chat` with `Origin`, `Access-Control-Request-Method: POST` and
-`Access-Control-Request-Headers: authorization, content-type`. The server must answer with:
-- `Access-Control-Allow-Origin`: the exact origin (or `*` when no credentials are used);
-- `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers` covering what was asked;
-- optionally `Access-Control-Max-Age`, so the browser caches the preflight result instead of
-  paying an extra round trip on every call (browsers cap how long they honour it);
-- `Access-Control-Allow-Credentials: true` if cookies or HTTP auth are involved.
+- **CORS blocks reading, not sending.** A simple request still reached your server and still ran, which is
+  why CSRF protection is a separate concern.
+- **Almost every AI API call is *not* simple.** JSON bodies and bearer tokens each trigger a preflight.
 
-The preflight exists *because* non-simple requests were impossible from other origins before CORS,
-and old servers may rely on that. Asking permission first keeps them safe.
+### The preflight exchange
+1. The browser sends `OPTIONS /v1/chat` with `Origin`, `Access-Control-Request-Method: POST` and
+   `Access-Control-Request-Headers: authorization, content-type`.
+2. The server must answer with:
+   - `Access-Control-Allow-Origin`: the exact origin (or `*` when no credentials are used);
+   - `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers` covering what was asked;
+   - optionally `Access-Control-Max-Age`, so the browser caches the result instead of paying an extra
+     round trip on every call (browsers cap how long they honour it);
+   - `Access-Control-Allow-Credentials: true` if cookies or HTTP auth are involved.
+3. **Why preflight exists:** non-simple requests were impossible from other origins before CORS, and old
+   servers may rely on that. Asking permission first keeps them safe.
 
 ### Credentials
-With `fetch(url, {credentials: "include"})` or an `EventSource` created with `withCredentials`, the
-browser sends cookies. It then requires an exact `Access-Control-Allow-Origin` (no `*`) plus
-`Allow-Credentials: true`, and it should be paired with `Vary: Origin` so caches don't serve one
-origin's headers to another. Bearer tokens in an `Authorization` header aren't "credentials" in this
-sense, but the header still triggers preflight and must appear in `Allow-Headers`.
+- **Cookies are sent** with `fetch(url, {credentials: "include"})` or an `EventSource` created with
+  `withCredentials`.
+- **The browser then requires** an exact `Access-Control-Allow-Origin` (no `*`) plus
+  `Allow-Credentials: true`, paired with `Vary: Origin` so caches don't serve one origin's headers to
+  another.
+- **Bearer tokens are not "credentials" in this sense**, but the `Authorization` header still triggers
+  preflight and must appear in `Allow-Headers`.
 
 ### Streaming endpoints
-Chat UIs stream, and the streaming client changes the CORS picture. The browser's `EventSource` API
-cannot set request headers, so it cannot send `Authorization: Bearer`. Teams then either switch to
-cookies (which means credentialed CORS, exact origins and CSRF defences), put the token in the query
-string (where it lands in proxy and access logs, so use a short-lived, single-purpose token if you do),
-or read the SSE stream with `fetch` and a stream reader, which can send any header and is the usual
-choice for POST-based chat endpoints. Either way the CORS headers must be on the streaming response
-itself, which `CORSMiddleware` handles because it adds them to the response start.
+The browser's `EventSource` API cannot set request headers, so it cannot send `Authorization: Bearer`.
+Teams pick one of three options:
+
+| Option | Cost |
+|---|---|
+| Switch to cookies | credentialed CORS, exact origins and CSRF defences |
+| Token in the query string | it lands in proxy and access logs, so use a short-lived, single-purpose token |
+| Read SSE with `fetch` and a stream reader | can send any header; the usual choice for POST-based chat endpoints |
+
+Either way the CORS headers must be on the streaming response itself, which `CORSMiddleware` handles
+because it adds them to the response start.
 
 ### Reading response headers
-Scripts can read only safelisted response headers unless you list others in
-`Access-Control-Expose-Headers`. If your UI needs `X-Request-ID`, `Retry-After` or a token-usage
-header, you must expose it.
+- **Scripts read only safelisted response headers** unless you list others in
+  `Access-Control-Expose-Headers`.
+- **Expose what the UI needs**, such as `X-Request-ID`, `Retry-After` or a token-usage header.
 
 ### In FastAPI
-`CORSMiddleware` (from Starlette) answers preflights itself and adds headers to normal responses.
-Its defaults are restrictive: no origins, only GET, no extra headers, no credentials. You have to
-opt in to each one. A preflight from an origin, method or header that isn't allowed gets a 400
-("Disallowed CORS ...") with no `Access-Control-Allow-Origin`, and the browser then refuses to send the
-real request; that 400 in the network tab is the fastest clue to which list is missing an entry. One
-sharp edge: with `allow_origins=["*"]` *and* `allow_credentials=True`,
-Starlette does not send a literal `*` (which browsers would reject). It echoes back whatever `Origin`
-arrived, so every website is allowed to make credentialed calls. The combination that browsers refuse
-on the wire is silently turned into "reflect any origin" by the middleware.
+- **`CORSMiddleware` (from Starlette)** answers preflights itself and adds headers to normal responses.
+- **Defaults are restrictive:** no origins, only GET, no extra headers, no credentials. Opt in to each.
+- **Disallowed preflights get a 400** ("Disallowed CORS ...") with no `Access-Control-Allow-Origin`, and
+  the browser refuses to send the real request. That 400 in the network tab is the fastest clue to which
+  list is missing an entry.
+- **Sharp edge: `allow_origins=["*"]` *and* `allow_credentials=True`.** Starlette does not send a literal
+  `*` (which browsers would reject). It echoes back whatever `Origin` arrived, so every website may make
+  credentialed calls: the combination browsers refuse is silently turned into "reflect any origin".
+- **Ordering:** middleware wraps the app in order, so CORS must sit outside anything that might
+  short-circuit a request (auth returning 401, rate limiters returning 429). Otherwise those responses
+  lack CORS headers and the browser reports a CORS error instead of the real status.
 
-Because middleware wraps the app in order, it must sit outside anything that might
-short-circuit a request (auth middleware returning 401, rate limiters returning 429). Otherwise
-those responses lack CORS headers and the browser reports a CORS error instead of the real status.
+## Diagram
+A preflighted JSON call with a bearer token: the browser asks permission with `OPTIONS`, and only an
+allowed answer lets the real POST go out and its response reach the script.
 
-## Example
-A chat UI at `https://chat.acme.com` (and a local dev server) calling a FastAPI backend with a bearer
-token, reading a request ID and rate-limit hint from responses.
+```mermaid
+sequenceDiagram
+    participant J as Page script on chat.acme.com
+    participant B as Browser
+    participant M as CORSMiddleware
+    participant A as FastAPI route
+    J->>B: fetch POST with JSON body and Authorization
+    B->>M: OPTIONS with Origin and requested method and headers
+    alt origin, method and headers allowed
+        M-->>B: 200 with Allow-Origin, Allow-Methods, Allow-Headers, Max-Age
+        B->>M: POST with Origin and Authorization
+        M->>A: forward request
+        A-->>M: 200 JSON
+        M-->>B: 200 plus Allow-Origin and Expose-Headers
+        B-->>J: script can read body and exposed headers
+    else not allowed
+        M-->>B: 400 Disallowed CORS, no Allow-Origin
+        B-->>J: CORS error, real POST never sent
+    end
+```
+
+## Examples
+### Chat UI calling a FastAPI backend with a bearer token
+A UI at `https://chat.acme.com` (and a local dev server) reads a request ID and rate-limit hint from
+responses.
 
 ```python
 from fastapi import FastAPI
@@ -133,55 +159,116 @@ async def chat(body: dict):
     return {"reply": "..."}
 ```
 
-What the browser does: `fetch("https://api.acme.com/v1/chat", {method: "POST", headers:
-{Authorization: "Bearer ...", "Content-Type": "application/json"}})` first sends `OPTIONS` from origin
-`https://chat.acme.com`. The middleware replies 200 with the allowed methods and headers, and the
-browser then sends the POST. A page at `https://evil.example` gets a 400 preflight response with no
-`Allow-Origin`, so its script never sends the POST. Had the page instead sent a form-encoded POST
-with no custom headers (a simple request), it *would* reach your server and run whatever that route
-does; the browser would only hide the response. That is why state-changing routes must reject
-requests that lack a credential the attacker's page cannot obtain, such as the bearer token here. `curl` from anywhere still reaches `/v1/chat`,
-which is why the bearer token must be validated.
+What the browser does with `fetch("https://api.acme.com/v1/chat", {method: "POST", headers:
+{Authorization: "Bearer ...", "Content-Type": "application/json"}})`: it first sends `OPTIONS` from
+the page's origin, then acts on the answer.
+
+| Caller | Exchange | Outcome |
+|---|---|---|
+| page on `https://chat.acme.com` | `OPTIONS` → 200 with allowed methods and headers, then the POST | works |
+| page on `https://evil.example` | 400 preflight with no `Allow-Origin` | its script never sends the POST |
+| `evil.example` sending a form-encoded POST with no custom headers | simple request, no preflight | *reaches your server and runs*; the browser only hides the response |
+| `curl` from anywhere | no CORS at all | reaches `/v1/chat` |
+
+- **State-changing routes must reject requests** that lack a credential the attacker's page cannot
+  obtain, such as the bearer token here.
+- **That is why the bearer token must be validated**: curl ignores CORS entirely.
+
+### Verify the policy with TestClient (runnable)
+Simulate preflights and a simple request, and see the wildcard-plus-credentials reflection.
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["https://chat.acme.com"],
+                   allow_methods=["POST"], allow_headers=["authorization", "content-type"])
+
+@app.post("/v1/chat")
+async def chat():
+    return {"reply": "..."}
+
+c = TestClient(app)
+def preflight(origin, headers="authorization, content-type"):
+    r = c.options("/v1/chat", headers={"Origin": origin,
+        "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": headers})
+    return r.status_code, r.headers.get("access-control-allow-origin"), r.text
+
+print(preflight("https://chat.acme.com"))                 # (200, 'https://chat.acme.com', 'OK')
+print(preflight("https://evil.example"))                  # (400, None, 'Disallowed CORS origin')
+print(preflight("https://chat.acme.com", "x-api-key"))    # 400 'Disallowed CORS headers'
+r = c.post("/v1/chat", headers={"Origin": "https://evil.example"})
+print(r.status_code, r.headers.get("access-control-allow-origin"))  # 200 None: it ran anyway
+
+app2 = FastAPI()
+app2.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True)
+app2.get("/me")(lambda: {"user": "alice"})
+r = TestClient(app2).get("/me", headers={"Origin": "https://evil.example", "Cookie": "s=1"})
+print(r.headers.get("access-control-allow-origin"),          # https://evil.example (reflected)
+      r.headers.get("access-control-allow-credentials"))     # true
+```
+
+## Production patterns
+- **Origins from per-environment config** — for every deployed API. Load the allowlist from settings
+  (an env var parsed into a list) instead of code, so staging adds `http://localhost:3000` and prod does
+  not. Monitor 400 preflight responses by `Origin` to catch a front end that was never added.
+- **CORS outermost in the middleware stack** — whenever auth or rate limiting is middleware. Call
+  `app.add_middleware(CORSMiddleware, ...)` last, since the last added wraps everything. Monitor browser
+  error reports that say "CORS" while server logs show 401 or 429 for the same request ID.
+- **Tenant-specific origins for embeddable widgets** — when customers embed your chat on their sites.
+  Store allowed origins with the tenant and check the `Origin` against that list in your own small
+  middleware, adding `Vary: Origin`. Monitor per-tenant rejected origins so FDEs can fix config fast.
+- **Expose headers the UI reads** — for rate limits and support tickets. List `x-request-id` and
+  `retry-after` in `expose_headers` and add a front-end test that reads them. Monitor support tickets
+  that arrive without a request ID.
+- **Same-origin path routing for first-party UIs** — when UI and API ship together. Serve `/api` behind
+  the same host via the reverse proxy, which removes preflights entirely. Monitor preflight count; it
+  should drop to zero.
+- **Preflight caching for chat latency** — on high-RTT mobile users. Set `max_age` (for example 600) so
+  repeat calls skip the `OPTIONS` round trip. Monitor `OPTIONS` request rate per session.
 
 ## Trade-offs
-- An explicit origin allowlist is the safe default, but it needs a deploy for each new front end.
-  `allow_origin_regex` (for example, for preview deployments) is more flexible, but one loose regex
-  can match an attacker's domain.
-- Cookie-based auth with credentials gives simpler UX and HttpOnly storage, but it needs exact
-  origins, `Vary: Origin` and separate CSRF defences. Bearer tokens avoid CSRF but must be stored by
-  front-end code.
-- A long `max_age` cuts preflight round trips (which hurt chat latency on high-RTT mobile links), but
-  policy changes take longer to reach browsers that cached the old answer.
-- Serving the UI and API from one origin (a path-based reverse proxy) removes CORS entirely, at the
-  cost of coupling their deploy and routing infrastructure.
+- **Explicit allowlist vs regex.** An explicit origin list is the safe default but needs a deploy for each
+  new front end. `allow_origin_regex` (for example, for preview deployments) is more flexible, but one
+  loose regex can match an attacker's domain.
+- **Cookies vs bearer tokens.** Cookie-based auth with credentials gives simpler UX and HttpOnly storage,
+  but needs exact origins, `Vary: Origin` and separate CSRF defences. Bearer tokens avoid CSRF but must
+  be stored by front-end code.
+- **Long vs short `max_age`.** A long one cuts preflight round trips (which hurt chat latency on high-RTT
+  mobile links), but policy changes take longer to reach browsers that cached the old answer.
+- **Same origin vs cross-origin.** Serving UI and API from one origin (a path-based reverse proxy)
+  removes CORS entirely, at the cost of coupling their deploy and routing infrastructure.
 
 ## Pitfalls
-- Treating CORS as access control. The symptom is an "internal" API with only a CORS allowlist that
-  scripts and partners call freely, because only browsers honour CORS.
-- Putting CORS middleware inside auth or rate-limit middleware, or relying on it for unhandled
-  exceptions (Starlette's server-error handler sits outside user middleware). The symptom is the
-  browser console showing "CORS error" when the real response was a 401, 429 or 500.
-- Forgetting `Access-Control-Expose-Headers`. The symptom is front-end code reading `null` for
-  `Retry-After` or a request ID that is visible in the network tab.
-- Reflecting any `Origin` with credentials enabled, including by passing `["*"]` with
-  `allow_credentials=True`, which Starlette implements as reflection. The symptom only shows up in a
-  security review or pentest: any website can read logged-in users' conversations (where the session
-  cookie is `SameSite=None`, so the browser attaches it to cross-site requests).
-- Using `EventSource` for an authenticated stream and then "fixing" it by putting a long-lived API
-  token in the URL. The symptom is working streams in the browser and full credentials visible in
-  proxy access logs and browser history.
-- Expecting a trailing slash or a different port to match. The symptom is that the allowlist works
-  in staging and fails in prod because `https://chat.acme.com/` was listed with a slash.
+- **Treating CORS as access control.** Symptom: an "internal" API with only a CORS allowlist that scripts
+  and partners call freely, because only browsers honour CORS.
+- **CORS inside auth or rate-limit middleware.** Or relying on it for unhandled exceptions (Starlette's
+  server-error handler sits outside user middleware). Symptom: the console shows "CORS error" when the
+  real response was a 401, 429 or 500.
+- **Forgetting `Access-Control-Expose-Headers`.** Symptom: front-end code reads `null` for `Retry-After`
+  or a request ID that is visible in the network tab.
+- **Reflecting any `Origin` with credentials enabled.** Including by passing `["*"]` with
+  `allow_credentials=True`, which Starlette implements as reflection. Symptom: only a security review or
+  pentest finds it: any website can read logged-in users' conversations (where the session cookie is
+  `SameSite=None`, so the browser attaches it to cross-site requests).
+- **A long-lived API token in an `EventSource` URL.** Symptom: streams work in the browser, and full
+  credentials are visible in proxy access logs and browser history.
+- **Expecting a trailing slash or a different port to match.** Symptom: the allowlist works in staging
+  and fails in prod because `https://chat.acme.com/` was listed with a slash.
 
 ## When to use
-Configure CORS whenever browser JavaScript on one origin calls your API on another: SPA front ends,
-embeddable chat widgets, browser extensions, notebooks hosted elsewhere. Skip it for server-to-server
-and mobile-native clients, which don't enforce it, and for same-origin deployments. Default to an
-explicit allowlist from configuration per environment, the minimum methods and headers, and bearer
-tokens unless you have a reason for cookies. For a widget embedded on many customer sites, consider
-per-tenant origin lists stored with the tenant. When debugging, read the preflight in the browser's
-network tab first. Most "CORS bugs" are a missing header in `Allow-Headers` or middleware ordering.
-Interviewers expect you to say plainly that CORS is browser-enforced and not a security boundary.
+- **Use when** browser JavaScript on one origin calls your API on another: SPA front ends, embeddable
+  chat widgets, browser extensions, notebooks hosted elsewhere.
+- **Skip for** server-to-server and mobile-native clients, which don't enforce it, and for same-origin
+  deployments.
+- **Default to** an explicit allowlist from configuration per environment, the minimum methods and
+  headers, and bearer tokens unless you have a reason for cookies. For a widget embedded on many
+  customer sites, consider per-tenant origin lists stored with the tenant.
+- **Debug** by reading the preflight in the browser's network tab first. Most "CORS bugs" are a missing
+  header in `Allow-Headers` or middleware ordering.
+- **Interviews:** say plainly that CORS is browser-enforced and not a security boundary.
 
 ## Role lens
 - **Engineer:** Adds `CORSMiddleware` with per-environment origins, lists every custom request and
@@ -201,6 +288,40 @@ allowlist protects against cross-site abuse of logged-in users, and real access 
 authentication on every request (API keys or validated tokens), authorization checks, rate limits, and
 CSRF defences if cookies are used. Even for browsers, a simple POST is sent anyway; CORS only hides the
 response.
+
+## Interview questions
+### What is an origin, and why do a front end and API on the same company domain still need CORS?
+- **An origin is (scheme, host, port).** `https://app.acme.com` and `https://api.acme.com` differ by
+  host, and `http://localhost:3000` and `http://localhost:8000` differ by port.
+- **So the same-origin policy blocks reads between them**, even though one company owns both; CORS
+  headers from the API are what let the UI's script read responses.
+
+### The console shows a CORS error but the server logs a 401 for the same request. What's wrong and how do you fix it?
+- **The auth middleware short-circuits outside CORS**, so its 401 carries no `Access-Control-Allow-Origin`
+  and the browser hides it, reporting a CORS error instead.
+- **Fix:** add `CORSMiddleware` last so it is outermost and decorates every response, including early
+  401s and 429s.
+- **Note:** unhandled 500s still bypass it, because Starlette's server-error handler sits outside user
+  middleware.
+
+### Cookies or bearer tokens for a browser chat UI on a different origin?
+- **Cookies:** HttpOnly storage and simpler UX, but they need credentialed CORS with exact origins,
+  `Allow-Credentials: true`, `Vary: Origin` and separate CSRF defences.
+- **Bearer tokens:** no CSRF from ambient credentials and no credentialed CORS, but front-end code must
+  store them, and `EventSource` cannot send the `Authorization` header.
+- **Common choice:** bearer tokens with SSE read through `fetch` and a stream reader.
+
+### How would you support an embeddable chat widget that runs on hundreds of customer sites?
+- **Per-tenant origin allowlists** stored with the tenant, checked against the incoming `Origin` in a
+  small middleware that also sets `Vary: Origin`, so adding a customer needs no deploy.
+- **Never** fall back to reflecting any origin or `allow_origins=["*"]` with credentials.
+- **Monitor rejected origins per tenant** so an FDE can fix a misconfigured portal quickly.
+
+### Why does `Access-Control-Max-Age` matter for chat latency, and what does a long value cost?
+- **Every JSON or bearer-token call is preflighted**, so without caching each request pays an extra
+  `OPTIONS` round trip, which hurts on high-RTT mobile links.
+- **A long `max_age` delays policy changes**, because browsers keep using their cached answer (and
+  browsers cap how long they honour it anyway).
 
 ## Quiz
 ### Q: Why does a `fetch` POST with `Content-Type: application/json` trigger an OPTIONS request first?

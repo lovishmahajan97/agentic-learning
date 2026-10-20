@@ -5,7 +5,7 @@ name: GPU infrastructure
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - infra-capacity-economics/gpu-sizing
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -21,119 +21,135 @@ sources:
 ---
 
 ## TL;DR
-A GPU deployment is a stack, not a card: the accelerator and its memory, the host around it, the
-driver and CUDA libraries, the container runtime that exposes the device, the scheduler that assigns
-it, and the procurement model that pays for it. Each layer fails differently, and most "the GPU is
-slow" tickets are really host, driver or scheduling problems. This lesson is the map; sizing,
-bandwidth, card selection, serverless and autoscaling each have their own lesson.
+A GPU deployment is a stack, not a card: accelerator, host, driver and CUDA, container runtime,
+scheduler and procurement. Each layer fails differently, and most "the GPU is slow" tickets are really
+host, driver or scheduling problems.
 
 ## Why it exists
-CPU servers are interchangeable enough that most engineers never think about the box: any node runs
-any container, the OS hides the hardware, and a scheduler can place work anywhere. GPUs break every one
-of those assumptions. A GPU is a separate computer attached over PCIe with its own memory, its own
-instruction set and its own driver, and the host kernel does not virtualise it the way it virtualises
-CPU time and RAM. An inference container therefore only works if the driver on the node, the CUDA
-toolkit inside the image, the device plugin that advertised the card, and the scheduler's placement
-all line up.
-
-The naive approach, "install the driver, `pip install torch`, run it", works on one developer machine
-and collapses at the second node: driver versions drift, images pull in CUDA builds the driver cannot
-run, pods land on nodes without a card, two pods silently share one card and OOM each other, and nobody
-can say whether the fleet is 30% or 90% busy because nothing exports GPU metrics. Add the price — one
-high-end accelerator costs more per hour than a rack of web servers — and the stack has to be
-deliberate: every idle hour is wasted money and every misplaced pod is a capacity bug. GPU
-infrastructure is the set of layers that turn a card into a reliable, schedulable, observable, billable
-resource.
+- **GPUs break CPU-server assumptions.** CPU nodes are interchangeable: any node runs any container, the
+  OS hides the hardware, the scheduler places work anywhere. A GPU is a separate computer on PCIe with
+  its own memory, instruction set and driver, and the host kernel does not virtualise it like CPU time
+  and RAM.
+- **Four things must line up.** An inference container only works if the node's driver, the CUDA toolkit
+  in the image, the device plugin that advertised the card and the scheduler's placement all agree.
+- **The naive approach collapses at the second node.** "Install the driver, `pip install torch`, run it"
+  works on one laptop. Then driver versions drift, images pull CUDA builds the driver cannot run, pods
+  land on nodes without a card, and two pods silently share one card and OOM each other.
+- **Nobody can see utilisation.** Without exported GPU metrics, nobody can say whether the fleet is 30%
+  or 90% busy.
+- **Every idle hour is expensive.** One high-end accelerator costs more per hour than a rack of web
+  servers, so every misplaced pod is a capacity bug. GPU infrastructure is the set of layers that turn a
+  card into a reliable, schedulable, observable, billable resource.
 
 ## How it works
-Walk the stack bottom-up. Each layer answers one question, and each has a lesson that goes deeper.
+Walk the stack bottom-up. Each layer answers one question; sizing, bandwidth, card selection,
+serverless and autoscaling each have their own lesson.
+
+| # | Layer | Question it answers | Typical failure |
+|---|---|---|---|
+| 1 | Accelerator | What does the compute look like? | Model does not fit; decode slow |
+| 2 | Node | What feeds the card? | Slow weight loads, CPU-bound serving |
+| 3 | Driver and CUDA | Will the code run at all? | "driver version is insufficient" |
+| 4 | Container runtime | How does a container see the device? | `nvidia-smi` fails in the pod |
+| 5 | Scheduling | Which workload gets which card? | Pods on wrong node, shared-card OOM |
+| 6 | Procurement | Who pays, and how? | "insufficient capacity", quota wait |
+| 7 | Observability | Is it actually busy? | "100% utilised" while idle; XID faults |
 
 ### 1. The accelerator: what does the compute look like?
-A data-centre GPU is thousands of simple cores grouped into streaming multiprocessors (SMs), each with
-tensor cores for matrix maths, fed by on-package memory (HBM on A100/H100, GDDR6 on L4). Two numbers
-dominate everything downstream: memory capacity, which decides whether the model fits (see *GPU
-sizing*), and memory bandwidth, which bounds how fast decode can run (see *GPU utilization & memory
-bandwidth*). Form factor matters too: SXM modules sit on a baseboard with NVLink/NVSwitch between GPUs
-and run at higher power; PCIe cards slot into ordinary servers, draw less power, and talk to each other
-only over PCIe unless bridged. Which card to buy is the subject of *A100 / H100 / L4 selection*.
+- **Shape.** Thousands of simple cores grouped into streaming multiprocessors (SMs), each with tensor
+  cores for matrix maths, fed by on-package memory (HBM on A100/H100, GDDR6 on L4).
+- **Two numbers dominate.** Memory capacity decides whether the model fits (see *GPU sizing*); memory
+  bandwidth bounds how fast decode runs (see *GPU utilization & memory bandwidth*).
+- **Form factor.** SXM modules sit on a baseboard with NVLink/NVSwitch between GPUs and run at higher
+  power. PCIe cards slot into ordinary servers, draw less power, and talk to each other only over PCIe
+  unless bridged. Which card to buy is *A100 / H100 / L4 selection*.
 
 ### 2. The node: what feeds the card?
 A GPU node is a host with one to eight accelerators plus the CPU, RAM, storage and network that keep
 them busy. Each can be the bottleneck:
-- **CPU and host RAM.** Tokenisation, request handling, data loading and the serving engine's scheduler
-  run on the CPU. Host RAM must stage weights on the way to the device, so a 64 GB host struggles to
-  load a 140 GB checkpoint.
-- **Storage.** Weights are read from disk at start-up. Pulling 140 GB over a 100 MB/s network volume
-  takes about 23 minutes; from local NVMe at a few GB/s it takes under a minute. Cold-start time is
-  mostly a storage decision.
-- **Intra-node interconnect.** Tensor parallelism exchanges activations between GPUs every layer.
-  NVLink gives hundreds of GB/s per GPU (NVIDIA quotes 900 GB/s for H100 SXM); a PCIe Gen4 x16 link
-  gives roughly 32 GB/s per direction. Sharding across PCIe-only cards works but leaves bandwidth on the
-  table.
-- **Network.** Multi-node training needs RDMA (InfiniBand or RoCE) so gradient all-reduce does not
-  stall in the host networking stack. Serving needs it only when one model replica spans machines (a
-  model too large for one eight-GPU node, or disaggregated prefill and decode that ship KV caches
-  between nodes); otherwise each request stays inside one node and ordinary data-centre Ethernet is
-  enough, *because* only prompts and tokens cross the network.
+- **CPU and host RAM.** Tokenisation, request handling, data loading and the engine's scheduler run on the
+  CPU. Host RAM stages weights on the way to the device, so a 64 GB host struggles to load a 140 GB
+  checkpoint.
+- **Storage.** Weights are read from disk at start-up: 140 GB over a 100 MB/s network volume takes about
+  23 minutes; local NVMe at a few GB/s takes under a minute. Cold-start time is mostly a storage decision.
+- **Intra-node interconnect.** Tensor parallelism exchanges activations between GPUs every layer. NVLink
+  gives hundreds of GB/s per GPU (NVIDIA quotes 900 GB/s for H100 SXM); PCIe Gen4 x16 gives roughly
+  32 GB/s per direction. Sharding across PCIe-only cards works but leaves bandwidth on the table.
+- **Network.** Multi-node training needs RDMA (InfiniBand or RoCE) so gradient all-reduce does not stall in
+  the host networking stack. Serving needs it only when one replica spans machines (a model too large for
+  one eight-GPU node, or disaggregated prefill and decode shipping KV caches between nodes).
+- **Otherwise Ethernet is enough,** *because* only prompts and tokens cross the network when each request
+  stays inside one node.
 
 ### 3. Driver and CUDA: will the code run at all?
-The kernel-mode NVIDIA driver is installed once per node and is the only piece that touches hardware.
-Everything else — CUDA runtime, cuBLAS, cuDNN, NCCL, the PyTorch build — ships inside the container
-and must be a version the node's driver supports. Drivers are backward compatible with older CUDA
-runtimes, not forward compatible, so "CUDA driver version is insufficient for CUDA runtime version"
-means the image is newer than the node. Two escape hatches exist but neither is a plan: CUDA minor-version
-compatibility lets, say, a 12.x runtime run on an older 12.x driver with some features (PTX JIT) missing,
-and the `cuda-compat` forward-compatibility package works only on data-centre GPUs. Pin both, and upgrade
-drivers fleet-wide *before* bumping base images.
+- **One driver per node.** The kernel-mode NVIDIA driver is the only piece that touches hardware.
+- **Everything else ships in the image.** CUDA runtime, cuBLAS, cuDNN, NCCL and the PyTorch build must be
+  versions the node's driver supports.
+- **Backward, not forward, compatible.** Drivers run older CUDA runtimes, not newer ones. "CUDA driver
+  version is insufficient for CUDA runtime version" means the image is newer than the node.
+- **Two escape hatches, neither a plan.** CUDA minor-version compatibility lets, say, a 12.x runtime run on
+  an older 12.x driver with some features (PTX JIT) missing. The `cuda-compat` forward-compatibility
+  package works only on data-centre GPUs.
+- **Rule.** Pin both, and upgrade drivers fleet-wide *before* bumping base images.
 
 ### 4. Container runtime: how does a container see the device?
-Containers do not include the driver. The NVIDIA Container Toolkit hooks the container runtime so
-that, when a container requests GPUs, the device files (`/dev/nvidia*`) and the driver's user-space
-libraries are mounted in at start. This is why a GPU image is portable across driver versions and why
-`nvidia-smi` works inside a container that never installed it.
+1. Containers do not include the driver.
+2. When a container requests GPUs, the NVIDIA Container Toolkit's runtime hook mounts the device files
+   (`/dev/nvidia*`) and the driver's user-space libraries in at start.
+3. That is why a GPU image is portable across driver versions, and why `nvidia-smi` works inside a
+   container that never installed it.
 
 ### 5. Scheduling: which workload gets which card?
-On Kubernetes a device plugin advertises GPUs as an extended resource, `nvidia.com/gpu`, in integer
-units. Extended resources cannot be overcommitted and requests must equal limits. The reason is that
-the kubelet treats an extended resource as an opaque count it cannot enforce: there is no cgroup-style
-controller that gives a container a guaranteed fraction of a GPU or caps its device memory, the way CFS
-quotas and memory cgroups do for CPU and RAM. (The GPU itself does time-slice between processes by
-default; what is missing is enforced shares and isolation.) The NVIDIA GPU Operator
-packages driver, toolkit, device plugin, feature discovery (node labels such as the card model) and the
-DCGM metrics exporter as one install. Taints keep ordinary pods off expensive nodes; labels let a pod
-target the right tier. Sharing one card between small workloads has three mechanisms with different
-isolation: MIG hardware-partitions an A100 or H100 into up to seven instances with separate memory;
-time-slicing lets the plugin advertise N virtual GPUs that share memory with no isolation; MPS lets
-processes run kernels concurrently on one card and, on Volta and later, can set an opt-in per-client
-memory cap, but clients still share one fault domain. Only MIG gives hardware-enforced memory and fault
-isolation, so only MIG reliably protects one tenant from another's OOM.
+- **Integer extended resource.** A device plugin advertises GPUs as `nvidia.com/gpu` in integer units.
+  Extended resources cannot be overcommitted and requests must equal limits.
+- **Why no overcommit.** The kubelet treats an extended resource as an opaque count it cannot enforce.
+  There is no cgroup-style controller that guarantees a container a fraction of a GPU or caps its device
+  memory, as CFS quotas and memory cgroups do for CPU and RAM.
+- **Time-slicing still happens.** The GPU does time-slice between processes by default; what is missing
+  is enforced shares and isolation.
+- **GPU Operator.** Packages driver, toolkit, device plugin, feature discovery (node labels such as the
+  card model) and the DCGM metrics exporter as one install.
+- **Placement.** Taints keep ordinary pods off expensive nodes; labels let a pod target the right tier.
+
+Sharing one card between small workloads:
+
+| Mechanism | How it shares | Memory isolation | Fault isolation |
+|---|---|---|---|
+| MIG | Hardware-partitions an A100 or H100 into up to seven instances with separate memory | Hardware-enforced | Yes |
+| Time-slicing | Plugin advertises N virtual GPUs sharing one memory pool | None | No |
+| MPS | Processes run kernels concurrently on one card | Opt-in per-client cap on Volta and later | No: one shared fault domain |
+
+Only MIG gives hardware-enforced memory and fault isolation, so only MIG reliably protects one tenant
+from another's OOM.
 
 ### 6. Procurement: who pays, and how?
-The same card arrives as on-demand instances, reserved or committed-use discounts, spot/preemptible
-capacity, bare-metal leases, GPU-specialist clouds, or serverless per-second billing. Quotas gate all
-of them; a fresh cloud account often cannot launch a single H100 without a request. The economics live
-in *cost modeling*, *TCO* and *serverless GPUs*; the operational rule is that procurement latency
-(days for quota, weeks for reservations) is part of capacity planning.
+- **Same card, many contracts.** On-demand instances, reserved or committed-use discounts,
+  spot/preemptible capacity, bare-metal leases, GPU-specialist clouds, or serverless per-second billing.
+- **Quotas gate all of them.** A fresh cloud account often cannot launch a single H100 without a request.
+- **Lead time is capacity planning.** Days for quota, weeks for reservations. The economics live in *cost
+  modeling*, *TCO* and *serverless GPUs*.
 
 ### 7. Observability: is it actually busy?
-The DCGM exporter publishes per-GPU utilisation, memory use, temperature, power, ECC and XID error
-counts to Prometheus. Without it the fleet is a black box; with it you discover that "100% utilised"
-often means one kernel at a time on an otherwise idle chip, which the utilization lesson unpacks.
+- **DCGM exporter.** Publishes per-GPU utilisation, memory use, temperature, power, ECC and XID error
+  counts to Prometheus. Without it the fleet is a black box.
+- **"100% utilised" is often a lie.** It frequently means one kernel at a time on an otherwise idle chip,
+  which the utilization lesson unpacks.
+- **GPUs fail in ways the OS does not hide.** Uncorrectable ECC errors, retired memory rows, a card that
+  drops off the PCIe bus. The driver logs these as XID events in the kernel log; DCGM exports them.
+- **Why it matters for scheduling.** Kubernetes still sees the device plugin's advertised count, *because*
+  nothing else tells it the card is bad. Unless a health check cordons the node, the scheduler keeps
+  placing pods on a card that will crash them.
+- **Automated cordon-on-XID** (or the GPU Operator's health checks) is part of the stack, not an optional
+  extra.
 
-GPUs also fail in ways the host OS does not hide or recover from: uncorrectable ECC errors, retired
-memory rows, a card that drops off the PCIe bus. The driver records these as XID events in the kernel
-log and DCGM exports them. They matter for scheduling *because* Kubernetes still sees the device
-plugin's advertised count: unless a health check cordons the node, the scheduler keeps placing pods on
-a card that will crash them. Automated cordon-on-XID (or the GPU Operator's health checks) is part of
-the stack, not an optional extra.
-
-## Example
-A minimal Kubernetes Deployment that asks for one GPU on a node labelled with a card model, tolerates
-the GPU taint, and fails fast on a mis-provisioned node. The init container runs `nvidia-smi`, which
-only succeeds if the toolkit mounted the driver libraries; because official `nvidia/cuda` images also set
-`NVIDIA_REQUIRE_CUDA`, the toolkit refuses to start the container on a driver too old for that CUDA
-version. Use the same CUDA version as the server image, and a bad node fails the pod before the server
-tries to load 16 GB of weights.
+## Examples
+### Deployment that fails fast on a bad node
+Asks for one GPU on a node labelled with a card model and tolerates the GPU taint.
+- The init container runs `nvidia-smi`, which only succeeds if the toolkit mounted the driver libraries.
+- Official `nvidia/cuda` images set `NVIDIA_REQUIRE_CUDA`, so the toolkit refuses to start the container
+  on a driver too old for that CUDA version.
+- Use the same CUDA version as the server image, and a bad node fails the pod before the server tries to
+  load 16 GB of weights.
 
 ```yaml
 apiVersion: apps/v1
@@ -170,41 +186,92 @@ spec:
         persistentVolumeClaim: { claimName: model-weights }   # NVMe-backed, not object storage
 ```
 
+### Cold-start calculator: storage decides ready-time
+Weight loading time is size divided by read throughput. Plug in your checkpoint and volume.
+
+```python
+def load_minutes(weights_gb: float, read_mb_per_s: float) -> float:
+    return weights_gb * 1000 / read_mb_per_s / 60
+
+checkpoint_gb = 140                       # e.g. a 70B model in fp16
+for volume, mb_s in [("network volume", 100), ("local NVMe (illustrative)", 3000)]:
+    print(f"{volume:28s} {load_minutes(checkpoint_gb, mb_s):5.1f} min")
+# network volume                23.3 min
+# local NVMe (illustrative)      0.8 min
+```
+
+### Worked triage: "the GPU is slow" ticket, layer by layer
+| Symptom seen | Layer | Check | Fix |
+|---|---|---|---|
+| CrashLoopBackOff only on some nodes | Driver/CUDA | Logs say "driver version is insufficient" | Upgrade driver fleet-wide, or pin to upgraded nodes |
+| Running-but-not-Ready for tens of minutes | Node storage | Weight read throughput | Local NVMe or pre-staged weights |
+| CUDA OOM in one deployment when another is busy | Scheduling | Two models time-sliced on one card | MIG, or separate cards |
+| "95% busy" but low tokens/s | Observability | SM activity, not GPU-Util | Batch more, fix the bottleneck |
+| "unknown error" or illegal-memory-access on one node | Hardware | XID entries in that node's kernel log | Cordon and drain the node |
+| Queue grows 20 minutes after scale-up | Procurement | Cloud says "insufficient capacity" | Reservations, quota headroom, fallback region |
+
+## Production patterns
+- **Fail-fast GPU init container.** Use on every GPU workload. Run `nvidia-smi` from an `nvidia/cuda`
+  base image with the same CUDA version as the server, as in the example above. Monitor init-container
+  failure counts per node: a cluster of failures marks a mis-provisioned node pool.
+- **Driver first, image second.** Use whenever you bump a base image. Roll the new driver across every GPU
+  node pool, verify, then release the image with the newer CUDA runtime. Monitor driver version per node
+  (feature discovery labels or the node image version) and block the rollout while versions are mixed.
+- **Cordon on XID.** Use on any fleet larger than a few nodes. Alert on the DCGM exporter's XID error
+  metric (`DCGM_FI_DEV_XID_ERRORS`) and cordon and drain the node automatically, or enable the GPU
+  Operator's health checks. Monitor how many nodes are cordoned so lost capacity is visible to the
+  autoscaler and on-call.
+- **Taint GPU nodes, select by label.** Use on any shared cluster. Taint GPU nodes with `NoSchedule` on
+  the `nvidia.com/gpu` key, add the matching toleration only to GPU workloads, and select the card tier
+  with the `nvidia.com/gpu.product` label. Monitor for CPU-only pods on GPU nodes.
+- **Weights on fast local storage.** Use when pod ready-time matters for autoscaling. Mount an NVMe-backed
+  volume or pre-stage weights on the node instead of pulling from object storage at start. Monitor pod
+  ready-time from scheduling to readiness.
+- **Measure SM activity, not GPU-Util.** Dashboard DCGM's SM activity profiling field
+  (`DCGM_FI_PROF_SM_ACTIVE`; enable it in the exporter's metric list if it is not on) next to tokens per
+  second. Monitor GPU hours used versus purchased.
+
 ## Trade-offs
-- SXM/NVLink nodes make multi-GPU sharding fast but come in fixed eight-card blocks; PCIe cards are
-  cheaper and available singly, which wins until a model must be split across cards.
-- A GPU Operator or managed node pool makes the driver stack someone else's problem but ties you to
-  their driver cadence; bare metal gives control and costs an ops team.
-- Sharing a card (MIG, time-slicing, MPS) raises utilisation for small models but caps per-tenant
-  performance and complicates scheduling; it stops paying off once one model saturates the card.
-- Spot and preemptible capacity is far cheaper but can vanish mid-job; fine for checkpointed training
-  and batch inference, wrong for latency-SLO serving unless on-demand fallback exists.
+- **SXM/NVLink vs PCIe.** SXM nodes make multi-GPU sharding fast but come in fixed eight-card blocks. PCIe
+  cards are cheaper and available singly, which wins until a model must be split across cards.
+- **Managed driver stack vs control.** A GPU Operator or managed node pool makes the driver stack someone
+  else's problem but ties you to their driver cadence. Bare metal gives control and costs an ops team.
+- **Card sharing vs per-tenant performance.** MIG, time-slicing or MPS raises utilisation for small models
+  but caps per-tenant performance and complicates scheduling. It stops paying off once one model
+  saturates the card.
+- **Spot vs reliability.** Spot and preemptible capacity is far cheaper but can vanish mid-job. Fine for
+  checkpointed training and batch inference, wrong for latency-SLO serving unless on-demand fallback
+  exists.
 
 ## Pitfalls
-- Image CUDA runtime newer than the node driver; symptom is CrashLoopBackOff on exactly the nodes
-  that have not had the driver upgrade, with "driver version is insufficient" in the logs.
-- Loading weights from object storage or a slow network disk on every start; symptom is pods stuck in
-  Running-but-not-Ready for tens of minutes while the readiness probe fails.
-- Time-slicing two models onto one card without checking combined memory; symptom is CUDA OOM errors
-  in one deployment that correlate with traffic to another.
-- Judging fleet health by `nvidia-smi` GPU-Util; symptom is "95% busy" dashboards while tokens per
-  second sit at a fraction of what the card can deliver.
-- Leaving a node with a faulty GPU in the pool; symptom is pods failing with CUDA "unknown error" or
-  illegal-memory-access on one node while identical pods elsewhere run, with XID entries in that node's
-  kernel log.
-- Treating quota and node lead time as instant; symptom is the autoscaler requesting a node, the cloud
-  answering "insufficient capacity", and the request queue growing for twenty minutes.
+- **Image CUDA runtime newer than the node driver.** Symptom: CrashLoopBackOff on exactly the nodes that
+  have not had the driver upgrade, with "driver version is insufficient" in the logs. Fix: driver first,
+  image second.
+- **Loading weights from object storage or a slow network disk on every start.** Symptom: pods stuck in
+  Running-but-not-Ready for tens of minutes while the readiness probe fails. Fix: NVMe-backed volumes.
+- **Time-slicing two models onto one card without checking combined memory.** Symptom: CUDA OOM errors in
+  one deployment that correlate with traffic to another. Fix: sum both footprints, or use MIG.
+- **Judging fleet health by `nvidia-smi` GPU-Util.** Symptom: "95% busy" dashboards while tokens per second
+  sit at a fraction of what the card can deliver. Fix: track DCGM SM activity.
+- **Leaving a node with a faulty GPU in the pool.** Symptom: CUDA "unknown error" or illegal-memory-access
+  on one node while identical pods elsewhere run, with XID entries in that node's kernel log. Fix:
+  cordon-on-XID.
+- **Treating quota and node lead time as instant.** Symptom: the autoscaler requests a node, the cloud
+  answers "insufficient capacity", and the request queue grows for twenty minutes. Fix: plan quota and
+  reservations ahead.
 
 ## When to use
-You do not choose whether to have GPU infrastructure; you choose how many layers to own. Managed node
-pools with the GPU Operator, or a serverless GPU platform, are right when the team is small and the
-workload is standard inference: the driver stack, device plugin and metrics come pre-wired. Own more
-layers when you need a specific NVLink topology, custom kernels or drivers, bare-metal pricing, or
-on-prem placement. Whatever the split, measure three things: pod ready-time (storage and image size),
-GPU hours used versus purchased (procurement), and DCGM SM activity (whether "busy" is real). In
-day-to-day work this shows up as a CrashLoopBackOff you must attribute to the right layer; in
-interviews, as "walk me through what happens between `kubectl apply` and the first token", where
-naming each layer and its failure mode is the expected answer.
+You do not choose whether to have GPU infrastructure; you choose how many layers to own.
+- **Buy the stack when:** the team is small and the workload is standard inference. Managed node pools
+  with the GPU Operator, or a serverless GPU platform, come with driver stack, device plugin and metrics
+  pre-wired.
+- **Own more layers when:** you need a specific NVLink topology, custom kernels or drivers, bare-metal
+  pricing, or on-prem placement.
+- **Measure three things:** pod ready-time (storage and image size), GPU hours used versus purchased
+  (procurement), and DCGM SM activity (whether "busy" is real).
+- **Day to day:** a CrashLoopBackOff you must attribute to the right layer.
+- **Interviews:** "walk me through what happens between `kubectl apply` and the first token"; naming each
+  layer and its failure mode is the expected answer.
 
 ## Role lens
 - **Engineer:** Writes the pod spec, pins CUDA and driver versions, mounts weights from fast storage,

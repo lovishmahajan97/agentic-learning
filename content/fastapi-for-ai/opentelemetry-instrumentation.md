@@ -5,7 +5,7 @@ name: OpenTelemetry instrumentation
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/structured-logging
   - fastapi-for-ai/shared-httpx-asyncclient
@@ -22,87 +22,95 @@ sources:
 ---
 
 ## TL;DR
-OpenTelemetry (OTel) is a vendor-neutral API, SDK and wire protocol for traces, metrics and logs. In
-FastAPI you initialise a tracer provider with an OTLP exporter, auto-instrument the app and its clients
-(FastAPI, httpx, SQLAlchemy, Redis), and add manual spans around LLM calls and retrieval steps. The
-payoff is a single trace per request showing where its seconds went, propagated across services, sent to
-whichever backend you choose without re-instrumenting.
+OpenTelemetry (OTel) is a vendor-neutral API, SDK and protocol for traces, metrics and logs. In FastAPI:
+an OTLP-exporting tracer provider, auto-instrumented app and clients, and manual spans around LLM and
+retrieval steps give one cross-service trace per request, for any backend.
 
 ## Why it exists
-A chat request that takes 9 seconds might spend them in the provider, in a vector search, in a re-ranker,
-in a database lock, or in three retries of a tool call made by an agent loop. Logs tell you that events
-happened; they do not show the causal tree of who called whom and how long each part took, especially
-once the request crosses services (gateway, retrieval service, model server). Without that tree, latency
-debugging is guesswork.
-
-Vendor-specific APM agents solve this but lock the instrumentation to one backend; switching vendors means
-re-instrumenting every service, and libraries cannot ship instrumentation for every vendor. Hand-rolled
-timing logs do not propagate across process boundaries and cannot be assembled into a tree. OTel separates
-the concerns: libraries and your code call a stable API, the SDK decides sampling and batching, and an
-exporter speaks OTLP to a collector or backend, so the backend is a deployment choice rather than a code
-change. Many LLM observability tools now accept OTLP as well, so the same instrumentation can feed them.
+- **Slow requests hide their cause.** A 9-second chat request might spend it in the provider, a vector
+  search, a re-ranker, a database lock, or three retries of an agent's tool call.
+- **Logs show events, not causality.** They do not show the tree of who called whom and how long each part
+  took, especially across services (gateway, retrieval service, model server). Without it, latency
+  debugging is guesswork.
+- **Vendor APM agents lock you in.** Switching vendors means re-instrumenting every service, and libraries
+  cannot ship instrumentation for every vendor.
+- **Hand-rolled timing logs** do not propagate across process boundaries and cannot be assembled into a
+  tree.
+- **OTel separates the concerns.** Code and libraries call a stable API, the SDK decides sampling and
+  batching, and an exporter speaks OTLP to a collector or backend, so the backend is a deployment choice,
+  not a code change. Many LLM observability tools now accept OTLP too.
 
 ## How it works
 ### Data model
-A **trace** is a tree of **spans** sharing a trace id. Each span has a name, start and end time, a parent,
-a status and attributes (key-value pairs). Spans are created through a **tracer** obtained from the global
-**tracer provider**, which owns the **resource** (attributes describing the service, such as
-`service.name` and `deployment.environment`), the **sampler** and the **span processors**. The
-`BatchSpanProcessor` queues finished spans and exports them on a background thread, because exporting
-synchronously would add network latency to every request.
+| Concept | What it is |
+|---|---|
+| **trace** | a tree of spans sharing a trace id |
+| **span** | name, start and end time, parent, status, attributes (key-value pairs) |
+| **tracer** | creates spans; obtained from the global tracer provider |
+| **tracer provider** | owns the resource, the sampler and the span processors |
+| **resource** | attributes describing the service, such as `service.name` and `deployment.environment` |
+| **`BatchSpanProcessor`** | queues finished spans and exports them on a background thread, because synchronous export would add network latency to every request |
 
 ### Propagation
-When the instrumented httpx client calls another service, it injects a W3C `traceparent` header carrying
-the trace id and the current span id. The receiving service's FastAPI instrumentation extracts it and
-makes its server span a child, which is how one trace spans many services. Within a process, the current
-span lives in a `contextvars`-based context, so async code keeps correct parentage across `await`s.
+1. **Inject.** The instrumented httpx client adds a W3C `traceparent` header carrying the trace id and the
+   current span id.
+2. **Extract.** The receiving service's FastAPI instrumentation reads it and makes its server span a child,
+   which is how one trace spans many services.
+3. **In process.** The current span lives in a `contextvars`-based context, so async code keeps correct
+   parentage across `await`s.
 
 ### Auto versus manual instrumentation
-- **Auto:** `FastAPIInstrumentor.instrument_app(app)` wraps the ASGI app in middleware that creates a
-  server span per request, named after the route template, with HTTP method and status attributes.
-  Library instrumentors (`HTTPXClientInstrumentor`, `SQLAlchemyInstrumentor`, Redis) add client spans.
-  The `opentelemetry-instrument` command can apply installed instrumentors without code changes.
-- **Manual:** auto-instrumentation sees an HTTP POST to the provider but not that it was a chat completion
-  on a specific model with 812 input tokens. Wrap model calls, retrieval, reranking and tool execution in
-  your own spans and set attributes. OTel's GenAI semantic conventions define names such as
-  `gen_ai.request.model` and `gen_ai.usage.input_tokens`; they are still marked as in development, so pin
-  the version you follow. `start_as_current_span` records an exception raised inside it as a span event and
+- **Auto: server spans.** `FastAPIInstrumentor.instrument_app(app)` wraps the ASGI app in middleware that
+  creates a server span per request, named after the route template, with HTTP method and status.
+- **Auto: client spans.** Library instrumentors (`HTTPXClientInstrumentor`, `SQLAlchemyInstrumentor`,
+  Redis) add them. The `opentelemetry-instrument` command applies installed instrumentors without code
+  changes.
+- **Manual: AI meaning.** Auto-instrumentation sees an HTTP POST to the provider, not a chat completion on a
+  specific model with 812 input tokens. Wrap model calls, retrieval, reranking and tool execution in your
+  own spans and set attributes.
+- **GenAI semantic conventions** define names such as `gen_ai.request.model` and
+  `gen_ai.usage.input_tokens`; they are still marked as in development, so pin the version you follow.
+- **Errors for free.** `start_as_current_span` records an exception raised inside it as a span event and
   sets the span status to error by default, so a failed provider call shows up red without extra code.
 
 ### Sampling
-Recording every span of every request is expensive at volume. A `ParentBased(TraceIdRatioBased(0.1))`
-sampler keeps about 10% of new traces and follows the caller's decision for propagated ones, so a trace is
-never half-sampled across services. Tail-based sampling (keep all errors and slow traces) happens in the
-collector, because only after a trace ends do you know whether it was interesting.
+- **Recording every span of every request is expensive at volume.**
+- **Head sampling:** `ParentBased(TraceIdRatioBased(0.1))` keeps about 10% of new traces and follows the
+  caller's decision for propagated ones, so a trace is never half-sampled across services.
+- **Tail sampling** (keep all errors and slow traces) happens in the collector, because only after a trace
+  ends do you know whether it was interesting.
 
 ### The collector
-The application usually exports OTLP to an OpenTelemetry Collector (conventionally port 4317 for gRPC,
-4318 for HTTP), running as a sidecar, a node agent or a central gateway, rather than straight to a vendor.
-The collector is a pipeline of receivers, processors and exporters: it batches and retries, can delete or
-hash attributes (a last line of defence against prompt text leaking into telemetry), performs tail
-sampling, and fans out to one or several backends. Keeping those decisions there means changing backends
-or sampling policy is a config change to one deployment, not a redeploy of every service.
+- **Export to a collector, not straight to a vendor.** Conventionally port 4317 for gRPC, 4318 for HTTP,
+  running as a sidecar, a node agent or a central gateway.
+- **A pipeline of receivers, processors and exporters.** It batches and retries, can delete or hash
+  attributes (a last line of defence against prompt text leaking into telemetry), performs tail sampling,
+  and fans out to one or several backends.
+- **Why there:** changing backends or sampling policy becomes a config change to one deployment, not a
+  redeploy of every service.
 
 ### Metrics and logs
-Traces are sampled, so they are the wrong source for totals. Request counts, latency histograms and token
-usage belong in metrics: a `MeterProvider` with a periodic exporting reader aggregates in process and
-exports every interval, and every request is counted regardless of trace sampling. The GenAI conventions
-define metrics such as `gen_ai.client.token.usage` and `gen_ai.client.operation.duration` for this. For
-logs, the cheap win is correlation: put the current span's trace id (32 hex characters) and span id on
-every log record, either with the stdlib `LoggingInstrumentor` or a structlog processor that reads
-`trace.get_current_span().get_span_context()`, so a log line links straight to its trace.
+- **Traces are sampled, so they are the wrong source for totals.** Request counts, latency histograms and
+  token usage belong in metrics.
+- **Metrics pipeline:** a `MeterProvider` with a periodic exporting reader aggregates in process and exports
+  every interval; every request is counted regardless of trace sampling.
+- **GenAI metrics:** the conventions define `gen_ai.client.token.usage` and
+  `gen_ai.client.operation.duration`.
+- **Logs: correlation is the cheap win.** Put the current span's trace id (32 hex characters) and span id
+  on every log record, with the stdlib `LoggingInstrumentor` or a structlog processor that reads
+  `trace.get_current_span().get_span_context()`, so a log line links straight to its trace.
 
 ### Process model
-Threads do not survive `fork`, and SDK state created before a fork is not safe to inherit. Recent SDK
-releases register an at-fork hook that restarts the batch span processor's worker thread in the child, but
-the OTLP gRPC exporter's channel is not fork-safe and metric readers have the same problem, so the official
-guidance still stands: with Gunicorn `--preload` or any pre-fork server, initialise the tracer provider in
-each worker (a `post_fork` hook or lifespan), not in the master.
+- **Threads do not survive `fork`**, and SDK state created before a fork is not safe to inherit.
+- **Partial fix in the SDK.** Recent releases register an at-fork hook that restarts the batch span
+  processor's worker thread in the child.
+- **Still unsafe:** the OTLP gRPC exporter's channel is not fork-safe, and metric readers have the same
+  problem.
+- **Official guidance stands:** with Gunicorn `--preload` or any pre-fork server, initialise the tracer
+  provider in each worker (a `post_fork` hook or lifespan), not in the master.
 
-## Example
-Initialisation in lifespan (per worker), auto-instrumentation for FastAPI and httpx, and a manual span
-around an LLM call with GenAI-style attributes.
-
+## Examples
+### Per-worker init, auto-instrumentation and a manual LLM span
 ```python
 from contextlib import asynccontextmanager
 import httpx
@@ -142,41 +150,109 @@ async def chat(body: dict):
         return r.json()
 ```
 
-The resulting trace is `POST /v1/chat` (server) → `chat model-a` (manual) → `POST` (httpx client), with
-the provider's latency and token counts on the spans. For streaming responses, start the model span inside
-the generator: a span ended when the handler returns would close before the first token is streamed.
+- **Resulting trace:** `POST /v1/chat` (server) → `chat model-a` (manual) → `POST` (httpx client), with the
+  provider's latency and token counts on the spans.
+- **Streaming caveat:** start the model span inside the generator; a span ended when the handler returns
+  closes before the first token is streamed.
+
+### Collector pipeline: scrub prompts, keep errors and slow traces
+A collector config (the `tail_sampling` processor ships in the collector's contrib distribution). Tail
+sampling only sees what the app exported, so the app's own sampler must keep everything (or a high ratio)
+for this to work, and all spans of a trace must reach the same collector instance.
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc: {endpoint: 0.0.0.0:4317}
+      http: {endpoint: 0.0.0.0:4318}
+processors:
+  attributes/scrub:
+    actions:
+      - {key: gen_ai.prompt, action: delete}
+      - {key: gen_ai.completion, action: delete}
+      - {key: enduser.id, action: hash}
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - {name: errors, type: status_code, status_code: {status_codes: [ERROR]}}
+      - {name: slow, type: latency, latency: {threshold_ms: 5000}}
+      - {name: baseline, type: probabilistic, probabilistic: {sampling_percentage: 10}}
+  batch: {}
+exporters:
+  otlp:
+    endpoint: tracing-backend.internal:4317
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes/scrub, tail_sampling, batch]
+      exporters: [otlp]
+```
+
+### Worked scenario: why totals from traces lie
+| Source | Calls counted per 1,000,000 real calls | Use for |
+|---|---|---|
+| Traces, head sampling at 10% | about 100,000 | latency breakdowns, examples of slow or failed requests |
+| Traces, tail sampling (errors + slow + 10%) | biased toward failures and slow calls | debugging, never totals |
+| Metrics (`gen_ai.client.token.usage` histogram) | 1,000,000 | spend, counts, SLOs |
+
+Token spend computed from head-sampled traces comes out at roughly a tenth of the provider's bill, and
+drifts whenever someone changes the sampling ratio.
+
+## Production patterns
+- **Init per worker, not in the master.** Build the tracer and meter providers in lifespan, or in
+  Gunicorn's `post_fork(server, worker)` hook in `gunicorn.conf.py`, never at import with `--preload`.
+  Monitor: exported spans per worker; a worker exporting zero is a fork problem.
+- **Exclude probes and noise.** Pass `excluded_urls` to `FastAPIInstrumentor.instrument_app` or set
+  `OTEL_PYTHON_FASTAPI_EXCLUDED_URLS` (for example `livez,readyz`). Monitor: span volume by route; probes
+  should not appear.
+- **Configure with standard environment variables.** Set `OTEL_SERVICE_NAME`,
+  `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_TRACES_SAMPLER` per environment instead of hard-coding them, so
+  the same image runs everywhere. Monitor: traces arriving with a missing or default service name.
+- **Totals from metrics, examples from traces.** Record token usage with a histogram named
+  `gen_ai.client.token.usage` (split by input and output) through a `MeterProvider` and
+  `PeriodicExportingMetricReader`, and reconcile it daily against the provider's bill. Monitor: the gap
+  between metric totals and billing.
+- **Scrub in the collector as the last line.** Keep content out of spans in code, and also delete or hash
+  sensitive attributes in the collector's `attributes` processor, as above. Monitor: a periodic backend
+  query for spans carrying prompt-like attributes.
+- **Trace id in every log line.** Add the 32-hex trace id to structured logs so on-call can jump from a log
+  to its trace. Monitor: the share of request logs that carry a trace id.
 
 ## Trade-offs
-- Vendor-neutral instrumentation lets you change backends by changing an exporter endpoint, but OTel's
-  configuration surface (providers, processors, samplers, collectors) is larger than a single vendor agent.
-- Auto-instrumentation gives broad coverage in minutes, but it records generic HTTP spans; the
-  AI-specific meaning (model, tokens, prompt version) only exists if you add manual spans.
-- Head sampling at a low ratio keeps cost bounded, but it drops most rare errors; flip to collector tail
-  sampling when you need every failed or slow trace.
-- Recording prompts and completions as span attributes or events helps quality debugging, but traces are
-  often retained and shared more widely than logs, so default to metadata only.
+- **Vendor neutrality vs configuration surface.** You change backends by changing an exporter endpoint,
+  but OTel's surface (providers, processors, samplers, collectors) is larger than a single vendor agent.
+- **Auto-instrumentation breadth vs meaning.** It gives broad coverage in minutes but records generic HTTP
+  spans; the AI-specific meaning (model, tokens, prompt version) only exists if you add manual spans.
+- **Head sampling cost vs rare errors.** A low ratio keeps cost bounded but drops most rare errors; flip to
+  collector tail sampling when you need every failed or slow trace.
+- **Content in spans vs exposure.** Prompts and completions as span attributes or events help quality
+  debugging, but traces are often retained and shared more widely than logs, so default to metadata only.
 
 ## Pitfalls
-- Initialising the provider before a pre-fork server forks workers; the symptom is a service that works
-  but exports no spans from workers, or exports them only intermittently, with gRPC errors or hangs.
-- Ending the LLM span before a `StreamingResponse` finishes; the symptom is model spans that last a few
-  milliseconds while the server span lasts the full 30 seconds of streaming.
-- Calling `instrument_app` and also adding the instrumentation middleware manually, or instrumenting twice
-  on reload; the symptom is duplicated nested server spans for every request.
-- Leaving health probes instrumented; the symptom is traces dominated by `/livez` every few seconds per pod
-  and a tracing bill driven by probes.
-- Computing token spend or request counts from traces under head sampling; the symptom is totals that are
-  roughly the sampling ratio of the provider's bill (about a tenth at 10%), or that drift as sampling changes.
-- Putting user ids or raw prompts in span names instead of attributes; the symptom is an explosion of
-  unique span names that breaks grouping and latency aggregation in the backend.
+- **Provider initialised before a pre-fork server forks workers.** Symptom: a service that works but
+  exports no spans from workers, or only intermittently, with gRPC errors or hangs.
+- **LLM span ended before a `StreamingResponse` finishes.** Symptom: model spans lasting a few milliseconds
+  while the server span lasts the full 30 seconds of streaming.
+- **Double instrumentation.** Calling `instrument_app` and also adding the instrumentation middleware
+  manually, or instrumenting twice on reload. Symptom: duplicated nested server spans for every request.
+- **Health probes left instrumented.** Symptom: traces dominated by `/livez` every few seconds per pod and a
+  tracing bill driven by probes.
+- **Token spend or request counts from traces under head sampling.** Symptom: totals roughly the sampling
+  ratio of the provider's bill (about a tenth at 10%), or drifting as sampling changes.
+- **User ids or raw prompts in span names instead of attributes.** Symptom: an explosion of unique span
+  names that breaks grouping and latency aggregation in the backend.
 
 ## When to use
-Instrument with OTel as soon as a request touches more than one slow dependency or more than one service,
-which describes almost every RAG or agent backend. Start with auto-instrumentation for FastAPI and your HTTP
-and DB clients, add manual spans for model calls, retrieval and tool execution, and export to a collector so
-sampling and routing stay out of application code. Correlate by adding the trace id to structured logs.
-Measure span coverage of p95 latency, so that unexplained time between spans shrinks. In interviews, explain
-propagation via `traceparent` and why manual spans are needed for LLM semantics.
+- **Use when:** a request touches more than one slow dependency or more than one service, which describes
+  almost every RAG or agent backend.
+- **Start with:** auto-instrumentation for FastAPI and your HTTP and DB clients, then manual spans for
+  model calls, retrieval and tool execution.
+- **Export to a collector** so sampling and routing stay out of application code.
+- **Correlate:** add the trace id to structured logs.
+- **Measure:** span coverage of p95 latency, so that unexplained time between spans shrinks.
+- **Interviews:** explain propagation via `traceparent` and why manual spans are needed for LLM semantics.
 
 ## Role lens
 - **Engineer:** Initialises the SDK per worker, instruments FastAPI and clients, writes manual spans with

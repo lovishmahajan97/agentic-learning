@@ -5,7 +5,7 @@ name: TestClient + pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/pytest
   - python-for-ai/pytest-asyncio
@@ -22,77 +22,99 @@ sources:
 ---
 
 ## TL;DR
-FastAPI apps are ASGI callables, so tests can call them in-process without a server. `TestClient`
-does it from ordinary synchronous tests by running the app on its own event loop in a helper thread;
-`httpx.AsyncClient` with `ASGITransport`, under pytest-asyncio, does it from `async def` tests on the
-test's own loop. Pick by whether the test itself must await things, and replace the LLM with a
-dependency override so tests are fast, free and deterministic.
+FastAPI apps are ASGI callables, so tests call them in-process. `TestClient` serves synchronous tests on
+a helper-thread loop; `httpx.AsyncClient` with `ASGITransport` serves `async def` tests on their own loop.
+Pick by whether the test awaits, and fake the LLM via dependency override.
 
 ## Why it exists
-The behaviour worth testing in an AI endpoint is mostly not the model: request validation, auth,
-how a provider error becomes a status code, whether a streaming endpoint emits a well-formed final
-event, whether a cached path skips the model. Testing that by starting Uvicorn and sending real HTTP
-is slow, needs free ports and makes failures hard to debug. Testing it by calling the endpoint
-function directly skips exactly the layers that break: dependency resolution, Pydantic validation,
-middleware, exception handlers and response serialisation.
-
-An in-process client gives you the full HTTP path with none of the network. The complication is the
-event loop. A normal pytest test is synchronous and has no loop; your app is async. If the test also
-needs to await things, such as seeding an async database or inspecting an async fake, it needs a loop
-of its own, and objects created on one loop cannot safely be used on another. That is the split this
-lesson is about: `TestClient` hides the loop from you, pytest-asyncio gives you one, and mixing them
-carelessly produces the most common async-testing errors.
+- **The behaviour worth testing is mostly not the model.** Request validation, auth, how a provider error
+  becomes a status code, whether a streaming endpoint emits a well-formed final event, whether a cached
+  path skips the model.
+- **Starting Uvicorn and sending real HTTP is the wrong tool.** It is slow, needs free ports and makes
+  failures hard to debug.
+- **Calling the endpoint function directly skips what breaks.** Dependency resolution, Pydantic
+  validation, middleware, exception handlers and response serialisation never run.
+- **An in-process client gives the full HTTP path with none of the network.** The complication is the
+  event loop: a normal pytest test is synchronous and has no loop, your app is async, and a test that
+  awaits things (seeding an async database, inspecting an async fake) needs a loop of its own.
+- **Objects created on one loop cannot safely be used on another.** `TestClient` hides the loop,
+  pytest-asyncio gives you one, and mixing them carelessly produces the most common async-testing errors.
 
 ## How it works
 ### TestClient
-`fastapi.testclient.TestClient` is Starlette's test client, built on httpx's request API. When you
-call `client.post(...)` it converts the request into ASGI messages and runs your app through an anyio
-portal: a separate thread with its own event loop. Your test stays synchronous, *because* the portal
-blocks until the app has produced the response. Two details matter. Lifespan startup and shutdown run
-only when the client is used as a context manager (`with TestClient(app) as client:`), *because*
-constructing the client alone does not start the app; without it, anything created in the lifespan,
-such as a shared httpx client or a Redis pool, is missing and endpoints fail with `AttributeError` on
-`app.state`. And streaming endpoints can be consumed with `client.stream(...)` and `iter_lines()`.
+`fastapi.testclient.TestClient` is Starlette's test client, built on httpx's request API.
+1. `client.post(...)` converts the request into ASGI messages.
+2. It runs your app through an anyio portal: a separate thread with its own event loop.
+3. Your test stays synchronous, *because* the portal blocks until the app has produced the response.
+
+Two details matter:
+- **Lifespan runs only under `with`.** Startup and shutdown run only when the client is used as a context
+  manager (`with TestClient(app) as client:`), *because* constructing the client alone does not start the
+  app. Without it, anything created in the lifespan (a shared httpx client, a Redis pool) is missing and
+  endpoints fail with `AttributeError` on `app.state`.
+- **Streaming works.** Consume streaming endpoints with `client.stream(...)` and `iter_lines()`.
 
 ### httpx.AsyncClient + ASGITransport
-For an `async def` test, create `httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-base_url="http://test")`. Requests run on the test's own event loop, so the test can await other
-async code before and after. `ASGITransport` does not run lifespan events, so wrap the app with a
-lifespan manager (for example the `asgi-lifespan` package) or enter the app's lifespan yourself.
+- **Construct** `httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")`.
+- **Same loop as the test,** so the test can await other async code before and after.
+- **No lifespan.** `ASGITransport` does not run lifespan events, so wrap the app with a lifespan manager
+  (for example the `asgi-lifespan` package) or enter the app's lifespan yourself.
 
 ### pytest-asyncio
-pytest does not run coroutines by itself. pytest-asyncio provides the loop: mark tests with
-`@pytest.mark.asyncio` (strict mode, the default) or set `asyncio_mode = "auto"` so every `async def`
-test and fixture is handled. Async fixtures use `@pytest_asyncio.fixture` in strict mode. Each test
-gets a fresh loop by default, *because* isolation beats speed; a session-scoped async fixture (a
-database engine, a container client) must share a loop with the tests that use it, which recent
-versions express with a `loop_scope` argument. The loop-scope API has changed across releases, so
-follow the docs for your installed version. AnyIO's own pytest plugin (`@pytest.mark.anyio`) is the
-alternative when the codebase already uses AnyIO.
+- **pytest does not run coroutines by itself;** pytest-asyncio provides the loop.
+- **Two modes:** mark tests with `@pytest.mark.asyncio` (strict mode, the default), or set
+  `asyncio_mode = "auto"` so every `async def` test and fixture is handled.
+- **Async fixtures** use `@pytest_asyncio.fixture` in strict mode.
+- **Fresh loop per test by default,** *because* isolation beats speed.
+- **Session-scoped async fixtures** (a database engine, a container client) must share a loop with the
+  tests that use them, which recent versions express with a `loop_scope` argument. The loop-scope API has
+  changed across releases, so follow the docs for your installed version.
+- **Alternative:** AnyIO's own pytest plugin (`@pytest.mark.anyio`) when the codebase already uses AnyIO.
 
 ### Replacing the model
-`app.dependency_overrides[get_llm] = lambda: FakeLLM()` swaps the real client for a fake at the
-dependency boundary, *because* that is where the app already expects an injectable object. For code
-that calls httpx directly, `httpx.MockTransport` or the `respx` library intercepts requests at the
-transport and returns canned responses. Clear overrides after each test, or one test's fake leaks into
-the next.
+| Code calls the model through | Replace it with |
+|---|---|
+| A dependency | `app.dependency_overrides[get_llm] = lambda: FakeLLM()` |
+| httpx directly | `httpx.MockTransport` or the `respx` library, which intercept at the transport |
 
-The override dict is keyed by the *callable object* that appears in `Depends(...)`. FastAPI looks up
-each dependency function in `dependency_overrides` while resolving the request, so the key must be
-that exact function. Overriding a lookalike (a wrapper, a re-import of a different function, or a
-dependency produced by a factory call such as `Depends(make_llm("gpt"))`, which creates a new closure
-at import time) silently does nothing, and the real client runs.
+- **Override at the dependency boundary,** *because* that is where the app already expects an injectable
+  object.
+- **Clear overrides after each test,** or one test's fake leaks into the next.
+- **The key is the exact callable in `Depends(...)`.** FastAPI looks up each dependency function in
+  `dependency_overrides` while resolving the request. Overriding a lookalike silently does nothing and
+  the real client runs: a wrapper, a re-import of a different function, or a dependency produced by a
+  factory call such as `Depends(make_llm("gpt"))`, which creates a new closure at import time.
 
 ### Exceptions surface differently in tests
-By default `TestClient(app)` re-raises an unhandled exception from the app into your test instead of
-returning a 500 (`raise_server_exceptions=True`), *because* a traceback is more useful than a status
-code while debugging. `ASGITransport` behaves the same way through `raise_app_exceptions`. Exceptions
-your app handles, `HTTPException` and registered exception handlers, still become normal responses.
-So to assert what a client actually sees when something unhandled breaks, construct the client with
-`raise_server_exceptions=False`; otherwise the test fails with the exception rather than checking the
-status.
+- **Unhandled exceptions are re-raised into the test** by default (`raise_server_exceptions=True`),
+  instead of becoming a 500, *because* a traceback is more useful than a status code while debugging.
+- **`ASGITransport` behaves the same** through `raise_app_exceptions`.
+- **Handled exceptions still become responses:** `HTTPException` and registered exception handlers.
+- **To assert what a client actually sees** when something unhandled breaks, construct the client with
+  `raise_server_exceptions=False`; otherwise the test fails with the exception rather than checking the
+  status.
 
-## Example
+## Diagram
+The decision is about event loops: a synchronous test lets `TestClient` run the app on its own portal
+loop, while a test that awaits must keep the app on the test's loop through `ASGITransport`.
+
+```mermaid
+flowchart TD
+    T["New endpoint test"] --> F["Override the LLM dependency with a fake"]
+    F --> Q{"Does the test await async objects shared with the app?"}
+    Q -->|"no"| TC["with TestClient(app) as client"]
+    TC --> PT["App runs on a portal thread with its own loop"]
+    PT --> LS1["Lifespan runs because of the with block"]
+    Q -->|"yes"| AC["AsyncClient with ASGITransport under pytest-asyncio"]
+    AC --> ONE["App runs on the test loop"]
+    ONE --> LS2["Lifespan only via a manager such as asgi-lifespan"]
+    LS1 --> CLR["Clear dependency_overrides after the test"]
+    LS2 --> CLR
+    Q -->|"needs time to first chunk"| SRV["Real running server, not in-process"]
+```
+
+## Examples
+### A fake LLM, tested sync and async
 A fake LLM via dependency override, tested once synchronously with `TestClient` and once asynchronously
 with `ASGITransport`. Requires `pytest-asyncio`.
 
@@ -138,46 +160,117 @@ async def test_async_skips_model_on_empty(fake):
     assert r.json() == {"summary": ""} and fake.prompts == []
 ```
 
-Both tests exercise routing, dependency injection and serialisation, run in milliseconds and cost
-nothing. Note what each assertion proves: the sync test checks that the request reached the fake
-exactly once through the override; the async test checks a negative, that the empty-input branch never
-touched the model, which no amount of mocking the HTTP layer would show as clearly. The same fake
-pattern extends to failure paths: a `FailingLLM` whose `complete` raises your provider-error type lets
-you assert that the endpoint maps it to, say, 502 with your error body. Real-model behaviour belongs
-in a separate, smaller suite.
+- **Cost:** both tests exercise routing, dependency injection and serialisation, run in milliseconds and
+  cost nothing.
+- **The sync test proves** the request reached the fake exactly once through the override.
+- **The async test proves a negative:** the empty-input branch never touched the model, which no amount
+  of mocking the HTTP layer would show as clearly.
+- **Real-model behaviour** belongs in a separate, smaller suite.
+
+### Failure paths: mapped errors and unhandled bugs
+The same fake pattern extends to failures. A `FailingLLM` raises your provider-error type, and the test
+asserts the endpoint maps it to, say, 502 with your error body. Builds on the app above.
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+class ProviderError(Exception): ...
+
+@app.exception_handler(ProviderError)
+async def provider_error(request: Request, exc: ProviderError):
+    return JSONResponse({"error": "upstream_failed"}, status_code=502)
+
+class FailingLLM(LLM):
+    async def complete(self, prompt: str) -> str: raise ProviderError("rate limited")
+
+class BuggyLLM(LLM):
+    async def complete(self, prompt: str) -> str: raise KeyError("bug")
+
+def test_provider_error_maps_to_502():
+    app.dependency_overrides[get_llm] = lambda: FailingLLM()
+    try:
+        with TestClient(app) as client:                      # handled: a normal response
+            r = client.post("/summarise", json={"text": "x"})
+        assert r.status_code == 502 and r.json() == {"error": "upstream_failed"}
+    finally:
+        app.dependency_overrides.clear()
+
+def test_unhandled_bug_is_500_for_clients():
+    app.dependency_overrides[get_llm] = lambda: BuggyLLM()
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:   # see the status
+            r = client.post("/summarise", json={"text": "x"})
+        assert r.status_code == 500
+    finally:
+        app.dependency_overrides.clear()
+```
+
+### Which client for which test
+| Test needs | Use | Lifespan |
+|---|---|---|
+| Validation, auth, error mapping, response shape | `TestClient` | `with TestClient(app)` |
+| Streaming format | `TestClient` with `client.stream(...)` | `with TestClient(app)` |
+| Await an async fixture shared with the app | `AsyncClient` + `ASGITransport` | lifespan manager |
+| Time to first chunk | A real running server | real startup |
+
+## Production patterns
+- **One `conftest.py` client fixture per style.** When a suite grows past a handful of files, define a
+  sync `client` fixture (`with TestClient(app) as c: yield c`) and an async one, so no test constructs
+  clients by hand and forgets lifespan. Monitor suite runtime per fixture.
+- **Async client with lifespan via `asgi-lifespan`.** When async tests need lifespan-created state, wrap
+  the app: `async with LifespanManager(app) as m:` then build the `AsyncClient` on
+  `ASGITransport(app=m.app)`. Monitor "attached to a different loop" errors, which mean a fixture's loop
+  scope does not match.
+- **Autouse override cleanup.** Add an `autouse=True` fixture that yields and then calls
+  `app.dependency_overrides.clear()`, so order-dependent passes disappear. Detect leaks by running the
+  suite in random order (for example with the `pytest-randomly` plugin).
+- **Transport-level fakes for raw httpx calls.** When code calls a provider through httpx rather than an
+  injectable dependency, give the shared client an `httpx.MockTransport(handler)` in tests, or use
+  `respx`, and return recorded provider payloads, including error bodies. Monitor that no test needs
+  network by running the suite with outbound network blocked in CI.
+- **A separate, small real-model suite.** Keep fakes for the fast suite and mark real-provider tests with
+  a custom marker (for example `@pytest.mark.live`) run on a schedule, not per commit. Monitor its cost
+  per run and its flake rate.
 
 ## Trade-offs
-- `TestClient` keeps tests synchronous and simple, but runs the app on a different loop in another
-  thread, so it breaks as soon as the test shares async objects with the app; then use `ASGITransport`.
-- `ASGITransport` runs everything on one loop and allows awaiting in the test, at the cost of async
-  fixtures, a pytest plugin and manual lifespan handling.
-- Overriding dependencies with fakes gives fast, deterministic tests of your logic, but proves nothing
-  about the real provider's behaviour, which needs contract or integration tests.
-- Function-scoped event loops isolate tests well; session-scoped loops make expensive async fixtures
-  reusable, but state leaks between tests become possible and must be cleaned up explicitly.
+- **`TestClient` simplicity vs loop isolation.** It keeps tests synchronous and simple, but runs the app on
+  a different loop in another thread, so it breaks as soon as the test shares async objects with the app;
+  then use `ASGITransport`.
+- **`ASGITransport` one-loop power vs setup.** It runs everything on one loop and allows awaiting in the
+  test, at the cost of async fixtures, a pytest plugin and manual lifespan handling.
+- **Fakes vs realism.** Overriding dependencies with fakes gives fast, deterministic tests of your logic,
+  but proves nothing about the real provider's behaviour, which needs contract or integration tests.
+- **Function vs session loop scope.** Function-scoped event loops isolate tests well; session-scoped loops
+  make expensive async fixtures reusable, but state leaks between tests become possible and must be
+  cleaned up explicitly.
 
 ## Pitfalls
-- Constructing `TestClient(app)` without `with`; lifespan never runs and endpoints fail with
-  `AttributeError` on `app.state` resources that exist in production.
-- Using `TestClient` inside an `async def` test that also created an async engine or client; the
-  symptom is "attached to a different loop" or a hang, because two loops share one object.
-- Forgetting to clear `app.dependency_overrides`; a later test passes or fails depending on test order.
-- Overriding a different function object from the one in `Depends(...)`; the symptom is a test that
-  passes slowly, needs network, or fails with an authentication error from the real provider.
-- Writing a test that expects a 500 from an unhandled error with default `TestClient` settings; the
-  test errors with the app's exception instead of seeing the status code.
-- Missing the asyncio marker in strict mode; the coroutine is never awaited, and depending on the
-  pytest version the test is skipped with a warning or fails, but its assertions never run.
-- Asserting on time-to-first-chunk through an in-process transport; buffering behaviour differs from
-  a real server and proxy, so streaming latency must be measured against a running server.
+- **`TestClient(app)` without `with`.** Lifespan never runs, and endpoints fail with `AttributeError` on
+  `app.state` resources that exist in production.
+- **`TestClient` inside an `async def` test that also created an async engine or client.** Symptom:
+  "attached to a different loop" or a hang, because two loops share one object.
+- **Forgetting to clear `app.dependency_overrides`.** Symptom: a later test passes or fails depending on
+  test order.
+- **Overriding a different function object from the one in `Depends(...)`.** Symptom: a test that passes
+  slowly, needs network, or fails with an authentication error from the real provider.
+- **Expecting a 500 from an unhandled error with default `TestClient` settings.** The test errors with the
+  app's exception instead of seeing the status code. Fix: `raise_server_exceptions=False`.
+- **Missing the asyncio marker in strict mode.** The coroutine is never awaited; depending on the pytest
+  version the test is skipped with a warning or fails, but its assertions never run.
+- **Asserting on time-to-first-chunk through an in-process transport.** Buffering differs from a real
+  server and proxy, so streaming latency must be measured against a running server.
 
 ## When to use
-Use `TestClient` as the default for endpoint tests: validation, auth, error mapping, response shape
-and streaming format, with the model replaced by a fake. Switch to `AsyncClient` plus `ASGITransport`
-under pytest-asyncio when the test must await other async work or share async fixtures with the app.
-Neither replaces integration tests against real databases or a recorded provider, nor load tests
-against a real server. Track suite runtime and flakiness. In interviews, expect questions on lifespan
-in tests, dependency overrides, and why loop mismatches happen.
+- **Use `TestClient` as the default** for endpoint tests: validation, auth, error mapping, response shape
+  and streaming format, with the model replaced by a fake.
+- **Switch to `AsyncClient` plus `ASGITransport`** under pytest-asyncio when the test must await other
+  async work or share async fixtures with the app.
+- **Neither replaces** integration tests against real databases or a recorded provider, nor load tests
+  against a real server.
+- **Measure** suite runtime and flakiness.
+- **Interviews:** expect questions on lifespan in tests, dependency overrides, and why loop mismatches
+  happen.
 
 ## Role lens
 - **Engineer:** Writes a fixture layer with fake LLM, overrides and clients, and chooses sync or async
@@ -197,6 +290,46 @@ awaits futures that belong to the test's loop. The fix is to keep everything on 
 `httpx.AsyncClient` with `ASGITransport` inside the async test, run the lifespan with a manager, and
 make the engine fixture's loop scope match the tests that use it. Alternatively, keep the test fully
 synchronous and let the app create its own engine in the lifespan.
+
+## Interview questions
+### Why test a FastAPI app through an in-process client instead of calling endpoint functions directly?
+- **Calling the function skips what breaks:** dependency resolution, Pydantic validation, middleware,
+  exception handlers and response serialisation never run.
+- **Starting Uvicorn is the other extreme:** slow, needs free ports and makes failures hard to debug.
+- **An in-process client** sends ASGI messages straight into the app, so you get the full HTTP path in
+  milliseconds with no network.
+
+### A test overrides get_llm with a fake, but the suite is slow and fails with an auth error from the real provider. What happened?
+- **The override key is not the callable in `Depends(...)`.** FastAPI looks up each dependency function
+  in `dependency_overrides`, so overriding a wrapper or a re-imported lookalike silently does nothing.
+- **A common cause is a factory** such as `Depends(make_llm("gpt"))`, which creates a new closure at import
+  time that the test cannot reference.
+- **Fix:** override the exact function object, or refactor the factory into a named dependency, and block
+  outbound network in CI so this fails fast.
+
+### When would you pick TestClient over AsyncClient with ASGITransport, and what does each cost?
+- **`TestClient` by default:** tests stay synchronous and lifespan runs under `with`, but the app runs on a
+  different loop in a portal thread.
+- **`ASGITransport` when the test awaits** async fixtures shared with the app, because one loop avoids
+  "attached to a different loop" errors.
+- **Its cost:** a pytest plugin, async fixtures and manual lifespan handling, since `ASGITransport` does
+  not run lifespan events.
+
+### How do you test that an unhandled bug in an endpoint returns 500 to clients?
+- **By default the exception is re-raised into the test** (`raise_server_exceptions=True`), so the test
+  errors with the traceback instead of seeing a status code.
+- **Construct the client with `raise_server_exceptions=False`** and assert `status_code == 500`;
+  `ASGITransport` has the equivalent `raise_app_exceptions`.
+- **Handled errors need no flag:** an `HTTPException` or a registered handler mapping `ProviderError` to 502
+  is a normal response.
+
+### Your async test suite passes locally but some tests never actually assert anything in CI. What do you check?
+- **The asyncio marker in strict mode,** the default: an `async def` test without `@pytest.mark.asyncio` is
+  never awaited, and depending on the pytest version it is skipped with a warning or fails.
+- **Fix it once:** set `asyncio_mode = "auto"` or add the marker consistently, and use
+  `@pytest_asyncio.fixture` for async fixtures in strict mode.
+- **Then check loop scope** for session-scoped async fixtures, following the docs for your installed
+  pytest-asyncio version, because that API has changed across releases.
 
 ## Quiz
 ### Q: Why do endpoints that read `app.state.http` fail with `AttributeError` in a test using `client = TestClient(app)`?

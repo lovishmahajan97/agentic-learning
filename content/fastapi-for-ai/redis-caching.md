@@ -5,7 +5,7 @@ name: Redis caching
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/redis
   - serving-inference/caching
@@ -20,37 +20,34 @@ sources:
 ---
 
 ## TL;DR
-An LLM or embedding call costs real money and seconds of latency, and many requests repeat exactly.
-Redis caching puts a shared, in-memory key-value store in front of those calls: hash the full,
-normalised request into a key, return the stored result on a hit, and call the model and store with
-a TTL on a miss. It is shared across workers, which an in-process dict is not, and it is safe only when
-the key captures everything that changes the answer.
+Redis caching puts one shared store in front of repeated LLM and embedding calls: hash the normalised
+request into a key, return hits, and on a miss call the model and store with a TTL. Safe only when the
+key captures everything changing the answer.
 
 ## Why it exists
-A FastAPI service in production runs several worker processes, often on several hosts, behind a load
-balancer. The expensive thing it does, calling a hosted model, an embedding API or a reranker, is slow
-(hundreds of milliseconds to tens of seconds) and billed per token. A meaningful share of that traffic
-repeats: the same FAQ question, the same document embedded on every re-index, the same classification
-prompt over the same ticket, the same tool lookup inside an agent loop that retries.
-
-The naive fix is a module-level dict or `functools.lru_cache`. It fails in three ways. It is per
-process, so with eight workers the hit rate is divided across eight cold caches and a deploy wipes all
-of them. It lives in the same heap as the app, so an unbounded cache becomes a memory leak that ends
-in an OOM kill. And `lru_cache` on an `async def` caches the coroutine object, not its result, so the
-second await fails. Caching in the provider's own prompt cache is different again: it discounts the
-prefix of a prompt, but you still pay for and wait on the generated output.
-
-Redis solves the sharing and bounding problems: one store all workers see, with per-key expiry, a
-memory ceiling and an eviction policy, and sub-millisecond reads on a local network. What it does not
-solve is correctness; that is entirely about the key.
+- **Model calls are slow and billed.** A hosted model, embedding API or reranker takes hundreds of
+  milliseconds to tens of seconds and is billed per token, and a production FastAPI service runs several
+  worker processes, often on several hosts, behind a load balancer.
+- **Much of the traffic repeats exactly.** The same FAQ question, the same document embedded on every
+  re-index, the same classification prompt over the same ticket, the same tool lookup inside an agent
+  loop that retries.
+- **A module-level dict or `functools.lru_cache` fails three ways.** It is per process, so with eight
+  workers the hit rate is split across eight cold caches and a deploy wipes all of them. It shares the
+  app's heap, so an unbounded cache is a memory leak ending in an OOM kill. And `lru_cache` on an
+  `async def` caches the coroutine object, not its result, so the second await fails.
+- **The provider's prompt cache is a different thing.** It discounts the prefix of a prompt, but you
+  still pay for and wait on the generated output.
+- **Redis solves sharing and bounding, not correctness.** One store all workers see, with per-key expiry,
+  a memory ceiling, an eviction policy and sub-millisecond reads on a local network. Correctness is
+  entirely about the key.
 
 ## How it works
 ### Cache-aside, step by step
-1. **Build the key** from everything that determines the output: model ID, prompt template version,
-   the rendered messages, sampling parameters, tool schema, and the tenant if data is tenant-scoped.
-   Serialise them canonically (sorted JSON keys, no whitespace variance) and hash with SHA-256, *because*
-   raw prompts are long and keys should be bounded, and canonical serialisation makes semantically
-   identical requests collide on purpose.
+1. **Build the key** from everything that determines the output: model ID, prompt template version, the
+   rendered messages, sampling parameters, tool schema, and the tenant if data is tenant-scoped.
+   Serialise canonically (sorted JSON keys, no whitespace variance) and hash with SHA-256, *because* raw
+   prompts are long and keys should be bounded, and canonical serialisation makes semantically identical
+   requests collide on purpose.
 2. **Read** with `GET`. On a hit, deserialise and return. Record a hit metric.
 3. **On a miss**, call the model, then `SET key value EX ttl`. The TTL is the staleness contract: it
    bounds how long a wrong or outdated answer can survive, *because* nobody reliably remembers to
@@ -60,59 +57,97 @@ solve is correctness; that is entirely about the key.
    being read and age out under TTL.
 
 ### Is it worth it? The arithmetic
-With hit rate *h*, a Redis round trip of *t_r* and a model call of *t_m*, mean latency is roughly
-`h·t_r + (1 − h)·(t_r + t_m + t_r)`: a miss pays the failed `GET`, the call and the `SET` (the `SET`
-can be fired without awaiting it). Because *t_r* is around a millisecond on a local network and *t_m*
-is hundreds of milliseconds or more, the cache pays for itself on latency at almost any hit rate;
-the saving in spend is simply *h* × calls × price per call. The real cost is memory:
-`entries × (key + value + per-key overhead)`. Value encoding dominates that. A 1,536-dimension
-float32 embedding is 6,144 bytes as raw bytes, but several times larger as a JSON list of Python
-floats, so a cache sized for one encoding overflows with the other. Measure *h* per namespace before
-growing memory: a namespace with a 2% hit rate is mostly paying to store keys nobody reads.
+With hit rate *h*, a Redis round trip *t_r* and a model call *t_m*, mean latency is roughly:
+
+```
+mean_latency ≈ h·t_r + (1 − h)·(t_r + t_m + t_r)
+```
+
+- **A miss pays three things:** the failed `GET`, the call and the `SET` (the `SET` can be fired without
+  awaiting it).
+- **Latency wins at almost any hit rate,** *because* *t_r* is around a millisecond on a local network and
+  *t_m* is hundreds of milliseconds or more.
+- **Spend saving** is simply *h* × calls × price per call.
+- **The real cost is memory:** `entries × (key + value + per-key overhead)`, and value encoding dominates.
+- **Encoding matters.** A 1,536-dimension float32 embedding is 6,144 bytes as raw bytes, but several times
+  larger as a JSON list of Python floats, so a cache sized for one encoding overflows with the other.
+- **Measure *h* per namespace before growing memory.** A namespace with a 2% hit rate is mostly paying to
+  store keys nobody reads.
 
 ### What is safe to cache
-Deterministic or near-deterministic work is the sweet spot: embeddings (same model and text give the
-same vector), classification and extraction at temperature 0, retrieval results for a fixed index
-version, and tool lookups. Creative generation at temperature above 0 is a product decision: caching
-it means every user gets the same "random" answer. Even temperature 0 is not bit-for-bit deterministic
-on most hosted models, so a cache *imposes* consistency rather than preserving it, which is often what
-you want.
+| Workload | Cache it? | Why |
+|---|---|---|
+| Embeddings | Yes | Same model and text give the same vector |
+| Classification and extraction at temperature 0 | Yes | Near-deterministic |
+| Retrieval results for a fixed index version | Yes | Key includes the index version |
+| Tool lookups | Yes | Usually pure functions of their inputs |
+| Creative generation, temperature above 0 | Product decision | Every user gets the same "random" answer |
+
+- **Temperature 0 is not bit-for-bit deterministic** on most hosted models, so a cache *imposes*
+  consistency rather than preserving it, which is often what you want.
 
 ### Wiring it into FastAPI
-Create one `redis.asyncio` client in the lifespan, store it on `app.state`, and hand it to endpoints
-through a dependency. The client owns a connection pool, *because* opening a TCP connection per
-request is slower than the cache read it serves. Use the asyncio client, not the sync one, *because*
-a sync call inside `async def` blocks the event loop for every request on that worker.
+- **One client, created in the lifespan.** Create one `redis.asyncio` client, store it on `app.state`,
+  and hand it to endpoints through a dependency.
+- **The client owns a connection pool,** *because* opening a TCP connection per request is slower than
+  the cache read it serves.
+- **Use the asyncio client, not the sync one,** *because* a sync call inside `async def` blocks the event
+  loop for every request on that worker.
 
 ### Stampede protection
-When a hot key expires, every concurrent request misses at once and all of them call the model: a
-cache stampede that can multiply provider spend and trip rate limits. Defences, cheapest first: add
-random jitter to TTLs so keys do not expire together; collapse concurrent misses inside one worker
-with an in-process "single-flight" map of key → pending future, which removes most duplicates for
-free; then, across workers, let one request recompute while others wait, using a short lock taken
-with `SET lock:key token NX PX 30000`; or serve the stale value while one request refreshes.
+When a hot key expires, every concurrent request misses at once and all of them call the model: a cache
+stampede that can multiply provider spend and trip rate limits. Defences, cheapest first:
+1. **Jitter TTLs** with random extra seconds so keys do not expire together.
+2. **Single-flight inside one worker:** an in-process map of key → pending future collapses concurrent
+   misses, which removes most duplicates for free.
+3. **A short lock across workers:** one request recomputes while others wait, using
+   `SET lock:key token NX PX 30000`.
+4. **Serve stale while one request refreshes.**
 
-The lock needs three details to be correct. `NX` makes the take atomic, *because* check-then-set in
-two commands lets two workers both see "no lock". The expiry means a crashed holder cannot block
-forever. And release must delete the lock only if it still holds *your* random token (a small Lua
-script doing compare-and-delete), *because* a holder slower than the lock's expiry would otherwise
-delete the next holder's lock and re-open the stampede. Losers poll `GET` for the value with a short
-sleep up to a deadline, then fall through and call the model themselves: a lock that makes waiters
-fail when the holder dies trades a cost problem for an availability one.
+The lock needs three details to be correct:
+- **`NX` makes the take atomic,** *because* check-then-set in two commands lets two workers both see "no
+  lock".
+- **The expiry** means a crashed holder cannot block forever.
+- **Release is compare-and-delete:** delete the lock only if it still holds *your* random token (a small
+  Lua script), *because* a holder slower than the lock's expiry would otherwise delete the next holder's
+  lock and re-open the stampede.
+- **Losers poll, then fall through.** They poll `GET` for the value with a short sleep up to a deadline,
+  then call the model themselves. A lock that makes waiters fail when the holder dies trades a cost
+  problem for an availability one.
 
 ### Memory and eviction
-Set `maxmemory` and an eviction policy. For a pure cache, `allkeys-lru` (or `allkeys-lfu`) lets
-Redis drop cold keys when full. If the same Redis also holds rate-limit counters or sessions that must
-not vanish, use `volatile-*` policies, which only evict keys that have a TTL, or better, a separate
-instance, *because* a cache filling up should never evict state that something else relies on.
+- **Set `maxmemory` and an eviction policy.**
+- **Pure cache:** `allkeys-lru` (or `allkeys-lfu`) lets Redis drop cold keys when full.
+- **Shared with state that must not vanish** (rate-limit counters, sessions): use `volatile-*` policies,
+  which only evict keys that have a TTL, or better, a separate instance, *because* a cache filling up
+  should never evict state that something else relies on.
 
 ### Failure mode
-Treat Redis as optional on the read path: on a connection error or timeout, log, count, and fall
-through to the model. A cache outage should cost money and latency, not availability.
+- **Redis is optional on the read path.** On a connection error or timeout, log, count, and fall through
+  to the model. A cache outage should cost money and latency, not availability.
 
-## Example
-A cache-aside wrapper for an embedding call, with a canonical key, TTL jitter and fail-open reads.
-`embed_remote` stands in for the real provider call.
+## Diagram
+Follow a request through cache-aside: a hit returns in about a millisecond, a miss takes the lock (or
+waits for the holder), calls the model and stores with a jittered TTL, and a Redis error falls through.
+
+```mermaid
+flowchart TD
+    R["Request"] --> K["Build key: version, tenant, SHA-256 of canonical input"]
+    K --> G{"GET key"}
+    G -->|"hit"| H["Return cached value"]
+    G -->|"Redis error"| M["Call the model directly"]
+    G -->|"miss"| L{"SET lock:key token NX PX 30000"}
+    L -->|"won the lock"| C["Call the model once"]
+    C --> S[("SET key value EX ttl plus jitter")]
+    S --> U["Compare-and-delete the lock, return value"]
+    L -->|"lock held"| W["Poll GET until deadline"]
+    W -->|"value appeared"| H
+    W -->|"deadline passed"| M
+```
+
+## Examples
+### Cache-aside wrapper for an embedding call
+A canonical key, TTL jitter and fail-open reads. `embed_remote` stands in for the real provider call.
 
 ```python
 import hashlib, json, random
@@ -156,44 +191,111 @@ async def embed(body: dict, r: redis.Redis = Depends(get_redis)):
     return {"vector": await embed_cached(r, "text-embedding-x", body["text"], body["tenant"])}
 ```
 
-Re-indexing 100,000 chunks where 90% are unchanged now pays for roughly 10,000 embedding calls instead
-of 100,000, provided the unchanged chunks' entries are still within their seven-day TTL and have not
-been evicted; the exact saving depends on how much content really changes and how often you re-index.
+- **Re-index saving:** re-indexing 100,000 chunks where 90% are unchanged now pays for roughly 10,000
+  embedding calls instead of 100,000.
+- **Provided** the unchanged chunks' entries are still within their seven-day TTL and have not been
+  evicted; the exact saving depends on how much content really changes and how often you re-index.
+
+### Stampede lock with a safe release
+One worker recomputes a hot key; the others poll briefly, then fall through. The release only deletes a
+lock that still holds this worker's token.
+
+```python
+import asyncio, secrets
+
+RELEASE = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+async def get_or_compute(r, key: str, compute, ttl: int, wait_s: float = 5.0):
+    if (hit := await r.get(key)) is not None:
+        return hit
+    token = secrets.token_hex(16)
+    if await r.set(f"lock:{key}", token, nx=True, px=30000):   # atomic take with expiry
+        try:
+            value = await compute()
+            await r.set(key, value, ex=ttl)
+            return value
+        finally:
+            await r.eval(RELEASE, 1, f"lock:{key}", token)      # compare-and-delete
+    deadline = asyncio.get_running_loop().time() + wait_s
+    while asyncio.get_running_loop().time() < deadline:        # losers poll for the value
+        await asyncio.sleep(0.05)
+        if (hit := await r.get(key)) is not None:
+            return hit
+    return await compute()                                     # holder died or is slow: fall through
+```
+
+### Worked numbers: is the cache worth it?
+Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
+
+| Hit rate *h* | Mean latency | Model calls paid |
+|---|---|---|
+| 0 (no cache) | 800 ms | 1,000,000 |
+| 0.3 | 0.3·1 + 0.7·802 ≈ 562 ms | 700,000 |
+| 0.6 | 0.6·1 + 0.4·802 ≈ 321 ms | 400,000 |
+
+- **The miss penalty is ~2 ms** on an 800 ms call, which is why even modest hit rates pay off.
+
+## Production patterns
+- **Versioned namespaces per data class.** When prompts, models or indexes change, keep the version in
+  the key prefix (`llm:v3:{tenant}:{sha}`) and bump it in the same deploy as the change. Monitor the hit
+  rate of the new namespace climbing back up after a bump.
+- **Fail-open client with tight timeouts.** On every cache read, give the client a short timeout
+  (`socket_timeout=0.2` as in the example) and catch `RedisError`, so a slow Redis degrades to a miss.
+  Monitor cache error counts and p99 cache latency alongside endpoint latency.
+- **Dedicated cache instance with an LRU policy.** When the cache would share Redis with sessions or
+  rate limits, give it its own instance with `maxmemory` set and `maxmemory-policy allkeys-lru`. Monitor
+  `evicted_keys` and `used_memory` from `INFO`.
+- **Hit-rate metrics per namespace.** Count hits and misses in the app, labelled by namespace, rather
+  than relying only on Redis's global `keyspace_hits` and `keyspace_misses`. Drop or shorten TTLs for
+  namespaces stuck near a 2% hit rate.
+- **Never cache failures.** Store only successful, complete responses (check the finish reason or status
+  before `SET`), so a transient provider error is not replayed for the full TTL. Monitor cached-value
+  size outliers, which often reveal truncated outputs.
 
 ## Trade-offs
-- A shared cache raises hit rate across all workers and survives deploys, but adds a network hop and a
-  dependency; for tiny, process-local, rarely-changing data an in-process LRU is faster and simpler.
-- Long TTLs maximise savings and stability but extend how long a stale or wrong answer is served; short
-  TTLs flip the balance when sources or prompts change often.
-- Exact-match keys are always correct when the key is complete, but miss paraphrases; semantic
-  (embedding-similarity) caching catches paraphrases at the risk of returning a near-miss answer.
-- Caching temperature-above-zero generations cuts cost but removes variety users may expect; it pays
-  off for FAQ-style traffic and backfires for creative or personalised output.
-- One Redis for cache, limits and sessions is cheaper to run, but under memory pressure eviction can
-  remove non-cache state; separate instances cost more and fail independently.
+- **Shared cache vs in-process LRU.** Redis raises hit rate across all workers and survives deploys, but
+  adds a network hop and a dependency; for tiny, process-local, rarely-changing data an in-process LRU
+  is faster and simpler.
+- **Long vs short TTLs.** Long TTLs maximise savings and stability but extend how long a stale or wrong
+  answer is served; short TTLs flip the balance when sources or prompts change often.
+- **Exact-match vs semantic keys.** Exact-match keys are always correct when the key is complete, but
+  miss paraphrases; semantic (embedding-similarity) caching catches paraphrases at the risk of returning
+  a near-miss answer.
+- **Caching sampled generations.** Caching temperature-above-zero output cuts cost but removes variety
+  users may expect; it pays off for FAQ-style traffic and backfires for creative or personalised output.
+- **One Redis vs several.** One instance for cache, limits and sessions is cheaper to run, but under
+  memory pressure eviction can remove non-cache state; separate instances cost more and fail
+  independently.
 
 ## Pitfalls
-- Leaving the tenant or user out of the key on tenant-scoped data; the symptom is one customer seeing
-  an answer generated from another customer's documents, which is a data leak, not a bug.
-- Forgetting to include the model ID or prompt version, so a prompt fix appears to do nothing; the
-  symptom is old outputs persisting after a deploy until TTLs expire.
-- Using the sync `redis` client inside `async def`; p99 latency climbs for every endpoint on the
-  worker because each cache call blocks the event loop.
-- No `maxmemory` or no TTL on cache keys; Redis memory grows until the host OOMs or, with
+- **Tenant or user missing from the key on tenant-scoped data.** Symptom: one customer sees an answer
+  generated from another customer's documents, which is a data leak, not a bug. Fix: tenant in every key.
+- **Model ID or prompt version missing from the key.** Symptom: a prompt fix appears to do nothing, and
+  old outputs persist after a deploy until TTLs expire. Fix: version the key.
+- **Sync `redis` client inside `async def`.** Symptom: p99 latency climbs for every endpoint on the
+  worker, because each cache call blocks the event loop. Fix: use `redis.asyncio`.
+- **No `maxmemory` or no TTL on cache keys.** Symptom: Redis memory grows until the host OOMs or, with
   `noeviction`, writes start failing with errors the app treats as outages.
-- Caching error responses or truncated generations; the symptom is a transient provider failure being
-  replayed to every user for the full TTL.
-- Releasing a stampede lock with a plain `DEL`; under slow model calls the symptom is bursts of
-  duplicate provider calls for the same key despite the lock, because holders delete each other's locks.
+- **Caching error responses or truncated generations.** Symptom: a transient provider failure is
+  replayed to every user for the full TTL. Fix: store only complete, successful results.
+- **Releasing a stampede lock with a plain `DEL`.** Symptom: under slow model calls, bursts of duplicate
+  provider calls for the same key despite the lock, because holders delete each other's locks. Fix:
+  compare-and-delete with your token.
 
 ## When to use
-Reach for Redis caching when the same expensive, deterministic-enough call repeats across users or
-workers: embeddings, temperature-0 classification and extraction, retrieval results, slow tool
-lookups. Do not use it to paper over a missing database index, for personalised or creative
-generations, or where serving a stale answer is a correctness or compliance problem. Measure hit
-rate, latency on hit versus miss, provider spend before and after, and Redis memory and evictions.
-In interviews, expect to design the key, choose the TTL, explain stampede protection and say what
-happens when Redis is down.
+- **Use when** the same expensive, deterministic-enough call repeats across users or workers:
+  embeddings, temperature-0 classification and extraction, retrieval results, slow tool lookups.
+- **Avoid when** it would paper over a missing database index, for personalised or creative generations,
+  or where serving a stale answer is a correctness or compliance problem.
+- **Measure** hit rate, latency on hit versus miss, provider spend before and after, and Redis memory and
+  evictions.
+- **Interviews:** expect to design the key, choose the TTL, explain stampede protection and say what
+  happens when Redis is down.
 
 ## Role lens
 - **Engineer:** Writes the canonical key builder, the async cache-aside wrapper, the lifespan-managed
@@ -213,6 +315,46 @@ document-set version in the key (or a hash of the retrieved chunk IDs and their 
 re-index changes the key; bump the key namespace on source updates; or shorten TTL for data classes
 that change often. I would cache retrieval and generation separately, keyed on their own inputs, and
 add a hit metric per namespace to confirm savings survive.
+
+## Interview questions
+### Why not just use functools.lru_cache or a module-level dict for LLM responses?
+- **It is per process.** With eight workers the hit rate splits across eight cold caches, and every deploy
+  or restart empties all of them.
+- **It shares the app heap,** so an unbounded cache grows until the worker is OOM-killed.
+- **On `async def` it caches the coroutine object, not the result,** so the second await of the same key
+  fails. Redis gives one shared, bounded store with per-key TTLs that every worker sees.
+
+### How would you design the cache key for a temperature-0 extraction endpoint serving many tenants?
+- **Include everything that changes the output:** model ID, prompt template version, rendered messages,
+  sampling parameters, tool schema and the tenant ID, because a missing tenant is a cross-customer leak.
+- **Serialise canonically** (sorted JSON keys, fixed separators) and hash with SHA-256 so keys stay bounded
+  and identical requests collide on purpose.
+- **Prefix with a namespace version** such as `llm:v3:{tenant}:{sha}`, and bump it with the prompt or model
+  change so old entries stop being read and age out under TTL.
+
+### Spend on a hot endpoint spikes every hour on the hour. What is happening and how do you fix it?
+- **Likely a cache stampede:** many hot keys were written together with the same TTL, expire together,
+  and every concurrent request misses and calls the model at once.
+- **Cheapest fix first:** add random jitter to TTLs, then collapse concurrent misses per worker with a
+  single-flight map of key to pending future.
+- **Across workers:** a short `SET lock:key token NX PX 30000` lock with compare-and-delete release, with
+  losers polling and then falling through, or serve stale while one request refreshes.
+
+### When would you choose not to cache model outputs at all?
+- **Personalised or creative generations,** because every user would get the same "random" answer and
+  variety is part of the product.
+- **When staleness is a correctness or compliance problem,** for example answers that must reflect a policy
+  updated minutes ago, or when the customer's rules forbid storing model outputs.
+- **When the real problem is elsewhere,** such as a missing database index, or when a namespace's measured
+  hit rate stays near 2% and you are paying to store keys nobody reads.
+
+### Redis goes down during peak traffic. What should your FastAPI service do, and what do you monitor?
+- **Fail open:** a short client timeout (`socket_timeout=0.2` in the example) and a caught `RedisError` turn
+  every cache call into a miss, so users see slower answers, not errors.
+- **Expect the cost to move to the provider:** at a 60% hit rate, model calls rise from 400,000 to 1,000,000
+  a month in the worked numbers above, which can trip provider rate limits.
+- **Monitor** cache error counts, p99 cache latency, hit rate per namespace, provider spend and, on the
+  Redis side, `used_memory` and `evicted_keys`.
 
 ## Quiz
 ### Q: Why is `functools.lru_cache` a poor choice for caching LLM calls in a multi-worker FastAPI service?

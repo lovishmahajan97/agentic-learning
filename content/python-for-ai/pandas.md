@@ -5,7 +5,7 @@ name: pandas
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/numpy
   - python-for-ai/polars
@@ -20,79 +20,90 @@ sources:
 ---
 
 ## TL;DR
-pandas gives Python a labelled, in-memory table, the DataFrame, built from typed column arrays plus an
-index, with vectorized column math, group-by, joins, reshaping and readers for nearly every file format.
-It is the default tool for exploring eval results, logs and datasets that fit in RAM. Its sharp edges
-come from its age and flexibility: index alignment, copy-versus-view semantics, eager execution and
-memory use several times the data size.
+pandas gives Python an in-memory labelled table, the DataFrame: typed columns plus an index, with
+vectorized math, group-by, joins and readers for most formats. It is the default for eval results and
+logs that fit in RAM; watch alignment, copies and memory.
 
 ## Why it exists
-NumPy arrays hold one dtype and address data by integer position. Real AI-engineering data is not like
-that: an eval run produces rows with a case ID, model name, category string, pass/fail boolean, latency,
-token counts and a timestamp. You want to ask "pass rate and p95 latency per model per category", join
-in a price table, and filter to failures to read them. Doing that with lists of dicts means hand-written
-loops for every group-by and join, slow and easy to get wrong; doing it with raw NumPy means keeping
-parallel arrays aligned by hand.
-
-SQL answers these questions well, but loading data into a database for a ten-minute analysis is
-friction, and SQL is awkward for the iterative, look-at-it-and-adjust workflow of a notebook. pandas
-brought the data-frame model familiar from R into Python: named columns of different types, row labels,
-and a large vocabulary of vectorized operations, all in process with your other Python code. That is
-why so much of the ecosystem, from scikit-learn inputs to plotting libraries, accepts DataFrames.
+- **AI data is mixed-type rows.** An eval run produces a case ID, model name, category string, pass/fail
+  boolean, latency, token counts and a timestamp. NumPy arrays hold one dtype and address data by integer
+  position.
+- **The questions are tabular.** "Pass rate and p95 latency per model per category", join in a price
+  table, filter to failures to read them.
+- **The naive tools fail.** Lists of dicts mean hand-written loops for every group-by and join, slow and
+  easy to get wrong; raw NumPy means keeping parallel arrays aligned by hand.
+- **SQL is friction here.** Loading data into a database for a ten-minute analysis is overhead, and SQL is
+  awkward for the iterative, look-at-it-and-adjust workflow of a notebook.
+- **pandas brought R's data-frame model into Python.** Named columns of different types, row labels and a
+  large vocabulary of vectorized operations, in process with your other code, which is why so much of the
+  ecosystem, from scikit-learn inputs to plotting libraries, accepts DataFrames.
 
 ## How it works
 ### Columns, dtypes and the index
-A DataFrame is essentially an ordered collection of columns (each a `Series`) sharing one `Index` of row
-labels. Each column is backed by a NumPy array or an extension array, so numeric columns get NumPy speed.
-Strings were historically stored in `object` columns, arrays of pointers to Python objects, which are
-slow and memory-hungry; newer pandas versions offer dedicated string dtypes (pandas 3.0 makes a
-string dtype the default for text) and, since pandas 2.0, optional Arrow-backed columns
-(`dtype_backend="pyarrow"`) that store data in Arrow's columnar format.
+- **Structure.** An ordered collection of columns (each a `Series`) sharing one `Index` of row labels.
+- **Storage.** Each column is a NumPy array or an extension array, so numeric columns get NumPy speed.
 
-Missing values are a historical compromise: a float column uses `NaN`, so an integer column that gains
-one missing value silently becomes `float64`. Nullable dtypes (`Int64`, `boolean`, `string`) use a
-separate mask instead, keeping the type.
+| Column kind | Storage | Note |
+|---|---|---|
+| Numeric | NumPy array | Compiled speed |
+| Strings, historically | `object`: pointers to Python objects | Slow and memory-hungry |
+| Strings, newer | Dedicated string dtypes | pandas 3.0 makes a string dtype the default for text |
+| Arrow-backed (since pandas 2.0, optional) | `dtype_backend="pyarrow"` | Arrow's columnar format |
+
+### Missing values
+- **Float columns use `NaN`,** so an integer column that gains one missing value silently becomes
+  `float64` (a historical compromise).
+- **Nullable dtypes (`Int64`, `boolean`, `string`)** use a separate mask instead, keeping the type.
 
 ### Alignment
-Arithmetic between Series aligns on index *labels*, not positions. `a + b` matches rows with the same
-label and yields `NaN` where a label exists on only one side. This was designed for time series, where
-aligning by date is what you want; for freshly filtered frames with gappy indexes it causes silent NaNs,
-which is why `reset_index(drop=True)` appears so often.
+- **Arithmetic aligns on index *labels*, not positions.** `a + b` matches rows with the same label and
+  yields `NaN` where a label exists on only one side.
+- **Why.** It was designed for time series, where aligning by date is what you want.
+- **The cost.** On freshly filtered frames with gappy indexes it causes silent NaNs, which is why
+  `reset_index(drop=True)` appears so often.
 
 ### Vectorized operations and their escape hatch
-Column expressions such as `df["cost"] = df["tokens"] / 1000 * df["price"]` run as NumPy operations over
-whole columns. `df.apply(f, axis=1)` calls a Python function per row, which brings back interpreter
-speed, so it should be a last resort. String and datetime operations live under `.str` and `.dt`.
+- **Column expressions** such as `df["cost"] = df["tokens"] / 1000 * df["price"]` run as NumPy operations
+  over whole columns.
+- **`df.apply(f, axis=1)`** calls a Python function per row, bringing back interpreter speed: a last resort.
+- **String and datetime operations** live under `.str` and `.dt`.
 
 ### Group-by, joins, reshaping
-`groupby` implements split-apply-combine: split rows by key, apply an aggregation per group, combine
-into a new frame. Named aggregation (`agg(pass_rate=("passed", "mean"))`) keeps output columns explicit.
-`merge` performs SQL-style joins; its `validate=` argument checks the expected cardinality so a
-duplicate key cannot silently multiply rows. `pivot_table` and `melt` switch between wide and long shapes.
+| Tool | What it does |
+|---|---|
+| `groupby` | Split-apply-combine: split rows by key, aggregate per group, combine into a new frame |
+| Named aggregation `agg(pass_rate=("passed", "mean"))` | Keeps output columns explicit |
+| `merge` | SQL-style joins; `validate=` checks cardinality so a duplicate key cannot silently multiply rows |
+| `pivot_table` / `melt` | Switch between wide and long shapes |
 
-Under the hood, `groupby` first *factorizes* the key columns: one hash pass maps each distinct key to
-an integer group code. Built-in aggregations named by string (`"mean"`, `"sum"`, `"size"`) then run a
-compiled loop that adds each row's value into its group's accumulator, so cost is roughly linear in rows
-whatever the number of groups. A lambda or custom function instead gets called once per group with a
-Series, which is fine for tens of groups and slow for a million. Two defaults matter: `dropna=True`
-drops rows whose key is missing, and for categorical keys `observed=` decides whether empty
-categories appear as rows.
+How `groupby` runs:
+1. **Factorize** the key columns: one hash pass maps each distinct key to an integer group code.
+2. **Aggregate.** Built-ins named by string (`"mean"`, `"sum"`, `"size"`) run a compiled loop adding each
+   row into its group's accumulator, so cost is roughly linear in rows whatever the number of groups.
+3. **Custom functions are slower.** A lambda is called once per group with a Series: fine for tens of
+   groups, slow for a million.
+
+Two defaults matter: `dropna=True` drops rows whose key is missing, and for categorical keys `observed=`
+decides whether empty categories appear as rows.
 
 ### Indexing, copies and views
-Use `.loc[row_mask, "col"]` for label-based selection and assignment and `.iloc` for positions. Chained
-indexing such as `df[mask]["col"] = x` may assign into a temporary copy and leave `df` unchanged, the
-origin of the `SettingWithCopyWarning`. pandas 3.0 made Copy-on-Write the default: every derived
-object behaves as a copy and real copying is deferred until a write. That removes the ambiguity in one
-direction: chained assignment *never* modifies `df`, and pandas emits a `ChainedAssignmentError`
-warning instead. Code written for pandas 2.x that relied on chained assignment silently stops working.
+- **Select and assign with `.loc[row_mask, "col"]`** for labels, `.iloc` for positions.
+- **Chained indexing** such as `df[mask]["col"] = x` may assign into a temporary copy and leave `df`
+  unchanged, the origin of the `SettingWithCopyWarning`.
+- **pandas 3.0 made Copy-on-Write the default.** Every derived object behaves as a copy and real copying
+  is deferred until a write.
+- **That removes the ambiguity in one direction.** Chained assignment *never* modifies `df`, and pandas
+  emits a `ChainedAssignmentError` warning instead. Code for pandas 2.x that relied on chained assignment
+  silently stops working.
 
 ### Execution model
-pandas is eager: each operation materializes a full result immediately, mostly on a single core. With
-intermediates, a common rule of thumb is to have several times the dataset's size available as RAM.
-Data larger than memory needs chunked reading (`chunksize=`), a columnar engine such as Polars or DuckDB,
-or a database.
+- **Eager.** Each operation materializes a full result immediately, mostly on a single core.
+- **RAM rule of thumb.** With intermediates, have several times the dataset's size available.
+- **Bigger than memory?** Chunked reading (`chunksize=`), a columnar engine such as Polars or DuckDB, or a
+  database.
 
-## Example
+## Examples
+### Eval summary per model and category
 Summarising an eval run: pass rate, tail latency and cost per model and category.
 
 ```python
@@ -126,45 +137,97 @@ df.loc[df["model"] == "small", "reviewed"] = True             # right: one .loc 
 failures = df.loc[~df["passed"], ["case_id", "model", "category"]]
 ```
 
-The summary shows `small` passing 0.0 on refund (2 cases) and 1.0 on billing, while `large` passes
-everything; refund cost for `large` is (180 + 200) / 1000 × 0.01 = 0.0038 USD versus 0.00015 for
-`small`. That is the shape of a real model-choice discussion: the cheap model fails one category, so
-route that category to the large one.
+| model | category | pass_rate | cost_usd |
+|---|---|---|---|
+| small | refund (2 cases) | 0.0 | 0.00015 |
+| small | billing | 1.0 | |
+| large | refund | 1.0 | (180 + 200) / 1000 × 0.01 = 0.0038 |
+| large | billing | 1.0 | |
+
+That is the shape of a real model-choice discussion: the cheap model fails one category, so route that
+category to the large one.
+
+### Loading a large usage log without exhausting memory
+A token-usage export too big to load with default dtypes. Read only needed columns, pin compact dtypes,
+and aggregate chunk by chunk.
+
+```python
+import pandas as pd
+
+cols = ["ts", "model", "route", "out_tokens", "latency_ms"]
+dtypes = {"model": "category", "route": "category",
+          "out_tokens": "int32", "latency_ms": "float32"}
+
+parts = []
+for chunk in pd.read_csv("usage.csv", usecols=cols, dtype=dtypes,
+                         parse_dates=["ts"], chunksize=1_000_000):
+    parts.append(chunk.groupby(["model", "route"], observed=True)
+                      .agg(calls=("latency_ms", "size"), out_tokens=("out_tokens", "sum")))
+
+usage = pd.concat(parts).groupby(level=["model", "route"], observed=True).sum()  # combine partial sums
+print(usage.sort_values("out_tokens", ascending=False).head())
+```
+
+Why the dtypes matter, per 10 million rows (bytes are exact for fixed-width types):
+
+| Column | Default dtype | Pinned dtype | Memory |
+|---|---|---|---|
+| `out_tokens` | int64, 8 B/row = 80 MB | int32, 4 B/row | 40 MB |
+| `latency_ms` | float64 = 80 MB | float32 | 40 MB |
+| `model` (a handful of values) | `object`: 8 B pointer per row plus Python string objects (~50 B each) | `category`: 1 B code per row | ~10 MB |
+
+Check the real numbers with `df.memory_usage(deep=True)`.
+
+## Production patterns
+- **Pin dtypes and columns at read time.** Pass `usecols=`/`dtype=` to `read_csv`, or `columns=` to
+  `read_parquet`, and use `category` for repeated strings. Log `df.memory_usage(deep=True).sum()` per
+  stage; a jump means a column fell back to `object` or `float64`.
+- **Guard every join.** Use `merge(..., validate="many_to_one")` and assert the row count is unchanged
+  after a left join. Monitor rows-before versus rows-after in pipeline logs, since inflated totals are the
+  classic silent failure.
+- **Nullable IDs everywhere.** Read ID columns as `Int64` or `string` (`dtype={"case_id": "Int64"}`, or
+  `df.convert_dtypes()`), so one missing value cannot turn IDs into `1234.0`. Watch join match rates.
+- **Opt into Copy-on-Write before upgrading.** On pandas 2.x set `pd.set_option("mode.copy_on_write",
+  True)` in tests and fix every chained assignment it flags. Track `ChainedAssignmentError` and
+  `SettingWithCopyWarning` counts in CI output; aim for zero.
+- **Hand off as Parquet, not CSV.** Write `df.to_parquet(path, index=False)` so dtypes survive the trip
+  to the next notebook or job. Monitor file sizes and read times, and keep `dropna=False` explicit in
+  report group-bys so missing categories stay visible.
 
 ## Trade-offs
-- An enormous API and ecosystem make most tasks one line away, but the API has many ways to do the same
-  thing and inconsistent historical defaults, so code quality varies wildly across a team.
-- Eager execution is easy to inspect cell by cell in a notebook, yet it materializes every intermediate;
-  on data near RAM size, lazy engines such as Polars or DuckDB optimize and stream instead.
-- Index-label alignment is ideal for time series, but on ad-hoc tables it silently introduces NaNs,
-  so many teams treat the index as a plain row number and join explicitly.
-- `object` dtype columns can hold anything, which tolerates messy data at the cost of speed and memory;
-  converting to proper string, categorical or Arrow dtypes flips that once data grows.
+- **Huge API vs consistency.** Most tasks are one line away, but there are many ways to do the same thing
+  and inconsistent historical defaults, so code quality varies wildly across a team.
+- **Eager vs lazy.** Eager execution is easy to inspect cell by cell, yet materializes every intermediate;
+  near RAM size, lazy engines such as Polars or DuckDB optimize and stream instead.
+- **Label alignment vs surprise NaNs.** Ideal for time series, but on ad-hoc tables it silently introduces
+  NaNs, so many teams treat the index as a plain row number and join explicitly.
+- **`object` flexibility vs cost.** It holds anything and tolerates messy data at the cost of speed and
+  memory; converting to string, categorical or Arrow dtypes flips that once data grows.
 
 ## Pitfalls
-- Using `apply(axis=1)` or `iterrows()` for arithmetic; the symptom is a notebook cell taking minutes on
-  a few million rows where the vectorized expression takes under a second.
-- Chained assignment like `df[mask]["col"] = x`; the symptom is `SettingWithCopyWarning` (pandas 2.x) or
-  `ChainedAssignmentError` (pandas 3.x, Copy-on-Write) and a frame that is unchanged afterwards.
-- Merging on a key that is not unique on the side you assumed; the symptom is the row count growing
-  after a join and inflated totals, caught by `validate="many_to_one"`.
-- One missing value turning an ID column into `float64`; the symptom is IDs printed as `1234.0` and
-  failed joins against integer keys.
-- Loading a multi-gigabyte CSV with default dtypes; the symptom is memory exhaustion, fixed by
-  specifying dtypes, reading only needed columns, or switching to Parquet. `df.memory_usage(deep=True)`
-  shows which columns (usually `object` strings) are responsible.
-- Grouping by a column with missing values under the default `dropna=True`; the symptom is per-group
-  counts that sum to fewer rows than the frame, because cases with no category vanished from the
-  report. Pass `dropna=False` or fill the key first.
+- **`apply(axis=1)` or `iterrows()` for arithmetic.** Symptom: a cell taking minutes on a few million rows
+  where the vectorized expression takes under a second. Fix: column expressions, `map` or `merge`.
+- **Chained assignment like `df[mask]["col"] = x`.** Symptom: `SettingWithCopyWarning` (pandas 2.x) or
+  `ChainedAssignmentError` (pandas 3.x, Copy-on-Write) and a frame unchanged afterwards. Fix: one `.loc`.
+- **Merging on a key not unique on the side you assumed.** Symptom: row count grows after a join and
+  totals inflate. Fix: `validate="many_to_one"` catches it.
+- **One missing value turning an ID column into `float64`.** Symptom: IDs printed as `1234.0` and failed
+  joins against integer keys. Fix: nullable `Int64`.
+- **A multi-gigabyte CSV with default dtypes.** Symptom: memory exhaustion. Fix: specify dtypes, read only
+  needed columns, or switch to Parquet; `df.memory_usage(deep=True)` shows which columns (usually `object`
+  strings) are responsible.
+- **Grouping a column with missing values under default `dropna=True`.** Symptom: per-group counts sum to
+  fewer rows than the frame, because cases with no category vanished from the report. Fix: pass
+  `dropna=False` or fill the key first.
 
 ## When to use
-Use pandas for exploratory analysis and reporting on data that fits comfortably in memory: eval results,
-annotation exports, token and cost logs, small training sets, and anything feeding scikit-learn or a
-plot. It is also the lingua franca for handing tables between libraries. Prefer Polars or DuckDB when
-data approaches RAM size, when a pipeline runs repeatedly and speed matters, or when you want lazy,
-query-optimized execution. Prefer a database when data is shared, updated concurrently or needs
-durability. In interviews, expect questions on group-by, joins, vectorization and why chained
-assignment fails.
+- **Use when:** exploratory analysis and reporting on data that fits comfortably in memory: eval results,
+  annotation exports, token and cost logs, small training sets, anything feeding scikit-learn or a plot.
+  It is also the lingua franca for handing tables between libraries.
+- **Prefer Polars or DuckDB when:** data approaches RAM size, a pipeline runs repeatedly and speed
+  matters, or you want lazy, query-optimized execution.
+- **Prefer a database when:** data is shared, updated concurrently or needs durability.
+- **Interviews:** expect group-by, joins, vectorization and why chained assignment fails.
 
 ## Role lens
 - **Engineer:** Loads JSONL eval and trace data into DataFrames, slices failures by category, and writes

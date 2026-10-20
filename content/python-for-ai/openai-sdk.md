@@ -5,7 +5,7 @@ name: OpenAI SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - python-for-ai/anthropic-sdk
   - python-for-ai/litellm
@@ -21,96 +21,104 @@ sources:
 ---
 
 ## TL;DR
-The `openai` Python package is the official typed client for OpenAI's API: sync and async clients,
-Pydantic-typed responses, streaming, tool calling, structured outputs, and built-in retries and
-timeouts. It matters beyond OpenAI because its Chat Completions request shape became the de facto
-interface that many other servers (vLLM, Ollama, gateways) imitate, so the same client often talks to
-them by changing `base_url`.
+The `openai` package is OpenAI's official typed client: sync and async, streaming, tools, structured
+outputs, retries and timeouts. Its Chat Completions shape is the de facto standard, so the same client
+reaches vLLM, Ollama or gateways by changing `base_url`.
 
 ## Why it exists
-Calling an LLM over raw HTTP looks easy: POST JSON, read JSON. The details are where production code
-breaks. Rate-limit responses (429) and transient 5xx errors are routine at volume and need backoff;
-requests can hang for minutes unless a timeout is set; streaming responses arrive as server-sent events
-that must be parsed incrementally; tool calls arrive as JSON strings inside nested structures whose
-shape changes when new features land; and every field you read from a dict is an unchecked guess about
-the schema. Teams that hand-roll this tend to reinvent retries badly (retrying non-idempotent work, or
-retrying 400s forever) and discover schema changes as `KeyError`s in production.
-
-The SDK encodes the API's contract in code generated from its OpenAPI specification, so request
-parameters and response objects are typed and autocompletable, errors are an exception hierarchy you
-can catch precisely, and the transport behaviour (connection pooling, retry with backoff, timeouts,
-streaming) is implemented once. The reason to learn it well, rather than hiding it behind a framework
-immediately, is that most debugging of LLM features comes down to what this client sent and received:
-the exact messages, the tool schema, the `usage` counts and the request ID you give to support.
+- **Raw HTTP breaks on the details.** 429 rate limits and transient 5xx errors are routine at volume and
+  need backoff; requests can hang for minutes without a timeout.
+- **Payloads are awkward to parse safely.** Streaming arrives as server-sent events parsed incrementally;
+  tool calls arrive as JSON strings inside nested structures whose shape changes as features land; every
+  dict field you read is an unchecked guess about the schema.
+- **Hand-rolled clients fail predictably.** Teams reinvent retries badly (retrying non-idempotent work, or
+  retrying 400s forever) and discover schema changes as `KeyError`s in production.
+- **The SDK encodes the contract once.** Generated from the OpenAPI specification, it gives typed,
+  autocompletable parameters and responses, a precise exception hierarchy, and one implementation of
+  pooling, retry with backoff, timeouts and streaming.
+- **Most LLM debugging happens here.** What this client sent and received, meaning the exact messages,
+  the tool schema, the `usage` counts and the request ID you give to support, is why to learn it before
+  hiding it behind a framework.
 
 ## How it works
 ### Client and transport
-`OpenAI()` reads `OPENAI_API_KEY` (and optionally organisation and project) from the environment and
-builds an `httpx` client with connection pooling. `AsyncOpenAI` exposes the same methods as coroutines
-for servers built on asyncio. Create one client per process and reuse it, because each client owns a
-connection pool; constructing one per request defeats keep-alive. `base_url` points the same client at
-any compatible server; Azure has a dedicated `AzureOpenAI` client because its classic deployment-based
-URLs, `api-version` parameter and Entra ID auth differ (Azure's newer v1-style endpoints can also be
-reached with the plain client and a `base_url`; check which one your deployment exposes).
+- **Env-configured.** `OpenAI()` reads `OPENAI_API_KEY` (and optionally organisation and project) and
+  builds an `httpx` client with connection pooling.
+- **Async twin.** `AsyncOpenAI` exposes the same methods as coroutines for asyncio servers.
+- **One client per process**, reused, because each client owns a connection pool; one per request defeats
+  keep-alive.
+- **`base_url`** points the same client at any compatible server.
+- **Azure.** A dedicated `AzureOpenAI` client exists because classic deployment-based URLs, the
+  `api-version` parameter and Entra ID auth differ. Azure's newer v1-style endpoints can also be reached
+  with the plain client and a `base_url`; check which one your deployment exposes.
 
 ### Two generation APIs
-- **Chat Completions** (`client.chat.completions.create`) takes a list of role-tagged `messages` and
-  returns `choices[0].message`. It is stateless: you resend the whole history each call. This is the
-  shape other providers copied.
-- **Responses** (`client.responses.create`) is OpenAI's newer API, taking `input` plus `instructions`,
-  returning a list of typed output items, with optional server-side conversation state and built-in
-  tools. The convenience property `response.output_text` concatenates text output.
-New OpenAI-specific features tend to arrive in Responses first; portability favours Chat Completions.
+| | Chat Completions | Responses |
+|---|---|---|
+| Call | `client.chat.completions.create` | `client.responses.create` |
+| Input | role-tagged `messages` | `input` plus `instructions` |
+| Output | `choices[0].message` | list of typed output items; `response.output_text` concatenates text |
+| State | stateless: resend the whole history each call | optional server-side conversation state, built-in tools |
+| Best for | portability; the shape other providers copied | new OpenAI-specific features, which tend to arrive here first |
 
-Server-side state (`previous_response_id`, or a conversation object) saves you from resending history
-over the wire, but it does not make history free: the model still reads the earlier turns, and they are
-billed as input tokens on each call. It also moves the transcript into the provider's storage, which
-matters for retention policies; `store=False` opts out, at the cost of managing history yourself.
+Server-side state (`previous_response_id`, or a conversation object):
+- **Saves resending history over the wire, not paying for it.** The model still reads earlier turns, and
+  they are billed as input tokens on each call.
+- **Moves the transcript into provider storage**, which matters for retention policies. `store=False` opts
+  out, at the cost of managing history yourself.
 
 ### Typed responses and structured output
-Responses are Pydantic models, so `resp.usage.prompt_tokens` is checked attribute access, not a dict
-lookup. For structured output, the `parse` helpers accept a Pydantic class, convert it to a strict JSON
-Schema, and return the validated object (`output_parsed` on Responses, `message.parsed` on Chat
-Completions). Strict schema mode constrains decoding to the schema, which is stronger than asking for
-JSON in the prompt; you still handle refusals and truncated outputs.
+- **Pydantic responses.** `resp.usage.prompt_tokens` is checked attribute access, not a dict lookup.
+- **`parse` helpers** take a Pydantic class, convert it to a strict JSON Schema, and return the validated
+  object (`output_parsed` on Responses, `message.parsed` on Chat Completions).
+- **Strict mode constrains decoding** to the schema, stronger than asking for JSON in the prompt. You still
+  handle refusals and truncated outputs.
 
 ### Tools
-You pass JSON Schema function definitions; the model may return tool calls whose `arguments` field is a
-JSON string. Your code parses and validates the arguments, runs the function, and sends the result back
-in a follow-up message tied to the call's ID. The SDK does not execute tools for you; that loop is your
-agent code.
+1. You pass JSON Schema function definitions.
+2. The model may return tool calls whose `arguments` field is a JSON string.
+3. Your code parses and validates the arguments and runs the function.
+4. You send the result back in a follow-up message tied to the call's ID.
+
+- **The SDK does not execute tools.** That loop is your agent code.
 
 ### Streaming
-`stream=True` returns an iterator of chunks (Chat Completions) or typed events (Responses) parsed from
-server-sent events, so you can forward tokens to a user as they arrive. Usage totals arrive only at the
-end: Chat Completions includes them in a final chunk only if you pass
-`stream_options={"include_usage": True}`, while Responses carries them on the closing
-`response.completed` event, so log them from the final event.
+- **`stream=True`** returns an iterator of chunks (Chat Completions) or typed events (Responses) parsed from
+  server-sent events, so you can forward tokens as they arrive.
+- **Usage arrives only at the end.** Chat Completions includes it in a final chunk only with
+  `stream_options={"include_usage": True}`; Responses carries it on the closing `response.completed`
+  event. Log usage from the final event.
 
 ### Errors, retries, timeouts
-Exceptions subclass `openai.APIError`: `APIConnectionError` and `APITimeoutError` for transport,
-`APIStatusError` subclasses such as `RateLimitError` (429), `BadRequestError` (400) and
-`AuthenticationError` (401). By default the client retries connection errors, 408, 409, 429 and 5xx
-responses twice (`max_retries=2`) with exponential backoff and jitter, honouring a `retry-after` header
-when the server sends one, because those failures are plausibly transient; 4xx errors like 400 are not
-retried, because resending the same bad request cannot succeed. The default timeout is 600 seconds, far
-too long for an interactive path, so set your own per client or per call with `with_options`.
+| Exception (all subclass `openai.APIError`) | Meaning |
+|---|---|
+| `APIConnectionError`, `APITimeoutError` | transport |
+| `RateLimitError` | 429 (an `APIStatusError` subclass) |
+| `BadRequestError` | 400 |
+| `AuthenticationError` | 401 |
 
-Two consequences follow. Worst-case wall-clock time is roughly `timeout × (max_retries + 1)` plus
-backoff. And a generation request is not idempotent: if a timeout fires after the server started work,
-the retry is a second, separately billed generation, so aggressive timeouts on long outputs can raise
-cost as well as latency.
+- **Default retries:** connection errors, 408, 409, 429 and 5xx are retried twice (`max_retries=2`) with
+  exponential backoff and jitter, honouring a `retry-after` header when sent, because those failures are
+  plausibly transient.
+- **No retry on 4xx like 400**, because resending the same bad request cannot succeed.
+- **Default timeout is 600 seconds**, far too long for an interactive path; set your own per client or per
+  call with `with_options`.
+- **Worst-case wall clock** is roughly `timeout × (max_retries + 1)` plus backoff.
+- **Generation is not idempotent.** If a timeout fires after the server started work, the retry is a
+  second, separately billed generation, so aggressive timeouts on long outputs raise cost as well as
+  latency.
 
 ### Raw responses and headers
-Typed objects hide the HTTP layer, which is usually what you want, except for the headers.
-`client.with_raw_response.chat.completions.create(...)` returns the raw response, whose headers include
-the request ID and rate-limit state (`x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`),
-and `.parse()` on it gives you the usual typed object. Reading remaining-token headers lets a batch
-worker slow down before it hits 429s instead of after.
+- **Typed objects hide the HTTP layer**, usually what you want, except for the headers.
+- **`client.with_raw_response.chat.completions.create(...)`** returns the raw response; its headers carry
+  the request ID and rate-limit state (`x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`),
+  and `.parse()` gives the usual typed object.
+- **Throttle before the 429.** Reading remaining-token headers lets a batch worker slow down before it hits
+  429s instead of after.
 
-## Example
-A support classifier with structured output, a tight timeout and explicit error handling. Model names
-change; read them from configuration.
+## Examples
+### Support classifier with structured output and explicit errors
+Model names change; read them from configuration.
 
 ```python
 import os
@@ -146,45 +154,109 @@ def triage(ticket: str) -> Triage | None:
 print(triage("I was charged twice this month and need it fixed today."))
 ```
 
-What happens on the wire: `parse` converts `Triage` into a JSON Schema (an enum for `category`, a
-boolean, a string, every field required, no extra properties), sends it as a strict text format, and the
-server constrains decoding so the reply can only be JSON matching that schema; the SDK then validates it
-back into a `Triage`. A 429 is retried up to three times before `RateLimitError` reaches the `except`, so
-re-raising there hands the failure to an outer queue rather than retrying a fourth time in-process.
+- **On the wire:** `parse` turns `Triage` into a JSON Schema (an enum for `category`, a boolean, a string,
+  every field required, no extra properties) sent as a strict text format. The server constrains decoding
+  to matching JSON; the SDK validates it back into a `Triage`.
+- **Retry accounting:** a 429 is retried up to three times before `RateLimitError` reaches the `except`, so
+  re-raising hands the failure to an outer queue instead of retrying a fourth time in-process.
+- **Local server:** the same code runs against vLLM with `OpenAI(base_url="http://localhost:8000/v1",
+  api_key="unused")`, provided that server implements the endpoint you call.
 
-Pointing the same code at a local vLLM server is `OpenAI(base_url="http://localhost:8000/v1",
-api_key="unused")`, provided that server implements the endpoint you call.
+### One round of the tool loop (Chat Completions)
+Reuses `client` and `MODEL` from above. The SDK only transports the call; parsing, validation, execution
+and the reply are yours.
+
+```python
+import json
+
+tools = [{"type": "function", "function": {
+    "name": "get_order", "description": "Look up an order by id",
+    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                   "required": ["order_id"], "additionalProperties": False}}}]
+
+def get_order(order_id: str) -> dict:
+    return {"order_id": order_id, "status": "shipped"}
+
+messages = [{"role": "user", "content": "Where is order A123?"}]
+resp = client.chat.completions.create(model=MODEL, messages=messages, tools=tools)
+msg = resp.choices[0].message
+if msg.tool_calls:
+    messages.append(msg)                            # the assistant turn that asked for tools
+    for call in msg.tool_calls:
+        try:
+            args = json.loads(call.function.arguments)          # model-generated, may be invalid
+            result = get_order(**args) if call.function.name == "get_order" else {"error": "unknown tool"}
+        except (json.JSONDecodeError, TypeError) as e:
+            result = {"error": f"bad arguments: {e}"}
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
+    resp = client.chat.completions.create(model=MODEL, messages=messages, tools=tools)
+print(resp.choices[0].message.content)
+```
+
+### Worked scenario: worst-case time a worker is held
+Using `timeout × (max_retries + 1)`, before backoff:
+
+| Settings | Worst case |
+|---|---|
+| Defaults: 600 s, `max_retries=2` | 1,800 s (30 minutes) |
+| Classifier above: 20 s, `max_retries=3` | 80 s |
+| Interactive path: 10 s, `max_retries=1` | 20 s |
+| Queued batch job: 60 s, `max_retries=0`, queue owns backoff | 60 s per attempt |
+
+During a provider incident, the first row is how a few slow calls exhaust a worker pool.
+
+## Production patterns
+- **Budget timeouts per path.** Create one client, then derive variants with
+  `client.with_options(timeout=10.0, max_retries=1)` for user-facing calls and longer budgets for batch.
+  Monitor `APITimeoutError` and `RateLimitError` rates separately, because they need different fixes.
+- **Log the request ID and usage on every call.** Record `resp._request_id`, model, input and output
+  tokens and latency in structured logs. Use them to answer "why this answer" and "why this bill".
+- **Throttle batch workers from headers.** Use `with_raw_response` and read
+  `x-ratelimit-remaining-tokens`, slowing the worker as it approaches zero. Monitor 429 count per hour; it
+  should trend to zero.
+- **Stream with usage on.** Pass `stream=True` with `stream_options={"include_usage": True}` on Chat
+  Completions, forward deltas to the user, and record usage from the final chunk. Monitor time to first
+  token.
+- **Async client in async servers.** Use `AsyncOpenAI` in FastAPI or other asyncio apps, created once at
+  startup. Monitor event-loop lag and concurrent in-flight calls.
+- **Configurable endpoint behind a thin interface.** Read `base_url` and model from config, and wrap calls
+  in one function per capability (classify, generate, embed) so tests fake it and a compatible server can
+  be swapped in.
 
 ## Trade-offs
-- The official SDK tracks new features immediately, but couples your code to one provider's shapes;
-  a thin internal interface or a router like LiteLLM is worth it once you genuinely use several providers.
-- Built-in retries handle transient failures with no code, but they multiply latency and cost on
-  overload; in queued batch jobs you may prefer `max_retries=0` and let the queue own backoff.
-- The Responses API offers server-side state and built-in tools, but other providers do not mirror it,
-  so Chat Completions remains the better choice when portability matters more than new features.
-- Strict structured outputs guarantee schema conformance, but restrict the JSON Schema features you can
-  use; complex unions or open-ended dicts may need a looser schema plus Pydantic validation.
+- **Immediate features vs provider coupling.** The official SDK tracks new features immediately but
+  couples code to one provider's shapes; a thin internal interface or a router like LiteLLM pays off once
+  you genuinely use several providers.
+- **Free retries vs multiplied latency.** Built-in retries handle transient failures with no code, but
+  multiply latency and cost on overload; in queued batch jobs prefer `max_retries=0` and let the queue own
+  backoff.
+- **Responses features vs portability.** Server-side state and built-in tools are not mirrored by other
+  providers, so Chat Completions is better when portability matters more than new features.
+- **Schema guarantee vs schema expressiveness.** Strict structured outputs guarantee conformance but
+  restrict JSON Schema features; complex unions or open-ended dicts may need a looser schema plus Pydantic
+  validation.
 
 ## Pitfalls
-- Creating a new client per request: connection setup on every call raises latency, and under load you
-  see socket exhaustion or many TLS handshakes in traces.
-- Leaving the default long timeout in a user-facing endpoint: one stuck upstream call ties up a worker
-  for minutes, and the symptom is request pile-ups during provider incidents.
-- Calling the sync client inside an async web server: the event loop blocks, and every concurrent
-  request stalls while one LLM call is in flight; use `AsyncOpenAI`.
-- Trusting tool-call `arguments` as valid: they are model-generated JSON strings, and the symptom is
-  occasional `JSONDecodeError` or wrong-typed fields crashing the tool layer.
-- Not logging request IDs and usage: when a customer reports a bad answer or a billing spike, you
-  cannot match it to a specific call or explain the cost.
+- **A new client per request.** Connection setup on every call raises latency; under load you see socket
+  exhaustion or many TLS handshakes in traces.
+- **The default long timeout in a user-facing endpoint.** One stuck upstream call ties up a worker for
+  minutes. Symptom: request pile-ups during provider incidents.
+- **The sync client inside an async web server.** The event loop blocks and every concurrent request
+  stalls while one LLM call is in flight; use `AsyncOpenAI`.
+- **Trusting tool-call `arguments` as valid.** They are model-generated JSON strings. Symptom: occasional
+  `JSONDecodeError` or wrong-typed fields crashing the tool layer.
+- **Not logging request IDs and usage.** When a customer reports a bad answer or a billing spike, you
+  cannot match it to a call or explain the cost.
 
 ## When to use
-Use the OpenAI SDK directly when OpenAI (or Azure OpenAI) is your primary provider and you want new
-features as they ship; use it with `base_url` against OpenAI-compatible servers for local or self-hosted
-models. Wrap it behind your own small interface (one function per capability: classify, generate, embed)
-so tests can fake it and a second provider can be added without touching callers. Move to LiteLLM or a
-gateway when you need routing, fallbacks or central spend tracking across providers. Measure latency
-percentiles, retry counts, error rates by type and tokens per call. Interviewers probe retry semantics,
-streaming, and how you validate structured output.
+- **Use directly when** OpenAI (or Azure OpenAI) is your primary provider and you want new features as they
+  ship; use it with `base_url` against OpenAI-compatible servers for local or self-hosted models.
+- **Wrap it** behind a small interface (one function per capability: classify, generate, embed) so tests
+  can fake it and a second provider can be added without touching callers.
+- **Move to LiteLLM or a gateway when** you need routing, fallbacks or central spend tracking across
+  providers.
+- **Measure** latency percentiles, retry counts, error rates by type and tokens per call.
+- **Interviews:** retry semantics, streaming, and how you validate structured output.
 
 ## Role lens
 - **Engineer:** Writes the client wrapper with timeouts, retries, structured output and streaming,

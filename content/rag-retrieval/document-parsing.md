@@ -5,7 +5,7 @@ name: Document parsing (OCR, layout, tables)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - multimodal/ocr
   - multimodal/document-understanding
@@ -20,109 +20,134 @@ sources:
 ---
 
 ## TL;DR
-Parsing turns PDFs, scans and office files into clean, ordered text with structure before anything is
-chunked or embedded. It needs OCR for pages that are images, layout analysis to recover reading order and
-drop headers and footers, and table extraction that keeps each cell tied to its row and column headers.
-It matters because every later stage only sees what the parser produced: retrieval cannot find text that
-was garbled, reordered or flattened.
+Parsing turns PDFs, scans and office files into clean, ordered, structured text before chunking: OCR for
+image pages, layout analysis for reading order, and tables that keep cells tied to their headers. Every
+later stage sees only what the parser produced.
 
 ## Why it exists
-A PDF is not a text file. It is a set of drawing instructions: place these glyphs at these coordinates,
-draw this line. There is no notion of "paragraph", "column" or "table cell", and sometimes not even of
-words: characters may be placed one by one, and spaces inferred from gaps. A scanned PDF is worse: each
-page is a photograph with no text layer at all.
-
-The naive approach, calling a library's `extract_text()` and chunking the result, fails in predictable
-ways. Two-column papers come out with lines interleaved across columns. Every page's running header ("ACME
-Corp Confidential, Page 7") is repeated hundreds of times and pollutes retrieval. Scanned pages yield
-empty strings, so whole documents silently vanish from the index. Tables are the worst case: a cell like
-"30 days" ends up as a token in a stream of numbers, detached from the row label "Refund window" and the
-column header "Enterprise plan", so no query can match it meaningfully and the model cannot interpret it
-even if it is retrieved.
-
-These failures are invisible downstream. The embedding model happily embeds garbage, the vector store
-indexes it, and the eventual symptom is a wrong answer that looks like a retrieval or model problem. In
-practice parsing errors are among the most common root causes found in RAG failure analysis, and they are
-cheapest to fix at the source.
+- **A PDF is drawing instructions, not text.** Place these glyphs at these coordinates, draw this line.
+  There is no "paragraph", "column" or "table cell", sometimes not even words: characters may be placed
+  one by one with spaces inferred from gaps. A scanned PDF is a photograph per page with no text layer.
+- **Naive `extract_text()` then chunking fails predictably.** Two-column papers interleave lines across
+  columns. A running header ("ACME Corp Confidential, Page 7") repeats hundreds of times and pollutes
+  retrieval. Scanned pages yield empty strings, so whole documents silently vanish from the index.
+- **Tables are the worst case.** "30 days" becomes a token in a stream of numbers, detached from the row
+  label "Refund window" and the column header "Enterprise plan", so no query matches it meaningfully and
+  the model cannot interpret it even if retrieved.
+- **The failures are invisible downstream.** The embedding model embeds garbage, the vector store indexes
+  it, and the symptom is a wrong answer that looks like a retrieval or model problem.
+- **Fix it at the source.** Parsing errors are among the most common root causes in RAG failure analysis,
+  and they are cheapest to fix where they happen.
 
 ## How it works
 ### 1. Triage each page
-Decide per page, not per file, *because* mixed PDFs (a digital contract with scanned signature pages) are
-common. If the page has a text layer with a plausible character count, extract it directly; it is exact
-and cheap. If the text layer is empty, tiny or garbage (some scanners add a poor OCR layer), render the
-page to an image and OCR it.
-
-"Plausible" needs a quality check, not just a length check. A text layer can be long and still useless:
-fonts embedded without a proper character-to-Unicode mapping extract as placeholders such as `(cid:42)`
-or as mojibake, and an old scanner's OCR layer can be riddled with errors. Cheap signals are the share of
-tokens that are dictionary words in the expected language, the share of replacement or placeholder
-characters, and whether the text contains the words you can see in a rendered thumbnail. Pages that fail
-go to OCR even though a text layer exists.
+- **Decide per page, not per file**, *because* mixed PDFs (a digital contract with scanned signature
+  pages) are common.
+- **Text layer with a plausible character count:** extract it directly; it is exact and cheap.
+- **Empty, tiny or garbage layer** (some scanners add a poor OCR layer): render the page to an image and OCR it.
+- **"Plausible" needs a quality check, not a length check.** Fonts embedded without a proper
+  character-to-Unicode mapping extract as placeholders such as `(cid:42)` or as mojibake, and an old
+  scanner's OCR layer can be riddled with errors.
+- **Cheap quality signals:** share of tokens that are dictionary words in the expected language; share of
+  replacement or placeholder characters; whether the text contains words visible in a rendered thumbnail.
+  Pages that fail go to OCR even though a text layer exists.
 
 ### 2. Extract with coordinates
-For digital pages, extract words or characters with bounding boxes and font information, not just a string.
-Coordinates are what make layout recovery possible; font size and weight are the main signals for headings.
+- **Extract words or characters with bounding boxes and font information**, not just a string.
+- **Coordinates make layout recovery possible**; font size and weight are the main signals for headings.
 
 ### 3. OCR for image pages
-OCR has two stages: *detection* finds text regions and lines, *recognition* converts each region to
-characters, with a confidence score. Quality depends heavily on input: render at a sufficient resolution
-(around 300 DPI is the commonly recommended setting for Tesseract), deskew, and set the correct language.
-Keep the per-word confidence, *because* low-confidence regions are where numbers get corrupted ("0" vs
-"O", "1" vs "l") and are worth flagging or routing to a stronger model.
+1. **Detection** finds text regions and lines.
+2. **Recognition** converts each region to characters, with a confidence score.
 
-OCR quality is measured as character error rate against a hand transcription:
-`CER = (substitutions + deletions + insertions) / characters in the reference`, the edit distance
-normalised by length. Word error rate is the same at word level. Measure it on numbers separately, because
-a page can have a low overall CER and still corrupt the one digit in "30 days" that the answer depends on.
+- **Quality depends heavily on input:** render at a sufficient resolution (around 300 DPI is the commonly
+  recommended setting for Tesseract), deskew, and set the correct language.
+- **Keep per-word confidence**, *because* low-confidence regions are where numbers get corrupted ("0" vs
+  "O", "1" vs "l"); flag them or route them to a stronger model.
+- **Measure character error rate** against a hand transcription:
+  `CER = (substitutions + deletions + insertions) / characters in the reference`, the edit distance
+  normalised by length. Word error rate is the same at word level.
+- **Measure numbers separately**, because a page can have a low overall CER and still corrupt the one
+  digit in "30 days" that the answer depends on.
 
 ### 4. Clean the text stream
-Born-digital text has its own artifacts. Words hyphenated at line ends ("refund-" / "able") must be
-rejoined or neither half matches a query; ligature glyphs (fi, fl) may extract as single unusual
-characters; hard line breaks inside paragraphs should become spaces. Normalise Unicode (for example NFKC)
-so visually identical characters compare equal, *because* both BM25 and embeddings see the bytes, not the
-glyphs.
+| Artifact | Fix |
+|---|---|
+| Words hyphenated at line ends ("refund-" / "able") | rejoin, or neither half matches a query |
+| Ligature glyphs (fi, fl) as single unusual characters | Unicode normalisation |
+| Hard line breaks inside paragraphs | turn into spaces |
+| Visually identical but different characters | normalise Unicode (for example NFKC) |
+
+- **Why normalise:** both BM25 and embeddings see the bytes, not the glyphs.
 
 ### 5. Layout analysis
-Group words into blocks and label them: title, heading, paragraph, list, table, figure, caption, header,
-footer. Rule-based approaches cluster by x-coordinates to find columns and recursively cut the page along
-whitespace (XY-cut); learned layout models detect regions directly from the page image and handle irregular
-layouts better. Then order blocks for reading: column by column, top to bottom. Remove running headers and
-footers by detecting text that repeats at the same position across pages. Preserve the heading hierarchy as
-metadata *because* chunking and retrieval both benefit from knowing "this paragraph is under 4.2 Refunds".
+- **Group words into labelled blocks:** title, heading, paragraph, list, table, figure, caption, header, footer.
+- **Rule-based:** cluster by x-coordinates to find columns and recursively cut the page along whitespace
+  (XY-cut). **Learned layout models** detect regions from the page image and handle irregular layouts better.
+- **Order blocks for reading:** column by column, top to bottom.
+- **Remove running headers and footers** by detecting text that repeats at the same position across pages.
+- **Keep the heading hierarchy as metadata**, *because* chunking and retrieval both benefit from knowing
+  "this paragraph is under 4.2 Refunds".
 
 ### 6. Tables
-Table extraction has two parts: detecting the table region, and recognising its structure (rows, columns,
-merged and spanning cells, multi-row headers). Ruled tables can be recovered from drawn lines; borderless
-tables need alignment heuristics or a learned structure model. Output the table as Markdown or HTML so
-structure survives, and for retrieval also serialise each row with its headers ("Plan: Enterprise; Refund
-window: 30 days"), *because* a row read in isolation must still be meaningful once chunked. Large numeric
-tables are often better loaded into a database and queried with SQL than embedded at all. Tables that
-continue across pages need stitching: the continuation usually repeats or omits the header row, and
-without stitching the second page's rows lose their column labels.
+- **Two parts:** detect the table region, then recognise its structure (rows, columns, merged and spanning
+  cells, multi-row headers).
+- **Ruled tables** can be recovered from drawn lines; **borderless tables** need alignment heuristics or a
+  learned structure model.
+- **Output Markdown or HTML** so structure survives.
+- **Also serialise each row with its headers** ("Plan: Enterprise; Refund window: 30 days"), *because* a
+  row read in isolation must still be meaningful once chunked.
+- **Large numeric tables** are often better loaded into a database and queried with SQL than embedded at all.
+- **Stitch tables that continue across pages.** The continuation usually repeats or omits the header row;
+  without stitching the second page's rows lose their column labels.
 
 ### 7. Figures and non-PDF formats
-Charts and diagrams carry content that no text extractor sees; at minimum keep the caption, and where the
-figure matters, generate a description with a VLM and mark it as generated. Office and web formats
-(DOCX, PPTX, HTML, XLSX) are easier in one respect, because headings, lists and table cells are explicit
-in the file, so parse their structure directly rather than converting to PDF first and re-inferring it.
-Spreadsheets in particular are tables already and usually belong in the SQL path.
+- **Figures:** charts and diagrams carry content no text extractor sees. At minimum keep the caption; where
+  the figure matters, generate a description with a VLM and mark it as generated.
+- **Office and web formats (DOCX, PPTX, HTML, XLSX)** are easier because headings, lists and table cells
+  are explicit in the file. Parse their structure directly rather than converting to PDF and re-inferring it.
+- **Spreadsheets** are tables already and usually belong in the SQL path.
 
 ### 8. Vision-language models as parsers
-A VLM given a page image can transcribe it to Markdown, including tables and reading order, and often
-copes with layouts that break rule-based pipelines. The costs: per-page inference cost and latency, and a
-specific risk that the model *generates* plausible text rather than transcribing, silently normalising a
-value or filling a smudged digit. Use it where layouts are complex, and validate numbers against the text
-layer or OCR output where possible.
+- **What it does well:** a VLM given a page image can transcribe it to Markdown, including tables and
+  reading order, and often copes with layouts that break rule-based pipelines.
+- **The costs:** per-page inference cost and latency.
+- **The specific risk:** the model *generates* plausible text rather than transcribing, silently
+  normalising a value or filling a smudged digit.
+- **Use it where layouts are complex**, and validate numbers against the text layer or OCR output where possible.
 
 ### Tools
-Text-layer libraries (pdfplumber, PyMuPDF, pdfminer.six), OCR engines (Tesseract and cloud OCR), document
-pipelines that bundle layout and tables (Unstructured, Docling), and managed services (AWS Textract, Azure
-AI Document Intelligence, Google Document AI). They differ mainly in layout and table quality on *your*
-documents, so compare them on a sample of your hardest pages.
+| Category | Examples |
+|---|---|
+| Text-layer libraries | pdfplumber, PyMuPDF, pdfminer.six |
+| OCR engines | Tesseract and cloud OCR |
+| Pipelines bundling layout and tables | Unstructured, Docling |
+| Managed services | AWS Textract, Azure AI Document Intelligence, Google Document AI |
 
-## Example
-A per-page parser: use the text layer when present, fall back to OCR, and serialise tables row by row with
-their headers.
+- **They differ mainly in layout and table quality on *your* documents**, so compare them on a sample of
+  your hardest pages.
+
+## Diagram
+Each page is triaged on its own, then text from either path goes through the same cleaning, layout and
+table steps before anything is chunked.
+
+```mermaid
+flowchart TD
+    P["PDF page"] --> Q{"Text layer present and passes quality check?"}
+    Q -->|"yes"| X["Extract words with bounding boxes and fonts"]
+    Q -->|"no: empty, cid placeholders, mojibake"| R["Render at about 300 DPI, deskew"]
+    R --> O["OCR with per-word confidence"]
+    O -.->|"low-confidence digits"| S["Re-run higher resolution or stronger engine"]
+    X --> C["Clean: rejoin hyphens, NFKC normalise, fix line breaks"]
+    O --> C
+    C --> L["Layout: blocks, reading order, strip headers and footers"]
+    L --> T["Tables: structure as Markdown or HTML, rows with headers, stitch pages"]
+    T --> K[("Structured text plus heading and page metadata to chunking")]
+```
+
+## Examples
+### Per-page parser with OCR fallback and row-wise tables
+Use the text layer when present, fall back to OCR, and serialise tables row by row with their headers.
 
 ```python
 import pdfplumber, pytesseract
@@ -153,45 +178,114 @@ def parse_pdf(path: str, min_chars: int = 50) -> list[dict]:
 #  "text": "Plan: Enterprise; Refund window: 30 days; Seats: Unlimited"}
 ```
 
-This is deliberately simple: it does not reorder multi-column pages, strip headers, or handle merged
-header cells, and `extract_tables` only works on text-layer pages. It also indexes each table twice:
-`extract_text()` already includes the table's cells as a flattened stream, so a production version crops
-table regions out of the page (for example with `page.filter` or `outside_bbox`) before extracting the
-prose. Each of those is a step you add once a sample of your real documents shows you need it.
+What this deliberately leaves out, to add once a sample of your real documents shows you need it:
+- **No reordering** of multi-column pages, **no header stripping**, **no merged header cells**.
+- **`extract_tables` only works on text-layer pages.**
+- **Each table is indexed twice:** `extract_text()` already includes the table's cells as a flattened
+  stream. A production version crops table regions out of the page (for example with `page.filter` or
+  `outside_bbox`) before extracting the prose.
+
+### Measuring OCR damage and text-layer quality
+Runnable with the standard library. It shows why overall CER hides digit errors, and how to reject a
+text layer full of `(cid:NN)` placeholders before it reaches the index.
+
+```python
+import re, unicodedata
+
+def cer(ref: str, hyp: str) -> float:
+    """(substitutions + deletions + insertions) / len(ref), via Levenshtein distance."""
+    prev = list(range(len(hyp) + 1))
+    for i, r in enumerate(ref, 1):
+        cur = [i]
+        for j, h in enumerate(hyp, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (r != h)))
+        prev = cur
+    return prev[-1] / max(len(ref), 1)
+
+def digits(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
+
+ref = "Refund window: 30 days for the Enterprise plan, billed annually."
+hyp = "Refund window: 3O days for the Enterprise plan, billed annually."   # OCR read 0 as O
+print(f"CER {cer(ref, hyp):.3f}  digit CER {cer(digits(ref), digits(hyp)):.2f}")
+# CER 0.016  digit CER 0.50  -> looks fine overall, but half the digits are wrong
+
+def layer_is_usable(text: str, vocab: set, min_word_share: float = 0.6) -> bool:
+    text = unicodedata.normalize("NFKC", text)        # ligature glyphs become plain letters
+    if text.count("(cid:") > 3 or text.count(chr(0xFFFD)) > 3:   # U+FFFD replacement character
+        return False                                  # broken font map: send the page to OCR
+    words = re.findall(r"[a-z]+", text.lower())
+    return bool(words) and sum(w in vocab for w in words) / len(words) >= min_word_share
+
+vocab = {"refund", "window", "days", "for", "the", "enterprise", "plan", "billed", "annually"}
+print(layer_is_usable(ref, vocab))                                    # True
+print(layer_is_usable("(cid:42)(cid:17)(cid:9)(cid:3) x", vocab))     # False
+```
+
+| Measurement on the sample sentence | Value | Reading |
+|---|---|---|
+| Overall CER | 0.016 | one wrong character out of 64: "good OCR" |
+| Digit CER | 0.50 | one of two digits wrong: the answer is wrong |
+
+The thresholds (`min_word_share=0.6`, more than 3 placeholders) are illustrative; tune them on pages you
+have labelled by eye.
+
+## Production patterns
+- **Per-page routing with a quality gate.** For every page, score the text layer (dictionary-word share,
+  `(cid:` and replacement-character counts) and send failures to OCR, recording `source` per page as in
+  the parser above. Monitor the OCR share per document type; a jump usually means a new scanner or broken
+  font embedding upstream.
+- **Keep OCR confidence and act on it.** With Tesseract, `pytesseract.image_to_data(...)` returns
+  per-word confidences; flag pages whose low-confidence words include digits and re-run them at higher
+  resolution or with a stronger engine. Monitor the share of low-confidence numeric tokens.
+- **Crop tables out before extracting prose.** Locate tables with pdfplumber's `page.find_tables()`, take
+  each table's bounding box, extract prose from `page.outside_bbox(...)`, and index rows separately with
+  headers. Monitor duplicate-chunk rate between prose and table rows.
+- **A parser golden set in CI.** Keep 20-50 of your ugliest pages (scans, two-column, borderless and
+  multi-page tables) with hand transcriptions; compute CER, digit CER and table cell accuracy on every
+  parser or library upgrade, and block the release on regressions.
+- **Strip repeated headers and footers by position.** Compare the top and bottom bands of each page across
+  the document and drop text that recurs at the same position on most pages, keeping the page number as
+  metadata for citations. Monitor how many chunks match the company name or "Confidential".
 
 ## Trade-offs
-- Text-layer extraction is exact, fast and cheap when the font encoding is sound, but only for born-digital PDFs; on scans or broken layers
-  it returns nothing, so per-page detection and OCR fallback are mandatory for mixed corpora.
-- Rule-based layout (column clustering, XY-cut) is deterministic and cheap, yet fails on irregular layouts
-  like brochures and forms, where learned layout models or VLMs pay for their cost.
-- VLM page transcription handles hard layouts and tables well, but costs per page and can hallucinate or
-  normalise values; the trade flips toward OCR plus rules when exact numbers matter and layouts are simple.
-- Row-wise table serialisation makes cells retrievable on their own, at the cost of more chunks and
-  repetition; for large analytical tables, loading them into SQL is cheaper and more accurate than embedding.
+- **Text layer vs OCR.** Text-layer extraction is exact, fast and cheap when the font encoding is sound,
+  but only for born-digital PDFs. On scans or broken layers it returns nothing, so per-page detection and
+  OCR fallback are mandatory for mixed corpora.
+- **Rule-based vs learned layout.** Column clustering and XY-cut are deterministic and cheap, yet fail on
+  irregular layouts like brochures and forms, where learned layout models or VLMs pay for their cost.
+- **VLM transcription vs exact numbers.** VLMs handle hard layouts and tables well, but cost per page and
+  can hallucinate or normalise values. The trade flips toward OCR plus rules when exact numbers matter and
+  layouts are simple.
+- **Row-wise serialisation vs index size.** Rows become retrievable on their own, at the cost of more
+  chunks and repetition. For large analytical tables, loading them into SQL is cheaper and more accurate
+  than embedding.
 
 ## Pitfalls
-- Using one `extract_text()` call for everything; the symptom is scanned documents producing empty chunks,
-  so whole contracts are missing from search with no error raised.
-- Ignoring reading order; the symptom is retrieved chunks whose sentences jump between two columns and that
+- **Using one `extract_text()` call for everything.** Symptom: scanned documents produce empty chunks, so
+  whole contracts are missing from search with no error raised.
+- **Ignoring reading order.** Symptom: retrieved chunks whose sentences jump between two columns and that
   match queries poorly despite containing the right words.
-- Leaving running headers and footers in; the symptom is many unrelated chunks scoring high for the company
-  name or "Confidential" and crowding out real results.
-- Flattening tables to a stream of values; the symptom is the model citing the right chunk but reading the
-  wrong cell, such as quoting the Basic plan's price for the Enterprise plan.
-- Trusting a text layer because it is non-empty; the symptom is chunks full of `(cid:NN)` placeholders or
+- **Leaving running headers and footers in.** Symptom: many unrelated chunks score high for the company
+  name or "Confidential" and crowd out real results.
+- **Flattening tables to a stream of values.** Symptom: the model cites the right chunk but reads the wrong
+  cell, such as quoting the Basic plan's price for the Enterprise plan.
+- **Trusting a text layer because it is non-empty.** Symptom: chunks full of `(cid:NN)` placeholders or
   mojibake that embed to near-identical vectors and never match any query.
-- Not stitching tables that span pages; the symptom is correct answers for rows on a table's first page
-  and wrong or missing answers for rows that happen to fall on its continuation.
-- Never evaluating the parser; problems surface only as downstream wrong answers, whereas a sample of pages
-  compared against hand transcriptions would show them immediately.
+- **Not stitching tables that span pages.** Symptom: correct answers for rows on a table's first page and
+  wrong or missing answers for rows that fall on its continuation.
+- **Never evaluating the parser.** Problems surface only as downstream wrong answers, whereas a sample of
+  pages compared against hand transcriptions would show them immediately.
 
 ## When to use
-Treat parsing as the first stage to verify on any new corpus, before choosing chunk sizes or embedding
-models. Sample pages from every document type (digital, scanned, multi-column, table-heavy, forms) and
-inspect the output by eye, then measure character error rate on OCR pages and cell accuracy on tables.
-Use plain text-layer extraction when documents are clean and born-digital; add OCR, layout models or VLMs
-only where the sample shows failures. In interviews, "I would look at the parsed text first" is often the
-answer that separates experienced RAG builders from tutorial-level ones.
+- **Verify parsing first** on any new corpus, before choosing chunk sizes or embedding models.
+- **Sample every document type** (digital, scanned, multi-column, table-heavy, forms) and inspect the
+  output by eye.
+- **Measure:** character error rate on OCR pages and cell accuracy on tables.
+- **Use plain text-layer extraction** when documents are clean and born-digital; add OCR, layout models or
+  VLMs only where the sample shows failures.
+- **Interviews:** "I would look at the parsed text first" often separates experienced RAG builders from
+  tutorial-level ones.
 
 ## Role lens
 - **Engineer:** Builds the per-page triage, OCR fallback, header stripping and table serialisation, and keeps
@@ -211,6 +305,47 @@ HTML, serialise rows with headers for retrieval, check OCR confidence and re-run
 higher resolution or with a stronger engine, and possibly load financial tables into a database for SQL
 lookups. I would build a small eval of numeric questions with known answers to confirm the fix, and avoid
 VLM transcription for numbers unless outputs are cross-checked.
+
+## Interview questions
+### Why is document parsing a retrieval problem and not just a preprocessing detail?
+- **A PDF is drawing instructions, not text:** glyphs at coordinates, with no paragraphs, columns or table
+  cells, and a scanned page has no text layer at all.
+- **Every later stage sees only the parser's output:** the embedding model embeds garbage, the vector store
+  indexes it, and the symptom looks like a retrieval or model problem.
+- **So fix it at the source:** parsing errors are among the most common root causes in RAG failure analysis
+  and cheapest to fix where they happen.
+
+### Whole contracts are missing from search but ingestion logged no errors. How do you debug it?
+- **Suspect empty text layers:** scanned pages make `extract_text()` return empty strings, so documents
+  silently vanish; check chunk counts and character counts per page for those files.
+- **Suspect broken font maps:** a non-empty layer full of `(cid:42)` placeholders or mojibake embeds to
+  near-identical vectors that never match a query.
+- **Fix:** triage per page with a quality check (dictionary-word share, placeholder counts), route failures
+  to OCR, and record `source` per page so the OCR share per document type is visible.
+
+### When would you use a vision-language model as the parser, and when would you avoid it?
+- **Use it for complex layouts:** brochures, forms and irregular tables that break rule-based column
+  clustering and XY-cut.
+- **Avoid it where exact numbers matter on simple layouts:** it generates rather than transcribes, so it can
+  silently normalise a value or fill a smudged digit, and it costs per-page inference and latency.
+- **If you use it,** validate numbers against the text layer or OCR output and mark generated figure
+  descriptions as generated.
+
+### OCR on a sample page scores a CER of 0.016. Is that good enough?
+- **Not on its own:** in the sample sentence that is one wrong character out of 64, but the wrong character
+  is the "0" in "30 days", so digit CER is 0.50 and the answer is wrong.
+- **Measure numbers separately** and keep per-word confidence, because low-confidence regions are where "0"
+  becomes "O" and "1" becomes "l".
+- **Inputs matter:** render around 300 DPI for Tesseract, deskew and set the correct language before
+  blaming the engine.
+
+### How do you handle tables so that a single row is still answerable after chunking?
+- **Keep structure:** detect the table region, recognise rows, columns and merged or multi-row headers, and
+  output Markdown or HTML.
+- **Serialise each row with its headers**, such as "Plan: Enterprise; Refund window: 30 days", and stitch
+  tables that continue across pages so continuation rows keep their column labels.
+- **Avoid double indexing and know when to stop embedding:** crop table regions out of the prose extraction,
+  and load large numeric tables into a database for SQL instead.
 
 ## Quiz
 ### Q: Why should OCR fallback be decided per page rather than per file?

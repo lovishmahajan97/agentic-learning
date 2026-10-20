@@ -5,7 +5,7 @@ name: Workflow orchestration (Temporal, Prefect, Airflow)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - reliability/durable-workflow-execution
   - agent-reliability/durable-execution-and-checkpointing
@@ -22,112 +22,121 @@ sources:
 ---
 
 ## TL;DR
-Workflow orchestrators run multi-step processes reliably outside a single request: they persist
-progress, retry steps, schedule work and show where each run is. Airflow schedules batch DAGs of data
-tasks; Prefect orchestrates dynamic Python dataflows with less ceremony; Temporal provides durable
-execution, replaying workflow code from an event history so long-running stateful processes survive
-crashes. For AI systems: indexing pipelines fit Airflow or Prefect; long-lived agent runs and
-approval flows fit Temporal-style engines.
+Workflow orchestrators run multi-step processes reliably outside a request. Airflow schedules batch DAGs,
+Prefect runs dynamic Python dataflows, Temporal replays durable workflow code. Indexing pipelines fit
+Airflow or Prefect; long-lived agent runs and approval flows fit Temporal-style engines.
 
 ## Why it exists
-Any process with several steps that take time, can fail independently and have side effects needs the
-same machinery: remember which steps completed, retry the ones that failed without repeating the ones
-that succeeded, wait (for a timer, a human, an external callback) without holding a process open, run on
-a schedule or on an event, and expose state so a human can see what happened. Every team that starts
-with a cron job and a script ends up reinventing this, badly, one incident at a time.
-
-The naive design is a background job with a loop and a database row for status. It works for one step.
-With five steps it needs per-step status, partial retries, idempotency for every side effect, a way to
-resume after a worker dies between steps, and a dashboard. The subtle failure is not a missing feature
-but a wrong guarantee: a job retried after a crash re-executes the "send email" step because the crash
-happened after the send and before the status write. Exactly-once is impossible across systems; what you
-can have is a durable record of which steps were attempted plus idempotent steps, and that is precisely
-what orchestrators provide.
-
-AI systems make this acute. Ingestion pipelines are multi-stage, scheduled and expensive to redo
-(parsing and embedding a million chunks). Agent runs take minutes to hours, wait for approvals, call
-flaky external tools and must not repeat consequential actions. Both are workflow orchestration problems
-with different shapes, which is why the three tools in this lesson coexist rather than compete.
+- **Multi-step processes all need the same machinery.** Remember which steps completed, retry failures
+  without repeating successes, wait (timer, human, callback) without holding a process open, run on a
+  schedule or event, and expose state. Teams starting from a cron job and a script reinvent this, badly,
+  one incident at a time.
+- **The naive job-plus-status-row breaks at five steps.** It needs per-step status, partial retries,
+  idempotency for every side effect, resume after a worker dies between steps, and a dashboard.
+- **The subtle failure is a wrong guarantee.** A job retried after a crash re-executes "send email"
+  because the crash came after the send and before the status write. Exactly-once is impossible across
+  systems; you get a durable record of attempted steps plus idempotent steps, which is what
+  orchestrators provide.
+- **AI systems make this acute.** Ingestion is multi-stage, scheduled and expensive to redo (parsing and
+  embedding a million chunks). Agent runs take minutes to hours, wait for approvals, call flaky tools and
+  must not repeat consequential actions. Different shapes, which is why the three tools coexist rather
+  than compete.
 
 ## How it works
+### The three at a glance
+| | Airflow | Prefect | Temporal |
+|---|---|---|---|
+| Unit | scheduled DAG of coarse tasks | Python flow calling tasks | workflow code calling activities |
+| Graph | static plan | ordinary code, data-dependent | ordinary code, deterministic |
+| Recorded state | task instance states | task run states and persisted results | full event history |
+| Recovery | retry the task for its interval | re-run flow, skip cached tasks | replay code against history |
+| Fits | periodic batch, backfills | runtime-shaped pipelines | long-lived stateful runs, human waits |
+
 ### Airflow: scheduled DAGs of tasks
-Airflow (started at Airbnb, now an Apache project) models work as a directed acyclic graph of tasks
-defined in Python. A scheduler evaluates DAGs against their schedule, creates task instances per run and
-hands them to an executor (local, Celery, Kubernetes) that runs them on workers; a metadata database
-records every task state. Tasks are meant to be idempotent, coarse units (run this SQL, launch this
-Spark job, call this API) and exchange only small values through XCom, *because* the DAG is a scheduling
-plan, not a data-flow program. Each DAG run is bound to a *data interval* (its logical date), and
-well-written tasks read only that interval's data and overwrite only that interval's output. That
-convention is what makes a retry or a backfill safe: re-running "2024-03-14" replaces that day's
-partition instead of appending a duplicate. Retries, SLAs, backfills over past dates and a mature UI are
-its strengths. Its shape fits periodic batch: nightly re-embedding, daily data-quality checks, hourly
-connector syncs. It fits poorly when the graph depends on runtime data or when a run must wait on a
-human for days.
+- **Model.** Airflow (started at Airbnb, now an Apache project) defines work as a directed acyclic graph
+  of tasks in Python.
+- **Execution.** A scheduler evaluates DAGs against their schedule, creates task instances per run and
+  hands them to an executor (local, Celery, Kubernetes) that runs them on workers; a metadata database
+  records every task state.
+- **Coarse, idempotent tasks.** Run this SQL, launch this Spark job, call this API, exchanging only small
+  values through XCom, *because* the DAG is a scheduling plan, not a data-flow program.
+- **Data intervals make retries safe.** Each DAG run is bound to a *data interval* (its logical date).
+  Well-written tasks read only that interval's data and overwrite only that interval's output, so
+  re-running "2024-03-14" replaces that day's partition instead of appending a duplicate.
+- **Strengths:** retries, SLAs, backfills over past dates and a mature UI. Fits nightly re-embedding,
+  daily data-quality checks, hourly connector syncs.
+- **Fits poorly** when the graph depends on runtime data or a run must wait on a human for days.
 
 ### Prefect: dynamic Python dataflows
-Prefect takes the opposite stance on structure: a flow is a Python function and tasks are decorated
-functions called from it, so loops, conditionals and fan-out driven by runtime data are ordinary code
-rather than a static graph. The orchestration layer (Prefect server or Cloud) tracks states, retries,
-caching of task results, schedules and concurrency limits, while your own workers execute the code, a
-hybrid model chosen *because* data and credentials then never leave your infrastructure. It suits the
-many AI pipelines where the number of documents, the branches and the parameters are discovered as the
-flow runs. It is still a pipeline tool: a flow run can be paused or suspended to wait for human input,
-but there is no replayable event history. Recovery is by retrying tasks and by re-running the flow
-function while skipping tasks whose results were persisted under a cache key; a suspended run resumes by
-executing the flow from the top in this way. That works well when tasks are coarse and their results are
-persisted, and poorly for a process with many small stateful steps that must survive anything for
-weeks, which is not its design centre.
+- **Model.** A flow is a Python function and tasks are decorated functions called from it, so loops,
+  conditionals and fan-out driven by runtime data are ordinary code rather than a static graph.
+- **Hybrid execution.** The orchestration layer (Prefect server or Cloud) tracks states, retries, task
+  result caching, schedules and concurrency limits, while your workers execute the code, *because* data
+  and credentials then never leave your infrastructure.
+- **Fits** the many AI pipelines whose number of documents, branches and parameters are discovered as
+  the flow runs.
+- **Still a pipeline tool.** A flow run can be paused or suspended for human input, but there is no
+  replayable event history. Recovery is by retrying tasks and re-running the flow function while skipping
+  tasks whose results were persisted under a cache key; a suspended run resumes by executing the flow
+  from the top this way.
+- **Works well** when tasks are coarse and results persisted; poorly for many small stateful steps that
+  must survive anything for weeks, which is not its design centre.
 
 ### Temporal: durable execution
-Temporal (descended from Uber's Cadence) solves a different problem: making ordinary code durable. You
-write a *workflow* function that orchestrates calls to *activities*, which are the functions that do side
-effects: call an LLM, write a database row, send an email. The Temporal server records every event in the
-workflow's life (started, activity scheduled, activity completed with its result, timer fired, signal
-received) in an append-only history. Workers poll task queues and execute workflow code; when a worker
-crashes, another worker picks up the workflow and *replays* its code against the recorded history.
-Because completed activity results come from history instead of re-execution, the code deterministically
-reaches the exact point where it stopped and continues. This is why workflow code must be deterministic:
-no wall-clock reads, random numbers or direct I/O inside it, only activities, timers and the SDK's
-side-effect APIs, *because* replay must reproduce the original decisions. Changing workflow code while
-runs are in flight therefore needs versioning (patch markers in the code).
+Temporal (descended from Uber's Cadence) makes ordinary code durable.
+1. **Workflow and activities.** A *workflow* function orchestrates calls to *activities*, the functions
+   that do side effects: call an LLM, write a database row, send an email.
+2. **Event history.** The server records every event (started, activity scheduled, activity completed
+   with its result, timer fired, signal received) in an append-only history.
+3. **Replay.** Workers poll task queues and execute workflow code. When a worker crashes, another picks
+   up the workflow and *replays* its code against the history; completed activity results come from
+   history instead of re-execution, so the code deterministically reaches where it stopped and
+   continues.
 
-Activities get retry policies, timeouts (schedule-to-start, start-to-close) and heartbeats for long
-tasks. Workflows can sleep for days with no process alive, receive *signals* (an approval arrived),
-answer *queries* (which step are you on), start child workflows, and run indefinitely by
-continuing-as-new to keep history bounded. The cost is the determinism discipline, a server to run or
-buy, and keeping payloads small by passing large data by reference, because every activity input and
-output lands in history.
+- **Determinism rule.** No wall-clock reads, random numbers or direct I/O in workflow code, only
+  activities, timers and the SDK's side-effect APIs, *because* replay must reproduce the original
+  decisions. Changing workflow code with runs in flight needs versioning (patch markers in the code).
+- **Activity controls.** Retry policies, timeouts (schedule-to-start, start-to-close) and heartbeats for
+  long tasks.
+- **Workflow powers.** Sleep for days with no process alive, receive *signals* (an approval arrived),
+  answer *queries* (which step are you on), start child workflows, and run indefinitely by
+  continuing-as-new to keep history bounded.
+- **Costs.** The determinism discipline, a server to run or buy, and small payloads (pass large data by
+  reference), because every activity input and output lands in history.
 
 ### The same crash, three recovery models
-Put a worker crash in the middle of step 3 of a five-step run, and the tools differ in what they know.
-Airflow knows task instances: tasks 1–2 are `success`, task 3 is marked failed (or found as a zombie and
-failed) and retried as a whole unit, so correctness rests on task 3 being idempotent for its interval.
-Prefect knows task runs and persisted results: retrying the flow re-enters it from the top, steps 1–2
-return cached results, step 3 runs again. Temporal knows every decision the workflow made: a new worker
-replays the code, steps 1–2 return their recorded results instantly, and step 3's activity is retried
-after its timeout. The finer the recorded state, the smaller the unit of redo, and the more discipline
-the code must obey (idempotent tasks; cacheable tasks; deterministic workflow code respectively).
+A worker crashes in the middle of step 3 of a five-step run.
+
+| Tool | What it knows | What happens | Correctness rests on |
+|---|---|---|---|
+| Airflow | task instances | tasks 1–2 are `success`; task 3 is marked failed (or found as a zombie and failed) and retried as a whole unit | task 3 idempotent for its interval |
+| Prefect | task runs and persisted results | retry re-enters the flow from the top; steps 1–2 return cached results, step 3 runs again | cacheable tasks |
+| Temporal | every decision the workflow made | a new worker replays; steps 1–2 return recorded results instantly; step 3's activity is retried after its timeout | deterministic workflow code |
+
+- **The finer the recorded state, the smaller the unit of redo,** and the more discipline the code must
+  obey.
 
 ### Which fits an AI system where
-- Re-chunk and re-embed a corpus nightly, with backfill over past days: **Airflow**.
-- Parse, enrich and index whatever arrived in the last hour, branching per document type: **Prefect**
+- **Nightly re-chunk and re-embed with backfill over past days:** **Airflow**.
+- **Parse, enrich and index whatever arrived in the last hour, branching per document type:** **Prefect**
   (or Airflow with dynamic task mapping).
-- An agent run that calls tools over an hour, pauses for a manager's approval until Monday, must never
-  issue a refund twice, and must be inspectable mid-run: **Temporal**.
-- A ten-second chain of three model calls inside a request: none of them; an in-process orchestrator is
-  enough.
+- **An agent run calling tools over an hour, pausing for a manager's approval until Monday, never issuing
+  a refund twice, inspectable mid-run:** **Temporal**.
+- **A ten-second chain of three model calls inside a request:** none of them; an in-process orchestrator
+  is enough.
 
 ### What all three give you, and what none of them do
-All three give persistence of step state, retries, scheduling, a UI and observability. None of them make
-your steps idempotent for you, and none guarantee a side effect happens exactly once: a retry after a
-crash between "effect done" and "result recorded" will re-run the step. Every activity or task that acts
-on the outside world needs an idempotency key derived from the run and the step.
+- **All three give:** persistence of step state, retries, scheduling, a UI and observability.
+- **None make your steps idempotent, and none guarantee exactly-once side effects:** a retry after a
+  crash between "effect done" and "result recorded" re-runs the step.
+- **So:** every activity or task that acts on the outside world needs an idempotency key derived from the
+  run and the step.
 
-## Example
-A Temporal Python workflow for document extraction with an LLM call. Activities carry the side effects
-and retry policies, the workflow carries only deterministic orchestration, and the approval wait is a
-durable signal rather than a blocked thread. `blob_store`, `db` and `llm_extract` are stand-ins for your
-own clients.
+## Examples
+### Temporal: document extraction with a durable approval wait
+Activities carry the side effects and retry policies; the workflow carries only deterministic
+orchestration; the approval wait is a durable signal rather than a blocked thread. `blob_store`, `db` and
+`llm_extract` stand in for your own clients.
 
 ```python
 import asyncio
@@ -172,57 +181,112 @@ class DocumentExtraction:
 # Worker(client, task_queue="extraction", workflows=[DocumentExtraction], activities=[extract_fields, write_record])
 ```
 
-Walk one low-confidence document through it. The server's history for the run reads, simplified:
-(1) workflow started with `doc_id`; (2) activity `extract_fields` scheduled; (3) activity started,
-recorded with attempt 2 because the server retried a provider 503 per the retry policy (intermediate
-attempts are not written as separate events); (4) activity completed with result
-`{..., "confidence": 0.62}`; (5) a 3-day timer started for the wait. No worker holds anything now. A deploy restarts every worker overnight. The next morning a
-reviewer sends the `approve(True)` signal, which is appended as event (6). A fresh worker replays `run`
-from the top: `execute_activity(extract_fields)` is matched to events 2–4 and returns the recorded
-fields without calling the LLM; `wait_condition` is matched to the timer; the signal handler applies
-event (6), so the condition is now true; and the code reaches `write_record`, which is the first genuinely
-new command. If someone had put `datetime.now()` in the workflow to stamp the record, the replay would
-compute a different value than the original run, which is exactly the class of bug the determinism rule
-and the SDK's `workflow.now()` exist to prevent.
+### Walking one low-confidence document through replay
+The server's history for the run, simplified:
+
+| Event | Recorded |
+|---|---|
+| (1) | workflow started with `doc_id` |
+| (2) | activity `extract_fields` scheduled |
+| (3) | activity started, recorded with attempt 2: the server retried a provider 503 per the retry policy (intermediate attempts are not written as separate events) |
+| (4) | activity completed with result `{..., "confidence": 0.62}` |
+| (5) | a 3-day timer started for the wait; no worker holds anything now |
+| — | a deploy restarts every worker overnight |
+| (6) | next morning a reviewer sends the `approve(True)` signal |
+
+A fresh worker replays `run` from the top:
+1. `execute_activity(extract_fields)` is matched to events 2–4 and returns the recorded fields without
+   calling the LLM.
+2. `wait_condition` is matched to the timer; the signal handler applies event (6), so the condition is
+   now true.
+3. The code reaches `write_record`, the first genuinely new command.
+
+- **The bug the rule prevents.** Had someone put `datetime.now()` in the workflow to stamp the record,
+  replay would compute a different value than the original run. The determinism rule and the SDK's
+  `workflow.now()` exist to prevent exactly this class of bug.
+
+### Airflow: an interval-scoped nightly re-embed
+A TaskFlow-style DAG (Airflow 2.x imports) where each run touches only its own day, so retries and
+backfills overwrite rather than duplicate. `docs`, `embed` and `index` stand in for your clients.
+
+```python
+from datetime import datetime, timedelta
+from airflow.decorators import dag, task
+
+@dag(schedule="@daily", start_date=datetime(2024, 1, 1), catchup=True,
+     default_args={"retries": 3, "retry_delay": timedelta(minutes=5)})
+def reembed_daily():
+    @task
+    def changed_ids(data_interval_start=None, data_interval_end=None):   # injected from the run context
+        return docs.changed_between(data_interval_start, data_interval_end)  # ids only: XCom stays small
+
+    @task
+    def reembed(doc_ids, ds=None):
+        index.overwrite_partition(ds, embed(doc_ids))   # overwrite this interval, never append
+
+    reembed(changed_ids())
+
+reembed_daily()
+```
+
+## Production patterns
+- **Idempotency keys from workflow and step.** In every Temporal activity with an external effect, build
+  the key from the workflow id and activity id (available from `activity.info()`) and send it to the
+  downstream API. Monitor activity attempt counts per type; a rising average means retries, and each
+  retry is a duplicate unless keyed.
+- **Patch-based versioning for in-flight runs.** Wrap changed workflow logic in `workflow.patched("change-id")`
+  so old histories replay the old branch and new runs take the new one; remove the patch once old runs
+  finish. Monitor non-determinism errors after each deploy and the count of open runs on old versions.
+- **Continue-as-new for long-lived workflows.** For workflows that loop for weeks (an agent that wakes
+  daily), call `workflow.continue_as_new(...)` with compact state before history grows large. Monitor
+  history event count and size per workflow against the server's limits.
+- **Interval-scoped, overwrite-only Airflow tasks.** Read only `data_interval_start` to
+  `data_interval_end` and overwrite that partition, with `catchup` set deliberately. Monitor row counts
+  per partition before and after retries or backfills; any growth on a re-run is a bug.
+- **Persisted, cache-keyed Prefect tasks.** Give expensive tasks (parse, embed) `retries`, a cache key
+  derived from their inputs (for example `cache_key_fn=task_input_hash`) and persisted results, so a
+  re-run flow skips finished work. Monitor cache-hit rate on retried flow runs.
 
 ## Trade-offs
-- Airflow's static DAGs give predictable scheduling, backfills and a mature ecosystem, but once the graph
-  depends on runtime data you are fighting the model; dynamic task mapping helps, Prefect removes the
-  constraint.
-- Prefect's plain-Python flows are fast to write and natural for data-dependent branching, but flows are
-  expected to complete; a run that must wait weeks for an external event is not its design centre.
-- Temporal's durable execution makes long-lived, stateful processes crash-proof and resumable, in
-  exchange for the determinism discipline in workflow code, versioning for in-flight runs, and operating
+- **Airflow's static DAGs vs runtime-shaped graphs.** Predictable scheduling, backfills and a mature
+  ecosystem, but once the graph depends on runtime data you are fighting the model; dynamic task mapping
+  helps, Prefect removes the constraint.
+- **Prefect's plain Python vs long waits.** Fast to write and natural for data-dependent branching, but
+  flows are expected to complete; a run that must wait weeks for an external event is not its design
+  centre.
+- **Temporal's durability vs discipline.** Long-lived, stateful processes become crash-proof and
+  resumable, in exchange for determinism in workflow code, versioning for in-flight runs, and operating
   or buying a server.
-- Storing every activity input and output in history is what enables replay, but it caps payload sizes;
-  passing blobs by reference keeps histories small at the cost of a second store to manage.
-- Any orchestrator adds an operational component and a learning curve; for a short chain inside a
-  request, in-process orchestration with good logging wins on simplicity.
+- **Full history vs payload size.** Storing every activity input and output enables replay but caps
+  payload sizes; passing blobs by reference keeps histories small at the cost of a second store to manage.
+- **Any orchestrator vs simplicity.** It adds an operational component and a learning curve; for a short
+  chain inside a request, in-process orchestration with good logging wins.
 
 ## Pitfalls
-- Doing I/O, reading the clock or generating random values inside Temporal workflow code; the symptom is
-  non-determinism errors on replay after a worker restart or a code deploy.
-- Assuming the orchestrator makes side effects exactly-once; the symptom is duplicate emails or writes
+- **I/O, clock reads or random values inside Temporal workflow code.** Symptom: non-determinism errors
+  on replay after a worker restart or a code deploy. Fix: move it into activities or SDK APIs.
+- **Assuming the orchestrator makes side effects exactly-once.** Symptom: duplicate emails or writes
   after a retry, fixed only by idempotency keys in the activity or task.
-- Using Airflow for per-request or event-driven work; the symptom is noticeable scheduler latency
-  between tasks (it was built for batch, not milliseconds) and DAG files sprouting conditionals to fake
-  dynamism.
-- Writing Airflow tasks that append rather than overwrite their interval's output; the symptom is
-  doubled rows for exactly the days that were retried or backfilled.
-- Passing megabytes of document text or embeddings through task results or workflow history; the symptom
-  is slow UIs, size limits being hit, and failed runs on large documents.
-- Deploying changed workflow code with runs in flight and no versioning; the symptom is those runs
-  failing or taking a different path on replay than they did originally.
+- **Airflow for per-request or event-driven work.** Symptom: noticeable scheduler latency between tasks
+  (it was built for batch, not milliseconds) and DAG files sprouting conditionals to fake dynamism.
+- **Airflow tasks that append rather than overwrite their interval's output.** Symptom: doubled rows for
+  exactly the days that were retried or backfilled.
+- **Megabytes of document text or embeddings through task results or workflow history.** Symptom: slow
+  UIs, size limits being hit, and failed runs on large documents. Fix: pass references.
+- **Deploying changed workflow code with runs in flight and no versioning.** Symptom: those runs fail or
+  take a different path on replay than they did originally.
 
 ## When to use
-Reach for a workflow orchestrator when a process has multiple steps with independent failure, runs
-longer than a request, needs scheduling or backfill, or waits on humans or external systems. Pick
-Airflow for scheduled batch with a fixed shape and a data-engineering team already running it; Prefect
-when the pipeline's shape is decided at runtime and you want plain Python; Temporal when runs are
-long-lived, stateful and must survive anything, which describes production agent runs and
-approval-gated business processes. Measure run success rate, retries per step, time spent waiting versus
-executing, and queue latency. In interviews, be able to explain deterministic replay in one paragraph,
-say why exactly-once is still your job, and place each tool against an AI pipeline and an agent run.
+- **Use an orchestrator when:** a process has multiple steps with independent failure, runs longer than a
+  request, needs scheduling or backfill, or waits on humans or external systems.
+- **Pick Airflow** for scheduled batch with a fixed shape and a data-engineering team already running it.
+- **Pick Prefect** when the pipeline's shape is decided at runtime and you want plain Python.
+- **Pick Temporal** when runs are long-lived, stateful and must survive anything: production agent runs
+  and approval-gated business processes.
+- **Measure:** run success rate, retries per step, time spent waiting versus executing, and queue
+  latency.
+- **Interviews:** explain deterministic replay in one paragraph, say why exactly-once is still your job,
+  and place each tool against an AI pipeline and an agent run.
 
 ## Role lens
 - **Engineer:** Writes idempotent tasks and activities, keeps workflow code deterministic, sets retry

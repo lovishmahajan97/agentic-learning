@@ -5,7 +5,7 @@ name: Model merging
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - training-adaptation/peft
   - training-adaptation/supervised-fine-tuning
@@ -23,111 +23,118 @@ sources:
 ---
 
 ## TL;DR
-Model merging combines several fine-tuned checkpoints of one base model into a single set of weights by
-arithmetic on the parameters: averaging, adding scaled task vectors, or trimming and sign-voting the
-deltas. No training is involved. It works because fine-tunes that start from the same initialisation
-stay in a connected low-loss region, so their deltas behave roughly additively. You get one model carrying
-several skills at the serving cost of one, paying with task interference that no gradient step corrects.
+Model merging combines fine-tunes of one base into one set of weights by parameter arithmetic (averaging,
+task vectors, trimming and sign-voting), with no training. You get several skills at one model's serving
+cost, paying with task interference nothing corrects.
 
 ## Why it exists
-Suppose you have three fine-tunes of the same 8B base: one for your support domain, one that follows tool
-call formats, and a community instruct tune with far better conversational quality than yours. Serving
-all three means three copies of the weights, a router, and no way for one answer to use two skills at
-once. Training one multi-task model instead means obtaining all three datasets (the community one is not
-yours to have), rebuilding the mix every time one dataset changes, and paying for a training run per
-iteration. Ensembling costs three forward passes per token.
-
-Merging offers a fourth option: because every one of those models is `base + small delta`, you can add the
-deltas and get a single model in minutes on a CPU. The reason this is not absurd is empirical and
-well-replicated: models fine-tuned from the same pretrained weights stay in the same basin of the loss
-landscape, so the straight line between them has no loss barrier (linear mode connectivity), and
-averaging two good solutions tends to land on a third good one that is often better than either. Model
-soups showed that averaging fine-tunes with different hyperparameters improved accuracy and
-out-of-distribution robustness at zero inference cost. Task arithmetic showed the deltas behave like
-vectors you can add, scale and even negate to remove a behaviour.
-
-The naive version, plain averaging, breaks as soon as the tasks disagree about a weight: one tune pushes it
-up, another pushes it down, and the average cancels both. The later methods are all answers to that
-interference problem.
+- **Serving several fine-tunes is costly.** Three fine-tunes of one 8B base (support domain, tool-call
+  formats, a community instruct tune with better conversation) mean three copies of the weights, a router,
+  and no way for one answer to use two skills at once.
+- **Multi-task training is often impossible.** You need all three datasets (the community one is not yours
+  to have), must rebuild the mix whenever one changes, and pay a training run per iteration. Ensembling
+  costs three forward passes per token.
+- **Merging is a fourth option.** Every model is `base + small delta`, so you add the deltas and get one
+  model in minutes on a CPU.
+- **Why it is not absurd.** Fine-tunes from the same pretrained weights stay in the same loss basin, so the
+  straight line between them has no loss barrier (linear mode connectivity). Averaging two good solutions
+  tends to land on a third, often better than either.
+- **The evidence.** Model soups: averaging fine-tunes with different hyperparameters improved accuracy and
+  out-of-distribution robustness at zero inference cost. Task arithmetic: deltas behave like vectors you
+  can add, scale and even negate to remove a behaviour.
+- **Plain averaging breaks on disagreement.** One tune pushes a weight up, another down, and the average
+  cancels both. Later methods all answer that interference problem.
 
 ## How it works
 ### Task vectors
-For a base θ_base and a fine-tune θ_i, the task vector is τ_i = θ_i − θ_base, computed tensor by tensor.
-Task arithmetic forms θ = θ_base + λ Σ τ_i for multi-task merging, θ_base − λ τ for forgetting (negating a
-toxicity fine-tune reduces toxicity), and even analogies. λ is a single scalar (or one per task) tuned on
-a validation set; because the deltas are additive approximations, λ around 0.3–1.0 in total is where
-things usually work, and larger sums push activations out of the range the base was trained in.
+- **Definition:** τ_i = θ_i − θ_base, computed tensor by tensor for base θ_base and fine-tune θ_i.
+- **Uses:**
+  - multi-task merging: θ = θ_base + λ Σ τ_i;
+  - forgetting: θ_base − λ τ (negating a toxicity fine-tune reduces toxicity);
+  - even analogies.
+- **λ** is one scalar (or one per task) tuned on a validation set. Deltas are additive approximations, so
+  λ around 0.3–1.0 in total usually works; larger sums push activations out of the range the base was
+  trained in.
 
 ### Linear averaging and soups
-θ = Σ w_i θ_i with Σ w_i = 1. Uniform soups average everything; greedy soups add a model only if the
-validation metric improves. This is the right tool when the models learned the *same* thing in slightly
-different ways (same data, different seeds or learning rates), and checkpoint averaging at the end of a
-long training run is the same idea applied along one trajectory. It is the wrong tool when the models
-learned different things.
+- **Formula:** θ = Σ w_i θ_i with Σ w_i = 1.
+- **Uniform soups** average everything; **greedy soups** add a model only if the validation metric improves.
+- **Right tool when** models learned the *same* thing differently (same data, different seeds or learning
+  rates). Checkpoint averaging at the end of a long run is the same idea along one trajectory.
+- **Wrong tool when** the models learned different things.
 
 ### SLERP
-Spherical linear interpolation treats each tensor (or the whole flattened model) as a vector and
-interpolates along the arc between the two, with cos Ω = a·b / (‖a‖‖b‖) and
+Spherical linear interpolation treats each tensor (or the whole flattened model) as a vector and moves
+along the arc between two, with cos Ω = a·b / (‖a‖‖b‖) and
 
 ```
 slerp(a, b, t) = sin((1 − t)Ω) / sin Ω · a  +  sin(tΩ) / sin Ω · b
 ```
 
-The point is norm preservation: a straight-line midpoint between two vectors at an angle is *shorter* than
-either, which shrinks activation scales layer by layer; SLERP keeps the magnitude. It only handles two
-models at a time and is the usual choice for blending two closely related instruct tunes.
+- **Why: norm preservation.** A straight-line midpoint between two vectors at an angle is *shorter* than
+  either, shrinking activation scales layer by layer; SLERP keeps the magnitude.
+- **Limit:** two models at a time. The usual choice for blending two closely related instruct tunes.
 
 ### TIES-Merging: trim, elect sign, disjoint merge
-TIES names two sources of interference. First, most entries of a task vector are tiny noise that still
-perturb other tasks when summed. Second, sign conflicts: when τ_A and τ_B disagree on direction, averaging
-cancels useful movement. The method does three things, in order, because each removes one failure mode:
+TIES names two sources of interference:
+- **Noise:** most entries of a task vector are tiny but still perturb other tasks when summed.
+- **Sign conflicts:** when τ_A and τ_B disagree on direction, averaging cancels useful movement.
 
-1. **Trim.** Keep only the top *k*% of each τ_i by magnitude (20% is a common setting); zero the rest.
-   Fine-tuning changes concentrate in a few parameters, so this removes noise without losing much.
-2. **Elect.** For each parameter, choose the sign carrying more total magnitude across tasks:
-   sign(Σ_i τ_i) after trimming. This decides which direction the merged model will move.
-3. **Disjoint merge.** Average only the task vectors that agree with the elected sign at that parameter,
-   ignoring the dissenters instead of letting them cancel the majority. Then θ = θ_base + λ τ_merged.
+Three steps, in order, each removing one failure mode:
+1. **Trim.** Keep only the top *k*% of each τ_i by magnitude (20% is common); zero the rest. Fine-tuning
+   changes concentrate in a few parameters, so this removes noise without losing much.
+2. **Elect.** Per parameter, pick the sign carrying more total magnitude: sign(Σ_i τ_i) after trimming.
+   This decides which way the merged model moves.
+3. **Disjoint merge.** Average only task vectors agreeing with the elected sign there, ignoring dissenters
+   instead of letting them cancel the majority. Then θ = θ_base + λ τ_merged.
 
-A four-parameter walkthrough makes the effect visible. Take τ_A = [+0.30, −0.02, +0.10, −0.40],
-τ_B = [−0.25, +0.01, +0.12, −0.05] and τ_C = [+0.05, 0.00, −0.08, −0.30]. The plain mean is
-[+0.03, 0.00, +0.05, −0.25]: on parameter 1, A's strong push and B's strong pull have cancelled to almost
-nothing. Trimming each vector to its top 50% (two entries) leaves A = [+0.30, 0, 0, −0.40],
-B = [−0.25, 0, +0.12, 0] and C = [0, 0, −0.08, −0.30]. The summed signs are [+, 0, +, −], and the disjoint
-means give τ_merged = [+0.30, 0, +0.12, −0.35]. Two lessons follow. Movement that the tasks agree on
-survives at full strength rather than being divided by the number of tasks, which is why λ for TIES sits
-near 1 rather than 1/N. And conflicts are not resolved, only decided: on parameter 1, B loses outright
-because A's magnitude was larger, so B's skill pays for the merge wherever it depended on that weight.
+Four-parameter walkthrough (trim to top 50%, two entries each):
+
+| | p1 | p2 | p3 | p4 |
+|---|---|---|---|---|
+| τ_A | +0.30 | −0.02 | +0.10 | −0.40 |
+| τ_B | −0.25 | +0.01 | +0.12 | −0.05 |
+| τ_C | +0.05 | 0.00 | −0.08 | −0.30 |
+| Plain mean | +0.03 | 0.00 | +0.05 | −0.25 |
+| Trimmed A / B / C | +0.30 / −0.25 / 0 | 0 / 0 / 0 | 0 / +0.12 / −0.08 | −0.40 / 0 / −0.30 |
+| Elected sign | + | 0 | + | − |
+| τ_merged | +0.30 | 0 | +0.12 | −0.35 |
+
+- **Agreement survives at full strength.** It is not divided by the number of tasks, which is why λ for
+  TIES sits near 1 rather than 1/N.
+- **Conflicts are decided, not resolved.** On p1, B loses outright because A's magnitude was larger, so
+  B's skill pays wherever it depended on that weight.
 
 ### DARE: drop and rescale
-DARE starts from the observation that SFT deltas are extremely redundant: you can set a random 90% (or
-more, on large models) of a task vector's entries to zero, multiply the survivors by 1/(1 − p), and the
-model's behaviour barely changes, because the rescaling keeps the expected delta identical and the
-redundancy covers the dropped entries. Sparsified deltas from different tasks collide far less often, so
-DARE is used as a preprocessing step before summing or before TIES ("dare_ties"). It works when deltas
-are small relative to the base; it fails on continued-pretraining deltas, which are large and not
-redundant.
+- **Observation:** SFT deltas are extremely redundant. Zero a random 90% (or more, on large models) of a
+  task vector's entries and multiply survivors by 1/(1 − p): behaviour barely changes.
+- **Why:** the rescaling keeps the expected delta identical, and the redundancy covers dropped entries.
+- **Use:** sparsified deltas from different tasks collide far less, so DARE is preprocessing before
+  summing or before TIES ("dare_ties").
+- **Limit:** works when deltas are small relative to the base; fails on continued-pretraining deltas,
+  which are large and not redundant.
 
 ### Passthrough and frankenmerges
-Stacking layers from different models, or repeating a block of layers to make a deeper model (depth
-up-scaling), is merging without arithmetic. The result is broken until it is healed with continued
-training, so this is a model-building technique rather than a free combination step.
+- Stacking layers from different models, or repeating a block to make a deeper model (depth up-scaling),
+  is merging without arithmetic.
+- The result is broken until healed with continued training, so this is model building, not a free
+  combination step.
 
 ### Constraints that follow from the mechanism
-Everything above is elementwise arithmetic on tensors, so it presumes the same architecture, the same
-tensor shapes (hence the same tokenizer and vocabulary size) and the same base lineage. Two fine-tunes of
-different base checkpoints have deltas measured from different origins; two models trained from different
-random initialisations are related by hidden permutations of their neurons and average into noise unless
-aligned first. LoRA adapters are task vectors restricted to a low-rank subspace, so adapter merging (a
-weighted sum of B_iA_i products, with the same TIES/DARE options) is the same technique with the same
-interference problems. And because nothing is trained, nothing is verified: every merge needs the full
-evaluation suite, including the chat template, end-of-turn behaviour and safety checks, before anyone
-calls it a model.
+- **Same architecture, shapes and lineage.** Everything is elementwise arithmetic, so it needs identical
+  tensor shapes (hence the same tokenizer and vocabulary size) and the same base.
+- **Different base checkpoints:** deltas measured from different origins.
+- **Different random initialisations:** related by hidden permutations of neurons; they average into
+  noise unless aligned first.
+- **LoRA adapters are task vectors** in a low-rank subspace, so adapter merging (a weighted sum of B_iA_i
+  products, with the same TIES/DARE options) has the same interference problems.
+- **Nothing is trained, so nothing is verified.** Every merge needs the full eval suite, including chat
+  template, end-of-turn behaviour and safety checks, before anyone calls it a model.
 
-## Example
-A compact TIES merge over Hugging Face state dicts in PyTorch. All checkpoints must share the base model
-and tensor shapes. It works tensor by tensor, so peak memory is one tensor times the number of models, and
-it falls back to copying non-float buffers unchanged.
+## Examples
+### TIES merge over Hugging Face state dicts
+PyTorch. All checkpoints must share the base model and tensor shapes. It works tensor by tensor, so peak
+memory is one tensor times the number of models, and copies non-float buffers unchanged.
 
 ```python
 import torch
@@ -162,46 +169,105 @@ def ties_merge(base, finetunes, k=0.2, lam=1.0):
 # mergekit expresses the same recipe as a YAML config (merge_method: ties, density: 0.2, weight: ...).
 ```
 
+### Reproduce the four-parameter walkthrough
+Pure Python; runs anywhere and prints the table's last row.
+
+```python
+tau = {"A": [+0.30, -0.02, +0.10, -0.40],
+       "B": [-0.25, +0.01, +0.12, -0.05],
+       "C": [+0.05, 0.00, -0.08, -0.30]}
+
+def trim(v, keep=2):                       # keep the top-`keep` entries by magnitude
+    top = sorted(range(len(v)), key=lambda i: abs(v[i]), reverse=True)[:keep]
+    return [x if i in top else 0.0 for i, x in enumerate(v)]
+
+sign = lambda x: (x > 0) - (x < 0)
+mean = [round(sum(c) / 3, 2) for c in zip(*tau.values())]
+trimmed = [trim(v) for v in tau.values()]
+merged = []
+for col in zip(*trimmed):
+    s = sign(sum(col))                                   # elect
+    agree = [x for x in col if x != 0 and sign(x) == s]  # disjoint merge
+    merged.append(round(sum(agree) / len(agree), 2) if agree else 0.0)
+print("plain mean:", mean)      # [0.03, -0.0, 0.05, -0.25]
+print("TIES      :", merged)    # [0.3, 0.0, 0.12, -0.35]
+```
+
+### The same merge as a mergekit config
+The declarative form teams usually commit to version control; run it with `mergekit-yaml config.yml
+./merged`.
+
+```yaml
+merge_method: ties
+base_model: org/base-8b
+models:
+  - model: org/support-sft
+    parameters:
+      density: 0.2      # TIES trim: keep the top 20% of each task vector
+      weight: 0.5
+  - model: org/instruct-tune
+    parameters:
+      density: 0.2
+      weight: 0.5
+parameters:
+  normalize: true
+dtype: bfloat16
+```
+
+## Production patterns
+- **Merge recipes as code.** Keep each merge as a versioned config (method, parent revisions, density,
+  weights, λ) next to its eval report, so any registered model can be rebuilt exactly. Monitor that parent
+  revisions in the config match the registry.
+- **Lineage check before merging.** Verify every parent was fine-tuned from the same base revision and
+  shares tokenizer and vocabulary size; refuse the merge on any shape mismatch instead of padding tensors.
+- **Small hyperparameter grid on a mixed validation set.** Sweep density (for example 0.2 to 0.5) and
+  weights or λ, plus a SLERP candidate for two-model merges, scoring every parent's task. Pick the point
+  where no parent's metric drops beyond tolerance.
+- **Full release gate, like a trained model.** Per-task evals against each parent, a general benchmark, a
+  chat-template smoke test (end-of-turn, role tags, system prompt) and the safety suite. Track refusal
+  rate on a fixed red-team set across every merge.
+- **Routing fallback.** If the merge cannot hold every parent's quality, keep the specialists behind a
+  router and treat the merge as an experiment. Compare cost per request and quality across both paths.
+
 ## Trade-offs
-- Zero training compute and no access to the original datasets, but also zero training signal: nothing
-  guarantees the merged model works, so evaluation effort replaces training effort; when you do own the
-  data and compute, multi-task SFT is the more reliable path.
-- One model for several skills saves GPUs and routing complexity, but interference grows with the number
-  of tasks and the size of their deltas; past a handful of tasks, per-task quality usually slips below the
+- **No training compute vs no training signal.** No datasets or GPUs needed, but nothing guarantees the
+  merge works, so evaluation effort replaces training effort. When you own the data and compute, multi-task
+  SFT is more reliable.
+- **One model vs interference.** One model for several skills saves GPUs and routing, but interference
+  grows with task count and delta size; past a handful of tasks, per-task quality usually slips below the
   specialists.
-- Plain averaging improves robustness when models are near-duplicates of each other, but it cancels
-  conflicting updates; TIES and DARE fix that at the cost of hyperparameters (k, p, λ) that need a
-  validation set to tune.
-- SLERP preserves norms and often beats linear interpolation for two models, but does not extend to many
-  models; linear and TIES scale to N at the cost of norm drift.
-- Task-vector negation can remove unwanted behaviour cheaply, but the same mechanism can strip safety
-  tuning, intentionally or by accident, which makes merged models a governance problem as much as a
-  technical one.
+- **Averaging vs TIES/DARE.** Plain averaging improves robustness for near-duplicates but cancels
+  conflicting updates; TIES and DARE fix that at the cost of hyperparameters (k, p, λ) tuned on a
+  validation set.
+- **SLERP vs N-way methods.** SLERP preserves norms and often beats linear interpolation for two models,
+  but does not extend to many; linear and TIES scale to N at the cost of norm drift.
+- **Negation power vs governance.** Task-vector negation removes unwanted behaviour cheaply, but the same
+  mechanism can strip safety tuning, deliberately or by accident, making merges a governance problem too.
 
 ## Pitfalls
-- Merging fine-tunes of different base revisions, or treating an instruct model as the base for deltas
-  computed against the pretrained one: the symptom is incoherent or garbage output, because the deltas
-  are measured from the wrong origin.
-- Vocabulary mismatch from added special tokens: embedding and output-head shapes differ, so the symptom
-  is a shape error, or, if someone pads the tensors, wrong tokens at generation time.
-- Weights that sum well above one, or λ too high: the symptom is repetitive, degenerate text and logits
-  that blow up, because activations leave the range the base model expects.
-- Each parent learned its own chat template: the merged model gets a mixture, so the symptom is leaked
+- **Wrong origin for deltas.** Merging fine-tunes of different base revisions, or treating an instruct
+  model as the base for deltas computed against the pretrained one. Symptom: incoherent or garbage output.
+- **Vocabulary mismatch from added special tokens.** Embedding and output-head shapes differ. Symptom: a
+  shape error, or, if someone pads the tensors, wrong tokens at generation time.
+- **Weights summing well above one, or λ too high.** Activations leave the range the base expects.
+  Symptom: repetitive, degenerate text and logits that blow up.
+- **Mixed chat templates.** Each parent learned its own, and the merge gets a mixture. Symptom: leaked
   role tags, never emitting end-of-turn, or ignoring the system prompt.
-- Trusting leaderboard scores for merges: benchmark contamination accumulates across parents, so the
-  symptom is a model that tops a public board and underperforms its parents on your tasks.
-- Skipping the safety regression: merging can quietly undo refusal training; the symptom is a model that
-  complies with requests every parent refused, discovered by a user rather than by a test.
+- **Trusting leaderboard scores for merges.** Benchmark contamination accumulates across parents.
+  Symptom: tops a public board, underperforms its parents on your tasks.
+- **Skipping the safety regression.** Merging can quietly undo refusal training. Symptom: complies with
+  requests every parent refused, discovered by a user rather than a test.
 
 ## When to use
-Merge when you have several fine-tunes of the same base and need one artifact, when you want to borrow a
-community tune's conversational quality for your domain model without its data, when you are averaging
-checkpoints or seeds from your own run, or when you want a fast experiment before committing to a
-multi-task training job. Do not merge as a substitute for training when you own the data, and never ship a
-merge that has not been through the per-task evals, a general benchmark, a template smoke test and the
-safety suite. Measure each parent's task metric before and after, and treat any drop as the cost of the
-merge, not noise. In interviews, be ready to explain task vectors, why TIES elects a sign, why DARE's
-rescaling preserves behaviour, and why two models from different initialisations cannot simply be averaged.
+- **Use when:** you have several fine-tunes of the same base and need one artifact; you want a community
+  tune's conversational quality for your domain model without its data; you are averaging checkpoints or
+  seeds from your own run; or you want a fast experiment before a multi-task training job.
+- **Avoid when:** you own the data, so training is the better substitute.
+- **Never ship** a merge without per-task evals, a general benchmark, a template smoke test and the
+  safety suite.
+- **Measure:** each parent's task metric before and after; treat any drop as the merge's cost, not noise.
+- **Interviews:** explain task vectors, why TIES elects a sign, why DARE's rescaling preserves behaviour,
+  and why two models from different initialisations cannot simply be averaged.
 
 ## Role lens
 - **Engineer:** Computes task vectors, tunes density and λ on a validation set, and runs the full eval and

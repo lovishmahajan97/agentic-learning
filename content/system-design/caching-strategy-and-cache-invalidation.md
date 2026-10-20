@@ -5,7 +5,7 @@ name: Caching strategy & cache invalidation
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - serving-inference/caching
   - prompting/prompt-caching
@@ -22,115 +22,137 @@ sources:
 ---
 
 ## TL;DR
-Model calls are the slowest, most expensive step in an AI system, and much of what they process repeats:
-the same system prompt, documents and questions. Caching happens at several layers, prefix caching of
-computation, exact and semantic response caches, embedding and retrieval caches, each with its own key
-and its own way of going stale. The design question is always the key: what must be identical for a
-cached result to still be correct, and how you find out when it no longer is.
+Model calls are the slowest, costliest step, and much of their input repeats. Cache at several layers
+(prefix, exact, semantic, embedding, retrieval), each with its own key. The design question is the key:
+what must match for a result to stay correct.
 
 ## Why it exists
-A cache hit returns in milliseconds and costs almost nothing; a miss takes seconds and bills every token.
-Prompts are dominated by content that repeats across requests: a system prompt, tool definitions,
-few-shot examples and retrieved documents can be thousands of tokens that are identical for every user
-of a feature. That makes caching the single biggest lever on cost and latency after model choice.
-
-The naive approach, "hash the prompt and cache the response", fails in ways specific to AI systems.
-Outputs are sampled, so caching only makes sense when you want the same answer and the key must include
-the sampling parameters. Prompts embed context, so an identical question from two tenants, or from the
-same tenant a week apart, can require different correct answers. Semantic near-duplicates look like hits
-and differ in one decisive detail: a negation, a date, an account number. And the things that make a
-cached answer wrong are numerous and silent: the provider updates the model, someone edits the prompt
-template, a document is re-ingested, the embedding model changes, an external tool's data moves.
-
-Without a deliberate strategy teams land in one of two bad places: caching nothing and paying for every
-repeated token, or caching eagerly and serving stale or wrong answers that cost more trust than the
-tokens saved. Both of the famous hard problems, naming things and invalidating caches, turn out to be the
-same problem here: the name of the cache entry is the list of everything the answer depends on.
+- **Hits are nearly free; misses are not.** A hit returns in milliseconds and costs almost nothing; a miss
+  takes seconds and bills every token.
+- **Prompts are mostly repeated content.** A system prompt, tool definitions, few-shot examples and
+  retrieved documents can be thousands of tokens identical for every user of a feature. Caching is the
+  biggest lever on cost and latency after model choice.
+- **"Hash the prompt and cache the response" fails in AI-specific ways:**
+  - Outputs are sampled, so caching only makes sense when you want the same answer, and the key must
+    include the sampling parameters.
+  - Prompts embed context: an identical question from two tenants, or from one tenant a week apart, can
+    need different correct answers.
+  - Semantic near-duplicates look like hits but differ in one decisive detail: a negation, a date, an
+    account number.
+  - Staleness is numerous and silent: the provider updates the model, someone edits the prompt template, a
+    document is re-ingested, the embedding model changes, an external tool's data moves.
+- **Without a strategy you land in one of two bad places:** caching nothing and paying for every repeated
+  token, or caching eagerly and serving stale or wrong answers that cost more trust than the tokens saved.
+- **Both famous hard problems are one problem here.** Naming things and invalidating caches merge: the name
+  of the cache entry is the list of everything the answer depends on.
 
 ## How it works
+### The layers at a glance
+| Layer | Caches | Key | Goes stale when |
+|---|---|---|---|
+| 1. Prefix / prompt | Computation (KV cache of a shared prefix) | Exact token prefix | Anything before or within the span changes |
+| 2. Exact response | Whole responses | Model, params, messages, tools, format, scope | Any key input changes |
+| 3. Semantic | Answers to similar queries | Query embedding within a scope | Sources change, or a paraphrase is a different question |
+| 4. Embedding | Vectors | Embedding model id + normalised text | Embedding model changes |
+| 5. Retrieval and tool | Doc ids, tool results, agent steps | Index version; tool name + args | Index changes; TTL expires |
+
 ### Layer 1: prefix and prompt caching (caching computation)
-A provider or a self-hosted engine reuses the KV cache for a byte-identical token prefix across requests,
-so the prefill of the shared part is not recomputed. The key is the exact prefix; any change *before or
-within* the cached span invalidates everything after it, because each cached key and value depends on all
-earlier positions. Design consequence: put static content first (system prompt, tools, few-shot, long
-documents) and dynamic content last, keep the ordering stable, and never inject a timestamp or the user's
-name near the top. Providers bill cached input tokens at a lower rate with short time-to-live windows,
-some charge a premium for the cache *write*, and most enforce a minimum cacheable prefix length of
-roughly a thousand tokens or more, so a short system prompt alone may never cache (all figures are
-vendor- and model-specific and change); engines such as vLLM offer automatic prefix caching across
-requests that share a prefix. The metric is cached-token share in usage reports, checked after every
-change to prompt assembly, because a regression there is silent: requests keep succeeding and only the
-bill moves.
+- **What:** a provider or self-hosted engine reuses the KV cache for a byte-identical token prefix across
+  requests, so the shared part's prefill is not recomputed.
+- **Key = the exact prefix.** Any change *before or within* the cached span invalidates everything after
+  it, because each cached key and value depends on all earlier positions.
+- **Layout rule:** static content first (system prompt, tools, few-shot, long documents), dynamic content
+  last, stable ordering, and never a timestamp or the user's name near the top.
+- **Pricing (vendor- and model-specific, and it changes):** cached input tokens bill at a lower rate with
+  short time-to-live windows; some providers charge a premium for the cache *write*; most enforce a
+  minimum cacheable prefix of roughly a thousand tokens or more, so a short system prompt alone may never
+  cache.
+- **Engines** such as vLLM offer automatic prefix caching across requests that share a prefix.
+- **Metric:** cached-token share in usage reports, checked after every change to prompt assembly, because a
+  regression is silent: requests keep succeeding and only the bill moves.
 
 ### Layer 2: exact response cache
-Key = hash of model id and version, sampling parameters, the full normalised message list, tool schemas,
-response format, and the tenant or user scope whenever the prompt contains private context. Value =
-the response plus its usage. Only sensible for deterministic intent (temperature 0, or a product that
-accepts identical answers to identical requests). Hit rates in open-ended chat are low; in form-like,
-classification and extraction features, where identical inputs recur, they are high.
+- **Key** = hash of model id and version, sampling parameters, the full normalised message list, tool
+  schemas, response format, and the tenant or user scope whenever the prompt contains private context.
+- **Value** = the response plus its usage.
+- **Only for deterministic intent:** temperature 0, or a product that accepts identical answers to
+  identical requests.
+- **Hit rates:** low in open-ended chat; high in form-like, classification and extraction features, where
+  identical inputs recur.
 
 ### Layer 3: semantic cache
-Embed the query, search cached queries within the same scope (tenant, prompt version, index version),
-and return the cached answer when similarity exceeds a threshold. The gain is a hit rate exact matching
-cannot reach; the risk is a paraphrase that is actually a different question. Mitigations: a high
-threshold; scope keys; excluding or entity-keying queries that contain numbers, dates, names or
-negations; a cheap verifier on borderline hits ("does this cached answer address this query?"); and a
-sampled false-hit audit. The economics: savings = hit_rate × (cost_miss − cost_hit) − false_hit_rate ×
-cost_of_a_wrong_answer − embedding cost per lookup. The last two terms are what people forget.
+1. Embed the query.
+2. Search cached queries within the same scope (tenant, prompt version, index version).
+3. Return the cached answer when similarity exceeds a threshold.
+
+- **Gain:** a hit rate exact matching cannot reach. **Risk:** a paraphrase that is actually a different
+  question.
+- **Mitigations:** a high threshold; scope keys; excluding or entity-keying queries with numbers, dates,
+  names or negations; a cheap verifier on borderline hits ("does this cached answer address this
+  query?"); a sampled false-hit audit.
+- **Economics:**
+
+```
+savings = hit_rate × (cost_miss − cost_hit) − false_hit_rate × cost_of_a_wrong_answer − embedding cost per lookup
+```
+
+The last two terms are what people forget.
 
 ### Layer 4: embedding cache
-Key = hash of embedding model id plus normalised text. Cheap and high-value in ingestion (unchanged
-chunks are not re-embedded on re-index) and for repeated queries. A new embedding model invalidates
-everything, which is fine *because* you must re-embed the whole index anyway; version the index.
+- **Key** = hash of embedding model id plus normalised text.
+- **Cheap and high-value** in ingestion (unchanged chunks are not re-embedded on re-index) and for repeated
+  queries.
+- **A new embedding model invalidates everything,** which is fine *because* you must re-embed the whole
+  index anyway; version the index.
 
 ### Layer 5: retrieval and tool caches
-Query → document ids, keyed by index version; external tool results with a TTL set by data volatility
-(exchange rates seconds, a product catalogue hours); memoised agent steps keyed by tool name and
-arguments.
+- **Query → document ids,** keyed by index version.
+- **External tool results** with a TTL set by data volatility (exchange rates seconds, a product catalogue
+  hours).
+- **Memoised agent steps** keyed by tool name and arguments.
 
 ### Read and write patterns
-Most AI response caches are **cache-aside**: the application looks up the key, calls the model on a
-miss and writes the result. That keeps the cache optional (a cache outage means slower, not broken), at
-the price of the stampede problem handled below. A gateway cache is effectively **read-through**:
-callers do not know it exists, which is convenient and is also why it cannot see tenants or document
-versions nobody put in the request. **Precomputation** (answers for the few hundred most frequent
-questions generated by a batch job, summaries written at ingestion) moves model cost off the request
-path entirely and suits features whose question set is predictable. **Stale-while-revalidate** serves
-an expired entry while one background call refreshes it, trading a bounded extra window of staleness for
-never making a user wait on a hot key; it is wrong for content where stale means incorrect, such as
-prices or permissions. Eviction under a memory cap is usually LRU or LFU; both ignore that entries
-differ greatly in what they cost to recompute, so a long-context answer is worth more cache space than a
-short classification.
+| Pattern | How | Trade-off |
+|---|---|---|
+| **Cache-aside** (most AI response caches) | App looks up the key, calls the model on a miss, writes the result | Cache stays optional (an outage means slower, not broken), at the price of stampedes |
+| **Read-through** (a gateway cache, effectively) | Callers do not know it exists | Convenient, and why it cannot see tenants or document versions nobody put in the request |
+| **Precomputation** | Batch job answers the few hundred most frequent questions; summaries written at ingestion | Moves model cost off the request path; suits predictable question sets |
+| **Stale-while-revalidate** | Serve an expired entry while one background call refreshes it | A bounded extra window of staleness for never making a user wait on a hot key; wrong where stale means incorrect, such as prices or permissions |
+
+- **Eviction under a memory cap** is usually LRU or LFU. Both ignore that entries differ greatly in what
+  they cost to recompute, so a long-context answer is worth more cache space than a short classification.
 
 ### Invalidation strategies
-1. **Versioned keys.** Include the model id, prompt template version, index version and embedding model
-   id in every key. Changing any of them yields a cold cache with no purge logic at all. Simplest and
-   most robust; the cost is cold misses after each deploy, which a replay of recent queries can pre-warm.
-2. **TTL.** Bounds staleness per data class; refresh ahead of expiry for hot keys; jitter expiries so
-   they do not align.
-3. **Event-driven purge.** When a document changes, purge the answers that used it. Needs a reverse
-   index from document id to cache keys, which the generation step must write. Precise, more complex,
-   and required when a deleted document must stop appearing in answers (erasure requests). It has a
-   race: a generation that read the old document can finish *after* the purge and write a stale answer
-   back. Close it by storing the version (a content hash) of each document an answer used alongside the
-   answer, and treating a hit as a miss when any of those versions is no longer current.
+1. **Versioned keys.** Include model id, prompt template version, index version and embedding model id in
+   every key. Changing any yields a cold cache with no purge logic at all. Simplest and most robust; the
+   cost is cold misses after each deploy, which a replay of recent queries can pre-warm.
+2. **TTL.** Bounds staleness per data class; refresh ahead of expiry for hot keys; jitter expiries so they
+   do not align.
+3. **Event-driven purge.** When a document changes, purge the answers that used it.
+   - Needs a reverse index from document id to cache keys, which the generation step must write.
+   - Precise, more complex, and required when a deleted document must stop appearing in answers (erasure
+     requests).
+   - **Race:** a generation that read the old document can finish *after* the purge and write a stale
+     answer back. Close it by storing the version (a content hash) of each document an answer used, and
+     treating a hit as a miss when any of those versions is no longer current.
 4. **Scope isolation.** Tenant and user in the key wherever the prompt carries private context; a shared
    cache across trust boundaries is a leak, not an optimisation.
 5. **Do not cache failures.** Errors, refusals, truncated streams and low-judge-score answers are not
    cached, or an outage gets remembered after it ends.
-6. **Stampede control.** Single-flight locking or request coalescing on popular keys so a thousand
+6. **Stampede control.** Single-flight locking or request coalescing on popular keys, so a thousand
    simultaneous misses produce one model call.
 
 ### Where each layer lives
-Prefix caching lives in the provider or engine. Exact and semantic caches can live in a gateway, which
-is convenient but context-blind, or in the application, which knows tenants and document versions and is
-usually the better place. Observe hit rate, cost saved and latency saved per layer, sampled false-hit
-rate, and the age of served entries.
+- **Prefix caching:** in the provider or engine.
+- **Exact and semantic caches:** in a gateway (convenient but context-blind) or in the application (knows
+  tenants and document versions; usually the better place).
+- **Observe per layer:** hit rate, cost saved and latency saved, sampled false-hit rate, and the age of
+  served entries.
 
-## Example
-An exact-match response cache in Redis with versioned, tenant-scoped keys, single-flight on misses, a
-rule against caching partial or refused answers, and a reverse index that lets the ingestion pipeline
-purge every cached answer that used a document when that document changes.
+## Examples
+### Exact-match cache in Redis
+Versioned, tenant-scoped keys, single-flight on misses, a rule against caching partial or refused answers,
+and a reverse index so the ingestion pipeline can purge every cached answer that used a changed document.
 
 ```python
 import hashlib, json, time, redis
@@ -169,55 +191,141 @@ def on_document_updated(tenant, doc_id):                         # called by the
     r.delete(f"deps:{tenant}:{doc_id}")
 ```
 
-Bumping `VERSIONS["prompt"]` at deploy time cold-starts the cache without any purge code; the reverse
-index handles the case versioning cannot, a single document changing under an unchanged prompt. Two
-simplifications to remove before production. The lock is released unconditionally, so a model call that
-outlives the lock's 30 s expiry deletes a lock another caller now holds; store a random token in the
-lock and delete only if it still matches (a small Lua compare-and-delete). And the purge has the
-in-flight race described above, which needs the document versions stored with each answer and checked
-on read.
+- **Bumping `VERSIONS["prompt"]` at deploy time** cold-starts the cache without any purge code.
+- **The reverse index handles what versioning cannot:** a single document changing under an unchanged
+  prompt.
+- **Simplification 1, the lock:** it is released unconditionally, so a model call that outlives the lock's
+  30 s expiry deletes a lock another caller now holds. Store a random token and delete only if it still
+  matches (a small Lua compare-and-delete).
+- **Simplification 2, the purge race:** described above; it needs the document versions stored with each
+  answer and checked on read. Both fixes follow.
+
+### Hardening: token lock and version-checked reads
+The two fixes, as drop-in helpers. Capture document versions at *retrieval* time, before generating, so an
+answer built from an old document carries the old version.
+
+```python
+import json, uuid, redis
+r = redis.Redis()
+
+RELEASE = r.register_script("""
+if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end
+return 0
+""")                                                          # compare-and-delete, atomic in Redis
+
+def acquire(k, ttl=30):
+    token = uuid.uuid4().hex                                  # unique per caller
+    return token if r.set(k + ":lock", token, nx=True, ex=ttl) else None
+
+def release(k, token):
+    RELEASE(keys=[k + ":lock"], args=[token])                 # deletes the lock only if it is still ours
+
+def read_versions(tenant, doc_ids):                           # call at RETRIEVAL time, before generating
+    vals = r.mget([f"docver:{tenant}:{d}" for d in doc_ids])  # ingestion writes a content hash per doc
+    return {d: (v.decode() if v else None) for d, v in zip(doc_ids, vals)}
+
+def store(k, out, versions, ttl):
+    r.set(k, json.dumps(out | {"doc_versions": versions}), ex=ttl)
+
+def get_if_current(tenant, k):
+    hit = r.get(k)
+    if not hit:
+        return None
+    entry = json.loads(hit)
+    used = entry.get("doc_versions", {})
+    if used and read_versions(tenant, list(used)) != used:    # a source changed since generation: a miss
+        return None
+    return entry
+```
+
+### Worked economics: is the semantic cache paying?
+Illustrative numbers plugged into the savings formula; similarity thresholds are examples, not
+recommendations.
+
+```python
+def semantic_savings(hit_rate, false_hit_rate, cost_miss, cost_hit, cost_wrong, embed_cost):
+    """Expected $ saved per request (rates are fractions of all requests)."""
+    return hit_rate * (cost_miss - cost_hit) - false_hit_rate * cost_wrong - embed_cost
+
+# Illustrative: $0.01 per model call, $0.0001 per cache hit, $0.00002 to embed the query,
+# $0.50 for a wrong answer (a support escalation). Thresholds trade hit rate for false hits.
+for threshold, hit, false_hit in ((0.97, 0.30, 0.003), (0.92, 0.45, 0.012)):
+    s = semantic_savings(hit, false_hit, 0.01, 0.0001, 0.50, 0.00002)
+    print(f"threshold {threshold}: hit {hit:.0%}, false hits {false_hit:.1%} -> "
+          f"net {s * 100_000:+,.0f} USD per 100k requests")
+# threshold 0.97: hit 30%, false hits 0.3% -> net +145 USD per 100k requests
+# threshold 0.92: hit 45%, false hits 1.2% -> net -156 USD per 100k requests
+```
+
+| Threshold | Hit rate | False-hit rate | Net per 100k requests |
+|---|---|---|---|
+| 0.97 (strict) | 30% | 0.3% | +$145 |
+| 0.92 (loose) | 45% | 1.2% | −$156: more hits, but wrong answers cost more than the tokens saved |
+
+## Production patterns
+- **Static-first prompts with explicit cache points.** Put system prompt, tools and long documents first;
+  on Anthropic mark the end of the static part with `cache_control: {"type": "ephemeral"}`, while OpenAI
+  caches long shared prefixes automatically. Monitor `cache_read_input_tokens` (Anthropic) or
+  `prompt_tokens_details.cached_tokens` (OpenAI) as a share of input after every prompt change.
+- **Prefix caching on self-hosted engines.** Turn on vLLM's automatic prefix caching (the
+  `enable_prefix_caching` engine option; recent releases enable it by default) and keep shared prefixes
+  byte-identical across requests. Monitor the engine's prefix-cache hit rate and time to first token.
+- **Version bump plus warm-up replay.** Put every dependency version in the key, and after a deploy replay
+  the most frequent recent queries against the new version before shifting traffic. Monitor hit rate in
+  the first hour after deploy and p95 latency during the cold window.
+- **Erasure-safe purge.** Write the reverse index and document versions at generation time, call the purge
+  from the same ingestion hook that deletes from the vector index, and check versions on read. Monitor
+  purge counts per erasure request and any hit whose source document no longer exists.
+- **Sampled false-hit audit.** Send a small share of semantic hits (say 1%) to a judge or reviewer that
+  asks whether the cached answer addresses the new query. Monitor false-hit rate per threshold and per
+  feature, and tighten the threshold when it rises.
+- **Jittered TTLs per data class.** Set TTL by volatility (seconds for prices, hours for catalogue data)
+  and add random jitter (for example up to 10% of the TTL) so popular keys do not expire together. Monitor
+  latency and cost spikes at TTL multiples and the age of served entries.
 
 ## Trade-offs
-- Looser keys and lower similarity thresholds raise the hit rate and the false-hit rate together; the
-  right point depends on what a wrong answer costs, which differs between an FAQ bot and a billing
-  assistant.
-- Longer TTLs save more and serve staler data; acceptable when you also have event-driven purge for the
-  content that matters, dangerous when TTL is the only invalidation you have.
-- Versioned keys are simple and safe but every deploy cold-starts the cache; when the cache is what meets
-  the latency SLO, add a warm-up replay or a brief dual-version window.
-- Prefix caching needs a static-first prompt layout, which constrains where personalisation can go; it
-  flips only in the rare design where per-user content must precede the shared instructions.
-- A global cache maximises hits and is a leak surface; a per-tenant cache is safer with a lower hit
-  rate; the trust boundary, not the hit rate, decides.
-- Event-driven purge is precise but requires dependency tracking storage and hooks in ingestion; TTL is
-  cheap but can only bound staleness, never eliminate it.
+- **Hit rate vs false hits.** Looser keys and lower similarity thresholds raise both together; the right
+  point depends on what a wrong answer costs, which differs between an FAQ bot and a billing assistant.
+- **Savings vs staleness.** Longer TTLs save more and serve staler data; acceptable with event-driven purge
+  for the content that matters, dangerous when TTL is the only invalidation you have.
+- **Simple versioning vs cold starts.** Versioned keys are simple and safe but every deploy cold-starts the
+  cache; when the cache is what meets the latency SLO, add a warm-up replay or a brief dual-version window.
+- **Prefix hits vs layout freedom.** Prefix caching needs a static-first layout, which constrains where
+  personalisation can go; it flips only in the rare design where per-user content must precede the shared
+  instructions.
+- **Global vs per-tenant cache.** A global cache maximises hits and is a leak surface; a per-tenant cache is
+  safer with a lower hit rate. The trust boundary, not the hit rate, decides.
+- **Precise purge vs cheap TTL.** Event-driven purge is precise but requires dependency tracking storage and
+  hooks in ingestion; TTL is cheap but can only bound staleness, never eliminate it.
 
 ## Pitfalls
-- Caching across tenants or users; the symptom is a user seeing another customer's data inside an
-  answer, which is a security incident rather than a bug.
-- Dynamic content at the top of the prompt; the symptom is a cached-token share near zero while prompt
-  caching is "enabled" and the bill is unchanged.
-- Semantic false hits; the symptom is confident wrong answers whose logs show a cache hit with high
-  similarity to a question that differed by a negation or a number.
-- Leaving the model or prompt version out of the key; the symptom is half of users seeing the old
-  behaviour for hours after a prompt change, and contaminated A/B results.
-- Caching errors, refusals or partial streams; the symptom is users still receiving an error message
-  long after the provider recovered.
-- Stampedes on expiry; the symptom is periodic latency and cost spikes aligned with TTL multiples.
-- Purging without guarding against in-flight generations; the symptom is a stale answer reappearing
-  minutes after a purge that logged success, typically when a document is edited during busy hours.
-- A deleted document still answered from cache; the symptom is a compliance finding after an erasure
-  request that the index honoured and the cache did not.
+- **Caching across tenants or users.** Symptom: a user sees another customer's data inside an answer, a
+  security incident rather than a bug.
+- **Dynamic content at the top of the prompt.** Symptom: cached-token share near zero while prompt caching
+  is "enabled" and the bill is unchanged.
+- **Semantic false hits.** Symptom: confident wrong answers whose logs show a high-similarity hit on a
+  question that differed by a negation or a number.
+- **Model or prompt version missing from the key.** Symptom: half of users see the old behaviour for hours
+  after a prompt change, and A/B results are contaminated.
+- **Caching errors, refusals or partial streams.** Symptom: users still receive an error message long after
+  the provider recovered.
+- **Stampedes on expiry.** Symptom: periodic latency and cost spikes aligned with TTL multiples.
+- **Purging without guarding against in-flight generations.** Symptom: a stale answer reappears minutes
+  after a purge that logged success, typically when a document is edited during busy hours.
+- **A deleted document still answered from cache.** Symptom: a compliance finding after an erasure request
+  that the index honoured and the cache did not.
 
 ## When to use
-Prefix caching is always worth having and is mostly a matter of prompt layout. An exact response cache
-pays off for form-like, classification and extraction traffic with deterministic settings. A semantic
-cache suits high-volume FAQ-like traffic where a measured false-hit rate is tolerable, and should be
-avoided for personalised or transactional queries. An embedding cache belongs in every ingestion
-pipeline. Measure hit rate per layer, cost and latency saved, sampled false-hit rate and the age of served
-entries, and treat erasure requests as a cache concern. In interviews, lead with the key: list what the
-answer depends on, show how versions make invalidation trivial, and explain when you still need
-event-driven purge.
+- **Prefix caching:** always worth having; mostly a matter of prompt layout.
+- **Exact response cache:** pays off for form-like, classification and extraction traffic with
+  deterministic settings.
+- **Semantic cache:** suits high-volume FAQ-like traffic where a measured false-hit rate is tolerable;
+  avoid it for personalised or transactional queries.
+- **Embedding cache:** belongs in every ingestion pipeline.
+- **Measure:** hit rate per layer, cost and latency saved, sampled false-hit rate and the age of served
+  entries; treat erasure requests as a cache concern.
+- **Interviews:** lead with the key. List what the answer depends on, show how versions make invalidation
+  trivial, and explain when you still need event-driven purge.
 
 ## Role lens
 - **Engineer:** Builds the versioned key function, scoping, single-flight and metrics, and lays prompts

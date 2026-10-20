@@ -5,7 +5,7 @@ name: Domain-driven design & bounded contexts
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - system-design/modular-monolith-vs-microservices
   - system-design/event-driven-architecture
@@ -22,118 +22,119 @@ sources:
 ---
 
 ## TL;DR
-Domain-driven design splits a large system along the meanings of its business language, not along
-technical layers: each bounded context owns one consistent model and vocabulary, and contexts talk
-through explicit contracts instead of a shared schema. It exists because words like "customer" mean
-different things in different parts of a business, and forcing one model onto all of them produces
-systems nobody can change. For AI systems, bounded contexts decide tool boundaries, data ownership and
-who translates meaning for the agent.
+Domain-driven design splits a system along the meanings of its business language: each bounded context
+owns one consistent model, and contexts talk through explicit contracts, not a shared schema. For AI,
+contexts decide tool boundaries, data ownership and who translates meaning for the agent.
 
 ## Why it exists
-Ask billing, support and sales what a "customer" is. Billing says a legal entity with a payment method
-and invoices. Support says a person with a login and a ticket history. Sales says an account with an
-owner, a pipeline stage and a renewal date. All three are right inside their own work and wrong inside
-each other's. A system that tries to define one Customer table with every field from every department
-gets a model nobody fully understands, where a change for billing breaks support, and where every team
-must coordinate with every other team to ship anything.
-
-The naive alternatives are both common. One is the enterprise canonical model: a committee defines the
-single true schema for every concept and everyone conforms. It fails because meaning is local; the
-canonical model becomes a lowest common denominator with dozens of optional fields, and the committee
-becomes the bottleneck. The other is splitting by technical layer or by table, a "customer service" that
-owns the Customer table for everyone, which recreates the same coupling behind an API.
-
-Domain-driven design starts from the observation that the inconsistency is not a defect to be fixed but
-a fact about the business to be modelled. Each area has its own language, used by its own people, and
-the software for that area should use exactly that language, consistently, inside a boundary. Between
-boundaries, translation is explicit. Conway's observation that systems mirror the communication
-structures of the organizations that build them is why this works: a boundary that matches a team's
-responsibility is one that team can own and change alone.
-
-AI systems raise the stakes. An agent is usually a consumer that reaches across many contexts at once,
-through tools, and retrieval indexes mix documents written in several vocabularies. If nobody has drawn
-the boundaries, the agent inherits every ambiguity and resolves it by guessing.
+- **One word, three meanings.** Ask billing, support and sales what a "customer" is. Billing: a legal
+  entity with a payment method and invoices. Support: a person with a login and a ticket history. Sales:
+  an account with an owner, a pipeline stage and a renewal date. Each is right inside its own work and
+  wrong inside the others'.
+- **One Customer table for everyone fails.** Nobody fully understands it, a change for billing breaks
+  support, and every team must coordinate with every other team to ship anything.
+- **The enterprise canonical model fails too.** A committee defines the single true schema and everyone
+  conforms, but meaning is local: the model becomes a lowest common denominator with dozens of optional
+  fields, and the committee becomes the bottleneck.
+- **Splitting by technical layer or table recreates the coupling.** A "customer service" that owns the
+  Customer table for everyone just moves the same coupling behind an API.
+- **DDD models the inconsistency instead of fixing it.** Each area uses its own language consistently
+  inside a boundary; between boundaries, translation is explicit. Conway's observation (systems mirror
+  their builders' communication structures) is why it works: a boundary matching a team's responsibility
+  is one that team can own and change alone. AI raises the stakes: an agent reaches across many contexts
+  through tools, retrieval indexes mix vocabularies, and without drawn boundaries the agent resolves every
+  ambiguity by guessing.
 
 ## How it works
 ### Ubiquitous language
-Within one area, developers and domain experts use the same terms, and the code uses them too: class
-names, tool names, event names, prompts. The discipline is that if a term means two things, you have
-found a boundary; if two terms mean one thing, you pick one. For an AI product this language is also
-what goes into system prompts, tool descriptions and evaluation rubrics, so inconsistency there shows up
-directly as model errors.
+- **One vocabulary, everywhere in the area.** Developers and domain experts use the same terms, and so
+  does the code: class names, tool names, event names, prompts.
+- **The boundary test.** If a term means two things, you have found a boundary; if two terms mean one
+  thing, pick one.
+- **For AI products** this language also goes into system prompts, tool descriptions and evaluation
+  rubrics, so inconsistency there shows up directly as model errors.
 
 ### Bounded contexts
-A bounded context is the boundary inside which a model and its language are consistent. It owns its
-data, its invariants and its storage; nothing outside writes to that storage directly. Draw contexts by
-language and by responsibility, not by data volume or by technology. Billing, Support and Sales from the
-example are three contexts, each with its own Customer, and that is correct. A context may be a service,
-a module in a modular monolith, or a schema in one database; the boundary is about ownership and
-meaning, and deployment is a separate decision.
+- **Definition.** The boundary inside which a model and its language are consistent. It owns its data,
+  its invariants and its storage; nothing outside writes to that storage directly.
+- **Draw by language and responsibility,** not by data volume or technology. Billing, Support and Sales
+  are three contexts, each with its own Customer, and that is correct.
+- **Deployment is a separate decision.** A context may be a service, a module in a modular monolith, or a
+  schema in one database; the boundary is about ownership and meaning.
 
 ### Finding the boundaries
-Boundaries are discovered, not decreed, and the usual technique is to map the business process with
-domain experts as a timeline of domain events (event storming) and then look for seams. Four signals
-mark a seam: a term that changes meaning ("customer", "active", "account"); a change in who decides
-(finance owns the dunning rule, support owns the escalation rule); a change in rate of change (pricing
-rules change weekly, ledger rules almost never); and a set of rules that must hold together at the same
-instant, which belongs inside one context. When two candidate contexts must constantly ask each other
-questions to make any decision, the seam is in the wrong place.
+Boundaries are discovered, not decreed. Map the business process with domain experts as a timeline of
+domain events (event storming), then look for seams. Four signals mark one:
+
+| Signal | Example |
+|---|---|
+| A term changes meaning | "customer", "active", "account" |
+| Who decides changes | finance owns the dunning rule, support owns the escalation rule |
+| Rate of change differs | pricing rules change weekly, ledger rules almost never |
+| Rules must hold together at the same instant | they belong inside one context |
+
+- **Wrong seam test:** when two candidate contexts must constantly ask each other questions to make any
+  decision, the seam is in the wrong place.
 
 ### Subdomain classification
-Not every context deserves the same investment. The *core* subdomain is where the business
-differentiates, and it gets the most careful modelling and your best people. *Supporting* subdomains are
-necessary but not differentiating, and *generic* subdomains (authentication, invoicing) should be bought
-or borrowed. For most AI products the core is the domain logic and the data, not the model call; this
-classification is what tells you where custom work belongs and where a vendor is fine.
+| Subdomain | What it is | Investment |
+|---|---|---|
+| *Core* | where the business differentiates | most careful modelling, your best people |
+| *Supporting* | necessary but not differentiating | adequate, build simply |
+| *Generic* | authentication, invoicing | buy or borrow |
+
+- **For most AI products the core is the domain logic and the data, not the model call.** This
+  classification tells you where custom work belongs and where a vendor is fine.
 
 ### Context mapping: how boundaries relate
-The relationships between contexts are named so teams can discuss them:
-- **Shared kernel**: two contexts share a small model and change it together. Cheap and dangerous; keep
+- **Shared kernel:** two contexts share a small model and change it together. Cheap and dangerous; keep
   it tiny.
-- **Customer–supplier**: the downstream team's needs feed the upstream team's roadmap.
-- **Conformist**: downstream adopts the upstream model wholesale because it has no leverage, typical with
+- **Customer–supplier:** the downstream team's needs feed the upstream team's roadmap.
+- **Conformist:** downstream adopts the upstream model wholesale because it has no leverage, typical with
   a vendor API.
-- **Anticorruption layer (ACL)**: downstream translates the upstream model into its own at the boundary,
-  *because* letting a foreign model leak in corrupts your language one field at a time. This is the most
-  important pattern for AI integrations: the agent's context should see its own concepts, with adapters
-  translating each external system.
-- **Open host service with a published language**: upstream exposes a stable, documented interface in a
+- **Anticorruption layer (ACL):** downstream translates the upstream model into its own at the boundary,
+  *because* a leaking foreign model corrupts your language one field at a time. The most important
+  pattern for AI integrations: the agent's context sees its own concepts, with adapters translating each
+  external system.
+- **Open host service with a published language:** upstream exposes a stable, documented interface in a
   well-defined language for many consumers. A tool schema an agent calls is exactly a published language.
-- **Separate ways**: the contexts do not integrate at all. Sometimes correct.
+- **Separate ways:** the contexts do not integrate at all. Sometimes correct.
 
 ### Inside a context: aggregates, entities, value objects, domain events
-An *aggregate* is a cluster of objects changed together under one transaction through one entry point
-(the root), with invariants that hold at the end of every transaction. Take an `Order` with its lines
-and the invariant "total must not exceed the approved credit of 10,000". Lines are changed only through
-`order.add_line(...)`, *because* if code could insert a line row directly, nothing would recheck the
-total. The design rules follow from that purpose. Keep aggregates as small as the true invariants
-allow, *because* the aggregate is the unit of locking and a large one serializes unrelated edits.
-Reference other aggregates by id, not by object, so loading an order does not drag in the customer.
-Change one aggregate per transaction, and let the others catch up through *domain events*
-("OrderPlaced", "InvoicePaid"); cross-context changes are always eventually consistent, *because* a
-single transaction spanning contexts would couple their storage and their uptime. This is where DDD
-hands over to event-driven architecture and sagas. *Entities* have identity over time (the order is the
-same order after its lines change); *value objects* are defined by their attributes and are immutable
-(`Money(120, "EUR")`), which makes them safe to share and pass across boundaries. A *repository* loads
-and saves whole aggregates, one per aggregate type, which keeps the invariant check from being bypassed
-by partial writes.
+- **Aggregate.** A cluster of objects changed together under one transaction through one entry point (the
+  root), with invariants that hold at the end of every transaction. Example: an `Order` with its lines and
+  the invariant "total must not exceed the approved credit of 10,000".
+- **One entry point.** Lines change only through `order.add_line(...)`, *because* if code could insert a
+  line row directly, nothing would recheck the total.
+- **Keep aggregates small** as the true invariants allow, *because* the aggregate is the unit of locking
+  and a large one serializes unrelated edits.
+- **Reference other aggregates by id,** not by object, so loading an order does not drag in the customer.
+- **One aggregate per transaction;** the others catch up through *domain events* ("OrderPlaced",
+  "InvoicePaid"). Cross-context changes are always eventually consistent, *because* a single transaction
+  spanning contexts would couple their storage and their uptime. Here DDD hands over to event-driven
+  architecture and sagas.
+- **Entities vs value objects.** *Entities* have identity over time (the order is the same order after its
+  lines change). *Value objects* are defined by their attributes and are immutable (`Money(120, "EUR")`),
+  which makes them safe to share and pass across boundaries.
+- **Repository.** Loads and saves whole aggregates, one per aggregate type, which keeps the invariant check
+  from being bypassed by partial writes.
 
 ### Applying it to an AI system
-- One tool, or tool group, per bounded context, speaking that context's published language; the agent's
-  tool list then mirrors the context map.
-- Translation lives in tool adapters (the ACL), never in the prompt. Asking the model to reconcile three
-  meanings of "customer" at runtime is asking it to redo your architecture per request.
-- Retrieval indexes and memory are scoped per context when vocabularies conflict, or tagged with the
+- **One tool, or tool group, per bounded context,** speaking that context's published language; the
+  agent's tool list then mirrors the context map.
+- **Translation lives in tool adapters (the ACL), never in the prompt.** Asking the model to reconcile
+  three meanings of "customer" at runtime is asking it to redo your architecture per request.
+- **Scope retrieval indexes and memory per context** when vocabularies conflict, or tag them with the
   context so the prompt can say which "account" a passage refers to.
-- Consequential actions respect aggregate boundaries: an agent step that must update two contexts is a
-  saga with compensation, not one transaction.
-- Evals are per context, written in that context's language by that context's experts.
+- **Consequential actions respect aggregate boundaries:** an agent step that must update two contexts is
+  a saga with compensation, not one transaction.
+- **Evals are per context,** written in that context's language by that context's experts.
 
-## Example
-Two bounded contexts, each with its own Customer, and a support agent that sees only its own concept
-through an anticorruption layer. The tool the agent calls is a published language; the translation from
+## Examples
+### Two contexts, one anticorruption layer, one published tool
+Each context has its own Customer; the support agent sees only its own concept. The translation from
 billing's model happens in the adapter, not in the prompt. `billing_api`, `mapping_repo` and `tickets`
-are stand-ins for the real clients.
+stand in for the real clients.
 
 ```python
 from dataclasses import dataclass
@@ -180,55 +181,124 @@ TOOLS = [{"name": "lookup_customer", "description": "Fetch the support view of a
                            "required": ["customer_id"]}}]
 ```
 
-Run one lookup. Billing returns `BillingAccount("B-881", "Acme GmbH", "ent", 2026-09-30)`; on
-2026-10-20 the account is 20 days past due, more than 14, so the agent sees
-`SupportCustomer(tier="enterprise", payment_blocked=True, open_tickets=3)` and never the words "ent" or
-`past_due_since`. The rule "payment is blocked after 14 days past due" is a support-context rule, so it
-lives in the support side's adapter, versioned and tested there, and neither billing nor the prompt needs
-to know it. Now billing launches a "team" plan. With a `.get(plan, "free")` default, every team-plan
-customer would silently be treated as free tier by the agent, a wrong answer with no error anywhere. The
-explicit map turns the upstream change into a failing call and an alert on day one, which is the point of
-an anticorruption layer: translation is a contract, and an unmapped value is a contract break.
+### Running one lookup, then an upstream change
+| Moment | What happens |
+|---|---|
+| Lookup | billing returns `BillingAccount("B-881", "Acme GmbH", "ent", 2026-09-30)` |
+| On 2026-10-20 | 20 days past due, more than 14, so the agent sees `SupportCustomer(tier="enterprise", payment_blocked=True, open_tickets=3)` and never the words "ent" or `past_due_since` |
+| Billing launches a "team" plan, with a `.get(plan, "free")` default | every team-plan customer is silently treated as free tier: a wrong answer with no error anywhere |
+| Same launch, with the explicit map | the upstream change becomes a failing call and an alert on day one |
+
+- **The 14-day rule is a support-context rule,** so it lives in the support side's adapter, versioned and
+  tested there; neither billing nor the prompt needs to know it.
+- **The point of an ACL:** translation is a contract, and an unmapped value is a contract break.
+
+### Runnable: an aggregate that protects its invariant
+Pure Python. `Money` is a value object; `Order` is the aggregate root and the only way to add lines.
+
+```python
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+@dataclass(frozen=True)
+class Money:                                   # value object: immutable, equal by value
+    amount: Decimal
+    currency: str
+    def __add__(self, other):
+        if other.currency != self.currency:
+            raise ValueError("currency mismatch")
+        return Money(self.amount + other.amount, self.currency)
+
+class CreditLimitExceeded(Exception):
+    pass
+
+@dataclass
+class Order:                                   # aggregate root: the only way to change lines
+    order_id: str
+    customer_id: str                           # another aggregate, referenced by id
+    credit: Money
+    lines: list = field(default_factory=list)
+    events: list = field(default_factory=list)
+
+    def total(self) -> Money:
+        t = Money(Decimal(0), self.credit.currency)
+        for _, price in self.lines:
+            t = t + price
+        return t
+
+    def add_line(self, sku: str, price: Money) -> None:
+        if (self.total() + price).amount > self.credit.amount:   # invariant checked on every change
+            raise CreditLimitExceeded(f"{self.order_id} would exceed {self.credit.amount}")
+        self.lines.append((sku, price))
+        self.events.append(("OrderLineAdded", self.order_id, sku))  # other contexts react later
+
+order = Order("O-1", "C-7", Money(Decimal(10000), "EUR"))
+order.add_line("seats", Money(Decimal(9880), "EUR"))
+order.add_line("support", Money(Decimal(120), "EUR"))
+print(order.total().amount)                    # 10000: equal to the credit is allowed
+try:
+    order.add_line("extra", Money(Decimal(1), "EUR"))
+except CreditLimitExceeded as e:
+    print("rejected:", e)                      # rejected: O-1 would exceed 10000
+```
+
+## Production patterns
+- **Storage ownership enforced by the database.** When contexts share one database, give each its own
+  schema and database role, and grant no role write access to another context's schema. Other contexts
+  read through an API or events. Monitor permission-denied errors from cross-schema access attempts.
+- **Strict ACL mappings with contract tests.** Translate every upstream enum through an explicit map that
+  raises on unknown values, and run contract tests against the upstream sandbox in CI. Alert on unmapped
+  value errors in production, because each one is an upstream change you have not modelled yet.
+- **Domain events through a transactional outbox.** Write the aggregate change and an outbox row in the
+  same transaction; a relay publishes the row to the broker. Other contexts consume and update their own
+  models. Monitor outbox lag and consumer lag per context.
+- **Tool groups that mirror the context map.** Register agent tools per context with that context's
+  published language and owners, and run per-context evals written by its experts. Monitor tool-selection
+  errors and eval scores by context, so a regression points at one owner.
+- **Coupling metrics on change.** Tag pull requests and releases by the contexts they touch, and track how
+  many contexts a typical change spans and how often releases must be coordinated. A rising number means a
+  seam is in the wrong place.
 
 ## Trade-offs
-- Separate models per context remove cross-team coupling and keep each model small, but the same
-  real-world thing now exists in several places and must be reconciled through events or adapters.
-- An anticorruption layer protects your language from upstream churn, at the cost of maintaining a
-  translation that changes whenever either side changes; for a tiny, stable upstream, conforming is
+- **Separate models vs reconciliation.** Separate models per context remove cross-team coupling and keep
+  each model small, but the same real-world thing exists in several places and must be reconciled
+  through events or adapters.
+- **ACL vs maintenance.** An anticorruption layer protects your language from upstream churn, at the cost
+  of a translation that changes whenever either side changes; for a tiny, stable upstream, conforming is
   cheaper.
-- Eventual consistency across aggregates and contexts gives independent deployability and uptime, but
-  introduces windows where contexts disagree; when the business cannot tolerate that window, the boundary
-  is probably drawn in the wrong place.
-- A rich core-domain model repays deep investment, while applying the same rigor to generic subdomains
-  wastes it; misclassifying the core is the expensive mistake.
-- Giving an agent one tool per context keeps meanings clean and privileges scoped, but multiplies tools;
+- **Eventual consistency vs disagreement windows.** Independent deployability and uptime come with
+  windows where contexts disagree; when the business cannot tolerate that window, the boundary is
+  probably drawn in the wrong place.
+- **Rich core model vs wasted rigor.** A rich core-domain model repays deep investment, while the same
+  rigor on generic subdomains wastes it; misclassifying the core is the expensive mistake.
+- **One tool per context vs tool count.** Meanings stay clean and privileges scoped, but tools multiply;
   when contexts are many, a facade context that speaks the agent's language may be justified.
 
 ## Pitfalls
-- One shared database schema behind several "services"; the symptom is a migration in one team's context
-  breaking another team's deployment.
-- Drawing contexts by technical layer or by noun ("the customer service"); the symptom is every feature
-  touching every service and release trains that must be coordinated.
-- Letting an upstream model leak through without an ACL; the symptom is vendor field names and enums
-  appearing in your prompts, your UI and your tests.
-- Asking the model to reconcile conflicting vocabularies at runtime; the symptom is answers that mix the
-  billing and support meanings of a term, and evals that cannot agree on correctness.
-- Translation tables in adapters with catch-all defaults; the symptom is a new upstream enum value
-  (a new plan, a new status) quietly mapped to the wrong meaning and discovered weeks later through
-  customer complaints rather than errors.
-- Transactions that span contexts; the symptom is distributed locks, timeouts under load, and partial
+- **One shared database schema behind several "services".** Symptom: a migration in one team's context
+  breaks another team's deployment.
+- **Contexts drawn by technical layer or by noun** ("the customer service"). Symptom: every feature
+  touches every service and release trains must be coordinated.
+- **An upstream model leaking through without an ACL.** Symptom: vendor field names and enums appear in
+  your prompts, your UI and your tests.
+- **Asking the model to reconcile conflicting vocabularies at runtime.** Symptom: answers mix the billing
+  and support meanings of a term, and evals cannot agree on correctness.
+- **Translation tables with catch-all defaults.** Symptom: a new upstream enum value (a new plan, a new
+  status) is quietly mapped to the wrong meaning and found weeks later through customer complaints
+  rather than errors.
+- **Transactions that span contexts.** Symptom: distributed locks, timeouts under load, and partial
   updates nobody can compensate.
 
 ## When to use
-Reach for explicit bounded contexts when more than one team or more than one vocabulary touches the
-system, when an agent must integrate several enterprise systems, or when a shared schema has become the
-bottleneck for change. For a small product with one team and one language, one context is correct; do
-not fragment prematurely. Measure coupling: how many contexts a typical change touches, how often
-cross-context releases must be coordinated, and how many tool adapters contain translation versus
-pass-through. Day to day this shows up as naming decisions, where a rule lives, and whether a new field
-belongs to you. In interviews, expect to be asked to draw a context map for a given business, to place an
-agent and its tools on it, and to explain why an anticorruption layer belongs in the adapter rather than
-the prompt.
+- **Use when:** more than one team or vocabulary touches the system, an agent must integrate several
+  enterprise systems, or a shared schema has become the bottleneck for change.
+- **Avoid when:** it is a small product with one team and one language; one context is correct, so do
+  not fragment prematurely.
+- **Measure coupling:** how many contexts a typical change touches, how often cross-context releases must
+  be coordinated, and how many tool adapters contain translation versus pass-through.
+- **Day to day:** naming decisions, where a rule lives, and whether a new field belongs to you.
+- **Interviews:** draw a context map for a given business, place an agent and its tools on it, and explain
+  why an anticorruption layer belongs in the adapter rather than the prompt.
 
 ## Role lens
 - **Engineer:** Keeps each context's language consistent in code, tools and prompts, writes adapters that

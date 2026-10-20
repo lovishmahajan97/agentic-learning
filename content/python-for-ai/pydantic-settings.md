@@ -5,7 +5,7 @@ name: pydantic-settings
 kind: tool
 difficulty: core
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - python-for-ai/pydantic
   - python-for-ai/python-dotenv
@@ -20,33 +20,35 @@ sources:
 ---
 
 ## TL;DR
-pydantic-settings is a Pydantic model whose fields are filled from environment variables, `.env` files
-and secret files instead of a request body. You declare configuration once, with types, defaults and
-constraints, and the app either starts with a fully validated settings object or refuses to start with
-an error naming the bad field. That moves config mistakes from 2 a.m. runtime failures to deploy-time
-crashes.
+pydantic-settings is a Pydantic model filled from environment variables, `.env` files and secret files.
+Declare config once with types and constraints; the app starts fully validated or refuses to start,
+moving config mistakes from 2 a.m. runtime failures to deploy-time crashes.
 
 ## Why it exists
-Reading configuration with `os.environ.get` scattered through the code has three failure modes that
-bite AI services in particular. Everything is a string, so `TIMEOUT="30"` must be converted by hand at
-each call site, and `"false"` is truthy. Nothing is checked up front, so a missing `VECTOR_DB_URL` or a
-typo in `RERANK_TOP_K` is discovered only when the first request reaches that code path, possibly hours
-after deploy. And there is no single list of what the service needs, so a new environment is configured
-by trial and error.
-
-The naive fix, a hand-written `config.py` that reads and converts every variable, works until it has
-thirty fields, nested groups (retrieval, model, tracing), lists of allowed models and secrets that must
-not appear in logs. At that point you are reimplementing a validation library. Pydantic already is one,
-so pydantic-settings reuses it: the same type coercion, constraints and error messages, aimed at the
-process environment. It was split out of Pydantic into its own package with Pydantic v2, so it is a
-separate install (`pip install pydantic-settings`).
+- **Everything is a string.** With `os.environ.get` scattered through the code, `TIMEOUT="30"` must be
+  converted at each call site, and `"false"` is truthy.
+- **Nothing is checked up front.** A missing `VECTOR_DB_URL` or a typo in `RERANK_TOP_K` surfaces only
+  when the first request reaches that code path, possibly hours after deploy.
+- **No single list of what the service needs.** A new environment is configured by trial and error.
+- **A hand-written `config.py` hits a wall.** It works until thirty fields, nested groups (retrieval,
+  model, tracing), lists of allowed models and secrets that must stay out of logs; then you are
+  reimplementing a validation library.
+- **Pydantic already is one.** pydantic-settings reuses its coercion, constraints and error messages,
+  aimed at the process environment. It was split out with Pydantic v2, so it is a separate install
+  (`pip install pydantic-settings`).
 
 ## How it works
 ### Declaring settings
-Subclass `BaseSettings` and annotate fields exactly as in a normal Pydantic model. Behaviour is set with
-`model_config = SettingsConfigDict(...)`: `env_prefix` (so `APP_MODEL` fills `model`, avoiding collisions
-with other software's variables), `env_file` (one path or a tuple, later files winning), `case_sensitive`
-(off by default), `env_nested_delimiter` and `extra`.
+Subclass `BaseSettings`, annotate fields as in any Pydantic model, and set behaviour with
+`model_config = SettingsConfigDict(...)`:
+
+| Option | Effect |
+|---|---|
+| `env_prefix` | `APP_MODEL` fills `model`, avoiding collisions with other software's variables |
+| `env_file` | One path or a tuple, later files winning |
+| `case_sensitive` | Off by default |
+| `env_nested_delimiter` | Lets one env var set one field of a nested model |
+| `extra` | What to do with unknown keys from dotenv files |
 
 ### Where values come from, in priority order
 When you instantiate `Settings()`, each field is resolved from the highest-priority source that has it:
@@ -57,42 +59,68 @@ When you instantiate `Settings()`, each field is resolved from the highest-prior
 4. Files in `secrets_dir`, one file per field, which is how Docker and Kubernetes secrets are mounted.
 5. Field defaults.
 
-The ordering is deliberate: the platform's environment beats a local file, which matches python-dotenv's
-default and means a stale `.env` cannot override production. You can reorder or add sources (a vault,
-a YAML file) by overriding the `settings_customise_sources` classmethod.
+- **Why this order.** The platform's environment beats a local file, matching python-dotenv's default,
+  so a stale `.env` cannot override production.
+- **Customisable.** Reorder or add sources (a vault, a YAML file) by overriding the
+  `settings_customise_sources` classmethod.
 
-Mechanically, each source is just a callable that returns a dict of raw values for the fields it knows
-about. pydantic-settings calls them, deep-merges the dicts so a higher-priority source overwrites a
-lower one key by key, and then runs one ordinary Pydantic validation over the merged dict. That design
-is why everything Pydantic can do (coercion, validators, nested models, aliases) works unchanged for
-config, and why a custom source only has to produce a dict. Note the asymmetry with python-dotenv:
-within `env_file=(".env", ".env.local")` the *later* file wins, whereas repeated `load_dotenv` calls
-keep the first value.
+### The merge mechanism
+1. Each source is a callable returning a dict of raw values for the fields it knows about.
+2. pydantic-settings calls them and deep-merges the dicts, a higher-priority source overwriting a lower
+   one key by key.
+3. One ordinary Pydantic validation runs over the merged dict.
 
-When a variable's name is fixed by someone else (the OpenAI SDK's `OPENAI_API_KEY`, a platform's
-`DATABASE_URL`), give the field `validation_alias="OPENAI_API_KEY"` (or `AliasChoices` for several
-accepted names) instead of bending your prefix convention.
+- **Consequence.** Everything Pydantic can do (coercion, validators, nested models, aliases) works
+  unchanged for config, and a custom source only has to produce a dict.
+- **Asymmetry with python-dotenv.** Within `env_file=(".env", ".env.local")` the *later* file wins,
+  whereas repeated `load_dotenv` calls keep the first value.
+- **Names fixed by someone else.** For the OpenAI SDK's `OPENAI_API_KEY` or a platform's `DATABASE_URL`,
+  use `validation_alias="OPENAI_API_KEY"` (or `AliasChoices` for several accepted names) instead of
+  bending your prefix convention.
 
 ### Parsing beyond strings
-Simple types are coerced with Pydantic's normal rules, so `"30"` becomes `30.0` for a `float` field and
-`"false"` becomes `False` for a `bool`. Complex fields (`list`, `dict`, nested models) are parsed from a
-JSON string, so `APP_ALLOWED_MODELS='["a","b"]'` works. With `env_nested_delimiter="__"`,
-`APP_RETRIEVAL__TOP_K=20` sets one field of a nested model without restating the rest. Constraints
-(`Field(gt=0)`, `Literal["dev","prod"]`) are enforced exactly as for API input, and a failure raises a
-single `ValidationError` listing every bad field at once, because one deploy should report all problems
-rather than one per restart.
+| Field type | Env value | Result |
+|---|---|---|
+| `float` | `"30"` | `30.0` |
+| `bool` | `"false"` | `False` |
+| `list`, `dict`, nested model | JSON string, e.g. `APP_ALLOWED_MODELS='["a","b"]'` | Parsed list |
+| Nested field with `env_nested_delimiter="__"` | `APP_RETRIEVAL__TOP_K=20` | Sets one field, rest keep defaults |
+
+- **Constraints apply.** `Field(gt=0)` and `Literal["dev","prod"]` are enforced exactly as for API input.
+- **All errors at once.** A failure raises a single `ValidationError` listing every bad field, because one
+  deploy should report all problems rather than one per restart.
 
 ### Secrets
-Type sensitive fields as `SecretStr`. The value is masked in `repr`, `str` and default serialization, so
-`print(settings)` or a crash log shows `**********`; you must call `.get_secret_value()` at the point of
-use. This does not encrypt anything; it prevents the most common leak, which is logging a config object.
+- **Type sensitive fields as `SecretStr`.** The value is masked in `repr`, `str` and default
+  serialization, so `print(settings)` or a crash log shows `**********`.
+- **Unwrap at the point of use** with `.get_secret_value()`.
+- **No encryption.** It prevents the most common leak, which is logging a config object.
 
 ### Where it lives at runtime
-Construct settings once and share them: a cached `get_settings()` function, or an object built in the
-FastAPI lifespan and injected as a dependency. That gives you one validation at startup and an easy
-override in tests (construct a `Settings(...)` with explicit kwargs and `_env_file=None`).
+- **Construct once and share:** a cached `get_settings()` function, or an object built in the FastAPI
+  lifespan and injected as a dependency.
+- **Payoff:** one validation at startup and an easy override in tests (construct a `Settings(...)` with
+  explicit kwargs and `_env_file=None`).
 
-## Example
+## Diagram
+Each source returns a dict; they are merged key by key in priority order, then one validation pass either
+yields a typed object or fails startup with every bad field listed.
+
+```mermaid
+flowchart TD
+    I["1. Init kwargs"] --> M["Deep-merge dicts, higher priority wins per key"]
+    E["2. Environment variables"] --> M
+    D["3. Dotenv files"] --> M
+    S["4. secrets_dir files"] --> M
+    M --> V["One Pydantic validation pass"]
+    F["5. Field defaults"] -->|"fill fields no source set"| V
+    V -->|"all fields valid"| OK["Typed Settings, built once and cached"]
+    V -->|"any field invalid"| ERR["One ValidationError listing every bad field"]
+    ERR --> X["Startup fails before serving traffic"]
+```
+
+## Examples
+### Settings for a RAG service
 A settings class for a RAG service, and what happens with real environment values.
 
 ```python
@@ -132,41 +160,84 @@ client_key = s.openai_api_key.get_secret_value()
 t = Settings(_env_file=None, openai_api_key="test", env="dev")
 ```
 
-If staging sets `APP_REQUEST_TIMEOUT_S=thirty` and `APP_ENV=production`, startup fails with one
-`ValidationError` reporting two errors: `request_timeout_s` is not a valid number and `env` is not one
-of `'dev', 'staging', 'prod'`. The pod crash-loops visibly instead of serving traffic with a broken
-timeout.
+- **Bad staging values fail loudly.** If staging sets `APP_REQUEST_TIMEOUT_S=thirty` and
+  `APP_ENV=production`, startup fails with one `ValidationError` reporting two errors:
+  `request_timeout_s` is not a valid number and `env` is not one of `'dev', 'staging', 'prod'`.
+- **Result.** The pod crash-loops visibly instead of serving traffic with a broken timeout.
+
+### Making mounted secret files authoritative
+When a team rotates keys by updating mounted secret files, a leftover env var would silently shadow the
+new key. Reordering sources makes the file win.
+
+```python
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="APP_", secrets_dir="/run/secrets")
+    openai_api_key: SecretStr
+
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings,
+                                   dotenv_settings, file_secret_settings):
+        # default order is init, env, dotenv, secrets; put secret files ahead of env vars
+        return (init_settings, file_secret_settings, env_settings, dotenv_settings)
+```
+
+| Source present | Default order picks | Reordered picks |
+|---|---|---|
+| Stale `APP_OPENAI_API_KEY` env var + new secret file | Stale env var | New secret file |
+| Only the env var | Env var | Env var |
+| Neither | Startup fails: required field | Startup fails: required field |
+
+## Production patterns
+- **Validate config before traffic.** Run a step that only constructs `Settings()` (a CI job against the
+  target environment's variables, or the container's first startup line) so a bad value fails the
+  deploy. Monitor deploy failures and crash-loops that name a field, not request-time `KeyError`s.
+- **One cached settings dependency.** Expose `get_settings()` with `@lru_cache` and inject it with FastAPI
+  `Depends(get_settings)`. In tests set `app.dependency_overrides[get_settings]` to return
+  `Settings(_env_file=None, ...)`, and call `get_settings.cache_clear()` when env changes.
+- **Prefix everything, alias the fixed names.** Set `env_prefix="APP_"` so fields like `path` cannot pick
+  up system variables, and use `validation_alias` only for names others own, such as `OPENAI_API_KEY`.
+  Review new fields for collisions.
+- **Secrets as `SecretStr`, delivered by the platform.** Mount them via `secrets_dir` or inject env vars
+  from a secrets manager; never put real values in `.env.example`. Log which settings are present at
+  startup, never their values, and grep logs for unmasked keys.
+- **Tolerate shared dotenv files.** Use `extra="ignore"` when the same `.env` feeds other tools, so their
+  keys do not fail validation. Keep a documented `.env.example` that mirrors the `Settings` fields.
 
 ## Trade-offs
-- Fail-fast validation turns silent misconfiguration into a crash at startup, which is right for
-  services but annoying for scripts that only need one value; there, plain `os.environ` is simpler.
-- One typed object documents every setting, but it couples config to Pydantic's coercion rules, so
-  lax coercion (`"1"` to `True`) can surprise; strict mode trades convenience for exactness.
-- JSON-in-env for lists and nested models keeps everything in variables, yet quoting JSON inside shell,
-  YAML and Helm templates is error-prone; past a few nested fields a mounted config file is cleaner.
-- `SecretStr` masks accidental logging but adds `.get_secret_value()` noise, and it is not a substitute
-  for a secrets manager with rotation; it only governs how the value is printed.
+- **Fail fast vs convenience.** Startup validation turns silent misconfiguration into a crash, right for
+  services but annoying for scripts that need one value; there plain `os.environ` is simpler.
+- **One typed object vs coercion surprises.** It documents every setting but couples config to Pydantic's
+  coercion rules, so lax coercion (`"1"` to `True`) can surprise; strict mode trades convenience for
+  exactness.
+- **JSON-in-env vs quoting pain.** Lists and nested models stay in variables, yet quoting JSON inside
+  shell, YAML and Helm templates is error-prone; past a few nested fields a mounted config file is
+  cleaner.
+- **Masking vs ceremony.** `SecretStr` masks accidental logging but adds `.get_secret_value()` noise, and
+  it is no substitute for a secrets manager with rotation; it only governs how the value is printed.
 
 ## Pitfalls
-- Instantiating `Settings()` at import time in a library module; the symptom is tests failing to
-  import because a required key is missing, fixed by constructing lazily or in the entry point.
-- Forgetting `env_prefix` and naming a field `path` or `home`; the symptom is the field mysteriously
-  filled from the system's own `PATH` or `HOME` variable.
-- Leaving `extra` at its default (`"forbid"`) when sharing a `.env` with other tools; the symptom is a
-  validation error about unexpected keys from the dotenv file (environment variables never trigger
-  it), fixed with `extra="ignore"`.
-- Expecting a nested override without setting `env_nested_delimiter`; the symptom is
-  `APP_RETRIEVAL__TOP_K` being silently ignored and the default used.
-- Caching settings with `lru_cache` and then changing env vars in a test; the symptom is old values,
-  fixed with `get_settings.cache_clear()` or dependency overrides.
+- **Instantiating `Settings()` at import time in a library module.** Symptom: tests fail to import
+  because a required key is missing. Fix: construct lazily or in the entry point.
+- **Forgetting `env_prefix` and naming a field `path` or `home`.** Symptom: the field is mysteriously
+  filled from the system's own `PATH` or `HOME` variable. Fix: add a prefix.
+- **Leaving `extra` at its default (`"forbid"`) with a shared `.env`.** Symptom: a validation error about
+  unexpected keys from the dotenv file (environment variables never trigger it). Fix: `extra="ignore"`.
+- **Expecting a nested override without `env_nested_delimiter`.** Symptom: `APP_RETRIEVAL__TOP_K` is
+  silently ignored and the default used. Fix: set the delimiter.
+- **Caching with `lru_cache`, then changing env vars in a test.** Symptom: old values. Fix:
+  `get_settings.cache_clear()` or dependency overrides.
 
 ## When to use
-Reach for pydantic-settings in any long-running service or worker with more than a few settings,
-anything with secrets, and anything deployed to more than one environment. It is the default choice in
-FastAPI codebases because settings plug straight into dependency injection. Keep plain `os.environ` or
-python-dotenv for throwaway scripts and notebooks. Measure success by how config failures surface: they
-should appear as startup errors naming the field, never as request-time `KeyError`s or wrong behaviour.
-In interviews, explain the source precedence and why secrets are typed as `SecretStr`.
+- **Use when:** any long-running service or worker with more than a few settings, anything with secrets,
+  and anything deployed to more than one environment.
+- **Default in FastAPI:** settings plug straight into dependency injection.
+- **Avoid when:** throwaway scripts and notebooks; keep plain `os.environ` or python-dotenv.
+- **Measure:** how config failures surface. They should appear as startup errors naming the field, never
+  as request-time `KeyError`s or wrong behaviour.
+- **Interviews:** explain the source precedence and why secrets are typed as `SecretStr`.
 
 ## Role lens
 - **Engineer:** Writes the `Settings` class, injects it through a cached dependency, and overrides it
@@ -188,6 +259,43 @@ be authoritative by design: override `settings_customise_sources` to return the 
 ahead of the environment source. Either way, add a startup log of *which source* supplied each secret
 (never the value), so the next shadowing is visible, and remember a running process never re-reads its
 settings without a restart.
+
+## Interview questions
+### Why use pydantic-settings instead of `os.environ.get` calls spread through the code?
+- **One typed schema:** every setting is declared once with a type and constraint, so `"30"` becomes
+  `30.0` and `"false"` becomes `False` without per-call-site conversion.
+- **Fail at startup, not mid-request:** a missing or malformed value raises one `ValidationError` naming
+  every bad field when `Settings()` is built, instead of a `KeyError` hours after deploy.
+- **Self-documenting:** the class is the list of what a new environment must provide.
+
+### A field named `path` holds a strange value in production. What happened and how do you fix it?
+- **Likely cause:** there is no `env_prefix`, and matching is case-insensitive by default, so the field
+  was filled from the operating system's own `PATH` variable.
+- **Fix:** set `env_prefix="APP_"` so only `APP_PATH` can fill it, and use `validation_alias` only for
+  names other software owns, such as `OPENAI_API_KEY`.
+- **Prevent it:** review new field names for collisions with common system variables like `HOME`.
+
+### How do you pass lists and nested config through environment variables, and when would you stop?
+- **Lists and dicts:** pass a JSON string, for example `APP_ALLOWED_MODELS='["a","b"]'`.
+- **Nested models:** set `env_nested_delimiter="__"` so `APP_RETRIEVAL__TOP_K=20` overrides one field and
+  the rest keep their defaults; without the delimiter the override is silently ignored.
+- **When to stop:** quoting JSON inside shell, YAML and Helm is error-prone, so past a few nested fields a
+  mounted config file read by a custom source is cleaner.
+
+### How do you test code that depends on `Settings` without the developer's `.env` leaking in?
+- **Construct explicitly:** `Settings(_env_file=None, openai_api_key="test", ...)` skips the dotenv file;
+  real environment variables still apply, so cover them with kwargs or `monkeypatch.delenv`.
+- **Override the dependency:** in FastAPI set `app.dependency_overrides[get_settings]` to return the test
+  object.
+- **Mind the cache:** `get_settings` is wrapped in `lru_cache`, so call `get_settings.cache_clear()`
+  after changing environment variables in a test.
+
+### What does `SecretStr` protect against, and what does it not?
+- **Protects:** accidental logging. The value is masked in `repr`, `str` and default serialization, so
+  `print(settings)` or a crash log shows `**********`.
+- **Does not:** encrypt, rotate or audit anything. The plaintext is in process memory and returned by
+  `.get_secret_value()`, which you call only at the point of use.
+- **So:** pair it with a secrets manager or mounted secret files for delivery and rotation.
 
 ## Quiz
 ### Q: `APP_MODEL` is set in the environment, `.env` sets `APP_MODEL` differently, and the field has a default. Which value wins?

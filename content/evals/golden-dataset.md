@@ -5,7 +5,7 @@ name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - evals/model-evaluation
   - evals/task-specific-acceptance-criteria
@@ -18,104 +18,130 @@ related:
 ---
 
 ## TL;DR
-A golden dataset is a curated, versioned set of inputs paired with outputs or labels that the people
-who own the task have agreed are correct. It is the fixed reference every eval number is computed
-against, so without it two prompts, two models or two weeks cannot be compared. "Golden" means
-*agreed and authoritative*, not perfect or large: a few hundred well-chosen, well-labeled items beat
-ten thousand scraped ones, provided they are stratified across the cases that matter and kept out of
-prompts and training data.
+A golden dataset is a curated, versioned set of inputs with outputs or labels the task owners agree are
+correct. It is the fixed reference for every eval number; "golden" means agreed and authoritative, not
+perfect or large.
 
 ## Why it exists
-Every eval score is "the fraction of *this set* that passed". If the set changes between runs, the
-score is meaningless as a comparison; if the set is not representative, the score is meaningless as a
-prediction. Teams that skip building one end up with three substitutes, each of which fails.
-
-"Use production logs directly" gives realistic inputs but no labels, no stable composition (this
-week's traffic has a billing spike, last week's did not), and privacy constraints that keep the data
-out of CI. "Have the model generate test cases" produces inputs that share the generator's blind
-spots and phrasing, and if the same model also writes the expected answers the whole eval is circular:
-it measures agreement with itself. "The engineer writes twenty examples" yields a set biased toward
-the cases the engineer already handled, and the same engineer then tunes the prompt until those twenty
-pass, which is overfitting with extra steps.
-
-A golden dataset solves these by making the reference explicit and shared. Subject-matter experts sign
-off on the expected outputs, so disagreement about "is this answer right" happens once, during
-labeling, instead of in every review. The set is versioned, so a score is reproducible. And because
-every production failure becomes a new item, the set grows toward the failures that actually occur
-rather than the ones imagined up front.
+- **A score is "the fraction of *this set* that passed".** If the set changes between runs, the score is
+  meaningless as a comparison; if it is not representative, it is meaningless as a prediction.
+- **"Use production logs directly" fails.** Realistic inputs, but no labels, no stable composition (this
+  week's traffic has a billing spike, last week's did not), and privacy constraints that keep the data
+  out of CI.
+- **"Have the model generate test cases" fails.** Inputs share the generator's blind spots and phrasing.
+  If the same model also writes the expected answers, the eval is circular: it measures agreement with
+  itself.
+- **"The engineer writes twenty examples" fails.** The set is biased toward cases the engineer already
+  handled, and the same engineer then tunes the prompt until those twenty pass: overfitting with extra
+  steps.
+- **What a golden set buys.** Subject-matter experts sign off on expected outputs, so "is this answer
+  right" is argued once, during labeling, not in every review. Versioning makes a score reproducible.
+  Every production failure becomes an item, so the set grows toward failures that actually occur.
 
 ## How it works
 ### What a record contains
 Each item needs enough to reproduce the request and to grade the response:
-
 - **Input**, complete: the user message, the system context that matters (retrieved documents or their
   ids, account state, conversation history), and any tool state the system reads.
-- **Expected output or label.** For closed tasks a label or exact value; for extraction a set of
-  fields; for open-ended tasks a reference answer *plus* a grading spec (rubric, must-contain facts,
-  acceptable alternatives), *because* a single reference string would fail correct paraphrases.
+- **Expected output or label.** Closed tasks: a label or exact value. Extraction: a set of fields.
+  Open-ended tasks: a reference answer *plus* a grading spec (rubric, must-contain facts, acceptable
+  alternatives), *because* a single reference string would fail correct paraphrases.
 - **Grader spec**: which grader applies (exact, JSON-schema, tests, rubric judge) and its parameters.
 - **Metadata**: slice tags (intent, language, difficulty, customer segment), provenance (sampled from
   logs on date X, authored by SME Y, synthetic from generator Z), labeler ids, and a version.
-
-Store it as JSONL under version control or in a dataset store with immutable versions. Changing the
-dataset changes the metric, so every run must record which dataset version it used.
+- **Storage:** JSONL under version control, or a dataset store with immutable versions. Changing the
+  dataset changes the metric, so every run records which dataset version it used.
 
 ### Where items come from
 Four sources, in rough order of value per item:
-
-1. **Sampled real traffic**, stratified. Production distributions are long-tailed: uniform random
-   sampling gives you hundreds of the common easy intent and zero of the rare one that causes
-   escalations. Set a quota per slice so each slice has enough items to measure on its own.
-2. **Failures from error analysis.** Every bug found in production or review becomes an item. This is
-   the highest-signal source *because* it encodes a failure mode you know exists.
+1. **Sampled real traffic, stratified.** Production distributions are long-tailed: uniform random
+   sampling gives hundreds of the common easy intent and zero of the rare one that causes escalations.
+   Set a quota per slice so each slice can be measured on its own.
+2. **Failures from error analysis.** Every bug found in production or review becomes an item. Highest
+   signal, *because* it encodes a failure mode you know exists.
 3. **SME-authored edge cases**: boundary conditions, ambiguous inputs that should trigger a clarifying
    question, policy exceptions. Experts know where the task is hard.
-4. **Synthetic generation** to fill coverage gaps (rare languages, adversarial phrasing), labeled by
-   humans rather than by the generator, and tagged as synthetic so you can check whether synthetic and
-   real items behave differently.
+4. **Synthetic generation** to fill coverage gaps (rare languages, adversarial phrasing). Labeled by
+   humans, not the generator, and tagged as synthetic so you can check whether synthetic and real items
+   behave differently.
 
 ### Labeling
-Write labeling guidelines before labeling; they become the task definition. Double-label a subset and
-measure agreement (see inter-annotator agreement). Where experts legitimately disagree, the item is
-either ambiguous (fix the guideline or drop it) or multi-answer (store all acceptable answers). Low
-agreement among qualified labelers is usually a property of the task definition rather than of the
-people (check labeler expertise and training too), and a grader cannot be more reliable than the
-labels it is checked against.
+1. **Write labeling guidelines first;** they become the task definition.
+2. **Double-label a subset and measure agreement** (see inter-annotator agreement).
+3. **Resolve legitimate expert disagreement:** the item is either ambiguous (fix the guideline or drop
+   it) or multi-answer (store all acceptable answers).
+
+- **Low agreement points at the task.** Among qualified labelers it is usually a property of the task
+  definition rather than the people (check labeler expertise and training too).
+- **Labels cap grader reliability.** A grader cannot be more reliable than the labels it is checked
+  against.
 
 ### Size and statistics
-For a pass rate *p* on *n* items the standard error is √(p(1−p)/n). At p = 0.8: n = 100 gives ±4
-points standard error (roughly ±8 at 95%); n = 400 gives ±2; n = 1,000 gives ±1.3. Per-slice
-numbers need per-slice *n*, which is why stratification matters more than total size.
+For a pass rate *p* on *n* items the standard error is √(p(1−p)/n). At p = 0.8:
 
-The question a dataset must answer is not "how precise is one score" but "can it detect the
-improvement I care about". For two *independent* runs at 80% power and α = 0.05 the textbook
-approximation is n ≈ (1.96 + 0.84)² · 2p(1−p) / δ² per version: detecting δ = 5 points at p = 0.8
-needs about 1,000 items. Paired comparisons on the same items need far fewer, *because* only items
-that flip carry information: with a fraction *d* of items discordant between versions,
-n ≈ (1.96 + 0.84)² · d / δ². If about 13% of items flip (a typical prompt change; measure yours from
-two runs), the same 5-point effect needs roughly 400 items. That arithmetic is why harnesses pair
-runs and why "how many items do we need" depends on how much versions disagree, not only on the pass
-rate. A workable starting point (illustrative, not a rule) is tens to a hundred items per slice you
-need to decide on, grown by every failure found afterwards.
+| n | Standard error | ≈ 95% interval |
+|---|---|---|
+| 100 | ±4 points | ±8 points |
+| 400 | ±2 points | ±4 points |
+| 1,000 | ±1.3 points | ±2.5 points |
+
+- **Per-slice numbers need per-slice *n*,** which is why stratification matters more than total size.
+- **The real question is detection:** not "how precise is one score" but "can it detect the
+  improvement I care about".
+
+```
+independent runs (80% power, α = 0.05):  n ≈ (1.96 + 0.84)² · 2p(1−p) / δ²   per version
+paired runs, discordant fraction d:      n ≈ (1.96 + 0.84)² · d / δ²
+```
+
+- **Independent:** detecting δ = 5 points at p = 0.8 needs about 1,000 items per version.
+- **Paired needs far fewer,** *because* only items that flip carry information. If about 13% of items
+  flip (a typical prompt change; measure yours from two runs), the same 5-point effect needs roughly
+  400 items.
+- **So:** harnesses pair runs, and "how many items do we need" depends on how much versions disagree,
+  not only on the pass rate.
+- **Starting point** (illustrative, not a rule): tens to a hundred items per slice you need to decide
+  on, grown by every failure found afterwards.
 
 ### Splits and hygiene
-Keep a *dev* split for iterating on prompts and a *held-out* split you look at only when deciding to
-ship, *because* a prompt tuned against the full set has been fitted to it. Never copy golden items
-into few-shot examples, fine-tuning data or synthetic-generation prompts; that is contamination of
-your own eval, and its symptom is a perfect offline score with unchanged production quality.
+- **Dev split** for iterating on prompts; **held-out split** looked at only when deciding to ship,
+  *because* a prompt tuned against the full set has been fitted to it.
+- **Never copy golden items** into few-shot examples, fine-tuning data or synthetic-generation prompts.
+  That contaminates your own eval; the symptom is a perfect offline score with unchanged production
+  quality.
 
 ### Maintenance
-Items go stale when the product or policy changes; labels turn out to be wrong when a "failure" is
-inspected and found correct. A set can also saturate: once every candidate passes 97% of it, it no
-longer separates good versions from great ones, and the remaining budget belongs on harder items
-drawn from recent failures. Treat the dataset like code: changes go through review, versions are
-tagged, and a changelog says why an item was added, relabeled or retired. When a version changes,
-re-run the baseline on the new version before comparing, *because* a score on v3 and a score on v4
-are different metrics.
+- **Items go stale** when the product or policy changes.
+- **Labels turn out wrong** when a "failure" is inspected and found correct.
+- **Sets saturate.** Once every candidate passes 97% of it, it no longer separates good versions from
+  great ones; the remaining budget belongs on harder items drawn from recent failures.
+- **Treat it like code:** changes go through review, versions are tagged, and a changelog says why an
+  item was added, relabeled or retired.
+- **Re-baseline on version change.** Re-run the baseline on the new version before comparing,
+  *because* a score on v3 and a score on v4 are different metrics.
 
-## Example
-A stratified sample from logs with per-intent quotas, a deterministic dev/held-out split by id hash,
-and the standard error you should expect from the resulting set. Replace `fetch_logs` with your store.
+## Diagram
+Four sources feed one labeling step; the reviewed, versioned set splits by id hash, and new failures
+flow back in as the next version.
+
+```mermaid
+flowchart TD
+    L["Sampled traffic with per-slice quotas"] --> LB["SME labeling under written guidelines"]
+    E["Failures from error analysis"] --> LB
+    X["SME-authored edge cases"] --> LB
+    Y["Synthetic items, tagged"] --> LB
+    LB --> AG{"Double-labeled agreement OK?"}
+    AG -->|"no: fix guideline, drop or multi-answer"| LB
+    AG -->|"yes"| V[("golden_vN.jsonl, reviewed and tagged")]
+    V -->|"hash of id"| DV["Dev split: iterate prompts"]
+    V -->|"hash of id"| HO["Held-out split: ship decisions only"]
+    HO -.->|"production failures, stale items, saturation"| E
+```
+
+## Examples
+### Stratified sampling and a stable split
+Sample from logs with per-intent quotas, split dev/held-out deterministically by id hash, and print the
+standard error to expect. Replace `fetch_logs` with your store.
 
 ```python
 import hashlib, json, math, random
@@ -153,45 +179,89 @@ print(len(items), "items;", f"SE at p=0.8 ≈ {stderr(0.8, len(items)):.3f}")   
 print(f"per-slice SE for billing (n=60) ≈ {stderr(0.8, 60):.3f}")               # -> 0.052
 ```
 
-The printed numbers say what the set can and cannot decide: overall differences under about 6 points
-are inside the noise, and the billing slice alone cannot resolve anything under about 10 points.
+- **What the output says:** overall differences under about 6 points are inside the noise.
+- **The billing slice alone** cannot resolve anything under about 10 points.
+
+### How many items do I need? A sample-size calculator
+Pure Python; plug in your baseline pass rate, the effect you care about, and the flip rate measured
+from two runs of the same set.
+
+```python
+import math
+
+Z = 1.96 + 0.84                     # two-sided alpha 0.05, 80% power
+
+def n_independent(p, delta):        # items per version, two unpaired runs
+    return math.ceil(Z**2 * 2 * p * (1 - p) / delta**2)
+
+def n_paired(d, delta):             # items, same set graded twice; d = fraction of items that flip
+    return math.ceil(Z**2 * d / delta**2)
+
+for delta in (0.05, 0.10):
+    print(f"delta={delta:.2f}  independent={n_independent(0.8, delta)}  paired(d=0.13)={n_paired(0.13, delta)}")
+# delta=0.05  independent=1004  paired(d=0.13)=408
+# delta=0.10  independent=251  paired(d=0.13)=102
+```
+
+| Decision you need | Independent runs | Paired runs (13% flip) |
+|---|---|---|
+| Detect a 5-point change | ~1,000 items | ~400 items |
+| Detect a 10-point change | ~250 items | ~100 items |
+
+## Production patterns
+- **Dataset as a versioned artifact.** Keep `golden_vN.jsonl` in the repo (or an immutable dataset
+  store), change it only through reviewed pull requests with a changelog line, and write the dataset
+  version into every eval result. Monitor runs whose baseline used a different version.
+- **Production-failure intake.** Route escalations, bug tickets and low-scoring sampled live answers
+  into a labeling queue; an SME writes the expected output and a grader spec before the item joins the
+  dev split. Monitor items added per week and per slice.
+- **Per-slice quotas with re-weighting.** Sample by quota so each slice has measurable *n*, and compute
+  the headline number by weighting slices by their share of traffic. Monitor per-slice *n* against the
+  sample-size calculator for the decisions you make.
+- **Hash-based split, rotated deliberately.** Assign splits by hashing the item id so they are stable
+  across versions; for small sets, rotate the held-out split on a schedule rather than fixing it
+  forever. Monitor the gap between dev and held-out scores.
+- **Leak check before release.** Search prompts, few-shot banks and fine-tuning files for golden item
+  ids or exact input strings as a CI step. Monitor for any match; one match blocks the run.
 
 ## Trade-offs
-- Stratified quotas give every slice measurable *n*, but they distort the overall average away from
-  the production mix; report per slice, or weight by traffic when you need a headline number.
-- Real-traffic items are realistic but need privacy review and redaction before they can sit in a
-  repository; synthetic items avoid that at the cost of sharing the generator's phrasing and blind spots.
-- A held-out split protects against overfitting prompts, but it removes a share of the items from
-  iteration (30% in the example above); with small sets, rotate the split periodically rather than
-  fixing it forever.
-- Expert labeling is expensive and slow, but cheap labels (crowd, or the model itself) move the error
-  from the system into the reference, where it is harder to notice and impossible to fix by prompting.
+- **Stratified quotas vs a representative average.** Every slice gets measurable *n*, but the overall
+  average drifts from the production mix. Report per slice, or weight by traffic for a headline number.
+- **Real traffic vs synthetic.** Real items are realistic but need privacy review and redaction before
+  they sit in a repository. Synthetic items avoid that at the cost of sharing the generator's phrasing
+  and blind spots.
+- **Held-out split vs iteration data.** It protects against overfitting prompts but removes a share of
+  items from iteration (30% in the example above). With small sets, rotate the split periodically.
+- **Expert labels vs cheap labels.** Expert labeling is expensive and slow, but cheap labels (crowd, or
+  the model itself) move the error from the system into the reference, where it is harder to notice and
+  impossible to fix by prompting.
 
 ## Pitfalls
-- Label errors in the reference; the symptom is a pass-rate ceiling below 100% where the "failures"
-  turn out, on inspection, to be correct outputs disagreeing with a wrong label.
-- A set that is too easy because it was drawn from happy-path traffic; the symptom is 98% offline
-  while support tickets keep arriving about cases the set never contained.
-- Golden items reused as few-shot examples or fine-tuning data; the symptom is a jump in offline score
-  with no movement in production metrics.
-- One reference string for an open-ended task; the symptom is correct, differently worded outputs
-  failing exact or overlap matching, and a team "fixing" the prompt to mimic the reference wording.
-- Never retiring stale items after a product change; the symptom is a stable score that no longer
-  tracks what the system is supposed to do, and arguments about whether old failures still count.
-- No per-slice quotas; the symptom is a rare but critical intent represented by three items, so its
-  pass rate swings between 33% and 100% run to run.
-- Comparing a new run on dataset v4 with an old baseline scored on v3; the symptom is a "regression"
-  or "improvement" that vanishes when the baseline is re-run on the same version.
+- **Label errors in the reference.** Symptom: a pass-rate ceiling below 100% where the "failures" turn
+  out, on inspection, to be correct outputs disagreeing with a wrong label.
+- **A set that is too easy** because it came from happy-path traffic. Symptom: 98% offline while
+  support tickets keep arriving about cases the set never contained.
+- **Golden items reused as few-shot or fine-tuning data.** Symptom: a jump in offline score with no
+  movement in production metrics.
+- **One reference string for an open-ended task.** Symptom: correct, differently worded outputs fail
+  exact or overlap matching, and the team "fixes" the prompt to mimic the reference wording.
+- **Never retiring stale items.** Symptom: a stable score that no longer tracks what the system is
+  supposed to do, and arguments about whether old failures still count.
+- **No per-slice quotas.** Symptom: a rare but critical intent with three items, so its pass rate swings
+  between 33% and 100% run to run.
+- **Comparing across dataset versions.** A new run on v4 against a baseline scored on v3. Symptom: a
+  "regression" or "improvement" that vanishes when the baseline is re-run on the same version.
 
 ## When to use
-Build one as soon as a prompt or pipeline is going to be changed more than once, which is always.
-Start small and targeted: a few dozen items per slice that matters, each labeled by someone with
-authority over the task, with a grader spec per item. Measure its statistical reach with the standard
-error before trusting a result from it, and grow it where decisions are tight and where production
-failures appear. Do not use it for training or few-shot prompting, and do not let the people tuning
-prompts see the held-out split. In interviews, expect to be asked how you would build one for a given
-product, how big it must be to detect a given improvement, and how you keep it from leaking into the
-system under test.
+- **Build one early:** as soon as a prompt or pipeline will change more than once, which is always.
+- **Start small and targeted:** a few dozen items per slice that matters, each labeled by someone with
+  authority over the task, with a grader spec per item.
+- **Measure its reach:** compute the standard error before trusting a result; grow it where decisions
+  are tight and where production failures appear.
+- **Avoid:** using it for training or few-shot prompting, or letting the people tuning prompts see the
+  held-out split.
+- **Interviews:** how you would build one for a given product, how big it must be to detect a given
+  improvement, and how you keep it from leaking into the system under test.
 
 ## Role lens
 - **Engineer:** Writes the sampling and split code, keeps the JSONL under version control, and turns
@@ -212,6 +282,46 @@ items, pull every recent complaint in as an item, have subject-matter experts wr
 expected answers under written guidelines, double-label a subset to measure agreement, attach a grader
 spec per item instead of exact-match on a reference, split into dev and held-out by id hash, and
 version the result. A few hundred such items will say more than two thousand synthetic ones.
+
+## Interview questions
+### What makes a dataset "golden", and why not just use production logs?
+- **Golden means agreed and authoritative:** expected outputs signed off by the people who own the task,
+  versioned so a score is reproducible, not a claim that the set is perfect or large.
+- **Raw logs fail as a reference** because they have no labels, their composition shifts week to week,
+  and privacy constraints keep them out of CI.
+- **Logs are still the best source of inputs,** sampled with per-slice quotas and then labeled by SMEs.
+
+### Design a golden dataset for a new customer-support assistant.
+- **Define slices first:** intent, language, customer segment, difficulty, and set a quota per slice so
+  each one is measurable on its own.
+- **Fill from four sources:** stratified traffic, failures from error analysis, SME edge cases, and
+  synthetic items for gaps, labeled by humans and tagged as synthetic.
+- **Store each record** with complete input, expected output or reference plus a grader spec, slice
+  tags, provenance and version, in JSONL under review, with a hash-based dev and held-out split.
+
+### How many items do you need to detect a 5-point improvement at an 80% pass rate?
+- **Independent runs:** n ≈ (1.96 + 0.84)² · 2p(1−p) / δ², about 1,000 items per version at 80% power
+  and α = 0.05.
+- **Paired runs:** n ≈ (1.96 + 0.84)² · d / δ²; with about 13% of items flipping that is roughly 400
+  items, because only discordant items carry information.
+- **So measure your flip rate** from two runs before sizing the set, and size per slice for the
+  decisions you make per slice.
+
+### Offline score jumped 8 points but production quality did not move. What do you suspect?
+- **Leakage first:** golden items copied into few-shot examples, fine-tuning data or generation prompts
+  make the eval measure recall, not capability.
+- **Check:** search prompts and training files for golden ids or exact input strings, and compare the
+  dev score with the held-out split.
+- **Then check composition:** a set drawn from happy-path traffic, or a changed dataset version compared
+  against an old baseline, produces the same symptom.
+
+### When do you retire or relabel items, and what does it cost?
+- **Retire stale items** when product or policy changes make the expected output wrong, and relabel when
+  an inspected "failure" turns out to be a correct output against a wrong label.
+- **Replace saturated material:** once every candidate passes 97% of it, budget goes to harder items
+  drawn from recent failures.
+- **The cost is comparability:** every change is a new version, so re-run the baseline on it before
+  comparing, and keep a changelog of why each item changed.
 
 ## Quiz
 ### Q: Why sample golden items with per-slice quotas rather than uniformly at random from production logs?

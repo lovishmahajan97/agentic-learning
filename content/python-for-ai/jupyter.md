@@ -5,7 +5,7 @@ name: Jupyter
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - python-for-ai/pandas
   - python-for-ai/async-await
@@ -19,84 +19,100 @@ sources:
 ---
 
 ## TL;DR
-Jupyter runs code interactively in cells against a long-lived kernel, keeping variables in memory
-between cells and saving code, outputs and charts together in an `.ipynb` file. That makes it the fastest
-way to explore data, iterate on prompts and read model outputs side by side. The same persistent state
-that makes it fast also makes notebooks unreliable as production code or as evidence, unless you
-restart and run everything top to bottom.
+Jupyter runs code in cells against a long-lived kernel and saves code and outputs together in an
+`.ipynb` file: the fastest way to explore data and read model outputs. That persistent state also makes
+notebooks unreliable as evidence unless you restart and run all.
 
 ## Why it exists
-Much AI work is exploratory: look at 50 failing eval cases, try three prompt variants, plot score
-distributions, inspect what the retriever returned. In a script, each question means re-running
-everything from the start: reloading a model, re-reading a dataset, re-calling an API you pay for. Seconds
-or minutes of setup dominate a two-second question, and output scrolls away in a terminal. A plain REPL
-keeps state but loses history and cannot show tables, images or charts well.
-
-Jupyter separates a **kernel** that holds state from a **front end** that sends code to it, so you load
-the model or dataframe once and then ask questions in small cells, each with its output rendered inline
-and saved next to the code. The result doubles as a record others can read. The naive alternative,
-scripts with print statements, is reproducible but slow to iterate; the notebook trades some
-reproducibility for iteration speed, and knowing exactly what you gave up is the skill.
+- **Much AI work is exploratory.** Look at 50 failing eval cases, try three prompt variants, plot score
+  distributions, inspect what the retriever returned.
+- **Scripts make every question start from zero.** Reloading a model, re-reading a dataset, re-calling an
+  API you pay for: seconds or minutes of setup dominate a two-second question, and output scrolls away in
+  a terminal.
+- **A plain REPL keeps state but not much else.** It loses history and cannot show tables, images or
+  charts well.
+- **Jupyter splits a stateful kernel from a front end.** Load the model or dataframe once, then ask
+  questions in small cells, each with output rendered inline and saved next to the code. The result
+  doubles as a record others can read.
+- **It trades some reproducibility for iteration speed.** Scripts with print statements are reproducible
+  but slow to iterate; knowing exactly what the notebook gave up is the skill.
 
 ## How it works
 ### Architecture
-- **Kernel.** A separate process (for Python, `ipykernel`, built on IPython) that executes code and
-  holds all variables. It is separate *because* the front end can then crash, reconnect or be a different
-  program entirely without losing state, and kernels for other languages plug in the same way.
-- **Messaging protocol.** Front ends talk to kernels over ZeroMQ sockets using a documented message
-  protocol: execute requests, streamed output, rich display data, interrupts. That protocol is why
-  JupyterLab, the classic Notebook interface, VS Code and hosted notebook services can all drive the same
-  kernel.
-- **Server.** Jupyter Server manages kernels, files and the browser-facing API.
-- **Document.** An `.ipynb` is JSON: a list of cells, each with source, an execution count and outputs
-  (text, HTML, base64 images). Outputs are stored *in* the file, which is why a notebook can be read
-  without re-running it, and also why it can carry data and secrets you did not intend to share.
+| Piece | What it is | Why it matters |
+|---|---|---|
+| **Kernel** | A separate process (for Python, `ipykernel`, built on IPython) that executes code and holds all variables | Separate *because* the front end can crash, reconnect or be another program without losing state; other languages plug in the same way |
+| **Messaging protocol** | ZeroMQ sockets with a documented protocol: execute requests, streamed output, rich display data, interrupts | Why JupyterLab, the classic Notebook interface, VS Code and hosted services can all drive the same kernel |
+| **Server** | Jupyter Server | Manages kernels, files and the browser-facing API |
+| **Document** | An `.ipynb` is JSON: cells, each with source, an execution count and outputs (text, HTML, base64 images) | Outputs live *in* the file, so it reads without re-running, and can also carry data and secrets you did not mean to share |
 
 ### State is the execution history, not the file
-The kernel's state is whatever cells you ran, in the order you ran them, including cells you have since
-edited or deleted. The file on disk shows the current text of each cell, which may not be the code that
-produced the variables in memory. Execution counts (`[7]`, `[3]`) out of order are the visible clue.
-The only proof that a notebook works is **Restart Kernel and Run All** producing the same results.
+- **The kernel's state is whatever cells you ran, in the order you ran them,** including cells since
+  edited or deleted.
+- **The file shows each cell's current text,** which may not be the code that produced the variables in
+  memory.
+- **The visible clue:** execution counts (`[7]`, `[3]`) out of order.
+- **The only proof a notebook works:** **Restart Kernel and Run All** producing the same results.
 
-### Kernels, environments and memory
-Which Python a notebook uses is set by its **kernelspec**, a small JSON file naming the interpreter to
-launch, not by the shell you started Jupyter from. Registering a virtual environment
-(`python -m ipykernel install --user --name myenv`) is how a project's environment becomes a selectable
-kernel. This explains the install trap: `!pip` runs whatever `pip` is first on the server's `PATH`, which
-may belong to another environment, while `%pip` installs with the kernel's own interpreter.
+### Kernels, environments and the install trap
+- **The kernelspec picks the Python.** It is a small JSON file naming the interpreter to launch, not the
+  shell you started Jupyter from.
+- **Register a project environment as a kernel:** `python -m ipykernel install --user --name myenv`.
+- **`!pip` vs `%pip`.** `!pip` runs whatever `pip` is first on the server's `PATH`, which may belong to
+  another environment; `%pip` installs with the kernel's own interpreter, which is what you usually want.
 
-Because the kernel lives until you restart it, so does everything it references. IPython also keeps
-every displayed result in its output history (`Out`, `_`, `__`), so a large DataFrame or tensor you
-displayed stays referenced even after you `del` the variable. Re-running a "load model" cell creates a
-second copy before the first can be freed. On a GPU that is the classic notebook out-of-memory error:
-the first load fits, the re-run does not, and only a kernel restart reliably gives the memory back.
+### Memory lives as long as the kernel
+- **Everything the kernel references survives until restart.**
+- **Output history holds references too.** IPython keeps every displayed result (`Out`, `_`, `__`), so a
+  large DataFrame or tensor you displayed stays referenced even after you `del` the variable.
+- **Re-running a "load model" cell makes a second copy** before the first can be freed. On a GPU that is
+  the classic notebook out-of-memory error: the first load fits, the re-run does not, and only a kernel
+  restart reliably gives the memory back.
 
 ### Useful machinery
-- Magics: `%timeit` for micro-benchmarks, `%autoreload` to pick up edits to imported modules, `!pip`
-  and `%pip` (the latter installs into the kernel's environment, which is what you usually want).
-- Top-level `await` works in IPython kernels *because* the kernel already runs an event loop; the same
-  fact is why `asyncio.run()` fails inside a notebook with "cannot be called from a running event loop".
-- Headless execution: `jupyter nbconvert --execute` runs a notebook top to bottom; papermill injects
+- **Magics:** `%timeit` for micro-benchmarks; `%autoreload` to pick up edits to imported modules.
+- **Top-level `await` works** *because* IPython kernels already run an event loop. The same fact is why
+  `asyncio.run()` fails in a notebook with "cannot be called from a running event loop".
+- **Headless execution:** `jupyter nbconvert --execute` runs a notebook top to bottom; papermill injects
   parameters and runs notebooks as batch jobs, which some teams use for scheduled reports.
-- Version control helpers: tools such as nbstripout remove outputs before commit, and Jupytext pairs a
-  notebook with a plain `.py` file so diffs and reviews are readable.
+- **Version control helpers:** nbstripout removes outputs before commit; Jupytext pairs a notebook with a
+  plain `.py` file so diffs and reviews are readable.
 
-## Example
-A worked scenario: error analysis on an eval run of 2,000 RAG answers.
+## Diagram
+The kernel's memory comes from the execution history, while the `.ipynb` stores only current cell text
+and saved outputs; Restart and Run All is what makes the two agree.
 
-Cell 1 loads the eval results JSONL into a pandas DataFrame and, once, the embedding model (about 30
-seconds). Cell 2 filters the 140 rows the judge scored as failures (illustrative numbers). Cell 3 shows
-ten of them with question, retrieved chunks and answer side by side. You notice many failures involve
-tables, so cell 4 adds a `has_table` flag by regex over the retrieved chunks and stores a cross-tab of
-document type against `has_table` for the failing rows in a variable, `by_type`. Cell 5 plots `by_type`.
-Each question takes seconds because the model and data stay in memory.
+```mermaid
+flowchart LR
+    F["Front end: JupyterLab, Notebook, VS Code"] -->|"execute request"| S["Jupyter Server"]
+    S -->|"ZeroMQ messages"| K["Kernel process: ipykernel"]
+    K --> M[("Variables and Out history in memory")]
+    K -->|"streamed output and display data"| F
+    F -->|"save"| N[("ipynb JSON: cell source, counts, outputs")]
+    M -.->|"may differ after edits or out-of-order runs"| N
+    R["Restart Kernel and Run All"] -->|"rebuilds state from cells in order"| M
+```
 
-Then the trap. You edit cell 2's filter to include "partial" scores and re-run cells 2 and 5 but not
-cell 4, so `by_type` still holds counts from the old subset and the chart is silently wrong; nothing
-errors. The notebook file shows the new filter, so a reviewer cannot tell. Before sharing, you Restart and Run All: cell 4 now runs on the new
-subset and the chart changes. That is the habit that makes the notebook trustworthy. Finally, the
-`has_table` heuristic moves into `analysis/features.py` with a test, and the notebook imports it, so the
-logic outlives the exploration.
+## Examples
+### Error analysis on 2,000 RAG answers, and the stale-cell trap
+Illustrative numbers from one eval run.
+
+| Cell | Does | Cost |
+|---|---|---|
+| 1 | Loads eval results JSONL into pandas and, once, the embedding model | about 30 seconds |
+| 2 | Filters the 140 rows the judge scored as failures | seconds |
+| 3 | Shows ten of them: question, retrieved chunks, answer side by side | seconds |
+| 4 | Many failures involve tables, so adds a `has_table` flag by regex over the chunks; stores a cross-tab of document type against `has_table` for failing rows in `by_type` | seconds |
+| 5 | Plots `by_type` | seconds |
+
+Each question takes seconds because the model and data stay in memory. Then the trap:
+1. **You edit cell 2's filter** to include "partial" scores and re-run cells 2 and 5, but not cell 4.
+2. **`by_type` still holds counts from the old subset,** so the chart is silently wrong; nothing errors.
+3. **The file shows the new filter,** so a reviewer cannot tell.
+4. **Before sharing, you Restart and Run All:** cell 4 now runs on the new subset and the chart changes.
+   That habit makes the notebook trustworthy.
+5. **Finally, the `has_table` heuristic moves into `analysis/features.py` with a test,** and the notebook
+   imports it, so the logic outlives the exploration.
 
 ```python
 %load_ext autoreload
@@ -109,37 +125,88 @@ fails = df[df.score < 3].assign(has_table=lambda d: d.chunks.map(has_table))
 pd.crosstab(fails.doc_type, fails.has_table)
 ```
 
+### CI check: was this report notebook run top to bottom?
+A pure-Python check for notebooks committed with outputs (curated reports). Counts of 1..n in order are
+what Restart and Run All produces; anything else means hidden state.
+
+```python
+import json, sys
+
+def check(path: str) -> list[str]:
+    nb = json.load(open(path, encoding="utf-8"))
+    counts = [c.get("execution_count") for c in nb["cells"] if c["cell_type"] == "code"]
+    ran = [n for n in counts if n is not None]
+    problems = []
+    if ran != list(range(1, len(ran) + 1)):
+        problems.append(f"execution counts {ran} are not 1..{len(ran)} in order")
+    if len(ran) < len(counts):
+        problems.append(f"{len(counts) - len(ran)} code cell(s) never ran")
+    return problems
+
+if __name__ == "__main__":
+    results = {p: check(p) for p in sys.argv[1:]}
+    for p, problems in results.items():
+        for msg in problems:
+            print(f"{p}: {msg}")
+    sys.exit(1 if any(results.values()) else 0)
+```
+
+A notebook whose counts read `[1, 7, 3]` fails with a clear message; one run cleanly passes. Do not run
+it on output-stripped notebooks, where every count is empty.
+
+## Production patterns
+- **Strip outputs at commit time.** Run `nbstripout --install` in the repo so a git filter removes outputs
+  and execution counts from exploratory notebooks. Monitor with a secret scanner over the repository, since
+  saved outputs are where keys and customer records leak.
+- **Pair notebooks with text files for review.** Use Jupytext paired formats (for example ipynb plus a
+  percent-format `.py`) so pull requests diff readable code. Review the `.py`; regenerate the notebook
+  from it.
+- **Re-execute reports headlessly before publishing.** Run `jupyter nbconvert --to notebook --execute` (or
+  papermill with `-p` parameters for scheduled runs) in CI, so published numbers come from a clean kernel.
+  Monitor run duration and failures like any batch job.
+- **Promote logic into a tested package.** Once a helper is reused, move it to a module with tests and
+  import it with `%autoreload 2` during exploration. Track how much logic lives only in cells; it should
+  trend to zero for anything scheduled.
+- **One registered kernel per project environment.** Register each project's virtual environment with
+  `python -m ipykernel install --user --name <project>` and install only with `%pip`. Watch for
+  `ModuleNotFoundError` right after an install, the sign of a mismatched interpreter.
+
 ## Trade-offs
-- Persistent kernel state makes iteration fast when setup is expensive, but hidden state means results
-  may not reproduce; the balance flips the moment the output informs a decision others rely on.
-- Outputs saved in the file make notebooks readable without re-running, yet they bloat diffs and can leak
-  customer data or keys; strip outputs for code review, keep them only for curated reports.
-- Notebooks are excellent for exploration and teaching, but poor for modular, tested code; once logic is
-  reused or scheduled, it belongs in a package that the notebook imports.
-- Parameterized notebook execution turns analyses into repeatable jobs cheaply, but a scheduled notebook
-  is harder to test, type-check and monitor than a script with the same logic.
+- **Fast iteration vs hidden state.** Persistent kernel state makes iteration fast when setup is
+  expensive, but results may not reproduce; the balance flips the moment the output informs a decision
+  others rely on.
+- **Readable saved outputs vs bloat and leaks.** Outputs saved in the file make notebooks readable without
+  re-running, yet bloat diffs and can leak customer data or keys; strip them for code review, keep them
+  only for curated reports.
+- **Exploration vs modular code.** Notebooks are excellent for exploration and teaching, but poor for
+  modular, tested code; once logic is reused or scheduled, it belongs in a package the notebook imports.
+- **Cheap scheduled jobs vs operability.** Parameterized notebook execution turns analyses into repeatable
+  jobs cheaply, but a scheduled notebook is harder to test, type-check and monitor than a script with the
+  same logic.
 
 ## Pitfalls
-- Trusting results from out-of-order execution; the symptom is a colleague running the notebook top to
-  bottom and getting different numbers, or a `NameError` for a variable you deleted.
-- Committing outputs with API keys, tokens or customer records; the symptom is secrets or personal data
-  appearing in the repository history and in rendered previews.
-- Calling `asyncio.run()` in a cell; it raises because the kernel's loop is already running, and the
-  usual hack, patching nested loops, hides the problem instead of using top-level `await`.
-- Re-running a model-loading cell, or displaying large tensors, in a long session; the symptom is CUDA
+- **Trusting out-of-order execution.** Symptom: a colleague running the notebook top to bottom gets
+  different numbers, or a `NameError` for a variable you deleted.
+- **Committing outputs with API keys, tokens or customer records.** Symptom: secrets or personal data in
+  the repository history and in rendered previews.
+- **Calling `asyncio.run()` in a cell.** It raises because the kernel's loop is already running. The usual
+  hack, patching nested loops, hides the problem; use top-level `await` instead.
+- **Re-running a model-loading cell, or displaying large tensors, in a long session.** Symptom: CUDA
   out-of-memory on a cell that worked an hour ago, cleared only by restarting the kernel.
-- Installing with `!pip` into a different interpreter than the kernel's; the symptom is a successful
-  install followed by `ModuleNotFoundError` in the next cell.
-- Shipping a notebook as the production service; the symptom is no tests, no error handling, and an
-  outage when someone runs cells in a new order.
+- **Installing with `!pip` into a different interpreter than the kernel's.** Symptom: a successful install
+  followed by `ModuleNotFoundError` in the next cell.
+- **Shipping a notebook as the production service.** Symptom: no tests, no error handling, and an outage
+  when someone runs cells in a new order.
 
 ## When to use
-Use Jupyter for exploration and communication: data inspection, error analysis on eval results, prompt
-iteration, quick model comparisons, and demos for stakeholders. Move code out as soon as it is reused,
-scheduled or needs tests. Do not treat a notebook's numbers as final until Restart and Run All reproduces
-them, and pin the environment so others can. For tracking runs and making evaluations reproducible, see
-the LLMOps lessons; notebooks complement experiment tracking rather than replace it. In interviews,
-expect to explain hidden state and how you keep notebook analysis honest.
+- **Use when:** exploring and communicating: data inspection, error analysis on eval results, prompt
+  iteration, quick model comparisons, and demos for stakeholders.
+- **Move code out when:** it is reused, scheduled or needs tests.
+- **Before trusting numbers:** treat nothing as final until Restart and Run All reproduces it, and pin the
+  environment so others can.
+- **Pair with tracking:** for tracking runs and reproducible evaluations, see the LLMOps lessons;
+  notebooks complement experiment tracking rather than replace it.
+- **Interviews:** expect to explain hidden state and how you keep notebook analysis honest.
 
 ## Role lens
 - **Engineer:** Explores data and failure cases in notebooks, then promotes stable logic into tested
@@ -158,6 +225,41 @@ filter applied to only one arm can produce a difference that the visible code do
 also check that both prompts ran on the same rows, with the same model and settings, that the evaluation
 function is identical for both, and that the sample is large enough for a 12-point gap to be meaningful.
 Then I would move the comparison into a script or eval harness so it can be re-run.
+
+## Interview questions
+### What is a Jupyter kernel, and why is it a separate process from the front end?
+- **The kernel executes code and holds all variables;** for Python it is `ipykernel`, built on IPython.
+- **It is separate so state survives the front end,** which can crash, reconnect or be a different program
+  such as JupyterLab, VS Code or a hosted service, all speaking the same ZeroMQ messaging protocol.
+- **The cost is hidden state:** memory reflects what ran, not what the file shows.
+
+### A notebook hits CUDA out-of-memory on a cell that worked an hour ago. How do you debug and fix it?
+- **Suspect re-run loading cells.** Re-running "load model" creates a second copy before the first can be
+  freed.
+- **Suspect output history.** IPython keeps displayed results in `Out`, `_` and `__`, so a displayed tensor
+  stays referenced after `del`.
+- **Fix:** restart the kernel, which reliably frees the memory, load the model once in an early cell, and
+  avoid displaying large tensors.
+
+### When would you not use a notebook?
+- **For anything scheduled, reused or served,** because notebooks are hard to test, type-check and
+  monitor; that logic belongs in a package the notebook imports.
+- **For results others will rely on, unless re-run cleanly,** because out-of-order state can produce
+  numbers the visible code does not explain.
+
+### `pip install` succeeded in a cell, but the next cell raises `ModuleNotFoundError`. Why?
+- **`!pip` runs whichever `pip` is first on the server's `PATH`,** which may belong to another
+  environment than the kernel's.
+- **Use `%pip`,** which installs with the kernel's own interpreter.
+- **Prevent it per project:** register the environment with `python -m ipykernel install --user --name`
+  and select that kernel.
+
+### How do you keep notebooks safe and reviewable in a team repository?
+- **Strip outputs on commit** with `nbstripout --install`, because saved outputs bloat diffs and can carry
+  keys or customer records.
+- **Pair with Jupytext** so reviews diff a readable `.py` file.
+- **Re-execute report notebooks in CI** with `jupyter nbconvert --execute` or papermill, so published numbers
+  come from a clean kernel.
 
 ## Quiz
 ### Q: What determines the values of variables in a running Jupyter kernel?

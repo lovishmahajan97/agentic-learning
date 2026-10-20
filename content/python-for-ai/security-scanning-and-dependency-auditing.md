@@ -5,7 +5,7 @@ name: Security scanning & dependency auditing (pip-audit, Bandit)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/uv-poetry-pip
@@ -22,39 +22,40 @@ sources:
 ---
 
 ## TL;DR
-Two complementary automated checks: **pip-audit** compares the exact versions you install against public
-vulnerability databases (known CVEs in *other people's code*), and **Bandit** statically scans *your own
-code* for risky patterns such as `pickle.load`, `eval`, `shell=True` and hard-coded secrets. Both run in CI
-in seconds. Neither proves code is safe: they catch known and pattern-shaped problems cheaply, so humans can
-spend review time on design-level risks.
+**pip-audit** checks your exact installed versions against vulnerability databases; **Bandit** scans your
+own code for risky patterns like `pickle.load`, `eval`, `shell=True` and hard-coded secrets. Both run in
+seconds in CI; neither proves code safe, they free reviewers for design-level risks.
 
 ## Why it exists
-An AI service is mostly third-party code: an LLM SDK, an HTTP stack, a web framework, tokenizers, parsers for
-PDFs and HTML, often torch and transformers. Vulnerabilities are disclosed in packages like these regularly,
-and an exact lockfile means you keep running the vulnerable version until someone notices. Nobody reads
-advisories for a hundred transitive packages by hand, so without automation the gap between "fix published"
-and "fix deployed" is unbounded.
-
-Your own code adds a second class of risk that AI work makes more common. Model artifacts are loaded with
-pickle-based formats that execute code on load; LLM output is tempting to pass to `eval`, a shell or SQL;
-prototype code hard-codes API keys; `yaml.load` and `trust_remote_code=True` slip in from tutorials. Code
-review catches some of this, inconsistently. The naive approach, "we will review carefully and update
-dependencies when we remember", fails because both problems scale with code volume and dependency count,
-while attention does not. Cheap, deterministic scanners on every pull request close the obvious holes.
+- **An AI service is mostly third-party code:** an LLM SDK, an HTTP stack, a web framework, tokenizers,
+  PDF and HTML parsers, often torch and transformers. Vulnerabilities are disclosed in packages like these
+  regularly.
+- **Locks keep you on the vulnerable version** until someone notices, and nobody reads advisories for a
+  hundred transitive packages by hand, so without automation the gap between "fix published" and "fix
+  deployed" is unbounded.
+- **AI work makes risky code more common.** Model artifacts use pickle-based formats that execute code on
+  load; LLM output is tempting to pass to `eval`, a shell or SQL; prototypes hard-code API keys; `yaml.load`
+  and `trust_remote_code=True` slip in from tutorials.
+- **Careful review does not scale.** "We will review carefully and update dependencies when we remember"
+  fails because both problems grow with code volume and dependency count, while attention does not.
+- **Cheap, deterministic scanners on every pull request** close the obvious holes.
 
 ## How it works
 ### pip-audit: known vulnerabilities in dependencies
-pip-audit, maintained under PyPA, takes a set of installed or declared packages (the current environment,
-`-r requirements.txt`, or a project directory), resolves exact versions, and queries a vulnerability service
-(PyPI's advisory data by default, or OSV with `-s osv`) for advisories affecting each version. It reports the
-package, version, advisory ID and the fixed versions, exits non-zero when anything is found (so CI fails), and
-can emit JSON or CycloneDX SBOM output. `--fix` upgrades to fixed versions where possible; `--ignore-vuln ID`
-records a deliberate, reviewed exception.
+1. **Input:** installed or declared packages: the current environment, `-r requirements.txt`, or a project
+   directory. pip-audit is maintained under PyPA.
+2. **Resolve** exact versions.
+3. **Query** a vulnerability service (PyPI's advisory data by default, or OSV with `-s osv`) for advisories
+   affecting each version.
+4. **Report** package, version, advisory ID and fixed versions; exit non-zero on findings so CI fails; emit
+   JSON or CycloneDX SBOM output on request.
 
-The design depends on exact versions, *because* advisories are expressed as affected version ranges. That is
-why auditing a lockfile or exported pinned requirements is meaningful, while auditing loose ranges in
-`pyproject.toml` is not: the answer depends on what would be installed. Auditing a lockfile is also how you
-find vulnerable transitive packages you never chose directly.
+- **`--fix`** upgrades to fixed versions where possible; **`--ignore-vuln ID`** records a deliberate,
+  reviewed exception.
+- **Exact versions are essential,** *because* advisories are expressed as affected version ranges. Auditing a
+  lockfile or exported pinned requirements is meaningful; auditing loose ranges in `pyproject.toml` is not,
+  since the answer depends on what would be installed.
+- **The lock also reveals transitive exposure:** vulnerable packages you never chose directly.
 
 ### Triage: what to do with a finding
 A finding is the start of a decision, not the decision. A useful order:
@@ -72,36 +73,43 @@ A finding is the start of a decision, not the decision. A useful order:
    the suppression is visible in review and revisited when a fix ships.
 
 ### Bandit: risky patterns in your code
-Bandit parses each Python file into an abstract syntax tree and runs plugins that match known-dangerous
-constructs, each with a test ID, severity and confidence. Examples: `B101` assert used (asserts vanish under
-`python -O`, so they must not enforce security), `B301` pickle deserialization, `B307` `eval`, `B506`
-unsafe `yaml.load`, `B602` subprocess with `shell=True`, `B105` hard-coded password strings, `B608` SQL built
-by string formatting. Run `bandit -r src -ll` to report medium severity and above, remembering that some
-useful checks are rated low (B105 and B101 among them) and disappear under that floor. B105 is also a
-name heuristic: it fires on literals assigned to names containing words such as `password`, `secret` or
-`token`, so `API_KEY = "sk-..."` slips past it, which is one more reason to run a real secret scanner. Configure skips per
-project (passing the config file explicitly), and suppress a reviewed line with `# nosec B602` plus a
-reason. Ruff implements many of the same checks as its `S` rules (from flake8-bandit), which lets teams run
-them inside the linter they already have.
+- **How:** parses each Python file into an abstract syntax tree and runs plugins matching known-dangerous
+  constructs, each with a test ID, severity and confidence.
 
-Bandit is fast and predictable *because* it matches syntax rather than tracking data flow. The cost is that
-it cannot tell whether the string reaching `subprocess` came from a constant or from a user, so it produces
-false positives, and it misses vulnerabilities that do not have a recognizable syntactic shape.
+| Test ID | Flags | Why |
+|---|---|---|
+| `B101` | assert used | asserts vanish under `python -O`, so they must not enforce security |
+| `B301` | pickle deserialization | executes code on load |
+| `B307` | `eval` | runs arbitrary expressions |
+| `B506` | unsafe `yaml.load` | full loader builds arbitrary objects |
+| `B602` | subprocess with `shell=True` | shell metacharacters from input |
+| `B105` | hard-coded password strings | secrets in source |
+| `B608` | SQL built by string formatting | SQL injection |
+
+- **Severity floor:** `bandit -r src -ll` reports medium severity and above. Some useful checks are rated low
+  (B105 and B101 among them) and disappear under that floor.
+- **B105 is a name heuristic:** it fires on literals assigned to names containing words such as `password`,
+  `secret` or `token`, so `API_KEY = "sk-..."` slips past it; one more reason to run a real secret scanner.
+- **Configure per project:** skips in a config file (passed explicitly); suppress a reviewed line with
+  `# nosec B602` plus a reason.
+- **Ruff alternative:** Ruff implements many of the same checks as its `S` rules (from flake8-bandit), so
+  teams can run them inside the linter they already have.
+- **Fast but blind to data flow,** *because* it matches syntax rather than tracking data. It cannot tell
+  whether the string reaching `subprocess` came from a constant or from a user, so it produces false
+  positives, and it misses vulnerabilities without a recognizable syntactic shape.
 
 ### What neither tool covers
-- **Malicious or typosquatted packages** that have no CVE: mitigated by locks with hashes, approved
-  indexes or mirrors, and reviewing new dependencies.
-- **Logic and authorization bugs**, prompt injection, data leakage between tenants: design and review issues.
-- **Secrets already committed**: dedicated secret scanners (gitleaks, trufflehog) search history, which
-  Bandit's string heuristics do not.
-- **Model artifacts**: prefer safetensors over pickle-based checkpoints, pin model revisions, and avoid
-  `trust_remote_code=True` for unreviewed repositories.
-- **Reachability**: a vulnerable function may be present but never called; tools such as OSV-Scanner,
-  Dependabot alerts, Safety or Snyk differ in databases and in triage features, so choose by workflow.
+| Gap | Mitigation |
+|---|---|
+| **Malicious or typosquatted packages** with no CVE | locks with hashes, approved indexes or mirrors, reviewing new dependencies |
+| **Logic and authorization bugs**, prompt injection, data leakage between tenants | design and review |
+| **Secrets already committed** | dedicated secret scanners (gitleaks, trufflehog) search history, which Bandit's string heuristics do not |
+| **Model artifacts** | prefer safetensors over pickle-based checkpoints, pin model revisions, avoid `trust_remote_code=True` for unreviewed repositories |
+| **Reachability** (vulnerable function present but never called) | tools such as OSV-Scanner, Dependabot alerts, Safety or Snyk differ in databases and triage features; choose by workflow |
 
-## Example
-Code a Bandit run would flag, the safer equivalent, and the CI commands. The scenario is an agent that loads
-a classifier, runs a shell tool and stores results.
+## Examples
+### What Bandit flags in an agent, and the safer equivalents
+The scenario: an agent that loads a classifier, runs a shell tool and stores results.
 
 ```python
 import pickle, sqlite3, subprocess, shlex
@@ -137,38 +145,84 @@ cfg_safe = yaml.safe_load(open("agent.yaml"))
 #   bandit -r src -ll                              # medium+ only: hides B105/B101, so run -l periodically
 ```
 
+### Scanner configuration kept in the repo
+Bandit reads `[tool.bandit]` from `pyproject.toml` when you pass the file with `-c` (install `bandit[toml]`);
+the Ruff block is the in-linter alternative. Pick one.
+
+```toml
+[tool.bandit]
+exclude_dirs = ["tests"]          # asserts and fixtures in tests drown real findings
+
+# Alternative: Bandit-style rules inside Ruff
+[tool.ruff.lint]
+extend-select = ["S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]             # assert is fine in tests
+```
+
+Run it with `bandit -c pyproject.toml -r src`.
+
+### Worked scenario: triaging a transitive finding
+pip-audit on the exported lock reports an advisory in `jinja2`, pulled in by a web framework.
+
+| Step | Finding | Action |
+|---|---|---|
+| Fixed version? | yes, a newer `jinja2` release | try `uv lock --upgrade-package jinja2` |
+| Transitive? | the framework's range excludes the fix | upgrade the framework; if blocked, a tested override as a stopgap |
+| Reachable? | the flaw is in the template sandbox; the service never renders untrusted templates | allowed to *defer*, with a written justification |
+| Record | `--ignore-vuln <ID>` in the CI script with reason and review date | revisit when the framework ships support |
+
+## Production patterns
+- **Audit the artifact that ships.** In CI export the lock (`uv export --format requirements-txt ...`) and
+  run `pip-audit -r req.txt --no-deps --disable-pip`, never the developer's environment. Track open findings
+  and time from advisory to fix deployed.
+- **Scheduled audits, not just PR audits.** New advisories appear for code that has not changed, so also run
+  the same audit daily or weekly against the deployed lock (for example a CI job on a `schedule` trigger) and
+  alert the owning team.
+- **Expiring, reviewed suppressions.** Keep each `--ignore-vuln ID` and `# nosec Bxxx` next to a reason and a
+  review date; count suppressions and review the list monthly so they do not become permanent.
+- **Audit evidence as SBOMs.** Emit CycloneDX output from pip-audit (its output-format option) and archive it
+  per release; regulated customers often ask for exactly this.
+- **Secret scanning on history.** Run gitleaks or trufflehog in CI and as a pre-commit hook, because Bandit's
+  B105 misses names like `API_KEY`. Rotate any key a scanner finds; deleting the commit is not enough.
+- **Model-artifact policy.** Accept only safetensors, pin model revisions, allowlist sources and keep
+  `trust_remote_code=True` behind review, since no dependency scanner looks inside model files.
+
 ## Trade-offs
-- Failing CI on any pip-audit finding keeps dependencies current, but blocks unrelated work when an advisory
-  has no fix yet; allow time-boxed, reviewed `--ignore-vuln` entries rather than disabling the check.
-- Bandit catches common dangerous calls with near-zero setup, but its syntax-only view yields false
-  positives; tune with severity thresholds and justified `nosec` comments, or move to a data-flow tool such
-  as Semgrep or CodeQL when signal-to-noise becomes the bottleneck.
-- Running scanners on every pull request catches problems early, but new advisories appear for code that has
-  not changed; also schedule a daily or weekly audit of the deployed lockfile.
-- Using Ruff's `S` rules avoids another tool, but may not match Bandit's full plugin set and configuration;
-  pick one and keep the rule list explicit.
+- **Current dependencies vs blocked work.** Failing CI on any pip-audit finding keeps dependencies current but
+  blocks unrelated work when an advisory has no fix yet; allow time-boxed, reviewed `--ignore-vuln` entries
+  rather than disabling the check.
+- **Zero setup vs false positives.** Bandit catches common dangerous calls with near-zero setup, but its
+  syntax-only view yields false positives; tune with severity thresholds and justified `nosec` comments, or
+  move to a data-flow tool such as Semgrep or CodeQL when signal-to-noise becomes the bottleneck.
+- **PR scans vs drift.** Scanning every pull request catches problems early, but new advisories appear for
+  unchanged code; also schedule a daily or weekly audit of the deployed lockfile.
+- **One tool vs full coverage.** Ruff's `S` rules avoid another tool but may not match Bandit's full plugin
+  set and configuration; pick one and keep the rule list explicit.
 
 ## Pitfalls
-- Auditing `pyproject.toml` ranges or the developer's environment instead of the lock that ships; the symptom
-  is a clean report while the production image contains a flagged version.
-- Blanket `# nosec` or skipping whole test IDs to make the build green; the symptom is a security review
-  finding `shell=True` on model output that the scanner had reported months earlier.
-- Treating a clean pip-audit report as "no supply-chain risk"; the symptom is surprise when a malicious
-  lookalike package with no CVE is found in the dependency tree.
-- Assuming Bandit understands context; the symptom is the team learning to ignore its output because findings
-  in tests and constant strings drown real ones, which a config excluding tests and a severity floor prevents.
-- Running `pip-audit --fix` in a project managed by a lockfile; the symptom is a green local audit
-  followed by the same finding in CI, because the fix changed the environment but never reached the lock.
-- Loading pickle-based model files from a public hub because "it is just weights"; the symptom is arbitrary
-  code execution on the inference host, which no dependency scanner would report.
+- **Auditing `pyproject.toml` ranges or the developer's environment** instead of the lock that ships.
+  Symptom: a clean report while the production image contains a flagged version.
+- **Blanket `# nosec` or skipped test IDs** to make the build green. Symptom: a security review finds
+  `shell=True` on model output that the scanner reported months earlier.
+- **Clean pip-audit treated as "no supply-chain risk".** Symptom: surprise when a malicious lookalike package
+  with no CVE is found in the dependency tree.
+- **Assuming Bandit understands context.** Symptom: the team ignores its output because findings in tests and
+  constant strings drown real ones. Fix: a config excluding tests and a severity floor.
+- **`pip-audit --fix` in a lockfile-managed project.** Symptom: a green local audit followed by the same
+  finding in CI, because the fix changed the environment but never reached the lock.
+- **Pickle-based model files from a public hub** because "it is just weights". Symptom: arbitrary code
+  execution on the inference host, which no dependency scanner would report.
 
 ## When to use
-Add both checks to CI as soon as a project has a lockfile and code that will run with real data or
-credentials; for AI services that is usually the first deployment. Run pip-audit against the exact lock on
-every PR and on a schedule, and Bandit (or Ruff `S` rules) on source directories with tests excluded or
-treated leniently. Track open findings, time from advisory to fix deployed, and the count of suppressions.
-In regulated customer environments, the JSON or CycloneDX output often becomes audit evidence. In interviews,
-the strong answer explains what each tool can and cannot see rather than listing tools.
+- **Use when:** a project has a lockfile and code that will run with real data or credentials; for AI
+  services that is usually the first deployment.
+- **Run:** pip-audit against the exact lock on every PR and on a schedule; Bandit (or Ruff `S` rules) on
+  source directories, with tests excluded or treated leniently.
+- **Measure:** open findings, time from advisory to fix deployed, and the count of suppressions.
+- **Regulated customers:** the JSON or CycloneDX output often becomes audit evidence.
+- **Interviews:** explain what each tool can and cannot see rather than listing tools.
 
 ## Role lens
 - **Engineer:** Fixes or justifies each finding, replaces pickle, `eval` and `shell=True` patterns, and keeps

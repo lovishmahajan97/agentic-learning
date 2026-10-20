@@ -5,7 +5,7 @@ name: Outlines
 kind: tool
 difficulty: advanced
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/instructor
   - python-for-ai/pydantic
@@ -20,100 +20,153 @@ sources:
 ---
 
 ## TL;DR
-Outlines makes a language model's output match a regex, a JSON Schema, a fixed set of choices or a
-grammar *by construction*, by masking every token that would break the pattern before sampling. Invalid
-output becomes impossible rather than detected and retried. The catch is that it needs access to the
-model's logits, so it applies to models you run yourself (or engines that integrate it), not to closed
-hosted APIs.
+Outlines makes model output match a regex, JSON Schema, choice list or grammar *by construction*, by
+masking tokens that would break the pattern before sampling. Invalid output becomes impossible, but it
+needs logit access, so it fits self-run models, not closed hosted APIs.
 
 ## Why it exists
-A language model samples one token at a time from a distribution over its whole vocabulary. Nothing in
-that process knows that you wanted a JSON object with an integer `age`. Prompting raises the
-probability of valid output; it never makes it certain, and smaller open models, the ones you can afford
-to self-host, break formats far more often than frontier APIs. The after-the-fact fix, parse and retry,
-has two costs. Each retry is another full generation, so tail latency multiplies. And retries do not
-converge on hard inputs: a model that keeps writing `"age": "about 40"` will keep doing it.
-
-The observation behind Outlines is that if you control sampling, you can refuse to sample invalid
-tokens at all. At each step, compute which vocabulary tokens could continue a valid string, set every
-other token's logit to negative infinity, and sample from what remains. The output is valid on the first
-pass, always. The naive version of this, checking every vocabulary token against the pattern at every
-step, costs a full scan of a vocabulary of tens or hundreds of thousands of tokens per generated token,
-which is too slow. Outlines' contribution was making the check effectively a lookup.
+- **Sampling knows nothing about your format.** A model samples one token at a time over its whole
+  vocabulary; nothing in that process knows you wanted a JSON object with an integer `age`. Prompting
+  raises the odds of valid output but never makes it certain.
+- **Small open models break formats most.** The ones you can afford to self-host break formats far more
+  often than frontier APIs.
+- **Parse-and-retry has two costs.** Each retry is another full generation, so tail latency multiplies.
+  And retries do not converge on hard inputs: a model that keeps writing `"age": "about 40"` will keep
+  doing it.
+- **If you control sampling, refuse invalid tokens.** At each step compute which tokens could continue a
+  valid string, set every other logit to negative infinity, and sample from what remains. Output is valid
+  on the first pass, always.
+- **The naive check is too slow.** Testing every token against the pattern at every step scans a
+  vocabulary of tens or hundreds of thousands of tokens per generated token. Outlines' contribution was
+  making that check effectively a lookup.
 
 ## How it works
 ### From pattern to automaton
-1. **Compile the constraint to a regular expression.** A regex is used directly. A JSON Schema is
-   translated into a regex that matches exactly the JSON strings that satisfy it (keys in schema order,
-   types as sub-patterns, enums as alternations). A `choice(["yes","no"])` is an alternation.
+1. **Compile the constraint to a regular expression.** A regex is used directly. A JSON Schema becomes a
+   regex matching exactly the JSON strings that satisfy it (keys in schema order, types as sub-patterns,
+   enums as alternations). A `choice(["yes","no"])` is an alternation.
 2. **Regex to finite-state machine.** The regex becomes a deterministic finite automaton over
    *characters*: states, and transitions labelled by characters.
-3. **Index the vocabulary against the FSM.** This is the key step. For every FSM state, walk each
-   vocabulary token's string character by character from that state; if the walk never falls off the
-   automaton, the token is allowed in that state, and you record the state it lands in. The result is a
-   map `state -> {allowed token -> next state}`. It is built once per (pattern, tokenizer) pair *because*
-   it is expensive, then cached and reused across every request with the same schema.
-4. **Generate.** At each decoding step, look up the current state's allowed set, mask all other logits,
-   sample (greedy, temperature, whatever you configured) from the survivors, then follow the transition
-   to the next state. Per-step overhead is a lookup and a mask, not a vocabulary scan.
+3. **Index the vocabulary against the FSM (the key step).** For every state, walk each token's string
+   character by character; if the walk never falls off the automaton, the token is allowed there, and you
+   record where it lands. Result: a map `state -> {allowed token -> next state}`.
+4. **Build once, cache.** The index is built once per (pattern, tokenizer) pair *because* it is
+   expensive, then reused across every request with the same schema.
+5. **Generate.** Each step: look up the current state's allowed set, mask all other logits, sample
+   (greedy, temperature, whatever you configured) from the survivors, follow the transition. Per-step
+   overhead is a lookup and a mask, not a vocabulary scan.
 
-Formally, with allowed set A(s) in state *s*, the sampled distribution is
-`p'(t) = p(t) · 1[t ∈ A(s)] / Σ_{u ∈ A(s)} p(u)`: the model's probabilities restricted to legal tokens and
-renormalized. Building the index costs roughly (number of FSM states) × (vocabulary size) × (average token
-length) character steps. That is why a schema with long enumerations or many optional fields, which
-multiplies states, takes visibly longer to compile than a two-field one, and why the work happens once.
+### The maths
+With allowed set A(s) in state *s*, the sampled distribution is
+`p'(t) = p(t) · 1[t ∈ A(s)] / Σ_{u ∈ A(s)} p(u)`: the model's probabilities restricted to legal tokens
+and renormalized.
 
-Working at the token level, not the character level, matters *because* tokens span several characters:
-a single token such as `name` moves the FSM four characters forward in one step, and the index records
-that, including tokens that are valid only because they straddle a boundary such as `":"`.
+```
+index build cost ≈ (number of FSM states) × (vocabulary size) × (average token length) character steps
+```
+
+- **More states, longer compile.** Long enumerations or many optional fields multiply states, so such a
+  schema takes visibly longer to compile than a two-field one; that is why the work happens once.
+- **Token level, not character level,** *because* tokens span several characters. A single token such as
+  `name` moves the FSM four characters forward in one step, and the index also records tokens valid only
+  because they straddle a boundary, such as `":"`.
 
 ### Grammars
-Regular expressions cannot describe arbitrarily nested structures. JSON with recursive schemas, or
-code in a programming language, needs a context-free grammar, which requires a pushdown automaton
-(a state plus a stack). Outlines supports grammar-constrained generation too, but it is costlier and
-less mature than the regex path; engines such as vLLM also offer alternative grammar backends for this
-reason. Outlines' own core was later rewritten as a separate `outlines-core` package, and recent
-versions can delegate to other backends; which one runs is a version detail to check.
+- **Regexes cannot describe arbitrary nesting.** Recursive JSON schemas, or code, need a context-free
+  grammar, which requires a pushdown automaton (a state plus a stack).
+- **Grammar mode exists but costs more.** Outlines supports it, but it is costlier and less mature than
+  the regex path; engines such as vLLM also offer alternative grammar backends for this reason.
+- **Backends move.** The core was later rewritten as a separate `outlines-core` package, and recent
+  versions can delegate to other backends; which one runs is a version detail to check.
 
 ### Where it runs
-Outlines wraps local model runtimes (Hugging Face Transformers, llama.cpp, MLX and others) and its core
-FSM logic is used inside serving engines; vLLM's guided decoding has offered an Outlines backend. The
-public Python API has changed between major versions (older code uses `outlines.generate.json(model,
-Schema)`; the 1.x API passes the output type when calling the model), so check the version you install.
+- **Local runtimes:** Outlines wraps Hugging Face Transformers, llama.cpp, MLX and others.
+- **Serving engines:** its core FSM logic is used inside them; vLLM's guided decoding has offered an
+  Outlines backend.
+- **The API changed between major versions.** Older code uses `outlines.generate.json(model, Schema)`;
+  the 1.x API passes the output type when calling the model. Check the version you install.
 
 ### What constraining does to quality
-Masking renormalizes probability over the allowed tokens. If the model strongly wanted a token you
-forbade, it is pushed onto a path it considered unlikely, and the content on that path can be worse even
-though the format is perfect. Two mechanisms make this worse than it sounds:
-- **The mask is greedy, not look-ahead.** It only asks "can this token still lead to a valid string?",
-  not "is this a good continuation?". If the model's mass sits on prose like `Sure! {"intent"...`, the
-  mask removes `Sure` and the model is renormalized into a state it was not planning for. Describing the
-  format in the prompt (or showing an example) keeps the model's own preference aligned with the mask, so
-  little probability is removed.
-- **Non-canonical tokenization.** The index allows any token sequence that spells a valid string, including
-  splits the tokenizer would never produce for that text (for example `"` + `int` + `ent` where training
-  data always had `"intent`). The model has rarely seen such sequences, so its later predictions degrade.
-  Mature implementations handle forced boundaries carefully; it is still a reason to measure accuracy, not
-  just parse rate.
+Masking renormalizes over allowed tokens. If the model strongly wanted a forbidden token, it is pushed
+onto a path it considered unlikely, and content there can be worse even though the format is perfect.
+Two mechanisms make this worse than it sounds:
+- **The mask is greedy, not look-ahead.** It asks "can this token still lead to a valid string?", not
+  "is this a good continuation?". If the model's mass sits on prose like `Sure! {"intent"...`, the mask
+  removes `Sure` and renormalizes into a state the model was not planning for.
+- **Fix: describe the format in the prompt** (or show an example). The model's own preference then
+  aligns with the mask, so little probability is removed.
+- **Non-canonical tokenization.** The index allows any token sequence that spells a valid string,
+  including splits the tokenizer would never produce (for example `"` + `int` + `ent` where training data
+  always had `"intent`). The model has rarely seen these, so later predictions degrade.
+- **Still measure accuracy, not just parse rate.** Mature implementations handle forced boundaries
+  carefully, but constraints guarantee syntax, never correctness.
 
-Constraints guarantee syntax, never correctness.
+## Diagram
+The left half runs once per (pattern, tokenizer) pair; the loop on the right runs every token and only
+does a lookup and a mask.
 
-## Example
-A worked scenario: classifying 50,000 support tickets on a self-hosted 7B model into
+```mermaid
+flowchart LR
+    S["Regex, JSON Schema or choice list"] --> R["Compile to regex"]
+    R --> F["Character-level FSM"]
+    F --> I[("Index: state to allowed tokens and next state")]
+    T["Tokenizer vocabulary"] --> I
+    I --> L["Look up allowed set for current state"]
+    G["Model logits for next token"] --> K["Mask others to minus infinity, renormalize"]
+    L --> K
+    K --> P["Sample from survivors"]
+    P -->|"follow transition"| L
+    P --> O["Output valid by construction"]
+```
+
+## Examples
+### Toy FSM index and one masked step (pure Python)
+A choice constraint, a tiny vocabulary, the precomputed index, and one renormalized sampling step.
+
+```python
+import math
+
+choices = ["yes", "no", "not sure"]                    # constraint: one of these strings
+vocab = ["y", "ye", "yes", "n", "no", "not", " sure", "s", "x", "Sure"]
+
+# FSM states = every prefix of a valid string; build the index once.
+states = {c[:i] for c in choices for i in range(len(c) + 1)}
+index = {s: {t: s + t for t in vocab if s + t in states} for s in states}
+
+print(index[""])      # tokens allowed at the start, and the state each lands in
+print(index["not"])   # only ' sure' can continue 'not'
+
+# One decoding step: mask disallowed logits, renormalize, pick.
+logits = {"Sure": 3.0, "yes": 1.0, "no": 0.5, "x": 0.2, "y": 0.1}
+allowed = {t: v for t, v in logits.items() if t in index[""]}
+z = sum(math.exp(v) for v in allowed.values())
+probs = {t: round(math.exp(v) / z, 3) for t, v in allowed.items()}
+print(probs)          # 'Sure' had the most mass but is masked out
+```
+
+Output: `index[""]` allows `y`, `ye`, `yes`, `n`, `no`, `not`; the step gives roughly
+`{'yes': 0.497, 'no': 0.301, 'y': 0.202}`. That is the greedy-mask problem in miniature: the model's
+favourite token is gone and its mass is spread over paths it ranked lower.
+
+### Ticket classifier on a self-hosted model
+Classifying 50,000 support tickets on a self-hosted 7B model into
 `{"intent": one of 6 labels, "urgent": true|false}`.
 
-Unconstrained with a careful prompt, suppose 4% of outputs fail to parse (an illustrative figure; measure
-your own). With parse-and-retry, 2,000 tickets need at least one more generation, some need several, and
-the p99 latency is now two or three generations long. With Outlines, the JSON Schema compiles once into an
-index. Apart from whatever optional whitespace the generated pattern permits, the model can only emit
-`{"intent":"`, then the tokens of one of the six labels, then the closing quote, `,"urgent":`, then
-`true` or `false`, then `}`. Every output parses; no retries exist.
+| | Parse-and-retry | Outlines |
+|---|---|---|
+| Parse failures | Suppose 4% (illustrative; measure your own) | None: every output parses |
+| Extra work | 2,000 tickets need at least one more generation, some several | No retries exist |
+| p99 latency | Two or three generations long | One generation |
+| Compile | None | JSON Schema compiles once into an index |
 
-Two more things happen. First, the model emits far fewer free tokens: most of the structure is forced, and
-when only one token is allowed in a state there is nothing to sample, and some implementations append
-such forced tokens directly and process several of them in a single forward pass. Second, field order is generation order, so if you want the model to reason, put a bounded
-`reasoning` string *before* `intent` in the schema; otherwise the label is chosen with no reasoning to
-condition on.
+- **What the model may emit.** Apart from whatever optional whitespace the pattern permits:
+  `{"intent":"`, then the tokens of one of the six labels, then the closing quote, `,"urgent":`, then
+  `true` or `false`, then `}`.
+- **Far fewer free tokens.** Most structure is forced. When only one token is allowed there is nothing to
+  sample, and some implementations append such forced tokens directly and process several in one forward
+  pass.
+- **Field order is generation order.** To make the model reason, put a bounded `reasoning` string
+  *before* `intent`; otherwise the label is chosen with no reasoning to condition on.
 
 ```python
 from typing import Literal
@@ -132,39 +185,60 @@ raw = model("Classify: 'I was charged twice this month, fix it today.'", Ticket,
 print(Ticket.model_validate_json(raw))   # always parses; may still be the wrong label
 ```
 
+## Production patterns
+- **Compile at startup, cache by schema.** For fixed schemas, build the generator once when the worker
+  starts so no request pays compile latency; for dynamic schemas, cache by a hash of the schema plus
+  tokenizer. Monitor compile time and cache hit rate.
+- **Constrain in the serving engine.** When serving with vLLM or a similar engine, request structured
+  output per call through its OpenAI-compatible JSON-schema option instead of embedding Outlines in app
+  code; the backend is an engine setting whose name varies by version. Monitor per-token latency with and
+  without constraints.
+- **Bound every free-text field.** Use `Field(max_length=...)` (JSON Schema `maxLength`) on strings and
+  set `max_new_tokens` above the longest valid output. Monitor how often generation stops at the token
+  limit; it should be near zero.
+- **Prompt for the format and use the chat template.** Build the prompt with
+  `tokenizer.apply_chat_template(..., add_generation_prompt=True)` and describe the JSON in it, so the
+  mask removes little probability. Watch for degenerate values on easy inputs.
+- **Gate on accuracy, not parse rate.** Before rollout, run the labelled set constrained and unconstrained
+  and keep the better configuration. Track task accuracy per release, since parse rate will read 100%.
+
 ## Trade-offs
-- Validity is guaranteed on the first pass and retries vanish, but only when you own the inference
-  stack; on hosted APIs you rely on the provider's own structured output or on validate-and-retry tools.
-- Index construction is paid once per schema and tokenizer; for a few fixed schemas it amortizes to
-  nothing, but per-request dynamic schemas pay compile latency each time unless cached.
-- Hard constraints remove format errors yet can lower content quality when the mask fights the model's
-  preferences; a looser pattern plus validation sometimes scores better on accuracy evals.
-- Regex-based JSON is fast and robust for flat or bounded schemas; deeply recursive structures need
-  grammar mode, which costs more per step and is where alternative backends may perform better.
+- **Guaranteed validity vs owning the stack.** Validity is guaranteed on the first pass and retries
+  vanish, but only when you own the inference stack; on hosted APIs you rely on the provider's structured
+  output or on validate-and-retry tools.
+- **One-time compile vs dynamic schemas.** Index construction is paid once per schema and tokenizer; for a
+  few fixed schemas it amortizes to nothing, but per-request dynamic schemas pay compile latency each time
+  unless cached.
+- **No format errors vs content quality.** Hard constraints can lower content quality when the mask fights
+  the model's preferences; a looser pattern plus validation sometimes scores better on accuracy evals.
+- **Regex speed vs grammar reach.** Regex-based JSON is fast and robust for flat or bounded schemas;
+  deeply recursive structures need grammar mode, which costs more per step and is where alternative
+  backends may perform better.
 
 ## Pitfalls
-- Unbounded strings or whitespace in the pattern let the model fill tokens until `max_new_tokens`;
-  the symptom is outputs truncated at the limit, which then fail to parse despite the constraint.
-- Assuming constrained output is correct output; the symptom is a perfect parse rate alongside poor
-  accuracy on a labelled set, because format and truth are different properties.
-- Putting the answer field before any reasoning field; the label is committed first, and the symptom is
-  lower accuracy than the same model achieves in free-form chain-of-thought.
-- Copying tutorial code across major versions; the API was reorganised (the `outlines.generate.*`
-  functions and the old `outlines.models.transformers(...)` loader are pre-1.0 idioms), and the symptom
-  is `AttributeError` or `TypeError` on those calls after an upgrade.
-- Constraining the output without describing the format in the prompt; the mask then fights the model's
-  preferred opening, and the symptom is valid JSON with odd or degenerate field values on easy inputs.
-- Forgetting the chat template for instruct models; passing a bare prompt degrades quality, which shows
-  up as worse labels than the same model gives through its usual chat interface.
+- **Unbounded strings or whitespace in the pattern.** The model can fill tokens until `max_new_tokens`.
+  Symptom: outputs truncated at the limit, which then fail to parse despite the constraint.
+- **Assuming constrained output is correct output.** Symptom: a perfect parse rate alongside poor accuracy
+  on a labelled set, because format and truth are different properties.
+- **Answer field before any reasoning field.** The label is committed first. Symptom: lower accuracy than
+  the same model achieves in free-form chain-of-thought.
+- **Copying tutorial code across major versions.** The `outlines.generate.*` functions and the old
+  `outlines.models.transformers(...)` loader are pre-1.0 idioms. Symptom: `AttributeError` or `TypeError`
+  on those calls after an upgrade.
+- **Constraining without describing the format in the prompt.** The mask fights the model's preferred
+  opening. Symptom: valid JSON with odd or degenerate field values on easy inputs.
+- **Forgetting the chat template for instruct models.** A bare prompt degrades quality. Symptom: worse
+  labels than the same model gives through its usual chat interface.
 
 ## When to use
-Use Outlines (or an engine's guided decoding) when you self-host open models and need structured output
-at volume: classification, extraction, routing, agent tool arguments on a small model. It is most
-valuable where retries are expensive or latency-bound, and where small models break formats often. Do not
-reach for it with closed APIs, which do not expose logits; use their native structured output or a
-validate-and-retry library like Instructor. Measure parse rate (should become 100%), task accuracy with
-and without the constraint, and compile latency for new schemas. In interviews, explain the FSM index and
-why constraining fixes syntax but not semantics.
+- **Use when:** you self-host open models and need structured output at volume: classification,
+  extraction, routing, agent tool arguments on a small model.
+- **Most valuable when:** retries are expensive or latency-bound, and small models break formats often.
+- **Avoid when:** you use closed APIs, which do not expose logits; use their native structured output or a
+  validate-and-retry library like Instructor.
+- **Measure:** parse rate (should become 100%), task accuracy with and without the constraint, and compile
+  latency for new schemas.
+- **Interviews:** explain the FSM index and why constraining fixes syntax but not semantics.
 
 ## Role lens
 - **Engineer:** Defines schemas with bounded strings and sensible field order, wires constrained decoding
@@ -184,6 +258,42 @@ for each state, walk each token's characters through the automaton and record wh
 where it lands. Generation then becomes lookup plus masking. The cost moves to compile time and memory
 per schema, which is cheap for a few stable schemas but painful for per-request dynamic schemas, so you
 cache indexes and avoid generating schemas on the fly.
+
+## Interview questions
+### What is constrained decoding, and why can't prompting alone give the same guarantee?
+- **It filters the vocabulary before each sample.** Tokens that cannot continue a valid string get a logit
+  of negative infinity, and the model samples from what remains, renormalized.
+- **Prompting only shifts probabilities.** The sampler knows nothing about your format, so a prompt raises
+  the odds of valid JSON but never makes it certain, especially on small self-hosted models.
+
+### Your constrained classifier parses 100% of outputs, but accuracy dropped versus free-form output. What do you check?
+- **The prompt.** If it does not describe the JSON, the model's mass sits on prose like `Sure!`, and the
+  greedy mask pushes it onto paths it ranked low.
+- **The chat template.** Instruct models need `apply_chat_template(..., add_generation_prompt=True)`; a
+  bare prompt degrades quality.
+- **Field order.** If `intent` comes before any `reasoning` field, the label is committed with nothing to
+  condition on.
+- **Non-canonical token splits,** which the index allows but the model has rarely seen in training.
+
+### When would you not use Outlines?
+- **On closed hosted APIs,** because masking needs the logits before sampling; use native structured output
+  or a validate-and-retry library like Instructor.
+- **For per-request dynamic schemas you cannot cache,** because each new schema pays index compile time.
+- **For deeply recursive structures,** which need grammar mode; it costs more per step and is less mature
+  than the regex path.
+
+### Where does the cost of constrained decoding go, and how do you keep it off the request path?
+- **Into the index build.** Roughly FSM states × vocabulary size × average token length character steps,
+  so long enums and many optional fields compile visibly slower.
+- **Per token it is a lookup and a mask,** not a scan of tens or hundreds of thousands of tokens.
+- **So** compile fixed schemas at worker startup, cache dynamic ones by a hash of schema plus tokenizer,
+  and monitor compile time and cache hit rate.
+
+### Why do unbounded string fields cause truncated output even under a constraint?
+- **Any length is valid.** A looping model keeps emitting legal characters until `max_new_tokens`, leaving
+  the JSON unclosed.
+- **Fix:** set `maxLength` (Pydantic `Field(max_length=...)`) on every free-text field, set
+  `max_new_tokens` above the longest valid output, and alert on generations that stop at the limit.
 
 ## Quiz
 ### Q: Why can't Outlines enforce a schema on a closed hosted model API?

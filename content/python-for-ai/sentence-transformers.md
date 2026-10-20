@@ -5,7 +5,7 @@ name: sentence-transformers
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/hugging-face
   - python-for-ai/pytorch
@@ -21,89 +21,113 @@ sources:
 ---
 
 ## TL;DR
-sentence-transformers is the standard Python library for turning text into fixed-size vectors whose
-cosine similarity tracks meaning, and for scoring query-document pairs with cross-encoders. It wraps a
-Hugging Face encoder with the pooling, normalisation and training losses that make its outputs usable
-as embeddings. It exists because a raw transformer's token outputs are not good sentence vectors, and
-comparing every pair through a full model does not scale to search.
+sentence-transformers is the standard Python library for text embeddings whose cosine similarity tracks
+meaning, and for cross-encoder reranking. It adds the pooling, normalisation and training losses that
+turn a Hugging Face encoder into a usable search model.
 
 ## Why it exists
-A BERT-style encoder produces one vector per token, not per sentence. The obvious shortcuts, taking the
-`[CLS]` vector or averaging token vectors from a model trained only on masked-language modelling, give
-vectors whose cosine similarity correlates poorly with semantic similarity; the model was never trained
-to place paraphrases close together. The accurate alternative, feeding both sentences into one model
-and classifying the pair (a cross-encoder), works well but costs a full forward pass per pair: to find
-the best match for one query among a million documents you would run a million forward passes per
-query.
-
-Sentence-BERT's insight was to fine-tune the encoder in a siamese setup, two copies with shared
-weights, so that each sentence is encoded independently and a simple similarity between the two vectors
-is trained to reflect relatedness. Independent encoding is the key property: document vectors can be
-computed once, stored in a vector index, and each query costs one forward pass plus a nearest-neighbour
-lookup. The library grew around that idea and now packages the model loading, pooling, batching,
-multi-GPU encoding, contrastive training losses and the cross-encoder rerankers you put after
-retrieval. Without it, every team re-implements pooling and normalisation, and small differences (mean
-versus CLS pooling, forgetting to normalise, missing query prefixes) silently degrade retrieval.
+- **Token vectors are not sentence vectors.** A BERT-style encoder emits one vector per token. Taking
+  `[CLS]` or averaging tokens from a model trained only on masked-language modelling gives vectors whose
+  cosine similarity correlates poorly with meaning; it was never trained to put paraphrases close.
+- **Pairwise scoring does not scale.** A cross-encoder (both sentences in one model, classify the pair) is
+  accurate but costs a forward pass per pair: a million forward passes per query over a million documents.
+- **Sentence-BERT's fix: siamese training.** Two copies with shared weights encode each sentence
+  independently, and a simple similarity between the two vectors is trained to reflect relatedness.
+- **Independent encoding is the key property.** Document vectors are computed once and stored in a vector
+  index; each query costs one forward pass plus a nearest-neighbour lookup.
+- **One library prevents silent drift.** It packages loading, pooling, batching, multi-GPU encoding,
+  contrastive losses and rerankers. Without it, teams re-implement pooling and small differences (mean vs
+  CLS pooling, forgetting to normalise, missing query prefixes) silently degrade retrieval.
 
 ## How it works
 ### Bi-encoder: `SentenceTransformer`
-A model is a pipeline of modules saved together: a Transformer module (a Hugging Face encoder with its
-tokenizer and max sequence length), a Pooling module (mean of token vectors masked by attention, CLS, or
-last-token for decoder-based embedders), and optionally a Dense projection and a Normalize step.
-`encode(texts, batch_size=..., normalize_embeddings=True)` tokenises, sorts inputs by length to reduce
-padding waste, runs batches on the chosen device under no-grad, pools and returns a NumPy array or
-tensor of shape `[n, dim]`. Normalising to unit length means dot product equals cosine similarity,
-which is what most vector indexes compute fastest.
+A model is a pipeline of modules saved together:
 
-Mean pooling is `e = Σᵢ mᵢ·hᵢ / Σᵢ mᵢ`, where `hᵢ` is token i's output vector and `mᵢ` is 1 for real
-tokens and 0 for padding. The mask matters because padding vectors are not zero; averaging them in would
-make the same sentence embed differently depending on what else was in its batch. Which pooling is
-correct is a property of how the model was trained, not a free choice, which is why the library stores
-the pooling config with the weights instead of asking you to pick.
+| Module | Role |
+|---|---|
+| Transformer | a Hugging Face encoder with its tokenizer and max sequence length |
+| Pooling | mean of token vectors masked by attention, CLS, or last-token for decoder-based embedders |
+| Dense (optional) | projection |
+| Normalize (optional) | unit length |
+
+`encode(texts, batch_size=..., normalize_embeddings=True)`:
+1. Tokenises and sorts inputs by length to reduce padding waste.
+2. Runs batches on the chosen device under no-grad.
+3. Pools and returns a NumPy array or tensor of shape `[n, dim]`.
+
+- **Normalise for speed.** At unit length, dot product equals cosine similarity, which most vector indexes
+  compute fastest.
+
+### Mean pooling and why the mask matters
+```
+e = Σᵢ mᵢ·hᵢ / Σᵢ mᵢ        hᵢ = token i's output vector, mᵢ = 1 for real tokens, 0 for padding
+```
+
+- **Padding vectors are not zero**, so averaging them in would make the same sentence embed differently
+  depending on what else was in its batch.
+- **Pooling is fixed by training, not a free choice**, which is why the library stores the pooling config
+  with the weights instead of asking you to pick.
 
 ### Prompts and asymmetry
-Many retrieval models are trained asymmetrically: queries and passages get different instruction
-prefixes (for example E5's `"query: "` and `"passage: "`). The library stores such prompts in the model
-config and applies them via `prompt_name` (and, from v5, through `encode_query` / `encode_document`,
-which pick the right prompt for you), because forgetting the prefix measurably hurts retrieval for
-those models while raising no error.
+- **Asymmetric models need prefixes.** Queries and passages get different instructions, for example E5's
+  `"query: "` and `"passage: "`.
+- **The library applies them.** Prompts live in the model config and are applied via `prompt_name`, and,
+  from v5, through `encode_query` / `encode_document`, which pick the right prompt for you.
+- **Why bother:** forgetting the prefix measurably hurts retrieval for those models while raising no error.
 
 ### Cross-encoder: `CrossEncoder`
-A cross-encoder takes the concatenated `(query, document)` pair and outputs one relevance score.
-Attention runs across both texts, so it captures interactions a dot product cannot, and it is usually
-more accurate, but it cannot precompute anything. The standard pattern is retrieve-then-rerank: a
-bi-encoder fetches the top 50-200 candidates cheaply, then a cross-encoder rescores only those.
+- **Input:** the concatenated `(query, document)` pair; **output:** one relevance score.
+- **More accurate, nothing precomputable.** Attention runs across both texts, capturing interactions a dot
+  product cannot.
+- **Retrieve-then-rerank.** A bi-encoder fetches the top 50-200 candidates cheaply; a cross-encoder
+  rescores only those.
 
-### Training
-Fine-tuning uses contrastive losses. `MultipleNegativesRankingLoss` takes (anchor, positive) pairs and
-treats every other positive in the batch as a negative. For anchor `aᵢ` in a batch of B pairs it is a
-B-way softmax cross-entropy:
+### Training with contrastive losses
+`MultipleNegativesRankingLoss` takes (anchor, positive) pairs and treats every other positive in the batch
+as a negative. For anchor `aᵢ` in a batch of B pairs it is a B-way softmax cross-entropy:
 
 ```
 loss_i = -log( exp(s·cos(aᵢ, pᵢ)) / Σⱼ exp(s·cos(aᵢ, pⱼ)) )      # j = 1..B, s is a scale (default 20)
 ```
 
-so each step asks "pick your true positive out of B candidates". Larger batches mean more, and on
-average harder, negatives for free, which is why batch size matters more here than in classification;
-`CachedMultipleNegativesRankingLoss` reaches large effective batches without the memory by computing
-embeddings in chunks. Adding a mined hard negative per pair (anchor, positive, negative), a passage that
-looks relevant but is not, teaches the distinctions random in-batch negatives never test. One trap:
-duplicates in a batch (two pairs with the same positive) become false negatives, so deduplicate. Recent versions train through a
-`SentenceTransformerTrainer` built on the Hugging Face Trainer, with evaluators that report retrieval
-metrics such as recall@k and NDCG on a held-out set.
+- **Each step asks "pick your true positive out of B candidates".**
+- **Batch size matters more than in classification**, because larger batches mean more, and on average
+  harder, negatives for free.
+- **`CachedMultipleNegativesRankingLoss`** reaches large effective batches without the memory by
+  computing embeddings in chunks.
+- **Mined hard negatives** (anchor, positive, negative): a passage that looks relevant but is not teaches
+  distinctions random in-batch negatives never test.
+- **Trap: duplicates become false negatives.** Two pairs with the same positive in a batch; deduplicate.
+- **Trainer.** Recent versions use a `SentenceTransformerTrainer` built on the Hugging Face Trainer, with
+  evaluators reporting retrieval metrics such as recall@k and NDCG on a held-out set.
 
 ### Matryoshka embeddings
-Models trained with `MatryoshkaLoss` pack the most important information into the leading dimensions, so
-you can keep, say, the first 256 of 768 dimensions (`truncate_dim=256`) and accept a modest recall loss
-for a 3× smaller index. A model not trained this way degrades badly when truncated, so check the model
-card before cutting dimensions, and re-normalise after truncation.
+- **Leading dimensions carry the most.** Models trained with `MatryoshkaLoss` let you keep, say, the first
+  256 of 768 dimensions (`truncate_dim=256`) for a 3× smaller index and a modest recall loss.
+- **Only for models trained that way.** Others degrade badly when truncated; check the model card, and
+  re-normalise after truncation.
 
 ### Truncation
-Each model has a `max_seq_length`; longer inputs are silently truncated. That limit, not the model's
-theoretical context, decides your chunk size.
+- **Each model has a `max_seq_length`**; longer inputs are silently truncated.
+- **That limit, not the model's theoretical context, decides your chunk size.**
 
-## Example
-Retrieve-then-rerank over a small corpus. `all-MiniLM-L6-v2` produces 384-dimensional vectors.
+## Diagram
+Retrieve-then-rerank: documents are embedded once offline, each query costs one bi-encoder pass plus a
+nearest-neighbour lookup, and only the k candidates pay for a cross-encoder pass.
+
+```mermaid
+flowchart LR
+    D["Documents, chunked under max_seq_length"] -->|"encode with passage prompt, offline"| BI["Bi-encoder: transformer, mask-aware pooling, normalize"]
+    BI --> IDX[("Vector index, model version stored")]
+    Q["User query"] -->|"encode with query prompt"| QE["Query vector"]
+    QE -->|"dot product equals cosine"| IDX
+    IDX -->|"top 50 to 200 candidates"| CE["CrossEncoder scores each query, doc pair"]
+    CE -->|"keep fixed top-k such as 5"| OUT["Passages sent to the LLM"]
+```
+
+## Examples
+### Retrieve-then-rerank over a small corpus
+`all-MiniLM-L6-v2` produces 384-dimensional vectors.
 
 ```python
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -130,49 +154,104 @@ for i, s in sorted(zip(top, rerank), key=lambda t: -t[1]):
 print(bi.max_seq_length)                       # inputs beyond this many tokens are truncated
 ```
 
-What to look for when you run it: both refund-related passages score well with the bi-encoder because
-they share the topic of returns, while the cross-encoder, which reads the query and passage together,
-should separate the one that answers "how long" (the 14-day passage) from the one that only mentions
-returns. Exact scores vary by model version; the ordering is the lesson.
+- **What to look for:** both refund-related passages score well with the bi-encoder because they share
+  the topic of returns. The cross-encoder reads query and passage together, so it should separate the one
+  that answers "how long" (the 14-day passage) from the one that only mentions returns.
+- **Exact scores vary by model version**; the ordering is the lesson.
+- **Cost shape:** with N documents and k candidates, a query costs 1 bi-encoder pass plus k cross-encoder
+  passes instead of N. At N = 1,000,000 and k = 50 that is 51 forward passes per query instead of a
+  million.
 
-Cost shape: with N documents and k candidates, a query costs 1 bi-encoder pass plus k cross-encoder
-passes, instead of N cross-encoder passes. At N = 1,000,000 and k = 50 that is 51 forward passes per
-query instead of a million.
+### Fine-tune on in-domain pairs without false negatives
+Sentence Transformers v3+ trainer API; the no-duplicates sampler keeps repeated texts out of one batch.
+
+```python
+from datasets import Dataset
+from sentence_transformers import (SentenceTransformer, SentenceTransformerTrainer,
+                                   SentenceTransformerTrainingArguments, losses)
+from sentence_transformers.training_args import BatchSamplers
+
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+train = Dataset.from_dict({
+    "anchor":   ["how long do refunds take", "reset my password"],
+    "positive": ["Refunds are issued within 14 days of a returned item being received.",
+                 "To reset your password, use the link on the sign-in page."],
+})
+args = SentenceTransformerTrainingArguments(
+    output_dir="out/support-embedder",
+    per_device_train_batch_size=64,                 # bigger batch = more in-batch negatives
+    batch_sampler=BatchSamplers.NO_DUPLICATES,      # avoid false negatives from duplicates
+    num_train_epochs=1,
+)
+loss = losses.MultipleNegativesRankingLoss(model)
+SentenceTransformerTrainer(model=model, args=args, train_dataset=train, loss=loss).train()
+```
+
+After training, re-embed the whole corpus with the new model, because its vectors are not comparable with
+the old ones.
+
+### Worked scenario: index size with Matryoshka truncation
+10 million passages stored as fp32 (4 bytes per dimension), vectors only, before index overhead:
+
+| Dimensions kept | Bytes per vector | Total |
+|---|---|---|
+| 768 (full) | 3,072 | ~30.7 GB |
+| 256 (`truncate_dim=256`) | 1,024 | ~10.2 GB |
+
+The 3× saving is real only for a Matryoshka-trained model; measure recall@k at both sizes on your labelled
+queries before switching.
+
+## Production patterns
+- **Version every vector.** Store the model name and version with each embedding, and re-index into a new
+  collection on upgrade, then switch reads over in one step. Monitor that no index mixes versions.
+- **Retrieve wide, rerank narrow.** Pull the top 50-200 with the bi-encoder, rerank with a `CrossEncoder`,
+  keep a fixed top-k such as 5. Monitor recall@50 on labelled queries and p95 rerank latency.
+- **Chunk to the real limit.** Count chunk tokens with the model's own tokenizer and keep each under
+  `max_seq_length`. Monitor the share of chunks that would be truncated; it should be zero.
+- **Let the library apply prompts.** Use `encode_query` / `encode_document` (v5) or `prompt_name` instead
+  of hand-written prefixes, so query and passage formats cannot drift apart. Spot-check recall against
+  the model card's claim.
+- **Batch offline embedding.** Pass whole lists to `encode` with a tuned `batch_size` on GPU, never one
+  text per call. Monitor documents per second and GPU utilisation during backfills.
 
 ## Trade-offs
-- Bi-encoders allow precomputed document vectors and millisecond search, but compress each text to one
-  vector and miss fine query-document interactions; add a cross-encoder when top-k precision matters.
-- Running embeddings locally avoids per-token API cost and keeps data in-house, but you own GPU capacity
-  and batching; hosted embedding APIs win when volume is small or ops capacity is scarce.
-- Small models (MiniLM-class) are fast enough for CPU, but larger or instruction-tuned embedders usually
-  retrieve better; the gap must be measured on your queries, not read from a public leaderboard.
-- Fine-tuning on in-domain pairs often beats a bigger generic model, but requires re-embedding the
-  whole corpus with the new model, since vectors from different models are not comparable.
+- **Precomputed speed vs fine interactions.** Bi-encoders allow precomputed document vectors and
+  millisecond search but compress each text to one vector and miss fine query-document interactions; add
+  a cross-encoder when top-k precision matters.
+- **Local vs hosted.** Running embeddings locally avoids per-token API cost and keeps data in-house, but
+  you own GPU capacity and batching; hosted embedding APIs win when volume is small or ops capacity scarce.
+- **Small and fast vs larger and better.** MiniLM-class models are fast enough for CPU, but larger or
+  instruction-tuned embedders usually retrieve better; measure the gap on your queries, not a public
+  leaderboard.
+- **Fine-tuned vs bigger generic.** Fine-tuning on in-domain pairs often beats a bigger generic model but
+  requires re-embedding the whole corpus, since vectors from different models are not comparable.
 
 ## Pitfalls
-- Forgetting `normalize_embeddings=True` with a model that does not already end in a Normalize module,
-  when the index uses dot product: documents whose vectors happen to have a large magnitude get inflated
-  scores, and the symptom is retrieval favouring the same few documents for every query.
-- Omitting a model's required query or passage prefix: no error, just noticeably worse recall than the
+- **Forgetting `normalize_embeddings=True` with a dot-product index**, on a model that does not already end
+  in a Normalize module. Large-magnitude vectors get inflated scores. Symptom: the same few documents win
+  for every query.
+- **Omitting a model's required query or passage prefix.** No error, just noticeably worse recall than the
   model card claims.
-- Chunks longer than `max_seq_length`: the tail is silently dropped, so facts near the end of a chunk
+- **Chunks longer than `max_seq_length`.** The tail is silently dropped, so facts near the end of a chunk
   are never retrievable.
-- Mixing vectors from two model versions in one index after an upgrade: similarity scores become
-  meaningless, and the symptom is a sudden, unexplained retrieval quality drop.
-- Thresholding cross-encoder scores ("keep passages scoring above 0.5") and then swapping the model:
-  scores are model-specific logits or sigmoid outputs, not calibrated probabilities, and the symptom is a
-  reranker that suddenly keeps nothing or everything; re-tune thresholds per model, or keep a fixed top-k.
-- Encoding one text at a time in a loop: throughput collapses because the GPU processes batches of one;
-  pass lists and let `encode` batch.
+- **Mixing vectors from two model versions in one index after an upgrade.** Similarity scores become
+  meaningless. Symptom: a sudden, unexplained retrieval quality drop.
+- **Thresholding cross-encoder scores ("keep passages scoring above 0.5") then swapping the model.** Scores
+  are model-specific logits or sigmoid outputs, not calibrated probabilities, so the reranker suddenly
+  keeps nothing or everything. Fix: re-tune thresholds per model, or keep a fixed top-k.
+- **Encoding one text at a time in a loop.** Throughput collapses because the GPU processes batches of
+  one; pass lists and let `encode` batch.
 
 ## When to use
-Reach for sentence-transformers when you need embeddings or reranking from open models: self-hosted
-RAG, data that cannot leave the network, high-volume offline embedding where API costs add up, semantic
-deduplication, clustering, or fine-tuning an embedder on your domain. Prefer a hosted embedding API when
-volume is modest and you do not want to run GPUs. Before choosing a model, build a small labelled set of
-real queries with their correct passages and measure recall@k and MRR for two or three candidates;
-choose on that, and record the model name and version alongside every stored vector. In interviews,
-explain bi-encoder versus cross-encoder cost and why in-batch negatives make batch size matter.
+- **Use when** you need embeddings or reranking from open models: self-hosted RAG, data that cannot leave
+  the network, high-volume offline embedding where API costs add up, semantic deduplication, clustering,
+  or fine-tuning an embedder on your domain.
+- **Prefer a hosted embedding API when** volume is modest and you do not want to run GPUs.
+- **Measure before choosing:** build a small labelled set of real queries with their correct passages,
+  measure recall@k and MRR for two or three candidates, choose on that, and record the model name and
+  version alongside every stored vector.
+- **Interviews:** explain bi-encoder versus cross-encoder cost and why in-batch negatives make batch size
+  matter.
 
 ## Role lens
 - **Engineer:** Embeds corpora in batches, applies correct prefixes and normalisation, adds a
@@ -192,6 +271,42 @@ negation. I would retrieve a larger candidate set, say top 50, with the bi-encod
 rerank with a cross-encoder and keep the top 5. Latency grows with the candidate count, so I would
 measure recall@50 to make sure the right passage is in the pool, then tune the pool size against p95
 latency and a precision metric on labelled queries.
+
+## Interview questions
+### Why can't you just mean-pool a plain BERT model to get sentence embeddings?
+- **It was never trained for it:** a masked-language-modelling encoder was not trained to put paraphrases
+  close, so pooled `[CLS]` or averaged token vectors give cosine scores that correlate poorly with meaning.
+- **Siamese contrastive training fixes that:** Sentence-BERT trains shared-weight encoders so a simple
+  similarity between independently encoded vectors reflects relatedness.
+- **Pooling is fixed by training**, so the library stores the pooling config with the weights.
+
+### Retrieval quality dropped suddenly after a model upgrade. What do you check?
+- **Mixed vector versions:** vectors from two models in one index are not comparable, so scores become
+  meaningless; check that every stored vector carries the new model name and version.
+- **Prompts and normalisation:** confirm the new model's required query and passage prefixes are applied
+  and that `normalize_embeddings=True` is set if the index uses dot product.
+- **Fix:** re-embed into a new collection, measure recall@k on labelled queries, then switch reads over.
+
+### When is a cross-encoder reranker not worth adding?
+- **When top-k precision is already fine:** if the right passage already ranks in the top few, a reranker
+  adds latency for little gain.
+- **When the candidate pool misses the answer:** reranking cannot recover a passage the bi-encoder never
+  retrieved, so fix recall@50 first.
+- **When latency budgets are tight:** cost grows with candidate count because each pair is one forward
+  pass; measure p95 rerank latency against the precision gained.
+
+### Why does batch size matter so much when training with `MultipleNegativesRankingLoss`?
+- **In-batch negatives:** every other positive in the batch is a negative, so a batch of B pairs makes
+  each step a B-way softmax.
+- **Bigger batches give more and harder negatives for free**; `CachedMultipleNegativesRankingLoss`
+  reaches large effective batches without the memory.
+- **Duplicates become false negatives**, so use the no-duplicates batch sampler.
+
+### How much storage does a 10M-passage index need, and how would you shrink it?
+- **Full 768 dimensions in fp32:** 3,072 bytes per vector, about 30.7 GB before index overhead.
+- **Matryoshka truncation to 256 dimensions:** 1,024 bytes per vector, about 10.2 GB, a 3× saving, but
+  only for a model trained with `MatryoshkaLoss` and only after measuring recall@k at both sizes.
+- **Re-normalise after truncation**, because the shorter vector is no longer unit length.
 
 ## Quiz
 ### Q: Why can a bi-encoder search a million documents quickly while a cross-encoder cannot?

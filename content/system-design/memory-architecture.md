@@ -5,7 +5,7 @@ name: Memory architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - agents/agent-memory
   - agents/memory-retrieval-update-deletion-policies
@@ -21,115 +21,115 @@ sources:
 ---
 
 ## TL;DR
-Models are stateless and context windows are finite, so anything an application must "remember" across
-turns, sessions or users has to be stored outside the model and brought back selectively. Memory
-architecture is the design of those stores and the policies that write, read, update and delete them:
-working memory in the context, session state in a database, long-term episodic and semantic memory in
-retrievable stores, each scoped to a user and tenant. The hard decisions are what to remember and what
-to forget.
+Models are stateless and windows finite, so anything remembered across turns, sessions or users lives
+outside the model and returns selectively. Memory architecture designs those scoped stores and the
+policies that write, read, update and delete them; the hard part is what to forget.
 
 ## Why it exists
-Every model call starts from zero. The only thing the model knows about this user, this task and the
-last hour is what the application puts in the prompt. For a single question that is fine. For an
-assistant that runs over weeks it means that preferences, decisions, half-finished tasks and facts
-learned in earlier sessions vanish unless something carries them forward.
-
-The naive design is to carry everything forward: append the whole conversation on every call. Cost and
-latency grow linearly with history, because every turn re-reads all previous turns; the window
-eventually fills; and quality drops before that, because relevant facts get buried among hundreds of
-turns of chatter. It also does nothing across sessions or across the user's other devices and agents.
-
-The second naive design is to embed every utterance into a vector store and retrieve by similarity. This
-brings back stale and contradictory facts side by side ("user lives in Berlin" from last year, "moved to
-Lisbon" from last week), has no notion of updating or deleting a fact, retrieves things the user told a
-different agent in a different context, and cannot answer "what did we decide", because decisions are
-not textually similar to the question that needs them.
-
-Memory architecture exists to replace both with explicit stores and policies. It borrows the
-operating-system picture: a small, expensive working set (the context window), a larger persistent
-store, and a controller that decides what to page in and out. The "what" is the design problem.
-Remember too little and the assistant is amnesiac; remember too much and it is expensive, confused and
-a privacy liability.
+- **Every model call starts from zero.** The model knows only what the application puts in the prompt.
+  Fine for one question; for an assistant running over weeks, preferences, decisions, half-finished
+  tasks and facts from earlier sessions vanish unless something carries them forward.
+- **Carrying the whole conversation forward fails.** Cost and latency grow linearly with history,
+  because every turn re-reads all previous turns; the window eventually fills; quality drops before that
+  as facts get buried among hundreds of turns of chatter. And nothing crosses sessions, devices or agents.
+- **Embedding every utterance and retrieving by similarity also fails.** It returns stale and
+  contradictory facts side by side ("user lives in Berlin" from last year, "moved to Lisbon" from last
+  week), cannot update or delete, retrieves what the user told a different agent, and cannot answer
+  "what did we decide", because decisions are not textually similar to the question that needs them.
+- **Explicit stores and policies replace both.** The operating-system picture: a small, expensive working
+  set (the context window), a larger persistent store, and a controller deciding what to page in and out.
+- **The "what" is the design problem.** Remember too little and the assistant is amnesiac; too much and
+  it is expensive, confused and a privacy liability.
 
 ## How it works
 ### Memory types and where each lives
-1. **Working memory** is the context window: system prompt, the current task, recent turns, retrieved
-   items. It is rebuilt per call by code; the model never stores anything itself.
-2. **Session state** is the full transcript and task state of one conversation or run, kept in a
-   database keyed by conversation id. It is the source of truth for the session *because* the context is
-   a view of it, not the other way around; compaction summarizes it for the prompt without deleting it.
-3. **Episodic memory** records what happened: past sessions, outcomes, decisions, with timestamps. It
-   answers "what did we do last time".
-4. **Semantic memory** holds distilled facts and preferences: "prefers concise answers", "account tier:
-   enterprise", "project X uses Postgres". It is small, structured where possible, and updated in place.
-5. **Procedural memory** is learned how-to: instructions, tool-usage notes, corrections that should
-   change future behaviour. It lands in prompts, skills or configuration, usually after human review.
-6. **External knowledge** (documents, databases) is not memory; it is retrieval, covered by the RAG
-   architecture lesson. Keeping them separate matters *because* memory is per user and mutable while
-   knowledge is shared and versioned.
+| # | Type | Holds | Lives in | Answers |
+|---|---|---|---|---|
+| 1 | Working memory | system prompt, current task, recent turns, retrieved items | the context window, rebuilt per call by code | this call |
+| 2 | Session state | full transcript and task state of one conversation or run | database keyed by conversation id | this session |
+| 3 | Episodic memory | past sessions, outcomes, decisions, with timestamps | retrievable store | "what did we do last time" |
+| 4 | Semantic memory | distilled facts and preferences | small, structured where possible, updated in place | "prefers concise answers", "account tier: enterprise", "project X uses Postgres" |
+| 5 | Procedural memory | instructions, tool-usage notes, corrections | prompts, skills or configuration, usually after human review | how to behave next time |
+| 6 | External knowledge | documents, databases | RAG index (see the RAG architecture lesson) | not memory |
+
+- **The model never stores anything itself;** working memory is assembled by code each call.
+- **Session state is the source of truth** *because* the context is a view of it, not the other way
+  around; compaction summarizes it for the prompt without deleting it.
+- **Keep knowledge separate from memory** *because* memory is per user and mutable while knowledge is
+  shared and versioned.
 
 ### The four operations
-- **Write.** Decide what is worth keeping. Options: the model calls a `remember` tool explicitly; a
-  background extractor reads the session after each turn or at session end and proposes facts; or the
-  application records structured events (purchases, settings changes) directly. Extraction at write time
-  keeps reads cheap *because* a read happens on every call and a write only when something changes.
-- **Read.** Build the working set: the last *n* turns verbatim, a rolling summary of older turns,
-  semantic facts for this user that match the current task, and episodic items ranked by relevance,
-  recency and importance. Scope filters (tenant, user, agent, purpose) apply inside the query, not
-  after, for the same reason as ACLs in RAG.
-- **Update and consolidate.** New facts that contradict old ones must supersede them, not sit beside
-  them; duplicates must merge; many episodes collapse into one summary. Detecting a contradiction is
-  the hard part, and embedding similarity alone is a poor detector: "lives in Berlin" and "moved to
-  Lisbon" may not be close vectors, while "likes Python" and "dislikes Python" are. Two mechanisms work.
-  For facts that drive behaviour, use typed slots (`home_city`, `answer_style`) so an update is an
-  upsert by key and supersession is deterministic. For free-text memories, retrieve the few nearest
-  existing memories and ask a model to choose add, update, delete or no-op against them. Consolidation
-  runs as a background job *because* it needs a model call and should not sit in the request path.
-- **Forget.** Time-to-live for episodic items, explicit deletion on user request, purpose limits (memory
-  collected for support is not used for marketing), and tenant off-boarding. Deletion must reach every
-  derived copy, including embeddings and summaries, which is why memory rows need lineage back to their
-  source events.
+1. **Write: decide what is worth keeping.**
+   - The model calls a `remember` tool explicitly; or
+   - a background extractor reads the session after each turn or at session end and proposes facts; or
+   - the application records structured events (purchases, settings changes) directly.
+   - Extraction at write time keeps reads cheap *because* a read happens on every call and a write only
+     when something changes.
+2. **Read: build the working set.** The last *n* turns verbatim, a rolling summary of older turns,
+   semantic facts for this user that match the task, and episodic items ranked by relevance, recency and
+   importance. Scope filters (tenant, user, agent, purpose) apply inside the query, not after, for the
+   same reason as ACLs in RAG.
+3. **Update and consolidate.** New facts that contradict old ones must supersede them, not sit beside
+   them; duplicates merge; many episodes collapse into one summary.
+   - **Embedding similarity is a poor contradiction detector:** "lives in Berlin" and "moved to Lisbon"
+     may not be close vectors, while "likes Python" and "dislikes Python" are.
+   - **Typed slots** (`home_city`, `answer_style`) for facts that drive behaviour: an update is an upsert
+     by key, so supersession is deterministic.
+   - **Model adjudication for free text:** retrieve the few nearest memories and ask a model to choose
+     add, update, delete or no-op against them.
+   - **Run consolidation in the background** *because* it needs a model call and should not sit in the
+     request path.
+4. **Forget.** Time-to-live for episodic items, explicit deletion on user request, purpose limits
+   (memory collected for support is not used for marketing), and tenant off-boarding. Deletion must reach
+   every derived copy, including embeddings and summaries, which is why memory rows need lineage back to
+   their source events.
 
 ### A read policy, concretely
-A common ranking, from the generative-agents line of work, scores each candidate as a weighted sum of
-relevance (embedding similarity to the current task), recency (exponential decay on age) and importance
-(a score assigned at write time), then takes the top *k* under a token budget:
-`score = w_rel·sim(q, m) + w_rec·exp(−age/τ) + w_imp·importance`, with each term normalized to [0, 1] so
-the weights mean what they say. At scale, an ANN search fetches a few hundred candidates by relevance and
-the composite score reranks only those, *because* computing recency and importance over every row is
-wasted work. The weights and τ are product decisions: a coding assistant weights recency (yesterday's
-branch matters, last quarter's does not), a CRM assistant weights importance (the contract renewal date
-matters however old it is).
+From the generative-agents line of work, score each candidate as a weighted sum, then take the top *k*
+under a token budget:
+
+`score = w_rel·sim(q, m) + w_rec·exp(−age/τ) + w_imp·importance`
+
+- **Terms:** relevance (embedding similarity to the current task), recency (exponential decay on age),
+  importance (a score assigned at write time), each normalized to [0, 1] so the weights mean what they
+  say.
+- **Two stages at scale:** an ANN search fetches a few hundred candidates by relevance and the composite
+  score reranks only those, *because* computing recency and importance over every row is wasted work.
+- **Weights and τ are product decisions:** a coding assistant weights recency (yesterday's branch
+  matters, last quarter's does not); a CRM assistant weights importance (the contract renewal date
+  matters however old it is).
 
 ### Who controls paging
-The MemGPT line of work makes the operating-system analogy literal: the model itself is given tools to
-read, write and evict memory, and decides when to page items in and out of its context. That is the
-same set of operations as above with the controller moved from application code into the model. It buys
-flexibility on open-ended tasks and costs predictability, extra calls, and a model that sometimes forgets
-to remember, so production systems often combine a code-driven baseline read with model-callable memory
-tools for the rest.
+- **Code-controlled:** the application decides what enters the context, as above.
+- **Model-controlled (MemGPT line of work):** the OS analogy made literal; the model gets tools to read,
+  write and evict memory and decides when to page items in and out. Same operations, controller moved
+  into the model.
+- **The trade:** flexibility on open-ended tasks, at the cost of predictability, extra calls, and a model
+  that sometimes forgets to remember.
+- **Production default:** a code-driven baseline read plus model-callable memory tools for the rest.
 
 ### Scoping and isolation
-Every memory row carries tenant id, user id, the agent or purpose it was collected for, a source event
-id and timestamps. Cross-user leakage through memory is the most embarrassing failure in this area, and
-it happens when the key is the agent instead of the user, or when a shared summary is built across
-users.
+- **Every memory row carries** tenant id, user id, the agent or purpose it was collected for, a source
+  event id and timestamps.
+- **Cross-user leakage is the most embarrassing failure here.** It happens when the key is the agent
+  instead of the user, or when a shared summary is built across users.
 
 ### Budget arithmetic (illustrative)
-A 200-turn conversation at roughly 150 tokens per turn replays about 30,000 tokens per call if sent
-verbatim. Keeping the last 10 turns verbatim (about 1,500 tokens), a 400-token rolling summary and 800
-tokens of retrieved memories puts the working set under 3,000 tokens, a tenfold reduction that stays
-flat as the conversation grows. Over the whole conversation the gap is larger still, because verbatim
-replay re-sends every earlier turn on every call: Σ 150·t for t = 1…200 ≈ 3.0M input tokens, against at
-most about 0.6M for the bounded design. Linear-per-call growth is quadratic in total. That flat line is
-the architectural goal.
+| Design | Per call | Over a 200-turn conversation |
+|---|---|---|
+| Verbatim replay (roughly 150 tokens per turn) | about 30,000 tokens at turn 200 | Σ 150·t for t = 1…200 ≈ 3.0M input tokens |
+| Bounded: last 10 turns (about 1,500 tokens) + 400-token summary + 800 tokens of memories | under 3,000 tokens, flat | at most about 0.6M |
 
-## Example
-A memory layer with the tiers wired together: a session store as the source of truth, a write policy
-that extracts facts after each turn and supersedes contradictions (by slot for typed facts, by model
-adjudication for free text), and a read policy that assembles a
-bounded working set using relevance, recency and scope. `llm`, `embed`, `cosine` and `store` are
-stand-ins for your model, embedding model and database.
+- **A tenfold per-call reduction that stays flat** as the conversation grows.
+- **Linear-per-call growth is quadratic in total,** because verbatim replay re-sends every earlier turn
+  on every call. That flat line is the architectural goal.
+
+## Examples
+### A memory layer with the tiers wired together
+A session store as the source of truth, a write policy that extracts facts after each turn and
+supersedes contradictions (by slot for typed facts, by model adjudication for free text), and a read
+policy that assembles a bounded working set using relevance, recency and scope. `llm`, `embed`, `cosine`
+and `store` stand in for your model, embedding model and database.
 
 ```python
 import math, time
@@ -172,56 +172,100 @@ def after_turn(user, tenant, convo_id, store):
             store.supersede(near[op["target_index"]].id, text=f["text"], **common)
 ```
 
-Trace two turns. In March the user says "I'm based in Berlin"; the extractor emits
-`{slot: "home_city", text: "Berlin"}` and the slot is written. In June they say "we just moved to
-Lisbon"; the extractor emits the same slot, the upsert replaces Berlin and records the June turn as the
-source, and no later read can surface both cities. Separately, "I like answers with code first" has no
-slot, so the three nearest memories are fetched; one is "prefers short answers", and the adjudicator
-chooses `add`, because the two preferences are compatible. Had a cosine threshold alone decided, the
-close pair "prefers short answers" / "prefers detailed answers" would either have been merged as a
-duplicate, keeping whichever text won, or kept side by side as a contradiction, depending on where the
-threshold sat; the adjudicator sees a conflict and chooses `update`.
+### Tracing the write policy over two turns and one preference
+| When | User says | Path | Result |
+|---|---|---|---|
+| March | "I'm based in Berlin" | extractor emits `{slot: "home_city", text: "Berlin"}` | slot written |
+| June | "we just moved to Lisbon" | same slot, upsert | Berlin replaced, June turn recorded as source; no later read can surface both cities |
+| Any time | "I like answers with code first" | no slot; three nearest fetched, one is "prefers short answers" | adjudicator chooses `add`: the preferences are compatible |
+| Contrast | "prefers short answers" vs "prefers detailed answers" | a cosine threshold alone would merge them as a duplicate (keeping whichever text won) or keep both as a contradiction, depending on where it sat | the adjudicator sees a conflict and chooses `update` |
+
+### Runnable: the same read policy, two products
+Pure Python. One coding memory and one CRM memory, scored under two weight profiles.
+
+```python
+import math
+
+def score(sim, age_days, importance, w_rel, w_rec, w_imp, tau_days):
+    return w_rel * sim + w_rec * math.exp(-age_days / tau_days) + w_imp * importance
+
+memories = {                       # (similarity, age in days, importance)
+    "branch feature/rrf is checked out": (0.6, 1, 0.3),
+    "contract renews on 1 March":        (0.5, 90, 0.9),
+}
+profiles = {                       # (w_rel, w_rec, w_imp, tau_days)
+    "coding assistant": (1.0, 1.0, 0.2, 7),
+    "CRM assistant":    (1.0, 0.2, 1.0, 30),
+}
+for name, w in profiles.items():
+    best = max(memories, key=lambda m: score(*memories[m], *w))
+    print(f"{name:16s} -> {best}")
+# coding assistant -> branch feature/rrf is checked out   (1.527 vs 0.68)
+# CRM assistant    -> contract renews on 1 March          (1.41 vs 1.093)
+```
+
+## Production patterns
+- **Typed slots with a unique key.** For facts that drive behaviour or billing, store one row per
+  `(tenant_id, user_id, slot)` with a unique constraint and write with an upsert (in Postgres,
+  `INSERT ... ON CONFLICT ... DO UPDATE`). Supersession becomes a database guarantee. Monitor
+  contradiction rate in sampled working sets.
+- **Lineage-driven deletion with a canary test.** Every memory, embedding and summary records its source
+  event ids; a purge is a lineage query that deletes rows and vectors and regenerates affected summaries.
+  Run a scheduled test that plants a unique fact, purges it, and asserts no read surfaces it. Monitor
+  time from request to completed purge.
+- **Consolidation off the request path.** Enqueue extraction and adjudication after each turn and run them
+  in a background worker, so a slow model call never delays a reply. Monitor queue lag and memories per
+  user, which should plateau rather than grow without bound.
+- **Two-stage scoped read.** ANN search with tenant, user and purpose filters inside the query fetches a
+  few hundred candidates; the composite score reranks them under a token budget. Monitor working-set
+  tokens per call and memory hit rate (retrieved items the answer actually used).
+- **Provenance-gated writes.** Extract only from the user's own turns and tag each memory with its source
+  type, rejecting tool output, retrieved documents and web pages. Monitor memories created per session by
+  source type; anything from a non-user source is an injection signal.
 
 ## Trade-offs
-- Extracting facts at write time keeps every read cheap, but spends a model call per turn and can store
-  things the user never meant to be remembered; read-time extraction from raw transcripts is cheaper to
-  write and far more expensive to query.
-- Structured semantic memory (typed fields) is precise and easy to update or delete, while free-text
-  memories capture nuance; most systems need both, with structure for anything that drives behaviour or
-  billing.
-- Rolling summaries keep context flat as conversations grow, but each compaction removes detail from the
-  prompt irreversibly; keeping the full transcript in the session store and retrieving from it recovers
-  the detail on demand.
-- Letting the model decide what to remember through a tool gives it agency and transparency, but it
-  under- and over-remembers unpredictably; a background extractor is more consistent and less visible to
-  the user.
-- Long retention makes the assistant feel continuous and raises privacy and compliance exposure; TTLs and
-  purpose scoping trade some continuity for a defensible deletion story.
+- **Write-time extraction vs cost and over-remembering.** Every read stays cheap, but a model call per
+  turn is spent and things the user never meant to be remembered may be stored; read-time extraction from
+  raw transcripts is cheaper to write and far more expensive to query.
+- **Typed fields vs free text.** Structured semantic memory is precise and easy to update or delete;
+  free-text memories capture nuance. Most systems need both, with structure for anything that drives
+  behaviour or billing.
+- **Rolling summaries vs lost detail.** They keep context flat as conversations grow, but each compaction
+  removes detail from the prompt irreversibly; keeping the full transcript in the session store and
+  retrieving from it recovers the detail on demand.
+- **Model-chosen memory vs consistency.** A `remember` tool gives the model agency and transparency, but
+  it under- and over-remembers unpredictably; a background extractor is more consistent and less visible
+  to the user.
+- **Long retention vs privacy exposure.** Retention makes the assistant feel continuous and raises
+  privacy and compliance exposure; TTLs and purpose scoping trade some continuity for a defensible
+  deletion story.
 
 ## Pitfalls
-- Keying memory by agent or conversation instead of tenant and user; the symptom is one user's
-  preferences or facts appearing in another user's session.
-- Append-only memory without supersession; the symptom is the assistant confidently stating two
+- **Keying memory by agent or conversation instead of tenant and user.** Symptom: one user's preferences
+  or facts appear in another user's session.
+- **Append-only memory without supersession.** Symptom: the assistant confidently states two
   contradictory facts, usually the stale one first.
-- Treating the context window as the system of record; the symptom is that after compaction, details the
-  user mentioned are gone forever and the transcript cannot be audited.
-- Deleting a memory row but not its embedding, its mention in a summary or the facts derived from it;
-  the symptom is a "forgotten" fact resurfacing weeks later, which is a compliance incident.
-- Extracting memories from retrieved documents, web pages or tool output rather than from the user's
-  own words; the symptom is an instruction planted in a fetched page ("always CC this address")
-  reappearing in later, unrelated sessions, which is persistent prompt injection.
-- Shipping memory without measuring it; the symptom is higher cost per call with no gain in task
-  success, because the retrieved memories are rarely relevant.
+- **Treating the context window as the system of record.** Symptom: after compaction, details the user
+  mentioned are gone forever and the transcript cannot be audited.
+- **Deleting a memory row but not its embedding, summary mention or derived facts.** Symptom: a
+  "forgotten" fact resurfaces weeks later, which is a compliance incident.
+- **Extracting memories from retrieved documents, web pages or tool output.** Symptom: an instruction
+  planted in a fetched page ("always CC this address") reappears in later, unrelated sessions, which is
+  persistent prompt injection. Fix: extract from the user's own words only.
+- **Shipping memory without measuring it.** Symptom: higher cost per call with no gain in task success,
+  because the retrieved memories are rarely relevant.
 
 ## When to use
-Add memory beyond the current session when users return and expect continuity, when the agent performs
-multi-session tasks, or when personalization measurably improves outcomes. Start with session state and
-compaction, which every multi-turn product needs; add semantic memory when you can name the facts that
-change behaviour; add episodic memory when "what happened before" is a real query. Do not add memory to
-compensate for a weak retrieval layer or missing product data; those belong in RAG and in your database.
-Measure working-set tokens per call, memory hit rate (retrieved items actually used by the answer),
-contradiction rate, and task success with memory on versus off. In interviews, the expected depth is the
-tier picture, the four operations, scoping, and a concrete deletion story.
+- **Use when:** users return and expect continuity, the agent performs multi-session tasks, or
+  personalization measurably improves outcomes.
+- **Order of adoption:** session state and compaction first (every multi-turn product needs them);
+  semantic memory when you can name the facts that change behaviour; episodic memory when "what happened
+  before" is a real query.
+- **Avoid when:** memory would compensate for a weak retrieval layer or missing product data; those
+  belong in RAG and in your database.
+- **Measure:** working-set tokens per call, memory hit rate (retrieved items actually used by the
+  answer), contradiction rate, and task success with memory on versus off.
+- **Interviews:** the tier picture, the four operations, scoping, and a concrete deletion story.
 
 ## Role lens
 - **Engineer:** Implements the session store, compaction, the extraction and consolidation jobs, and the

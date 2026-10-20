@@ -5,7 +5,7 @@ name: DPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - training-adaptation/rlhf
   - training-adaptation/grpo
@@ -22,31 +22,24 @@ sources:
 ---
 
 ## TL;DR
-DPO trains a model on preference pairs with a plain classification-style loss, no reward model and no
-RL loop. It works because the KL-constrained objective RLHF optimises has a closed-form solution in
-which the reward is a function of the policy itself, so the reward model can be substituted out of the
-Bradley–Terry loss. You get most of RLHF's effect for the cost of an SFT run, but offline: the pairs
-describe some earlier model's outputs, not the policy's current ones.
+DPO trains on preference pairs with a classification-style loss, no reward model or RL loop, because
+RLHF's KL-constrained objective has a closed-form optimum. You get most of RLHF's effect for an SFT
+run's cost, but offline.
 
 ## Why it exists
-RLHF with PPO delivers, but the machinery is heavy. Four models have to be resident, two of them
-training; a generation loop dominates wall-clock time; PPO's hyperparameters (clip range, value loss
-weight, KL coefficient, learning rate schedule) interact in ways that take experienced teams weeks to
-stabilise; and the reward model is a separate artefact to train, validate and keep current. For a team
-with ten thousand preference pairs and one node of GPUs, this is a mismatch between the size of the
-problem and the size of the tool.
-
-The obvious shortcut, fine-tuning on the chosen responses and ignoring the rejected ones, throws away
-half the signal: the model learns what good looks like but nothing about what bad looks like, and it
-cannot push probability *away* from the rejected answers. The next obvious shortcut, a contrastive loss
-that raises chosen log-probability and lowers rejected log-probability, has no leash: the model can
-satisfy it by driving the rejected sequence to zero probability, trashing everything nearby.
-
-DPO's insight is that the leash and the comparison can be combined analytically. The RLHF objective,
-maximise reward minus β times KL from the reference, has an exact optimum, and inverting it expresses
-the reward in terms of the policy and reference log-probabilities. Substituting that expression into
-the Bradley–Terry loss gives a loss on the policy alone that is the same optimisation problem RLHF
-solves, with no reward model and no sampling. The leash is still there; it is just inside the formula.
+- **PPO's machinery is heavy.** Four models resident, two training; a generation loop dominating
+  wall-clock time; interacting hyperparameters (clip range, value loss weight, KL coefficient, learning
+  rate schedule) that take experienced teams weeks to stabilise; and a reward model to train, validate
+  and keep current.
+- **The tool outsizes the problem.** For a team with ten thousand preference pairs and one node of GPUs,
+  that is a mismatch.
+- **SFT on chosen responses wastes half the signal.** The model learns what good looks like but nothing
+  about bad, and cannot push probability *away* from rejected answers.
+- **A naive contrastive loss has no leash.** Raising chosen and lowering rejected log-probability can be
+  satisfied by driving the rejected sequence to zero probability, trashing everything nearby.
+- **DPO combines leash and comparison analytically.** Invert the exact optimum of "reward minus β·KL",
+  substitute into Bradley–Terry, and you get a policy-only loss for the same optimisation problem, with
+  no reward model and no sampling. The leash is inside the formula.
 
 ## How it works
 ### The derivation in four lines
@@ -61,65 +54,67 @@ solves, with no reward model and no sampling. The leash is still there; it is ju
 L_DPO(θ) = − E [ log σ( β·log π_θ(y_w|x)/π_ref(y_w|x)  −  β·log π_θ(y_l|x)/π_ref(y_l|x) ) ]
 ```
 
-Each log-ratio term is the *implicit reward* `r̂(x,y) = β·log(π_θ(y|x)/π_ref(y|x))`: how much more the
-policy likes this response than the reference does, scaled by β. The loss wants the implicit reward
-margin between chosen and rejected to be large and positive.
+- **Implicit reward:** each log-ratio term is `r̂(x,y) = β·log(π_θ(y|x)/π_ref(y|x))`, how much more the
+  policy likes this response than the reference does, scaled by β.
+- **Goal:** make the implicit reward margin between chosen and rejected large and positive.
 
 ### What the gradient does
-Differentiating gives `−β·σ(r̂_l − r̂_w)·[∇log π_θ(y_w|x) − ∇log π_θ(y_l|x)]`. The bracket raises the
-chosen sequence's likelihood and lowers the rejected one's; the weight in front is the sigmoid of how
-wrong the current implicit reward ranking is. Pairs the model already ranks correctly with a large
-margin contribute almost nothing; pairs it gets backwards contribute most. That weighting is what the
-naive contrastive loss lacks and what stops DPO from endlessly pushing already-separated pairs.
+Differentiating the loss gives `−β·σ(r̂_l − r̂_w)·[∇log π_θ(y_w|x) − ∇log π_θ(y_l|x)]`.
+
+- **The bracket** raises the chosen sequence's likelihood and lowers the rejected one's.
+- **The weight in front** is the sigmoid of how wrong the current implicit ranking is.
+- **So correctly ranked, well-separated pairs contribute almost nothing; backwards pairs contribute most.**
+  That weighting is what the naive contrastive loss lacks, and it stops DPO endlessly pushing
+  already-separated pairs.
 
 ### The role of β
-β is the same KL coefficient as in RLHF, read the other way round: it scales how large a log-ratio is
-needed to achieve a given preference probability. Small β (TRL's default is 0.1) lets the policy move
-far from the reference to separate pairs; large β keeps it close. There is no explicit KL term, but the
-reference log-probabilities appear in every pair, so drift is penalised implicitly.
+- **Same KL coefficient as RLHF, read the other way round:** it scales how large a log-ratio is needed for
+  a given preference probability.
+- **Small β (TRL's default is 0.1)** lets the policy move far from the reference to separate pairs;
+  **large β** keeps it close.
+- **No explicit KL term**, but reference log-probabilities appear in every pair, so drift is penalised
+  implicitly.
 
 ### Sequence log-probabilities
-Each term is the sum of per-token log-probabilities over the response tokens only, with prompt tokens
-masked. The reference model is frozen, so its log-probs for the dataset can be computed once and
-cached, which brings the training memory down to one trainable model plus stored numbers, versus
-RLHF's four networks. A common trick when fine-tuning with LoRA is to disable the adapter for the
-reference forward pass instead of loading a second copy.
+- **Each term is a sum** of per-token log-probabilities over response tokens only, prompt masked.
+- **Cache the reference.** It is frozen, so its log-probs for the dataset can be computed once. Training
+  memory drops to one trainable model plus stored numbers, versus RLHF's four networks.
+- **LoRA trick:** disable the adapter for the reference forward pass instead of loading a second copy.
 
 ### Why "offline" matters
-DPO uses whichever pairs you give it. If the chosen and rejected responses came from a different model
-than the one being trained, the loss is comparing sequences the policy would rarely generate, and the
-gradient's effect on the policy's actual outputs is indirect. This is the distribution-shift cost of
-dropping the sampling loop. The reference matters here too: the derivation treats π_ref as the
-distribution the pairs live near, so when you only have someone else's pairs, the DPO paper's advice is
-to first SFT the reference on the chosen responses so it is close to the data. The better fix is to
-generate the candidate responses with the policy being trained (or its SFT ancestor), label those, and
-iterate in rounds (often called iterative or online DPO), which recovers much of on-policy RLHF's
-advantage while keeping the simple loss.
+- **DPO uses whichever pairs you give it.** Pairs from a different model compare sequences the policy
+  would rarely generate, so the gradient's effect on its actual outputs is indirect: the
+  distribution-shift cost of dropping the sampling loop.
+- **The reference should sit near the data.** The derivation treats π_ref as the distribution the pairs
+  live near; with only someone else's pairs, the DPO paper advises first SFT-ing the reference on the
+  chosen responses.
+- **The better fix: go on-policy in rounds.** Generate candidates with the policy (or its SFT ancestor),
+  label those, and iterate (often called iterative or online DPO). This recovers much of on-policy RLHF's
+  advantage with the simple loss.
 
 ### Known failure: likelihood displacement
-The loss only cares about the *difference* in log-ratios. A model can increase the margin by reducing
-the probability of both chosen and rejected responses, as long as the rejected one falls faster. In
-practice chosen log-probability often does decrease during DPO, and the probability mass goes
-somewhere unobserved, sometimes to worse responses. Monitoring chosen log-probability, not just the
-margin, catches this; mixing a small SFT term on the chosen responses or switching to a variant are the
-usual mitigations.
+- **The loss only sees the *difference* in log-ratios.** The margin can grow while both chosen and
+  rejected probabilities fall, as long as rejected falls faster.
+- **In practice chosen log-probability often decreases** during DPO, and the mass goes somewhere
+  unobserved, sometimes to worse responses.
+- **Detect** by monitoring chosen log-probability, not just the margin. **Mitigate** by mixing in a small
+  SFT term on chosen responses, or by switching to a variant.
 
 ### The variants, and what each one changes
-- **IPO** replaces the log-sigmoid with a squared loss that pulls the margin toward a fixed target
-  instead of toward infinity, because with near-deterministic preferences DPO's loss keeps rewarding
-  ever-larger margins and overfits.
-- **KTO** needs no pairs: each response is labelled simply desirable or undesirable, which fits
-  thumbs-up / thumbs-down product feedback that never comes as matched comparisons.
-- **ORPO** drops the reference model and adds an odds-ratio penalty to an ordinary SFT loss, folding SFT
-  and preference training into one stage.
-- **SimPO** also drops the reference and uses the *length-normalised* average log-probability as the
-  implicit reward, with a target margin, which directly attacks the length bias of summed log-probs.
-All four keep DPO's shape: an offline loss on preference data with no reward model and no sampling.
-Which one wins is data-dependent, so treat them as ablations to run, not upgrades to assume.
+| Variant | Change | Because |
+|---|---|---|
+| **IPO** | squared loss pulling the margin toward a fixed target, not infinity | with near-deterministic preferences DPO keeps rewarding ever-larger margins and overfits |
+| **KTO** | no pairs: each response labelled desirable or undesirable | fits thumbs-up / thumbs-down product feedback that never comes as matched comparisons |
+| **ORPO** | no reference; odds-ratio penalty added to an ordinary SFT loss | folds SFT and preference training into one stage |
+| **SimPO** | no reference; *length-normalised* average log-prob as implicit reward, plus a target margin | directly attacks the length bias of summed log-probs |
 
-## Example
-The DPO loss on sequence log-probabilities, with the reference log-probs precomputed. Shapes are
-`[batch]` after summing per-token log-probs over response tokens; the helper shows the masked sum.
+All four keep DPO's shape: an offline loss on preference data, no reward model, no sampling. Which one
+wins is data-dependent, so treat them as ablations to run, not upgrades to assume.
+
+## Examples
+### The DPO loss from sequence log-probs
+Reference log-probs are precomputed. Shapes are `[batch]` after summing per-token log-probs over
+response tokens; the helper shows the masked sum.
 
 ```python
 import torch, torch.nn.functional as F
@@ -148,42 +143,106 @@ print(f"margin={margin.item():.2f} loss={loss.item():.3f} reward_acc={acc.item()
 # probability mass is leaving both responses: likelihood displacement.
 ```
 
-Note the scale: a 4-nat total swing in log-probability across responses of dozens of tokens is a small
-per-token change, yet with β = 0.1 it already yields a 60/40 preference. β is what turns modest
-log-probability shifts into decisive preferences, and lowering it lets the model move further.
+- **Note the scale.** A 4-nat total swing across responses of dozens of tokens is a small per-token
+  change, yet with β = 0.1 it already yields a 60/40 preference.
+- **β turns modest log-probability shifts into decisive preferences**; lowering it lets the model move
+  further.
+
+### Worked numbers: what β does to the same 4-nat swing
+Preference probability is σ(β × log-ratio margin). Computed for the 4-nat swing above:
+
+| β | Margin β×4 | P(chosen beats rejected) | Loss | Log-ratio margin needed for P = 0.9 |
+|---|---|---|---|---|
+| 0.05 | 0.2 | 0.55 | 0.598 | ~44 nats |
+| 0.1 | 0.4 | 0.60 | 0.513 | ~22 nats |
+| 0.5 | 2.0 | 0.88 | 0.127 | ~4.4 nats |
+
+- **Small β means the loss keeps pulling** until the policy has moved tens of nats from the reference on
+  each pair: big behaviour change, more drift risk.
+- **Large β is satisfied after small moves:** the policy stays close to the reference, which is what you
+  want when pairs are noisy or off-policy.
+
+### Production run with TRL
+A typical first round on the SFT checkpoint. Argument names follow recent TRL releases; check your
+installed version.
+
+```python
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import DPOConfig, DPOTrainer
+
+name = "my-org/support-sft"                      # the SFT checkpoint: policy init and reference
+model = AutoModelForCausalLM.from_pretrained(name)
+tok = AutoTokenizer.from_pretrained(name)
+pairs = load_dataset("json", data_files="pairs.jsonl", split="train")   # prompt / chosen / rejected
+split = pairs.train_test_split(test_size=0.05, seed=0)
+
+args = DPOConfig(
+    output_dir="dpo-round1",
+    beta=0.1,                        # the KL leash
+    num_train_epochs=1,              # small pair sets overfit fast
+    learning_rate=5e-7,              # far below SFT rates; tune per model
+    per_device_train_batch_size=4,
+    precompute_ref_log_probs=True,   # reference scored once, not every step
+    eval_strategy="steps", eval_steps=100,
+)
+trainer = DPOTrainer(model=model, ref_model=None,   # None: TRL builds the frozen reference itself
+                     args=args, train_dataset=split["train"], eval_dataset=split["test"],
+                     processing_class=tok)
+trainer.train()
+```
+
+## Production patterns
+- **Cache or share the reference.** Precompute reference log-probs once (`precompute_ref_log_probs=True`
+  in TRL), or with LoRA pass no separate reference so the adapter is disabled for the reference pass.
+  Monitor GPU memory and step time; a second full copy is the usual reason a run does not fit.
+- **Plot chosen log-prob next to the margin.** TRL logs implicit rewards, margins, accuracies and chosen
+  and rejected log-probs at each logging step. Alert when chosen log-prob falls steadily while margins
+  grow, the likelihood-displacement signature, and respond with larger β or an SFT term on chosen.
+- **One epoch, early stop on held-out reward accuracy.** Hold out a few percent of pairs and evaluate
+  every few hundred steps. Stop when held-out accuracy plateaus, because training accuracy near 100% with
+  flat held-out accuracy means the pairs are being memorised.
+- **Regenerate pairs on-policy each round.** Sample candidates from the current checkpoint, have the
+  judge or experts label them, and run the next DPO round with that checkpoint as the new reference.
+  Monitor win rate against the previous round's model on a fixed prompt set.
+- **Audit length before training.** Compute the chosen-to-rejected length ratio over the dataset and the
+  share of pairs where chosen is longer. If it is heavily skewed, rebalance pairs or try SimPO, and
+  monitor mean output length every round.
 
 ## Trade-offs
-- One trainable model and a cached reference instead of four networks makes DPO cheap and stable, but
-  it is offline, so its advantage shrinks when the pairs were generated by a model far from the one you
-  are training.
-- A small β separates pairs faster and allows larger behaviour changes, while a large β preserves the
-  reference; the right value flips toward large β when the pairs are noisy or off-policy.
-- Dropping the reward model removes an artefact to maintain, but also removes a reusable scorer for
-  rejection sampling, data filtering and monitoring, which matters once you run many rounds.
-- Variants that drop the reference (ORPO, SimPO) save memory and can reduce length bias, but give up
+- **Cheap and stable vs offline.** One trainable model and a cached reference instead of four networks
+  makes DPO cheap and stable, but its advantage shrinks when the pairs came from a model far from the
+  one you are training.
+- **Small vs large β.** Small β separates pairs faster and allows larger behaviour changes; large β
+  preserves the reference. The right value flips toward large β when pairs are noisy or off-policy.
+- **No reward model vs no reusable scorer.** Dropping it removes an artefact to maintain, but also a
+  scorer for rejection sampling, data filtering and monitoring, which matters once you run many rounds.
+- **Reference-free variants vs leash.** ORPO and SimPO save memory and can reduce length bias, but give up
   the explicit leash and need their own margin or length terms to stay stable.
 
 ## Pitfalls
-- Training for several epochs on a small pair set; the symptom is reward accuracy near 100% on
-  training pairs, falling held-out win rate, and verbose or strangely confident outputs.
-- Ignoring chosen log-probability; margin and loss look healthy while the policy's likelihood of good
-  responses falls, and the mass migrates to unobserved outputs, often degenerate ones.
-- Using pairs from a stronger, different model as if they were on-policy; the loss moves but the
-  trained model's actual outputs barely change, because it never produced sequences like those.
-- Length-confounded pairs where the chosen response is usually longer; the model learns length, which
-  shows up as answers growing every round with no quality gain.
-- Mismatched tokenisation or chat template between the stored reference log-probs and the policy's
-  inputs; the implicit rewards are then noise and training appears to work while nothing improves.
+- **Several epochs on a small pair set.** Symptom: reward accuracy near 100% on training pairs, falling
+  held-out win rate, and verbose or strangely confident outputs.
+- **Ignoring chosen log-probability.** Margin and loss look healthy while the likelihood of good responses
+  falls and mass migrates to unobserved, often degenerate, outputs.
+- **Treating pairs from a stronger, different model as on-policy.** The loss moves but the trained model's
+  outputs barely change, because it never produced sequences like those.
+- **Length-confounded pairs** where chosen is usually longer. The model learns length: answers grow every
+  round with no quality gain.
+- **Mismatched tokenisation or chat template** between stored reference log-probs and policy inputs. The
+  implicit rewards are noise; training appears to work while nothing improves.
 
 ## When to use
-DPO is the default first preference-optimisation method for an application team: you have a few
-thousand to a few hundred thousand pairs, one node, and a need for reproducible runs. Use it after
-SFT, on pairs generated by the SFT model or by the policy from the previous round, and iterate in
-rounds if you can afford fresh labelling. Prefer RLHF with PPO or GRPO when you need on-policy
-exploration, a reusable reward model, or a programmatic reward, and when you have the engineering to
-run the loop. Measure held-out reward accuracy, chosen log-probability, judge or human win rate against
-the SFT model, and a general capability suite. In interviews, be ready to sketch the derivation, name
-the implicit reward, and explain why DPO is offline and what that costs.
+- **Use as the default first preference method** for an application team: a few thousand to a few hundred
+  thousand pairs, one node, and a need for reproducible runs.
+- **Run it after SFT**, on pairs generated by the SFT model or by the previous round's policy, and iterate
+  in rounds if you can afford fresh labelling.
+- **Prefer RLHF with PPO or GRPO when** you need on-policy exploration, a reusable reward model, or a
+  programmatic reward, and have the engineering to run the loop.
+- **Measure** held-out reward accuracy, chosen log-probability, judge or human win rate against the SFT
+  model, and a general capability suite.
+- **Interviews:** sketch the derivation, name the implicit reward, and explain why DPO is offline and what
+  that costs.
 
 ## Role lens
 - **Engineer:** Precomputes reference log-probs, verifies the response mask and chat template match,

@@ -5,7 +5,7 @@ name: Cancellation on client disconnect
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/streamingresponse
@@ -22,72 +22,74 @@ sources:
 ---
 
 ## TL;DR
-Users close tabs, press stop and retry, but a server that does not notice keeps generating tokens,
-holding a concurrency slot and GPU memory, and possibly running agent tool calls for nobody. ASGI
-reports a vanished client as an `http.disconnect` message, not an exception, so your code must detect
-it and cancel the in-flight work, let cancellation propagate to the upstream call, run cleanup in
-`finally`, and protect the few side effects that must finish.
+When users close tabs or press stop, an unaware server keeps generating tokens, holding slots and
+running tools for nobody. ASGI reports disconnect as an `http.disconnect` message, so detect it,
+cancel the work, clean up in `finally`, and shield side effects that must finish.
 
 ## Why it exists
-LLM requests are long and expensive compared with ordinary web requests. A chat answer can stream for
-thirty seconds; an agent run can take minutes and make dozens of model and tool calls. During that
-time users abandon requests constantly: they navigate away, hit "stop generating", lose mobile
-signal, or click retry, which disconnects the first request and starts a second identical one.
-
-If the server ignores the disconnect, each abandoned request keeps consuming everything it was
-consuming: output tokens billed by the provider, a slot under your concurrency limit, a sequence in a
-self-hosted engine's batch with its KV cache, a database connection. A retry storm therefore doubles
-load at exactly the wrong moment, since every retry leaves a ghost behind. In agent workflows the cost
-is worse than money: the ghost may go on to send an email or write a record the user thought they had
-stopped.
-
-The naive assumption is that the framework handles it, because the connection is gone. It does not,
-in general. The ASGI server learns about the closed socket and puts an `http.disconnect` event on the
-receive channel, but your handler is awaiting a provider call, not reading that channel, so nothing
-interrupts it. Streaming responses get partial help in recent Starlette versions; ordinary endpoints
-typically run to completion. Cancellation is something you wire up deliberately.
+- **LLM requests are long and expensive.** A chat answer can stream for thirty seconds; an agent run can
+  take minutes and make dozens of model and tool calls.
+- **Users abandon requests constantly.** They navigate away, hit "stop generating", lose mobile signal,
+  or click retry, which disconnects the first request and starts a second identical one.
+- **An ignored disconnect keeps consuming everything.** Output tokens billed by the provider, a slot under
+  your concurrency limit, a sequence in a self-hosted engine's batch with its KV cache, a database
+  connection. A retry storm doubles load at exactly the wrong moment, since every retry leaves a ghost.
+- **In agent workflows the cost is worse than money.** The ghost may go on to send an email or write a
+  record the user thought they had stopped.
+- **The framework does not handle it, in general.** The ASGI server puts an `http.disconnect` event on the
+  receive channel, but your handler is awaiting a provider call, not reading that channel, so nothing
+  interrupts it. Streaming responses get partial help in recent Starlette versions; ordinary endpoints
+  typically run to completion. Cancellation is something you wire up deliberately.
 
 ## How it works
 ### How a disconnect reaches the app
-When the client closes the connection, the server marks it closed and the next `receive()` returns
-`{"type": "http.disconnect"}`. Starlette exposes this as `await request.is_disconnected()`, which
-checks for that message without blocking. Nothing is raised into the handler, *because* the handler
-is the one deciding what to await.
+1. The client closes the connection and the server marks it closed.
+2. The next `receive()` returns `{"type": "http.disconnect"}`.
+3. Starlette exposes this as `await request.is_disconnected()`, which checks for that message without
+   blocking.
+- **Nothing is raised into the handler,** *because* the handler is the one deciding what to await.
 
 ### Streaming responses
-For a `StreamingResponse`, recent Starlette versions run the body iterator alongside a task that
-listens for `http.disconnect` and cancel the iterator when it arrives, so an `async for` over the
-provider stream receives `CancelledError`. The exact behaviour has changed across releases, so also
-check `is_disconnected()` between chunks, and open the upstream stream with `async with` so leaving
-the block closes the upstream connection. Closing the upstream stream is what tells the provider or
-inference engine to stop; self-hosted engines such as vLLM abort the sequence and free its cache,
-while hosted providers' billing for partial output is vendor-specific.
+- **Recent Starlette cancels the iterator.** For a `StreamingResponse`, it runs the body iterator alongside
+  a task that listens for `http.disconnect` and cancels the iterator when it arrives, so an `async for`
+  over the provider stream receives `CancelledError`.
+- **Belt and braces.** The exact behaviour has changed across releases, so also check `is_disconnected()`
+  between chunks, and open the upstream stream with `async with` so leaving the block closes the
+  upstream connection.
+- **Closing upstream is what stops the provider.** Self-hosted engines such as vLLM abort the sequence and
+  free its cache; hosted providers' billing for partial output is vendor-specific.
 
-Where the cancellation lands matters. If the generator is suspended at an `await` on the provider,
-it receives `CancelledError` there and its `finally` runs immediately. If it is suspended at `yield`,
-waiting for the server to take the next chunk, the generator itself is not running; it is finalised
-when it is closed (`GeneratorExit` at the `yield`), which may happen only when the iterator is
-cleaned up, later than you expect. So do not put time-critical release logic only in the generator's
-`finally`; pair it with a release-once guard that the endpoint's own cleanup can also trigger.
+Where the cancellation lands matters:
+| Generator suspended at | What happens | When `finally` runs |
+|---|---|---|
+| An `await` on the provider | Receives `CancelledError` there | Immediately |
+| `yield`, waiting for the server to take the next chunk | Not running; finalised when closed (`GeneratorExit` at the `yield`) | Possibly only when the iterator is cleaned up, later than you expect |
+
+- **So do not put time-critical release logic only in the generator's `finally`;** pair it with a
+  release-once guard that the endpoint's own cleanup can also trigger.
 
 ### Ordinary endpoints
-For a non-streaming endpoint, run the expensive work as a task and race it against a disconnect
-watcher. If the watcher wins, cancel the task. Cancellation raises `CancelledError` at the task's
-current `await`; inside httpx that aborts the request and closes the connection, *because* httpx
-treats cancellation as abandoning the exchange. The result is cooperative: cancellation lands only at
-an `await`, so CPU-bound code or a blocking call in a thread cannot be interrupted this way.
+1. Run the expensive work as a task.
+2. Race it against a disconnect watcher.
+3. If the watcher wins, cancel the task. Cancellation raises `CancelledError` at the task's current
+   `await`; inside httpx that aborts the request and closes the connection, *because* httpx treats
+   cancellation as abandoning the exchange.
+- **It is cooperative:** cancellation lands only at an `await`, so CPU-bound code or a blocking call in a
+  thread cannot be interrupted this way.
 
-The watcher can poll `is_disconnected()` on an interval, as in the example below, or be a task that
-awaits `request.receive()` until it returns `http.disconnect`, which reacts instantly with no polling.
-The second form is only safe once the body has been fully read, *because* `receive()` also delivers
-body chunks and a watcher that consumes them steals them from the handler.
+Two watcher designs:
+| Watcher | Reacts | Safe when |
+|---|---|---|
+| Poll `is_disconnected()` on an interval (the example below) | Within one poll interval | Always |
+| A task awaiting `request.receive()` until it returns `http.disconnect` | Instantly, no polling | Only once the body has been fully read, *because* `receive()` also delivers body chunks and a watcher that consumes them steals them from the handler |
 
 ### Cancellation must reach every child task
-Cancelling a task cancels what it is awaiting, not tasks it started. An agent loop that fires
-parallel tool calls with bare `asyncio.create_task(...)` leaves those children running after the
-parent is cancelled. Start them in an `asyncio.TaskGroup` (Python 3.11+) or an AnyIO task group,
-*because* structured concurrency ties the children's lifetime to the block: cancelling the parent
-cancels every child and waits for their `finally` blocks before the parent finishes.
+- **Cancelling a task cancels what it is awaiting, not tasks it started.** An agent loop that fires
+  parallel tool calls with bare `asyncio.create_task(...)` leaves those children running after the
+  parent is cancelled.
+- **Use an `asyncio.TaskGroup` (Python 3.11+) or an AnyIO task group,** *because* structured concurrency
+  ties the children's lifetime to the block: cancelling the parent cancels every child and waits for
+  their `finally` blocks before the parent finishes.
 
 ### Rules for code that may be cancelled
 1. **Do not swallow `CancelledError`.** Catching `Exception` is safe because `CancelledError` derives
@@ -102,16 +104,17 @@ cancels every child and waits for their `finally` blocks before the parent finis
    retry after cancellation cannot duplicate them.
 
 ### When not to cancel
-If the user expects the work to finish without them watching, such as a long report or a batch
-ingestion, cancellation on disconnect is wrong. Move it to a durable job, return a job ID, and let the
-client reconnect for the result.
+- **Work the user expects to finish without watching,** such as a long report or a batch ingestion. Move
+  it to a durable job, return a job ID, and let the client reconnect for the result.
 
 ### The path in between
-A proxy or load balancer between client and app may not propagate the disconnect promptly, or may
-keep the upstream connection open while it buffers. Test the full path: start a long request through
-the real ingress, close the client, and confirm the app logs a cancellation.
+- **Proxies may hide the disconnect.** A proxy or load balancer between client and app may not propagate
+  the disconnect promptly, or may keep the upstream connection open while it buffers.
+- **Test the full path:** start a long request through the real ingress, close the client, and confirm
+  the app logs a cancellation.
 
-## Example
+## Examples
+### Cancel a non-streaming call when the client leaves
 A helper that runs a non-streaming model call as a task and cancels it if the client disconnects,
 returning 499 (the "client closed request" code popularised by nginx) for logs and metrics.
 
@@ -150,42 +153,128 @@ async def answer(body: dict, request: Request):
     return {"answer": result}
 ```
 
-Scenario (illustrative): a support bot sees 20% of chat requests abandoned after about 3 seconds of a
-typical 15-second generation. Without cancellation those requests consume the full 15 seconds of
-model time and their slots; with it they free capacity after about 3 seconds, which under a fixed
-concurrency cap translates directly into shorter queues for the users who stayed.
+Scenario (illustrative):
+| | Without cancellation | With cancellation |
+|---|---|---|
+| Abandoned requests | 20% of chats, after about 3 seconds | same |
+| Model time per abandoned request | full 15-second generation | about 3 seconds |
+| Slot held | 15 seconds | about 3 seconds |
+| Effect under a fixed concurrency cap | longer queues for everyone | shorter queues for the users who stayed |
+
+### Streaming relay that stops upstream on disconnect
+The upstream stream is opened with `async with`, so breaking out of the loop (or being cancelled by
+Starlette) closes the provider connection. Assumes a shared httpx client on `app.state.http`.
+
+```python
+from fastapi.responses import StreamingResponse
+
+@app.post("/chat/stream")
+async def chat_stream(body: dict, request: Request):
+    http = request.app.state.http
+
+    async def gen():
+        async with http.stream("POST", "/v1/chat", json={**body, "stream": True}) as r:
+            async for line in r.aiter_lines():
+                if await request.is_disconnected():
+                    break                          # leaving the block closes the upstream stream
+                yield line + "\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+```
+
+### Runnable: bare tasks vs a TaskGroup under cancellation
+An agent step fans out two tool calls; the client disconnects 0.1 seconds in. Bare tasks finish their
+side effects anyway; TaskGroup children are cancelled with the parent. Python 3.11+.
+
+```python
+import asyncio
+
+log: list[str] = []
+
+async def tool(name: str, seconds: float):
+    try:
+        await asyncio.sleep(seconds)               # stands in for a tool or model call
+        log.append(f"{name} finished")             # a side effect the user thought they stopped
+    except asyncio.CancelledError:
+        log.append(f"{name} cancelled")
+        raise
+
+async def step_bare():
+    asyncio.create_task(tool("bare-A", 0.3))       # orphans: nothing ties them to this step
+    asyncio.create_task(tool("bare-B", 0.3))
+    await asyncio.sleep(1)
+
+async def step_grouped():
+    async with asyncio.TaskGroup() as tg:          # Python 3.11+
+        tg.create_task(tool("tg-A", 0.3))
+        tg.create_task(tool("tg-B", 0.3))
+
+async def main():
+    for step in (step_bare, step_grouped):
+        t = asyncio.create_task(step())
+        await asyncio.sleep(0.1)
+        t.cancel()                                 # the client disconnected
+        await asyncio.gather(t, return_exceptions=True)
+    await asyncio.sleep(0.5)                       # give orphans time to act
+    print(log)
+
+asyncio.run(main())
+# ['tg-B cancelled', 'tg-A cancelled', 'bare-A finished', 'bare-B finished']
+```
+
+## Production patterns
+- **Count 499s as a first-class metric.** Return or log 499 for every request cancelled by disconnect and
+  chart it per route next to latency. A rising 499 rate after a latency regression means users are giving
+  up; alert on it.
+- **Track tokens spent after disconnect.** In the shielded usage record, store whether the request was
+  cancelled and the tokens billed, so finance and capacity reviews see the ghost cost. Monitor its share
+  of total spend; it should fall after cancellation ships.
+- **Configure the proxy to forward aborts.** With nginx in front, keep `proxy_ignore_client_abort` off
+  (its default) so a client abort closes the upstream connection, and disable `proxy_buffering` on
+  streaming routes. Verify with an end-to-end test that the app logs a cancellation within a second or
+  so of the client closing.
+- **Cancel points plus idempotency keys in agent loops.** Check `is_disconnected()` before each step and
+  before any side-effecting tool call, and send an idempotency key derived from run ID and step number.
+  Monitor duplicate side effects reported by downstream systems.
+- **Durable jobs for work that must finish.** For reports and batch ingestion, enqueue a job, return 202
+  with a job ID, and let the client poll or reconnect. Monitor job completion rate and age, not 499s.
+- **Bounded shields only.** Wrap every shielded step in its own timeout (`asyncio.wait_for(..., 2.0)` in
+  the example) so shutdown cannot hang. Monitor shielded-step timeouts and graceful-shutdown duration.
 
 ## Trade-offs
-- Cancelling on disconnect saves tokens, slots and GPU memory, but loses work a user might have come
-  back for; move such work to a durable job with a result the client can fetch later.
-- Polling `is_disconnected()` frequently notices faster but adds overhead per request; a quarter to
-  half a second is usually ample next to multi-second model calls.
-- Aggressive cancellation in agent loops prevents ghost actions, but cancelling mid-tool-call can leave
-  external systems half-updated; cancel between steps and make side effects idempotent.
-- Shielding cleanup keeps billing and audit records complete, but a shielded step that hangs blocks
-  shutdown; bound every shielded operation with its own timeout.
+- **Saved capacity vs lost work.** Cancelling on disconnect saves tokens, slots and GPU memory, but loses
+  work a user might have come back for; move such work to a durable job with a result the client can
+  fetch later.
+- **Poll interval vs overhead.** Polling `is_disconnected()` frequently notices faster but adds overhead
+  per request; a quarter to half a second is usually ample next to multi-second model calls.
+- **Aggressive vs safe cancellation in agents.** Aggressive cancellation prevents ghost actions, but
+  cancelling mid-tool-call can leave external systems half-updated; cancel between steps and make side
+  effects idempotent.
+- **Shielded cleanup vs shutdown.** Shielding keeps billing and audit records complete, but a shielded
+  step that hangs blocks shutdown; bound every shielded operation with its own timeout.
 
 ## Pitfalls
-- Assuming the handler is cancelled automatically when the client leaves; provider dashboards show
-  token usage well above what users actually received.
-- A broad `except BaseException:` or bare `except:` around the model call that logs and continues; the
-  cancellation is swallowed and the request keeps running after the disconnect.
-- Cancelling the task but not closing the upstream stream; the app stops reading while the provider or
+- **Assuming the handler is cancelled automatically when the client leaves.** Symptom: provider
+  dashboards show token usage well above what users actually received.
+- **A broad `except BaseException:` or bare `except:` around the model call that logs and continues.**
+  The cancellation is swallowed and the request keeps running after the disconnect.
+- **Cancelling the task but not closing the upstream stream.** The app stops reading while the provider or
   engine keeps generating, visible as engine batch occupancy that does not drop.
-- Releasing concurrency slots only on the success path; every cancelled request leaks a slot, and
+- **Releasing concurrency slots only on the success path.** Every cancelled request leaks a slot, and
   capacity shrinks until the worker appears hung.
-- Testing only against the app directly; behind a buffering proxy the disconnect never arrives, so
+- **Testing only against the app directly.** Behind a buffering proxy the disconnect never arrives, so
   cancellation works in development and silently does nothing in production.
-- Spawning parallel tool or model calls with bare `create_task` inside a cancellable agent step; the
-  symptom is tool side effects and provider usage logged seconds after the request was cancelled.
+- **Spawning parallel tool or model calls with bare `create_task` inside a cancellable agent step.**
+  Symptom: tool side effects and provider usage logged seconds after the request was cancelled.
 
 ## When to use
-Wire up disconnect-driven cancellation for every interactive endpoint whose work is long or expensive:
-chat and completion endpoints, streaming generations, agent runs, and retrieval pipelines with
-several model calls. Skip it for work that must complete regardless of the client, which belongs in a
-job queue. Measure the rate of 499s or cancelled requests, tokens spent after disconnect, slot
-occupancy, and time from disconnect to cancellation through the real ingress. In interviews, explain
-that disconnect is a message, how cancellation propagates through `await`, and what must be shielded.
+- **Use for** every interactive endpoint whose work is long or expensive: chat and completion endpoints,
+  streaming generations, agent runs, and retrieval pipelines with several model calls.
+- **Skip it** for work that must complete regardless of the client, which belongs in a job queue.
+- **Measure** the rate of 499s or cancelled requests, tokens spent after disconnect, slot occupancy, and
+  time from disconnect to cancellation through the real ingress.
+- **Interviews:** explain that disconnect is a message, how cancellation propagates through `await`, and
+  what must be shielded.
 
 ## Role lens
 - **Engineer:** Races model calls against a disconnect watcher, propagates cancellation into the httpx

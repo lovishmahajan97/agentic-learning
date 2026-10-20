@@ -5,7 +5,7 @@ name: Multi-model architecture
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - system-design/model-portfolio
   - system-design/model-routing-cascading
@@ -18,90 +18,120 @@ related:
 ---
 
 ## TL;DR
-No single model is the best embedder, reranker, classifier, generator, vision model and judge at once,
-and the best model for each job is rarely the cheapest. A multi-model architecture decomposes the system
-into stages, each served by the model that fits that stage's quality, latency and cost budget, joined by
-explicit typed contracts. The price is coupling: every stage's output is the next stage's input
-distribution, so models have to be versioned and evaluated together, not one at a time.
+Split the system into stages, each served by the model that fits its quality, latency and cost budget,
+joined by typed contracts. The price is coupling: each stage's output is the next one's input, so version
+and evaluate models together.
 
 ## Why it exists
-Early LLM applications were one prompt and one model. Production systems are not: a request passes
-through a safety classifier, PII redaction, query rewriting, embedding, retrieval, reranking, generation,
-structured extraction, perhaps a judge, and sometimes speech or vision on the way in or out. Pushing all
-of that through one frontier generator fails three ways. Cost: embedding a hundred thousand document
-chunks through a generative model is nonsense when an embedding model does it for a tiny fraction of the
-price. Capability: a chat model does not emit vectors, and a prompted generalist ranks query–document
-pairs worse and far more expensively than a cross-encoder trained for exactly that. Latency: every extra
-job on the critical path is another multi-second call.
-
-The opposite naive design, "best model for every job from whichever vendor, wired up ad hoc", fails on
-operability. Each vendor brings its own authentication, limits, failure modes and tokeniser; nobody can
-say which versions are in production; and when quality drops there is no way to tell which stage
-regressed. The architecture exists to get the benefits of specialisation while keeping the system one
-thing you can reason about: a governed portfolio of models, stage contracts, shared telemetry, and an
-evaluation that runs per stage *and* end to end.
+- **Production requests pass through many jobs.** Safety classifier, PII redaction, query rewriting,
+  embedding, retrieval, reranking, generation, structured extraction, perhaps a judge, sometimes speech or
+  vision. Early LLM apps were one prompt and one model; production systems are not.
+- **No single model is best at every job,** and the best model for each job is rarely the cheapest. Pushing
+  everything through one frontier generator fails three ways:
+  - **Cost:** embedding a hundred thousand chunks through a generative model is nonsense when an embedding
+    model does it for a tiny fraction of the price.
+  - **Capability:** a chat model does not emit vectors, and a prompted generalist ranks query–document pairs
+    worse and far more expensively than a cross-encoder trained for exactly that.
+  - **Latency:** every extra job on the critical path is another multi-second call.
+- **The opposite naive design fails on operability.** "Best model for every job from whichever vendor,
+  wired up ad hoc": each vendor brings its own authentication, limits, failure modes and tokeniser; nobody
+  knows which versions are in production; and when quality drops nobody can tell which stage regressed.
+- **What the architecture buys:** specialisation while the system stays one thing you can reason about: a
+  governed portfolio of models, stage contracts, shared telemetry, and evaluation per stage *and* end to
+  end.
 
 ## How it works
 ### Decompose by job, not by vendor
-List the jobs a request needs. For each, record the output type (vector, label, score, free text,
-structured object), quality sensitivity, volume, latency budget and data sensitivity. The mapping then
-mostly writes itself: high-volume narrow outputs go to small specialised models, often self-hosted;
-low-volume open-ended generation goes to a frontier model; vectors go to an embedding model; pairwise
-relevance goes to a cross-encoder reranker; safety screening goes to a fast classifier that runs on every
-request, with a larger model consulted only for ambiguous cases. Routing within a job (see model
-routing / cascading) is orthogonal to decomposition across jobs.
+For each job a request needs, record output type (vector, label, score, free text, structured object),
+quality sensitivity, volume, latency budget and data sensitivity. The mapping mostly writes itself:
+
+| Job shape | Model class |
+|---|---|
+| High-volume, narrow output | Small specialised model, often self-hosted |
+| Low-volume, open-ended generation | Frontier model |
+| Vectors | Embedding model |
+| Pairwise relevance | Cross-encoder reranker |
+| Safety screening on every request | Fast classifier; a larger model only for ambiguous cases |
+
+Routing within a job (see model routing / cascading) is orthogonal to decomposition across jobs.
 
 ### Patterns of composition
-1. **Pipeline.** Guard → rewrite → embed → retrieve → rerank → generate → verify. Stages that do not
-   depend on each other (guard and embed) run concurrently. A gate that almost always passes can also
-   run *speculatively*: start retrieval, or even generation, while the guard decides, and discard the
-   work if it blocks. You pay wasted calls on the few blocked requests to remove the guard's latency
-   from every other request; it is unsafe only if the speculative stage has side effects or streams to
-   the user before the gate has passed.
-2. **Generator plus verifier.** A second model checks grounding, schema or policy. Inline when it gates
-   the response; sampled and asynchronous when it feeds monitoring.
+1. **Pipeline.** Guard → rewrite → embed → retrieve → rerank → generate → verify.
+   - Independent stages (guard and embed) run concurrently.
+   - A gate that almost always passes can run *speculatively*: start retrieval, or even generation, while
+     the guard decides, and discard the work if it blocks.
+   - You pay wasted calls on the few blocked requests to remove the guard's latency from every other one.
+   - Unsafe only if the speculative stage has side effects or streams to the user before the gate passes.
+2. **Generator plus verifier.** A second model checks grounding, schema or policy. Inline when it gates the
+   response; sampled and asynchronous when it feeds monitoring.
 3. **Planner plus executors.** A strong model decomposes a task and cheap models carry out subtasks; the
    backbone of most agent designs.
-4. **Ensemble.** Several models answer and a selector or vote picks; expensive, reserved for high-stakes
+4. **Ensemble.** Several models answer and a selector or vote picks. Expensive; reserved for high-stakes
    decisions where the extra calls are cheaper than a mistake.
 
 ### Contracts between stages
-Each stage has a typed, versioned input and output schema (a Pydantic or Zod model, not free text), and
-each stage records the model id and version it used in the trace. This is not bureaucracy: the next stage
-was tuned against *this* stage's output distribution. Swap the query rewriter and the embedder sees
-different text; swap the embedding model and every stored vector is in a different space; swap the
-generator and the citation format the verifier parses may change. Typed contracts make the drift
-detectable at the boundary instead of three stages downstream, and versions make it attributable.
+- **Typed, versioned schemas:** each stage's input and output is a Pydantic or Zod model, not free text.
+- **Model id and version in the trace** for every stage.
+- **Why it is not bureaucracy:** the next stage was tuned against *this* stage's output distribution.
+  - Swap the query rewriter and the embedder sees different text.
+  - Swap the embedding model and every stored vector is in a different space.
+  - Swap the generator and the citation format the verifier parses may change.
+- **Typed contracts make drift detectable** at the boundary instead of three stages downstream; versions
+  make it attributable.
 
 ### Budgets compose, tails do not average
-Latency adds along the serial path, so parallelise what you can and budget with tail numbers: the p99 of a
-sum of four stages is at least the largest single-stage p99 and can exceed the sum of all four p99s,
-because tail events in different stages combine (the sum of the p99s is only guaranteed to be at least
-the p96 of the total, by a union bound over the four stages). In practice, when stages are slow for
-independent reasons, the sum of the p99s is a pessimistic budget, because tails rarely coincide; it is
-correlated slowness (two stages on one GPU pool or one provider, a retry policy at every stage, a
-shared overloaded network path) that drives the real p99 towards or past that sum. Budget with the sum,
-then measure the end-to-end distribution. Cost adds per request; find the dominant stage, which is
-usually generation but is sometimes a reranker scoring 50 candidates with a large cross-encoder. Failure
-is per stage: each needs its own timeout, fallback and degraded mode (drop the reranker, skip the judge).
+- **Latency adds along the serial path,** so parallelise what you can and budget with tail numbers.
+- **Bounds:** the p99 of a sum of four stages is at least the largest single-stage p99 and can exceed the
+  sum of all four p99s, because tail events in different stages combine. The sum of the p99s is only
+  guaranteed to be at least the p96 of the total, by a union bound over the four stages.
+- **Independent slowness:** the sum of the p99s is a pessimistic budget, because tails rarely coincide.
+- **Correlated slowness** (two stages on one GPU pool or one provider, a retry policy at every stage, a
+  shared overloaded network path) drives the real p99 towards or past that sum.
+- **Rule:** budget with the sum, then measure the end-to-end distribution.
+- **Cost adds per request.** Find the dominant stage: usually generation, sometimes a reranker scoring 50
+  candidates with a large cross-encoder.
+- **Failure is per stage.** Each needs its own timeout, fallback and degraded mode (drop the reranker,
+  skip the judge).
 
 ### Evaluate per stage and end to end
-Component metrics (recall@k for retrieval, precision for the guard, schema pass rate for extraction) tell
-you *which* stage moved; the end-task metric tells you whether it mattered. You need both *because* a
-stage can improve on its own metric and hurt the task: a reranker that prefers long passages raises
-nDCG and pushes the generator past its useful context. Any model change ships behind a flag and a rerun of
-both evaluations.
+| Level | Examples | Tells you |
+|---|---|---|
+| Component | recall@k for retrieval, precision for the guard, schema pass rate for extraction | *Which* stage moved |
+| End task | Task success, judged answer quality | Whether it mattered |
+
+- **You need both** *because* a stage can improve on its own metric and hurt the task: a reranker that
+  prefers long passages raises nDCG and pushes the generator past its useful context.
+- **Any model change** ships behind a flag and a rerun of both evaluations.
 
 ### Run it as a portfolio
-A registry of approved models with versions, owners and deprecation dates; a gateway as the single egress
-so cost and usage are attributable per stage; and a rule that a stage upgrade is a release, with a
-canary, not a config edit.
+- **A registry** of approved models with versions, owners and deprecation dates.
+- **A gateway as the single egress,** so cost and usage are attributable per stage.
+- **A stage upgrade is a release,** with a canary, not a config edit.
 
-## Example
-A typed pipeline skeleton: each stage names its model, records timing and model version into a trace,
-independent stages run concurrently, and the judge runs off the hot path on a sample. `classify`,
-`embed`, `rerank`, `generate`, `judge` and `vector_search` are thin adapters around whatever providers
-or servers you use.
+## Diagram
+A typical RAG pipeline as stages: guard and embed run concurrently, each later stage depends on the
+previous one's typed output, and the sampled judge sits off the hot path.
+
+```mermaid
+flowchart LR
+    Q["User question"] --> G["Guard: fast safety classifier"]
+    Q --> E["Embed: embedding model"]
+    G -->|"verdict allow or block"| GATE{"Allowed?"}
+    E -->|"query vector"| VS[("Vector search, k=50")]
+    GATE -->|"block"| REF["Refusal"]
+    GATE -->|"allow"| RR["Rerank: cross-encoder, top 5"]
+    VS -->|"50 candidates"| RR
+    RR -->|"typed passages"| GEN["Generate: frontier model"]
+    GEN --> A["Answer plus sources"]
+    GEN -.->|"5% sample, async"| J["Judge: small model"]
+    J -.->|"scores by model version"| T[("Trace and per-stage metrics")]
+```
+
+## Examples
+### Typed pipeline skeleton with a trace
+Each stage names its model and records timing and version; independent stages run concurrently; the judge
+runs off the hot path on a sample. `classify`, `embed`, `rerank`, `generate`, `judge` and `vector_search`
+are thin adapters around whatever providers or servers you use.
 
 ```python
 import asyncio, time, random
@@ -139,53 +169,116 @@ async def answer(question):
     return {"answer": draft, "sources": [d.id for d in top], "trace": trace.stages}
 ```
 
-The trace is what makes the architecture debuggable: when quality drops you can group judge scores by the
-`generate` model version, or latency by stage, instead of guessing. Note that the sampled judge appends
-to the trace *after* the response has returned, so the trace must be emitted when background work
-finishes, not at return.
+- **The trace makes it debuggable:** group judge scores by the `generate` model version, or latency by
+  stage, instead of guessing.
+- **Emit the trace late:** the sampled judge appends *after* the response returns, so emit the trace when
+  background work finishes, not at return.
 
-Read the latency budget off the structure. With illustrative p95s of guard 80 ms in parallel with embed
-40 ms, vector search 30 ms, rerank 150 ms and generation 2.5 s, the serial budget is about
-80 + 30 + 150 + 2,500 ≈ 2.8 s. Running guard and embed together saved the 40 ms of the shorter one, and
-generation is nine-tenths of the total, so streaming its output (which moves the user-visible number to
-time-to-first-token) does more for perceived latency than any change to the other stages. Cost usually
-has the same shape, until someone raises the rerank candidate count from 50 to 500 and the reranker
-becomes the dominant line.
+### Worked latency budget
+Illustrative p95s, read off the structure:
+
+| Stage | p95 | On the serial path? |
+|---|---|---|
+| Guard | 80 ms | Yes (parallel with embed, the longer of the two) |
+| Embed | 40 ms | No, hidden behind guard: concurrency saved these 40 ms |
+| Vector search | 30 ms | Yes |
+| Rerank | 150 ms | Yes |
+| Generation | 2.5 s | Yes, nine-tenths of the total |
+| **Serial budget** | 80 + 30 + 150 + 2,500 ≈ 2.8 s | |
+
+- **Stream the generator first.** It moves the user-visible number to time-to-first-token and does more for
+  perceived latency than any change to the other stages.
+- **Cost usually has the same shape,** until someone raises the rerank candidate count from 50 to 500 and
+  the reranker becomes the dominant line.
+
+### Why correlated slowness breaks the budget
+A runnable simulation: four stages at 200 ms that occasionally take 1,500 ms.
+
+```python
+import random
+
+def p(xs, q):
+    xs = sorted(xs); return xs[int(q * (len(xs) - 1))]
+
+def stage(slow):                              # 200 ms normally, 1,500 ms when slow
+    return random.uniform(180, 220) + (1300 if slow else 0)
+
+random.seed(0)
+N, P_SLOW, STAGES = 100_000, 0.02, 4
+indep, corr = [], []
+for _ in range(N):
+    indep.append(sum(stage(random.random() < P_SLOW) for _ in range(STAGES)))  # independent causes
+    shared = random.random() < P_SLOW                                           # one shared GPU pool
+    corr.append(sum(stage(shared) for _ in range(STAGES)))
+
+one = [stage(random.random() < P_SLOW) for _ in range(N)]
+print(f"single-stage p99 ~ {p(one, .99):,.0f} ms; sum of 4 p99s ~ {4 * p(one, .99):,.0f} ms")
+print(f"end-to-end p99, independent slowness: {p(indep, .99):,.0f} ms")
+print(f"end-to-end p99, correlated slowness:  {p(corr, .99):,.0f} ms")
+# single-stage p99 ~ 1,499 ms; sum of 4 p99s ~ 5,997 ms
+# independent: ~2,130 ms (tails rarely coincide); correlated: ~6,000 ms (the full sum)
+```
+
+## Production patterns
+- **Model registry checked in CI.** Keep one file listing every stage's approved model id, version, owner
+  and deprecation date; fail the build if code references a model not in it. Monitor days until each
+  model's deprecation and the number of stages on unregistered or retired versions.
+- **Single egress with stage tags.** Send every model call through the gateway with the stage name and
+  pipeline version attached as request metadata, so spend and errors split by stage. Monitor cost per
+  stage per request and which stage dominates.
+- **Re-index behind an alias on embedder change.** Build a new index with the new embedding model, compare
+  recall@k on the golden set, then switch a read alias in one step; never mix query and document vectors
+  from different models. Monitor recall@k and the share of documents re-embedded.
+- **Stage upgrades as canaries.** Put each stage's model id behind a flag, send a small share of traffic
+  to the new version, and compare both the component metric and the end-task metric before widening.
+  Monitor the two metrics side by side; divergence means hidden coupling.
+- **Per-stage timeout with a degraded mode.** Give optional stages a hard timeout and a defined fallback
+  (rerank times out, so keep vector-search order; the judge is skipped). Monitor degraded-mode rate per
+  stage; a rising rate is an incident before users notice.
+- **Sampled asynchronous judge.** Judge a fixed share (for example 5%) of production answers off the hot
+  path and group scores by each stage's model version. Monitor judge score per version and judge
+  agreement with periodic human labels.
 
 ## Trade-offs
-- Each stage gets a right-sized model for quality and cost, but there are more moving parts, vendors and
-  versions to manage; for low-volume products one strong model's simplicity can win outright.
-- Stages can be upgraded independently, yet hidden coupling means a swap is safe only with an end-to-end
-  eval; the independence evaporates when stages have been tuned to each other's quirks.
-- Running independent stages concurrently cuts latency, but raises peak concurrency and cost during
-  bursts, and complicates per-stage rate-limit budgeting.
-- Vendor diversity gives best-of-breed quality and resilience, but every new processor needs a security
-  review and a data-processing agreement; in regulated settings fewer vendors is the better trade.
-- An inline verifier raises the quality floor on every request at a latency and cost premium; a sampled
-  asynchronous judge is nearly free but only catches problems after users have seen them.
+- **Right-sized models vs moving parts.** Each stage gets a right-sized model for quality and cost, but
+  there are more vendors and versions to manage; for low-volume products one strong model's simplicity can
+  win outright.
+- **Independent upgrades vs hidden coupling.** A swap is safe only with an end-to-end eval; independence
+  evaporates when stages have been tuned to each other's quirks.
+- **Concurrency vs burst cost.** Running independent stages concurrently cuts latency, but raises peak
+  concurrency and cost during bursts, and complicates per-stage rate-limit budgeting.
+- **Vendor diversity vs compliance load.** Best-of-breed quality and resilience, but every new processor
+  needs a security review and a data-processing agreement; in regulated settings fewer vendors is the
+  better trade.
+- **Inline verifier vs sampled judge.** Inline raises the quality floor on every request at a latency and
+  cost premium; a sampled asynchronous judge is nearly free but only catches problems after users have
+  seen them.
 
 ## Pitfalls
-- Upgrading the embedding model without re-indexing; the symptom is retrieval recall collapsing because
-  query vectors and stored document vectors now live in different spaces.
-- Budgeting latency with averages; the symptom is an end-to-end p99 far above the sum of stage p50s
-  while every stage looks healthy on its own dashboard.
-- No per-stage telemetry; the symptom is "the answers got worse" with no way to tell whether the
-  rewriter, retriever, reranker or generator regressed.
-- Passing free text between stages instead of typed objects; the symptom is parse failures after a
-  model update and prompt-injection text riding from one stage into the next.
-- Running an LLM judge inline on all traffic; the symptom is cost roughly doubling and latency rising
-  with no gain the product can show, when a 5% sample would have caught the same regressions.
-- Treating two vendors' "same" capability as interchangeable; the symptom is dimension mismatches,
-  silent truncation at a different token limit, or changed tool-call formats after a swap.
+- **Upgrading the embedding model without re-indexing.** Symptom: retrieval recall collapses because query
+  vectors and stored document vectors now live in different spaces.
+- **Budgeting latency with averages.** Symptom: an end-to-end p99 far above the sum of stage p50s while
+  every stage looks healthy on its own dashboard.
+- **No per-stage telemetry.** Symptom: "the answers got worse" with no way to tell whether the rewriter,
+  retriever, reranker or generator regressed.
+- **Free text between stages instead of typed objects.** Symptom: parse failures after a model update and
+  prompt-injection text riding from one stage into the next.
+- **An LLM judge inline on all traffic.** Symptom: cost roughly doubling and latency rising with no gain
+  the product can show, when a 5% sample would have caught the same regressions.
+- **Treating two vendors' "same" capability as interchangeable.** Symptom: dimension mismatches, silent
+  truncation at a different token limit, or changed tool-call formats after a swap.
 
 ## When to use
-Any system beyond a prototype is already multi-model; the question is whether the decomposition is
-explicit. Make it explicit as soon as you have more than one model class in the path, or more than one
-team touching the pipeline. Measure cost and latency per stage (p50, p95, p99), each stage's component
-metric and the end-task metric, and alert on divergence between them. Resist adding a stage without a
-measured gain; each one is a dependency with its own failure mode. In interviews, draw the pipeline, name
-the model class and budget for each stage, and explain how you would localise a regression after an
-upgrade. That coupling-and-eval story is what distinguishes architecture from a diagram.
+- **Always, explicitly:** any system beyond a prototype is already multi-model; the question is whether
+  the decomposition is explicit.
+- **Make it explicit when** you have more than one model class in the path, or more than one team touching
+  the pipeline.
+- **Measure:** cost and latency per stage (p50, p95, p99), each stage's component metric and the end-task
+  metric; alert on divergence between them.
+- **Avoid** adding a stage without a measured gain; each one is a dependency with its own failure mode.
+- **Interviews:** draw the pipeline, name the model class and budget per stage, and explain how you would
+  localise a regression after an upgrade. That coupling-and-eval story distinguishes architecture from a
+  diagram.
 
 ## Role lens
 - **Engineer:** Implements typed stage adapters, records model versions in traces, writes component evals
@@ -207,6 +300,46 @@ rates, check for context truncation from a different tokeniser or limit, and rea
 disagreements. The fix is usually prompt re-tuning plus an end-to-end eval before a canary rollout. The
 lesson is procedural: a stage upgrade is a release that needs per-stage telemetry, end-to-end evaluation
 and a feature flag, regardless of what the public benchmark says.
+
+## Interview questions
+### Why not run every job in the pipeline through one frontier model?
+- **Cost:** embedding a hundred thousand chunks through a generative model costs far more than an
+  embedding model built for it.
+- **Capability:** a chat model does not emit vectors, and a prompted generalist ranks query–document pairs
+  worse and more expensively than a cross-encoder.
+- **Latency:** every extra job on the critical path is another multi-second call, so specialised small
+  models keep the serial path short.
+
+### Design the model stages for a support assistant with retrieval and a safety check.
+- **Decompose by job:** guard (fast classifier), embed (embedding model), retrieve (vector search), rerank
+  (cross-encoder), generate (frontier model), sampled judge (small model, asynchronous).
+- **Compose:** run guard and embed concurrently, or start retrieval speculatively while the guard decides,
+  since retrieval has no side effects.
+- **Contracts:** typed, versioned schemas between stages, with model id and version in the trace for every
+  stage.
+
+### How would you budget end-to-end latency across four serial stages?
+- **Budget with the sum of the stage tail numbers,** then measure the end-to-end distribution, because
+  tails do not average.
+- **Correlated slowness matters:** stages sharing one GPU pool or provider, or retries at every stage, push
+  the real p99 towards or past that sum.
+- **Find the dominant stage:** usually generation, so stream it to move the user-visible number to
+  time-to-first-token.
+
+### When would you deliberately avoid adding another model stage?
+- **When there is no measured gain** on the end-task metric, because each stage is a dependency with its own
+  failure mode, timeout and version to govern.
+- **For low-volume products,** where one strong model's simplicity can win outright.
+- **In regulated settings,** where each new vendor needs a security review and a data-processing agreement,
+  so fewer vendors is the better trade.
+
+### You must change the embedding model in production. What is your rollout plan?
+- **Re-index, never mix spaces:** query vectors and stored document vectors from different models make
+  recall collapse.
+- **Build the new index alongside,** compare recall@k on the golden set, then run the end-task eval, since a
+  better component metric can still hurt the task.
+- **Switch a read alias in one step** behind a flag and canary, and keep the old index until the end-task
+  metric holds.
 
 ## Quiz
 ### Q: Why do multi-model systems need typed, versioned contracts between stages?

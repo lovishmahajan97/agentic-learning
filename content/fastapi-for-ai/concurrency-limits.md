@@ -5,7 +5,7 @@ name: Concurrency limits (semaphores)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/backpressure
   - fastapi-for-ai/rate-limiting
@@ -22,97 +22,108 @@ sources:
 ---
 
 ## TL;DR
-An async FastAPI worker will happily start thousands of model calls at once; the provider, the GPU or
-your memory will not handle them. A semaphore caps how many run concurrently: each call takes a slot
-before starting and returns it when done, and everyone else waits or is turned away. Size the cap
-from the downstream's real limit divided across workers, bound the wait, and fail fast with 503
-when the wait is too long.
+An async worker will start thousands of model calls at once; providers, GPUs and memory cannot cope. A
+semaphore caps calls in flight. Size it from the downstream limit divided across workers, bound the
+wait, and fail fast with 503.
 
 ## Why it exists
-With `async def` endpoints, a worker does not run out of threads; each request is a cheap coroutine.
-That is the point of async, and also the danger. A burst of 2,000 chat requests becomes 2,000
-concurrent provider calls in a few milliseconds. The provider answers with 429s past its concurrency
-quota, a self-hosted vLLM server queues them internally until latency is useless, each in-flight
-request holds a connection, a prompt and a growing response in memory, and retries from impatient
-clients double the load. Nothing in the async machinery pushes back.
-
-The naive answers do not fix it. A rate limit (requests per second) controls arrivals, not how many
-are in flight at once; with LLM calls taking anywhere from one to sixty seconds, the same rate can
-mean ten or six hundred concurrent calls. Leaning on the HTTP client's pool limit as the cap only moves
-the queue into the pool wait, where it surfaces as `PoolTimeout` with no clean 503 and no per-dependency
-policy, and a bigger pool just sends more load downstream. More workers multiply the problem. What is missing is a direct cap on in-flight work
-for each scarce resource, enforced before the work starts. The relationship to aim at is Little's law:
-in-flight = throughput × latency. If a dependency can sustain 64 concurrent calls and calls take 4
-seconds on average, its ceiling is about 16 requests per second, whatever you do upstream.
+- **Async removes the natural brake.** With `async def` endpoints a worker does not run out of threads;
+  each request is a cheap coroutine. A burst of 2,000 chat requests becomes 2,000 concurrent provider
+  calls in a few milliseconds.
+- **Everything downstream suffers and nothing pushes back.** The provider answers with 429s past its
+  concurrency quota, a self-hosted vLLM server queues internally until latency is useless, each
+  in-flight request holds a connection, a prompt and a growing response in memory, and retries from
+  impatient clients double the load.
+- **A rate limit controls arrivals, not in-flight work.** With LLM calls taking anywhere from one to sixty
+  seconds, the same rate can mean ten or six hundred concurrent calls.
+- **The HTTP client's pool limit is the wrong cap.** It only moves the queue into the pool wait, where it
+  surfaces as `PoolTimeout` with no clean 503 and no per-dependency policy; a bigger pool just sends more
+  load downstream. More workers multiply the problem.
+- **What is missing is a direct cap per scarce resource, enforced before the work starts.** Little's law:
+  in-flight = throughput × latency. A dependency that sustains 64 concurrent calls at 4 seconds average
+  has a ceiling of about 16 requests per second, whatever you do upstream.
 
 ## How it works
 ### The primitive
-`asyncio.Semaphore(n)` holds a counter starting at *n*. `acquire()` decrements it, or suspends the
-coroutine if it is zero; `release()` increments it and wakes one waiter. `async with sem:` pairs them
-and releases even on exceptions and cancellation, *because* a leaked slot permanently shrinks capacity
-until restart. `BoundedSemaphore` additionally raises if released more times than acquired, which
-turns a double-release bug into an error instead of silent extra capacity. AnyIO's `CapacityLimiter`
-is the equivalent when the codebase uses AnyIO.
+- **`asyncio.Semaphore(n)`** holds a counter starting at *n*.
+  - `acquire()` decrements it, or suspends the coroutine if it is zero.
+  - `release()` increments it and wakes one waiter.
+- **`async with sem:`** pairs them and releases even on exceptions and cancellation, *because* a leaked
+  slot permanently shrinks capacity until restart.
+- **`BoundedSemaphore`** also raises if released more times than acquired, turning a double-release bug
+  into an error instead of silent extra capacity.
+- **AnyIO's `CapacityLimiter`** is the equivalent when the codebase uses AnyIO.
 
 ### Where it lives
-Create one semaphore per scarce dependency at startup in the lifespan and store it on `app.state`.
-It must be shared across requests, *because* a semaphore created per request limits nothing. It is
-also bound to the process: each Uvicorn worker has its own, so the effective limit is
-`workers × n`. To keep a fleet under a provider quota of 64 with 4 workers, use 16 per worker; with
-autoscaling replicas, a fixed per-process number drifts and you need a shared limiter (for example
-leases with expiry in Redis) or a gateway that enforces the global cap.
+- **One semaphore per scarce dependency,** created at startup in the lifespan and stored on `app.state`.
+  It must be shared across requests, *because* a semaphore created per request limits nothing.
+- **It is per process.** Each Uvicorn worker has its own, so the effective limit is `workers × n`.
+- **Example:** to keep a fleet under a provider quota of 64 with 4 workers, use 16 per worker.
+- **Autoscaling breaks fixed numbers.** With autoscaling replicas a fixed per-process number drifts, so
+  you need a shared limiter (for example leases with expiry in Redis) or a gateway that enforces the
+  global cap.
 
 ### Bound the wait
-A plain `async with sem:` waits forever. Under sustained overload the wait queue grows without limit,
-which is just an unbounded queue with extra steps. Wrap the acquire in a timeout, and if it expires
-return 503 with `Retry-After`, *because* a fast, honest rejection lets the client or load balancer
-retry elsewhere while a slow one burns the client's whole timeout. You can also check
-`sem.locked()` to reject immediately when there is no free slot.
+- **A plain `async with sem:` waits forever.** Under sustained overload the wait queue grows without limit,
+  which is just an unbounded queue with extra steps.
+- **Wrap the acquire in a timeout** and, if it expires, return 503 with `Retry-After`, *because* a fast,
+  honest rejection lets the client or load balancer retry elsewhere while a slow one burns the client's
+  whole timeout.
+- **Reject immediately** by checking `sem.locked()` when there is no free slot.
 
 ### Choosing n
-For a hosted provider, *n* starts from the quota: `n_per_worker = floor(quota / (workers × replicas))`,
-minus headroom for retries and other services sharing the key. For a self-hosted inference server
-there is no quota, only a curve: run a load test that steps concurrency up and record throughput and
-per-request latency (time per output token, time to first token) at each step. Throughput rises while
-the engine batches more sequences, then flattens; latency stays roughly flat, then climbs. Set *n*
-just before the knee, *because* past it extra concurrency buys no throughput and only adds queueing
-inside the engine, where you can neither see nor reject it. Little's law gives the resulting ceiling:
-`max throughput ≈ n / mean latency`. When the knee moves (longer prompts, a new model), a static *n*
-goes stale; adaptive limiters adjust it from observed latency or 429s, at the cost of a feedback
-loop that must itself be tuned.
+| Dependency | Starting point |
+|---|---|
+| Hosted provider | The quota: `n_per_worker = floor(quota / (workers × replicas))`, minus headroom for retries and other services sharing the key |
+| Self-hosted inference server | No quota, only a curve: find the knee with a concurrency sweep |
+
+The sweep for a self-hosted engine:
+1. Step concurrency up in a load test.
+2. Record throughput and per-request latency (time per output token, time to first token) at each step.
+3. Throughput rises while the engine batches more sequences, then flattens; latency stays roughly flat,
+   then climbs.
+4. Set *n* just before the knee, *because* past it extra concurrency buys no throughput and only adds
+   queueing inside the engine, where you can neither see nor reject it.
+
+- **The resulting ceiling (Little's law):** `max throughput ≈ n / mean latency`.
+- **Static *n* goes stale** when the knee moves (longer prompts, a new model). Adaptive limiters adjust it
+  from observed latency or 429s, at the cost of a feedback loop that must itself be tuned.
 
 ### Not all calls cost the same
-A provider quota is often in tokens per minute as well as requests, and a 50k-token prompt holds far
-more of a self-hosted engine's KV cache than a 200-token one. A slot-per-request semaphore treats them
-as equal. A weighted limit charges each call units proportional to its expected tokens. Do not build
-this by calling `acquire()` *k* times on an `asyncio.Semaphore`: acquisition is not atomic, so two
-large requests can each hold half of what they need and wait on each other forever. Use a limiter
-that takes *k* units in one step, or cap request size separately so one slot is a bounded cost.
+- **Quotas count tokens too.** A provider quota is often in tokens per minute as well as requests, and a
+  50k-token prompt holds far more of a self-hosted engine's KV cache than a 200-token one.
+- **A slot-per-request semaphore treats them as equal.** A weighted limit charges each call units
+  proportional to its expected tokens.
+- **Do not call `acquire()` *k* times on an `asyncio.Semaphore`.** Acquisition is not atomic, so two large
+  requests can each hold half of what they need and wait on each other forever.
+- **Instead,** use a limiter that takes *k* units in one step, or cap request size separately so one slot
+  is a bounded cost.
 
 ### Separate limits per dependency
-One semaphore for the LLM, another for embeddings, another for the reranker or a slow internal tool.
-This is the bulkhead idea: a stall in one dependency fills only its own slots instead of starving
-every endpoint. Endpoints that call several dependencies take each slot only around the call that
-needs it.
+- **One semaphore each** for the LLM, embeddings, the reranker or a slow internal tool.
+- **This is the bulkhead idea:** a stall in one dependency fills only its own slots instead of starving
+  every endpoint.
+- **Endpoints that call several dependencies** take each slot only around the call that needs it.
 
 ### Streaming endpoints
-For a `StreamingResponse`, acquire the slot *before* returning the response, so you can still answer
-503 with proper headers, and release it in the generator's `finally`, *because* the expensive work
-happens while the stream is being consumed, after the endpoint function has returned. One edge
-case: an async generator that is never started never runs its `finally`, so if the response is
-abandoned before the first chunk the slot can leak; guard with a release-once flag that is also
-triggered from cleanup outside the generator, and alert on slots that never return.
+- **Acquire before returning the response,** so you can still answer 503 with proper headers.
+- **Release in the generator's `finally`,** *because* the expensive work happens while the stream is being
+  consumed, after the endpoint function has returned.
+- **Edge case:** an async generator that is never started never runs its `finally`, so if the response is
+  abandoned before the first chunk the slot can leak. Guard with a release-once flag that is also
+  triggered from cleanup outside the generator, and alert on slots that never return.
 
 ### The hidden limit you already have
-Sync `def` endpoints and `run_in_threadpool` calls run on AnyIO's worker thread pool, which has a
-default capacity limiter (40 threads in current AnyIO). That is a concurrency limit too, often hit by
-accident when blocking SDK calls sit in a sync endpoint. Server-wide, Uvicorn's `--limit-concurrency`
-returns 503 once a worker holds too many connections or tasks; it is a coarse safety net, not a
-per-dependency limit.
+- **The thread pool.** Sync `def` endpoints and `run_in_threadpool` calls run on AnyIO's worker thread
+  pool, which has a default capacity limiter (40 threads in current AnyIO). That is a concurrency limit
+  too, often hit by accident when blocking SDK calls sit in a sync endpoint.
+- **Uvicorn's `--limit-concurrency`** returns 503 once a worker holds too many connections or tasks; it is
+  a coarse safety net, not a per-dependency limit.
 
-## Example
-A per-worker cap on calls to an LLM provider whose quota is 64 concurrent requests across 4 workers,
-with a bounded wait and a slot held for the full duration of a stream.
+## Examples
+### Per-worker cap for a streaming LLM endpoint
+A per-worker cap on calls to an LLM provider whose quota is 64 concurrent requests across 4 workers, with
+a bounded wait and a slot held for the full duration of a stream.
 
 ```python
 import asyncio
@@ -150,41 +161,108 @@ async def chat(body: dict, request: Request):
     return StreamingResponse(gen(), media_type="text/plain")
 ```
 
-With an average generation of 8 seconds, 16 slots per worker sustain about 16 / 8 = 2 requests per
-second per worker, 8 across the fleet. Above that, requests wait up to 2 seconds and then get 503
-instead of piling up.
+- **Ceiling:** with an average generation of 8 seconds, 16 slots per worker sustain about 16 / 8 = 2
+  requests per second per worker, 8 across the fleet.
+- **Above that,** requests wait up to 2 seconds and then get 503 instead of piling up.
+
+### Runnable: a burst against a bounded semaphore
+Twelve requests arrive at once against 4 slots; each call takes 1 second and waiters give up after 0.5
+seconds. Runs on Python 3.11+ with no dependencies.
+
+```python
+import asyncio
+
+async def main(n=4, requests=12, work_s=1.0, wait_s=0.5):
+    sem, inflight, peak, rejected = asyncio.BoundedSemaphore(n), 0, 0, 0
+
+    async def handle():
+        nonlocal inflight, peak, rejected
+        try:
+            async with asyncio.timeout(wait_s):
+                await sem.acquire()
+        except TimeoutError:
+            rejected += 1                      # in FastAPI: 503 with Retry-After
+            return
+        try:
+            inflight += 1
+            peak = max(peak, inflight)
+            await asyncio.sleep(work_s)        # stands in for the provider call
+        finally:
+            inflight -= 1
+            sem.release()
+
+    await asyncio.gather(*(handle() for _ in range(requests)))
+    print(f"peak in flight={peak}, served={requests - rejected}, rejected={rejected}")
+
+asyncio.run(main())   # peak in flight=4, served=4, rejected=8
+```
+
+### Worked sizing: quota, workers and throughput
+| Input | Value | Result |
+|---|---|---|
+| Provider quota | 64 concurrent | — |
+| Workers × replicas | 4 × 1 | `floor(64 / 4)` = 16 per worker |
+| Mean generation | 8 s | 16 / 8 = 2 req/s per worker, 8 req/s fleet |
+| Scale to 8 workers, same *n* | 8 × 16 = 128 in flight | double the quota: 429s return |
+| Scale to 8 workers, re-sized | `floor(64 / 8)` = 8 per worker | fleet stays at 64 |
+
+## Production patterns
+- **Per-dependency bulkheads in the lifespan.** When an endpoint fans out to an LLM, embeddings and a
+  reranker, create one `BoundedSemaphore` per dependency on `app.state` and take each only around its
+  call. Monitor slots in use, wait time and rejections per dependency (count them in your own code, since
+  the semaphore exposes no public in-use counter).
+- **Derive *n* from config, not a constant.** Read the quota and the worker and replica counts from
+  settings and compute `floor(quota / (workers × replicas))` at startup, minus retry headroom. Monitor
+  provider 429 rate after every scaling change.
+- **Global leases for autoscaled fleets.** When replica count varies, take a lease with expiry in Redis
+  (or route through a gateway that enforces the global cap) instead of a per-process semaphore. Monitor
+  lease acquire latency and leases that expire without release.
+- **Raise the thread limiter deliberately.** If sync SDK calls must stay in `def` endpoints, set AnyIO's
+  default limiter in the lifespan, for example
+  `anyio.to_thread.current_default_thread_limiter().total_tokens = 100`, sized to the downstream. Monitor
+  latency of sync endpoints under load, which plateaus at the thread cap.
+- **Per-tenant caps on top of the global cap.** For multi-tenant APIs, give each tenant a small semaphore
+  checked before the shared one, so a noisy customer cannot take every slot. Monitor rejections by tenant
+  and idle global capacity.
+- **Uvicorn `--limit-concurrency` as the outer net.** Set it above the sum of your dependency caps so it
+  only fires when something else has failed. Monitor its 503s separately from your own.
 
 ## Trade-offs
-- A tight cap protects the downstream and keeps latency predictable, but rejects requests the
-  downstream might have absorbed; raise it only when measured downstream latency stays flat.
-- Waiting briefly for a slot smooths short bursts; waiting long only converts overload into latency,
-  so the right wait is short compared with the client's timeout.
-- Per-process semaphores are simple and fast but assume a fixed worker count; under autoscaling, a
-  distributed limiter is accurate at the price of a network round trip per acquire.
-- One shared cap per dependency is fair to no one in particular; per-tenant caps prevent a noisy
-  customer from taking every slot, at the cost of idle capacity when tenants are quiet.
+- **Tight cap vs absorbed load.** A tight cap protects the downstream and keeps latency predictable, but
+  rejects requests the downstream might have absorbed; raise it only when measured downstream latency
+  stays flat.
+- **Short vs long waits.** Waiting briefly for a slot smooths short bursts; waiting long only converts
+  overload into latency, so the right wait is short compared with the client's timeout.
+- **Per-process vs distributed limiter.** Per-process semaphores are simple and fast but assume a fixed
+  worker count; under autoscaling a distributed limiter is accurate at the price of a network round trip
+  per acquire.
+- **Shared vs per-tenant caps.** One shared cap per dependency is fair to no one in particular; per-tenant
+  caps prevent a noisy customer from taking every slot, at the cost of idle capacity when tenants are
+  quiet.
 
 ## Pitfalls
-- Creating the semaphore inside the endpoint or a per-request dependency; it limits nothing, and the
+- **Creating the semaphore inside the endpoint or a per-request dependency.** It limits nothing; the
   symptom is provider 429s at the same load as before the change.
-- Forgetting that the cap is per worker; scaling from 4 to 8 workers doubles provider concurrency and
+- **Forgetting that the cap is per worker.** Scaling from 4 to 8 workers doubles provider concurrency and
   429s return after the scale-up.
-- Acquiring without a timeout; under overload p99 latency climbs to the client timeout and memory
+- **Acquiring without a timeout.** Under overload p99 latency climbs to the client timeout and memory
   grows with the number of suspended waiters.
-- Releasing in the endpoint for a streaming response; the slot is freed when headers go out, so real
+- **Releasing in the endpoint for a streaming response.** The slot is freed when headers go out, so real
   concurrency against the provider far exceeds the cap.
-- Manual `acquire()` without `try/finally`; a cancelled or failed request leaks a slot, and capacity
+- **Manual `acquire()` without `try/finally`.** A cancelled or failed request leaks a slot, and capacity
   shrinks slowly until the worker seems to hang at zero.
-- Sizing *n* for a self-hosted engine from GPU count or intuition rather than a concurrency sweep; the
-  symptom is throughput that does not rise when *n* is raised while time per token keeps growing.
+- **Sizing *n* for a self-hosted engine from GPU count or intuition** rather than a concurrency sweep.
+  Symptom: throughput does not rise when *n* is raised while time per token keeps growing.
 
 ## When to use
-Put a semaphore in front of every scarce or quota-bound dependency an async service calls: hosted
-LLMs with concurrency quotas, self-hosted inference servers whose latency degrades past a batch size,
-embedding and reranking services, slow internal tools. Pair it with rate limiting for per-client
-fairness and with backpressure for what to do when slots run out. Measure slot utilisation, wait
-time, rejection rate and downstream latency against concurrency. In interviews, expect to compute a
-per-worker limit from a quota and to explain why rate limits alone do not bound concurrency.
+- **Use in front of** every scarce or quota-bound dependency an async service calls: hosted LLMs with
+  concurrency quotas, self-hosted inference servers whose latency degrades past a batch size, embedding
+  and reranking services, slow internal tools.
+- **Pair it** with rate limiting for per-client fairness and with backpressure for what to do when slots
+  run out.
+- **Measure** slot utilisation, wait time, rejection rate and downstream latency against concurrency.
+- **Interviews:** expect to compute a per-worker limit from a quota and to explain why rate limits alone
+  do not bound concurrency.
 
 ## Role lens
 - **Engineer:** Creates per-dependency semaphores in the lifespan, bounds acquisition with a timeout,

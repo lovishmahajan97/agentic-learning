@@ -5,7 +5,7 @@ name: Model fallback strategies
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - serving-inference/fallbacks
   - serving-inference/retry-strategies
@@ -21,101 +21,113 @@ sources:
 ---
 
 ## TL;DR
-Every model endpoint fails sometimes: outages, 429 throttling, latency spikes, regional capacity limits,
-deprecated model ids. A fallback strategy decides in advance what to call instead, in what order, and on
-which errors, so a provider's bad hour does not become your outage. Fallbacks are not free: the
-substitute behaves differently, retries can amplify an incident, and an untested fallback is a second
-failure waiting behind the first.
+A fallback strategy decides in advance what to call instead, in what order and on which errors, so a
+provider's bad hour is not your outage. The substitute behaves differently, retries can amplify incidents,
+and an untested fallback is a second failure.
 
 ## Why it exists
-A model API is a remote dependency with several distinct ways of failing: hard errors (5xx, connection
-resets), throttling (429, sometimes with a `Retry-After`), slow responses that blow the deadline when the
-provider is overloaded, capability changes (a model id retired, behaviour shifted by a silent update),
-and exhausted quota in one region while another has capacity. Each surfaces to the user as an error or a
-spinner that never resolves. If your availability target is higher than the provider's, arithmetic alone
-says you need a second, independent path: two paths that each succeed 99.5% of the time give
-1 − 0.005² = 99.9975% *if their failures are independent*. They rarely are. Two resellers of the same
-upstream model, two deployments in one cloud region, or two keys drawing on one organisation quota fail
-together, so the real gain is set by how independent the rungs are, and independence is the property to
-design for.
-
-The naive alternative, "retry with backoff", only covers transient blips on the same endpoint. During a
-real incident it makes things worse: every client retries, load on the failing provider multiplies, and
-each user waits through several timeouts before seeing an error. The other naive alternative, "add a
-second provider", fails more quietly: the backup returns malformed JSON, ignores the tool schema, or
-truncates at a smaller context window, so the error rate looks fine while the product silently breaks.
-
-Fallback is a specific thing, distinct from its neighbours. A *retry* repeats the call on the same
-target. A *fallback* keeps the function but changes the target: another region, another provider,
-another model. *Degradation* changes the function itself. Getting the three confused is how teams end up
-with a fallback chain that is slower than the outage it was meant to hide.
+- **Model endpoints fail in several distinct ways:** outages and hard errors (5xx, connection resets),
+  throttling (429, sometimes with a `Retry-After`), latency spikes that blow the deadline when the provider
+  is overloaded, capability changes (a deprecated or retired model id, behaviour shifted by a silent
+  update), and regional capacity limits or exhausted quota while another region has capacity. Each reaches
+  the user as an error or a spinner that never resolves.
+- **The arithmetic needs a second path.** If your availability target is higher than the provider's, two
+  paths that each succeed 99.5% of the time give 1 − 0.005² = 99.9975% *if their failures are
+  independent*.
+- **They rarely are.** Two resellers of the same upstream model, two deployments in one cloud region, or
+  two keys on one organisation quota fail together. The real gain is set by how independent the rungs are,
+  so independence is the property to design for.
+- **"Retry with backoff" makes real incidents worse.** It only covers transient blips on the same
+  endpoint. In an incident every client retries, load on the failing provider multiplies, and each user
+  waits through several timeouts before seeing an error.
+- **"Add a second provider" fails quietly.** The backup returns malformed JSON, ignores the tool schema, or
+  truncates at a smaller context window, so the error rate looks fine while the product silently breaks.
 
 ## How it works
+### Retry vs fallback vs degradation
+| Mechanism | What changes | Example |
+|---|---|---|
+| *Retry* | Nothing: repeats the call on the same target | Same endpoint after jittered backoff |
+| *Fallback* | The target, keeping the function | Another region, provider or model |
+| *Degradation* | The function itself | Cache, non-AI path, honest unavailability |
+
+Confusing the three is how teams end up with a fallback chain slower than the outage it was meant to hide.
+
 ### Classify the failure first
-Every error maps to one of three actions, and the mapping is the heart of the design.
+Every error maps to one action; the mapping is the heart of the design.
 - **Retry the same target** for 429 (honour `Retry-After`), 5xx, connection errors and timeouts on
-  idempotent calls; once or twice, with jittered backoff, never unbounded.
+  idempotent calls: once or twice, with jittered backoff, never unbounded.
 - **Fail over** on repeated 5xx or timeouts, an open circuit, a 404 for a retired model id, or regional
   capacity errors.
-- **Neither** for 400 invalid request, 401, content-policy refusals and context-too-long: these recur
-  identically on every target, so failing over just multiplies latency and cost. They also say nothing
-  about the target's health, so they must not count towards its circuit breaker.
-- **Escalate on invalid output.** A response that arrives but fails schema validation after one repair
-  attempt is a legitimate reason to try the next rung, usually a stronger model. This is the cascade
-  idea applied to reliability; count it separately from error-triggered fallback, because it signals a
-  prompt or model-fit problem rather than an outage.
+- **Neither** for 400 invalid request, 401, content-policy refusals and context-too-long. These recur
+  identically on every target, so failing over multiplies latency and cost. They say nothing about the
+  target's health, so they must not count towards its circuit breaker.
+- **Escalate on invalid output.** A response that fails schema validation after one repair attempt is a
+  legitimate reason to try the next rung, usually a stronger model. This is the cascade idea applied to
+  reliability. Count it separately from error-triggered fallback, because it signals a prompt or
+  model-fit problem rather than an outage.
 
 ### The ladder, ordered by behavioural distance
-1. Same model, another deployment or region: identical behaviour, different capacity.
-2. Same model through another provider (a cloud platform serving the same weights): identical weights,
+1. **Same model, another deployment or region:** identical behaviour, different capacity.
+2. **Same model through another provider** (a cloud platform serving the same weights): identical weights,
    possibly different limits and features.
-3. Same family, adjacent version: small drift in style and formatting.
-4. Comparable model from another vendor: prompts, tool-call formats, structured output and tokeniser
+3. **Same family, adjacent version:** small drift in style and formatting.
+4. **Comparable model from another vendor:** prompts, tool-call formats, structured output and tokeniser
    limits must all be re-validated.
-5. A smaller model: a quality drop, but still the same function.
-6. Hand off to graceful degradation: cache, non-AI path, honest unavailability.
+5. **A smaller model:** a quality drop, but still the same function.
+6. **Hand off to graceful degradation:** cache, non-AI path, honest unavailability.
+
 Order *because* each rung down changes behaviour more; you want the first rung that works to be the one
 users cannot tell from normal.
 
 ### Deadlines, not timeouts
-Each attempt needs its own timeout, and the attempts must fit inside one user-facing deadline. Without
-that, a 10 s primary timeout plus a 10 s fallback is a 20 s worst case nobody signed off. Pass the
-remaining budget down the ladder and skip rungs that cannot complete in time.
+- **Each attempt has its own timeout,** and all attempts fit inside one user-facing deadline.
+- **Without that,** a 10 s primary timeout plus a 10 s fallback is a 20 s worst case nobody signed off.
+- **Pass the remaining budget down the ladder** and skip rungs that cannot complete in time.
 
 ### Circuit breakers
-Per target: after N failures in a window the breaker opens, the target is skipped for a cooldown, then a
-single probe decides whether to close it. Without a breaker, every request during an outage waits the
-full primary timeout *before* falling back, so latency equals timeout plus fallback for the whole
-incident, and the failing provider keeps receiving your traffic.
+1. **Closed:** per target, count failures in a window.
+2. **Open:** after N failures the target is skipped for a cooldown.
+3. **Half-open:** a single probe decides whether to close it.
+
+Without a breaker, every request during an outage waits the full primary timeout *before* falling back.
+Latency equals timeout plus fallback for the whole incident, and the failing provider keeps receiving
+your traffic.
 
 ### Hedging for latency
-Dean and Barroso's hedged request sends the same call to a second target after the p95 delay has elapsed
-and takes whichever answers first. It trims the tail at the cost of roughly 5% extra calls, but only for
-idempotent calls, never once a stream has been committed to the user, and it must switch off when the
-breaker shows the primary is overloaded, or it doubles the load that caused the problem.
+- **What:** Dean and Barroso's hedged request sends the same call to a second target after the p95 delay
+  and takes whichever answers first.
+- **Cost:** it trims the tail for roughly 5% extra calls.
+- **Only for idempotent calls,** and never once a stream has been committed to the user.
+- **Switch it off when the breaker shows the primary is overloaded,** or it doubles the load that caused
+  the problem.
 
 ### Equivalence is a test, not an assumption
-Validate outputs against a schema regardless of which model served them; keep per-model prompt variants
-when formats differ; send a small continuous slice (around 1%) through each fallback so it is exercised
-in daily traffic; run game days where the primary is blocked on purpose. Tag every response with the
-target that served it, and alert when the fallback share rises, otherwise the primary can be down for a
-week and the only signal is the bill.
+- **Validate outputs against a schema** regardless of which model served them.
+- **Keep per-model prompt variants** when formats differ.
+- **Send a small continuous slice (around 1%) through each fallback** so it is exercised in daily traffic.
+- **Run game days** where the primary is blocked on purpose.
+- **Tag every response with its serving target and alert when the fallback share rises,** otherwise the
+  primary can be down for a week and the only signal is the bill.
 
 ### Side effects and streams
-A retry or failover after a tool call executed (an email sent, a record written) duplicates the side
-effect; tool calls need idempotency keys and agent state needs checkpoints so the fallback resumes after
-the action rather than replaying it. A stream that fails midway restarts on the fallback with the partial
-output discarded; models do not reliably continue each other's text.
+- **A retry or failover after a tool call executed** (an email sent, a record written) duplicates the side
+  effect. Tool calls need idempotency keys; agent state needs checkpoints so the fallback resumes after
+  the action rather than replaying it.
+- **A stream that fails midway restarts on the fallback** with the partial output discarded; models do not
+  reliably continue each other's text.
 
 ### Capacity and cost
-Failing all traffic over to a secondary hits the secondary's rate limits unless quota was provisioned in
-advance; you cannot buy it during the incident. Failing over to a larger model is a cost spike. Both
-belong in the runbook before the first outage.
+- **Secondary rate limits:** failing all traffic over hits them unless quota was provisioned in advance;
+  you cannot buy it during the incident.
+- **Larger fallback models** are a cost spike.
+- **Both belong in the runbook** before the first outage.
 
-## Example
-A fallback ladder with per-target circuit breakers (closed, open, half-open with a single probe), error
-classification and a shared deadline. `call_model`, `ModelError` (with an HTTP `status`) and
-`ServiceDegraded` are the adapter types your client layer provides; the point is the control flow.
+## Examples
+### Fallback ladder with breakers and a shared deadline
+Per-target circuit breakers (closed, open, half-open with a single probe), error classification and one
+deadline. `call_model`, `ModelError` (with an HTTP `status`) and `ServiceDegraded` are the adapter types
+your client layer provides; the point is the control flow.
 
 ```python
 import asyncio, random, time
@@ -165,50 +177,130 @@ async def complete(messages, deadline=10.0):
     raise ServiceDegraded(last_err)                     # hand off to the graceful-degradation layer
 ```
 
-`served_by` and `fallback_depth` go into metrics and traces; the alert on fallback depth greater than zero
-is what tells you the primary is unhealthy before customers do. Two details are deliberate. Client errors
-are recorded as healthy, because a burst of malformed requests from one buggy caller must not open the
-breaker and push everyone else's traffic to a worse rung. And the per-rung timeouts (3 s, 3 s, 6 s) sum
-to more than the 10 s deadline, so the third rung only gets what is left: if both primaries time out,
-it has just under 4 s of its 6 s, and a rung that cannot finish in that time is better skipped
-(`remaining <= 0` is the crude version of that check). A production breaker also has to release the half-open
-probe slot on every exit path, including cancellation when the client disconnects, or a target can stay
-skipped indefinitely.
+- **`served_by` and `fallback_depth` go into metrics and traces;** the alert on fallback depth greater than
+  zero tells you the primary is unhealthy before customers do.
+- **Client errors are recorded as healthy,** because a burst of malformed requests from one buggy caller
+  must not open the breaker and push everyone else's traffic to a worse rung.
+- **The per-rung timeouts (3 s, 3 s, 6 s) sum to more than the 10 s deadline,** so the third rung gets only
+  what is left: if both primaries time out, it has just under 4 s of its 6 s. A rung that cannot finish in
+  that time is better skipped (`remaining <= 0` is the crude version of that check).
+- **Release the half-open probe slot on every exit path** in a production breaker, including cancellation
+  when the client disconnects, or a target can stay skipped indefinitely.
+
+### Availability when rungs share a cause
+Pure Python: how much of the 99.9975% survives when some failures are shared.
+
+```python
+def both_fail(p_each, common_share):
+    """P(both rungs fail) when a share of each rung's failures comes from a shared cause."""
+    q = p_each * common_share                     # shared-cause outage: takes down both rungs
+    r = (p_each - q) / (1 - q)                    # independent failures, so each rung still fails p_each
+    return q + (1 - q) * r * r
+
+for share in (0.0, 0.1, 0.5, 1.0):
+    print(f"shared cause {share:>4.0%}: availability {1 - both_fail(0.005, share):.4%}")
+# 0%: 99.9975%   10%: 99.9480%   50%: 99.7494%   100%: 99.5000% (the second rung bought nothing)
+```
+
+### Hedged request
+Start the primary; if it has not answered by the hedge delay (set it near your p95), start the secondary
+and take the first success.
+
+```python
+import asyncio
+
+async def hedged(call, primary, secondary, hedge_after):
+    """Start primary; if no answer by hedge_after seconds, also start secondary. First success wins."""
+    tasks = {asyncio.create_task(call(primary))}
+    done, _ = await asyncio.wait(tasks, timeout=hedge_after)
+    if not done:                                         # slow tail: send the hedge
+        tasks.add(asyncio.create_task(call(secondary)))  # (a fast error is the ladder's job, not this)
+    errors = []
+    while tasks:
+        done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            if t.exception() is None:
+                for p in tasks: p.cancel()               # stop the loser
+                return t.result()
+            errors.append(t.exception())
+    raise errors[-1]
+
+async def fake(target):                                  # demo: primary stalls, secondary is quick
+    await asyncio.sleep(2.0 if target == "primary" else 0.3)
+    return f"answer from {target}"
+
+print(asyncio.run(hedged(fake, "primary", "secondary", hedge_after=0.8)))   # answer from secondary, ~1.1 s
+```
+
+### Worked incident: a 40-minute primary outage
+Illustrative traffic of 50 requests per second, `primary-us` hard down, breaker defaults from the ladder
+code (5 failures, 60 s cooldown).
+
+| | No breaker | With breaker |
+|---|---|---|
+| Requests sent to the dead primary | 50 × 2,400 s = 120,000 | ~5 to open it, then one probe per cooldown: about 40 more |
+| Added latency per request | The full 3 s primary timeout, every request | None once open; only probes pay it |
+| Load on the failing provider | All your traffic, plus retries | Near zero |
+| Signal | Error rate looks flat | `fallback_depth` > 0 alert fires as soon as traffic shifts to the next rung |
+
+## Production patterns
+- **Declare the ladder in the gateway.** When several services share providers, put fallbacks in gateway
+  config rather than app code: LiteLLM's `router_settings` takes `fallbacks`, and it also has separate
+  fallback lists for context-window and content-policy errors. Monitor fallback rate per rung and success
+  rate after fallback.
+- **Keep a live slice on every rung.** Route around 1% of normal traffic to each fallback continuously
+  with a weighted deployment or a hash of the request id. Monitor schema pass rate and judged quality per
+  serving target, so a broken fallback shows up on a quiet Tuesday, not during an outage.
+- **Game-day the primary.** In staging, then production off-peak, block the primary on purpose (an egress
+  rule or an alias pointed at an unreachable endpoint) and watch the ladder take over. Monitor
+  time-to-detect, latency by rung, error rate and on-call actions taken.
+- **Pre-provision and watch secondary headroom.** Size secondary quota for 100% failover before launch and
+  load-test it. Read the provider's rate-limit response headers (OpenAI's `x-ratelimit-remaining-requests`,
+  Anthropic's `anthropic-ratelimit-requests-remaining`) and alert when headroom on the secondary drops.
+- **Propagate the deadline.** Pass the absolute deadline from the edge to every service (a request header
+  or context value), and compute each rung's timeout as `min(rung_timeout, remaining)`. Monitor rungs
+  skipped for lack of budget and end-to-end p99 against the deadline.
+- **Idempotency keys on side-effecting tools.** Generate one key per logical action, store it with the
+  result, and make the tool return the stored result on a repeat. Monitor duplicate-key hits during
+  incidents; a spike shows the ladder replaying actions.
 
 ## Trade-offs
-- Availability rises, but output consistency falls as the ladder descends to other vendors; for audited
-  or regulated outputs, restrict the ladder to same-model rungs and degrade honestly after that.
-- Hedged requests cut tail latency for a few per cent extra calls, yet they double load exactly when the
-  provider is struggling; disable hedging whenever the breaker indicates overload.
-- A longer ladder raises the chance of success but stretches the worst-case latency; with a tight
-  deadline a short ladder with a breaker beats a long one.
-- Cross-vendor fallback sends data to a second processor; it flips from asset to liability when that
-  vendor is not on the approved list for the data class involved.
-- Pre-provisioned secondary quota costs money while idle, but without it the fallback fails with 429s
-  at the exact moment it is needed.
+- **Availability vs output consistency.** Consistency falls as the ladder descends to other vendors. For
+  audited or regulated outputs, restrict the ladder to same-model rungs and degrade honestly after that.
+- **Shorter tails vs load during overload.** Hedged requests cut tail latency for a few per cent extra
+  calls, yet double load exactly when the provider is struggling; disable hedging whenever the breaker
+  indicates overload.
+- **Longer ladder vs worst-case latency.** More rungs raise the chance of success but stretch the
+  worst case; with a tight deadline a short ladder with a breaker beats a long one.
+- **Cross-vendor resilience vs data exposure.** Cross-vendor fallback sends data to a second processor; it
+  flips from asset to liability when that vendor is not on the approved list for the data class involved.
+- **Idle quota cost vs failover that works.** Pre-provisioned secondary quota costs money while idle, but
+  without it the fallback fails with 429s at the exact moment it is needed.
 
 ## Pitfalls
-- A fallback never exercised in normal traffic; the symptom is the first real outage revealing expired
+- **A fallback never exercised in normal traffic.** Symptom: the first real outage reveals expired
   credentials, a wrong model id or a schema mismatch on the secondary.
-- Retrying or failing over after a side effect; the symptom is duplicate emails, tickets or payments
-  appearing during provider incidents.
-- No circuit breaker; the symptom is every request during an outage taking primary timeout plus fallback
-  time, and the failing provider being hammered by your retries.
-- Silent fallback with no metric; the symptom is discovering the primary has been down for days from the
+- **Retrying or failing over after a side effect.** Symptom: duplicate emails, tickets or payments during
+  provider incidents.
+- **No circuit breaker.** Symptom: every request during an outage takes primary timeout plus fallback
+  time, and the failing provider is hammered by your retries.
+- **Silent fallback with no metric.** Symptom: discovering the primary has been down for days from the
   invoice or from a slow drift in answer quality.
-- Failing over on non-retryable errors; the symptom is a single bad request producing identical 400s
-  from three providers with triple the latency and cost.
-- Ignoring context-window and limit differences; the symptom is context-length errors appearing only on
-  long requests and only when the fallback is active.
+- **Failing over on non-retryable errors.** Symptom: a single bad request produces identical 400s from
+  three providers with triple the latency and cost.
+- **Ignoring context-window and limit differences.** Symptom: context-length errors appear only on long
+  requests and only when the fallback is active.
 
 ## When to use
-Every production call should have at least the first two rungs and a documented ladder; how deep it goes
-depends on the SLO, the audit constraints on outputs and the cost you can absorb during an incident.
-Decide the error classification, the deadline and the breaker thresholds per use case, and provision
-secondary quota before launch. Measure fallback rate by rung, success rate after fallback, latency by
-rung, the cost delta during failover and the quality of fallback-served responses on your eval. In
-interviews, distinguish retry, fallback and degradation cleanly, then talk about error classification,
-breakers, deadline propagation and equivalence testing; that sequence is the expected depth.
+- **Always:** every production call should have at least the first two rungs and a documented ladder.
+- **Depth depends on** the SLO, the audit constraints on outputs and the cost you can absorb during an
+  incident.
+- **Decide per use case:** the error classification, the deadline and the breaker thresholds; provision
+  secondary quota before launch.
+- **Measure:** fallback rate by rung, success rate after fallback, latency by rung, the cost delta during
+  failover and the quality of fallback-served responses on your eval.
+- **Interviews:** distinguish retry, fallback and degradation cleanly, then cover error classification,
+  breakers, deadline propagation and equivalence testing; that sequence is the expected depth.
 
 ## Role lens
 - **Engineer:** Implements error classification, breakers and deadline propagation, tags responses with

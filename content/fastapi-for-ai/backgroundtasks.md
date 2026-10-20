@@ -5,7 +5,7 @@ name: BackgroundTasks
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/job-queues-and-durable-workers
   - fastapi-for-ai/dependency-injection
@@ -20,80 +20,106 @@ sources:
 ---
 
 ## TL;DR
-`BackgroundTasks` runs functions *after* the response has been sent, in the same process and event
-loop, with no persistence, no retry and no status. It exists so a handler can answer quickly while
-doing cheap follow-up work (write a trace, bump a usage counter, fire a webhook) without standing up a
-queue. Use it for work you can afford to lose when the process dies; anything that must happen, or
-that takes more than a few seconds, belongs in a durable job queue.
+`BackgroundTasks` runs functions after the response is sent, in the same process, with no persistence,
+retry or status. Use it for cheap, loss-tolerant follow-ups (traces, counters, webhooks); anything that
+must happen or takes seconds needs a durable queue.
 
 ## Why it exists
-Every LLM request drags follow-up work behind it: persist the prompt, response and token usage for
-observability and billing, update a rate-limit counter, save an evaluation sample, emit an analytics
-event, notify a webhook. Doing them inline adds their latency to the response (a database write plus a
-webhook round trip can be a few hundred milliseconds; illustrative) and couples the user's success to
-theirs: a slow analytics endpoint should never turn a good answer into a 500.
-
-The naive escapes each fail. `asyncio.create_task(...)` and forgetting the handle looks right, but the
-event loop keeps only weak references to tasks, so a task with no strong reference can be garbage
-collected mid-flight, and its exception surfaces only as a "Task exception was never retrieved" log
-line when the task is collected, if at all; the asyncio documentation warns about exactly this. Spawning a thread per request has no limit and loses exceptions the same way. A full job queue
-(Celery, ARQ) is the correct tool for durable work, but it is a broker, a worker fleet and a
-serialisation boundary, which is a lot of machinery for a fifty-millisecond insert.
-
-`BackgroundTasks` is the deliberately small middle: Starlette keeps the task list on the response
-object and awaits it right after the body has been flushed, so ordering relative to the response is
-guaranteed, sync functions are pushed to the thread pool, async functions are awaited, and nothing new
-has to be deployed. Its limits are the same facts stated the other way round: the work exists only in
-this process's memory, so a crash, a deploy or an out-of-memory kill erases it silently.
+- **Every LLM request drags follow-up work.** Persist prompt, response and token usage for observability
+  and billing, update a rate-limit counter, save an evaluation sample, emit an analytics event, notify a
+  webhook.
+- **Inline costs latency and couples failures.** A database write plus a webhook round trip can be a few
+  hundred milliseconds (illustrative), and a slow analytics endpoint should never turn a good answer
+  into a 500.
+- **Bare `asyncio.create_task(...)` is a trap.** The event loop keeps only weak references to tasks, so
+  an unreferenced task can be garbage collected mid-flight, and its exception surfaces only as a "Task
+  exception was never retrieved" log line when collected, if at all; the asyncio documentation warns
+  about exactly this. A thread per request has no limit and loses exceptions the same way.
+- **A full job queue is heavy for small work.** Celery or ARQ is correct for durable work, but it is a
+  broker, a worker fleet and a serialisation boundary: a lot of machinery for a fifty-millisecond insert.
+- **`BackgroundTasks` is the deliberately small middle.** Starlette keeps the task list on the response
+  and awaits it right after the body is flushed, so ordering is guaranteed, sync functions go to the
+  thread pool, async ones are awaited, and nothing new is deployed. The flip side: the work lives only
+  in this process's memory, so a crash, deploy or out-of-memory kill erases it silently.
 
 ## How it works
 ### Declaring tasks
-Add a parameter typed `BackgroundTasks` to a path operation or to any dependency; FastAPI injects one
-instance per request and merges every `add_task(func, *args, **kwargs)` call into a single ordered
-list. `Response(..., background=BackgroundTask(fn))` is the lower-level Starlette form for custom
-responses, including `StreamingResponse`.
+- **Inject it.** Add a parameter typed `BackgroundTasks` to a path operation or any dependency; FastAPI
+  injects one instance per request.
+- **One ordered list.** Every `add_task(func, *args, **kwargs)` call, from the route or any dependency, is
+  merged into a single ordered list.
+- **Lower-level form.** `Response(..., background=BackgroundTask(fn))` is the Starlette form for custom
+  responses, including `StreamingResponse`.
 
 ### When they run
-Starlette's `Response.__call__` sends `http.response.start`, then the body, then, if a background
-object is attached, `await self.background()`. So tasks start only after the final body bytes have
-been handed to the server; the client already has its response. `BackgroundTasks.__call__` runs them
-sequentially in insertion order: an `async def` is awaited on the event loop, a plain `def` is run via
-`run_in_threadpool`. Nothing runs in parallel, so one slow task delays the rest.
+1. Starlette's `Response.__call__` sends `http.response.start`.
+2. It sends the body; the client now has its response.
+3. If a background object is attached, it calls `await self.background()`.
+4. `BackgroundTasks.__call__` runs tasks sequentially in insertion order: an `async def` is awaited on
+   the event loop, a plain `def` runs via `run_in_threadpool`.
+
+Nothing runs in parallel, so one slow task delays the rest.
 
 ### What the server sees
-The ASGI call for the request has not returned while tasks run. That means uvicorn's graceful shutdown
-waits for them (indefinitely by default, or up to `--timeout-graceful-shutdown` if set), anything counting in-flight requests counts them, and the
-handler's resources stay allocated. It also means the work dies with the process: an orchestrator that
-sends SIGKILL after its grace period takes every pending task with it, and nothing recorded that they
-existed. Kubernetes, for example, allows 30 seconds by default between SIGTERM and SIGKILL, so the
-honest budget for a background task is "finishes well inside the grace period, or is acceptable to
-lose"; a task that calls a model for 40 seconds fails that test on every deploy.
+The ASGI call for the request has not returned while tasks run, so:
+- **Graceful shutdown waits for them**: indefinitely by default, or up to `--timeout-graceful-shutdown`
+  if set.
+- **In-flight counters count them**, and the handler's resources stay allocated.
+- **The work dies with the process.** An orchestrator that sends SIGKILL after its grace period takes
+  every pending task with it, and nothing recorded that they existed.
+- **Budget accordingly.** Kubernetes allows 30 seconds by default between SIGTERM and SIGKILL, so a task
+  must finish well inside the grace period or be acceptable to lose. A task that calls a model for 40
+  seconds fails that test on every deploy.
 
 ### Exceptions
-An exception in a task propagates out of the application after the response is gone. The server logs
-it (uvicorn prints an "Exception in ASGI application" traceback), the client never learns of it, and
-there is no retry. Wrap each task body in `try/except` with real logging and a metric, and write tasks
-so that running twice is harmless, because the day you move them to a queue they will.
+- **They escape after the response is gone.** The server logs it (uvicorn prints an "Exception in ASGI
+  application" traceback), the client never learns of it, and there is no retry.
+- **Guard each task.** Wrap the body in `try/except` with real logging and a metric.
+- **Make tasks idempotent**, so running twice is harmless, because the day you move them to a queue they will.
 
 ### Interaction with yield dependencies
-A dependency that yields a database session has exit code that must run at some point. Whether that
-teardown runs before or after background tasks has changed across FastAPI versions (0.106 changed the
-default so sessions are not held while the response travels the network; later versions added a scope
-option to choose). The only version-proof rule is: never hand a request-scoped resource to a background
-task. Create the session, client or file handle inside the task.
+- **Teardown timing has moved.** Whether a yield dependency's exit code runs before or after background
+  tasks has changed across FastAPI versions: 0.106 changed the default so sessions are not held while
+  the response travels the network; later versions added a scope option to choose.
+- **Version-proof rule:** never hand a request-scoped resource to a background task. Create the session,
+  client or file handle inside the task.
 
 ### Capacity
-Sync tasks share the default thread pool (anyio's limiter, 40 threads) with sync endpoints and sync
-dependencies, so a burst of "cheap" sync tasks can starve ordinary sync routes. Async tasks share the
-event loop, so a CPU-heavy task, computing embeddings locally, hashing a large upload, blocks every
-request for its duration. Treat a task as part of the request's cost, just paid after the response. A useful back-of-envelope:
-background work in flight ≈ request rate × task duration, so 200 requests per second each followed by a
-250 ms trace write means about 50 tasks running at any moment per process, on top of the requests
-themselves; if those tasks are sync, that alone exceeds the 40-thread pool.
+| Task type | Shares | Risk |
+|---|---|---|
+| Sync `def` | the default thread pool (anyio's limiter, 40 threads) with sync endpoints and dependencies | a burst of "cheap" sync tasks starves ordinary sync routes |
+| `async def` | the event loop | a CPU-heavy task (local embeddings, hashing a large upload) blocks every request for its duration |
 
-## Example
-An LLM endpoint that answers immediately and records a trace afterwards. The task opens its own
-session, guards its own exceptions, and would be harmless if run twice.
+Treat a task as part of the request's cost, paid after the response. Back-of-envelope:
+
+```
+background work in flight ≈ request rate × task duration
+200 req/s × 250 ms trace write ≈ 50 tasks running at any moment per process
+```
+
+That is on top of the requests themselves; if those tasks are sync, that alone exceeds the 40-thread pool.
+
+## Diagram
+The decision path for a follow-up: only short, loss-tolerant work reaches `BackgroundTasks`, and there
+the function type decides whether it runs on the loop or in the thread pool.
+
+```mermaid
+flowchart TD
+    W["Follow-up work after the answer"] --> Q1{"Is losing it on a crash acceptable?"}
+    Q1 -->|"no: billing, audit, LLM job"| Q2{"Must it commit with the request?"}
+    Q2 -->|"yes"| TX["Write inline in the same transaction"]
+    Q2 -->|"no"| OB["Outbox row plus durable worker"]
+    Q1 -->|"yes: trace, counter, cache warm"| Q3{"Finishes well inside the shutdown grace period?"}
+    Q3 -->|"no"| OB
+    Q3 -->|"yes"| BT["background_tasks.add_task"]
+    BT --> R["Runs after body is sent, in insertion order"]
+    R -->|"async def"| L["Awaited on the event loop"]
+    R -->|"plain def"| TP["run_in_threadpool, 40 shared threads"]
+```
+
+## Examples
+### LLM endpoint that records a trace after answering
+The task opens its own session, guards its own exceptions, and would be harmless if run twice.
 
 ```python
 import logging, time
@@ -128,38 +154,106 @@ async def answer(body: Ask, bg: BackgroundTasks):
 # session_factory and Trace come from your SQLAlchemy setup (see the async database lesson).
 ```
 
+### If you must use `create_task`: keep a strong reference
+When work should outlive the request but not block its response cleanup (for example, launched from a
+WebSocket handler), the asyncio-docs pattern is a module-level set plus a done callback. Runnable as is.
+
+```python
+import asyncio, logging
+
+_tasks: set[asyncio.Task] = set()
+
+def _done(task: asyncio.Task) -> None:
+    _tasks.discard(task)                              # drop the reference once finished
+    if not task.cancelled() and task.exception():
+        logging.error("background task failed", exc_info=task.exception())
+
+def spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _tasks.add(task)                                  # strong reference: cannot be GC'd mid-flight
+    task.add_done_callback(_done)                     # exception is retrieved and logged, not lost
+    return task
+
+async def write_trace(n: int) -> None:
+    await asyncio.sleep(0.1)
+    if n == 2:
+        raise RuntimeError("db down")
+
+async def main() -> None:
+    for n in range(3):
+        spawn(write_trace(n))
+    print("in flight:", len(_tasks))                  # 3
+    await asyncio.gather(*_tasks, return_exceptions=True)   # what a lifespan shutdown should do
+    print("in flight:", len(_tasks))                  # 0
+
+asyncio.run(main())
+```
+
+Still not durable: a SIGKILL loses these exactly as it loses `BackgroundTasks`.
+
+### Worked scenario: which follow-ups survive a deploy?
+Illustrative: 30 s Kubernetes grace period, uvicorn draining in-flight requests on SIGTERM.
+
+| Follow-up | Duration | Loss acceptable? | Verdict |
+|---|---|---|---|
+| Trace write | ~250 ms | yes, a missing trace is tolerable | `BackgroundTasks` |
+| Usage counter bump | ~5 ms | yes, if reconciled from traces | `BackgroundTasks` |
+| Webhook to customer | ~300 ms, can hang | no, customer expects it | outbox row + worker |
+| Summarisation model call | ~40 s | no, user waits for it | durable job queue |
+| Billing ledger entry | ~5 ms | never | same transaction as the request |
+
+## Production patterns
+- **Own resources inside the task.** For any task touching a database or HTTP client, open it inside the
+  task (`async with session_factory() as session`) or use an app-scoped client from lifespan, never a
+  `yield` dependency's object. Monitor "session is closed" and pool-checkout errors after upgrades.
+- **Guard, log and count every task.** Wrap each body in `try/except`, call `log.exception(...)` and
+  increment a failure counter labelled by task name, because the server log is otherwise the only trace.
+  Alert on failure rate per task name.
+- **Fit the shutdown budget.** Set uvicorn `--timeout-graceful-shutdown` below Kubernetes
+  `terminationGracePeriodSeconds` (30 by default), and keep every task's p99 well under it. Monitor task
+  duration p99 and log lines for tasks cut off at shutdown.
+- **Promote to an outbox when loss costs money.** When a follow-up becomes billing, audit or a customer
+  webhook, insert an outbox row in the request's transaction and let a worker deliver it with an
+  idempotency key. Monitor outbox lag and oldest undelivered row.
+- **Keep sync tasks off the shared pool.** Prefer async clients in tasks; if sync work is unavoidable,
+  size the pool deliberately (`anyio.to_thread.current_default_thread_limiter().total_tokens = N` in
+  lifespan) instead of discovering the 40-thread limit under load. Monitor thread-pool saturation.
+
 ## Trade-offs
-- Zero infrastructure and in-process execution, but zero durability: the moment losing the work has a
-  cost (billing ledgers, audit records) the trade flips to a queue with persisted jobs.
-- Latency is hidden from the user, but the worker is still busy; under load, background work competes
-  with new requests for the loop and thread pool, and once tasks take seconds that competition is
+- **Zero infrastructure vs zero durability.** Execution is in-process with nothing to deploy, but the
+  moment losing the work has a cost (billing ledgers, audit records) the trade flips to a queue with
+  persisted jobs.
+- **Hidden latency vs a still-busy worker.** The user does not wait, but under load background work
+  competes with new requests for the loop and thread pool; once tasks take seconds, that competition is
   visible in p99 latency.
-- Sequential execution per request is simple to reason about, but tasks cannot overlap, so a slow
+- **Simple ordering vs no overlap.** Sequential execution per request is easy to reason about, but a slow
   webhook delays the trace write queued behind it.
-- Exceptions are isolated from the client, which protects the user experience, but the same isolation
+- **Isolated exceptions vs hidden failures.** The user experience is protected, but the same isolation
   hides failures unless you add logging and metrics yourself.
 
 ## Pitfalls
-- Running the LLM job itself in the background and returning a job id; the symptom is jobs that vanish
-  after every deploy and a status endpoint with nothing to read, because nothing persisted the job.
-- Passing the request's yield-dependency session into a task; the symptom is "session is closed" or
+- **Running the LLM job itself in the background and returning a job id.** Symptom: jobs vanish after
+  every deploy and the status endpoint has nothing to read, because nothing persisted the job.
+- **Passing the request's yield-dependency session into a task.** Symptom: "session is closed" or
   "connection already returned to pool" errors, often appearing only after a FastAPI upgrade.
-- A CPU-heavy sync task; the symptom is latency on unrelated sync endpoints rising with traffic as the
+- **A CPU-heavy sync task.** Symptom: latency on unrelated sync endpoints rises with traffic as the
   40-thread pool fills up.
-- A blocking call (sync HTTP client, sync SDK) inside an async task; the symptom is the whole worker
-  freezing for the duration of each task, visible as periodic stalls in every route.
-- Assuming the client would have noticed a failure; the symptom is silent data loss in traces or
-  counters discovered weeks later during an audit.
-- Reaching for bare `asyncio.create_task` instead; the symptom is tasks that occasionally vanish
-  mid-flight with no error, because nothing held a strong reference to them.
+- **A blocking call (sync HTTP client, sync SDK) inside an async task.** Symptom: the whole worker
+  freezes for each task, visible as periodic stalls in every route.
+- **Assuming the client would have noticed a failure.** Symptom: silent data loss in traces or counters,
+  discovered weeks later during an audit.
+- **Reaching for bare `asyncio.create_task` instead.** Symptom: tasks occasionally vanish mid-flight with
+  no error, because nothing held a strong reference to them.
 
 ## When to use
-Use `BackgroundTasks` for short, idempotent, loss-tolerant follow-ups: trace and metric writes, cache
-warming, non-critical notifications, cleanup of temporary files. Do not use it for the LLM call, for
-anything a customer will later ask about, for retries, or for work longer than a few seconds. The
-decision test is "if this process dies now, is losing this acceptable?" Measure task duration, failure
-rate from your own logging, and thread-pool saturation. In interviews the key distinction to articulate
-is after-response versus durable: when it runs, where it runs, and what happens on a crash.
+- **Use when** follow-ups are short, idempotent and loss-tolerant: trace and metric writes, cache warming,
+  non-critical notifications, cleanup of temporary files.
+- **Avoid when** it is the LLM call, anything a customer will later ask about, retries, or work longer
+  than a few seconds.
+- **Decision test:** "if this process dies now, is losing this acceptable?"
+- **Measure** task duration, failure rate from your own logging, and thread-pool saturation.
+- **Interviews:** articulate after-response versus durable: when it runs, where it runs, and what happens
+  on a crash.
 
 ## Role lens
 - **Engineer:** Queues trace writes and counters after the response, gives each task its own
@@ -179,6 +273,34 @@ state, which costs a few milliseconds and is the simplest correct option, or rec
 durably before responding and process it asynchronously: insert an outbox row in that transaction and
 let a worker or queue consumer post it, with idempotency keyed by request id so retries never
 double-charge. Keep `BackgroundTasks` for the non-financial trace and metrics writes.
+
+## Interview questions
+### What is FastAPI's BackgroundTasks, and why use it instead of asyncio.create_task?
+- **An ordered list of callables run after the response body is sent,** in the same process: `async def`
+  functions are awaited, plain `def` functions go to the thread pool.
+- **It is safer than a bare task,** because the event loop keeps only weak references to tasks, so an
+  unreferenced `create_task` can be garbage collected mid-flight and its exception may never surface.
+
+### A team runs a 40-second summarisation in a BackgroundTask and returns a job id. Jobs vanish after deploys. Why?
+- **Nothing persisted the job.** The work lives only in process memory, so a deploy, crash or OOM kill
+  erases it and the status endpoint has nothing to read.
+- **It also loses the shutdown race.** Kubernetes allows 30 seconds between SIGTERM and SIGKILL by
+  default, so a 40-second task is cut off on every deploy.
+- **Fix:** persist a job row and enqueue it to a durable queue such as Celery or ARQ, with a status
+  endpoint reading the row.
+
+### Latency on unrelated sync endpoints climbs with traffic after adding background trace writes. Diagnose it.
+- **Sync tasks share the thread pool** (anyio's limiter, 40 threads) with sync endpoints and dependencies.
+- **Do the arithmetic:** 200 req/s × 250 ms is about 50 tasks in flight per process, which alone exceeds
+  40 threads, so routes queue for a thread.
+- **Fix:** make the writes async with an async client, or size the limiter deliberately in lifespan, and
+  watch thread-pool saturation.
+
+### When is BackgroundTasks the wrong choice even for small work?
+- **When loss has a cost.** A billing ledger entry or audit record belongs in the request's transaction or
+  an outbox row, because the client already got a success when the task fails.
+- **When the task needs the request's database session.** Yield-dependency teardown timing has changed
+  across FastAPI versions (0.106 changed the default), so create resources inside the task instead.
 
 ## Quiz
 ### Q: When exactly does a function added with BackgroundTasks start running?

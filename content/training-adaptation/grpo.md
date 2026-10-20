@@ -5,7 +5,7 @@ name: GRPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - training-adaptation/rlhf
   - training-adaptation/dpo
@@ -22,117 +22,108 @@ sources:
 ---
 
 ## TL;DR
-GRPO is a policy-gradient method that drops PPO's value model: for each prompt it samples a group of
-responses, scores them, and uses the group's mean and spread as the baseline, so each advantage is
-"how much better than its siblings". It keeps PPO's clipped update and a KL term to a
-reference. It exists because a critic the size of the policy is costly and unstable for sequence-level
-rewards, and it is the usual choice for training open reasoning models with verifiable rewards.
+GRPO is PPO without the value model: sample a group of responses per prompt and use the group's reward
+mean and spread as the baseline. It keeps PPO's clip and a KL term; open reasoning models with
+verifiable rewards usually use it.
 
 ## Why it exists
-PPO estimates how good each token was by comparing the reward it eventually earned against a
-*value model's* prediction of expected reward from that point. For language, the value model is
-usually another copy of the policy with a scalar head, trained alongside it. That doubles trainable
-memory, and the value estimates are poor: the reward arrives only at the end of a long response, the
-value model must guess from partial text, and its errors feed straight into the advantages. Teams
-spent as much effort stabilising the critic as training the policy.
-
-Meanwhile a new kind of reward appeared. For maths with a known answer, code with unit tests, or
-output with a checkable format, a *program* can score a response: right or wrong, passes or fails. No
-reward model, no raters, no overoptimisation of a learned proxy. With rewards this cheap, you can
-afford to sample many responses per prompt, and that changes what the best estimator is. If you have
-eight attempts at the same problem, the natural question is not "was this better than a critic's
-guess" but "was this better than the other seven". The group *is* the baseline.
-
-The naive alternative, REINFORCE with the raw reward, works in principle but has enormous variance:
-every correct answer gets the same push regardless of whether the prompt was trivial or hard. The
-group-relative advantage fixes this automatically: on a prompt the model always solves, all rewards
-are equal and the advantage is zero, so no gradient is wasted on it; on a prompt it solves one time in
-eight, the single success gets a large positive advantage. The signal concentrates where learning is
-possible.
+- **PPO's critic is costly and unstable for text.** PPO judges each token against a *value model's*
+  prediction of expected reward, usually another copy of the policy with a scalar head, trained alongside
+  it. That doubles trainable memory.
+- **Its estimates are poor.** The reward arrives only at the end of a long response, the value model must
+  guess from partial text, and its errors feed straight into the advantages. Teams spent as much effort
+  stabilising the critic as training the policy.
+- **Verifiable rewards changed the economics.** For maths with a known answer, code with unit tests, or
+  checkable formats, a *program* scores the response: no reward model, no raters, no overoptimisation of a
+  learned proxy. Cheap rewards make many samples per prompt affordable.
+- **So the group is the baseline.** With eight attempts at one problem, the natural question is "was this
+  better than the other seven", not "better than a critic's guess".
+- **Raw REINFORCE has enormous variance**: every correct answer gets the same push whether the prompt was
+  trivial or hard. Group-relative advantages fix this: always-solved prompts give zero advantage (no
+  wasted gradient); a prompt solved one time in eight gives its single success a large positive push.
 
 ## How it works
 ### Sampling the group
-For each prompt q in a batch, the current policy (the "old" policy for this iteration) samples G
-responses o₁ … o_G, with G commonly between 8 and 16 in open recipes and as high as 64 in
-DeepSeekMath (larger groups suit harder tasks). Each response
-gets a scalar reward r_i from a reward function: a rule-based verifier, a reward model, or a sum of
-several terms (accuracy plus format, for instance).
+1. For each prompt q, the current ("old") policy samples G responses o₁ … o_G.
+2. G is commonly between 8 and 16 in open recipes, and as high as 64 in DeepSeekMath; larger groups suit
+   harder tasks.
+3. Each response gets a scalar reward r_i: a rule-based verifier, a reward model, or a sum of terms
+   (accuracy plus format, for instance).
 
 ### Group-relative advantage
-The advantage for response i is its reward standardised within the group:
-
 ```
 Â_i = ( r_i − mean(r₁…r_G) ) / std(r₁…r_G)
 ```
 
-The same Â_i is assigned to every token of response i, because the reward is for the whole outcome
-and nothing finer-grained is known. This replaces the value model with two numbers per prompt. It is
-cheap, nearly unbiased (the group mean includes the sample's own reward, a small bias that a
-leave-one-out baseline such as RLOO removes), and has the "difficulty-adaptive" property described
-above. Dividing by the standard deviation is a separate choice: for a 0/1 reward the group's spread is
-smallest when the pass rate is near 0 or near 1, so the division up-weights prompts the model almost
-always fails or almost always solves relative to ones it solves half the time. Whether that is
-desirable is debated (see below). A group with
-all-equal rewards has zero variance and contributes nothing; implementations add a small epsilon to
-the denominator and often filter such prompts out of the batch.
+- **Every token of response i gets the same Â_i**, because the reward is for the whole outcome and nothing
+  finer-grained is known.
+- **Two numbers per prompt replace the value model.** Cheap and nearly unbiased: the group mean includes
+  the sample's own reward, a small bias that a leave-one-out baseline such as RLOO removes.
+- **Difficulty-adaptive:** the signal concentrates on prompts the model sometimes, but not always, solves.
+- **Dividing by std is a separate choice.** For a 0/1 reward the spread is smallest when the pass rate is
+  near 0 or near 1, so the division up-weights almost-always-failed and almost-always-solved prompts
+  relative to half-solved ones. Whether that is desirable is debated (see below).
+- **All-equal groups contribute nothing** (zero variance). Implementations add a small epsilon to the
+  denominator and often filter such prompts out of the batch.
 
 ### The clipped surrogate
-With advantages in hand, GRPO uses PPO's clipped objective per token:
-
 ```
 ratio_t = π_θ(o_t | q, o_<t) / π_old(o_t | q, o_<t)
 L_clip  = mean over tokens of  min( ratio_t · Â_i ,  clip(ratio_t, 1−ε, 1+ε) · Â_i )
 ```
 
-The ratio compares the policy being updated to the one that generated the samples, and the clip
-removes the gradient incentive to move any token's probability ratio beyond about 1±ε in one update. This lets
-the same batch of samples be reused for a few gradient steps without the policy running away from the
-data, which is the whole point of PPO-style methods over plain policy gradient. Note the edge case: if
-each batch of samples is used for exactly one gradient step, π_θ equals π_old at that step, every ratio
-is 1, the clip never binds, and GRPO reduces to REINFORCE with a group-mean baseline (plus the KL
-term). The clip only
-earns its keep when samples are reused.
+- **The ratio** compares the policy being updated with the one that generated the samples.
+- **The clip** removes the incentive to move any token's ratio beyond about 1±ε in one update, so a batch
+  of samples can be reused for a few gradient steps without the policy running away from the data. That
+  is the point of PPO-style methods over plain policy gradient.
+- **Edge case:** with exactly one gradient step per batch, π_θ equals π_old, every ratio is 1, the clip
+  never binds, and GRPO reduces to REINFORCE with a group-mean baseline (plus the KL term). The clip
+  only earns its keep when samples are reused.
 
 ### Outcome versus process rewards
-The default is *outcome supervision*: one reward per response, spread to all its tokens. DeepSeekMath
-also described *process supervision*, where a process reward model scores each reasoning step and a
-token's advantage is the normalised sum of the step rewards from that point on. Process rewards
-assign credit more precisely, but need a step-level scorer, which is expensive to build and itself
-hackable; most open reasoning recipes since have used outcome rewards from verifiers.
+| | Outcome supervision (default) | Process supervision |
+|---|---|---|
+| Reward | one per response, spread to all its tokens | a process reward model scores each reasoning step |
+| Token advantage | the response's Â_i | normalised sum of step rewards from that point on |
+| Cost | needs only a final-answer check | needs a step-level scorer: expensive and itself hackable |
+| Used by | most open reasoning recipes since DeepSeekMath | described in DeepSeekMath |
 
 ### The KL term
-Instead of folding the KL penalty into the reward as PPO does, GRPO adds it directly to the loss:
-`L = −L_clip + β · KL(π_θ ‖ π_ref)`, estimated per token with the low-variance estimator
-`π_ref/π_θ − log(π_ref/π_θ) − 1`, which is always non-negative. The reference is the SFT or base
-checkpoint the run started from. Keeping the KL out of the reward means advantages reflect only task
-success, and drift is controlled separately. Some later recipes drop the KL term entirely when the
-reward is fully verifiable and the run is monitored, trading safety for faster movement.
+- **Added to the loss, not the reward:** `L = −L_clip + β · KL(π_θ ‖ π_ref)`.
+- **Per-token estimator:** `π_ref/π_θ − log(π_ref/π_θ) − 1`, low-variance and always non-negative.
+- **Reference:** the SFT or base checkpoint the run started from.
+- **Why separate:** advantages then reflect only task success, and drift is controlled on its own knob.
+- **Some later recipes drop the KL entirely** when the reward is fully verifiable and the run is
+  monitored, trading safety for faster movement.
 
 ### Reward design
-GRPO's results depend on the reward function more than on the algorithm. DeepSeek-R1 used rule-based
-rewards: an accuracy reward checking the final answer against ground truth, and a format reward
-checking that reasoning appears inside designated tags. Rule-based rewards cannot be gamed by
-flattery the way a learned reward model can, but they can be gamed by format tricks, by answers that
-match a lax checker, or by test suites that are incomplete. For tasks without a verifier, a reward
-model is used and GRPO inherits RLHF's overoptimisation problem.
+- **Results depend on the reward more than on the algorithm.**
+- **DeepSeek-R1 used rule-based rewards:** an accuracy reward checking the final answer against ground
+  truth, and a format reward checking that reasoning appears inside designated tags.
+- **Rules cannot be flattered** the way a learned reward model can, **but they can be gamed** by format
+  tricks, answers that match a lax checker, or incomplete test suites.
+- **Without a verifier** you use a reward model, and GRPO inherits RLHF's overoptimisation problem.
 
 ### Why long reasoning emerges
-With outcome-only rewards and many samples, responses that happen to check their work, backtrack, or
-try alternatives succeed more often on hard problems, so the policy is pushed toward them. Response
-length tends to grow during training as a result, which is a feature when it buys accuracy and a cost
-when it does not. A known subtlety is that averaging the loss per response over its own length (as in
-the original formulation) interacts with length: wrong long responses are penalised less per token than
-wrong short ones, which can bias the model toward verbosity on failures. Dr. GRPO proposed removing
-both the per-response length normalisation and the standard-deviation division for this reason.
-DAPO kept the group baseline but changed several other pieces: a token-level average across the whole
-group, a higher upper clip bound so rare useful tokens can grow, dynamic sampling that drops
-all-correct and all-wrong groups and refills the batch, and a penalty for overlong responses. Which
-normalisation and clipping you use is a real design choice, not a detail, and comparing GRPO runs that
+- **Outcome rewards plus many samples select for checking, backtracking and trying alternatives**,
+  because those responses succeed more often on hard problems.
+- **Length grows during training** as a result: a feature when it buys accuracy, a cost when it does not.
+- **Length normalisation interacts with this.** Averaging the loss per response over its own length (the
+  original formulation) penalises wrong long responses less per token than wrong short ones, biasing
+  toward verbosity on failures.
+
+| Variant | What it changes |
+|---|---|
+| **Dr. GRPO** | removes both the per-response length normalisation and the std division |
+| **DAPO** | keeps the group baseline; token-level average across the whole group; higher upper clip bound so rare useful tokens can grow; dynamic sampling that drops all-correct and all-wrong groups and refills the batch; overlong-response penalty |
+
+Which normalisation and clipping you use is a real design choice, not a detail: comparing GRPO runs that
 differ in it is comparing different algorithms.
 
-## Example
-Group advantages and the GRPO loss for one prompt with eight sampled responses. Rewards come from a
-verifier; three of eight are correct. Token log-probs are illustrative placeholders.
+## Examples
+### Group advantages and the GRPO loss
+One prompt, eight sampled responses, verifier rewards with three of eight correct. Token log-probs are
+illustrative placeholders.
 
 ```python
 import torch
@@ -165,44 +156,91 @@ print("loss:", grpo_loss(logp_new, logp_old, logp_ref, adv, mask).item())
 # then take 1-4 gradient steps on this loss before sampling again.
 ```
 
-The printed advantages show the mechanism: on a prompt the model gets right three times in eight,
-each success receives a push of about +1.2 and each failure about −0.7. Had it been right seven times,
-the single failure would get a large negative push (about −2.5) and each success a small positive one
-(about +0.35), which is exactly where the gradient should go.
+- **Three of eight right:** each success gets about +1.2, each failure about −0.7.
+- **Seven of eight right:** the single failure gets a large negative push (about −2.5) and each success a
+  small positive one (about +0.35), exactly where the gradient should go.
+
+### Worked numbers: advantages across pass rates
+How the advantage of one correct and one wrong response changes with pass rate, with and without the std
+division (G = 8, pure Python):
+
+```python
+from statistics import mean, stdev
+
+def group_advantages(k, G=8, scale=True):
+    """Advantage of a correct and a wrong response when k of G pass a 0/1 verifier."""
+    r = [1.0] * k + [0.0] * (G - k)
+    m, s = mean(r), stdev(r)                      # sample std, as torch.std
+    f = (lambda x: (x - m) / (s + 1e-4)) if scale else (lambda x: x - m)
+    return round(f(1.0), 2), round(f(0.0), 2)
+
+for k in (1, 2, 4, 6, 7):
+    print(f"{k}/8", group_advantages(k), group_advantages(k, scale=False))
+```
+
+| Pass rate | Correct, with std (GRPO) | Wrong, with std | Correct, no std (Dr. GRPO) | Wrong, no std |
+|---|---|---|---|---|
+| 1/8 | +2.47 | −0.35 | +0.88 | −0.12 |
+| 2/8 | +1.62 | −0.54 | +0.75 | −0.25 |
+| 4/8 | +0.94 | −0.94 | +0.50 | −0.50 |
+| 6/8 | +0.54 | −1.62 | +0.25 | −0.75 |
+| 7/8 | +0.35 | −2.47 | +0.12 | −0.88 |
+
+- **The std division multiplies extreme groups more:** about ×2.8 at 1/8 versus ×1.9 at 4/8. That is the
+  up-weighting of near-always-failed and near-always-solved prompts described above.
+- **Without it (Dr. GRPO)** half-solved prompts carry relatively more of the gradient.
+
+## Production patterns
+- **Curate prompts by pass rate before training.** Sample G responses per prompt from the starting
+  checkpoint, score them, and drop prompts solved 0/G or G/G. Monitor the share of zero-advantage groups
+  per step and re-curate as the policy improves, because solved prompts accumulate.
+- **Generate rollouts with a fast inference engine.** Trainers such as TRL's `GRPOTrainer` (with
+  `GRPOConfig(num_generations=..., use_vllm=True)`) or OpenRLHF hand sampling to vLLM. Monitor the
+  probability ratio at the first gradient step on fresh samples; values far from 1 mean the sampler and
+  trainer disagree.
+- **Unit-test the reward function like production code.** Keep a suite of known hacks (empty reasoning
+  tags, hard-coded test outputs, answers that fool a lax parser) and assert they score zero. Log each
+  reward component separately per step so a format term cannot hide a falling accuracy term.
+- **Score against an independent held-out verifier.** Evaluate every few dozen steps on prompts and tests
+  the reward never sees. Stop or roll back when training reward rises and held-out accuracy does not:
+  the reward-hacking signature.
+- **Cap and watch length.** Set a maximum completion length and, if needed, an overlong penalty. Monitor
+  mean response length, truncation rate and accuracy together; length rising with flat accuracy means
+  you pay inference cost for nothing.
 
 ## Trade-offs
-- Removing the value model halves trainable memory and eliminates critic instability, but the group
-  baseline needs several samples per prompt, so generation cost per update rises with G.
-- Verifiable rewards cannot be flattered and need no raters, yet they only exist for tasks with a
-  checker, and a lax checker becomes the thing the model optimises instead of the task.
-- Larger groups give lower-variance advantages and more useful signal on hard prompts, while small
-  groups are cheaper; the balance shifts toward larger G as the pass rate per prompt falls.
-- Keeping the KL term protects capability and prevents collapse, but slows movement on tasks where
-  the reward is trustworthy; dropping it is defensible only with close monitoring of general evals.
+- **No value model vs more sampling.** Removing it halves trainable memory and eliminates critic
+  instability, but the group baseline needs several samples per prompt, so generation cost per update
+  rises with G.
+- **Verifiable rewards vs coverage.** They cannot be flattered and need no raters, yet exist only for tasks
+  with a checker, and a lax checker becomes what the model optimises instead of the task.
+- **Large vs small groups.** Larger groups give lower-variance advantages and more signal on hard prompts;
+  small groups are cheaper. The balance shifts toward larger G as pass rate per prompt falls.
+- **KL term vs speed.** Keeping it protects capability and prevents collapse but slows movement where the
+  reward is trustworthy; dropping it is defensible only with close monitoring of general evals.
 
 ## Pitfalls
-- Prompts the model always or never solves; the symptom is a large share of groups with zero
-  advantage and GPU time burned on samples that produce no gradient. Curate difficulty and filter such
-  groups.
-- Reward hacking on format or verifier gaps; the symptom is a reward curve rising while accuracy on an
-  independent held-out checker stays flat, or outputs that satisfy tags with empty reasoning.
-- Mismatch between the sampling engine's and the trainer's token probabilities (different kernels or
-  precision); the symptom is ratios far from 1 at the first gradient step and erratic training.
-- Letting response length grow unchecked; the symptom is rising mean length with flat accuracy and
-  exploding inference cost, often a sign of the per-length normalisation bias or a weak length cap.
-- Treating the reward model case like the verifiable case; with a learned reward, GRPO overoptimises
+- **Prompts the model always or never solves.** Symptom: many zero-advantage groups and GPU time burned on
+  samples that produce no gradient. Fix: curate difficulty and filter such groups.
+- **Reward hacking on format or verifier gaps.** Symptom: reward rising while accuracy on an independent
+  held-out checker stays flat, or outputs that satisfy tags with empty reasoning.
+- **Sampler and trainer probabilities disagree** (different kernels or precision). Symptom: ratios far
+  from 1 at the first gradient step and erratic training.
+- **Unchecked response length.** Symptom: rising mean length with flat accuracy and exploding inference
+  cost, often the per-length normalisation bias or a weak length cap.
+- **Treating the reward-model case like the verifiable case.** With a learned reward GRPO overoptimises
   exactly as PPO does, so the same KL and human-evaluation discipline applies.
 
 ## When to use
-Use GRPO when you can write a reward function you trust, when the task benefits from the model
-exploring many attempts, and when you want on-policy RL without PPO's critic: maths and code
-reasoning, structured-output compliance, tool-call correctness checked by execution, and agentic tasks
-with verifiable end states. Do not reach for it when a few thousand demonstrations or preference pairs
-already solve the problem, because the sampling loop is the most expensive post-training stage after
-pre-training. Measure accuracy on an independent held-out verifier, response length, KL from the
-reference, and a general capability suite. In interviews, expect to explain why the group replaces
-the critic, write the advantage formula, and describe how reward hacking shows up with rule-based
-rewards.
+- **Use when** you can write a reward function you trust, the task benefits from many attempts, and you
+  want on-policy RL without PPO's critic: maths and code reasoning, structured-output compliance,
+  tool-call correctness checked by execution, agentic tasks with verifiable end states.
+- **Avoid when** a few thousand demonstrations or preference pairs already solve the problem, because the
+  sampling loop is the most expensive post-training stage after pre-training.
+- **Measure** accuracy on an independent held-out verifier, response length, KL from the reference, and a
+  general capability suite.
+- **Interviews:** explain why the group replaces the critic, write the advantage formula, and describe how
+  reward hacking shows up with rule-based rewards.
 
 ## Role lens
 - **Engineer:** Writes and tests the reward function, wires a fast sampler to the trainer, filters

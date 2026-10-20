@@ -5,7 +5,7 @@ name: Instruction tuning
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/post-training
@@ -23,90 +23,108 @@ sources:
 ---
 
 ## TL;DR
-Instruction tuning is SFT with a particular data design: many different tasks, each written as a
-natural-language instruction with its answer, so the model learns the general skill "read an
-instruction, do what it says" rather than any one task. The payoff is zero-shot generalisation to
-instructions it never saw. Task diversity, not examples per task, is what drives it, which is why
-building the mixture is most of the work.
+Instruction tuning is SFT on many different tasks, each phrased as a natural-language instruction, so
+the model learns "read an instruction, do what it says" and generalises zero-shot. Task diversity, not
+examples per task, drives it.
 
 ## Why it exists
-A base model can do many tasks if you show it a few examples in the prompt, because few-shot patterns
-are common in its training data. But users do not write few-shot prompts. They write "summarise this
-in two lines" or "translate to French, formal register", and a base model given that instruction may
-echo it, answer something adjacent, or continue the document. The capability exists; the *interface*
-does not.
-
-The first attempt at fixing this was fine-tuning on one task at a time: a summarisation model, a
-translation model. Each worked on its task and not at all on the next one, and the number of tasks
-users invent is unbounded. The question that produced instruction tuning was: if we fine-tune on
-*dozens* of tasks, each phrased as an instruction, does the model learn to follow instructions for
-tasks it has never seen? FLAN and T0 showed that it does, and that the effect grows with the number of
-distinct tasks and the size of the model. The model is not learning summarisation or translation; it
-is learning the mapping from instruction text to behaviour, which transfers.
-
-The naive alternative, a single huge dataset for one task phrased one way, fails because the model
-overfits to that phrasing and that task, and because there is nothing for it to generalise across.
-Instruction tuning works precisely because the data is wide and shallow.
+- **The capability exists; the interface does not.** A base model does many tasks given few-shot
+  examples, because such patterns are common in its training data. But users write "summarise this in two
+  lines" or "translate to French, formal register", and a base model may echo that, answer something
+  adjacent, or continue the document.
+- **One task at a time does not scale.** A summarisation model and a translation model each worked on its
+  task and not at all on the next, and the number of tasks users invent is unbounded.
+- **Dozens of instruction-phrased tasks transfer.** FLAN and T0 showed that fine-tuning on many tasks
+  teaches instruction following on unseen ones, and the effect grows with distinct tasks and model size.
+  The model learns the mapping from instruction text to behaviour, which transfers.
+- **One huge single-task dataset fails** because the model overfits to that phrasing and task, and there
+  is nothing to generalise across. Instruction tuning works precisely because the data is wide and
+  shallow.
 
 ## How it works
 ### The data unit
-Each example is an instruction, an optional input, and an output: "Classify the sentiment of the
-following review. Review: ... Answer: positive". Classic academic datasets are converted into this
-form by writing *templates*: a sentiment dataset becomes instruction-tuning data through several
-phrasings ("Is this review positive or negative?", "What is the sentiment of this text?"), and often
-through inversion ("Write a negative review about a laptop"). Multiple templates per task matter
-because the model must not key on the exact wording; it has to learn the intent.
+- **Instruction, optional input, output:** "Classify the sentiment of the following review. Review: ...
+  Answer: positive".
+- **Templates convert academic datasets.** A sentiment set becomes instruction data through several
+  phrasings ("Is this review positive or negative?", "What is the sentiment of this text?") and often
+  inversion ("Write a negative review about a laptop").
+- **Multiple templates per task matter** because the model must not key on exact wording; it has to learn
+  the intent.
 
 ### Why diversity beats depth
-Experiments across the FLAN line found that adding more *tasks* improves held-out performance more
-than adding more examples of the same tasks, and that gains saturate quickly per task. The mechanism
-is that each task teaches the model one more point in "instruction space", and generalisation is
-interpolation between those points. The direction of those ablations is consistent: past a modest
-number of examples per task, a new task is worth more than more rows of an old one. The same logic says
-that mixtures should be *balanced*: sample tasks roughly in proportion to their size but cap the large
-ones (examples-proportional mixing with a cap, as the FLAN work did), so a giant dataset does not
-dominate the gradient.
+- **The finding (FLAN line):** more *tasks* improve held-out performance more than more examples of the
+  same tasks, and per-task gains saturate quickly.
+- **The mechanism:** each task is one more point in "instruction space"; generalisation is interpolation
+  between those points.
+- **The rule of thumb:** past a modest number of examples per task, a new task is worth more than more
+  rows of an old one.
+- **Balance the mixture.** Sample tasks roughly in proportion to size but cap the large ones
+  (examples-proportional mixing with a cap, as the FLAN work did), so a giant dataset does not dominate
+  the gradient.
 
 ### Mixing prompt formats, not just tasks
-The same task can be presented zero-shot (instruction only), few-shot (instruction plus worked
-examples) or with a chain-of-thought answer. Later FLAN work found that training on a mix of these
-formats improved results in both zero-shot and few-shot use compared with training on a single format. The reason is the same as for templates: the model should learn the intent, not one
-surface layout of the prompt.
+| Format | Prompt contains |
+|---|---|
+| Zero-shot | instruction only |
+| Few-shot | instruction plus worked examples |
+| Chain-of-thought | an answer with reasoning steps |
+
+Later FLAN work found that training on a mix of these improved both zero-shot and few-shot use versus a
+single format, for the same reason as templates: learn the intent, not one surface layout.
 
 ### Where the instructions come from
-- **Converted benchmarks.** Public NLP datasets re-templated; cheap, broad, but academic in style.
-- **Human-written.** Annotators write realistic requests and answers; expensive, the most useful per
-  example, and the only way to get genuine user-style prompts.
-- **Model-generated (Self-Instruct).** Start from a seed set of hand-written tasks, prompt a strong
-  model to invent new instructions and answer them, filter for quality and diversity, repeat. This is
-  how most open instruction datasets scaled: a few hundred seeds become tens of thousands of examples.
-  The risk is that the student inherits the teacher's errors and style, and that generated instructions
-  cluster around what the teacher finds easy.
+| Source | How | Strength | Risk |
+|---|---|---|---|
+| **Converted benchmarks** | re-template public NLP datasets | cheap, broad | academic in style |
+| **Human-written** | annotators write realistic requests and answers | most useful per example; the only way to get genuine user-style prompts | expensive |
+| **Model-generated (Self-Instruct)** | seed tasks → strong model invents and answers new instructions → filter for quality and diversity → repeat | how most open instruction datasets scaled: a few hundred seeds become tens of thousands of examples | student inherits teacher's errors and style; instructions cluster around what the teacher finds easy |
 
 ### Reasoning and format data
-Including chain-of-thought examples in the mixture preserves and strengthens multi-step reasoning;
-instruction mixtures without any reasoning data were found to *hurt* reasoning benchmarks, because the
-model learns to answer tersely. The same holds for anything you want to survive the tuning: code,
-long-form answers, refusals, tool calls. If it is not in the mixture, the model drifts away from it.
+- **Keep chain-of-thought in the mixture.** It preserves and strengthens multi-step reasoning. Mixtures
+  without any reasoning data were found to *hurt* reasoning benchmarks, because the model learns to answer
+  tersely.
+- **Whatever is absent drifts away:** code, long-form answers, refusals, tool calls. If it is not in the
+  mixture, the model drifts from it.
 
 ### How it relates to SFT and chat tuning
-Mechanically, instruction tuning *is* supervised fine-tuning: next-token loss on the output tokens
-with the instruction masked. The difference is intent and data: SFT as a term covers any
-demonstration-based fine-tuning, including narrow single-task adaptation, while instruction tuning
-specifically targets broad instruction following. Modern chat models are instruction-tuned with
-multi-turn conversational data through a chat template; the single-turn instruction/input/output
-format is the ancestor of that.
+- **Mechanically it *is* SFT:** next-token loss on output tokens, instruction masked.
+- **The difference is intent and data.** SFT covers any demonstration-based fine-tuning, including narrow
+  single-task adaptation; instruction tuning targets broad instruction following.
+- **Modern chat models** are instruction-tuned with multi-turn conversational data through a chat
+  template; the single-turn instruction/input/output format is its ancestor.
 
 ### Scale dependence
-The original FLAN work found the benefit of instruction tuning appeared only above a certain model
-size, with small models actually getting worse on held-out tasks. The usual reading is that small
-models lack the spare capacity to learn both the tasks and the meta-skill, so they overfit the seen
-tasks. Later work with better mixtures narrowed this gap, but the lesson stands: instruction tuning
-surfaces latent ability, it does not create it.
+- **The original FLAN finding:** the benefit appeared only above a certain model size; small models got
+  *worse* on held-out tasks.
+- **The usual reading:** small models lack spare capacity for both the tasks and the meta-skill, so they
+  overfit the seen tasks.
+- **Later work with better mixtures narrowed the gap**, but the lesson stands: instruction tuning surfaces
+  latent ability, it does not create it.
 
-## Example
-A miniature instruction mixture built from two task families with several templates each, balanced
-with a per-task cap. This is the shape of what FLAN-style pipelines do at a scale of hundreds of tasks.
+## Diagram
+Follow how many narrow sources become one wide, balanced mixture, and note that evaluation holds out
+whole task families rather than rows.
+
+```mermaid
+flowchart TD
+    BM["Public benchmarks"] -->|"several templates and inversions per task"| P["Instruction pool"]
+    HW["Human-written real requests"] --> P
+    SD["Seed tasks"] --> SI["Self-Instruct: teacher invents and answers"]
+    SI -->|"filter for quality and diversity"| P
+    P --> MX["Mix formats: zero-shot, few-shot, chain-of-thought"]
+    MX --> CAP["Examples-proportional mixing with a per-task cap"]
+    CAP --> SFT["SFT loss: instruction masked, output supervised"]
+    SFT --> IT["Instruction-tuned model"]
+    HO["Held-out task families and real user requests"] --> EV{"Works on unseen tasks?"}
+    IT --> EV
+    EV -->|"no: add tasks and phrasings"| P
+    EV -->|"yes"| NX["Preference training and safety data"]
+```
+
+## Examples
+### A miniature FLAN-style mixture
+Two task families, several templates each, balanced with a per-task cap. FLAN-style pipelines do this at
+a scale of hundreds of tasks.
 
 ```python
 import random
@@ -143,49 +161,86 @@ for ex in data[:3]:
 # (instruction masked, output supervised). Hold out whole tasks, not rows, to measure generalisation.
 ```
 
-Why the cap matters, in numbers: suppose the real mixture has three tasks with 500,000, 20,000 and
-2,000 examples. Sampling in proportion to size gives them about 96%, 4% and 0.4% of the gradient, so the
-model is effectively single-task. Capping each at 10,000 before mixing gives 10,000 / 10,000 / 2,000,
-or about 45%, 45% and 9%; the large task loses examples it did not need, and the small one becomes
-visible. The cap is a knob you tune by watching per-task held-out scores, not a constant.
+- **Hold out entire tasks for evaluation.** If the model handles a task family it never saw, the skill
+  transferred; if it only handles seen tasks, you have a multi-task model, not an instruction-following
+  one.
 
-Holding out entire tasks is the evaluation that matters: if the model handles a task family it never
-saw in training, the instruction-following skill transferred; if it only handles seen tasks, you have a
-multi-task model, not an instruction-following one.
+### Worked numbers: why the cap matters
+Suppose the real mixture has three tasks with 500,000, 20,000 and 2,000 examples.
+
+| Mixing rule | Task A (500,000) | Task B (20,000) | Task C (2,000) | Effect |
+|---|---|---|---|---|
+| Proportional to size | ~96% | ~4% | ~0.4% | effectively single-task |
+| Cap each at 10,000 | ~45% | ~45% | ~9% | small task becomes visible |
+
+The large task loses examples it did not need. The cap is a knob you tune by watching per-task held-out
+scores, not a constant. The same arithmetic as a function:
+
+```python
+def mixing_rates(sizes, cap=None):
+    """Examples-proportional mixing, optionally capping each task's size first."""
+    eff = {t: min(n, cap) if cap else n for t, n in sizes.items()}
+    total = sum(eff.values())
+    return {t: round(100 * n / total, 1) for t, n in eff.items()}
+
+sizes = {"qa": 500_000, "extraction": 20_000, "rewrite": 2_000}
+print(mixing_rates(sizes))              # {'qa': 95.8, 'extraction': 3.8, 'rewrite': 0.4}
+print(mixing_rates(sizes, cap=10_000))  # {'qa': 45.5, 'extraction': 45.5, 'rewrite': 9.1}
+```
+
+## Production patterns
+- **Extend an instruct checkpoint, do not start from scratch.** Most teams take an already
+  instruction-tuned open model and add their tasks to a general instruction mixture to keep breadth.
+  Monitor a general benchmark suite before and after; a drop means the general share is too small.
+- **Hold out task families, not rows.** Tag every example with a task id and reserve whole families (and a
+  sample of real user requests) for evaluation. Monitor the gap between seen-task and unseen-task scores;
+  a large gap means a multi-task model, not an instruction follower.
+- **Write several templates per task, including inversions.** Generate at least two or three phrasings
+  per task and evaluate on paraphrases never used in training. Monitor score variance across phrasings
+  of the same request; high variance means the model keys on wording.
+- **Filter generated instructions for diversity.** When bootstrapping with Self-Instruct, drop a new
+  instruction that is too similar to existing ones (the paper used a ROUGE-L overlap threshold of 0.7),
+  and have humans review a sample. Monitor the task-type distribution so it does not collapse toward
+  what the teacher finds easy.
+- **Keep reasoning, long-form and refusal data in every mix.** Reserve a fixed slice for chain-of-thought,
+  code, long answers and refusals. Monitor multi-step reasoning benchmarks, mean output length and refusal
+  rate, which fall first when these slices are dropped.
 
 ## Trade-offs
-- Broad, shallow mixtures generalise to unseen instructions, while narrow deep ones excel at the seen
-  task; when you only ever need one task, the narrow fine-tune wins on that task.
-- Model-generated instructions scale cheaply and widen coverage, but import the teacher's errors and
-  style, so the saving reverses if the teacher is weaker than your target or your domain is unusual.
-- Templating public benchmarks gives thousands of tasks for free, yet academic phrasings differ from
-  real user requests, so a slice of genuine human-written prompts is worth more per example.
-- Including reasoning and long-form data keeps those abilities but lengthens average outputs and
-  training cost; omit them only when the deployment never needs them.
+- **Broad and shallow vs narrow and deep.** Broad mixtures generalise to unseen instructions; narrow ones
+  excel at the seen task. When you only ever need one task, the narrow fine-tune wins on that task.
+- **Model-generated scale vs teacher limits.** Generated instructions scale cheaply and widen coverage but
+  import the teacher's errors and style; the saving reverses if the teacher is weaker than your target or
+  your domain is unusual.
+- **Templated benchmarks vs real requests.** Templating public benchmarks gives thousands of tasks for
+  free, but academic phrasings differ from real user requests, so a slice of genuine human-written
+  prompts is worth more per example.
+- **Reasoning and long-form data vs cost.** Including them keeps those abilities but lengthens average
+  outputs and training cost; omit them only when the deployment never needs them.
 
 ## Pitfalls
-- Using one template per task; the symptom is a model that follows training phrasings exactly and
-  fails when a user words the same request differently.
-- Training only on zero-shot prompts; the symptom is a model that gets confused or copies the format of
-  the examples when a user pastes a few demonstrations into the prompt.
-- Letting one huge dataset dominate the mixture; the symptom is a model that is excellent at that task
-  and has quietly regressed on everything else, visible only if you evaluate per task family.
-- Evaluating on held-out rows of seen tasks and calling it generalisation; the number looks great and
-  says nothing about unseen instructions, which is what users send.
-- Training on instruction data with no chain-of-thought or long answers; the symptom is terse replies
-  and a drop on multi-step reasoning benchmarks after tuning.
-- Treating "instruction tuned" as "aligned"; an instruction-tuned model follows harmful instructions as
-  readily as benign ones until preference training and safety data add a refusal policy.
+- **One template per task.** Symptom: the model follows training phrasings exactly and fails when a user
+  words the same request differently.
+- **Only zero-shot prompts.** Symptom: confusion, or copying the examples' format, when a user pastes a
+  few demonstrations into the prompt.
+- **One huge dataset dominating the mixture.** Symptom: excellent at that task, quietly regressed on
+  everything else, visible only if you evaluate per task family.
+- **Held-out rows of seen tasks called generalisation.** The number looks great and says nothing about
+  unseen instructions, which is what users send.
+- **No chain-of-thought or long answers in the data.** Symptom: terse replies and a drop on multi-step
+  reasoning benchmarks after tuning.
+- **Treating "instruction tuned" as "aligned".** An instruction-tuned model follows harmful instructions
+  as readily as benign ones until preference training and safety data add a refusal policy.
 
 ## When to use
-Instruction tuning is the right tool when you need a model that follows a wide range of requests it has
-not seen verbatim: a general assistant, an internal copilot that fields open-ended tasks, or a base for
-later preference training. It is overkill when the product has one fixed task, where a narrow SFT on
-that task is simpler and better. In practice most teams do not build the mixture from scratch; they
-start from an already instruction-tuned open model and add their own tasks to a general mixture to
-keep breadth. Measure with held-out *task families* and a general benchmark suite. In interviews, be
-ready to explain why diversity beats depth, how Self-Instruct bootstraps data, and how instruction
-tuning differs from both plain SFT and preference optimisation.
+- **Use when** you need a model that follows a wide range of requests it has not seen verbatim: a general
+  assistant, an internal copilot fielding open-ended tasks, or a base for later preference training.
+- **Avoid when** the product has one fixed task; a narrow SFT on that task is simpler and better.
+- **In practice** start from an already instruction-tuned open model and add your tasks to a general
+  mixture to keep breadth, rather than building the mixture from scratch.
+- **Measure** with held-out *task families* and a general benchmark suite.
+- **Interviews:** explain why diversity beats depth, how Self-Instruct bootstraps data, and how
+  instruction tuning differs from plain SFT and from preference optimisation.
 
 ## Role lens
 - **Engineer:** Builds the template and mixing pipeline, caps task sizes, holds out task families, and
@@ -208,6 +263,42 @@ and add a slice of genuine user-style instructions, possibly bootstrapped with S
 filtered by humans. I would also check that the mixture is balanced, since one large task can crowd out
 the generalisation signal, and confirm the model is large enough to benefit, because small models
 tend to overfit seen tasks.
+
+## Interview questions
+### What is instruction tuning, and how is it different from plain SFT?
+- **Mechanically it is SFT:** next-token loss on the output, with the instruction masked.
+- **The difference is the data and the goal.** It trains on many tasks phrased as natural-language
+  instructions, so the model learns the mapping from instruction to behaviour and follows unseen ones
+  zero-shot.
+- **Plain SFT** also covers narrow single-task adaptation, which does not generalise to new requests.
+
+### You have one 500,000-example task and two small ones. How do you build the mixture?
+- **Proportional mixing** gives the big task about 96% of samples, so the result is effectively
+  single-task.
+- **Cap each task** (for example at 10,000) before proportional mixing; the small tasks then become
+  visible at about 45% and 9%.
+- **Tune the cap** by watching per-task held-out scores, because it is a knob, not a constant.
+
+### When would you not instruction-tune, and do a narrow fine-tune instead?
+- **When the product has one fixed task**, because a narrow SFT on that task is simpler and wins on it.
+- **When an existing instruct model already passes your evals** with prompting, since owning a tuned
+  model is a maintenance cost.
+- **Instruction tuning pays** when requests are open-ended and users will word them in ways you cannot
+  enumerate.
+
+### Your tuned model handles training phrasings but fails on paraphrases. What went wrong?
+- **Too few templates per task**, so the model keyed on wording instead of intent.
+- **Fix the data:** write several phrasings per task including inversions, and add genuine user-style
+  requests.
+- **Fix the eval:** test on paraphrases and task families never seen in training, and track score
+  variance across phrasings of the same request.
+
+### What are the risks of scaling instruction data with Self-Instruct, and how do you control them?
+- **The student inherits the teacher's errors and style**, and generated tasks cluster around what the
+  teacher finds easy.
+- **Controls:** filter new instructions that are too similar to existing ones (the paper used a ROUGE-L
+  threshold of 0.7), have humans review a sample, and keep human-written seeds.
+- **Monitor** the task-type distribution across bootstrap rounds so diversity does not collapse.
 
 ## Quiz
 ### Q: Why does adding more distinct tasks help instruction tuning more than adding more examples of existing tasks?

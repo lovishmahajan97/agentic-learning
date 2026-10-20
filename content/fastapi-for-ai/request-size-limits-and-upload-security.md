@@ -5,7 +5,7 @@ name: Request-size limits & upload security
 kind: practice
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/uploadfile
   - fastapi-for-ai/middleware-ordering
@@ -22,89 +22,92 @@ sources:
 ---
 
 ## TL;DR
-An AI backend accepts the largest, least trusted inputs in your stack: long prompts, PDFs, images,
-audio, zip archives of documents for RAG. Uvicorn and FastAPI put no cap on JSON request body size,
-so one oversized or malicious upload can exhaust memory or disk, or a parser can be exploited. Cap
+AI backends accept huge, untrusted inputs, and uvicorn and FastAPI put no cap on JSON body size. Cap
 size at every layer, count bytes while streaming, never trust the client's filename or content type,
-and parse untrusted files in an isolated, resource-limited worker.
+and parse files in an isolated, resource-limited worker.
 
 ## Why it exists
-Upload endpoints are where attackers and accidents meet your most fragile code. Accidentally, a user
-drags a 4 GB video into a "chat with your documents" box, and a worker that reads the body into memory
-dies, taking every other in-flight request on that process with it. Deliberately, someone sends a
-200 KB zip that expands to many gigabytes (a decompression bomb), an image declaring enormous
-dimensions so the decoder allocates huge buffers, a "PDF" that is really an HTML or SVG file with
-script, a filename like `../../app/main.py`, or a Word document with an XML external-entity payload.
-And for AI specifically, the *content* is an attack surface: a valid PDF can contain hidden text that
-instructs your model to exfiltrate data once it is retrieved into a prompt.
+- **The inputs are the largest and least trusted in your stack:** long prompts, PDFs, images, audio, zip
+  archives of documents for RAG. Upload endpoints are where attackers and accidents meet your most
+  fragile code.
+- **Accidents kill workers.** A user drags a 4 GB video into a "chat with your documents" box; a worker
+  that reads the body into memory dies, taking every other in-flight request on that process with it.
+- **Attacks are varied.** A 200 KB zip that expands to many gigabytes (a decompression bomb), an image
+  declaring enormous dimensions so the decoder allocates huge buffers, a "PDF" that is really HTML or SVG
+  with script, a filename like `../../app/main.py`, or a Word document with an XML external-entity payload.
+- **For AI, the *content* is an attack surface.** A valid PDF can contain hidden text that instructs your
+  model to exfiltrate data once it is retrieved into a prompt.
+- **Each naive defence misses something**, so upload security is defence in depth: each layer sees
+  different information (see the table below).
 
-The naive defences each miss something. "Check `Content-Length`" fails for chunked uploads, which
-send no length at all, and it is a claim about the body rather than a measurement of it. "Check the `.pdf` extension" or the multipart `Content-Type`
-trusts values the client chose. "Limit at nginx" is necessary but blind to the file's insides, and
-bypassed if the app is ever exposed another way. "We validate after `await file.read()`" is too late:
-the bytes are already in memory or on disk. Upload security is defence in depth, because each layer
-sees different information.
+| Naive defence | Why it fails |
+|---|---|
+| "Check `Content-Length`" | chunked uploads send no length at all, and it is a claim about the body, not a measurement of it |
+| "Check the `.pdf` extension" or the multipart `Content-Type` | trusts values the client chose |
+| "Limit at nginx" | necessary but blind to the file's insides, and bypassed if the app is ever exposed another way |
+| "We validate after `await file.read()`" | too late: the bytes are already in memory or on disk |
 
 ## How it works
 ### Layer 1: the edge
-Set a body cap at the reverse proxy or gateway (nginx `client_max_body_size`, which defaults to 1 MB,
-or your gateway's equivalent). It rejects oversized requests before they consume a Python worker, and
-it is the only layer that can cheaply stop a flood of huge bodies. Set it per route: chat JSON might
-get 1-2 MB, the document endpoint 50 MB.
-
-Size has a time dimension too. A client that trickles a 50 MB body at a few kilobytes per second
-stays under every byte cap while holding a connection and a worker slot for hours, and a few hundred
-such clients exhaust capacity (the slow-body variant of slowloris). Bound it with the proxy's body
-read timeout (nginx `client_body_timeout`, which limits the gap between reads) and, for large
-uploads, an overall wall-clock limit or a minimum transfer rate; buffering the full body at the proxy
-before forwarding also keeps slow clients off your Python workers.
+- **Set a body cap at the reverse proxy or gateway** (nginx `client_max_body_size`, which defaults to
+  1 MB, or your gateway's equivalent). It rejects oversized requests before they consume a Python worker,
+  and it is the only layer that can cheaply stop a flood of huge bodies.
+- **Set it per route:** chat JSON might get 1-2 MB, the document endpoint 50 MB.
+- **Size has a time dimension too.** A client that trickles a 50 MB body at a few kilobytes per second
+  stays under every byte cap while holding a connection and a worker slot for hours. A few hundred such
+  clients exhaust capacity (the slow-body variant of slowloris).
+- **Bound time at the proxy.** Use the body read timeout (nginx `client_body_timeout`, which limits the
+  gap between reads) and, for large uploads, an overall wall-clock limit or a minimum transfer rate.
+  Buffering the full body at the proxy before forwarding also keeps slow clients off your Python workers.
 
 ### Layer 2: the app, counting bytes
-Uvicorn doesn't limit body size, and FastAPI parses JSON bodies fully into memory. Add ASGI
-middleware (or a dependency on a streaming route) that:
-1. rejects early with **413 Content Too Large** if `Content-Length` exceeds the route's cap, *because*
-   that avoids reading anything; and
-2. wraps `receive` and counts bytes as `http.request` messages arrive, aborting once the running
-   total passes the cap, *because* chunked requests declare no length, and only a count of bytes
-   actually received holds regardless of what the headers say. (An HTTP/1.1 server frames the body by
-   `Content-Length` when it is present, so a client cannot simply send more than it declared; the gap
-   is the request with no length.)
+Uvicorn doesn't limit body size, and FastAPI parses JSON bodies fully into memory. Add ASGI middleware
+(or a dependency on a streaming route) that:
+1. **Rejects early with 413 Content Too Large** if `Content-Length` exceeds the route's cap, *because*
+   that avoids reading anything.
+2. **Wraps `receive` and counts bytes** as `http.request` messages arrive, aborting once the running
+   total passes the cap, *because* chunked requests declare no length, and only a count of bytes actually
+   received holds regardless of what the headers say.
 
-Count the bytes your code will actually hold, not just the bytes on the wire: if you accept
-`Content-Encoding: gzip` request bodies and decompress them in middleware, cap the *decompressed*
-total as well, or a small compressed body becomes a decompression bomb before any handler runs.
-
-Multipart parsing (used by `UploadFile`) spools files to temporary disk, so a missing cap there
-fills the disk instead of RAM. Recent Starlette versions limit the number of multipart fields and
-files and the size of non-file parts, but they don't cap total file size for you.
+- **Why the gap is the no-length request:** an HTTP/1.1 server frames the body by `Content-Length` when
+  it is present, so a client cannot simply send more than it declared.
+- **Count the bytes your code will hold, not just the wire bytes.** If you accept
+  `Content-Encoding: gzip` request bodies and decompress them in middleware, cap the *decompressed* total
+  too, or a small compressed body becomes a decompression bomb before any handler runs.
+- **Multipart spools to disk.** Parsing (used by `UploadFile`) writes files to temporary disk, so a
+  missing cap fills the disk instead of RAM. Recent Starlette versions limit the number of multipart
+  fields and files and the size of non-file parts, but don't cap total file size for you.
 
 ### Layer 3: the file itself
-- **Identify by content, not by claims.** Read the first bytes and check the magic number (`%PDF-`,
-  PNG's `\x89PNG`, ZIP's `PK\x03\x04`) against an allowlist of types the endpoint accepts. Deny by
-  default. Note that DOCX, XLSX and EPUB are all ZIP containers.
-- **Rename and isolate storage.** Generate the stored name (a UUID) and keep the original filename
-  only as escaped metadata, so path traversal and overwrite are impossible. Store outside any served
-  directory, in object storage with private ACLs, scoped by tenant.
-- **Bound decompression and decoding.** Cap total uncompressed size, entry count and compression
-  ratio when expanding archives. Cap pixel count for images (Pillow warns above its configurable
-  `Image.MAX_IMAGE_PIXELS` and raises `DecompressionBombError` above twice that; set the value to your
-  own cap and treat the warning as an error). Cap page count for PDFs. Disable external entities in XML
-  parsers (`defusedxml`).
+- **Identify by content, not by claims.** Read the first bytes and check the magic number (`%PDF-`, PNG's
+  `\x89PNG`, ZIP's `PK\x03\x04`) against an allowlist of types the endpoint accepts. Deny by default.
+  DOCX, XLSX and EPUB are all ZIP containers.
+- **Rename and isolate storage.** Generate the stored name (a UUID) and keep the original filename only
+  as escaped metadata, so path traversal and overwrite are impossible. Store outside any served directory,
+  in object storage with private ACLs, scoped by tenant.
+- **Bound archives.** Cap total uncompressed size, entry count and compression ratio when expanding.
+- **Bound images.** Cap pixel count: Pillow warns above its configurable `Image.MAX_IMAGE_PIXELS` and
+  raises `DecompressionBombError` above twice that; set the value to your own cap and treat the warning
+  as an error.
+- **Bound PDFs and XML.** Cap page count for PDFs. Disable external entities in XML parsers (`defusedxml`).
 - **Scan** with antivirus (e.g. ClamAV) when files are shared with other users or downloaded later.
 
 ### Layer 4: parsing in isolation
-PDF, Office and image parsers are large native codebases with a history of memory-corruption bugs, and
-some inputs make them run for minutes. Don't parse in the request worker. Accept and store the file,
-return `202` with a job ID, and parse in a separate worker with CPU, memory and wall-clock limits
-(container limits or `resource.setrlimit`, plus a timeout), ideally without network access. A crash
-or hang then kills one job, not the API.
+- **Parsers are risky native code.** PDF, Office and image parsers are large native codebases with a
+  history of memory-corruption bugs, and some inputs make them run for minutes.
+- **Don't parse in the request worker.** Accept and store the file, return `202` with a job ID, and parse
+  in a separate worker.
+- **Limit that worker:** CPU, memory and wall-clock limits (container limits or `resource.setrlimit`,
+  plus a timeout), ideally without network access. A crash or hang then kills one job, not the API.
 
 ### Layer 5: the content as untrusted input
-Extracted text goes into prompts and indexes. Treat it as data: strip or flag hidden text and
-invisible characters, keep per-tenant indexes, and apply prompt-injection defences at retrieval time.
-Run PII detection if documents may contain regulated data.
+- **Extracted text goes into prompts and indexes, so treat it as data.**
+- **Strip or flag** hidden text and invisible characters.
+- **Isolate and defend:** keep per-tenant indexes and apply prompt-injection defences at retrieval time.
+- **Run PII detection** if documents may contain regulated data.
 
-## Example
+## Examples
+### Byte-counting ASGI middleware plus a magic-byte check
 A pure-ASGI size-limit middleware, plus a type check on the first bytes.
 
 ```python
@@ -151,55 +154,130 @@ async def upload(file: UploadFile):
     return {"job_id": "job_123", "detected_type": kind}
 ```
 
-The `Content-Length` check rejects an honest 3 GB upload in microseconds. A chunked request that
-declares no size is cut off once it passes 50 MiB. The counter raises an `HTTPException` from
-`receive`, which looks like the "never raise HTTPException in middleware" mistake but is not: the
-middleware only *installs* `counted`, and it is FastAPI's body parsing, deep inside
-`ExceptionMiddleware`, that calls it. The exception is raised there, FastAPI re-raises
-`HTTPException` from body parsing unchanged, and the handler turns it into a 413. If something
-outside `ExceptionMiddleware` read the body instead, the same raise would become a 500.
-Note the order of events for the type check: the handler runs only after the whole multipart body has
-been received and spooled, so the 415 protects storage and parsing, while the byte counter is what
-protects the worker. A file named `report.pdf` that starts with `<svg` gets 415 regardless
-of its name or declared type.
+| Request | What stops it |
+|---|---|
+| Honest 3 GB upload | the `Content-Length` check, in microseconds |
+| Chunked request that declares no size | the byte counter, once it passes 50 MiB |
+| `report.pdf` that starts with `<svg` | 415, regardless of its name or declared type |
+
+- **Raising `HTTPException` from `receive` is safe here.** It looks like the "never raise HTTPException
+  in middleware" mistake but is not: the middleware only *installs* `counted`, and FastAPI's body parsing,
+  deep inside `ExceptionMiddleware`, calls it. FastAPI re-raises `HTTPException` from body parsing
+  unchanged, and the handler turns it into a 413.
+- **Caveat:** if something outside `ExceptionMiddleware` read the body instead, the same raise would
+  become a 500.
+- **Order of events:** the handler runs only after the whole multipart body has been received and
+  spooled, so the 415 protects storage and parsing, while the byte counter protects the worker.
+
+### Bounded archive check before extraction (runnable, stdlib only)
+Rejects a decompression bomb and a path-traversal entry; the caps are illustrative.
+
+```python
+import io, os, zipfile
+
+MAX_ENTRIES, MAX_TOTAL, MAX_RATIO = 1_000, 200 * 2**20, 100   # entries, uncompressed bytes, ratio
+
+def check_archive(data: bytes) -> int:
+    """Return total uncompressed bytes, or raise before anything big is held in memory."""
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    infos = zf.infolist()
+    if len(infos) > MAX_ENTRIES:
+        raise ValueError(f"{len(infos)} entries")
+    total = 0
+    for i in infos:
+        parts = i.filename.replace("\\", "/").split("/")
+        if i.filename.startswith(("/", "\\")) or ".." in parts:
+            raise ValueError(f"unsafe path {i.filename!r}")
+        if i.compress_size and i.file_size / i.compress_size > MAX_RATIO:
+            raise ValueError(f"ratio {i.file_size // i.compress_size}:1 in {i.filename!r}")
+        with zf.open(i) as f:                     # headers can lie: count what decompresses
+            while chunk := f.read(1 << 16):
+                total += len(chunk)
+                if total > MAX_TOTAL:
+                    raise ValueError("uncompressed total over cap")
+    return total
+
+def make_zip(files: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, body in files.items():
+            z.writestr(name, body)
+    return buf.getvalue()
+
+ok = make_zip({"a.pdf": b"%PDF-1.7 " + os.urandom(100_000)})
+bomb = make_zip({"big.pdf": b"\0" * 20 * 2**20})            # 20 MiB of zeros
+evil = make_zip({"../../app/main.py": b"print('pwned')"})
+for name, z in [("ok", ok), ("bomb", bomb), ("traversal", evil)]:
+    try:
+        print(name, len(z), "bytes ->", check_archive(z), "uncompressed")
+    except ValueError as e:
+        print(name, len(z), "bytes -> rejected:", e)
+# ok 100152 bytes -> 100009 uncompressed
+# bomb 20499 bytes -> rejected: ratio 1028:1 in 'big.pdf'
+# traversal 148 bytes -> rejected: unsafe path '../../app/main.py'
+```
+
+A ~20 KB upload passes any edge byte cap but expands 1000-fold; only an inside-the-file check sees that.
+Run this in the parse worker, not the API process.
+
+## Production patterns
+- **Per-route edge caps** — on every public ingress. In nginx, set `client_max_body_size` inside each
+  `location` (small for chat, larger for documents) and a short `client_body_timeout`; keep request
+  buffering on so slow uploads finish at nginx before reaching Python. Monitor 413s at the edge versus
+  in the app; app 413s mean traffic is bypassing the proxy.
+- **Presigned direct-to-storage uploads** — for files above tens of megabytes. Issue an S3 presigned POST
+  whose policy includes a `content-length-range` condition, have the client upload directly, and send
+  the API only the object key. Monitor uploads that never get a follow-up API call (abandoned objects)
+  and expire them with a bucket lifecycle rule.
+- **Quarantine bucket, then promote** — when files are shared or redistributed. Land uploads in a private
+  quarantine prefix, run type checks and antivirus in a worker, and copy to the serving location only on
+  pass. Monitor scan failures and quarantine age.
+- **Sandboxed parse workers** — for every untrusted document. Run parsers in a container with memory and
+  CPU limits, no network, and a per-job timeout; in a plain process, apply `resource.setrlimit` in the
+  child before parsing. Monitor parse failures and timeouts by file type, and OOM kills.
+- **Pillow bomb guard as an error** — on image and vision routes. Set `Image.MAX_IMAGE_PIXELS` to your cap
+  and promote the warning with `warnings.simplefilter("error", Image.DecompressionBombWarning)`. Monitor
+  rejections by declared image size.
+- **Peak RSS per worker as an SLO signal** — always. Track peak worker RSS alongside 413/415 counts; a
+  rising RSS ceiling with flat 413s means something is buffering bodies you thought were capped.
 
 ## Trade-offs
-- Tight size caps protect workers and cost, but they reject legitimate large documents. Offer a
-  separate upload path (direct-to-object-storage with presigned URLs) when real files exceed what the
-  API should proxy.
-- Parsing synchronously in the request gives users an immediate answer, but it puts native parsers
-  and their crashes in your API process. Asynchronous sandboxed parsing is safer and scales, at the
-  cost of job status plumbing and a slower first answer.
-- Strict allowlists of formats reduce attack surface, but they frustrate users with legitimate .docx
-  or .heic files. Widen the list only when you have a hardened parser for each format.
-- Antivirus scanning catches known malware in shared files, but it adds latency and infrastructure
-  and does nothing against parser exploits or prompt injection, so it pays off mostly when files are
-  redistributed.
+- **Tight caps vs legitimate large documents.** Tight size caps protect workers and cost but reject real
+  large files. Offer a separate upload path (direct-to-object-storage with presigned URLs) when real files
+  exceed what the API should proxy.
+- **Sync vs async parsing.** Parsing in the request gives users an immediate answer but puts native
+  parsers and their crashes in your API process. Asynchronous sandboxed parsing is safer and scales, at
+  the cost of job status plumbing and a slower first answer.
+- **Strict vs wide format allowlists.** Strict lists reduce attack surface but frustrate users with
+  legitimate .docx or .heic files. Widen the list only when you have a hardened parser for each format.
+- **Antivirus vs its limits.** Scanning catches known malware in shared files, but adds latency and
+  infrastructure and does nothing against parser exploits or prompt injection, so it pays off mostly when
+  files are redistributed.
 
 ## Pitfalls
-- Relying on `Content-Length` only. The symptom is memory spikes or disk-full alerts from chunked
-  uploads that never declared a size.
-- Capping bytes but not time. The symptom is worker or connection exhaustion with low bandwidth and
-  low CPU, and many requests stuck for minutes in "reading body".
-- Saving files using the client's filename. The symptom is files appearing outside the upload
-  directory, or one user's upload overwriting another's identically named file.
-- Trusting the multipart `Content-Type` or extension. The symptom is HTML or SVG files with script
-  stored as "images" and served back to other users, which is stored XSS.
-- Extracting archives without ratio or entry limits. The symptom is a worker killed by the OOM killer,
-  or a full disk, from a small upload that expanded.
-- Parsing PDFs in the API worker. The symptom is latency spikes and occasional worker crashes that
+- **Relying on `Content-Length` only.** Symptom: memory spikes or disk-full alerts from chunked uploads
+  that never declared a size.
+- **Capping bytes but not time.** Symptom: worker or connection exhaustion with low bandwidth and low
+  CPU, and many requests stuck for minutes in "reading body".
+- **Saving files under the client's filename.** Symptom: files appear outside the upload directory, or
+  one user's upload overwrites another's identically named file.
+- **Trusting the multipart `Content-Type` or extension.** Symptom: HTML or SVG files with script stored
+  as "images" and served back to other users, which is stored XSS.
+- **Extracting archives without ratio or entry limits.** Symptom: a worker killed by the OOM killer, or
+  a full disk, from a small upload that expanded.
+- **Parsing PDFs in the API worker.** Symptom: latency spikes and occasional worker crashes that
   correlate with specific customer documents.
-- Indexing extracted text without injection handling. The symptom is the assistant following
-  instructions that appear nowhere in the visible document.
+- **Indexing extracted text without injection handling.** Symptom: the assistant follows instructions
+  that appear nowhere in the visible document.
 
 ## When to use
-Apply size limits to every endpoint, because JSON bodies are uploads too, and long-context models
-tempt clients to send megabytes of prompt. Apply the full upload discipline (magic-byte allowlist,
-generated names, private storage, bounded decompression, sandboxed parsing) whenever users submit
-files for RAG ingestion, vision or transcription. For files larger than tens of megabytes, have
-clients upload directly to object storage with presigned URLs, and give the API only the object key.
-Track 413/415 counts, parse-job failures and timeouts by file type, and peak worker RSS. In
-interviews, the strong answer names several layers and explains what each one can and can't see.
+- **Size limits on every endpoint**, because JSON bodies are uploads too, and long-context models tempt
+  clients to send megabytes of prompt.
+- **The full upload discipline** (magic-byte allowlist, generated names, private storage, bounded
+  decompression, sandboxed parsing) whenever users submit files for RAG ingestion, vision or transcription.
+- **Presigned direct uploads** for files larger than tens of megabytes; give the API only the object key.
+- **Measure:** 413/415 counts, parse-job failures and timeouts by file type, and peak worker RSS.
+- **Interviews:** the strong answer names several layers and explains what each one can and can't see.
 
 ## Role lens
 - **Engineer:** Writes the byte-counting middleware, the magic-byte allowlist and the job hand-off,

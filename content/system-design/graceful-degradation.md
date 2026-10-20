@@ -5,7 +5,7 @@ name: Graceful degradation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - system-design/model-fallback-strategies
   - reliability/backpressure-and-load-shedding
@@ -21,92 +21,100 @@ sources:
 ---
 
 ## TL;DR
-When the AI path is failing, slow, over budget or overloaded, the product should step down to a
-cheaper, simpler and honestly labelled version of itself rather than fall over. Graceful degradation is a
-designed ladder (full → reduced → cached → non-AI → clear unavailability) with explicit triggers,
-hysteresis, labelled output and degraded paths that are exercised so they still work when needed.
-Fallbacks keep the function by changing the provider; degradation keeps the user moving by changing the
-function.
+When the AI path fails, slows, overspends or overloads, step down to a cheaper, simpler, honestly labelled
+version instead of falling over: a designed ladder with triggers, hysteresis and exercised paths.
+Fallbacks change the provider; degradation changes the function.
 
 ## Why it exists
-Most AI features are enhancements on a product that worked before them: search, support, editors,
-dashboards. A model incident, an exhausted rate limit, a runaway cost day or a traffic spike will happen.
-If the feature's failure also breaks the workflow around it, you have turned an enhancement into a new
-failure point and lowered the availability of the whole product. Users who could have found the document
-themselves now see a spinner.
-
-The naive responses each miss something. "Retry and show an error" makes the user wait and then gives
-them nothing. "Fall back to another model" handles a provider outage but not overload, budget exhaustion
-or a latency SLO that the fallback also misses. "Turn the feature off" is a single binary switch, so the
-smallest incident costs the whole feature. There is also an AI-specific failure the others ignore: a
-response that was produced but should not be trusted, because the grounding check failed or the judge
-rejected it. The right move there is to show less and say why, not to fail.
-
-Load shedding and priority classes came from site reliability engineering; AI systems add a new axis,
-quality levels, because the same request can be answered well, adequately, or not at all, at different
-costs. Degradation is the discipline of deciding those levels before the incident.
+- **Most AI features enhance a product that already worked:** search, support, editors, dashboards. A
+  model incident, an exhausted rate limit, a runaway cost day or a traffic spike will happen.
+- **If the feature's failure breaks the workflow around it,** an enhancement becomes a new failure point
+  and lowers the whole product's availability. Users who could have found the document themselves now see
+  a spinner.
+- **The naive responses each miss something.**
+  - "Retry and show an error" makes the user wait and then gives them nothing.
+  - "Fall back to another model" handles a provider outage, not overload, budget exhaustion or a latency
+    SLO the fallback also misses.
+  - "Turn the feature off" is one binary switch, so the smallest incident costs the whole feature.
+- **AI adds a failure the others ignore:** a response that was produced but should not be trusted,
+  because the grounding check failed or the judge rejected it. Show less and say why; do not fail.
+- **AI adds an axis to SRE practice.** Load shedding and priority classes came from site reliability
+  engineering; AI adds quality levels, because one request can be answered well, adequately, or not at
+  all, at different costs. Degradation decides those levels before the incident.
 
 ## How it works
 ### Define the ladder per feature
-- **Level 0, full:** the strong model, tools, reranking, a verifier.
-- **Level 1, reduced:** a smaller model, fewer retrieved passages, no reranker, a lower `max_tokens`,
-  agent loops capped at one step. Visibly still an answer; cheaper and faster.
-- **Level 2, cached or precomputed:** a cached answer to a similar question, a precomputed summary, an
-  FAQ entry, scoped to the same tenant.
-- **Level 3, non-AI:** keyword search results, a template, the raw documents, a form. The product as it
-  was before the feature.
-- **Level 4, honest unavailability:** a clear message, the rest of the product working, and a way to
-  proceed (a human handoff, a link, try later).
+| Level | What the user gets | Typical contents |
+|---|---|---|
+| **0, full** | The best answer | Strong model, tools, reranking, a verifier |
+| **1, reduced** | Visibly still an answer; cheaper and faster | Smaller model, fewer retrieved passages, no reranker, lower `max_tokens`, agent loops capped at one step |
+| **2, cached or precomputed** | A known-good answer | Cached answer to a similar question, precomputed summary, FAQ entry, scoped to the same tenant |
+| **3, non-AI** | The product as it was before the feature | Keyword search results, a template, the raw documents, a form |
+| **4, honest unavailability** | A way to proceed | A clear message, the rest of the product working, a human handoff, a link, try later |
+
 For each level write down what the user sees, what it costs, and who gets it.
 
 ### Triggers
-Dependency health (breaker state, error rate, p95 latency), load (queue depth, concurrency), budget burn
-(spend today against the cap), rate-limit headroom, quality signals (a failed grounding check demotes
-*this* response to sources-only), and a human-operated kill switch. Evaluate triggers where the decision
-is made and with hysteresis: step down quickly on a bad signal, step back up only after the signal has
-been healthy for a sustained period, *because* flapping between levels is worse for users than staying
-one level down. Concretely that means separate enter and exit thresholds plus a minimum dwell time: for
-example (illustrative numbers), enter Reduced when p95 exceeds 4 s, and leave it only after p95 has
-stayed under 2.5 s for ten minutes. The gap between 4 s and 2.5 s is what stops a signal hovering near
-one threshold from toggling the level on every sample.
+- **Dependency health:** breaker state, error rate, p95 latency.
+- **Load:** queue depth, concurrency.
+- **Budget burn:** spend today against the cap.
+- **Rate-limit headroom.**
+- **Quality signals:** a failed grounding check demotes *this* response to sources-only.
+- **A human-operated kill switch.**
 
-Budget triggers deserve the same care. Trigger on projected burn, not on spend so far:
-`spent + current_rate × hours_left > cap` fires mid-morning on a heavy day and lets you step down one
-level gently, whereas `spent ≥ cap` fires late in the day and drops every user straight to the cached
-level for the rest of it.
+### Hysteresis
+- **Evaluate triggers where the decision is made.**
+- **Step down quickly on a bad signal; step back up only after sustained health,** *because* flapping
+  between levels is worse for users than staying one level down.
+- **Concretely:** separate enter and exit thresholds plus a minimum dwell time. Illustrative numbers: enter
+  Reduced when p95 exceeds 4 s; leave only after p95 has stayed under 2.5 s for ten minutes.
+- **The gap between 4 s and 2.5 s** stops a signal hovering near one threshold from toggling the level on
+  every sample.
+
+### Budget triggers: projected burn, not spend so far
+| Trigger | When it fires on a heavy day | Effect |
+|---|---|---|
+| `spent + current_rate × hours_left > cap` | Mid-morning | Step down one level gently |
+| `spent ≥ cap` | Late in the day | Every user drops straight to the cached level for the rest of it |
 
 ### Shed by priority, isolate by class
-Classify requests: interactive versus batch, paying versus free, critical versus nice-to-have. Shed
-batch and low tiers first and keep a reserved share of capacity for critical interactive traffic in its
-own bulkhead, so a batch backfill can never starve the chat box. Shed at admission, before any tokens
-are spent: a request abandoned after generation has started has already paid for the work it throws
-away, and under overload that waste is exactly the capacity you were short of.
+1. **Classify requests:** interactive versus batch, paying versus free, critical versus nice-to-have.
+2. **Shed batch and low tiers first.**
+3. **Reserve capacity** for critical interactive traffic in its own bulkhead, so a batch backfill can never
+   starve the chat box.
+4. **Shed at admission, before any tokens are spent.** A request abandoned after generation started has
+   already paid for the work it throws away, and under overload that waste is exactly the capacity you
+   were short of.
 
 ### Deadlines and partial results
-Give each request a deadline and return what you have when it expires: retrieved passages without the
-synthesis, a streamed partial answer with a visible marker. Streaming makes partial output useful rather
-than confusing, but partial answers are dangerous where a half-statement misleads; there, sources-only is
-the right degraded form.
+- **Give each request a deadline** and return what you have when it expires: retrieved passages without
+  the synthesis, or a streamed partial answer with a visible marker.
+- **Streaming makes partial output useful** rather than confusing.
+- **Partial answers are dangerous where a half-statement misleads;** there, sources-only is the right
+  degraded form.
 
 ### Honesty in the interface
-Label degraded output ("Showing matching documents; the AI summary is unavailable"). Never present a
-Level 1 answer as Level 0 when the quality difference matters, since users act on outputs and silent
-degradation transfers the risk to them.
+- **Label degraded output:** "Showing matching documents; the AI summary is unavailable".
+- **Never present a Level 1 answer as Level 0** when the quality difference matters, since users act on
+  outputs and silent degradation transfers the risk to them.
 
 ### Keep the degraded paths alive
-A non-AI path that nobody runs rots: its index goes stale, its credentials expire, its flag is removed.
-Send a small share of traffic through each level routinely, run synthetic checks against them, and hold
-game days. Every level sits behind a flag that flips without a deploy, and the runbook names the flags.
+- **Unused paths rot:** the non-AI path's index goes stale, its credentials expire, its flag is removed.
+- **Exercise them:** send a small share of traffic through each level routinely, run synthetic checks, and
+  hold game days.
+- **Every level sits behind a flag** that flips without a deploy, and the runbook names the flags.
 
 ### Measure
-Time spent at each level, requests served per level, user outcomes per level (completion rate, handoff
-rate), and time to recover to full. "Percentage of sessions served at Level 0" is a good SLO.
+- Time spent at each level and requests served per level.
+- User outcomes per level (completion rate, handoff rate).
+- Time to recover to full.
+- **A good SLO:** "Percentage of sessions served at Level 0".
 
-## Example
-A support-answer endpoint with a degradation ladder. A background task refreshes `h`, a health snapshot,
-every few seconds; the handler picks a level, enforces a deadline, and steps down rather than raising
-when a stage fails. `keyword_or_vector_search`, `generate`, `semantic_cache_lookup` and `ModelError` are
-your adapters.
+## Examples
+### Support-answer endpoint with a degradation ladder
+A background task refreshes `h`, a health snapshot, every few seconds; the handler picks a level, enforces a
+deadline, and steps down rather than raising when a stage fails. `keyword_or_vector_search`, `generate`,
+`semantic_cache_lookup` and `ModelError` are your adapters.
 
 ```python
 import asyncio, time
@@ -153,46 +161,108 @@ async def answer(q, user, h, deadline_s=6.0):
     return {"level": 4, "answer": None, "sources": [], "label": "Search is temporarily unavailable"}
 ```
 
-The `level` field in every response is the metric: a histogram of it over time is the dashboard that
-shows whether the product has been quietly running degraded. `current_level` is stateless for brevity;
-the hysteresis belongs in the background task that builds `h`, which should hold a level until its exit
-condition has persisted for the dwell time, so every request in a window sees the same level. Note also
-the order of the ladder: each step down is cheaper than the one above it, and a failure inside a level
-moves the request down rather than retrying, so an incident lowers spend instead of raising it.
+- **The `level` field in every response is the metric:** a histogram of it over time shows whether the
+  product has been quietly running degraded.
+- **Hysteresis lives in the background task.** `current_level` is stateless for brevity; the task that
+  builds `h` should hold a level until its exit condition has persisted for the dwell time, so every
+  request in a window sees the same level.
+- **Each step down is cheaper than the one above,** and a failure inside a level moves the request down
+  rather than retrying, so an incident lowers spend instead of raising it.
+
+### Hysteresis controller for the background task
+Runnable, pure Python, using the illustrative 4 s / 2.5 s / ten-minute thresholds.
+
+```python
+class Hysteresis:
+    """Enter REDUCED fast when p95 > enter_ms; leave only after p95 < exit_ms for dwell_s straight."""
+    def __init__(self, enter_ms=4000, exit_ms=2500, dwell_s=600):
+        self.enter_ms, self.exit_ms, self.dwell_s = enter_ms, exit_ms, dwell_s
+        self.reduced, self.healthy_since = False, None
+
+    def update(self, p95_ms, now_s):
+        if p95_ms > self.enter_ms:
+            self.reduced, self.healthy_since = True, None      # step down immediately
+        elif self.reduced and p95_ms < self.exit_ms:
+            self.healthy_since = self.healthy_since or now_s
+            if now_s - self.healthy_since >= self.dwell_s:
+                self.reduced, self.healthy_since = False, None  # step up after sustained health
+        elif self.reduced:
+            self.healthy_since = None                           # in the gap: hold the level, reset dwell
+        return "REDUCED" if self.reduced else "FULL"
+
+h = Hysteresis()
+samples = [3000, 4200, 3800, 4100, 2400, 3000, 2300] + [2000] * 10   # one sample per minute
+print(" ".join(h.update(p, 60 * i)[0] for i, p in enumerate(samples)))
+# F R R R R R R R R R R R R R R R F : no flapping around 4 s; full only after 10 healthy minutes
+```
+
+A single 4 s threshold on the same samples would flip F R F R F F F, which users read as randomness.
+
+### Worked scenario: projected-burn budget trigger
+Illustrative: daily cap $500, a heavy day where spend reaches $150 by 10:00 and runs at $40 per hour.
+
+| Trigger | Fires at | What users get |
+|---|---|---|
+| Projected: 150 + 40 × 14 h left = $710 > $500 | 10:00 | Step to Reduced; if the smaller model halves the rate, 150 + 20 × 14 = $430 and the cap holds |
+| Spend so far: $150 + $40/h reaches $500 | about 18:45 | Everyone drops straight to Cached for the rest of the day |
+
+## Production patterns
+- **Levels as runtime flags.** Read the forced level and the kill switch per request from your
+  feature-flag service or a config key, never from code, so mitigation is a flag flip, not a deploy. Name
+  each flag in the runbook. Monitor flag changes with who and when, and time from alert to flip.
+- **Admission-time bulkheads.** Give each request class its own concurrency pool (for example a separate
+  semaphore or worker pool for batch with a hard cap) and reject over-limit batch work with 503 and a
+  `Retry-After` before any model call. Monitor shed rate per class and interactive p95 during batch runs.
+- **Projected-burn budget job.** Every few minutes compute `spent + current_rate × hours_left` per feature
+  and tenant, and write the resulting level into the health snapshot. Monitor projected versus actual
+  end-of-day spend and hours spent at each budget-driven level.
+- **Synthetic checks per level.** Run a canary query against each level on a schedule by forcing the level
+  with a test-only header or flag, and fail the check if the non-AI index is stale or a credential is
+  expired. Monitor canary success per level, not only for Level 0.
+- **Level-mix SLO.** Emit the served level as a metric label on every response and set an SLO on the share
+  of sessions at Level 0, alerting on burn rate. Monitor the level histogram per tenant, so one noisy
+  tenant's degradation is visible.
 
 ## Trade-offs
-- The product survives incidents, but you maintain several code paths and the eval for each; when the
-  AI feature *is* the product, degrade within AI levels and then be honest, since no non-AI path exists.
-- Honest labelling preserves trust but makes degradation visible to users and competitors; where outputs
-  are acted on, visibility is the correct default and the trade is rarely worth reversing.
-- Priority shedding protects paying and critical users at the expense of the free tier, which may be the
-  acquisition funnel; if growth is the KPI, shed batch work before shedding free users.
-- Partial results at the deadline beat nothing, but a half answer can mislead; in medical, legal or
-  financial contexts return sources only rather than a truncated synthesis.
-- Eager triggers save cost and latency, but set too low they keep the product one level down most of the
-  day without anyone noticing; hysteresis thresholds need the same review as the SLO.
+- **Survival vs code-path cost.** The product survives incidents, but you maintain several code paths and
+  an eval for each. When the AI feature *is* the product, degrade within AI levels and then be honest,
+  since no non-AI path exists.
+- **Trust vs visible degradation.** Honest labelling preserves trust but shows degradation to users and
+  competitors; where outputs are acted on, visibility is the correct default and the trade is rarely worth
+  reversing.
+- **Protecting paying users vs the funnel.** Priority shedding protects paying and critical users at the
+  expense of the free tier, which may be the acquisition funnel; if growth is the KPI, shed batch work
+  before shedding free users.
+- **Partial results vs misleading halves.** Partial results at the deadline beat nothing, but a half
+  answer can mislead; in medical, legal or financial contexts return sources only rather than a truncated
+  synthesis.
+- **Eager triggers vs permanent degradation.** Eager triggers save cost and latency, but set too low they
+  keep the product one level down most of the day without anyone noticing; hysteresis thresholds need the
+  same review as the SLO.
 
 ## Pitfalls
-- Degraded paths never exercised; the symptom is the non-AI path failing with an expired credential or
-  stale index at the exact moment of the incident.
-- Silent degradation with no time-in-level metric; the symptom is weeks of reduced answers discovered
-  from quality complaints or a bill that dropped for no known reason.
-- Flapping between levels; the symptom is a user getting a fast reduced answer, then a slow full one,
-  then a cached one within a single session, which reads as randomness.
-- Degrading to something more expensive, such as retries or a larger fallback model; the symptom is
-  cost rising during the incident instead of falling.
-- A kill switch that requires a deploy; the symptom is a 40-minute mitigation for a 2-minute decision.
-- Triggers measured globally when load is per tenant; the symptom is one noisy tenant degrading
-  everyone, or nobody being degraded while that tenant's queue grows unbounded.
+- **Degraded paths never exercised.** Symptom: the non-AI path fails with an expired credential or stale
+  index at the exact moment of the incident.
+- **Silent degradation with no time-in-level metric.** Symptom: weeks of reduced answers discovered from
+  quality complaints or a bill that dropped for no known reason.
+- **Flapping between levels.** Symptom: a user gets a fast reduced answer, then a slow full one, then a
+  cached one within a single session, which reads as randomness.
+- **Degrading to something more expensive,** such as retries or a larger fallback model. Symptom: cost
+  rises during the incident instead of falling.
+- **A kill switch that requires a deploy.** Symptom: a 40-minute mitigation for a 2-minute decision.
+- **Triggers measured globally when load is per tenant.** Symptom: one noisy tenant degrades everyone, or
+  nobody is degraded while that tenant's queue grows unbounded.
 
 ## When to use
-Design the ladder for any user-facing AI feature with an SLO, at the same time as the non-functional
-requirements, because the levels shape the architecture (what stays deterministic, where caches live,
-which flags exist). Offline batch work usually needs only retry-later. Agree the degraded behaviour with
-product and, in customer deployments, with the customer, before go-live. Measure time per level,
-outcomes per level and recovery time, and set an SLO on the share of sessions served at full quality. In
-interviews, distinguish degradation from fallback, describe the ladder, the triggers with hysteresis,
-priority shedding, honest labelling and the discipline of exercising the degraded paths.
+- **Use for** any user-facing AI feature with an SLO; design the ladder alongside the non-functional
+  requirements, because the levels shape the architecture (what stays deterministic, where caches live,
+  which flags exist).
+- **Skip the ladder for** offline batch work, which usually needs only retry-later.
+- **Agree degraded behaviour before go-live** with product and, in customer deployments, with the customer.
+- **Measure:** time per level, outcomes per level and recovery time; set an SLO on the share of sessions
+  served at full quality.
+- **Interviews:** distinguish degradation from fallback, then describe the ladder, triggers with
+  hysteresis, priority shedding, honest labelling and the discipline of exercising the degraded paths.
 
 ## Role lens
 - **Engineer:** Implements levels as flagged code paths with deadlines, emits the level on every response,

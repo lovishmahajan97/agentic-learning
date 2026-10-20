@@ -5,7 +5,7 @@ name: Chunking strategies (fixed, recursive, semantic)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/chunk-overlap
   - rag-retrieval/retrieval-granularity
@@ -21,94 +21,125 @@ sources:
 ---
 
 ## TL;DR
-An embedding model turns a span of text into one vector, so a whole document becomes a blurry average
-in which the specific passage a question needs is drowned out, and text past the
-encoder's input limit is lost. Chunking cuts documents into retrievable units first. Fixed-size is
-predictable but blind to structure; recursive splitting tries natural boundaries (paragraph, line,
-sentence) before falling back to hard cuts; semantic splitting places boundaries where adjacent
-sentences stop being about the same thing. The strategy defines what "a hit" means downstream.
+Chunking cuts documents into retrievable units before embedding, because one vector per document blurs
+the passage a question needs. Fixed-size is predictable, recursive follows natural boundaries, semantic
+follows topic shifts. The strategy defines what "a hit" means.
 
 ## Why it exists
-Three constraints force chunking. Two are hard. Embedding models have a maximum input length, typically
-512 tokens for BERT-derived encoders and around 8,000 for many newer long-context ones. Local libraries
-such as sentence-transformers truncate silently (some hosted APIs return an error instead): the second
-half of a long document simply never reaches the vector, so no query can ever retrieve it. The generation side has a budget too; stuffing ten full documents into every prompt is
-slow, expensive and, past a point, hurts answer quality because the model has to find the needle itself.
-
-The third constraint is softer but decides retrieval quality: dilution. Pooling a 30-page contract into
-one vector gives you "a contract", not "the indemnification cap in clause 14.3". A query about that
-cap scores middling against the whole-document vector and loses to a shorter document that happens to
-mention caps. A chunk holding only clause 14 scores high. The vector of a small, focused span is a
-sharper key.
-
-The naive fix, cutting every N characters, trades one failure for another. It splits sentences, table
-rows and function bodies in half, so chunks embed half-thoughts, and it separates headings from the
-paragraphs they explain, so a chunk says "set this to 30 seconds" with no indication of what. Chunking
-strategy is therefore a design decision about what unit of meaning gets its own address in the index,
-not a preprocessing detail.
+- **Encoders have a hard input limit.** Typically 512 tokens for BERT-derived encoders and around 8,000
+  for many newer long-context ones. Local libraries such as sentence-transformers truncate silently
+  (some hosted APIs return an error instead), so the second half of a long document never reaches the
+  vector and no query can retrieve it.
+- **The generator has a budget too.** Stuffing ten full documents into every prompt is slow, expensive
+  and, past a point, hurts answer quality because the model has to find the needle itself.
+- **Dilution decides retrieval quality.** Pooling a 30-page contract into one vector gives "a contract",
+  not "the indemnification cap in clause 14.3". A query about that cap scores middling against the whole
+  document and loses to a shorter one that mentions caps; a chunk holding only clause 14 scores high.
+- **Cutting every N characters trades one failure for another.** It splits sentences, table rows and
+  function bodies in half, and separates headings from their paragraphs, so a chunk says "set this to 30
+  seconds" with no indication of what.
+- **So chunking is a design decision.** It chooses what unit of meaning gets its own address in the
+  index, not a preprocessing detail.
 
 ## How it works
 ### The common skeleton
-Every splitter answers three questions: where a boundary is allowed to fall, how large a piece may be,
-and what metadata travels with each piece. Size is measured in tokens rather than characters, because
-both the embedder's limit and the LLM's context budget are in tokens and the characters-per-token
-ratio varies by language and content (English prose is roughly four characters per token; code, CJK
-text and tables differ). Count with the embedding model's own tokenizer when you can, or with a close
-proxy such as tiktoken, and leave headroom under the model limit.
+Every splitter answers three questions:
+1. **Where may a boundary fall?** (any token, a separator, a topic shift)
+2. **How large may a piece be?** Measured in tokens, not characters, because both the embedder's limit
+   and the LLM's context budget are in tokens.
+3. **What metadata travels with each piece?**
+
+- **Why tokens:** the characters-per-token ratio varies (English prose is roughly four characters per
+  token; code, CJK text and tables differ).
+- **How to count:** use the embedding model's own tokenizer when you can, or a close proxy such as
+  tiktoken, and leave headroom under the model limit.
+
+### The three strategies
+| Strategy | Boundary rule | Strength | Failure |
+|---|---|---|---|
+| Fixed-size | every N tokens, optional overlap | trivial, uniform sizes, predictable index size and cost | mid-sentence cuts, headings split from bodies |
+| Recursive | coarsest separator that fits, then finer | follows paragraphs cheaply, never exceeds limit | degenerates to fixed-size on structureless text |
+| Semantic | where adjacent-sentence similarity drops | topically coherent chunks in unstructured prose | one embedding per sentence, tuned threshold, variable sizes |
 
 ### Fixed-size
-Walk the token stream and cut every N tokens, optionally with overlap. Because it ignores content, it
-is trivial to implement, produces uniform chunk sizes (predictable index size and cost) and works on
-text with no structure at all, such as OCR output or log files. It fails precisely where content has
-structure: mid-sentence cuts, headings separated from bodies, a code function split between its
-signature and its body, a table split between header row and data rows.
+- **How:** walk the token stream and cut every N tokens, optionally with overlap.
+- **Works on:** text with no structure at all, such as OCR output or log files, because it ignores
+  content.
+- **Fails where content has structure:** a code function split between signature and body, a table
+  split between header row and data rows.
 
 ### Recursive (separator hierarchy)
-Take an ordered list of separators from coarse to fine, for example `["\n\n", "\n", ". ", " ", ""]`.
-Split on the coarsest separator first. Any piece that still exceeds the limit is split again with the
-next separator, recursively; pieces smaller than the limit are merged greedily with their neighbours up
-to the limit. The design logic: paragraphs are semantic units, so most chunks end on paragraph
-boundaries; the fallback chain guarantees no piece can exceed the limit; and the greedy merge keeps
-chunks from being tiny. Structure-aware splitters are this same algorithm with format-specific
-separators: Markdown headings (carrying the heading path into each chunk's metadata or text), HTML
-block tags, or language-aware separators for code (class and function boundaries). LangChain's
-`RecursiveCharacterTextSplitter` and the LlamaIndex sentence and Markdown parsers are implementations
-of this idea; the separator order is the main knob.
+1. Take an ordered list of separators from coarse to fine, for example `["\n\n", "\n", ". ", " ", ""]`.
+2. Split on the coarsest separator first.
+3. Any piece still over the limit is split again with the next separator, recursively.
+4. Pieces under the limit are merged greedily with neighbours up to the limit.
+
+- **Why this design:** paragraphs are semantic units, so most chunks end on paragraph boundaries; the
+  fallback chain guarantees no piece exceeds the limit; the greedy merge keeps chunks from being tiny.
+- **Structure-aware splitters are the same algorithm** with format-specific separators: Markdown
+  headings (carrying the heading path into each chunk's metadata or text), HTML block tags, or
+  language-aware separators for code (class and function boundaries).
+- **Implementations:** LangChain's `RecursiveCharacterTextSplitter` and the LlamaIndex sentence and
+  Markdown parsers. The separator order is the main knob.
 
 ### Semantic
-Split the text into sentences and embed each one. Compute the cosine similarity between consecutive
-sentences (or between each sentence and a small window of its neighbours). Mark a breakpoint wherever
-similarity drops below a threshold, which can be absolute, a percentile of all drops, or a number of
-standard deviations below the mean. Sentences between breakpoints form a chunk, with a size cap and a
-fallback split for runs that grow too long. An illustrative run over six transcript
-sentences: consecutive similarities of 0.81, 0.78, 0.34, 0.80, 0.76. The drop to 0.34 between sentences
-3 and 4 is far below the others, so a percentile rule (break on the largest few percent of distances,
-where distance = 1 − similarity) places one boundary there and yields two chunks of three sentences.
-The rule is relative on purpose: absolute cosine levels differ by embedding model, so a fixed
-threshold such as 0.5 that works under one model splits everywhere or nowhere under another. Because
-boundaries follow topic shifts rather than formatting, the result is topically coherent chunks even in unstructured prose such as meeting
-transcripts or long narrative. The costs are real: one embedding call per sentence before you have
-even embedded the chunks, a threshold that must be tuned per corpus, highly variable chunk sizes, and
-little gain over recursive splitting on text that already has paragraphs and headings.
+1. Split the text into sentences and embed each one.
+2. Compute cosine similarity between consecutive sentences (or each sentence and a small window of
+   neighbours).
+3. Mark a breakpoint where similarity drops below a threshold: absolute, a percentile of all drops, or a
+   number of standard deviations below the mean.
+4. Sentences between breakpoints form a chunk, with a size cap and a fallback split for long runs.
+
+- **Illustrative run, six transcript sentences:** consecutive similarities 0.81, 0.78, 0.34, 0.80, 0.76.
+  The drop to 0.34 between sentences 3 and 4 stands out, so a percentile rule (break on the largest few
+  percent of distances, distance = 1 − similarity) yields two chunks of three sentences.
+- **The rule is relative on purpose.** Absolute cosine levels differ by embedding model, so a fixed
+  threshold such as 0.5 that works under one model splits everywhere or nowhere under another.
+- **Payoff:** boundaries follow topic shifts rather than formatting, so meeting transcripts and long
+  narrative get coherent chunks.
+- **Costs:** one embedding call per sentence before you embed the chunks, a per-corpus threshold, highly
+  variable chunk sizes, and little gain over recursive splitting on text with paragraphs and headings.
 
 ### Choosing the size
-Smaller chunks give sharper matches but less context for the generator; larger chunks give more
-context but blurrier vectors and fewer of them fit in the prompt. Practitioners usually start somewhere
-between a couple of hundred and a thousand tokens (illustrative, not a benchmark) and then measure
-recall@k and answer quality on a golden set across several sizes. Factoid lookups prefer small chunks;
-"summarise the section" prefers large ones. The tension can be decoupled entirely by indexing small
-spans and returning their larger parent, which is the subject of retrieval granularity and
-parent-document retrieval.
+- **Small chunks:** sharper matches, less context for the generator. Factoid lookups prefer them.
+- **Large chunks:** more context, blurrier vectors, fewer fit in the prompt. "Summarise the section"
+  prefers them.
+- **Starting range:** somewhere between a couple of hundred and a thousand tokens (illustrative, not a
+  benchmark), then measure recall@k and answer quality on a golden set across several sizes.
+- **Decouple the tension:** index small spans and return their larger parent (see retrieval granularity
+  and parent-document retrieval).
 
 ### Metadata
-Every chunk should carry its document id, position index, section or heading path, and source
-location (page, URL, line range). This is what makes deduplication, reassembly, citations, metadata
-filtering and incremental re-indexing possible later.
+Every chunk carries its document id, position index, section or heading path, and source location (page,
+URL, line range). That makes deduplication, reassembly, citations, metadata filtering and incremental
+re-indexing possible later.
 
-## Example
-A minimal recursive splitter. It measures in characters to stay short; in production, replace `len`
-with a token count from the embedding model's tokenizer. Note how an oversized paragraph falls through
-to the next separator while small pieces are merged up to the limit.
+## Diagram
+Read it as the choice of strategy per document, then the recursive fallback loop that guarantees every
+piece fits the token limit before metadata is attached.
+
+```mermaid
+flowchart TD
+    D["Parsed document"] --> Q{"Has usable structure?"}
+    Q -->|"headings, paragraphs, code"| R["Recursive: split on coarsest separator"]
+    Q -->|"unstructured prose, transcripts"| S["Semantic: embed sentences, break at similarity drops"]
+    Q -->|"no structure, OCR or logs"| F["Fixed-size: cut every N tokens"]
+    R --> C{"Piece over token limit?"}
+    C -->|"yes"| N["Split again with next finer separator"]
+    N --> C
+    C -->|"no"| G["Greedy merge small pieces up to limit"]
+    S --> CAP["Apply size cap and fallback split"]
+    G --> M["Attach doc id, position, heading path, source"]
+    CAP --> M
+    F --> M
+    M --> E[("Embed and index")]
+```
+
+## Examples
+### A minimal recursive splitter
+It measures in characters to stay short; in production, replace `len` with a token count from the
+embedding model's tokenizer. An oversized paragraph falls through to the next separator, while small
+pieces are merged up to the limit.
 
 ```python
 SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
@@ -141,43 +172,95 @@ for c in recursive_split(doc, max_len=200):
 # splitters copy the heading path into every chunk instead of treating it as ordinary text.
 ```
 
+### Semantic breakpoints by percentile
+The illustrative run above, in pure Python. Real use would compute `sims` from sentence embeddings.
+
+```python
+def breakpoints(sims, pct=95):
+    dists = [1 - s for s in sims]                 # distance between sentence i and i+1
+    ranked = sorted(dists)
+    cut = ranked[min(len(ranked) - 1, int(len(ranked) * pct / 100))]
+    return [i + 1 for i, d in enumerate(dists) if d >= cut]   # boundary before sentence i+1
+
+def group(sentences, cuts):
+    out, start = [], 0
+    for c in cuts + [len(sentences)]:
+        out.append(sentences[start:c]); start = c
+    return out
+
+sims = [0.81, 0.78, 0.34, 0.80, 0.76]             # consecutive similarities, 6 sentences
+cuts = breakpoints(sims)
+print([round(1 - s, 2) for s in sims], cuts)       # [0.19, 0.22, 0.66, 0.2, 0.24] [3]
+print([len(g) for g in group([f"s{i}" for i in range(1, 7)], cuts)])   # [3, 3]
+```
+
+Because the cut is a percentile of this document's own distances, swapping the embedding model shifts
+every similarity but still places the boundary at the largest drop.
+
+### Worked scenario: the wrong-subsystem answers
+| Symptom | Cause | Fix |
+|---|---|---|
+| Chunk reads "set this to 30 seconds" | fixed-size cut split heading from body | recursive split on headings |
+| Retrieval looks right, answer names wrong component | vector has no subject words | prepend heading path to chunk text |
+| 12-token tail chunks top generic queries | unspecific vectors from near-empty chunks | merge tails into the previous chunk |
+| Table chunk shows headers but no rows | split mid-table | treat tables as atomic, repeat header row |
+
+## Production patterns
+- **Token-counted recursive default** — for most corpora, build the splitter from the embedder's
+  tokenizer, for example LangChain's `RecursiveCharacterTextSplitter.from_tiktoken_encoder(...)` or
+  `from_huggingface_tokenizer(...)`, with `chunk_size` well under the model limit. Monitor the chunk
+  token-count histogram and the count of chunks at the cap.
+- **Per-format splitters** — route by document type: `MarkdownHeaderTextSplitter` for docs (heading path
+  into metadata), `RecursiveCharacterTextSplitter.from_language(Language.PYTHON, ...)` for code, plain
+  recursive for prose. Monitor recall@k per source type, not just overall.
+- **Versioned chunk config** — store splitter name, separators, size and tokenizer in each chunk's
+  metadata (or a config hash), and re-index into a new index when it changes. Monitor that every live
+  chunk carries the current version.
+- **Chunk-size sweep in CI** — re-run a golden question set at two or three sizes whenever parsing or
+  chunking changes, and gate the merge on recall@k and answer quality. Monitor regressions per release.
+- **Semantic splitting only where structure is absent** — for transcripts, use a percentile breakpoint
+  (LlamaIndex `SemanticSplitterNodeParser` or LangChain's experimental `SemanticChunker` both offer
+  one) plus a hard size cap. Monitor chunk-size variance and embedding cost per document.
+
 ## Trade-offs
-- Fixed-size gives predictability and zero tuning, but it breaks sentences, tables and code; the
-  moment the corpus has real structure, recursive splitting wins at the same cost.
-- Recursive splitting respects structure cheaply, yet it assumes the separators mean something; on OCR
-  text or transcripts with no paragraph breaks it degenerates into fixed-size splitting.
-- Semantic chunking produces coherent chunks from unstructured prose, at the price of embedding every
-  sentence and tuning a corpus-specific threshold; on already-structured text the gain rarely pays.
-- Small chunks sharpen matching but starve the generator of context; the trade disappears once you
-  index small spans and return their parent section instead.
-- Prepending the heading path to each chunk improves matching and disambiguation, but spends tokens
-  on every chunk and can over-weight the heading words for very short chunks.
+- **Fixed-size predictability vs broken structure.** Zero tuning, but it breaks sentences, tables and
+  code; once the corpus has real structure, recursive splitting wins at the same cost.
+- **Recursive cheapness vs reliance on separators.** It respects structure cheaply, yet assumes the
+  separators mean something; on OCR text or transcripts with no paragraph breaks it degenerates into
+  fixed-size splitting.
+- **Semantic coherence vs cost.** Coherent chunks from unstructured prose, at the price of embedding
+  every sentence and tuning a corpus-specific threshold; on already-structured text the gain rarely pays.
+- **Small chunks vs generator context.** Small chunks sharpen matching but starve the generator; the
+  trade disappears once you index small spans and return their parent section.
+- **Heading path in text vs token spend.** Prepending it improves matching and disambiguation, but costs
+  tokens on every chunk and can over-weight heading words for very short chunks.
 
 ## Pitfalls
-- Counting characters instead of tokens, so chunks exceed the embedder's limit and are truncated
-  silently; the symptom is that queries about the tail of long chunks never retrieve anything.
-- Splitting tables or code mid-structure; the symptom is retrieved chunks showing column headers with
-  no rows, or a function body with no signature, and the model guessing the rest.
-- Dropping heading context, so a chunk reads "set this to 30 seconds" with no subject; the symptom is
-  plausible-looking retrievals that lead the model to answer for the wrong component.
-- Tuning chunk size by intuition rather than against a golden set; the symptom is silent regressions
-  after every "improvement" and an argument nobody can settle.
-- Leaving tiny trailing chunks (a 12-token final paragraph) in the index; the symptom is short,
-  near-empty chunks crowding the top-k for generic queries because their vectors are unspecific.
-- Running semantic chunking with an absolute similarity threshold copied from another setup; the
-  symptom is either one giant chunk per document or one chunk per sentence after an embedding-model swap.
-- Running semantic chunking over short, single-topic documents; the symptom is one chunk per document,
-  and the whole exercise collapses back into whole-document embedding with extra cost.
+- **Counting characters instead of tokens.** Chunks exceed the embedder's limit and are truncated
+  silently; queries about the tail of long chunks never retrieve anything.
+- **Splitting tables or code mid-structure.** Retrieved chunks show column headers with no rows, or a
+  function body with no signature, and the model guesses the rest.
+- **Dropping heading context.** A chunk reads "set this to 30 seconds" with no subject; plausible-looking
+  retrievals lead the model to answer for the wrong component.
+- **Tuning chunk size by intuition.** Without a golden set you get silent regressions after every
+  "improvement" and an argument nobody can settle.
+- **Leaving tiny trailing chunks.** A 12-token final paragraph's unspecific vector crowds the top-k for
+  generic queries; merge or drop it.
+- **Copying an absolute semantic threshold.** After an embedding-model swap you get one giant chunk per
+  document or one chunk per sentence; use a relative rule.
+- **Semantic chunking short, single-topic documents.** You get one chunk per document, and the exercise
+  collapses back into whole-document embedding with extra cost.
 
 ## When to use
-Default to recursive, token-counted, structure-aware splitting with a few hundred tokens per chunk and
-full metadata on every chunk; it is cheap and handles most corpora. Reach for semantic chunking only
-when the corpus is unstructured prose and evaluation shows boundary problems, because its sentence
-embedding cost and threshold tuning are only worth paying when structure is absent. Use fixed-size as
-the fallback for structureless text or as the inner step of a recursive chain. Measure, do not guess:
-hold chunking constant while you tune anything else, and compare strategies on recall@k and end-task
-answer quality. In interviews, be ready to explain dilution, why recursive splitting is the sensible
-default, and how parent-document retrieval decouples match size from context size.
+- **Default:** recursive, token-counted, structure-aware splitting with a few hundred tokens per chunk
+  and full metadata on every chunk; it is cheap and handles most corpora.
+- **Semantic chunking:** only for unstructured prose where evaluation shows boundary problems, because
+  its sentence-embedding cost and threshold tuning only pay when structure is absent.
+- **Fixed-size:** the fallback for structureless text, or the inner step of a recursive chain.
+- **Measure, do not guess:** hold chunking constant while you tune anything else, and compare strategies
+  on recall@k and end-task answer quality.
+- **Interviews:** explain dilution, why recursive splitting is the sensible default, and how
+  parent-document retrieval decouples match size from context size.
 
 ## Role lens
 - **Engineer:** Picks separators and chunk size per document type, counts tokens with the embedder's
@@ -199,6 +282,46 @@ and store it as metadata, so both the vector and the generator see the subject. 
 smaller spans and returning the parent section, add metadata filtering by subsystem where the question
 makes it explicit, and verify the change with a golden set of questions whose expected section is
 known, measuring recall@k before and after rather than eyeballing results.
+
+## Interview questions
+### Why not just embed each document whole and skip chunking?
+- **Encoders have an input limit.** Past it, text is truncated silently or rejected, so the tail of a long
+  document never reaches the vector and cannot be retrieved.
+- **Pooling dilutes meaning.** One vector for a 30-page contract represents "a contract", so a query about
+  one clause scores middling and loses to a shorter document that merely mentions the topic.
+- **The generator also has a budget.** Returning whole documents is slow, costly and makes the model find
+  the needle itself.
+
+### Walk me through how a recursive character splitter decides where to cut.
+- **Ordered separators, coarse to fine,** such as paragraph break, newline, sentence end, space, then
+  single characters.
+- **Split on the coarsest first;** any piece still over the limit is split with the next separator, so no
+  chunk can exceed the limit.
+- **Greedy merge** packs small neighbouring pieces back up to the limit, so most chunks end on paragraph
+  boundaries and few are tiny.
+
+### When would you choose semantic chunking, and when would you refuse it?
+- **Choose it** for unstructured prose such as meeting transcripts, where there are no headings or
+  paragraph breaks and an eval shows boundary failures.
+- **Refuse it** on structured docs or short single-topic documents, because recursive splitting is as good
+  for less cost, and short documents collapse to one chunk anyway.
+- **If used,** break on a relative rule (a percentile of distances) with a hard size cap, because absolute
+  cosine levels change with the embedding model.
+
+### Retrieval quality dropped after someone changed chunk size from 500 to 1,000 tokens. How do you debug it?
+- **Confirm with the golden set:** compare recall@k and answer quality at both sizes on the same questions,
+  holding the embedder and retriever constant.
+- **Inspect misses:** larger chunks blur vectors, so factoid queries now match broader sections that rank
+  below shorter, more specific ones.
+- **Fix options:** revert, route by query type, or index small spans and return the parent section so match
+  size and context size are decoupled.
+
+### How do you make chunking safe to change in a production index?
+- **Version the config:** store splitter, separators, size and tokenizer (or a config hash) on every chunk.
+- **Re-index into a new index** when the config changes, then switch over, instead of mixing two chunkings
+  in one index.
+- **Gate the change in CI** on a golden-set recall@k run and watch the chunk token-count histogram after
+  rollout.
 
 ## Quiz
 ### Q: Why are documents chunked before embedding rather than embedded whole?

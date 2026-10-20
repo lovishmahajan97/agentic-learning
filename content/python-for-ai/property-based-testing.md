@@ -5,7 +5,7 @@ name: Property-based testing (Hypothesis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/pytest
   - python-for-ai/pydantic
@@ -20,93 +20,110 @@ sources:
 ---
 
 ## TL;DR
-Instead of writing example inputs by hand, you state a property that must hold for every input
-("chunks never exceed the size limit and rejoin to the original text"), and Hypothesis generates
-hundreds of inputs, including the nasty edge cases you would not think of, then shrinks any failure to
-a minimal counterexample. It exists because the bugs in parsing, chunking and serialisation code hide in
-inputs nobody writes examples for: empty strings, Unicode, boundaries.
+You state a property that must hold for every input; Hypothesis generates hundreds of inputs, biased
+toward edge cases, and shrinks any failure to a minimal counterexample. Parsing, chunking and
+serialisation bugs hide exactly there.
 
 ## Why it exists
-Example-based tests check the cases their author imagined. The author of a text chunker writes tests
-for "a paragraph", "exactly one chunk long" and "three chunks", and the chunker passes. Then
-production hits an empty document, a string of combining characters, a chunk size of 1, or an overlap
-equal to the chunk size minus one, and it crashes or silently drops text. The bug was always there; the
-example set simply never visited that part of the input space.
-
-AI glue code is dense with exactly this kind of function: tokenisation-adjacent splitting, prompt
-templating that must escape user text, parsers for model output, JSON round-trips for tool arguments,
-deduplication, score normalisation, pagination over retrieval results. Their input spaces are huge and
-their correctness conditions are easy to state but hard to enumerate.
-
-The naive alternative, "generate random inputs in a loop", finds some bugs but has two problems.
-Uniform random data rarely hits the boundaries that matter (an empty list, zero, the maximum value, a
-lone surrogate), and when it does find a failure the input is a 1,400-character random string from
-which you must reverse-engineer the bug by hand. Property-based testing fixes both: generators are
-biased toward edge cases, and failures are automatically shrunk to the smallest input that still fails.
+- **Examples test only what the author imagined.** A chunker passes "a paragraph", "exactly one chunk
+  long" and "three chunks", then production hits an empty document, combining characters, a chunk size
+  of 1, or an overlap of chunk size minus one, and it crashes or silently drops text.
+- **The bug was always there.** The example set simply never visited that part of the input space.
+- **AI glue code is full of such functions.** Tokenisation-adjacent splitting, prompt templating that
+  escapes user text, model-output parsers, JSON round-trips for tool arguments, deduplication, score
+  normalisation, pagination over retrieval results: huge input spaces, rules easy to state, hard to
+  enumerate.
+- **"Random inputs in a loop" falls short twice.** Uniform random data rarely hits the boundaries that
+  matter (an empty list, zero, the maximum value, a lone surrogate), and a failure arrives as a
+  1,400-character random string you must reverse-engineer by hand.
+- **Property-based testing fixes both:** generators are biased toward edge cases, and failures are shrunk
+  automatically to the smallest input that still fails.
 
 ## How it works
 ### Properties, not examples
-A property is a universally quantified claim about your code: for all valid inputs *x*, some predicate
-holds. Common shapes, roughly in order of how often they pay off:
-- **Round-trip:** `decode(encode(x)) == x` (JSON, serialisers, tokenizer encode/decode where lossless).
-- **Invariant:** the output always satisfies a condition (every chunk length ≤ size; scores in [0, 1];
-  output sorted; no duplicate IDs).
-- **Idempotence:** `f(f(x)) == f(x)` (normalisation, deduplication, cleaning).
-- **Oracle / differential:** a fast implementation agrees with a slow obviously-correct one, or the new
-  version agrees with the old one.
-- **Metamorphic:** a known change to the input produces a known change to the output (reordering
-  documents does not change the set retrieved).
+A property is a universally quantified claim: for all valid inputs *x*, some predicate holds. Common
+shapes, roughly in order of how often they pay off:
+
+| Shape | Claim | AI-code example |
+|---|---|---|
+| **Round-trip** | `decode(encode(x)) == x` | JSON, serialisers, tokenizer encode/decode where lossless |
+| **Invariant** | output always satisfies a condition | every chunk length ≤ size; scores in [0, 1]; output sorted; no duplicate IDs |
+| **Idempotence** | `f(f(x)) == f(x)` | normalisation, deduplication, cleaning |
+| **Oracle / differential** | fast version agrees with a slow obviously-correct one, or new agrees with old | rewritten ranker vs reference |
+| **Metamorphic** | a known input change gives a known output change | reordering documents does not change the set retrieved |
 
 ### Strategies
-A strategy describes how to generate values: `st.integers(0, 100)`, `st.text()`, `st.lists(...)`,
-`st.dictionaries(...)`, combined with `.map`, `.filter`, `st.one_of`, `st.recursive` and `st.builds` (call
-a constructor with generated arguments). `st.from_type` derives a strategy from type hints, which works
-with dataclasses and many annotated classes. `st.data()` lets a test draw values interactively, so one
-parameter can depend on another (an overlap smaller than the chunk size). Strategies deliberately
-over-sample edge cases: empty collections, boundary integers, unusual Unicode.
+- **Primitives:** `st.integers(0, 100)`, `st.text()`, `st.lists(...)`, `st.dictionaries(...)`.
+- **Combinators:** `.map`, `.filter`, `st.one_of`, `st.recursive` and `st.builds` (call a constructor
+  with generated arguments).
+- **`st.from_type`** derives a strategy from type hints; works with dataclasses and many annotated classes.
+- **`st.data()`** draws values interactively, so one parameter can depend on another (an overlap smaller
+  than the chunk size).
+- **Edge cases are over-sampled on purpose:** empty collections, boundary integers, unusual Unicode.
 
 ### Running, shrinking and remembering
-`@given(...)` turns a test into a loop. By default Hypothesis runs about 100 examples per test (tunable
-with `@settings(max_examples=...)`) and flags examples that run too long via a deadline setting. When an
-example fails, Hypothesis shrinks it: it repeatedly tries simpler versions of the input and keeps any
-that still fail. Unlike classic QuickCheck, which shrinks values by type-specific rules, Hypothesis
-shrinks the underlying sequence of random choices that produced the value. That is a design choice with
-a real payoff: shrinking works automatically for any composed strategy, including ones with `.map` and
-`.filter`, without you writing a shrinker.
+1. **`@given(...)` turns a test into a loop.** By default about 100 examples per test (tunable with
+   `@settings(max_examples=...)`); a deadline setting flags examples that run too long.
+2. **On failure, Hypothesis shrinks:** it repeatedly tries simpler inputs and keeps any that still fail.
+3. **It shrinks choices, not values.** Classic QuickCheck shrinks values by type-specific rules;
+   Hypothesis shrinks the underlying sequence of random choices that produced the value. The payoff:
+   shrinking works for any composed strategy, including `.map` and `.filter`, with no shrinker to write.
+4. **Failures are remembered.** They are saved in a local database (the `.hypothesis/` directory) and
+   replayed first next run, so a found bug is checked every time until fixed.
+5. **`@example(...)` pins an input permanently**, turning a counterexample into a documented regression.
 
-Failing examples are saved in a local database (the `.hypothesis/` directory) and replayed first on the
-next run, so a bug, once found, is checked every time until fixed. `@example(...)` pins a specific input
-permanently, which is how you turn a found counterexample into a documented regression case.
-`assume(cond)` discards inputs that do not meet a precondition; use it sparingly, because heavy
-filtering makes generation slow and Hypothesis will report a health-check failure. The cheaper fix is
-almost always to construct valid inputs directly (draw `size` first, then `overlap` below it) rather
-than generate freely and throw most away.
+- **`assume(cond)`** discards inputs that miss a precondition. Use it sparingly, because heavy filtering
+  makes generation slow and Hypothesis reports a health-check failure.
+- **Construct valid inputs instead** (draw `size` first, then `overlap` below it) rather than generating
+  freely and throwing most away; it is almost always cheaper.
 
 ### Profiles: different budgets for different lanes
-The example count is a dial between thoroughness and suite time, so set it per environment rather
-than per test. `settings.register_profile("ci", max_examples=1000)` and
-`settings.register_profile("dev", max_examples=50)` in `conftest.py`, then select one with
-`--hypothesis-profile=ci` or `settings.load_profile(...)` from an environment variable. A CI profile
-can also set `derandomize=True`, which makes the generated examples a fixed function of the test, so
-a red build is reproducible and never caused by an unlucky draw; the price is that CI explores the
-same inputs every run, which is why some teams keep a randomised nightly job alongside it.
+The example count is a dial between thoroughness and suite time, so set it per environment, not per test.
+- **Register** `settings.register_profile("ci", max_examples=1000)` and
+  `settings.register_profile("dev", max_examples=50)` in `conftest.py`.
+- **Select** with `--hypothesis-profile=ci` or `settings.load_profile(...)` from an environment variable.
+- **`derandomize=True` in CI** makes examples a fixed function of the test, so a red build is reproducible
+  and never an unlucky draw. The price: CI explores the same inputs every run, which is why some teams
+  keep a randomised nightly job alongside it.
 
 ### Stateful testing
-For objects with operations (a cache, a conversation memory, a rate limiter), the bug is often in a
-*sequence* of calls rather than in any single input. `RuleBasedStateMachine` lets you declare each
-operation as a `@rule` with its own argument strategies and each invariant as an `@invariant`.
-Hypothesis then generates random programs (put, put, evict, get, ...), runs each against the real
-object and a deliberately trivial model (a plain `dict` standing in for an LRU cache), and checks
-after every step that the two agree. When they diverge, it shrinks the *program*, so a 40-step
-failure is typically reported as the three or four calls that actually matter, such as "insert at
-capacity, read the oldest key, insert again".
+- **The bug is often in a *sequence* of calls** for objects with operations (a cache, a conversation
+  memory, a rate limiter), not in any single input.
+- **`RuleBasedStateMachine`:** declare each operation as a `@rule` with argument strategies and each
+  invariant as an `@invariant`.
+- **Random programs vs a model.** Hypothesis generates programs (put, put, evict, get, ...), runs each
+  against the real object and a deliberately trivial model (a plain `dict` standing in for an LRU cache),
+  and checks after every step that they agree.
+- **It shrinks the *program*.** A 40-step failure is typically reported as the three or four calls that
+  matter, such as "insert at capacity, read the oldest key, insert again".
 
-## Example
-A chunker for retrieval with overlap. A few properties pin down its contract: no chunk exceeds `size`,
-only the last chunk may be short, consecutive chunks really share `overlap` characters, and dropping
-each later chunk's overlap rejoins the original text exactly. An earlier version used
-`range(0, len(text), step)`; Hypothesis failed it immediately and shrank the counterexample to
-`text=''`, where that version returned no chunks at all.
+## Diagram
+The loop behind one `@given` test: replay saved failures first, generate edge-biased inputs, and on a
+failure shrink the choice sequence until the smallest failing input remains.
+
+```mermaid
+flowchart TD
+    S["@given test starts"] --> DB[(".hypothesis/ example database")]
+    DB -->|"replay saved failures first"| G["Generate input from strategies, edge cases over-sampled"]
+    G --> R["Run the property"]
+    R -->|"passes"| N{"Reached max_examples?"}
+    N -->|"no"| G
+    N -->|"yes"| P["Test passes"]
+    R -->|"fails"| SH["Shrink: try simpler choice sequences"]
+    SH -->|"still fails, keep it"| SH
+    SH -->|"no simpler failure found"| M["Report minimal counterexample"]
+    M -->|"save for next run"| DB
+    M --> E["Pin it with @example or a named regression test"]
+```
+
+## Examples
+### Chunker and tool-argument round-trip
+A retrieval chunker with overlap. The contract: no chunk exceeds `size`, only the last may be short,
+consecutive chunks really share `overlap` characters, and dropping each later chunk's overlap rejoins
+the text exactly.
+
+An earlier version used `range(0, len(text), step)`; Hypothesis failed it at once and shrank the
+counterexample to `text=''`, where that version returned no chunks at all.
 
 ```python
 import json
@@ -141,47 +158,137 @@ def test_empty_text_regression():          # the shrunk counterexample, pinned a
     assert chunk("", size=4, overlap=1) == [""]
 ```
 
-The chunker test encodes the specification in five assertions. The full-length and shared-overlap
-checks matter: without them a chunker that emitted one character per chunk would still rejoin
-correctly and pass whenever `overlap` is 0. No hand-written example set would have covered size 1,
-overlap `size - 1`, empty text and non-ASCII text all at once. The round-trip test excludes floats on
-purpose, because `NaN` breaks equality, which is itself the kind of fact property tests force you to
-decide explicitly.
+- **Five assertions encode the spec.** The full-length and shared-overlap checks matter: without them a
+  chunker emitting one character per chunk would still rejoin correctly and pass whenever `overlap` is 0.
+- **Coverage no example set gives:** size 1, overlap `size - 1`, empty text and non-ASCII text, all at once.
+- **Floats excluded on purpose** from the round-trip, because `NaN` breaks equality; property tests force
+  you to decide such facts explicitly.
+
+### Stateful: an LRU cache against a dict-and-list model
+Runnable with `pip install hypothesis pytest`; pytest collects `TestLRU`.
+
+```python
+from collections import OrderedDict
+from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
+
+class LRU:                                         # the code under test
+    def __init__(self, capacity: int):
+        self.capacity, self.data = capacity, OrderedDict()
+    def get(self, k):
+        if k not in self.data:
+            return None
+        self.data.move_to_end(k)                   # delete this line to see the bug found
+        return self.data[k]
+    def put(self, k, v):
+        self.data[k] = v
+        self.data.move_to_end(k)
+        if len(self.data) > self.capacity:
+            self.data.popitem(last=False)          # evict least recently used
+
+class LRUMachine(RuleBasedStateMachine):
+    def __init__(self):
+        super().__init__()
+        self.cache, self.model, self.recency = LRU(3), {}, []   # model: dict + list
+
+    def _touch(self, k):
+        if k in self.recency:
+            self.recency.remove(k)
+        self.recency.append(k)
+
+    @rule(k=st.integers(0, 5), v=st.integers())
+    def put(self, k, v):
+        self.cache.put(k, v)
+        self.model[k] = v
+        self._touch(k)
+        if len(self.recency) > 3:
+            del self.model[self.recency.pop(0)]
+
+    @rule(k=st.integers(0, 5))
+    def get(self, k):
+        assert self.cache.get(k) == self.model.get(k)
+        if k in self.model:
+            self._touch(k)
+
+    @invariant()
+    def within_capacity(self):
+        assert len(self.cache.data) <= 3
+
+TestLRU = LRUMachine.TestCase
+```
+
+With the marked line deleted, one run reported this shrunk program (exact keys vary run to run):
+
+| Step | Call | Why it matters |
+|---|---|---|
+| 1-3 | `put(1)`, `put(0)`, `put(3)` | fill capacity 3 |
+| 4 | `get(1)` | 1 should become most recent |
+| 5 | `put(2)` | evicts; the buggy cache drops 1, the model drops 0 |
+| 6 | `get(0)` | cache returns a value, model says `None`: assertion fails |
+
+### Worked scenario: example budgets per lane
+Rough orders of magnitude for a suite of 40 property tests at ~2 ms per example (illustrative).
+
+| Profile | `max_examples` | Per test | Whole suite |
+|---|---|---|---|
+| `dev` | 50 | ~0.1 s | ~4 s |
+| default | 100 | ~0.2 s | ~8 s |
+| `ci` (+ `derandomize=True`) | 1000 | ~2 s | ~80 s |
+| nightly, randomised | 10,000 | ~20 s | ~13 min |
+
+## Production patterns
+- **Profiles selected by environment.** In `conftest.py`, register `dev`, `ci` and `nightly` profiles and
+  call `settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "dev"))`. PRs run the deterministic `ci`
+  profile; a nightly job runs a large randomised budget. Monitor property-lane wall time per profile.
+- **Pin every shrunk counterexample.** Add it as `@example(...)` on the property and, for important bugs,
+  as a plain named regression test like `test_empty_text_regression`. The bug then stays covered even if
+  the `.hypothesis/` database is wiped.
+- **Persist the example database in CI.** Cache the `.hypothesis/` directory between CI runs with your
+  CI system's cache step, so failures found on one run are replayed first on the next.
+- **Reproduce from CI output.** Enable the `print_blob=True` setting in the CI profile; a failure then
+  prints an `@reproduce_failure(...)` line you paste locally to replay the exact case.
+- **Tune deadlines, not tolerance for slowness.** For legitimately slow properties set
+  `@settings(deadline=None)` or a larger `timedelta`, rather than leaving deadline flakes in the suite.
+  Track which tests carry such overrides.
+- **Stateful tests for anything with memory.** Caches, conversation memories and rate limiters get a
+  `RuleBasedStateMachine` against a plain dict or list model. Re-run it whenever eviction or expiry logic
+  changes.
 
 ## Trade-offs
-- Properties cover far more of the input space than examples, but are harder to write; for code whose
-  correctness you cannot state as a rule, a handful of good examples remains the better investment.
-- More examples find rarer bugs, but slow the suite; run the default count locally and a larger count
-  in a nightly or CI profile, and flip that balance once the suite becomes a bottleneck.
-- Generated inputs explore edge cases you did not imagine, but random exploration means a new failure
-  can surface on an unrelated commit; the example database and pinned `@example`s keep that manageable.
-- Restating the implementation as the property is easy but proves nothing; an independent oracle or
-  invariant costs more thought and is the only version that actually catches bugs.
+- **Coverage vs effort.** Properties cover far more of the input space but are harder to write; for code
+  whose correctness you cannot state as a rule, a handful of good examples is the better investment.
+- **More examples vs suite time.** Larger counts find rarer bugs but slow the suite; run the default
+  count locally and a larger count in a nightly or CI profile, and flip that once the suite is a bottleneck.
+- **Exploration vs surprise failures.** Generated inputs explore edge cases you did not imagine, but a new
+  failure can surface on an unrelated commit; the example database and pinned `@example`s keep that
+  manageable.
+- **Easy property vs real property.** Restating the implementation as the property is easy but proves
+  nothing; an independent oracle or invariant costs more thought and is the only version that catches bugs.
 
 ## Pitfalls
-- Writing a property that re-implements the function under test; the symptom is a test that has never
-  failed, even when you deliberately break the code.
-- Overusing `filter` or `assume` to carve out valid inputs; the symptom is slow tests and Hypothesis
-  health-check errors about too much data being filtered out.
-- Generating floats for equality-based properties without thinking about NaN, infinities and rounding;
-  the symptom is spurious failures on `nan != nan` or tiny representation differences.
-- Using a function-scoped pytest fixture (such as `tmp_path`) inside a `@given` test and expecting it
-  fresh per example; it is created once per *test function* and shared by all generated examples, so
-  state written by one example leaks into the next. Hypothesis raises a health-check error for this;
-  create the resource inside the test body instead.
-- Calling a real LLM or network service inside `@given`; the symptom is a test that makes a hundred
-  paid, slow, non-deterministic calls per run and fails on flaky responses, not on bugs.
-- Deleting the `.hypothesis/` database in CI without pinning found failures; the symptom is a bug that
-  reproduced once and then mysteriously stops reproducing until it hits production.
+- **Re-implementing the function as the property.** Symptom: a test that has never failed, even when you
+  deliberately break the code.
+- **Overusing `filter` or `assume`.** Symptom: slow tests and health-check errors about too much data
+  being filtered out. Fix: construct valid inputs directly.
+- **Floats in equality properties.** NaN, infinities and rounding cause spurious failures on
+  `nan != nan` or tiny representation differences. Exclude them or compare with tolerance.
+- **Function-scoped fixtures inside `@given`.** `tmp_path` and friends are created once per *test
+  function* and shared by all examples, so one example's state leaks into the next. Hypothesis raises a
+  health-check error; create the resource inside the test body instead.
+- **Real LLM or network calls inside `@given`.** Symptom: a hundred paid, slow, non-deterministic calls
+  per run, failing on flaky responses rather than bugs.
+- **Deleting `.hypothesis/` in CI without pinning failures.** Symptom: a bug that reproduced once, then
+  mysteriously stops reproducing until it hits production.
 
 ## When to use
-Reach for property-based testing on deterministic code with a large input space and an easy-to-state
-rule: parsers for model output, chunkers and splitters, serialisers, prompt template escaping, ID and
-deduplication logic, ranking and score normalisation, and anything stateful like caches and memories.
-It is not the tool for judging model quality; the model's outputs are not deterministic and their
-"correctness" is a graded judgement, which is what evals and metamorphic evaluation address. Use it
-alongside a few readable examples, which serve as documentation. In interviews, being able to name the
-property for a given function (round-trip, invariant, idempotence, oracle) is the skill being tested.
+- **Use when:** deterministic code has a large input space and an easy-to-state rule: model-output
+  parsers, chunkers and splitters, serialisers, prompt template escaping, ID and deduplication logic,
+  ranking and score normalisation, and stateful things like caches and memories.
+- **Avoid when:** judging model quality. Outputs are not deterministic and "correctness" is a graded
+  judgement, which evals and metamorphic evaluation address.
+- **Pair with:** a few readable examples, which serve as documentation.
+- **Interviews:** naming the property for a given function (round-trip, invariant, idempotence, oracle)
+  is the skill being tested.
 
 ## Role lens
 - **Engineer:** Writes Hypothesis properties for parsers, chunkers and tool-argument serialisation, and
@@ -201,6 +308,44 @@ returning garbage. A third: extraction is unchanged by leading and trailing whit
 prose should be filtered so it cannot itself contain braces, or the property must define which object
 wins. I would not use Hypothesis to decide whether the model produces good JSON in the first place;
 that is an eval over real prompts, and replies would be recorded examples, not generated ones.
+
+## Interview questions
+### What does property-based testing find that example-based tests miss?
+- **Definition:** you state a rule that must hold for all valid inputs and Hypothesis generates the
+  inputs, about 100 per test by default, biased toward empty collections, boundary integers and unusual
+  Unicode.
+- **Why it finds more:** examples cover only what the author imagined, while generators visit the corners
+  (chunk size 1, overlap of size minus one, empty text) where parsing and chunking bugs live.
+- **Shrinking makes failures readable**, reporting `text=''` instead of a 1,400-character random string.
+
+### Which properties would you write for a retrieval chunker with overlap?
+- **Invariants:** at least one chunk, no chunk longer than `size`, only the last chunk short.
+- **Overlap really shared:** the tail of each chunk equals the head of the next for `overlap` characters.
+- **Round-trip:** dropping each later chunk's overlap rejoins the original text exactly.
+- **Generate valid inputs directly:** draw `size` first, then `overlap` below it with `st.data()`, rather
+  than generating freely and filtering with `assume`.
+
+### A property test fails in CI but you cannot reproduce it locally. What do you do?
+- **Make CI deterministic:** use a `ci` profile with `derandomize=True`, so a red build is a fixed
+  function of the test, not an unlucky draw.
+- **Get the exact case:** with `print_blob=True` the failure prints a `@reproduce_failure(...)` line you
+  paste locally.
+- **Keep it covered:** pin the shrunk input with `@example(...)` and cache `.hypothesis/` between CI runs.
+
+### When is property-based testing the wrong tool?
+- **When you cannot state the rule:** for code whose correctness is not expressible as an invariant, a few
+  good examples are the better investment.
+- **When judging model quality:** outputs are non-deterministic and correctness is graded, which is the
+  job of evals, not Hypothesis.
+- **When the property restates the implementation:** it never fails, even when you break the code, so it
+  proves nothing.
+
+### How would you budget example counts for a suite of 40 property tests?
+- **Per lane, not per test:** register `dev` (50 examples), `ci` (1000, derandomized) and a randomised
+  nightly profile, and select with `--hypothesis-profile` or an environment variable.
+- **Rough arithmetic at ~2 ms per example (illustrative):** about 4 s for the suite in dev, about 80 s in
+  CI and about 13 minutes nightly at 10,000 examples.
+- **Monitor property-lane wall time** and raise or lower budgets when the PR lane becomes a bottleneck.
 
 ## Quiz
 ### Q: What does Hypothesis shrinking do after a property fails?

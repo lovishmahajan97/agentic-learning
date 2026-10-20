@@ -5,7 +5,7 @@ name: Async cancellation & exception propagation
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-await
@@ -21,95 +21,119 @@ sources:
 ---
 
 ## TL;DR
-Cancelling an asyncio task does not kill it: it schedules a `CancelledError` to be raised at the
-task's next `await`, so the task can run its `finally` blocks and release connections. Errors in
-concurrent children must also travel somewhere. `TaskGroup` and `asyncio.timeout` build on this one
-mechanism, which is why swallowing `CancelledError` silently breaks deadlines, sibling cleanup and
-shutdown.
+Cancelling an asyncio task schedules a `CancelledError` at its next `await`, so `finally` blocks can
+release connections. `TaskGroup` and `asyncio.timeout` build on this one mechanism, so swallowing
+`CancelledError` silently breaks deadlines, sibling cleanup and shutdown.
 
 ## Why it exists
-An agent turn fans out: three tool calls and a retrieval query run concurrently, and the user then
-closes the browser tab, or the 30-second deadline passes, or one tool returns a fatal error that
-makes the others pointless. In every case the remaining work must stop, and stopping it badly has
-real costs: an LLM stream that keeps generating (and, depending on the provider, keeps billing), a
-connection that never goes back to the pool, a half-written row in a checkpoint store.
+- **Concurrent work must stop cleanly.** An agent turn runs three tool calls and a retrieval query; then
+  the user closes the tab, the 30-second deadline passes, or one tool returns a fatal error that makes the
+  others pointless.
+- **Stopping badly is expensive.** An LLM stream keeps generating (and, depending on the provider, keeps
+  billing), a connection never returns to the pool, a checkpoint store gets a half-written row.
+- **Killing from outside is unsafe.** Interrupting a thread or coroutine at an arbitrary instruction
+  leaves locks held and sockets half-written, which is why Python offers no safe way to kill a thread.
+- **A `stop` flag only works if every piece of code checks it**, and library code you call never will.
+- **Ignored background errors are worse.** A task that raised but was never awaited loses its exception
+  until garbage collection logs "Task exception was never retrieved", long after the request returned a
+  wrong answer.
 
-The naive alternatives fail. Killing a thread or coroutine from outside at an arbitrary instruction
-would leave locks held and sockets half-written, which is why Python offers no safe way to kill a
-thread. Polling a `stop` flag only works if every piece of code checks it, and library code you call
-never will. Ignoring errors in background tasks is worse: a task that raised but was never awaited
-loses its exception until garbage collection logs "Task exception was never retrieved", long after
-the request returned a wrong answer.
-
-asyncio's answer is cooperative cancellation delivered as an exception. Because a coroutine can only
-be suspended at an `await`, that is the only place it can be interrupted, so cancellation arrives at a
-known point and travels up the stack through ordinary `try/finally` and `async with` cleanup. Error
-propagation then needs rules for what happens to siblings when one child fails, which is what
-structured concurrency (`TaskGroup`) supplies.
+**asyncio's answer:** cooperative cancellation delivered as an exception. A coroutine can only be
+suspended at an `await`, so that is the only place it can be interrupted; cancellation arrives at a known
+point and travels up the stack through ordinary `try/finally` and `async with` cleanup. Structured
+concurrency (`TaskGroup`) then supplies rules for siblings when one child fails.
 
 ## How it works
 ### Cancellation is a request, delivered at an await
-Step by step, `task.cancel()` does three things:
-1. If the task is suspended on a future, it cancels *that* future. If the task was awaiting another
-   task (`await other_task`), the inner task is cancelled too, so the request travels **down** the
-   await chain to whatever is actually waiting on I/O.
-2. Cancelling the future wakes the task on the next loop iteration, exactly as a result would.
-3. When the task resumes, it throws `CancelledError` into the coroutine at the suspended `await`, and
-   the exception then travels **up** the call stack.
+`task.cancel()` does three things:
+1. **Cancel what it waits on.** If the task is suspended on a future, it cancels *that* future. If it
+   was awaiting another task (`await other_task`), the inner task is cancelled too, so the request
+   travels **down** the await chain to whatever is actually waiting on I/O.
+2. **Wake the task.** Cancelling the future wakes the task on the next loop iteration, exactly as a
+   result would.
+3. **Throw.** On resume, `CancelledError` is thrown into the coroutine at the suspended `await`, and
+   travels **up** the call stack.
 
-If the task is running or ready rather than suspended, only a flag is set, and the throw happens at
-its next suspension point. Code between awaits runs to completion; a CPU loop with no await
-cannot be cancelled at all. The exception unwinds the coroutine like any other: `finally` blocks run,
-`async with` exits run (the `httpx` client closes the stream, the lock is released). Since Python 3.8
-`CancelledError` subclasses `BaseException`, not `Exception`, *because* the common
-`except Exception:` retry or logging block used to catch it by accident and keep the task alive.
+What follows from that:
+- **Running or ready tasks only get a flag;** the throw happens at the next suspension point.
+- **Code between awaits runs to completion;** a CPU loop with no await cannot be cancelled at all.
+- **Unwinding is ordinary:** `finally` blocks run, `async with` exits run (the `httpx` client closes the
+  stream, the lock is released).
+- **`BaseException` since Python 3.8.** `CancelledError` subclasses `BaseException`, not `Exception`,
+  *because* the common `except Exception:` retry or logging block used to catch it by accident and keep
+  the task alive.
 
-The contract: you may catch `CancelledError` to clean up or log, but you must re-raise it. A task
-that swallows it reports as completed, and whoever cancelled it (a timeout, a TaskGroup, the server
-shutting down) believes the cancellation failed or never happened.
+**The contract:** catch `CancelledError` to clean up or log, but always re-raise it. A task that swallows
+it reports as completed, and whoever cancelled it (a timeout, a TaskGroup, server shutdown) believes the
+cancellation failed or never happened.
 
 ### Timeouts are cancellation plus translation
-`asyncio.timeout(delay)` (3.11+) schedules a cancel of the current task at the deadline. When the
-resulting `CancelledError` reaches the `async with` exit, the context manager recognises it as its own
-and converts it into `TimeoutError`. The older `asyncio.wait_for` is built on `asyncio.timeout` since
-3.12; before that it ran the awaitable as a separate inner task and cancelled that task instead, with
-the same cancel-then-translate shape. That is why a swallowed
-cancellation inside a timeout block makes the deadline silently not fire. Python 3.11 added
-`Task.cancelling()` and `Task.uncancel()` so these constructs can tell their own cancellation apart
-from one requested from outside.
+1. `asyncio.timeout(delay)` (3.11+) schedules a cancel of the current task at the deadline.
+2. When that `CancelledError` reaches the `async with` exit, the context manager recognises it as its
+   own and converts it into `TimeoutError`.
+
+- **`asyncio.wait_for`** is built on `asyncio.timeout` since 3.12. Before that it ran the awaitable as a
+  separate inner task and cancelled that task, with the same cancel-then-translate shape.
+- **Hence the bug:** a swallowed cancellation inside a timeout block makes the deadline silently not fire.
+- **Telling cancellations apart.** Python 3.11 added `Task.cancelling()` and `Task.uncancel()` so these
+  constructs can distinguish their own cancellation from one requested from outside.
 
 ### Where a task's exception goes
-An exception raised inside a task is stored on the task, not raised anywhere. It surfaces only when
-someone awaits the task (the exception is re-raised in the awaiter, with its original traceback) or
-calls `task.result()` / `task.exception()`. If nobody ever does, the loop logs "Task exception was
-never retrieved" when the task object is garbage-collected, which may be minutes later or never. So
-every task needs an owner: something that awaits it, a TaskGroup, or a done-callback that logs the
-error. `asyncio.wait` follows the same rule: it never raises the children's exceptions, it hands you
-`done` tasks whose results you must still check.
+- **Stored, not raised.** An exception inside a task is stored on the task.
+- **It surfaces only** when someone awaits the task (re-raised in the awaiter with its original
+  traceback) or calls `task.result()` / `task.exception()`.
+- **Otherwise it is lost for a while.** The loop logs "Task exception was never retrieved" when the task
+  object is garbage-collected, which may be minutes later or never.
+- **So every task needs an owner:** something that awaits it, a TaskGroup, or a done-callback that logs.
+- **`asyncio.wait` follows the same rule:** it never raises children's exceptions; it hands you `done`
+  tasks whose results you must still check.
 
 ### Propagation: gather versus TaskGroup
-`asyncio.gather(*aws)` with the default `return_exceptions=False` propagates the *first* exception
-to the awaiting caller, but does not cancel the other children: they keep running, orphaned. With
-`return_exceptions=True` it returns exceptions as list items, so you must inspect every result.
-Cancelling the gather itself does cancel all children.
+| Construct | When a child fails | Other children | Error you see |
+|---|---|---|---|
+| `asyncio.gather(*aws)`, default `return_exceptions=False` | First exception propagates to the caller | Keep running, orphaned | The first exception |
+| `gather(..., return_exceptions=True)` | Exceptions returned as list items | Keep running | None raised; inspect every result |
+| Cancelling the gather itself | — | All cancelled | `CancelledError` |
+| `asyncio.TaskGroup` (3.11+) | Group cancels remaining children (and the `async with` body if still running), waits for them to unwind | Cancelled, cleanup runs | `ExceptionGroup` of every child failure |
 
-`asyncio.TaskGroup` (3.11+) implements structured concurrency: no child outlives the `async with`
-block. When any child raises a non-cancellation exception, the group cancels all remaining children
-(and the body of the `async with`, if it is still running), waits for them to finish unwinding, then
-raises an `ExceptionGroup` holding every child failure. Children that ended by cancellation are not
-reported as failures, *because* the group itself caused them.
-You handle those with `except*`, which matches by type inside the group, *because* concurrent code
-can genuinely fail in several ways at once and a single exception would hide the others.
+- **No child outlives the block** in a TaskGroup; that is structured concurrency.
+- **Cancelled children are not reported as failures**, *because* the group itself caused them.
+- **Handle the group with `except*`**, which matches by type inside the group, *because* concurrent code
+  can genuinely fail in several ways at once and a single exception would hide the others.
 
 ### Shielding
-`asyncio.shield(aw)` protects an inner awaitable from a cancellation aimed at the outer task. It is
-needed precisely because of step 1 above: without it, cancelling the outer task would cancel the inner
-one it awaits. `shield` inserts a separate future between them, so the outer `await` still raises
-`CancelledError` while the inner work continues. Keep a reference to the inner task, or it can be
-garbage-collected once nobody awaits it. Use it narrowly, for work that
-must complete even when the requester is gone, such as committing an audit record.
+- **What it does.** `asyncio.shield(aw)` protects an inner awaitable from a cancellation aimed at the
+  outer task.
+- **Why it is needed.** Because of step 1 above, cancelling the outer task would otherwise cancel the
+  inner one it awaits. `shield` inserts a separate future between them, so the outer `await` still raises
+  `CancelledError` while the inner work continues.
+- **Keep a reference to the inner task**, or it can be garbage-collected once nobody awaits it.
+- **Use it narrowly**, for work that must complete even when the requester is gone, such as committing an
+  audit record.
 
-## Example
+## Diagram
+A timeout firing: the cancel request travels down the await chain, `CancelledError` travels back up
+through `finally`, and the timeout block converts it to `TimeoutError` only if nobody swallowed it.
+
+```mermaid
+sequenceDiagram
+    participant TO as asyncio.timeout block
+    participant T as Task (agent turn)
+    participant I as Inner await (HTTP stream)
+    participant L as Event loop
+    TO->>T: deadline reached, task.cancel()
+    T->>I: cancel the future it is waiting on
+    L->>T: wake task on next iteration
+    I-->>T: CancelledError thrown at the await
+    Note over T: finally and async with exits run, connection released
+    T-->>TO: CancelledError re-raised up the stack
+    Note over TO: recognises its own cancel, converts it
+    TO-->>T: TimeoutError raised to the caller
+    Note over T,TO: if the task swallowed CancelledError, the block exits normally and no TimeoutError appears
+```
+
+## Examples
+### Fail-fast fan-out with a deadline
 ```python
 import asyncio
 
@@ -140,46 +164,111 @@ async def agent_turn() -> None:
 
 asyncio.run(agent_turn())
 ```
-At 0.2 s the calculator raises. The TaskGroup cancels the retriever and the LLM call; each prints
-"cancelled" and "connection released" as `CancelledError` unwinds it; then the group raises an
-`ExceptionGroup` that `except* ValueError` handles. Change `fail=True` to `False` and the 2-second
-timeout fires instead: the timeout cancels `agent_turn`, the group passes that cancellation to its
-children, the LLM call unwinds, and the caller sees `TimeoutError`. Deleting the `raise` in the child
-would not break this particular run, because the timeout belongs to `agent_turn`, not the child; but
-the cancelled child would then report success, and the same swallow in the task that owns a timeout
-makes the block exit normally so no `TimeoutError` is ever raised.
+
+**Timeline as written:**
+| Time | Event |
+|---|---|
+| 0 s | Three children start and suspend on their sleeps |
+| 0.2 s | The calculator raises `ValueError` and releases its connection |
+| just after | The TaskGroup cancels the retriever and the LLM call; each prints "cancelled" and "connection released" as `CancelledError` unwinds it |
+| then | The group raises an `ExceptionGroup`, which `except* ValueError` handles |
+
+**With `fail=False`:** the 2-second timeout fires instead. It cancels `agent_turn`, the group passes that
+cancellation to its children, the LLM call unwinds, and the caller sees `TimeoutError`.
+
+**If you delete the `raise` in the child:** this particular run would not break, because the timeout
+belongs to `agent_turn`, not the child. But the cancelled child would then report success, and the same
+swallow in the task that owns a timeout makes the block exit normally, so no `TimeoutError` is ever raised.
+
+### Test that cancellation actually cleans up
+A test that cancels mid-call and checks resources are back to idle catches swallowed cancellations
+before production does. Runs on Python 3.8+.
+
+```python
+import asyncio
+
+in_flight = 0
+
+async def stream_llm(swallow: bool = False):
+    global in_flight
+    in_flight += 1
+    try:
+        await asyncio.sleep(10)          # stands in for a long LLM stream
+    except asyncio.CancelledError:
+        if not swallow:
+            raise                        # correct: re-raise
+        return "partial"                 # bug: swallows the cancellation
+    finally:
+        in_flight -= 1                   # runs on cancellation too
+
+async def cancel_mid_call(swallow: bool) -> None:
+    t = asyncio.create_task(stream_llm(swallow))
+    await asyncio.sleep(0.1)             # let it start and suspend
+    assert in_flight == 1
+    t.cancel()
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+    print(f"swallow={swallow}: cancelled={t.cancelled()}, in_flight={in_flight}")
+
+asyncio.run(cancel_mid_call(swallow=False))   # cancelled=True, in_flight=0
+asyncio.run(cancel_mid_call(swallow=True))    # cancelled=False, in_flight=0
+```
+In both runs the `finally` releases the resource, but only the correct version reports
+`cancelled=True`; the swallowing one looks like a normal return to whoever cancelled it. Assert on
+`t.cancelled()` in tests.
+
+## Production patterns
+- **Nested deadline budget.** Give each turn an outer `asyncio.timeout(...)` and each tool or model call a
+  shorter inner one, so inner deadlines fire first with a specific error. Monitor timeout counts per layer;
+  outer timeouts firing means an inner one is missing or too long.
+- **Owner for every task.** Put fan-out in a `TaskGroup`; for true background work, add a done-callback
+  that logs `t.exception()` when `not t.cancelled()`. Alert on "Task exception was never retrieved" in logs.
+- **Close the upstream stream on disconnect.** In a streaming endpoint, iterate the provider stream inside
+  `async with` so cancellation closes it, and check `await request.is_disconnected()` (Starlette) in the
+  loop. Monitor upstream tokens generated after client disconnect.
+- **Bound cleanup awaits.** Inside `finally`, wrap slow cleanup in its own `asyncio.timeout(...)` so a hung
+  close cannot stall shutdown. Monitor shutdown duration against the process manager's kill timeout.
+- **Shield only short, critical writes.** Create the audit or billing write as its own task, keep it in a
+  set, and `await asyncio.shield(task)`. Monitor the number of shielded tasks in flight during incidents.
 
 ## Trade-offs
-- TaskGroup's fail-fast semantics stop wasted work and guarantee no orphans, but one flaky optional
-  tool cancels the whole fan-out; when partial results are acceptable, catch errors inside each child.
-- `gather(return_exceptions=True)` keeps every result and never cancels siblings, at the cost of
-  manual inspection; it flips to the better choice when children are independent and best-effort.
-- Cooperative cancellation keeps cleanup safe and predictable, but it cannot interrupt CPU-bound or
-  blocking code; such work must run in a thread or process where cancellation only abandons the wait.
-- `shield` guarantees critical work finishes, but that work then outlives the request and can pile
-  up during an incident; it is only safe when the shielded work is short and bounded.
+- **Fail-fast vs partial results.** TaskGroup stops wasted work and guarantees no orphans, but one flaky
+  optional tool cancels the whole fan-out. When partial results are acceptable, catch errors inside each
+  child.
+- **Keep everything vs manual inspection.** `gather(return_exceptions=True)` keeps every result and never
+  cancels siblings, at the cost of manual inspection. It is the better choice when children are
+  independent and best-effort.
+- **Safe cleanup vs reach.** Cooperative cancellation keeps cleanup safe and predictable, but cannot
+  interrupt CPU-bound or blocking code. Such work must run in a thread or process, where cancellation only
+  abandons the wait.
+- **Guaranteed completion vs pile-up.** `shield` makes critical work finish, but that work outlives the
+  request and can pile up during an incident. It is only safe when the shielded work is short and bounded.
 
 ## Pitfalls
-- A bare `except:` or `except BaseException:` without re-raise (or `except Exception` on Python 3.7
-  and earlier) swallows cancellation; the symptom is timeouts that never fire and shutdowns that hang.
-- Fire-and-forget `asyncio.create_task(...)` without keeping a reference or awaiting it; the symptom
-  is "Task exception was never retrieved" in logs and occasionally tasks garbage-collected mid-flight.
-- Using `gather` and assuming a failure stops the other calls; the symptom is token spend and tool
-  side effects continuing after the request already returned an error.
-- Awaiting inside `finally` during cancellation without a bound; a slow cleanup call can itself hang,
-  so shutdown stalls until the process manager kills it.
-- Expecting cancel to stop a blocking `requests.get` or a tight loop; the symptom is a task that
-  stays "cancelling" until the blocking call returns on its own.
+- **Swallowing cancellation.** A bare `except:` or `except BaseException:` without re-raise (or
+  `except Exception` on Python 3.7 and earlier). Symptom: timeouts that never fire and shutdowns that hang.
+  Fix: re-raise.
+- **Fire-and-forget `asyncio.create_task(...)`** without keeping a reference or awaiting it. Symptom:
+  "Task exception was never retrieved" in logs and occasionally tasks garbage-collected mid-flight.
+- **Assuming a `gather` failure stops the other calls.** Symptom: token spend and tool side effects
+  continue after the request already returned an error. Fix: `TaskGroup`.
+- **Unbounded awaits in `finally` during cancellation.** A slow cleanup call can itself hang, so shutdown
+  stalls until the process manager kills it. Fix: a timeout around cleanup.
+- **Expecting cancel to stop a blocking `requests.get` or a tight loop.** Symptom: a task that stays
+  "cancelling" until the blocking call returns on its own.
 
 ## When to use
-You meet this whenever code starts more than one task or has a deadline, which in an AI backend is
-almost always: per-request timeouts on model calls, client disconnects on streaming endpoints,
-parallel tool calls, and graceful shutdown. Default to `TaskGroup` for fan-out where all results
-matter and `asyncio.timeout` for deadlines; use `gather(return_exceptions=True)` for best-effort
-batches. Every coroutine that holds a resource should release it in `finally` or `async with`. Test
-it: write a test that cancels mid-call and asserts the connection pool and locks are back to idle.
-In interviews, expect to explain why `CancelledError` is a `BaseException` and how TaskGroup differs
-from gather when one child fails.
+- **You meet it whenever** code starts more than one task or has a deadline, which in an AI backend is
+  almost always: per-request timeouts on model calls, client disconnects on streaming endpoints, parallel
+  tool calls, graceful shutdown.
+- **Defaults:** `TaskGroup` for fan-out where all results matter, `asyncio.timeout` for deadlines,
+  `gather(return_exceptions=True)` for best-effort batches.
+- **Resources:** every coroutine that holds a resource releases it in `finally` or `async with`.
+- **Test it:** cancel mid-call and assert the connection pool and locks are back to idle.
+- **Interviews:** explain why `CancelledError` is a `BaseException` and how TaskGroup differs from gather
+  when one child fails.
 
 ## Role lens
 - **Engineer:** Writes children that re-raise `CancelledError`, wraps fan-out in `TaskGroup`, and
@@ -199,6 +288,44 @@ them to unwind before raising an `ExceptionGroup`, so nothing outlives the reque
 re-raise `CancelledError` and release resources in `finally`. Because cancellation only lands at an
 await, a CRM write already sent cannot be undone, so consequential tools also need idempotency keys
 or a compensating action.
+
+## Interview questions
+### How does task.cancel() actually stop a coroutine in asyncio?
+- **It is a request, not a kill.** `task.cancel()` cancels the future the task is suspended on (and
+  any task it awaits), then wakes it so `CancelledError` is thrown at that `await`.
+- **It unwinds through ordinary cleanup.** `finally` blocks and `async with` exits run on the way up,
+  so connections and locks are released.
+- **Code between awaits runs to completion**, so a CPU loop with no await cannot be cancelled.
+
+### A service's 30-second request timeout sometimes never fires. How do you debug it?
+- **Suspect a swallowed cancellation.** `asyncio.timeout` works by cancelling the task and converting
+  the `CancelledError` at block exit; a bare `except:` or `except BaseException:` without re-raise
+  leaves nothing to convert.
+- **Grep for broad handlers** and retry wrappers in the call path, and add a test that cancels mid-call
+  and asserts `t.cancelled()` is true.
+- **Also check for blocking calls** such as `requests.get`, which keep the task cancelling until they
+  return on their own.
+
+### When would you choose gather with return_exceptions=True over a TaskGroup?
+- **Independent, best-effort children:** a batch of embedding calls or optional enrichment tools where
+  one failure should not cancel the rest.
+- **The cost is manual inspection.** Exceptions come back as list items, siblings are never cancelled,
+  and you must check every result yourself.
+- **Choose TaskGroup** when every result matters or a failure makes the others pointless, because it
+  cancels siblings and reports an `ExceptionGroup`.
+
+### What does asyncio.shield protect, and what are the risks in production?
+- **It protects inner work from outer cancellation.** The outer `await` still raises `CancelledError`,
+  but the inner awaitable keeps running, which suits committing an audit or billing record.
+- **Keep a reference** to the inner task, or it can be garbage-collected once nobody awaits it.
+- **Shielded work outlives the request**, so during an incident it can pile up; keep it short and
+  bounded and monitor how many shielded tasks are in flight.
+
+### Why did Python 3.8 make CancelledError a BaseException, and what changed for retry code?
+- **Accidental swallowing.** Retry and logging blocks written as `except Exception:` used to catch
+  cancellation and keep the task alive, breaking timeouts and shutdown.
+- **Now generic handlers let it pass**, but anything catching `BaseException` or using a bare `except:`
+  must still re-raise it, and code on Python 3.7 and earlier keeps the old risk.
 
 ## Quiz
 ### Q: Why does `CancelledError` inherit from `BaseException` rather than `Exception` in modern Python?

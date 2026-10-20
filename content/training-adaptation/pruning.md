@@ -5,7 +5,7 @@ name: Pruning
 kind: concept
 difficulty: advanced
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - training-adaptation/quantization
   - training-adaptation/knowledge-distillation
@@ -22,94 +22,123 @@ sources:
 ---
 
 ## TL;DR
-Pruning removes parameters a trained network barely uses, individual weights, attention heads, MLP
-neurons or whole layers, and then repairs the damage with a short fine-tune or distillation from the
-original. It exists because large models are heavily over-parameterised, so much of the compute spent at
-inference moves the output very little. The catch is that only structured removal (whole rows, heads,
-layers, or the hardware-supported 2:4 pattern) turns into real speed and memory wins on GPUs; scattered
-zeros mostly do not.
+Pruning removes weights, heads, neurons or layers a trained model barely uses, then repairs it by
+fine-tuning or distillation. Only structured removal (rows, heads, layers, or 2:4) gives real GPU speed and
+memory wins; scattered zeros mostly do not.
 
 ## Why it exists
-Models are trained big because width and depth make optimisation easy and sample-efficient, not because
-every parameter is needed at inference. The evidence of slack is old and consistent: many attention heads
-can be removed after training with little loss, a sizeable fraction of middle transformer layers barely
-change the residual stream they receive, and half the individual weights of a large model can be zeroed in
-one shot with a modest perplexity increase. All that slack is paid for on every token you serve.
-
-The naive route to a smaller model, training one from scratch at the target size, costs the full
-pretraining budget, trillions of tokens, and gives you a model that was never as good as the big one.
-Quantization, the other obvious lever, shaves a constant factor on bytes but leaves parameter count and
-FLOPs unchanged, and it bottoms out around 4 bits. Pruning attacks the count itself: a pruned-and-repaired
-model starts from the parent's knowledge, so recovering most of its quality has been reported to need
-tens of times fewer tokens than training the small size fresh. It also composes with quantization, since
-fewer weights at fewer bits multiply.
-
-What makes pruning harder than it sounds is hardware. GPUs multiply dense matrices; a matrix that is 50%
-zeros in random places costs exactly the same to multiply as a full one unless the kernel knows the
-pattern. So the central design question of pruning is not "which weights are unimportant" but "which
-*shape* of removal can the hardware cash in".
+- **Large models are heavily over-parameterised.** They are trained big because width and depth make
+  optimisation easy and sample-efficient, not because every parameter is needed at inference. Much
+  inference compute moves the output very little.
+- **The slack is well documented.** Many attention heads can be removed after training with little loss;
+  a sizeable fraction of middle layers barely change the residual stream they receive; half the individual
+  weights of a large model can be zeroed in one shot with a modest perplexity increase. You pay for that
+  slack on every token served.
+- **Training small from scratch is the expensive route.** It costs the full pretraining budget, trillions
+  of tokens, and the result was never as good as the big one. A pruned-and-repaired model starts from the
+  parent's knowledge; recovery has been reported to need tens of times fewer tokens.
+- **Quantization alone hits a floor.** It shaves a constant factor on bytes but leaves parameter count and
+  FLOPs unchanged, and bottoms out around 4 bits. Pruning attacks the count and composes with
+  quantization: fewer weights at fewer bits multiply.
+- **Hardware decides what counts.** GPUs multiply dense matrices; a matrix 50% zeros in random places
+  costs the same unless the kernel knows the pattern. The real question is "which *shape* of removal can
+  the hardware cash in", not "which weights are unimportant".
 
 ## How it works
 ### What you remove: the granularity ladder
-- **Unstructured** pruning zeroes individual weights anywhere. It preserves accuracy best at a given
-  sparsity because it has the most freedom, but the result is an irregular sparse matrix. Dense kernels
-  gain nothing, and storing it sparsely needs column indices whose overhead eats most of the saving at 50%;
-  general sparse kernels only beat dense ones at very high sparsity (around 90% and up). It is useful for
-  CPU runtimes with sparse support and for research, rarely for GPU serving.
-- **Semi-structured N:M** pruning, in practice **2:4**, zeroes exactly two of every four consecutive
-  weights. NVIDIA GPUs from Ampere onward have sparse tensor cores that execute this pattern at up to twice
-  the dense matmul rate, and store it as the two surviving values plus 2-bit position indices: per four
-  16-bit weights that is 2 × 16 + 2 × 2 = 36 bits instead of 64, about 56% of the dense size. The sparsity
-  is fixed at 50% and the constraint is local, so quality drops more than with free unstructured pruning
-  at the same ratio.
-- **Structured** pruning removes whole units: attention heads (the matching slices of W_Q, W_K, W_V and
-  W_O), MLP neurons (columns of the up/gate projections and the matching rows of the down projection),
-  hidden channels (hard, because the residual stream touches every layer), or entire layers (depth
-  pruning). The output is a smaller *dense* model, so every kernel on every device gets faster with no
-  special support. The price is the coarsest constraint and therefore the largest quality hit per
-  parameter removed, which is why structured pruning is almost always followed by recovery training.
+| Granularity | Removes | Accuracy at a given sparsity | GPU speedup |
+|---|---|---|---|
+| Unstructured | individual weights anywhere | best | almost none |
+| Semi-structured 2:4 | two of every four consecutive weights | middle | up to 2× matmul on Ampere+ |
+| Structured | heads, neurons, channels, layers | largest hit per parameter | everywhere, no special support |
+
+- **Unstructured.**
+  - Most freedom, so best accuracy, but an irregular sparse matrix: dense kernels gain nothing.
+  - Sparse storage needs column indices whose overhead eats most of the saving at 50%; general sparse
+    kernels only beat dense at very high sparsity (around 90% and up).
+  - Useful for CPU runtimes with sparse support and research, rarely for GPU serving.
+- **Semi-structured N:M, in practice 2:4.**
+  - NVIDIA GPUs from Ampere onward have sparse tensor cores that run this pattern at up to twice the dense
+    matmul rate.
+  - Storage: the two survivors plus 2-bit position indices. Per four 16-bit weights, 2 × 16 + 2 × 2 = 36
+    bits instead of 64, about 56% of dense.
+  - Sparsity is fixed at 50% and the constraint is local, so quality drops more than free unstructured
+    pruning at the same ratio.
+- **Structured.**
+  - Attention heads: the matching slices of W_Q, W_K, W_V and W_O.
+  - MLP neurons: columns of the up/gate projections and the matching rows of the down projection.
+  - Hidden channels: hard, because the residual stream touches every layer.
+  - Entire layers: depth pruning.
+  - The output is a smaller *dense* model, so every kernel on every device gets faster. The coarsest
+    constraint costs the most quality, which is why recovery training almost always follows.
 
 ### How you decide: importance scores
-- **Magnitude** (|w|): the classic criterion, cheap and surprisingly good after training with weight
-  decay. On large LLMs it fails in one shot at 50% because of outlier features: a small weight sitting on
-  an input channel that always carries huge activations is important, and magnitude cannot see that.
-- **Activation-aware** (Wanda): score each weight by |W_ij| · ‖X_j‖₂, its magnitude times the norm of
-  the input feature it multiplies over a few calibration sequences, and prune the lowest scores *within
-  each output row* so every output keeps the same number of inputs. No gradients, no retraining, seconds
-  per layer, and it matches far more expensive methods at 50% on large models precisely because it fixes
-  the outlier blind spot.
-- **Second-order** (SparseGPT): the same Optimal Brain Surgeon machinery GPTQ uses. For each layer,
-  prune the weight whose removal least increases the reconstruction error ‖WX − ŴX‖², then update the
-  remaining weights in the row using the inverse Hessian **H⁻¹** = (XXᵀ)⁻¹ to compensate. Done
-  column-wise with shared Hessian updates, it prunes 100B+ models to 50–60% unstructured or 2:4 in a few
-  hours on one GPU, with better accuracy than Wanda at the cost of the Hessian work.
-- **Gradient / Taylor** scores (|w · ∂L/∂w| and group versions) estimate the loss change from removing a
-  unit and are the usual choice for heads and neurons. For layers, a cheap and effective proxy is how
-  little a block changes its input: compute the cosine similarity between a layer's input and output
-  hidden states on calibration data; blocks with similarity near 1 are nearly identity maps and can be
-  dropped first. The first and last few layers almost never qualify.
+- **Magnitude (|w|).** Classic, cheap, and surprisingly good after training with weight decay. On large
+  LLMs it fails in one shot at 50% because of outlier features: a small weight on an input channel that
+  always carries huge activations is important, and magnitude cannot see that.
+- **Activation-aware (Wanda).**
+  - Score each weight by |W_ij| · ‖X_j‖₂: magnitude times the norm of its input feature over a few
+    calibration sequences.
+  - Prune the lowest scores *within each output row*, so every output keeps the same number of inputs.
+  - No gradients, no retraining, seconds per layer. It matches far more expensive methods at 50% on large
+    models precisely because it fixes the outlier blind spot.
+- **Second-order (SparseGPT).**
+  - The Optimal Brain Surgeon machinery GPTQ uses. Prune the weight whose removal least increases
+    ‖WX − ŴX‖², then update the row's remaining weights with **H⁻¹** = (XXᵀ)⁻¹ to compensate.
+  - Column-wise with shared Hessian updates, it prunes 100B+ models to 50–60% unstructured or 2:4 in a few
+    hours on one GPU, more accurately than Wanda at the cost of the Hessian work.
+- **Gradient / Taylor (|w · ∂L/∂w| and group versions).** Estimate the loss change from removing a unit;
+  the usual choice for heads and neurons.
+- **Layer influence by cosine similarity.** Compare a layer's input and output hidden states on
+  calibration data. Similarity near 1 means a near-identity block that can be dropped first. The first and
+  last few layers almost never qualify.
 
 ### When you prune and how you recover
-One-shot methods (Wanda, SparseGPT) prune a finished model and stop; they are the right tool for a quick
-50% result. Classic iterative pruning alternates prune → fine-tune → prune with a sparsity schedule that
-ramps gradually, because the network needs time to reroute around each cut. That loop is also where the
-lottery-ticket hypothesis came from: iterative magnitude pruning of small vision networks found sparse
-subnetworks that, rewound to their early-training weights, train to full accuracy on their own. It is a
-useful intuition for *why* over-parameterised training works, but it has not become a practical recipe for
-LLMs, where finding the ticket costs more than training the dense model. For structured pruning of LLMs
-the recipe that works is prune, then **distil from the unpruned parent**: the pruned model is an excellent
-initialisation, and token-level distillation provides a dense signal that repairs it with a small
-fraction of a pretraining budget. Reported findings from that line of work: width pruning (heads, MLP,
-embedding channels) tends to preserve quality better than depth pruning at equal parameter count, while
-depth pruning gives the bigger latency win because fewer sequential layers means fewer kernel launches
-per token. Contrast mixture-of-experts: it is structured sparsity designed in and *learned during
-pretraining* (each token activates a few experts), rather than carved out afterwards, and at frontier scale
-it has been the more widely adopted way to cut FLOPs per token; see that lesson.
+- **One-shot (Wanda, SparseGPT).** Prune a finished model and stop: the right tool for a quick 50% result.
+- **Iterative.** Alternate prune → fine-tune → prune with a gradually ramping sparsity schedule, because
+  the network needs time to reroute around each cut.
+- **Lottery tickets.** Iterative magnitude pruning of small vision networks found sparse subnetworks that,
+  rewound to early-training weights, train to full accuracy alone. Useful intuition for *why*
+  over-parameterised training works, but not a practical LLM recipe: finding the ticket costs more than
+  training the dense model.
+- **Structured LLM recipe: prune, then distil from the unpruned parent.** The pruned model is an excellent
+  initialisation; token-level distillation gives a dense repair signal at a small fraction of a
+  pretraining budget.
 
-## Example
-Wanda-style pruning of one linear layer in PyTorch, compared with magnitude pruning, in both unstructured
-(per-row 50%) and 2:4 form. The calibration activations include a few outlier channels, which is exactly
-the case where magnitude scores go wrong and activation-aware scores do not.
+Reported findings from that line of work:
+
+| Choice | Quality at equal parameter count | Latency win |
+|---|---|---|
+| Width pruning (heads, MLP, embedding channels) | better preserved | smaller |
+| Depth pruning (layers) | worse | bigger: fewer sequential layers, fewer kernel launches per token |
+
+**Contrast mixture-of-experts.** MoE is structured sparsity designed in and *learned during pretraining*
+(each token activates a few experts), not carved out afterwards. At frontier scale it has been the more
+widely adopted way to cut FLOPs per token; see that lesson.
+
+## Diagram
+The production pipeline: quantization is tried first, the granularity choice decides whether hardware
+can cash in the cut, and recovery plus evals sit between every stage.
+
+```mermaid
+flowchart TD
+    P[("Dense parent model")] --> Q["Try quantization first: does it hit the target?"]
+    Q -->|"yes"| S["Ship quantized model after evals"]
+    Q -->|"no: depth or parameter count is the limit"| C["Score importance on production prompts"]
+    C --> U["Unstructured: best accuracy, no GPU speedup"]
+    C --> T["2:4: up to 2x matmul on Ampere and later"]
+    C --> R["Structured: heads, neurons, layers, smaller dense model"]
+    T --> D["Recover: distil from the dense parent"]
+    R --> D
+    D --> QZ["Quantize last"]
+    QZ --> E["Task, safety and tokens per second evals"]
+    P -.->|"teacher"| D
+```
+
+## Examples
+### Wanda vs magnitude pruning on one layer
+PyTorch, unstructured (per-row 50%) and 2:4. The calibration activations include a few outlier channels,
+exactly where magnitude scores go wrong and activation-aware scores do not.
 
 ```python
 import torch
@@ -146,49 +175,104 @@ for name, Wp in [("magnitude 50%", prune_rows(W, magnitude)), ("wanda 50%", prun
 # then measure perplexity and task evals; for structured cuts, follow with distillation from W.
 ```
 
+### Rank layers for depth pruning by block influence
+Hugging Face Transformers. `hidden_states` holds the embedding output plus each layer's output, so entries
+*i* and *i+1* are layer *i*'s input and output. Use production prompts as calibration text.
+
+```python
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+name = "Qwen/Qwen2.5-0.5B"                                   # any causal LM
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32).eval()
+texts = ["Summarise this support ticket: printer offline after update.",
+         "Write a SQL query that counts orders per customer."]   # use a few hundred real prompts
+
+sims = None
+with torch.no_grad():
+    for t in texts:
+        hs = model(**tok(t, return_tensors="pt"), output_hidden_states=True).hidden_states
+        s = torch.stack([F.cosine_similarity(hs[i], hs[i + 1], dim=-1).mean() for i in range(len(hs) - 1)])
+        sims = s if sims is None else sims + s
+sims /= len(texts)
+order = sims.argsort(descending=True)                        # most identity-like first
+print("drop candidates:", [int(i) for i in order[:4]])       # skip the first and last few layers
+# Note: in many HF models the final entry of hidden_states is taken after the last norm, so the
+# last layer's score is not comparable to the others; another reason to exclude it.
+```
+
+### Worked scenario: what each cut buys an 8B model on an A100
+Illustrative planning numbers for a 32-layer model; confirm every row with your own benchmark.
+
+| Option | Weight bytes | Decode effect | Recovery needed |
+|---|---|---|---|
+| 50% unstructured | unchanged in a dense engine | none | optional |
+| 2:4 sparse | about 56% of dense | only if the kernel reads the compressed form | usually |
+| Drop 8 of 32 layers | about 75% of the layer weights | about a quarter less sequential work | distil from parent |
+| INT4 weights, no pruning | about 26% of bf16 | largest at low batch | none |
+
+This is why quantization comes first: it hits the memory target with no training.
+
+## Production patterns
+- **Quantize first, prune second.** When the target is bytes or decode latency, try INT8/INT4 before any
+  pruning; prune only when parameter count or sequential depth is the constraint. Track tokens per second
+  at deployment batch size after each step.
+- **Prune → distil → quantize, with evals at every stage.** Keep the dense parent as the distillation
+  teacher, recover the pruned model, and quantize last, because errors compound. Log task, safety and
+  general-benchmark scores at each stage so you know where quality went.
+- **Calibrate on production prompts.** Importance scores are activation-dependent, so sample a few hundred
+  real requests (code, chat, languages in proportion) for Wanda, SparseGPT or block-influence scoring.
+  Watch per-domain eval deltas, not just aggregate perplexity.
+- **Verify 2:4 end to end in the engine.** In PyTorch, `torch.sparse.to_sparse_semi_structured`
+  converts a 2:4-masked weight for sparse kernels; in a serving engine, confirm the sparse kernel path is
+  actually selected. Benchmark real tokens per second against the dense model before claiming a win.
+- **Safety suite as a release gate.** Re-run refusal and safety evals on every pruned candidate, because
+  safety behaviour can be disproportionately fragile under pruning.
+
 ## Trade-offs
-- Unstructured pruning gives the best accuracy per removed weight but almost no GPU speedup; it only pays
-  on sparse-aware CPU runtimes or at extreme sparsity, so for GPU serving it flips to being a reporting
-  exercise rather than a cost saving.
-- 2:4 sparsity can run matmuls at up to twice the dense rate on supporting GPUs (realised gains are
-  smaller and kernel-dependent) and cuts weight bytes to about 56%,
-  but it is a fixed 50%, usually needs recovery training, and only helps decode if the kernel reads the
-  compressed form; on hardware without sparse tensor cores it is pure quality loss.
-- Structured pruning speeds up everything everywhere, but costs more quality per parameter and needs the
-  most recovery compute; depth pruning is cheapest to implement and best for latency, width pruning
-  preserves quality better at the same size.
-- Prune-then-distil needs a small fraction of the tokens that training a fresh small model would, but the
+- **Unstructured accuracy vs no GPU speedup.** Best accuracy per removed weight, but it only pays on
+  sparse-aware CPU runtimes or at extreme sparsity; for GPU serving it is a reporting exercise, not a cost
+  saving.
+- **2:4 speed vs rigidity.** Matmuls can run at up to twice the dense rate on supporting GPUs (realised
+  gains are smaller and kernel-dependent) and weight bytes drop to about 56%. But it is a fixed 50%,
+  usually needs recovery, and helps decode only if the kernel reads the compressed form. On hardware
+  without sparse tensor cores it is pure quality loss.
+- **Structured speed vs quality.** Faster everywhere, but more quality lost per parameter and the most
+  recovery compute. Depth pruning is cheapest to implement and best for latency; width pruning preserves
+  quality better at the same size.
+- **Prune-then-distil efficiency vs inheritance.** A small fraction of a fresh model's tokens, but the
   result inherits the parent's architecture, tokenizer and biases, and its ceiling is the parent.
-- Stacking pruning with quantization multiplies savings, but the errors compound, so prune and recover
-  first, quantize last, and evaluate at every stage.
+- **Stacking with quantization.** Savings multiply but errors compound, so prune and recover first,
+  quantize last, and evaluate at every stage.
 
 ## Pitfalls
-- Reporting sparsity as if it were speedup: a 50% unstructured-sparse model runs at identical tokens per
-  second in a dense engine; the symptom is a proud "50% smaller" slide and an unchanged GPU bill.
-- Calibrating on data unlike the deployment traffic: scores are activation-dependent, so the symptom is
-  fine perplexity on web text and broken behaviour on code or chat.
-- Removing layers by position rules of thumb without measuring block influence, including the first or
-  last layers: the symptom is degenerate, repetitive output even at a small depth cut.
-- Skipping the recovery fine-tune because perplexity looked acceptable: perplexity and downstream ability
-  diverge after pruning, so the symptom is intact next-token loss and collapsed instruction following or
-  reasoning on your evals.
-- Width-pruning one side of a paired matrix (dropping MLP up-projection columns without the matching
-  down-projection rows, or query heads without accounting for grouped KV heads): the symptom is a shape
-  error if you are lucky and silent garbage if you are not.
-- Assuming pruning is behaviour-neutral: safety and refusal behaviour can be disproportionately fragile
-  under pruning, so the symptom is a smaller model that complies with requests its parent refused. Re-run
-  the safety suite, not just the capability suite.
+- **Reporting sparsity as speedup.** A 50% unstructured-sparse model runs at identical tokens per second
+  in a dense engine. Symptom: a proud "50% smaller" slide and an unchanged GPU bill.
+- **Calibrating on data unlike deployment traffic.** Scores are activation-dependent. Symptom: fine
+  perplexity on web text, broken behaviour on code or chat.
+- **Removing layers by position rules of thumb.** Without measuring block influence, and especially
+  cutting first or last layers. Symptom: degenerate, repetitive output even at a small depth cut.
+- **Skipping recovery because perplexity looked fine.** Perplexity and downstream ability diverge after
+  pruning. Symptom: intact next-token loss, collapsed instruction following or reasoning on your evals.
+- **Width-pruning one side of a paired matrix.** Dropping MLP up-projection columns without the matching
+  down-projection rows, or query heads without accounting for grouped KV heads. Symptom: a shape error if
+  lucky, silent garbage if not.
+- **Assuming pruning is behaviour-neutral.** Safety and refusal behaviour can be disproportionately
+  fragile. Symptom: a smaller model that complies with requests its parent refused. Re-run the safety
+  suite, not just capability evals.
 
 ## When to use
-Prune when you need a model size that does not exist in the family you have standardised on, when you have
-a strong parent and some training budget for recovery, or when the hardware has 2:4 support and the
-workload is matmul-heavy. Prefer quantization first; it is cheaper and usually reaches the memory target
-alone, and prune only when latency or parameter count, not bytes, is the constraint. Measure tokens per
-second and task evals at the deployment batch size, never sparsity percentages, and keep the KV cache in
-the picture: pruning query heads does not shrink it, pruning KV heads or layers does. In day-to-day work
-pruning shows up as a model-shrinking project with a distillation phase attached; in interviews, expect to
-explain why unstructured sparsity does not speed up a GPU, how Wanda differs from magnitude pruning, and
-what 2:4 actually buys.
+- **Use when:** you need a size that does not exist in your standard family, you have a strong parent and
+  recovery budget, or the hardware has 2:4 support and the workload is matmul-heavy.
+- **Prefer quantization first:** it is cheaper and usually reaches the memory target alone. Prune only
+  when latency or parameter count, not bytes, is the constraint.
+- **Measure:** tokens per second and task evals at deployment batch size, never sparsity percentages.
+  Keep the KV cache in view: pruning query heads does not shrink it, pruning KV heads or layers does.
+- **Day to day:** a model-shrinking project with a distillation phase attached.
+- **Interviews:** explain why unstructured sparsity does not speed up a GPU, how Wanda differs from
+  magnitude pruning, and what 2:4 actually buys.
 
 ## Role lens
 - **Engineer:** Runs one-shot pruning with calibration data from production prompts, wires the recovery
@@ -209,6 +293,46 @@ cosine similarity, remove the least influential middle layers, and distil from t
 2:4 sparsity is tempting on A100s, but its decode benefit depends on the engine reading the compressed
 format and it needs recovery training too, so I would try it only after depth pruning. Throughout, I would
 track task evals and safety evals, not perplexity, and verify the KV cache budget is unchanged.
+
+## Interview questions
+### What does 2:4 semi-structured sparsity buy you, concretely?
+- **The pattern:** two of every four consecutive weights are zero, which sparse tensor cores on NVIDIA
+  GPUs from Ampere onward run at up to twice the dense matmul rate.
+- **Storage:** per four 16-bit weights, 2 × 16 + 2 × 2 = 36 bits instead of 64, about 56% of dense.
+- **The catch:** sparsity is fixed at 50%, quality drops more than free unstructured pruning, recovery is
+  usually needed, and decode only benefits if the kernel reads the compressed form.
+
+### One-shot magnitude pruning at 50% wrecked your LLM. Why, and what would you use instead?
+- **Outlier features:** a small weight on an input channel that always carries huge activations matters a
+  lot, and |w| alone cannot see it, so magnitude deletes exactly those weights.
+- **Wanda** fixes the blind spot by scoring |W_ij| · ‖X_j‖₂ per output row, with no gradients and seconds
+  per layer.
+- **SparseGPT** is more accurate still, using the inverse Hessian to compensate the remaining weights, at
+  the cost of the Hessian work.
+
+### Width pruning or depth pruning for a latency-bound service? What do you give up?
+- **Depth pruning** drops whole layers: fewer sequential layers and kernel launches per token, so the
+  bigger latency win and the simplest implementation.
+- **Width pruning** removes heads, MLP neurons or embedding channels: better quality at equal parameter
+  count, smaller latency win.
+- **Either way** recovery by distillation from the parent follows, and for depth pruning you measure block
+  influence and never cut the first or last few layers.
+
+### A pruned 8B model passes perplexity checks but now answers requests its parent refused. What went wrong?
+- **Perplexity and behaviour diverge after pruning:** next-token loss can stay intact while instruction
+  following, reasoning or refusals collapse.
+- **Safety behaviour is fragile:** it can be disproportionately damaged by pruning, so a capability-only
+  eval misses it.
+- **Fix:** add the refusal and safety suite to the release gate for every pruned candidate, and recover
+  with distillation from the parent before re-checking.
+
+### When would you not prune at all?
+- **When bytes are the constraint:** quantization is cheaper, needs no training and usually reaches the
+  memory target alone; INT4 weights are about 26% of bf16.
+- **When the GPU lacks the pattern:** 2:4 on hardware without sparse tensor cores is pure quality loss,
+  and unstructured sparsity gives no speedup in a dense engine.
+- **When you have no recovery budget or strong parent:** a different, smaller model family may be the
+  cheaper route.
 
 ## Quiz
 ### Q: Why does 50% unstructured sparsity usually not make a GPU model faster?

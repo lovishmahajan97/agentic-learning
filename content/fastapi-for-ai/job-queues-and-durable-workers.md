@@ -5,7 +5,7 @@ name: Job queues & durable workers (Celery / ARQ + job-status endpoint)
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/message-queues
@@ -22,99 +22,126 @@ sources:
 ---
 
 ## TL;DR
-A job queue moves slow or must-complete work (batch summarisation, embedding a corpus, a long agent
-run) out of the request into worker processes, after recording the job's existence somewhere durable,
-so the API can answer `202 Accepted` with a job id and the client learns the outcome from a job-status
-endpoint. Celery is the mature, sync-first, multi-broker option; ARQ is a small asyncio-native queue on
-Redis. Both deliver at-least-once, so every job body must be idempotent.
+A job queue moves slow or must-complete work to workers after persisting a job record; the API answers
+`202 Accepted` with a job id and a status endpoint reports the outcome. Celery is sync-first, ARQ
+asyncio-native; both need idempotent jobs.
 
 ## Why it exists
-Three constraints kill long HTTP requests. Intermediaries cut connections that run or idle too long,
-commonly after tens of seconds by default (vendor-dependent), so a five-minute corpus summarisation
-never returns. Clients retry on timeout, so the work runs twice and the second run races the first.
-And a deploy, crash or scale-down kills in-flight work with nothing to say it existed. The AI shape of
-the problem is worse than classic web work because a single job can mean thousands of model calls at
-real cost, bounded by provider rate limits rather than by your CPUs.
-
-`BackgroundTasks` does not help: it runs after the response in the same process and vanishes with it.
-Holding the connection open with huge timeouts hides the symptom and still loses work on restart. The
-backend-fundamentals lesson on durable workers covers the theory, leases, acknowledgements and
-visibility timeouts; this lesson is the FastAPI-facing shape of it. The idea is to split "accept" from
-"do": the API validates, persists a job record, enqueues a small message, and hands back a handle; a
-separate worker fleet claims jobs, does the work with periodic progress writes, and records the result;
-the client polls or subscribes for the outcome. Each half scales and fails independently, and the job
-record, not the HTTP connection, is the source of truth.
+- **Intermediaries cut long requests.** Connections that run or idle too long are dropped, commonly after
+  tens of seconds by default (vendor-dependent), so a five-minute corpus summarisation never returns.
+- **Clients retry on timeout.** The work runs twice, and the second run races the first.
+- **Deploys and crashes kill in-flight work** with nothing to say it existed.
+- **AI makes it worse.** One job can mean thousands of model calls at real cost, bounded by provider rate
+  limits rather than your CPUs.
+- **The naive fixes fail.** `BackgroundTasks` runs after the response in the same process and vanishes
+  with it; huge timeouts hide the symptom and still lose work on restart. The fix splits "accept" from
+  "do": the job record, not the HTTP connection, is the source of truth, and each half scales and fails
+  independently. (The backend-fundamentals lesson on durable workers covers leases, acknowledgements and
+  visibility timeouts; this is the FastAPI-facing shape.)
 
 ## How it works
 ### The contract between API and client
-1. `POST /jobs`: validate input fully, because this is the last moment you can return a 4xx. Insert a
-   job row in your own database (`id`, `owner`, `status=queued`, `created_at`, the idempotency key if
-   the client sent one). Enqueue a message carrying the job id and small parameters, never the payload
-   itself; a 50 MB document goes to object storage and the message carries its key. Return `202` with
-   `{"job_id": ..., "status_url": ...}` and a `Location` header.
-2. `GET /jobs/{id}`: check the caller owns the job (answer 404, not 403, so ids cannot be probed).
-   Return `status` (`queued`, `running`, `succeeded`, `failed`, `cancelled`), `progress`, `result` or a
-   `result_url`, a sanitised `error`, and timestamps. Add `Retry-After` so well-behaved clients back
-   off.
-3. The worker claims a job, writes `running` with its worker id and start time, performs the work with
-   progress updates, writes the result and a terminal status. Terminal states are immutable.
-4. Optionally push: an SSE endpoint that tails the job row, or a webhook on completion.
+1. **`POST /jobs`.** Validate input fully, because this is the last moment you can return a 4xx.
+   - Insert a job row in your own database (`id`, `owner`, `status=queued`, `created_at`, the idempotency
+     key if the client sent one).
+   - Enqueue a message with the job id and small parameters, never the payload; a 50 MB document goes to
+     object storage and the message carries its key.
+   - Return `202` with `{"job_id": ..., "status_url": ...}` and a `Location` header.
+2. **`GET /jobs/{id}`.** Check the caller owns the job (answer 404, not 403, so ids cannot be probed).
+   - Return `status` (`queued`, `running`, `succeeded`, `failed`, `cancelled`), `progress`, `result` or a
+     `result_url`, a sanitised `error`, and timestamps.
+   - Add `Retry-After` so well-behaved clients back off.
+3. **Worker.** Claims a job, writes `running` with its worker id and start time, works with progress
+   updates, then writes the result and a terminal status. Terminal states are immutable.
+4. **Optional push.** An SSE endpoint that tails the job row, or a webhook on completion.
 
-Why your own row and not the broker's result backend: result backends are ephemeral (TTL-bound), carry
-no ownership or audit metadata, and couple your API to the queue library. The row also absorbs a
-classic race: write the row and commit *before* enqueueing; if the enqueue fails, a sweeper re-enqueues
-rows stuck in `queued`. Enqueueing first can produce a worker that finds no row. The outbox pattern
-makes this airtight when you need it.
+### Why your own row, not the broker's result backend
+- **Result backends are ephemeral** (TTL-bound), carry no ownership or audit metadata, and couple your
+  API to the queue library.
+- **The row absorbs a classic race.** Write the row and commit *before* enqueueing; if the enqueue fails,
+  a sweeper re-enqueues rows stuck in `queued`. Enqueueing first can produce a worker that finds no row.
+- **The outbox pattern** makes this airtight when you need it.
 
 ### Celery
-Tasks are plain functions decorated with `@app.task`; `task.delay(...)` or `apply_async(args,
-countdown=..., queue=...)` enqueues to RabbitMQ, Redis or SQS. The default worker pool is prefork, one
-OS process per concurrency slot, which suits CPU-bound and sync code. Reliability is opt-in: by
-default a message is acknowledged when received, so a worker crash loses it; set `acks_late=True` and
-`task_reject_on_worker_lost=True` for at-least-once. With the Redis broker an unacknowledged message is
-redelivered after `visibility_timeout`, which defaults to one hour, so any job longer than that runs
-twice unless you raise it. Retries come from `autoretry_for`, `retry_backoff`, `max_retries` and
-`self.retry()`; `soft_time_limit` and `time_limit` bound runaway tasks. Celery has no native asyncio
-task body: calling an async SDK means `asyncio.run(...)` inside the task or using the sync client.
-Beat schedules periodic jobs, Flower monitors, and the canvas primitives (chains, groups, chords) express
-fan-out such as "embed every chunk, then build the index".
+The mature, sync-first, multi-broker option.
+- **Tasks and enqueueing.** Plain functions decorated with `@app.task`; `task.delay(...)` or
+  `apply_async(args, countdown=..., queue=...)` enqueues to RabbitMQ, Redis or SQS.
+- **Prefork pool by default.** One OS process per concurrency slot, which suits CPU-bound and sync code.
+- **Reliability is opt-in.** By default a message is acknowledged when received, so a worker crash loses
+  it; set `acks_late=True` and `task_reject_on_worker_lost=True` for at-least-once.
+- **Redis `visibility_timeout`.** An unacknowledged message is redelivered after it, and it defaults to
+  one hour, so any longer job runs twice unless you raise it.
+- **Retries and limits.** `autoretry_for`, `retry_backoff`, `max_retries` and `self.retry()`;
+  `soft_time_limit` and `time_limit` bound runaway tasks.
+- **No native asyncio task body.** Calling an async SDK means `asyncio.run(...)` inside the task, or the
+  sync client.
+- **Ecosystem.** Beat schedules periodic jobs, Flower monitors, and canvas primitives (chains, groups,
+  chords) express fan-out such as "embed every chunk, then build the index".
 
 ### ARQ
-Tasks are `async def` functions taking a `ctx` dict first. A `WorkerSettings` class lists `functions`,
-`redis_settings`, `max_jobs` (concurrent jobs per worker process), `job_timeout`, `max_tries`,
-`keep_result` and `on_startup`/`on_shutdown` hooks where you create shared clients (an `httpx` client,
-a database pool) into `ctx`. Enqueue with `await pool.enqueue_job("name", *args, _job_id=...)`; a job
-id that already exists is not enqueued again, which gives you deduplication for free. Retries are
-requested by raising `arq.Retry(defer=seconds)`. One worker process holds `max_jobs` concurrent
-coroutines, so a single process can keep many LLM calls in flight, which is exactly the shape of
-IO-bound AI work. Retries are narrower than in Celery: raising `arq.Retry`, a job interrupted by
-worker shutdown, or a job whose worker died (picked up again once its in-progress marker expires)
-gets another try, up to `max_tries`; any other exception marks the job failed. So classify errors
-yourself: transient ones (a provider 429 or 5xx, a network timeout) become `Retry` with a growing
-`defer`, permanent ones (bad input, a document that no longer exists) fail immediately. It is Redis-only and small: named queues exist, but
-there are no canvas workflows, priorities or RabbitMQ.
+A small asyncio-native queue on Redis.
+- **Tasks** are `async def` functions taking a `ctx` dict first.
+- **`WorkerSettings`** lists `functions`, `redis_settings`, `max_jobs` (concurrent jobs per worker
+  process), `job_timeout`, `max_tries`, `keep_result`, and `on_startup`/`on_shutdown` hooks that put
+  shared clients (an `httpx` client, a database pool) into `ctx`.
+- **Free deduplication.** `await pool.enqueue_job("name", *args, _job_id=...)` does not enqueue a job id
+  that already exists.
+- **IO-bound shape.** One process holds `max_jobs` concurrent coroutines, so it keeps many LLM calls in
+  flight, exactly the shape of AI work.
+- **Narrow retries.** Raising `arq.Retry(defer=seconds)`, a job interrupted by worker shutdown, or a job
+  whose worker died (picked up once its in-progress marker expires) gets another try, up to `max_tries`;
+  any other exception marks the job failed.
+- **So classify errors yourself.** Transient ones (a provider 429 or 5xx, a network timeout) become
+  `Retry` with a growing `defer`; permanent ones (bad input, a deleted document) fail immediately.
+- **Small by design.** Redis-only; named queues exist, but no canvas workflows, priorities or RabbitMQ.
 
 ### Choosing
-Pick Celery when the organisation already runs it, when you need RabbitMQ, multiple queues with
-priorities, Beat schedules or canvas workflows, or when jobs are CPU-bound. Pick ARQ when the codebase
-is asyncio, Redis is already present, jobs are IO-bound model calls, and a small operational surface
-matters. Either way the body must be idempotent because delivery is at-least-once: check the job's
-status before acting, write results with upserts keyed by job id, and pass idempotency keys to
-external calls. For multi-step agent runs that need checkpoints and resumption, a workflow engine
-is the next step up; see the durable workflow lesson.
+| Pick | When |
+|---|---|
+| Celery | the organisation already runs it; you need RabbitMQ, multiple queues with priorities, Beat schedules or canvas workflows; jobs are CPU-bound |
+| ARQ | the codebase is asyncio, Redis is already present, jobs are IO-bound model calls, a small operational surface matters |
+| Workflow engine | multi-step agent runs that need checkpoints and resumption (see the durable workflow lesson) |
+
+Either way delivery is at-least-once, so the body must be idempotent:
+- **Check the job's status before acting.**
+- **Write results with upserts keyed by job id.**
+- **Pass idempotency keys to external calls.**
 
 ### Backpressure and capacity
-Queue depth is your backpressure signal: export it, cap in-flight jobs per tenant, and reject new jobs
-with `429` or `503` when depth times average duration exceeds what you promised. Use separate queues
-for cheap interactive jobs and expensive batch jobs so one never starves the other. Size worker
-concurrency by provider rate limits and memory, not CPU.
+- **Queue depth is the backpressure signal.** Export it and cap in-flight jobs per tenant.
+- **Reject early.** Return `429` or `503` when depth × average duration exceeds what you promised.
+- **Separate queues** for cheap interactive and expensive batch jobs, so one never starves the other.
+- **Size worker concurrency by provider rate limits and memory, not CPU.**
 
-## Example
-The FastAPI side of the contract with an ARQ worker. The job row is committed before enqueueing, the
-status endpoint hides other users' jobs, and the worker checks status first so a redelivered job is a
-no-op, a retry skips documents already summarised, and only transient provider errors are retried.
-`db` stands for your async data-access layer and `TransientLLMError` for however your client
-signals a 429, 5xx or timeout.
+## Diagram
+The job row is the source of truth: it is committed before the enqueue, the worker updates it, and the
+status route only ever reads it.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as FastAPI
+    participant D as Job row (Postgres)
+    participant Q as Broker (Redis)
+    participant W as Worker
+    C->>A: POST /jobs
+    A->>D: insert status queued, commit
+    A->>Q: enqueue job id only
+    A->>C: 202 with job_id and status_url
+    Q->>W: deliver job id
+    W->>D: status running, progress updates
+    C->>A: GET /jobs/id
+    A->>D: read row, check owner
+    A->>C: status running, Retry-After
+    W->>D: result and terminal status succeeded
+```
+
+## Examples
+### FastAPI contract with an ARQ worker
+The job row is committed before enqueueing, the status endpoint hides other users' jobs, and the worker
+checks status first: a redelivered job is a no-op, a retry skips documents already summarised, and only
+transient provider errors are retried. `db` stands for your async data-access layer and
+`TransientLLMError` for however your client signals a 429, 5xx or timeout.
 
 ```python
 import uuid
@@ -173,46 +200,101 @@ class WorkerSettings:
     max_jobs, job_timeout, max_tries = 10, 1800, 3   # concurrency bound by LLM rate limits, not CPU
 ```
 
+### The same job on Celery, configured for at-least-once
+Celery's defaults favour throughput over durability; these settings flip that. All are standard Celery
+configuration keys and task options.
+
+```python
+import asyncio
+from celery import Celery
+
+app = Celery("ai", broker="redis://localhost:6379/0")
+app.conf.update(
+    task_acks_late=True,                    # ack after the task finishes, not on receipt
+    task_reject_on_worker_lost=True,        # OOM-killed worker -> message is redelivered
+    worker_prefetch_multiplier=1,           # don't let one worker hoard long jobs
+    broker_transport_options={"visibility_timeout": 4 * 3600},  # > longest job, or it runs twice
+)
+
+@app.task(bind=True, autoretry_for=(TransientLLMError,), retry_backoff=True, max_retries=5,
+          soft_time_limit=1500, time_limit=1800)
+def summarize_corpus(self, job_id: str, corpus_id: str):
+    # Celery task bodies are sync: drive the async implementation explicitly.
+    asyncio.run(summarize_corpus_async(job_id, corpus_id))   # same idempotent body as the ARQ version
+```
+
+### Worked scenario: sizing workers against a provider rate limit
+Illustrative numbers: 1,000 documents, one model call per document, a provider limit of 600 requests per
+minute, ~4 s per call.
+
+| Quantity | Calculation | Result |
+|---|---|---|
+| Allowed call rate | 600 / 60 s | 10 calls/s |
+| In-flight calls to hit that rate | 10 calls/s × 4 s | ~40 concurrent |
+| ARQ processes at `max_jobs = 10` (one call each) | 40 / 10 | 4 workers |
+| Fastest possible corpus time | 1,000 / 10 calls/s | ~100 s |
+| Add an 8th worker | 80 in flight, still 10 calls/s allowed | only more 429s and retries |
+
+More workers past the rate limit add retries, not throughput; CPU never enters the sum.
+
+## Production patterns
+- **Commit-then-enqueue plus a sweeper.** For every job type, commit the row before enqueueing, and run a
+  periodic sweep (Celery Beat, or ARQ `cron_jobs`) that re-enqueues rows stuck in `queued` and fails
+  `running` rows whose heartbeat is stale. Monitor the count of stuck rows each sweep finds.
+- **Late acks and a long visibility timeout on Celery.** Set `task_acks_late=True`,
+  `task_reject_on_worker_lost=True` and a Redis `visibility_timeout` above the longest job. Monitor the
+  duplicate-delivery rate (same job id started twice).
+- **Classify retries explicitly.** Map provider 429/5xx/timeouts to `arq.Retry(defer=...)` or Celery's
+  `autoretry_for`, permanent errors to immediate `failed`. Monitor retries per job and the share of jobs
+  that exhaust `max_tries`.
+- **Separate queues per cost class.** Route interactive jobs and batch ingestion to different queues with
+  their own workers (Celery `queue=` on `apply_async`; separate ARQ `queue_name` per worker), so a corpus
+  import cannot starve a user-facing job. Monitor time-in-queue per queue.
+- **Status route as a cheap read.** Serve `GET /jobs/{id}` from the job row with `Retry-After`, owner
+  checks and 404 for others' jobs; add SSE or webhooks once polling dominates. Monitor polls per job and
+  status-route share of total QPS.
+
 ## Trade-offs
-- Durability and horizontal scaling of workers, but a second deployable, a broker to operate, and a
-  serialisation boundary; for follow-ups measured in milliseconds that can be lost, `BackgroundTasks`
-  is cheaper.
-- At-least-once delivery means no job is lost, but every job can run twice, so idempotency is a
-  requirement rather than a nicety; the flip is at-most-once (Celery's default early ack), which is
-  only acceptable for work you would rather drop than repeat.
-- Polling a status endpoint is simple and stateless, but at scale it becomes your highest-QPS route;
-  once clients number in the thousands, push via SSE or webhooks pays for itself.
-- Celery's breadth (brokers, routing, Beat, canvas) buys flexibility at the price of sync task bodies
-  and more configuration; ARQ's asyncio model fits LLM IO well but stops at Redis and a deliberately
-  minimal feature set (no canvas, no priorities, retries only on explicit `Retry`).
+- **Durability and scaling vs operational weight.** Workers scale horizontally and jobs survive restarts,
+  but you add a second deployable, a broker and a serialisation boundary; for millisecond follow-ups that
+  can be lost, `BackgroundTasks` is cheaper.
+- **At-least-once vs duplicates.** No job is lost, but every job can run twice, so idempotency is a
+  requirement. The flip is at-most-once (Celery's default early ack), acceptable only for work you would
+  rather drop than repeat.
+- **Polling simplicity vs load.** A status endpoint is simple and stateless, but at scale it becomes your
+  highest-QPS route; once clients number in the thousands, push via SSE or webhooks pays for itself.
+- **Celery breadth vs ARQ fit.** Celery's brokers, routing, Beat and canvas cost sync task bodies and
+  more configuration; ARQ's asyncio model fits LLM IO but stops at Redis and a minimal feature set (no
+  canvas, no priorities, retries only on explicit `Retry`).
 
 ## Pitfalls
-- Enqueueing before the job row is committed; the symptom is workers logging "job not found" and
-  retrying until the row appears, or never.
-- Stuffing documents into the message; the symptom is Redis memory spikes and slow enqueues; pass
-  object-storage keys instead.
-- Keeping Celery's default early acknowledgement; the symptom is jobs stuck in `running` forever after
-  a worker is OOM-killed.
-- A Redis `visibility_timeout` shorter than the longest job; the symptom is the same job id appearing
-  twice in worker logs and doubled model spend.
-- Serving status from the broker's result backend; the symptom is finished jobs that look unknown
-  once the result TTL passes (Celery reports an expired id as `PENDING`; its `result_expires` defaults
-  to one day, ARQ's `keep_result` to one hour).
-- No ownership check on the status route; the symptom is a security finding that job ids, often
-  sequential, expose other tenants' results.
-- Clients polling in tight loops; the symptom is the status endpoint dominating request volume; send
+- **Enqueueing before the job row is committed.** Symptom: workers log "job not found" and retry until
+  the row appears, or never.
+- **Stuffing documents into the message.** Symptom: Redis memory spikes and slow enqueues. Fix: pass
+  object-storage keys.
+- **Keeping Celery's default early acknowledgement.** Symptom: jobs stuck in `running` forever after a
+  worker is OOM-killed.
+- **A Redis `visibility_timeout` shorter than the longest job.** Symptom: the same job id twice in worker
+  logs and doubled model spend.
+- **Serving status from the broker's result backend.** Symptom: finished jobs look unknown once the
+  result TTL passes (Celery reports an expired id as `PENDING`; its `result_expires` defaults to one day,
+  ARQ's `keep_result` to one hour).
+- **No ownership check on the status route.** Symptom: a security finding that job ids, often sequential,
+  expose other tenants' results.
+- **Clients polling in tight loops.** Symptom: the status endpoint dominates request volume. Fix: send
   `Retry-After` and document a backoff.
-- Letting a retried job overwrite a terminal state; the symptom is a job flipping from `succeeded`
-  back to `running` and confusing every dashboard.
+- **Letting a retried job overwrite a terminal state.** Symptom: a job flips from `succeeded` back to
+  `running`, confusing every dashboard.
 
 ## When to use
-Use a queue when work outlives a reasonable HTTP timeout, must survive restarts, needs retries, or
-should be throttled against provider rate limits independently of API traffic: corpus ingestion and
-embedding, batch evaluation runs, scheduled re-summarisation, long agent tasks. Do not use it for
-interactive single-turn chat, where streaming is the right answer, or for sub-second follow-ups.
-Measure queue depth, time-in-queue, job duration percentiles, retry and duplicate rates, and status
-polls per job. In interviews, be ready to draw the 202-plus-status contract, explain why the job row
-beats the result backend, and say what at-least-once forces on job bodies.
+- **Use when** work outlives a reasonable HTTP timeout, must survive restarts, needs retries, or should be
+  throttled against provider rate limits independently of API traffic: corpus ingestion and embedding,
+  batch evaluation runs, scheduled re-summarisation, long agent tasks.
+- **Avoid when** it is interactive single-turn chat (stream instead) or sub-second follow-ups.
+- **Measure** queue depth, time-in-queue, job duration percentiles, retry and duplicate rates, and status
+  polls per job.
+- **Interviews:** draw the 202-plus-status contract, explain why the job row beats the result backend, and
+  say what at-least-once forces on job bodies.
 
 ## Role lens
 - **Engineer:** Writes idempotent task bodies, the enqueue-after-commit path, and the status route
@@ -235,6 +317,38 @@ from the start on another worker. For that to be correct, the task must be idemp
 check the job status first, skip documents that already have a summary (upsert keyed by document id),
 and update progress monotonically, so the second run does only the remaining ~500 and marks success. In both
 cases the row, not the broker, is what the status endpoint and the on-call engineer read.
+
+## Interview questions
+### Why split long AI work into a 202 response plus a durable worker?
+- **HTTP connections are the wrong source of truth.** Intermediaries cut long requests after tens of
+  seconds, clients retry on timeout, and deploys kill in-flight work with no record of it.
+- **A committed job row survives all three.** The API accepts and returns a job id, workers do the work
+  and scale independently, and the status endpoint reads the row.
+
+### Workers log "job not found" a few times a day. What is the bug and the fix?
+- **Enqueue before commit.** The worker picked up the message before the API's transaction committed the
+  job row.
+- **Fix:** commit the row first, then enqueue; if the enqueue fails, a sweeper re-enqueues rows stuck in
+  `queued`, or use the outbox pattern when it must be airtight.
+
+### Celery or ARQ for a service that fans out thousands of LLM calls?
+- **ARQ fits IO-bound async work.** One process holds `max_jobs` concurrent coroutines, so many model
+  calls stay in flight, and the codebase stays asyncio.
+- **Celery wins on breadth:** RabbitMQ or SQS brokers, priorities, Beat schedules, canvas chains and
+  chords, and prefork processes for CPU-bound work, at the cost of sync task bodies.
+- **Either way delivery is at-least-once,** so the job body must be idempotent.
+
+### The same job id shows up twice in worker logs and model spend has doubled. What happened?
+- **A redelivery.** With Celery on Redis, an unacknowledged message is redelivered after
+  `visibility_timeout`, which defaults to one hour, so any longer job runs twice.
+- **Fix the setting and the body:** raise the timeout above the longest job, and make the task check
+  status first and upsert results keyed by job or document id so a rerun only does the remaining work.
+
+### How do you size worker concurrency for a job type that calls a rate-limited model provider?
+- **The provider limit is the ceiling, not CPU.** Concurrency times calls per second per job must stay
+  under the rate limit; more workers past it only add 429s and retries.
+- **Watch queue depth and time-in-queue,** and reject early with `429` or `503` when depth × average
+  duration exceeds the promised turnaround.
 
 ## Quiz
 ### Q: Why does the API return 202 with a job id instead of holding the connection until the work finishes?

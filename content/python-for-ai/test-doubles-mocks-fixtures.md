@@ -5,7 +5,7 @@ name: Test doubles, mocks and fixtures
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/pytest
   - python-for-ai/pytest-asyncio
@@ -22,105 +22,121 @@ sources:
 ---
 
 ## TL;DR
-A test double stands in for a real collaborator (an LLM, an HTTP API, a database) so a test is fast,
-deterministic and free. Doubles come in kinds: dummies, stubs, spies, mocks and fakes, which differ in
-whether they return canned data, record calls, or behave like a small real implementation. Fixtures are
-how pytest builds, shares and tears down those doubles and other test state. Choose the kind by what
-the test must verify: the result, or the interaction.
+A test double (dummy, stub, spy, mock or fake) stands in for an LLM, API or database so tests are fast,
+deterministic and free; fixtures build and tear them down. Pick the kind by what you verify: result
+or interaction.
 
 ## Why it exists
-Code around a model talks to things you cannot afford to call in a unit test. A real LLM call costs
-money, takes hundreds of milliseconds to seconds, returns different text on each run, rate-limits you
-in CI, and needs a secret the CI runner may not have. A vector database needs a running server. A
-payment or ticketing API has side effects. If every test of your retry logic, prompt assembly or tool
-dispatch goes through those, the suite is slow, flaky and expensive, and people stop running it.
-
-You also cannot easily make the real dependency misbehave on demand. The branches that matter most,
-"the model returned an empty string", "the API timed out on the second attempt", "the tool returned
-malformed JSON", are exactly the ones a live service rarely produces when you want it to.
-
-The naive fix, patching everything with `MagicMock` until the test goes green, trades one problem for
-another. A bare mock accepts any attribute and any call, so a test can pass while the code calls a
-method that does not exist on the real client. And tests that assert on every internal call break on
-every refactor even when behaviour is unchanged. The vocabulary of test doubles exists to pick the
-smallest stand-in that verifies what you actually care about.
+- **Real dependencies are unaffordable in unit tests.** A real LLM call costs money, takes hundreds of
+  milliseconds to seconds, returns different text each run, rate-limits you in CI, and needs a secret
+  the runner may not have. A vector database needs a server; a payment or ticketing API has side effects.
+- **Through the real thing, the suite dies.** Tests of retry logic, prompt assembly or tool dispatch get
+  slow, flaky and expensive, and people stop running them.
+- **You cannot make a live service misbehave on demand.** "The model returned an empty string", "the API
+  timed out on the second attempt", "the tool returned malformed JSON" are the branches that matter most
+  and the ones a live service rarely produces when you want.
+- **Patching everything with `MagicMock` fails differently.** A bare mock accepts any attribute and call,
+  so a test passes while code calls a method the real client lacks; asserting on every internal call
+  breaks on every refactor even when behaviour is unchanged.
+- **The vocabulary picks the smallest stand-in** that verifies what you actually care about.
 
 ## How it works
 ### The kinds of double
 Meszaros's taxonomy, which most of the industry uses loosely:
-- **Dummy:** passed only to fill a parameter; never used. `client=None` when the path under test does
-  not touch the client.
-- **Stub:** returns canned answers. "Whatever you are asked, reply `'{"label": "spam"}'`." Used to drive
-  the code down a branch. You assert on the code's output, not on the stub.
-- **Spy:** a stub that also records how it was called, so the test can check afterwards ("was the
-  second attempt sent with a lower temperature?").
-- **Mock:** pre-programmed with expectations about calls; the test fails if the interactions differ.
-  In Python, `unittest.mock.Mock` is technically a spy you assert on after the fact.
-- **Fake:** a working, simplified implementation: an in-memory vector store that really ranks by
-  cosine similarity, a dict-backed cache with real TTL logic, a model server that speaks the provider's
-  HTTP API. Fakes are more code, but they make tests read like usage and can be shared across suites.
 
-Strictly, a "fake LLM" that pops scripted replies off a list is a stub that also records calls (a
-spy); it has no behaviour of its own. Teams call it a fake anyway, and the label matters less than the
-question it answers: does this double *compute* anything, or only replay what the test told it?
+| Kind | What it does | Example |
+|---|---|---|
+| **Dummy** | fills a parameter; never used | `client=None` when the path under test does not touch the client |
+| **Stub** | returns canned answers to drive a branch; you assert on the code's output | "Whatever you are asked, reply `'{"label": "spam"}'`." |
+| **Spy** | a stub that also records calls, checked afterwards | "was the second attempt sent with a lower temperature?" |
+| **Mock** | pre-programmed with call expectations; fails if interactions differ | `unittest.mock.Mock` is technically a spy you assert on after the fact |
+| **Fake** | a working, simplified implementation | in-memory vector store ranking by cosine similarity; dict cache with real TTL; a model server speaking the provider's HTTP API |
 
-The distinction matters because it decides what the test verifies. Stubs and fakes support
-**state verification**: run the code, check the result. Mocks and spies support **behaviour
-verification**: check the calls. State verification survives refactoring; behaviour verification is
-right only when the call *is* the behaviour (an email was sent, a tool was invoked with these
-arguments, a charge was not made twice).
+- **Fakes cost more code** but make tests read like usage and can be shared across suites.
+- **The "fake LLM" naming caveat.** One that pops scripted replies off a list is strictly a stub that
+  records calls (a spy); it has no behaviour of its own. Teams call it a fake anyway. The real question:
+  does this double *compute* anything, or only replay what the test told it?
+
+### State vs behaviour verification
+| | Doubles | Test checks | Survives refactoring? |
+|---|---|---|---|
+| **State verification** | stubs, fakes | the result | yes |
+| **Behaviour verification** | mocks, spies | the calls | no; right only when the call *is* the behaviour |
+
+Calls that *are* the behaviour: an email was sent, a tool was invoked with these arguments, a charge was
+not made twice.
 
 ### unittest.mock mechanics
-- `Mock` / `MagicMock` create attributes on access and record every call in `call_args_list`.
+- **`Mock` / `MagicMock`** create attributes on access and record every call in `call_args_list`.
   `MagicMock` also supports dunder methods (`len`, iteration, context managers). `AsyncMock` returns
   awaitables, for async clients.
-- `return_value` and `side_effect` script behaviour; `side_effect` can be an exception (raised on every
-  call), a callable, or an iterable consumed one item per call in which any exception item is raised.
-  `side_effect=[TimeoutError(), "ok"]` is how you simulate "timeout, then success".
-- **Spec it.** `Mock(spec_set=RealClass)` rejects attributes the real class lacks (and assignment of
-  new ones); `create_autospec(RealClass, instance=True)` goes further and also checks call signatures
-  of the methods. Either matters because an unspecced mock will happily accept `client.compelte(...)`
-  and the typo ships.
-- `patch("pkg.module.name")` replaces a name *where it is looked up*, not where it is defined. If
-  `app/summarize.py` does `from app.llm import call_llm`, you patch `app.summarize.call_llm`;
-  patching `app.llm.call_llm` changes nothing the code under test sees. The reason is mechanical:
-  `from x import y` copies a reference into the importing module's namespace at import time, and
-  `patch` only rebinds one namespace entry. `patch.object(obj, "attr")` avoids the string path entirely.
-- `Mock(wraps=real)` is Python's true spy: calls go through to the real object and are recorded, which
-  suits "did the retry wrapper call the real tokenizer exactly once?"
+- **Scripting.** `return_value` and `side_effect`; `side_effect` can be an exception (raised every call),
+  a callable, or an iterable consumed one item per call in which any exception item is raised.
+  `side_effect=[TimeoutError(), "ok"]` simulates "timeout, then success".
+- **Spec it.** `Mock(spec_set=RealClass)` rejects attributes the real class lacks (and assignment of new
+  ones); `create_autospec(RealClass, instance=True)` also checks method call signatures. This matters
+  because an unspecced mock happily accepts `client.compelte(...)` and the typo ships.
+- **`patch("pkg.module.name")` replaces a name *where it is looked up*.** If `app/summarize.py` does
+  `from app.llm import call_llm`, patch `app.summarize.call_llm`; patching `app.llm.call_llm` changes
+  nothing the code sees, because `from x import y` copies a reference into the importing namespace at
+  import time and `patch` rebinds only one entry.
+- **`patch.object(obj, "attr")`** avoids the string path entirely.
+- **`Mock(wraps=real)` is Python's true spy.** Calls go through to the real object and are recorded:
+  "did the retry wrapper call the real tokenizer exactly once?"
 
 ### Fixtures
-A pytest fixture is a function whose return value (or `yield`ed value) is injected into any test that
-names it as a parameter. Code after `yield` is teardown, and runs even if the test fails. Scope
-(`function`, `class`, `module`, `package`, `session`) controls how often it is rebuilt: wide scope for
-expensive immutable things (a loaded tokenizer), function scope for anything a test can mutate.
-Fixtures in `conftest.py` are shared by every test below that directory. A **factory fixture**
-returns a function, so each test can build its own variant ("an LLM that replies with these three
-strings"). Built-ins do common jobs: `monkeypatch` sets env vars and attributes and undoes them,
-`tmp_path` gives an isolated directory.
+- **Injection.** A pytest fixture's return (or `yield`ed) value is injected into any test naming it as a
+  parameter. Code after `yield` is teardown and runs even if the test fails.
+- **Scope** (`function`, `class`, `module`, `package`, `session`) sets how often it is rebuilt: wide for
+  expensive immutable things (a loaded tokenizer), function scope for anything a test can mutate.
+- **`conftest.py`** fixtures are shared by every test below that directory.
+- **Factory fixture.** Returns a function, so each test builds its own variant ("an LLM that replies with
+  these three strings").
+- **Built-ins:** `monkeypatch` sets env vars and attributes and undoes them; `tmp_path` gives an isolated
+  directory.
 
 ### Prefer injection over patching
-If a function takes its client as a parameter (or a constructor does), the test passes a fake and
-needs no patching at all. Patching is the tool for code you cannot restructure; dependency injection
-is what makes doubles cheap.
+- **Injected client, no patching.** If a function (or constructor) takes its client as a parameter, the
+  test passes a fake.
+- **Patching is for code you cannot restructure**; dependency injection is what makes doubles cheap.
 
 ### Where to put the seam
 For an LLM call there are three places to cut, and each decides what the test still exercises:
 1. **Your own interface** (`LLMClient.complete`): a fake replaces everything below it. Fastest and
    simplest, but the SDK, request building, retries and response parsing are not tested at all.
-2. **The HTTP transport**: libraries such as `respx` (for httpx) or recorded cassettes (vcrpy,
-   pytest-recording) intercept requests below the SDK. The real SDK serialises your request and
-   parses a realistic response, so a wrong field name or a changed response shape fails here.
-3. **A fake server process**: the code under test talks to a real socket. This is the integration
-   level, covered in the integration-testing lesson.
-Cut as high as the test allows, because higher seams are faster and less brittle; move the seam down
-only for the code whose correctness depends on what is below it, such as response parsing.
+2. **The HTTP transport**: `respx` (for httpx) or recorded cassettes (vcrpy, pytest-recording) intercept
+   requests below the SDK. The real SDK serialises your request and parses a realistic response, so a
+   wrong field name or a changed response shape fails here.
+3. **A fake server process**: the code talks to a real socket. This is the integration level, covered in
+   the integration-testing lesson.
 
-## Example
-A summarizer retries once when the model returns empty output and truncates to a limit read from the
-environment. The tests use three kinds of double: a scripted stub-with-spy (what most teams call a fake
-LLM) for state checks, an autospecced mock for one interaction that matters, and `monkeypatch` for
-configuration.
+Cut as high as the test allows, because higher seams are faster and less brittle. Move the seam down
+only for code whose correctness depends on what is below it, such as response parsing.
+
+## Diagram
+The decision path for one dependency: first ask whether to double it at all, then what you verify, then
+where to cut the seam.
+
+```mermaid
+flowchart TD
+    D["Dependency in the code under test"] --> Q1{"Crosses the process boundary? LLM, HTTP, DB, clock"}
+    Q1 -->|"no, your own code"| R["Call the real code"]
+    Q1 -->|"yes"| Q2{"Is the call itself the requirement?"}
+    Q2 -->|"no, check the result"| S["Stub or fake, assert on state"]
+    Q2 -->|"yes, e.g. never charge twice"| M["Autospecced mock or spy, assert on calls"]
+    S --> Q3{"Does correctness depend on the SDK or wire format?"}
+    M --> Q3
+    Q3 -->|"no"| I["Inject a fake at your own interface"]
+    Q3 -->|"yes"| H["Cut at HTTP transport: MockTransport, respx, cassettes"]
+    I --> K["Keep it honest: shared suite run against the real backend nightly"]
+    H --> K
+```
+
+## Examples
+### Summarizer: scripted fake, autospec mock, monkeypatch
+A summarizer retries once on empty output and truncates to a limit read from the environment. Three
+doubles: a scripted stub-with-spy (what most teams call a fake LLM) for state checks, an autospecced
+mock for one interaction that matters, and `monkeypatch` for configuration.
 
 ```python
 import os
@@ -170,39 +186,109 @@ def test_truncates_to_env_limit(monkeypatch, make_llm):
 
 None of these tests hit the network, and none breaks if `summarize` changes how it builds its prompt.
 
+### Transport seam: `httpx.MockTransport` scripts a 429, then a reply
+Cutting at the HTTP layer exercises request building, status handling and response parsing. Runnable
+with `pip install httpx pytest`.
+
+```python
+import httpx
+import pytest
+
+def classify(text: str, http: httpx.Client) -> str:
+    for attempt in range(3):
+        r = http.post("/v1/chat", json={"messages": [{"role": "user", "content": text}]})
+        if r.status_code == 429 and attempt < 2:
+            continue                                   # real code would back off here
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip().lower()
+    raise AssertionError("unreachable")
+
+def scripted(*responses):
+    seen, queue = [], list(responses)
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return queue.pop(0)
+    return httpx.MockTransport(handler), seen
+
+def reply(content):
+    return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+def test_retries_rate_limit_then_parses():
+    transport, seen = scripted(httpx.Response(429), reply("  SPAM\n"))
+    with httpx.Client(transport=transport, base_url="https://llm.test") as http:
+        assert classify("win a prize", http) == "spam"
+    assert len(seen) == 2
+    assert seen[0].url.path == "/v1/chat"
+
+def test_gives_up_after_three_429s():
+    transport, _ = scripted(*[httpx.Response(429)] * 3)
+    with httpx.Client(transport=transport, base_url="https://llm.test") as http:
+        with pytest.raises(httpx.HTTPStatusError):
+            classify("x", http)
+```
+
+### Worked scenario: which patch target?
+| Code under test in `app/summarize.py` | Lookup at call time | Correct target |
+|---|---|---|
+| `from app.llm import call_llm` then `call_llm(...)` | `app.summarize` namespace | `app.summarize.call_llm` |
+| `import app.llm` then `app.llm.call_llm(...)` | `app.llm` module attribute | `app.llm.call_llm` |
+| `self.client.complete(...)` with injected client | the object passed in | no patch: pass a fake |
+
+The wrong target in row 1 shows up as a test that still makes real network calls or fails with a missing
+API key despite the patch.
+
+## Production patterns
+- **One shared fake client.** Keep a `FakeLLM` and a factory fixture (`make_llm`) in the root
+  `conftest.py`, scripting replies, exceptions and timeouts (`AsyncMock(side_effect=[TimeoutError(),
+  "ok"])` for async). Every new branch test then costs one line. Watch for teams forking their own fakes.
+- **Autospec by default.** Use `create_autospec(RealClient, instance=True)` (or `spec_set=`) for any
+  remaining mock, and flag bare `MagicMock()` for clients in review. Monitor production `AttributeError`
+  or `TypeError` from client calls that tests missed.
+- **Record real responses, replay in CI.** With pytest-recording, mark tests `@pytest.mark.vcr`, record
+  once locally, and run CI with `--record-mode=none` so any unrecorded request fails. Strip secrets via a
+  `vcr_config` fixture returning `{"filter_headers": ["authorization"]}`. Re-record on SDK upgrades.
+- **Realistic stub data.** Store sanitised real model outputs (fenced JSON, preambles, trailing prose)
+  as fixture files and feed parsers from them, so stubs look like what models return, mess included.
+  Add every production parse failure as a new fixture file.
+- **Keep fakes honest.** Run one behaviour suite parametrized over `["fake", "real"]`, with the real
+  backend marked `integration` and run nightly. A fake that drifts fails the shared suite.
+
 ## Trade-offs
-- Fakes make tests readable and refactor-proof, but are code you must maintain and can drift from the
-  real service; pair them with a contract or integration test once drift has bitten you.
-- Mocks verify interactions precisely, but couple tests to implementation; they flip from liability to
-  asset only when the interaction itself is the requirement, such as "never call the payment API twice".
-- Wide fixture scopes make suites fast, but let one test's mutation leak into another; use them only
-  for objects nothing mutates, and function scope for everything else.
-- Patching lets you test code you cannot restructure, but hides the dependency; when you own the code,
-  injecting the collaborator removes the need for patching entirely.
+- **Fakes: readable vs drift.** They make tests readable and refactor-proof, but are code you maintain
+  and can drift from the real service; pair them with a contract or integration test once drift has
+  bitten you.
+- **Mocks: precise vs coupled.** They verify interactions precisely but couple tests to implementation;
+  they flip from liability to asset only when the interaction is the requirement, such as "never call
+  the payment API twice".
+- **Wide fixture scope: fast vs leaky.** Suites get faster, but one test's mutation leaks into another;
+  use wide scope only for objects nothing mutates, and function scope for everything else.
+- **Patching: reach vs hidden dependency.** It lets you test code you cannot restructure but hides the
+  dependency; when you own the code, injecting the collaborator removes the need for patching.
 
 ## Pitfalls
-- Unspecced `MagicMock` standing in for a client; the symptom is a green test while production raises
-  `AttributeError` or `TypeError` because the method name or signature is wrong.
-- Patching the name where it is defined rather than where it is imported; the symptom is a test that
-  still makes real network calls or fails with a missing API key despite the patch.
-- Asserting on every call and argument; the symptom is dozens of tests failing after a refactor that
-  changed no behaviour, so the team learns to update assertions without reading them.
-- Stubbing the LLM with an idealised reply (perfect JSON, no fences, no preamble); the symptom is a
-  parser that passes every test and fails on the first real response wrapped in markdown fences.
-- Mutating a session-scoped fixture inside a test; the symptom is tests that pass alone and fail
-  depending on order, or only under parallel runs.
-- Using a plain `Mock` for an async client; awaiting its result raises `TypeError: object Mock can't be
-  used in 'await' expression`, or, worse, code that never awaits passes silently. Use `AsyncMock` or
-  autospec, which creates async methods for coroutine functions.
+- **Unspecced `MagicMock` as a client.** Symptom: a green test while production raises `AttributeError`
+  or `TypeError` because the method name or signature is wrong. Fix: autospec.
+- **Patching where defined, not where imported.** Symptom: a test that still makes real network calls or
+  fails with a missing API key despite the patch.
+- **Asserting on every call and argument.** Symptom: dozens of tests fail after a refactor that changed
+  no behaviour, so the team learns to update assertions without reading them.
+- **Idealised LLM stubs.** Perfect JSON, no fences, no preamble. Symptom: a parser that passes every test
+  and fails on the first real response wrapped in markdown fences.
+- **Mutating a session-scoped fixture.** Symptom: tests that pass alone and fail depending on order, or
+  only under parallel runs.
+- **Plain `Mock` for an async client.** Awaiting it raises
+  `TypeError: object Mock can't be used in 'await' expression`, or, worse, code that never awaits passes silently. Use `AsyncMock` or autospec,
+  which creates async methods for coroutine functions.
 
 ## When to use
-Use doubles at the boundary of your process: model APIs, HTTP services, databases, clocks and
-randomness. Do not double your own pure functions or value objects; call them. Default to fakes and
-stubs with state assertions, reach for spec'd mocks when the call is the requirement, and record real
-model responses as stub data so your stubs look like what models actually return, including their
-mess. Every double is a claim about the real dependency, so back the important ones with a contract
-or integration test. In interviews, expect "how do you test code that calls an LLM?"; a good answer
-separates deterministic logic tested with doubles from model quality measured with evals.
+- **Use doubles at the process boundary:** model APIs, HTTP services, databases, clocks and randomness.
+- **Do not double your own code:** call your pure functions and value objects directly.
+- **Default:** fakes and stubs with state assertions; spec'd mocks only when the call is the
+  requirement; recorded real model responses as stub data, including their mess.
+- **Back the important doubles:** every double is a claim about the real dependency, so cover key ones
+  with a contract or integration test.
+- **Interviews:** for "how do you test code that calls an LLM?", separate deterministic logic tested
+  with doubles from model quality measured with evals.
 
 ## Role lens
 - **Engineer:** Builds a shared fake LLM client and factory fixtures so every test can script model
@@ -222,6 +308,42 @@ registry code, and use fake tools that record what they received. Tests then ass
 tool ran with validated arguments, malformed arguments were rejected, the final answer included the
 tool result. I would keep interaction assertions only where the call is the requirement, such as a
 destructive tool never running without approval, and spec every remaining mock against the real class.
+
+## Interview questions
+### What is the difference between a stub, a mock and a fake?
+- **Stub:** returns canned answers to drive a branch, and the test asserts on the code's output (state
+  verification).
+- **Mock:** pre-programmed with call expectations and fails if interactions differ (behaviour
+  verification); Python's `Mock` is really a spy you assert on afterwards.
+- **Fake:** a working, simplified implementation, such as an in-memory vector store that really ranks by
+  cosine similarity. The question to ask is whether the double computes anything or only replays.
+
+### You patched call_llm but the test still makes a real network call. What went wrong?
+- **Most likely the wrong patch target.** If `app/summarize.py` does `from app.llm import call_llm`, the
+  name is looked up in `app.summarize`, so patch `app.summarize.call_llm`, not `app.llm.call_llm`.
+- **Why:** `from x import y` copies a reference at import time and `patch` rebinds only one entry.
+- **Better fix:** inject the client as a parameter or use `patch.object`, so no string path is needed.
+
+### When would you deliberately assert on calls instead of results?
+- **Only when the interaction is the requirement:** an email was sent, a tool ran with these arguments, a
+  charge was not made twice, a destructive tool never ran without approval.
+- **Otherwise prefer state checks**, because asserting on every internal call breaks on refactors that
+  change no behaviour, and teams learn to update assertions without reading them.
+- **Spec the mock** with `create_autospec(..., instance=True)` so signature mistakes still fail.
+
+### How would you test a parser for LLM output so it survives real responses?
+- **Feed it realistic stub data:** sanitised real outputs with markdown fences, preambles and trailing
+  prose, stored as fixture files, because idealised stubs hide exactly the cases that fail in production.
+- **Add each production parse failure as a new fixture file**, so the suite grows from incidents.
+- **Cut at the transport when the SDK parses the response**, using `httpx.MockTransport` or recorded
+  cassettes, so a changed response shape fails the test.
+
+### How do you stop a shared fake LLM from drifting away from the real provider?
+- **Run one behaviour suite against both:** parametrize a fixture over `["fake", "real"]`, mark the real
+  backend `integration` and run it nightly, so drift fails the shared suite.
+- **Back key doubles with contract or recorded-response tests**, re-recording cassettes on SDK upgrades.
+- **Monitor production `AttributeError` or `TypeError` from client calls** that the tests missed; each one
+  is a hole in a double.
 
 ## Quiz
 ### Q: Which double is best described as a working, simplified implementation?

@@ -5,7 +5,7 @@ name: LLM-as-a-judge
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - evals/judge-calibration-and-bias
   - evals/rubrics
@@ -22,105 +22,104 @@ sources:
 ---
 
 ## TL;DR
-LLM-as-a-judge uses a model, given a rubric, the output to assess and often a reference or a second
-output, to grade in place of a human reviewer. It exists because open-ended outputs have no
-exact-match answer and human grading does not scale to hundreds of items per prompt iteration. It is
-only as good as its measured agreement with human labels on your task, because judges carry known
-biases (position, verbosity, self-preference) and grade confidently, right or wrong.
+LLM-as-a-judge has a model grade open-ended outputs against a rubric, often with a reference, in place
+of a human. It scales grading but is only as good as its measured agreement with humans, because
+judges are biased.
 
 ## Why it exists
-A summarizer, a support reply or an agent's final report cannot be graded by string equality. The
-string-overlap metrics inherited from machine translation (BLEU, ROUGE) reward wording, not
-correctness, and correlate poorly with human judgment on open-ended tasks. Embedding similarity cannot
-see that one number in a financial summary is wrong. Humans can, but a prompt iteration loop that
-needs 300 outputs graded ten times a day is a full-time reviewer per engineer, and human grading drifts
-over a long session anyway.
-
-The practical gap is a grader that is cheap, fast, consistent and *good enough*, and a strong language
-model with a clear rubric fills it. The evidence that it can work came from chat-quality comparisons:
-with a capable judge and pairwise prompts, agreement with human preferences reached levels comparable
-to human-human agreement in the MT-Bench study. The evidence that it can fail came from the same line
-of work: judges prefer the answer in the first position, prefer longer answers, prefer their own
-model family's style, and struggle to verify math and code by reading.
-
-The naive alternative, "ask the model to rate it 1 to 10", fails because an undefined scale compresses
-toward 7 or 8, varies with phrasing, and gives you a number you cannot act on or audit. The pattern is
-therefore not "use an LLM to grade" but "design a grader, calibrate it against humans, and keep it
-calibrated".
+- **Open-ended outputs have no exact match.** A summarizer, a support reply or an agent's final report
+  cannot be graded by string equality.
+- **Cheap metrics measure the wrong thing.** BLEU and ROUGE, inherited from machine translation, reward
+  wording, not correctness, and correlate poorly with human judgment on open-ended tasks. Embedding
+  similarity cannot see that one number in a financial summary is wrong.
+- **Humans do not scale.** A prompt iteration loop needing 300 outputs graded ten times a day is a
+  full-time reviewer per engineer, and human grading drifts over a long session anyway.
+- **A strong model with a clear rubric fills the gap**: a grader that is cheap, fast, consistent and
+  *good enough*.
+  - *It can work:* in the MT-Bench study, a capable judge with pairwise prompts reached agreement with
+    human preferences comparable to human-human agreement.
+  - *It can fail:* the same line of work found judges prefer the first position, longer answers and
+    their own model family's style, and struggle to verify math and code by reading.
+- **"Rate it 1 to 10" fails.** An undefined scale compresses toward 7 or 8, varies with phrasing, and
+  gives a number you cannot act on or audit. The pattern is "design a grader, calibrate it against
+  humans, and keep it calibrated".
 
 ## How it works
 ### Modes
-- **Pointwise with a rubric.** The judge sees one output and a rubric and returns pass/fail or a small
-  scale. Binary verdicts per criterion are preferred *because* they are easier to calibrate and to
-  act on than a 1–10 score, and because a rubric decomposed into criteria tells you *what* failed.
-- **Reference-guided.** The judge also sees the golden answer and checks the output against it. This
-  is far more reliable for correctness than unguided judging, *because* the judge no longer has to
-  know the answer, only to compare.
-- **Pairwise.** The judge sees outputs A and B and states a preference. Appropriate for relative
-  comparisons (prompt v1 versus v2, model X versus Y), and mandatory to run in both orders *because*
-  of position bias; a preference that flips when the order flips is a tie.
-- **Probability-weighted scoring.** Instead of taking the judge's single sampled score, read the
-  probabilities it assigns to each score token and report the expected value, as G-Eval does after a
-  chain-of-thought step that writes out the evaluation steps. This turns a coarse 1–5 scale into a
-  continuous score that ties less often, *because* a judge torn between 3 and 4 reports 3.5 instead of
-  whichever token it sampled. It needs log-probabilities from the judge API.
-- **Reference-free quality checks** such as faithfulness: the judge checks each claim in an answer
-  against retrieved context. Here the "reference" is the context, and the rubric is "supported, not
-  supported, contradicted".
+| Mode | Judge sees | Use it for | Because |
+|---|---|---|---|
+| **Pointwise with a rubric** | One output + rubric → pass/fail or a small scale | Absolute gates | Binary verdicts per criterion are easier to calibrate and act on than a 1–10 score, and a decomposed rubric tells you *what* failed |
+| **Reference-guided** | Output + golden answer | Correctness | Far more reliable than unguided judging: the judge no longer has to know the answer, only compare |
+| **Pairwise** | Outputs A and B → preference | Relative comparisons (prompt v1 vs v2, model X vs Y) | Must run in both orders because of position bias; a preference that flips with order is a tie |
+| **Probability-weighted** | Score-token probabilities → expected value | Finer-grained scores | Turns a coarse 1–5 scale into a continuous score that ties less often |
+| **Reference-free quality** | Answer + retrieved context, e.g. faithfulness | RAG grounding | The "reference" is the context; rubric is "supported, not supported, contradicted" |
+
+- **Probability-weighted detail.** G-Eval reads the probabilities the judge assigns to each score token
+  and reports the expected value, after a chain-of-thought step that writes out the evaluation steps. A
+  judge torn between 3 and 4 reports 3.5 instead of whichever token it sampled. It needs
+  log-probabilities from the judge API.
 
 ### Designing the judge prompt
-State the task the output was supposed to do, the criterion in concrete terms with examples of pass and
-fail, and the output format. Ask for a short justification *before* the verdict, *because* reasoning
-first often improves agreement with humans (the evidence is mixed and model-dependent, so measure it
-on your calibration set) and always produces an audit trail you can read when the judge is wrong.
-Return structured output (JSON with `verdict` and `reason`) so the harness never parses prose. Keep each
-judge single-purpose: one criterion per call, *because* a judge asked to assess accuracy, tone and
-completeness at once blurs them into one score. Few-shot examples taken from human-labeled cases, kept
-out of the calibration set, anchor the scale.
+1. **State the task** the output was supposed to do.
+2. **State the criterion concretely,** with examples of pass and fail.
+3. **Ask for a short justification *before* the verdict,** *because* reasoning first often improves
+   agreement with humans (evidence is mixed and model-dependent, so measure it on your calibration set)
+   and always produces an audit trail for when the judge is wrong.
+4. **Return structured output** (JSON with `verdict` and `reason`) so the harness never parses prose.
+
+- **One criterion per call,** *because* a judge asked to assess accuracy, tone and completeness at once
+  blurs them into one score.
+- **Few-shot anchors** from human-labeled cases, kept out of the calibration set, anchor the scale.
 
 ### Known biases and their mitigations
-- **Position bias:** prefers the first (or second) candidate. Swap and require consistency.
-- **Verbosity bias:** prefers longer, more detailed-looking answers. Instruct explicitly, and prefer
-  binary criteria that length cannot satisfy.
-- **Self-enhancement:** prefers outputs in its own style. Use a judge from a different model family
-  than the generator, or at least check agreement by generator.
-- **Surface anchoring:** rewards outputs that echo the reference's wording. Reference-guided rubrics
-  should ask about facts, not phrasing.
-- **Reasoning limits:** judges misgrade math and code by inspection. Use execution and tests there,
-  and keep the judge for what cannot be executed.
+| Bias | What it does | Mitigation |
+|---|---|---|
+| **Position** | Prefers the first (or second) candidate | Swap and require consistency |
+| **Verbosity** | Prefers longer, more detailed-looking answers | Instruct explicitly; prefer binary criteria length cannot satisfy |
+| **Self-enhancement** | Prefers outputs in its own style | Judge from a different model family than the generator, or at least check agreement by generator |
+| **Surface anchoring** | Rewards outputs echoing the reference's wording | Reference-guided rubrics ask about facts, not phrasing |
+| **Reasoning limits** | Misgrades math and code by inspection | Use execution and tests; keep the judge for what cannot be executed |
 
 ### Calibration: the step that makes it an eval
-Build a human-labeled set for the criterion (on the order of a hundred or two items, illustrative, with
-both passes and failures represented). Run the judge, then compute agreement, Cohen's kappa (agreement
-corrected for chance), and per-class recall. For a judge used as a gate, recall on *failures* is the
-number that matters, *because* a judge that passes 95% of items while missing a quarter of real
-failures is a leaky gate. Iterate the judge prompt on a dev split and confirm on a held-out split, the
-same discipline as any model.
+1. **Build a human-labeled set** for the criterion: on the order of a hundred or two items
+   (illustrative), with both passes and failures represented.
+2. **Run the judge and compute** agreement, Cohen's kappa (agreement corrected for chance), and
+   per-class recall.
+3. **For a gate, read recall on *failures*,** *because* a judge that passes 95% of items while missing
+   a quarter of real failures is a leaky gate.
+4. **Iterate on a dev split, confirm on a held-out split,** the same discipline as any model.
 
-Calibration also tells you how wrong the judge's headline number is. A judge with recall *r_pass* on
-human passes and *r_fail* on human failures reports a pass rate that is biased toward whichever error
-it makes more often. If you trust those two rates, the true pass rate can be estimated from the
-observed one as `true ≈ (observed + r_fail − 1) / (r_pass + r_fail − 1)` (the Rogan–Gladen correction
-from diagnostic testing). The correction is only as good as the calibration set, and it fails when the
-generator changes and its errors stop resembling the ones the judge was calibrated on, but it makes
-the point concrete: an uncorrected judge score is an estimate of the judge, not of the system.
+### Correcting the headline number
+A judge with recall *r_pass* on human passes and *r_fail* on human failures reports a pass rate biased
+toward whichever error it makes more often. If you trust those two rates (the Rogan–Gladen correction
+from diagnostic testing):
 
-When one judge is not reliable enough, use several: different model families, or the same judge with
-the candidate order swapped, combined by majority vote. Disagreement between them is a useful flag
-for items to route to a human. Re-calibrate when the generator, the task or the judge model changes,
-and keep sampling live outputs for human spot checks so drift is caught.
+```
+true ≈ (observed + r_fail − 1) / (r_pass + r_fail − 1)
+```
+
+- **Limits:** only as good as the calibration set, and it fails when the generator changes and its
+  errors stop resembling those the judge was calibrated on.
+- **The point:** an uncorrected judge score is an estimate of the judge, not of the system.
+
+### When one judge is not enough
+- **Ensemble:** several judges from different model families, or the same judge with candidate order
+  swapped, combined by majority vote.
+- **Route disagreement to humans:** disagreement between judges flags items for a human.
+- **Re-calibrate** when the generator, the task or the judge model changes, and keep sampling live
+  outputs for human spot checks so drift is caught.
 
 ### Cost and placement
-A judge call costs tokens per item per criterion, so judge cost can exceed generation cost. Use
-deterministic checks for anything deterministic, a smaller model for simple criteria once calibrated,
-and batch offline. Judges belong in the offline harness and in sampled online monitoring; using one as
-a synchronous guardrail adds a full model call to every request's latency and should be a deliberate
-decision.
+- **Judge cost can exceed generation cost:** a judge call costs tokens per item per criterion.
+- **Spend wisely:** deterministic checks for anything deterministic, a smaller model for simple criteria
+  once calibrated, and batch offline.
+- **Placement:** judges belong in the offline harness and in sampled online monitoring. A synchronous
+  guardrail adds a full model call to every request's latency and should be a deliberate decision.
 
-## Example
-A single-criterion, reference-guided binary judge with a reasoning-first JSON verdict, followed by the
-calibration numbers that decide whether it can be trusted. `llm` is any chat-completion call returning
-text; the judge prompt is the part that matters.
+## Examples
+### Reference-guided binary judge and its calibration
+Single criterion, reasoning-first JSON verdict, then the calibration numbers that decide whether it can
+be trusted. `llm` is any chat-completion call returning text; the judge prompt is the part that matters.
 
 ```python
 import json
@@ -160,46 +159,107 @@ def calibrate(items, human: dict[str, bool]) -> dict:
 #   observed pass rate 0.75 vs true 0.70; correction: (0.75 + 0.75 - 1) / (135/140 + 0.75 - 1) ≈ 0.70
 ```
 
-The 90% agreement looks fine; the 75% recall on failures is the number that says the judge is not yet
-good enough to gate a release, and the 15 missed failures are where to look to improve the rubric. The
-judge also overstates quality by 5 points, which matters when comparing two systems: if version B's
-errors are the kind this judge misses more often, B can look better than A while being worse.
+| Calibration number | Value | Reading |
+|---|---|---|
+| Agreement | 90% | Looks fine, but most items pass |
+| Recall on failures | 75% | Misses one real failure in four: not yet good enough to gate a release |
+| Missed failures | 15 | Where to look to improve the rubric |
+| Headline bias | +5 points | Observed 0.75 vs true 0.70 |
+
+- **Why the bias matters:** when comparing two systems, if version B's errors are the kind this judge
+  misses more often, B can look better than A while being worse.
+
+### Pairwise in both orders, plus the corrected pass rate
+Pure Python. Counts order-consistent wins, treats flips as ties, tests the decisive items, and applies
+the correction above.
+
+```python
+from math import comb
+
+def order_consistent(b_second: dict, b_first: dict) -> dict:
+    """Each dict: item id -> winning candidate ('A' or 'B'), named by candidate, not position.
+    b_second: run with A shown first; b_first: run with B shown first."""
+    tally = {"A": 0, "B": 0, "tie": 0}
+    for i in b_second:
+        tally[b_second[i] if b_second[i] == b_first[i] else "tie"] += 1   # flips with order = tie
+    return tally
+
+def sign_test(wins: int, losses: int) -> float:              # two-sided exact test on decisive items
+    n, k = wins + losses, min(wins, losses)
+    return min(1.0, 2 * sum(comb(n, j) for j in range(k + 1)) / 2**n)
+
+def rogan_gladen(observed: float, r_pass: float, r_fail: float) -> float:
+    return (observed + r_fail - 1) / (r_pass + r_fail - 1)
+
+# 100 items: B wins 68 when shown first, 44 when shown second (the quiz scenario)
+b_first = {i: "B" if i < 68 else "A" for i in range(100)}
+b_second = {i: "B" if i < 44 else "A" for i in range(100)}
+t = order_consistent(b_second, b_first)
+print(t, "p =", round(sign_test(t["B"], t["A"]), 3))
+print("corrected pass rate:", round(rogan_gladen(0.75, 135 / 140, 0.75), 3))
+# {'A': 32, 'B': 44, 'tie': 24} p = 0.207
+# corrected pass rate: 0.7
+```
+
+- **Reading it:** a 56% average for B hides 24 order-driven ties. On the 76 decisive items, 44 vs 32
+  is not significant (p ≈ 0.21), so the judge has not shown B is better.
+
+## Production patterns
+- **Judge as a versioned artifact.** Store the judge prompt, the pinned judge model snapshot and its
+  latest calibration report together, and record the judge version in every eval manifest. Monitor
+  score moves that coincide with a judge-version change.
+- **Calibration gate before gating.** Allow a judge to block releases only after its recall on human-
+  labeled failures clears a threshold set from the cost of a missed failure; re-run calibration when
+  the generator, task or judge model changes. Monitor failure recall per calibration run.
+- **Order-swapped pairwise by default.** Run every pairwise comparison in both orders and count flips
+  as ties, as in the example. Monitor the tie rate; a rising rate means position is driving verdicts.
+- **Sampled online judging with a human queue.** Judge a fixed sample of live traffic asynchronously,
+  off the request path, and route judge disagreements and low-scoring items to human reviewers.
+  Monitor judge-human agreement on the reviewed sample week over week.
+- **Structured verdicts, errors kept separate.** Request JSON (a structured-output or JSON mode where
+  the API offers one), validate the `verdict` field, and count unparseable replies as grader errors,
+  not as fails. Monitor the parse-error rate.
+- **Cross-family panel for high-stakes criteria.** Use judges from model families other than the
+  generator, combined by majority vote. Monitor per-judge agreement by generator to catch
+  self-preference.
 
 ## Trade-offs
-- A judge grades hundreds of outputs in minutes for a few dollars, but every verdict carries the
-  judge's biases, so the savings are real only after calibration against human labels on this task.
-- Reference-guided judging is far more accurate for correctness, but it needs a golden answer per
-  item, which is the expensive thing a judge was supposed to avoid; it moves labeling, not removes it.
-- Pairwise preference is more sensitive than absolute scores for comparing two versions, but it
-  requires two runs per item in both orders and yields no absolute pass rate to gate on.
-- A smaller, cheaper judge model cuts eval cost sharply, but its agreement must be re-measured per
-  criterion; cheap judges fail first on subtle factual errors.
-- Reasoning-first verdicts usually help agreement and always help auditability, but add output
-  tokens and latency per item, which matters when the judge is sampled online.
+- **Speed vs bias.** A judge grades hundreds of outputs in minutes for a few dollars, but every verdict
+  carries the judge's biases, so the savings are real only after calibration against human labels on
+  this task.
+- **Reference-guided accuracy vs labeling.** Far more accurate for correctness, but needs a golden
+  answer per item, the expensive thing a judge was supposed to avoid; it moves labeling, not removes it.
+- **Pairwise sensitivity vs gating.** More sensitive than absolute scores for comparing two versions,
+  but needs two runs per item in both orders and yields no absolute pass rate to gate on.
+- **Cheap judge vs subtle errors.** A smaller judge model cuts eval cost sharply, but its agreement must
+  be re-measured per criterion; cheap judges fail first on subtle factual errors.
+- **Reasoning-first vs cost.** It usually helps agreement and always helps auditability, but adds
+  output tokens and latency per item, which matters when the judge is sampled online.
 
 ## Pitfalls
-- Shipping a judge that was never compared with human labels; the symptom is a stable, high offline
-  score alongside user complaints about exactly the failures the judge passes.
-- Grading pairwise in one order only; the symptom is a preference rate near 60–70% for whichever
-  candidate is listed first, regardless of content.
-- One judge for many criteria with a 1–10 score; the symptom is scores clustered at 7–8 with no way to
+- **Shipping a judge never compared with human labels.** Symptom: a stable, high offline score
+  alongside user complaints about exactly the failures the judge passes.
+- **Pairwise in one order only.** Symptom: a preference rate near 60–70% for whichever candidate is
+  listed first, regardless of content.
+- **One judge for many criteria with a 1–10 score.** Symptom: scores clustered at 7–8 with no way to
   say what changed when the average moves by 0.3.
-- Judging the generator with the same model; the symptom is a persistent preference for the house style
+- **Judging the generator with the same model.** Symptom: a persistent preference for the house style
   that disappears when a different judge family is used.
-- Using a judge to verify arithmetic or code correctness by reading; the symptom is confidently passed
-  outputs that fail when executed.
-- Never re-calibrating after a generator change; the symptom is the judge's failure recall quietly
-  dropping as the new generator's errors look different from the ones the rubric anticipated.
+- **Verifying arithmetic or code by reading.** Symptom: confidently passed outputs that fail when
+  executed.
+- **Never re-calibrating after a generator change.** Symptom: failure recall quietly drops as the new
+  generator's errors look different from the ones the rubric anticipated.
 
 ## When to use
-Use a judge for criteria that cannot be checked deterministically: factual agreement with a reference,
-faithfulness to retrieved context, instruction adherence, tone and policy compliance. Do not use it
-where a test, a schema check or a regex will do, or as the sole gate before its failure recall on
-human-labeled items is known. Measure agreement, kappa and per-class recall, report them next to the
-scores the judge produces, and spot-check live outputs continually. In day-to-day work the judge is a
-versioned prompt in the harness with its own calibration report; in interviews, the expected depth is
-naming the biases, explaining why binary rubric criteria beat numeric scales, and describing how you
-would prove a judge is trustworthy before gating a release on it.
+- **Use when:** the criterion cannot be checked deterministically: factual agreement with a reference,
+  faithfulness to retrieved context, instruction adherence, tone and policy compliance.
+- **Avoid when:** a test, a schema check or a regex will do; and never as the sole gate before its
+  failure recall on human-labeled items is known.
+- **Measure:** agreement, kappa and per-class recall, reported next to the scores the judge produces,
+  plus continual spot checks of live outputs.
+- **Day to day:** the judge is a versioned prompt in the harness with its own calibration report.
+- **Interviews:** name the biases, explain why binary rubric criteria beat numeric scales, and describe
+  how you would prove a judge is trustworthy before gating a release on it.
 
 ## Role lens
 - **Engineer:** Writes single-criterion judge prompts with structured verdicts, runs the calibration

@@ -5,7 +5,7 @@ name: Model selection
 kind: decision
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - evals/model-evaluation
   - evals/benchmarking
@@ -21,103 +21,132 @@ sources:
 ---
 
 ## TL;DR
-Model selection is choosing, per task, the cheapest and fastest model that clears a quality bar you
-have measured on your own data, after filtering by hard constraints such as modality, context length,
-deployment location, licensing and tool support. It is a funnel, not a leaderboard lookup, because
-public benchmarks measure a different distribution from your traffic, and because quality has a
-threshold ("good enough for this task") while cost and latency are paid linearly on every call.
+Model selection is a funnel: filter by hard constraints, then pick per task the cheapest, fastest model
+that clears a quality bar measured on your data. Quality has a threshold; cost and latency are paid
+linearly on every call.
 
 ## Why it exists
-At any moment there are dozens of plausible models, spanning one to two orders of magnitude in price
-per token and several-fold in latency, and whichever one you pick is multiplied by every request for
-the life of the feature. The decision therefore deserves a method, and the obvious method is wrong.
-
-"Pick the top of the leaderboard" fails for four reasons. Public benchmarks measure broad ability on
-public data; your task is a narrow distribution with its own format, domain vocabulary and failure
-costs, and the benchmark questions may have leaked into training data. The quality gap between the top
-two or three models on a narrow task is frequently smaller than their cost gap, so the ranking is
-unstable exactly where the money is. Non-quality dimensions often decide feasibility outright: context
-length at your p95 prompt size, reliable structured output, tool-calling behaviour, language coverage,
-rate limits at your peak, data residency, and the provider's deprecation cadence. And your prompt was
-tuned on the model you started with, so a naive swap systematically underrates every other candidate.
-
-"Pick the cheapest and hope" fails on the tail: the errors a weaker model makes concentrate in the
-hard, high-stakes cases, which are precisely the ones that generate support tickets or compliance
-findings.
-
-The reasoning that resolves this: quality has a threshold value. Below the bar the feature does not
-work; above it, extra points rarely change the business outcome. Cost and latency, by contrast, are
-linear in volume. So the optimum is not the best model but the cheapest model that clears the bar with
-a margin, and the only way to know which one that is to measure your task.
+- **The choice is multiplied by every request.** At any moment dozens of plausible models span one to
+  two orders of magnitude in price per token and several-fold in latency, and the pick is paid for the
+  life of the feature. It deserves a method, and the obvious method is wrong.
+- **"Top of the leaderboard" fails for four reasons.** (1) Benchmarks measure broad ability on public
+  data, not your narrow distribution, vocabulary and failure costs, and may have leaked into training.
+  (2) The quality gap among the top two or three is often smaller than their cost gap, so the ranking is
+  unstable exactly where the money is. (3) Non-quality dimensions decide feasibility. (4) Your prompt
+  was tuned on the starting model, so a naive swap underrates every other candidate.
+- **The feasibility dimensions.** Context length at your p95 prompt size, reliable structured output,
+  tool-calling behaviour, language coverage, rate limits at your peak, data residency and the
+  provider's deprecation cadence.
+- **"Cheapest and hope" fails on the tail.** A weaker model's errors concentrate in the hard,
+  high-stakes cases, precisely the ones that generate support tickets or compliance findings.
+- **Threshold versus linear.** Below the bar the feature does not work; above it, extra points rarely
+  change the outcome, while cost and latency grow with volume. So the optimum is the cheapest model that
+  clears the bar with a margin, and only measuring your task tells you which.
 
 ## How it works
 ### Step 1: apply hard constraints first
-Filter before you evaluate quality, because no quality number rescues a model that cannot run where
-the data is. The usual gates: modality (text, vision, audio); context window versus your *measured*
-p95 prompt size, not the mean; native structured output or JSON-schema support; tool calling;
-languages; deployment constraints (a region, a VPC, on-prem or air-gapped, which narrows the field to
-open-weight models or private endpoints); licence terms; quota and rate limits at launch peak; the
-provider's version pinning and deprecation policy; data-use and retention terms.
+Filter before evaluating quality, *because* no quality number rescues a model that cannot run where the
+data is. The usual gates:
+- **Modality:** text, vision, audio.
+- **Context window** versus your *measured* p95 prompt size, not the mean.
+- **Output and tools:** native structured output or JSON-schema support; tool calling; languages.
+- **Deployment:** a region, a VPC, on-prem or air-gapped, which narrows the field to open-weight models
+  or private endpoints.
+- **Commercial terms:** licence terms; quota and rate limits at launch peak; version pinning and
+  deprecation policy; data-use and retention terms.
 
 ### Step 2: build the task evaluation before touching candidates
-Fifty to a few hundred examples drawn from real or realistic traffic, with expected outputs or a
-scoring rubric, and a metric that is the task's own: exact or normalised match for extraction and
-classification, citation faithfulness for retrieval-augmented answers, a calibrated LLM-as-judge rubric
-for free-form generation, pass@k for code. Build it first *because* otherwise the prompt gets tuned to
-the first model tried and every later comparison is biased toward the incumbent. The set should
-over-sample the hard and high-cost cases, since that is where candidates differ.
+- **Size and source.** Fifty to a few hundred examples from real or realistic traffic, with expected
+  outputs or a scoring rubric.
+- **The task's own metric.** Exact or normalised match for extraction and classification; citation
+  faithfulness for retrieval-augmented answers; a calibrated LLM-as-judge rubric for free-form
+  generation; pass@k for code.
+- **First, because of bias.** Otherwise the prompt gets tuned to the first model tried and every later
+  comparison favours the incumbent.
+- **Over-sample the hard cases.** Hard and high-cost cases are where candidates differ.
 
 ### Step 3: run candidates fairly
-Same examples, same prompt structure, then a bounded, equal amount of prompt adaptation per model,
-because format sensitivity differs between families and zero adaptation punishes the newcomer. Fix
-sampling settings, run several seeds, and report a mean with a confidence interval: on 100 examples a
-proportion near 0.9 has a 95% half-width of roughly ±6 points (1.96 × √(0.9 × 0.1 / 100) ≈ 0.059), so a
-2-point gap is noise. Two consequences follow from that formula. Repeated runs only average out
-sampling randomness; they do not shrink the error from having drawn *these* 100 examples, which only
-more examples can do, and halving the interval needs four times as many (about 860 examples for ±2
-points at 0.9). And because every candidate runs on the same examples, compare them **paired**: count
-the examples only model A gets right and only model B gets right (McNemar's test uses exactly these
-discordant counts). Pairing cancels the difficulty of each example, so it detects real differences
-that two overlapping intervals hide, and it tells you *how* the models differ: few discordant examples
-means they behave alike; many in both directions means they fail on different inputs, which argues for
-a cascade rather than a straight swap. Keep the set private; a model that has seen your examples is not
-being evaluated.
+1. **Same examples, same prompt structure,** then a bounded, equal amount of prompt adaptation per
+   model, *because* format sensitivity differs between families and zero adaptation punishes the newcomer.
+2. **Fix sampling settings, run several seeds,** and report a mean with a confidence interval.
+3. **Know the noise floor.** On 100 examples a proportion near 0.9 has a 95% half-width of roughly ±6
+   points, so a 2-point gap is noise:
+
+| Fact from the formula | Consequence |
+|---|---|
+| 1.96 × √(0.9 × 0.1 / 100) ≈ 0.059 | a 2-point gap on 100 examples is noise |
+| Repeated runs average only sampling randomness | they do not shrink the error from drawing *these* 100 examples; only more examples do |
+| Halving the interval needs four times as many examples | about 860 examples for ±2 points at 0.9 |
+
+4. **Compare paired.** Every candidate runs on the same examples, so count the examples only model A
+   gets right and only model B gets right (McNemar's test uses exactly these discordant counts).
+   Pairing cancels each example's difficulty, so it detects real differences two overlapping intervals
+   hide.
+5. **Read the discordance pattern.** Few discordant examples means the models behave alike. Many in both
+   directions means they fail on different inputs, which argues for a cascade rather than a straight swap.
+6. **Keep the set private.** A model that has seen your examples is not being evaluated.
 
 ### Step 4: measure cost and latency on real request shapes
-Cost per request is input tokens × input price plus output tokens × output price, adjusted for cached
-prefixes. Measure the tokens from the eval runs rather than estimating, *because* tokenizers differ
-across families (the same document can be 20–30% more tokens in one than another, and more for
-non-English text) and because output verbosity differs. For reasoning models the hidden reasoning
-tokens are billed as output on most providers and can dominate, so price per token alone misleads. Measure time to
-first token and total latency at p50 and p95, under realistic concurrency, at the hours you will run.
-The number to compare is not cost per call but
+- **Cost per request** = input tokens × input price + output tokens × output price, adjusted for cached
+  prefixes.
+- **Measure tokens from the eval runs, don't estimate,** *because* tokenizers differ across families
+  (the same document can be 20–30% more tokens in one than another, and more for non-English text) and
+  output verbosity differs.
+- **Reasoning models.** Hidden reasoning tokens are billed as output on most providers and can dominate,
+  so price per token alone misleads.
+- **Latency.** Time to first token and total latency at p50 and p95, under realistic concurrency, at
+  the hours you will run.
+
+The number to compare is not cost per call but:
 
 ```
 cost per successful task = (cost of all calls, including retries after format failures and escalations)
                            ÷ (tasks that pass the eval)
 ```
 
-*because* a model that is 40% cheaper per call but needs a retry on one call in five, or escalates
-often, can lose its advantage once the denominator and the extra calls are counted.
+*Because* a model 40% cheaper per call that needs a retry on one call in five, or escalates often, can
+lose its advantage once the denominator and the extra calls are counted.
 
 ### Step 5: find the frontier and apply the rule
-Lay candidates out on quality versus cost versus latency and discard any model that another beats on
-all three. Among the rest, choose the cheapest whose *lower* confidence bound clears the bar and whose
-p95 fits the latency budget. If the cheap model fails only on an identifiable tail, consider a cascade:
-cheap model by default with escalation to a stronger one on low confidence or a trigger condition,
-which is often cheaper than running the strong model everywhere.
+1. **Plot** candidates on quality versus cost versus latency.
+2. **Discard** any model another beats on all three.
+3. **Choose** the cheapest whose *lower* confidence bound clears the bar and whose p95 fits the
+   latency budget.
+4. **Consider a cascade** if the cheap model fails only on an identifiable tail: cheap by default,
+   escalating to a stronger one on low confidence or a trigger condition, often cheaper than running
+   the strong model everywhere.
 
 ### Step 6: operational factors and re-evaluation
-Pin an exact model version, never a floating alias, so quality cannot change under you. Check for a
-second source: a fallback model that also clears the bar, even at higher cost, turns an outage or a
-deprecation notice into a configuration change. Then schedule re-selection: when a deprecation is
-announced, when a new model could move the frontier, or on a fixed cadence. The eval set is what
-makes each re-run cheap; this is the compounding payoff of having built it first.
+- **Pin an exact model version,** never a floating alias, so quality cannot change under you.
+- **Have a second source.** A fallback model that also clears the bar, even at higher cost, turns an
+  outage or deprecation notice into a configuration change.
+- **Schedule re-selection:** when a deprecation is announced, when a new model could move the frontier,
+  or on a fixed cadence. The eval set makes each re-run cheap; this is the compounding payoff of
+  building it first.
 
-## Example
-A small harness that applies the funnel's quantitative steps. Each candidate exposes a `call` that
-returns the text plus the measured token counts; prices are placeholders you fill from the provider's
-current sheet. The selection rule requires the lower confidence bound, not the mean, to clear the bar.
+## Diagram
+The selection funnel: hard constraints remove candidates before any quality work, and the rule at the
+bottom compares lower confidence bounds with the bar, not leaderboard ranks.
+
+```mermaid
+flowchart TD
+    A["All plausible models"] --> F["Step 1: hard constraints - modality, context at p95, deployment, terms"]
+    F -->|"eligible only"| E["Step 2: private task eval set, built first"]
+    E --> R["Step 3: fair runs - equal prompt adaptation, seeds, paired comparison"]
+    R --> C["Step 4: measured tokens, cost per successful task, p95 latency"]
+    C --> P["Step 5: drop dominated models, keep the frontier"]
+    P --> Q{"Cheapest model whose lower bound clears the bar and p95 fits?"}
+    Q -->|"yes"| S["Pin exact version, add second source, write ADR"]
+    Q -->|"cheap model fails only on a tail"| K["Cascade: cheap default, escalate on trigger"]
+    Q -->|"none"| N["Prompt work, retrieval, cascade or fine-tune"]
+    S -.->|"deprecation, new release or cadence"| E
+```
+
+## Examples
+### Selection harness for the quantitative steps
+Each candidate exposes a `call` that returns the text plus the measured token counts; prices are
+placeholders you fill from the provider's current sheet. The rule requires the lower confidence bound,
+not the mean, to clear the bar.
 
 ```python
 import statistics, time
@@ -157,44 +186,107 @@ def select(results, bar, max_p95):
 # print(select(results, bar=0.92, max_p95=2.5))
 ```
 
-If `select` returns `None`, no candidate clears the bar within budget; the next moves are prompt work,
-retrieval improvements, a cascade, or fine-tuning a smaller model, in roughly that order of cost.
+If `select` returns `None`, no candidate clears the bar within budget. The next moves, in roughly that
+order of cost: prompt work, retrieval improvements, a cascade, or fine-tuning a smaller model.
+
+### Is the gap real? Interval width and the paired test
+Runnable, standard library only. It reproduces the noise-floor numbers above and the paired reading
+used in Check yourself.
+
+```python
+from math import comb, sqrt
+
+def half_width(p, n, z=1.96):
+    """95% half-width of a proportion; only more examples shrink it."""
+    return z * sqrt(p * (1 - p) / n)
+
+def mcnemar_exact(only_a, only_b):
+    """Two-sided exact McNemar p-value from the discordant counts."""
+    n, k = only_a + only_b, min(only_a, only_b)
+    return min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n)
+
+for n in (60, 100, 400, 860):
+    print(f"n={n:4d}  p=0.9  ±{half_width(0.9, n):.3f}")
+# n=60 ±0.076, n=100 ±0.059, n=400 ±0.029, n=860 ±0.020
+print("3 vs 1  p =", round(mcnemar_exact(3, 1), 3))     # 0.625: few disagreements, models alike
+print("14 vs 12 p =", round(mcnemar_exact(14, 12), 3))  # 0.845: many both ways, different failures
+```
+
+Both 2-point gaps are statistically invisible, but they mean different things: the first says "read
+those four examples", the second says "the models fail on different inputs; consider a cascade".
+
+### Worked scenario: the 40%-cheaper model that costs more
+Illustrative numbers, normalised so the strong model costs 1.0 per call.
+
+| | Strong model | Cheap model |
+|---|---|---|
+| Cost per call | 1.0 | 0.6 (40% cheaper) |
+| Cost with retries (one call in five retried) | 1.0 | 0.6 × 1.2 calls = 0.72 |
+| Escalations to the strong model | none | 25% of tasks → +0.25 |
+| Spend per task | 1.0 | 0.97 |
+| Tasks that pass the eval | 95% | 90% |
+| **Cost per successful task** | **1.05** | **1.08** |
+
+The per-call price says "save 40%"; the per-successful-task number says the swap loses money.
+
+## Production patterns
+- **Selection ADR with an evidence table.** For every model choice. Record each candidate's eval score
+  with its interval, cost per successful task, p95 latency and failure categories, plus the re-selection
+  triggers. Monitor whether production metrics stay inside the ADR's assumptions.
+- **Pinned version in config, never an alias.** For every production route. Store the dated model
+  identifier in configuration behind one model interface, so a change is a reviewed config diff. Monitor
+  provider deprecation notices and have a re-selection ticket opened automatically.
+- **Exercised second source.** For any user-facing route. Configure a fallback model that also clears
+  the bar and send a small scheduled share of traffic or a synthetic test through it, so it is not first
+  used during an outage. Monitor 429 and 5xx rates per provider and fallback success rate.
+- **Shadow comparison before a swap.** When a cheaper or newer candidate looks viable offline. Send a
+  sample of production requests to the candidate in parallel without showing its answers, then score
+  both offline. Monitor the paired disagreement rate and which categories the disagreements fall into.
+- **Log provider-reported usage per request.** Always. Store input, output and cached token counts
+  from each response next to the trace, so cost per successful task is computed from data. Monitor
+  forecast-versus-bill error and output-token growth per route.
+- **Scheduled re-run of the eval.** On a fixed cadence and on deprecation notices. Run the same
+  harness against current candidates and compare lower bounds with the bar. Monitor the frontier, not
+  release announcements.
 
 ## Trade-offs
-- "Cheapest that clears the bar" minimises spend but leaves little headroom when the traffic
-  distribution drifts harder; if your task changes often, buy margin with a stronger model or a cascade.
-- A private eval set gives a trustworthy comparison but costs expert time and goes stale; a small set
-  has wide confidence intervals, so differences of a few points cannot be acted on.
-- Adapting the prompt per candidate makes the comparison fair but multiplies the effort; skipping it
-  is cheaper and systematically favours the incumbent model.
-- Standardising on one provider's best model simplifies operations but concentrates deprecation and
-  outage risk; a second source doubles evaluation work and halves the blast radius.
-- Reasoning-heavy models raise quality on genuinely hard tasks but bring high output-token cost and
-  latency variance; the choice flips as soon as the task is not reasoning-bound.
+- **Cheapest-that-clears vs headroom.** It minimises spend but leaves little margin when traffic drifts
+  harder; if your task changes often, buy margin with a stronger model or a cascade.
+- **Private eval set vs effort.** It gives a trustworthy comparison but costs expert time and goes
+  stale; a small set has wide intervals, so differences of a few points cannot be acted on.
+- **Per-candidate prompt adaptation vs effort.** It makes the comparison fair but multiplies the work;
+  skipping it is cheaper and systematically favours the incumbent model.
+- **One provider vs second source.** Standardising on one provider's best model simplifies operations
+  but concentrates deprecation and outage risk; a second source doubles evaluation work and halves the
+  blast radius.
+- **Reasoning-heavy models vs cost and variance.** They raise quality on genuinely hard tasks but bring
+  high output-token cost and latency variance; the choice flips as soon as the task is not reasoning-bound.
 
 ## Pitfalls
-- Choosing on public leaderboard rank. Symptom: the "better" model scores lower on your eval, or wins
+- **Choosing on public leaderboard rank.** Symptom: the "better" model scores lower on your eval, or wins
   it and then fails on JSON formatting or tool calls in production.
-- Estimating cost from list price without measuring tokens. Symptom: the bill differs from the forecast
-  by a large fraction because of tokenizer differences or verbose outputs.
-- Comparing single runs and treating a 2-point gap as real. Symptom: the ranking flips when someone
+- **Estimating cost from list price without measuring tokens.** Symptom: the bill differs from the
+  forecast by a large fraction because of tokenizer differences or verbose outputs.
+- **Comparing single runs and treating a 2-point gap as real.** Symptom: the ranking flips when someone
   re-runs the comparison the following week.
-- Deploying a floating "latest" alias. Symptom: quality or format changes overnight with no deploy and
-  no entry in the change log.
-- Ignoring quotas and rate limits at peak. Symptom: 429 errors at launch, and the fallback path has
+- **Deploying a floating "latest" alias.** Symptom: quality or format changes overnight with no deploy
+  and no entry in the change log.
+- **Ignoring quotas and rate limits at peak.** Symptom: 429 errors at launch, and the fallback path has
   never been exercised.
-- Evaluating in English only for a multilingual product. Symptom: context overflows and higher cost for
-  languages whose tokenization is two to three times less efficient.
+- **Evaluating in English only for a multilingual product.** Symptom: context overflows and higher cost
+  for languages whose tokenization is two to three times less efficient.
 
 ## When to use
-Run the funnel whenever a new task is introduced, when a deprecation notice arrives, when a model
-release plausibly moves the quality-cost frontier, or when the latency or cost target changes. Do not
-re-select on every release announcement; the eval harness makes a scheduled re-run cheap, so put it on
-a cadence instead. Track eval score with its interval, cost per successful task, p95 latency, and
-failure rates by category (format, refusal, timeout). Day to day this shows up as "can we move this
-to the cheaper model", and the honest answer is always "the eval says". In interviews, articulating
-the threshold-versus-linear reasoning, the hard-constraint filter, and "I would build the eval set
-first" is the expected depth; naming a favourite model is not.
+- **Run the funnel when:** a new task is introduced, a deprecation notice arrives, a model release
+  plausibly moves the quality-cost frontier, or the latency or cost target changes.
+- **Avoid:** re-selecting on every release announcement. The eval harness makes a scheduled re-run
+  cheap, so put it on a cadence instead.
+- **Measure:** eval score with its interval, cost per successful task, p95 latency, and failure rates by
+  category (format, refusal, timeout).
+- **Day to day:** this shows up as "can we move this to the cheaper model", and the honest answer is
+  always "the eval says".
+- **Interviews:** articulate the threshold-versus-linear reasoning, the hard-constraint filter, and "I
+  would build the eval set first"; naming a favourite model is not the expected depth.
 
 ## Role lens
 - **Engineer:** Owns the eval harness, measures real token counts and latency percentiles, and keeps
@@ -221,6 +313,43 @@ latency, rate limits at peak, and the real cost ratio measured from tokens, sinc
 Fourth, consider a cascade, cheap by default with escalation on low confidence, which may capture most
 of the saving while covering the tail. I would say no if the lower bound misses the bar or the misses
 land in the costly category.
+
+## Interview questions
+### How would you choose a model for a new production task?
+- **Filter on hard constraints first:** modality, context window against measured p95 prompt size,
+  structured output and tools, deployment region or environment, licence and rate limits.
+- **Build a private task eval set before trying candidates,** because otherwise the prompt is tuned to
+  the first model and every comparison favours it.
+- **Pick the cheapest model whose lower confidence bound clears the bar** and whose p95 fits the latency
+  budget, then pin the version and keep a second source.
+
+### Why is "quality is a threshold, cost is linear" the core of the decision?
+- **Below the bar the feature does not work;** above it, extra points rarely change the outcome.
+- **Cost and latency are paid on every call** and grow with volume, for the life of the feature.
+- **So the optimum is the cheapest model that clears the bar with a margin,** and only measuring your
+  own task tells you which one that is.
+
+### Your forecast said the new model would cost 30% less, but the first bill matched the old one. What went wrong?
+- **Tokens were estimated, not measured.** Tokenizers differ across families, so the same document can
+  be 20-30% more tokens in one, and more for non-English text.
+- **Output verbosity and hidden reasoning tokens,** which most providers bill as output, can dominate.
+- **Retries and escalations were left out of the denominator.** Compare cost per successful task
+  computed from provider-reported usage logged per request.
+
+### How do you make a comparison between the incumbent model and a newcomer fair?
+- **Same examples, same prompt structure,** then a bounded, equal amount of prompt adaptation per model,
+  because format sensitivity differs between families and zero adaptation punishes the newcomer.
+- **Fix sampling settings and run several seeds,** reporting a mean with a confidence interval over
+  examples, not over example-times-run.
+- **Keep the set private and over-sample hard cases,** because a model that has seen your examples is
+  not being evaluated and the hard cases are where candidates differ.
+
+### When would you deliberately not pick the cheapest model that clears the bar?
+- **When the task drifts often.** The cheapest-that-clears choice leaves little headroom, so buy margin
+  with a stronger model or a cascade.
+- **When the misses cluster in a high-cost class,** such as wrong citations on compliance questions, even
+  if the total score is close.
+- **When it cannot hold the rate limits or p95 at peak,** because feasibility beats a quality score.
 
 ## Quiz
 ### Q: Why is "pick the model at the top of a public leaderboard" a poor selection rule?

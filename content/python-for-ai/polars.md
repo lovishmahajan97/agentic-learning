@@ -5,7 +5,7 @@ name: polars
 kind: tool
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - python-for-ai/pandas
   - python-for-ai/pyarrow
@@ -20,41 +20,42 @@ sources:
 ---
 
 ## TL;DR
-Polars is a DataFrame library written in Rust on the Arrow columnar memory model, with an expression API
-and a lazy mode that turns your code into a query plan, optimizes it (pushing filters and column
-selection down into the file scan) and runs it on all cores. For tables from a few gigabytes upward,
-or pipelines that run repeatedly, it is typically much faster and leaner than pandas; the price is a
-different, stricter API and no row index.
+Polars is a Rust DataFrame library on Arrow memory. Its lazy mode optimizes a query plan, pushing
+filters and columns into the scan, and uses all cores, so recurring or multi-gigabyte pipelines
+typically run much faster than in pandas; the API is stricter.
 
 ## Why it exists
-pandas was designed when a single core and a few hundred megabytes were the norm. Its execution model
-shows that: each operation runs eagerly, materializes a full intermediate result, mostly on one core,
-and string columns have historically been arrays of Python objects. Point it at 50 GB of agent traces to
-compute daily token usage per model and you read every column of every file into memory, filter
-afterwards, and wait on one core while the others idle.
-
-Two things are needed to do better. The first is a memory layout built for analytics: typed, contiguous
-columns with a proper string representation and real null handling, so scans and aggregations are
-cache-friendly and vectorizable. Apache Arrow defines exactly that. The second is a query engine rather
-than a function library: if the library sees the whole computation before running it, it can skip
-columns that are never used, apply filters while reading the file instead of after, and split work
-across threads. Databases have done this for decades; Polars brings it to a DataFrame API that lives in
-a Python process, with no server to run.
+- **pandas was designed for one core and a few hundred megabytes.** Each operation runs eagerly,
+  materializes a full intermediate, mostly on one core, and strings have historically been arrays of
+  Python objects.
+- **That breaks at trace scale.** Point it at 50 GB of agent traces to compute daily token usage per
+  model and you read every column of every file into memory, filter afterwards, and wait on one core
+  while the others idle.
+- **Fix one: an analytics memory layout.** Typed, contiguous columns with a proper string representation
+  and real null handling, so scans and aggregations are cache-friendly and vectorizable. Apache Arrow
+  defines exactly that.
+- **Fix two: a query engine, not a function library.** Seeing the whole computation first lets it skip
+  unused columns, apply filters while reading instead of after, and split work across threads.
+- **Databases have done this for decades.** Polars brings it to a DataFrame API inside a Python process,
+  with no server to run.
 
 ## How it works
 ### Expressions, not row functions
-Computation is described with expressions: `pl.col("latency_ms").quantile(0.95)`,
-`(pl.col("out_tokens") / 1000 * pl.col("price")).alias("cost")`, `pl.when(cond).then(a).otherwise(b)`.
-An expression is a description of a column computation, not a result. Contexts apply them:
-`select`, `with_columns`, `filter`, and `group_by(...).agg(...)`. Because expressions are declarative,
-Polars can run independent expressions in parallel and optimize them, which a Python lambda executed per
-row would prevent. Python UDFs (`map_elements`) exist but drop you back to interpreter speed.
+- **Expressions describe a column computation, not a result:** `pl.col("latency_ms").quantile(0.95)`,
+  `(pl.col("out_tokens") / 1000 * pl.col("price")).alias("cost")`,
+  `pl.when(cond).then(a).otherwise(b)`.
+- **Contexts apply them:** `select`, `with_columns`, `filter`, and `group_by(...).agg(...)`.
+- **Why declarative.** Polars can run independent expressions in parallel and optimize them, which a
+  Python lambda executed per row would prevent.
+- **Escape hatch.** Python UDFs (`map_elements`) exist but drop you back to interpreter speed.
 
 ### Eager and lazy
-`pl.read_parquet` returns a `DataFrame` immediately, like pandas. `pl.scan_parquet` (also `scan_csv`,
-`scan_ndjson`) returns a `LazyFrame`: each subsequent call adds a node to a logical plan and nothing is
-read until `.collect()`. Before executing, the optimizer applies rules such as:
+| Call | Returns | When it reads |
+|---|---|---|
+| `pl.read_parquet` | `DataFrame` | Immediately, like pandas |
+| `pl.scan_parquet` (also `scan_csv`, `scan_ndjson`) | `LazyFrame` | Nothing until `.collect()`; each call adds a node to a logical plan |
 
+Before executing, the optimizer applies rules such as:
 - **Projection pushdown:** only columns referenced anywhere in the plan are read from disk.
 - **Predicate pushdown:** filters move into the scan, so Parquet row groups whose statistics rule them
   out can be skipped.
@@ -63,27 +64,30 @@ read until `.collect()`. Before executing, the optimizer applies rules such as:
 `lf.explain()` prints the optimized plan, so you can verify what will be read.
 
 ### Memory and parallelism
-Columns are Arrow-style buffers with a validity bitmap for nulls, so `null` is distinct from a float
-`NaN` and an integer column with missing values stays an integer column. The engine is multi-threaded
-in Rust, outside the GIL, so a group-by uses all cores without multiprocessing. A parallel group-by
-works the way a distributed one does: threads hash rows into partitions, build partial aggregates
-independently, and merge them. That is why output group order is not guaranteed unless you pass
-`maintain_order=True` (which costs speed), and why it matters for tests and reports that compare
-frames row by row. For data larger than RAM, Polars has a streaming engine that processes the plan in
-batches, and `sink_parquet` writes a lazy result straight to disk without materializing it; how you
-enable streaming has changed across releases, so check the docs for your version.
+- **Arrow-style buffers with a validity bitmap.** `null` is distinct from a float `NaN`, and an integer
+  column with missing values stays an integer column.
+- **Multi-threaded Rust, outside the GIL.** A group-by uses all cores without multiprocessing.
+- **Parallel group-by works like a distributed one.** Threads hash rows into partitions, build partial
+  aggregates independently, and merge them.
+- **So group order is not guaranteed** unless you pass `maintain_order=True` (which costs speed). That
+  matters for tests and reports that compare frames row by row.
+- **Larger than RAM.** A streaming engine processes the plan in batches, and `sink_parquet` writes a lazy
+  result straight to disk without materializing it. How you enable streaming has changed across
+  releases, so check the docs for your version.
 
 ### No index, strict types
-There is no row index and no label alignment: rows are positions, and joins are explicit. Schemas are
-strict; mixing types in a column or comparing incompatible dtypes raises an error rather than silently
-becoming `object`. This is a deliberate trade: fewer silent surprises, more errors up front.
+- **No row index, no label alignment.** Rows are positions, and joins are explicit.
+- **Strict schemas.** Mixing types in a column or comparing incompatible dtypes raises an error rather
+  than silently becoming `object`.
+- **The deliberate trade:** fewer silent surprises, more errors up front.
 
 ### Interop
-Because both speak Arrow, conversion to and from pyarrow is typically zero-copy, and `to_pandas()`
-exists for libraries that only accept pandas. Many plotting and ML libraries accept Polars frames
-directly now, but not all.
+- **Arrow on both sides.** Conversion to and from pyarrow is typically zero-copy.
+- **`to_pandas()`** exists for libraries that only accept pandas. Many plotting and ML libraries accept
+  Polars frames directly now, but not all.
 
-## Example
+## Examples
+### Daily token usage from trace files, read lazily
 Daily token usage per model from a directory of trace files, read lazily.
 
 ```python
@@ -110,44 +114,91 @@ daily = lf.collect()  # multi-threaded execution happens here
 daily.write_parquet("daily_usage.parquet")
 ```
 
-Suppose the trace files hold 40 columns, including large prompt and completion text fields, and only
-rows from 1 October onward are needed. The plan reads 7 numeric or short columns and skips row groups whose `ts`
-statistics fall before October, so the bytes read can be a small fraction of the dataset. The
-equivalent eager pandas code would load all 40 columns, text included, before filtering.
+Suppose the trace files hold 40 columns, including large prompt and completion text, and only rows from
+1 October onward are needed:
+
+| | Eager pandas | Lazy Polars |
+|---|---|---|
+| Columns read | All 40, text included | 7 numeric or short columns |
+| Rows read | All, filtered afterwards | Row groups whose `ts` statistics fall before October are skipped |
+| Bytes read | The whole dataset | Can be a small fraction of it |
+
+### Clean a fine-tuning set with an explicit schema
+Raw JSONL with a field that is "always an integer" until it is not. An explicit schema fails fast and
+predictably, and the dedupe runs in parallel native code.
+
+```python
+import polars as pl
+
+schema = {"id": pl.String, "prompt": pl.String, "completion": pl.String,
+          "source": pl.String, "quality": pl.Float64}
+
+lf = (
+    pl.scan_ndjson("raw/sft.jsonl", schema=schema)       # no inference from the first rows
+      .filter(pl.col("quality") >= 0.7)
+      .with_columns(pl.col("prompt").str.strip_chars().str.to_lowercase().alias("key"))
+      .unique(subset=["key"], keep="first", maintain_order=True)   # deterministic output order
+      .drop("key")
+)
+clean = lf.collect()
+print(clean.height, clean.null_count())                  # rows kept, nulls per column
+clean.write_parquet("clean/sft.parquet")
+```
+
+- **No `map_elements`:** normalisation uses built-in string expressions, so it stays parallel.
+- **`maintain_order=True`** keeps reruns diffable, at some speed cost.
+
+## Production patterns
+- **Lazy scan, then read the plan.** Build pipelines from `scan_parquet`/`scan_ndjson` and review
+  `lf.explain()` whenever a pipeline changes, checking that filters and projections sit in the scan.
+  Monitor bytes read and peak memory per run; a sudden jump usually means an early `.collect()` crept in.
+- **Explicit schemas at ingestion.** Pass `schema=` to scans of JSONL, or `schema_overrides=` for CSV, for
+  every source you do not control. Track ingestion failures by source; a type error there beats a
+  silently wrong column downstream.
+- **Deterministic outputs.** End report pipelines with an explicit `.sort(...)` (or `maintain_order=True`
+  where order matters) before writing or diffing. Monitor flaky report diffs and tests; they usually
+  trace back to group order.
+- **Lay out Parquet for skipping.** Sort or partition files by the common filter key (date, customer)
+  before `write_parquet`, so row-group statistics are tight and predicate pushdown can skip data. Watch
+  row groups read versus total in your profiling.
+- **Pin the version and fail on deprecations.** Pin Polars in the lockfile and treat deprecation warnings
+  as errors in CI, because names such as `groupby` became `group_by` and other APIs evolved quickly.
+  Convert with `to_pandas()` or to Arrow only at library boundaries.
 
 ## Trade-offs
-- Lazy plans with pushdown and parallelism are fast on large data, but debugging means reading a
-  query plan instead of inspecting intermediate frames; for small exploratory data, eager mode or pandas
-  is just as quick to write.
-- Strict types and no index remove pandas' silent alignment and dtype drift, at the cost of more upfront
-  casting and errors when ingesting messy JSON or CSV.
-- Faster and leaner than pandas on most analytical workloads, yet its ecosystem is younger, so some
-  libraries still expect pandas and you pay a conversion at the boundary.
-- An in-process engine needs no server, but it has no concurrency control, durability or access
-  management; once many users share the data, a warehouse or database wins.
+- **Speed vs debuggability.** Lazy plans with pushdown and parallelism are fast on large data, but
+  debugging means reading a query plan instead of inspecting intermediate frames; for small exploratory
+  data, eager mode or pandas is just as quick to write.
+- **Strictness vs ingestion friction.** Strict types and no index remove pandas' silent alignment and
+  dtype drift, at the cost of more upfront casting and errors on messy JSON or CSV.
+- **Performance vs ecosystem.** Faster and leaner than pandas on most analytical workloads, yet younger,
+  so some libraries still expect pandas and you pay a conversion at the boundary.
+- **No server vs no governance.** An in-process engine needs no server, but has no concurrency control,
+  durability or access management; once many users share the data, a warehouse or database wins.
 
 ## Pitfalls
-- Writing pandas habits in Polars, such as `map_elements` with Python lambdas; the symptom is Polars code
-  running no faster than pandas and using one core.
-- Calling `.collect()` early and continuing eagerly; the symptom is memory spikes, because pushdown can
-  only apply to the part of the plan built before collecting.
-- Confusing `null` and `NaN`; the symptom is `drop_nulls()` leaving NaN rows behind, or averages that
-  come out NaN.
-- Assuming code copied from older blog posts still runs; the symptom is `AttributeError` or deprecation
-  warnings because names such as `groupby` became `group_by` and other APIs evolved quickly.
-- Relying on `group_by` output order; the symptom is a test or a diff of a daily report that fails
-  intermittently with the same data, because groups come back in a different order each run. Sort
-  explicitly or pass `maintain_order=True`.
-- Reading wide JSONL with inferred schemas; the symptom is a type error deep in the file when a field
-  that was always an integer suddenly holds a string, fixed by passing an explicit schema.
+- **pandas habits such as `map_elements` with Python lambdas.** Symptom: Polars code no faster than pandas
+  and using one core. Fix: built-in expressions like `when/then` or string methods.
+- **Calling `.collect()` early and continuing eagerly.** Symptom: memory spikes, because pushdown only
+  applies to the plan built before collecting. Fix: stay lazy until the end.
+- **Confusing `null` and `NaN`.** Symptom: `drop_nulls()` leaves NaN rows behind, or averages come out
+  NaN. Fix: handle both explicitly.
+- **Code copied from older blog posts.** Symptom: `AttributeError` or deprecation warnings because names
+  such as `groupby` became `group_by` and other APIs evolved quickly. Fix: check the current docs.
+- **Relying on `group_by` output order.** Symptom: a test or daily-report diff fails intermittently with
+  the same data, because groups come back in a different order each run. Fix: sort explicitly or pass
+  `maintain_order=True`.
+- **Wide JSONL with inferred schemas.** Symptom: a type error deep in the file when an always-integer
+  field suddenly holds a string. Fix: pass an explicit schema.
 
 ## When to use
-Reach for Polars when data is in the gigabytes, when a transformation runs on a schedule (token and
-cost rollups, eval aggregation, dataset deduplication and filtering before fine-tuning), or when pandas
-is running out of memory or time. Use lazy scans over Parquet whenever possible. Stay with pandas for
-small notebooks, for code that leans on pandas-only libraries, or when the team's skills make it the
-cheaper choice. Consider DuckDB if the team prefers SQL; it occupies similar ground. Measure wall time
-and peak memory on your real data before migrating a pipeline.
+- **Use when:** data is in the gigabytes; a transformation runs on a schedule (token and cost rollups,
+  eval aggregation, dataset deduplication and filtering before fine-tuning); or pandas is running out of
+  memory or time. Use lazy scans over Parquet whenever possible.
+- **Stay with pandas when:** small notebooks, code leaning on pandas-only libraries, or team skills make
+  it the cheaper choice.
+- **Consider DuckDB when:** the team prefers SQL; it occupies similar ground.
+- **Measure:** wall time and peak memory on your real data before migrating a pipeline.
 
 ## Role lens
 - **Engineer:** Writes lazy Polars pipelines over Parquet trace and eval data, checks `explain()` for

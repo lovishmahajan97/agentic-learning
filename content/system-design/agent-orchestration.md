@@ -5,7 +5,7 @@ name: Agent orchestration
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - agents/workflows-vs-agents
   - agents/state-machines
@@ -21,108 +21,116 @@ sources:
 ---
 
 ## TL;DR
-Agent orchestration is the control layer that decides what runs next in an LLM application: which model
-call, tool, sub-agent or human step, with what state, and what happens on failure. It exists because
-once a system has more than one model call plus tools, ordering, state, retries, concurrency and
-interruption need an owner. The core design choice is how much of that control flow is deterministic
-code and how much is left to the model.
+Agent orchestration is the control layer deciding what runs next (model call, tool, sub-agent or human
+step), with what state, and what happens on failure. The core choice is how much control flow is
+deterministic code versus left to the model.
 
 ## Why it exists
-A single prompt needs no orchestration. The moment you add a second call that depends on the first, a
-tool whose result feeds a third call, and a user who may need to approve something in the middle, you
-have a program whose steps are spread across model outputs, and something must own it.
-
-The naive implementation is a Python function that calls things in order, with results in local
-variables. It works until the first production requirement. A tool times out at step four: do you redo
-steps one to three, with their side effects? A user closes the tab while the agent waits for approval:
-where is the run? Traffic triples: can you run steps concurrently, and which ones? Someone asks what the
-agent did for a given ticket last Tuesday: which log line was that? Each answer bolts another ad-hoc
-mechanism onto the function until it is an orchestrator written by accident, untested and undocumented.
-
-A second naive answer is to let the model orchestrate everything: give it all the tools and let it
-decide every transition. That is the right choice for genuinely open-ended steps and the wrong one for
-steps that must happen (validation, logging, a compliance check), that must not happen twice
-(payments), or that must happen in a fixed order. Model-chosen control flow is also the hardest to
-evaluate, since every run may take a different path.
-
-Orchestration as a deliberate layer makes the control flow explicit: state is a typed object, steps are
-nodes, transitions are either fixed edges or router decisions (made by code or by the model), and a
-runtime executes it with persistence, events and policies attached. The reason is the same one behind
-every explicit state machine: you can inspect, resume, test and reason about what you have written
-down, and you cannot do any of that with control flow buried in prompts.
+- **Two dependent calls already make a program.** Add a second call that depends on the first, a tool
+  whose result feeds a third, and a user who may approve something midway: the steps are spread across
+  model outputs, and something must own ordering, state, retries, concurrency and interruption.
+- **A plain Python function becomes an accidental orchestrator.** A tool times out at step four: redo
+  steps one to three, with their side effects? The user closes the tab during approval: where is the run?
+  Traffic triples: which steps can run concurrently? Each answer bolts on another ad-hoc mechanism,
+  untested and undocumented.
+- **Letting the model orchestrate everything is wrong for fixed steps.** Right for genuinely open-ended
+  steps; wrong for steps that must happen (validation, logging, a compliance check), must not happen
+  twice (payments), or must happen in a fixed order. Model-chosen paths are also the hardest to evaluate.
+- **A deliberate layer makes control flow explicit.** State is a typed object, steps are nodes,
+  transitions are fixed edges or router decisions, and a runtime adds persistence, events and policies.
+  As with any explicit state machine, you can inspect, resume, test and reason about what is written down.
 
 ## How it works
 ### State, nodes, edges
-Represent a run as a state object (the task, messages, intermediate results, counters) and the
-application as a graph. A node is a function from state to updated state: call the model, call a tool,
-run a sub-agent, ask a human. Edges are either static (A always leads to B) or conditional, decided by a
-router. Routers can be pure code (`if state.score < 0.7`), a classifier, or the main model's tool
-choice. This representation is used *because* it makes the possible paths enumerable: you can draw it,
-test each node in isolation, and know where loops can occur.
+- **State:** one object per run (the task, messages, intermediate results, counters).
+- **Node:** a function from state to updated state: call the model, call a tool, run a sub-agent, ask a
+  human.
+- **Edges:** static (A always leads to B) or conditional, decided by a router. Routers can be pure code
+  (`if state.score < 0.7`), a classifier, or the main model's tool choice.
+- **Why this shape:** it makes the possible paths enumerable, *because* you can draw it, test each node
+  in isolation, and know where loops can occur.
 
 ### The orchestration patterns, from most to least deterministic
-1. **Prompt chaining.** A fixed sequence where each step checks the previous output. Use when the task
-   decomposes cleanly and predictably.
-2. **Routing.** Classify first, then dispatch to a specialized path (different prompt, model or tool
-   set). Use when inputs fall into distinct categories that want different handling.
-3. **Parallelization.** Run independent nodes concurrently and join (sectioning), or run the same node
-   several times and vote (ensembling). Use when latency matters and branches are independent.
-4. **Orchestrator–workers.** A model decides the sub-tasks at runtime; code runs the fan-out and join.
-   Use when sub-tasks cannot be known in advance.
-5. **Evaluator–optimizer.** Generate, evaluate against explicit criteria, revise, bounded by a budget.
-   Use when quality is checkable.
-6. **Autonomous agent loop.** The model picks the next node every step until it decides it is done. Use
-   when the path is unknown and the environment gives trustworthy feedback.
+| # | Pattern | How | Use when |
+|---|---|---|---|
+| 1 | Prompt chaining | fixed sequence, each step checks the previous output | the task decomposes cleanly and predictably |
+| 2 | Routing | classify, then dispatch to a specialized path (prompt, model or tool set) | inputs fall into distinct categories |
+| 3 | Parallelization | run independent nodes and join (sectioning), or run one node several times and vote (ensembling) | latency matters and branches are independent |
+| 4 | Orchestrator–workers | a model decides sub-tasks at runtime; code runs the fan-out and join | sub-tasks cannot be known in advance |
+| 5 | Evaluator–optimizer | generate, evaluate against explicit criteria, revise, bounded by a budget | quality is checkable |
+| 6 | Autonomous agent loop | the model picks the next node every step until done | the path is unknown and feedback is trustworthy |
 
-Each step down this list trades predictability and cost for flexibility, which is why the right system
-usually mixes them: a routed, chained outer workflow with an autonomous loop for the one step that needs
-it.
+- **Each step down trades predictability and cost for flexibility,** so the right system usually mixes
+  them: a routed, chained outer workflow with an autonomous loop for the one step that needs it.
 
 ### Runtime responsibilities
-The orchestrator executes the graph and owns the cross-cutting concerns, *because* putting them in nodes
-means every node reimplements them differently:
-- **Persistence.** Checkpoint state after each node so a run can resume at the node where it stopped.
-  This is also what makes human-in-the-loop possible: an interrupt is a checkpoint plus a status, and
-  resumption is loading it and continuing. Note the semantics this gives you: a crash *after* a node
-  finishes but *before* its checkpoint is written re-runs that node on resume, so node execution is
-  at-least-once, never exactly-once. That single fact is why side-effecting nodes need idempotency keys
-  and why model-calling nodes should be safe to repeat.
+The orchestrator owns cross-cutting concerns *because* putting them in nodes means every node
+reimplements them differently.
+- **Persistence.** Checkpoint state after each node so a run resumes at the node where it stopped. An
+  interrupt is a checkpoint plus a status; resumption is loading it and continuing, which is what makes
+  human-in-the-loop possible.
+- **At-least-once, never exactly-once.** A crash *after* a node finishes but *before* its checkpoint is
+  written re-runs that node on resume. That single fact is why side-effecting nodes need idempotency
+  keys and model-calling nodes should be safe to repeat.
 - **Policies.** Step and cost budgets, per-node timeouts, retry with backoff for transient failures, and
   idempotency keys for nodes with side effects so a retry does not repeat them.
 - **Concurrency.** Fan-out and join primitives with limits, so parallel branches do not exhaust rate
-  limits. When parallel branches write to the same state field, the runtime needs an explicit merge rule
-  (append to a list, take the max, last-writer-wins); LangGraph calls these reducers. Without one, the
-  branch that finishes last silently overwrites the others.
+  limits. Parallel writes to one state field need an explicit merge rule (append to a list, take the
+  max, last-writer-wins); LangGraph calls these reducers. Without one, the branch that finishes last
+  silently overwrites the others.
 - **Events.** A structured stream per run (node started, model called, tool result, waiting for
   approval, done) that clients subscribe to, *because* long runs need progress and operators need traces.
 - **Cancellation.** A cooperative stop signal checked between nodes, with in-flight tool calls either
   finished or compensated.
 
 ### Request-driven versus event-driven orchestration
-For short runs an orchestrator can execute inside a request. For runs that wait (approvals, slow tools,
-scheduled follow-ups) orchestration must be event-driven: a run advances when an event arrives, workers
-are stateless, and the durable state is in the store. This is where agent orchestration meets workflow
-engines such as Temporal; the graph is the same, the executor is a durable one.
+| | Request-driven | Event-driven |
+|---|---|---|
+| Fits | short runs | runs that wait (approvals, slow tools, scheduled follow-ups) |
+| How a run advances | inside one request | when an event arrives |
+| Workers | hold the run | stateless; durable state is in the store |
+
+- This is where agent orchestration meets workflow engines such as Temporal: the graph is the same, the
+  executor is a durable one.
 
 ### Orchestration versus choreography
-Everything above is *orchestration*: one component holds the graph and tells each step when to run.
-The alternative, *choreography*, has no central owner: each agent or service reacts to events on a bus
-and emits its own. Choreography couples components less and scales organisationally, but the end-to-end
-flow exists only implicitly in the sum of subscriptions, so "where is run 42 and why did it stop?" has no
-single answer. For LLM applications, where steps are non-deterministic and budgets and approvals must be
-enforced per run, a central orchestrator per run is the usual choice; choreography fits the boundaries
-*between* runs and systems (a finished run emits an event another team's pipeline consumes).
+- **Orchestration:** one component holds the graph and tells each step when to run (everything above).
+- **Choreography:** no central owner; each agent or service reacts to events on a bus and emits its own.
+  It couples components less and scales organisationally, but the flow exists only implicitly in the sum
+  of subscriptions, so "where is run 42 and why did it stop?" has no single answer.
+- **For LLM applications** steps are non-deterministic and budgets and approvals are enforced per run, so
+  a central orchestrator per run is the usual choice. Choreography fits the boundaries *between* runs and
+  systems (a finished run emits an event another team's pipeline consumes).
 
 ### Frameworks
-Graph libraries such as LangGraph give you the state graph, checkpointing and interrupts; vendor agent
-SDKs give you the autonomous loop with hand-offs; durable execution engines give you the event-driven
-executor. The abstraction matters less than making state explicit and keeping runtime concerns out of
-the nodes.
+- **Graph libraries** such as LangGraph: the state graph, checkpointing and interrupts.
+- **Vendor agent SDKs:** the autonomous loop with hand-offs.
+- **Durable execution engines:** the event-driven executor.
+- **What matters more than the abstraction:** making state explicit and keeping runtime concerns out of
+  the nodes.
 
-## Example
-A small graph executor that makes the ideas concrete: typed state, nodes as functions, a static edge, a
-code router, a model-driven node, a checkpoint after every node, and an interrupt for human approval
-that is resumed by calling `run` again with the same id. `call_model`, `mail` and `store` are stand-ins.
+## Diagram
+The graph from the example below. Static edges are fixed in code, the router after `grade` is a code
+decision on the score, and every node writes a checkpoint so the approval wait holds no worker.
+
+```mermaid
+flowchart TD
+    T["Ticket arrives"] --> D["draft_reply: model call"]
+    D -->|"static edge"| G["grade: model returns score and critique"]
+    G -->|"score below 0.7 and step below 6"| D
+    G -->|"otherwise"| A["approval: interrupt node"]
+    A -->|"approved is None"| W[("Checkpoint: waiting_approval")]
+    W -.->|"approval event calls run again"| A
+    A -->|"approved"| S["send with idempotency key"]
+    A -->|"rejected"| R["rejected"]
+    S --> DN["done"]
+```
+
+## Examples
+### A small graph executor with an approval interrupt
+Typed state, nodes as functions, a static edge, a code router, a model-driven node, a checkpoint after
+every node, and an interrupt resumed by calling `run` again with the same id. `call_model`, `mail` and
+`store` are stand-ins.
 
 ```python
 from dataclasses import dataclass, field, asdict
@@ -168,51 +176,105 @@ def run(run_id, store, max_steps=10):
     return s
 ```
 
-Trace one ticket. `draft_reply` (step 1) → `grade` returns 0.55 with the critique "promises a refund
-date" (step 2) → the router loops back → `draft_reply` uses the critique (step 3) → `grade` returns
-0.82 (step 4) → `approval` finds `approved is None`, sets `waiting_approval` and the run returns at step 5
-with its cursor on `approval`; no worker is held. Hours later the approval service writes
-`approved=True, status="running"` and calls `run` again: it loads the checkpoint, re-enters `approval`,
-routes to `send`, and finishes. If the process dies after `send` sends but before its checkpoint, the
-resume re-runs `send`, and the idempotency key `ticket:send` turns the second send into a no-op. The
-`s.step < 6` guard in the router and `max_steps` in the loop are two independent bounds on the
-revise cycle, one per level.
+### Tracing one ticket through it
+| Step | Node | What happens |
+|---|---|---|
+| 1 | `draft_reply` | first draft |
+| 2 | `grade` | returns 0.55 with the critique "promises a refund date"; router loops back |
+| 3 | `draft_reply` | redrafts using the critique |
+| 4 | `grade` | returns 0.82; router goes to `approval` |
+| 5 | `approval` | finds `approved is None`, sets `waiting_approval`; run returns with cursor on `approval`, no worker held |
+| — | (hours later) | approval service writes `approved=True, status="running"` and calls `run` again |
+| 6–7 | `approval` → `send` | loads the checkpoint, re-enters `approval`, routes to `send`, finishes |
+
+- **Crash after `send` sends but before its checkpoint:** resume re-runs `send`, and the idempotency key
+  `ticket:send` turns the second send into a no-op.
+- **Two independent bounds on the revise cycle, one per level:** the `s.step < 6` guard in the router and
+  `max_steps` in the loop.
+
+### Runnable: why parallel branches need a reducer
+Pure Python. Three branches finish in random order and merge into one state field.
+
+```python
+import asyncio, random
+
+async def branch(name):
+    await asyncio.sleep(random.random() / 100)        # branches finish in any order
+    return {"findings": [f"{name}: result"]}
+
+def last_writer_wins(state, update):
+    return {**state, **update}
+
+def append_reducer(state, update):
+    return {**state, "findings": state["findings"] + update["findings"]}
+
+async def fan_out(merge):
+    state = {"findings": []}
+    for coro in asyncio.as_completed([branch(n) for n in ("web", "docs", "tickets")]):
+        state = merge(state, await coro)
+    return state
+
+print(len(asyncio.run(fan_out(last_writer_wins))["findings"]))  # 1, and which one varies run to run
+print(len(asyncio.run(fan_out(append_reducer))["findings"]))    # 3
+```
+
+## Production patterns
+- **Database-backed checkpointer keyed by thread.** When runs must survive restarts or wait on humans,
+  compile the graph with a persistent checkpointer (in LangGraph, a Postgres checkpointer) and pass a
+  stable `thread_id` per run in the config. Monitor run counts by status and runs with no checkpoint
+  write for longer than their expected duration.
+- **Approval as an interrupt, resumed by event.** Pause in the approval node (LangGraph offers an
+  `interrupt()` call, resumed later with a resume command), return immediately, and resume from the
+  approval service's event. Monitor time spent waiting, approval and rejection rates, and expired
+  approvals.
+- **Declared reducers for every fan-out field.** Any state key written by parallel branches gets an
+  explicit merge rule, for example `Annotated[list, operator.add]` in a LangGraph state type. Monitor in
+  tests: assert the joined result contains one entry per branch.
+- **Idempotency keys on every side-effecting node.** Derive the key from run id and node (as in
+  `ticket:send`) and pass it to the downstream API, because node execution is at-least-once. Monitor
+  duplicate side effects detected by the downstream system.
+- **Per-run event stream to clients and traces.** Stream node started, tool result, waiting and done
+  events to the UI (for example over server-sent events) and to tracing under the run id. Alert on
+  running runs whose last event is older than a threshold you set: they are stuck.
 
 ## Trade-offs
-- Explicit graphs make paths enumerable and testable, but every new behaviour is a code change; a
-  model-driven loop adapts without redeploys at the price of unpredictable paths.
-- Checkpointing after each node enables resume and human interrupts, but adds a store round-trip per
-  node; for sub-second, side-effect-free chains, in-memory execution is fine.
-- Parallel branches cut latency but multiply concurrent model calls, so rate limits and cost spikes
-  arrive sooner; cap fan-out and reserve it for genuinely independent work.
-- Putting policies (budgets, retries, idempotency) in the runtime keeps nodes simple, but makes the
-  runtime a critical dependency that must itself be reliable and well understood.
-- A framework accelerates the first version while shaping your state and persistence model; if you later
-  need a durable, event-driven executor, migrating a framework-specific graph can be a rewrite.
+- **Explicit graphs vs adaptability.** Graphs make paths enumerable and testable, but every new
+  behaviour is a code change; a model-driven loop adapts without redeploys at the price of
+  unpredictable paths.
+- **Per-node checkpoints vs latency.** Checkpointing enables resume and human interrupts but adds a store
+  round-trip per node; for sub-second, side-effect-free chains, in-memory execution is fine.
+- **Parallel branches vs rate limits and cost.** They cut latency but multiply concurrent model calls, so
+  rate limits and cost spikes arrive sooner. Cap fan-out and reserve it for genuinely independent work.
+- **Policies in the runtime vs a critical dependency.** Budgets, retries and idempotency in the runtime
+  keep nodes simple, but the runtime must itself be reliable and well understood.
+- **Framework speed vs lock-in.** A framework accelerates the first version while shaping your state and
+  persistence model; migrating a framework-specific graph to a durable, event-driven executor later can
+  be a rewrite.
 
 ## Pitfalls
-- Hiding control flow in prompts ("after you search, always validate, then..."); the symptom is runs
-  that skip required steps and no way to assert they happened.
-- Retrying a node with side effects without an idempotency key; the symptom is duplicate emails, tickets
-  or payments after a transient failure.
-- Unbounded loops in evaluator–optimizer or self-correction edges; the symptom is a run that revises
-  forever at increasing cost with no termination.
-- Treating human approval as a blocking call in a worker; the symptom is held connections, worker
-  exhaustion and runs lost when the process restarts.
-- Parallel branches writing the same state key without a reducer; the symptom is a fan-out of three
-  searches whose joined result contains only one branch's findings, varying run to run.
-- No per-run event stream; the symptom is users seeing a spinner for minutes and operators unable to say
-  which node a stuck run is in.
+- **Hiding control flow in prompts** ("after you search, always validate, then..."). Symptom: runs that
+  skip required steps and no way to assert they happened. Fix: make required steps nodes.
+- **Retrying a side-effecting node without an idempotency key.** Symptom: duplicate emails, tickets or
+  payments after a transient failure.
+- **Unbounded evaluator–optimizer or self-correction loops.** Symptom: a run that revises forever at
+  increasing cost with no termination. Fix: bound at the router and the loop.
+- **Human approval as a blocking call in a worker.** Symptom: held connections, worker exhaustion and
+  runs lost when the process restarts. Fix: checkpoint, return, resume on event.
+- **Parallel branches writing one state key without a reducer.** Symptom: a fan-out of three searches
+  whose joined result contains only one branch's findings, varying run to run.
+- **No per-run event stream.** Symptom: users see a spinner for minutes and operators cannot say which
+  node a stuck run is in.
 
 ## When to use
-Introduce an explicit orchestration layer as soon as a feature has more than one model call with
-dependencies, any tool with side effects, or any step that waits on a human or an external system.
-Choose the most deterministic pattern that handles the task, and confine model-driven control flow to the
-steps that need judgment. Measure per-node latency and failure rates, run completion versus interruption
-versus budget exhaustion, and retries per run. Day to day this is where you decide what is a node, where
-checkpoints go, and what is idempotent. In interviews, the expected depth is to describe the pattern
-ladder from chaining to autonomous loop, say which runtime concerns the orchestrator owns, and explain how
-an approval interrupt is implemented without blocking a worker.
+- **Use when:** a feature has more than one model call with dependencies, any tool with side effects, or
+  any step that waits on a human or an external system.
+- **Choose:** the most deterministic pattern that handles the task, and confine model-driven control flow
+  to steps that need judgment.
+- **Measure:** per-node latency and failure rates, run completion versus interruption versus budget
+  exhaustion, and retries per run.
+- **Day to day:** deciding what is a node, where checkpoints go, and what is idempotent.
+- **Interviews:** describe the pattern ladder from chaining to autonomous loop, say which runtime concerns
+  the orchestrator owns, and explain how an approval interrupt works without blocking a worker.
 
 ## Role lens
 - **Engineer:** Defines nodes, routers and state types, adds checkpoints and idempotency keys, and emits
@@ -234,6 +296,49 @@ checkpoint and resumes at the next node. The refund-executing node gets an idemp
 or retried run cannot pay twice, the threshold check is code in the router rather than a prompt
 instruction, and the event stream shows the run as waiting so support can see why it is pending. If runs
 can wait days, a durable workflow engine is the natural executor.
+
+## Interview questions
+### What is agent orchestration, and why not let the model drive every step?
+
+- **Definition:** the control layer that decides what runs next (model call, tool, sub-agent or human
+  step), with what state, and what happens on failure.
+- **Why not the model everywhere:** steps that must happen, must not happen twice or must run in a
+  fixed order belong in code, and model-chosen paths are the hardest to evaluate.
+
+### Walk me through the pattern ladder. Which would you pick for a support inbox with three ticket types?
+
+- **The ladder:** prompt chaining, routing, parallelization, orchestrator–workers, evaluator–optimizer,
+  then the autonomous agent loop; each step down trades predictability and cost for flexibility.
+- **For distinct ticket types, routing:** classify, then dispatch to a specialized prompt, model or tool
+  set, and confine an autonomous loop to the one path that genuinely needs it.
+
+### A fan-out of three searches sometimes returns only one branch's findings. What is wrong?
+
+- **Missing reducer.** Parallel branches write the same state key with no merge rule, so the branch that
+  finishes last silently overwrites the others, varying run to run.
+- **Fix:** declare an explicit merge (append to a list, take the max, last-writer-wins), for example
+  `Annotated[list, operator.add]` in a LangGraph state type, and assert one entry per branch in tests.
+
+### Why must side-effecting nodes be idempotent even with checkpoints after every node?
+
+- **Execution is at-least-once, never exactly-once.** A crash after a node finishes but before its
+  checkpoint is written re-runs that node on resume.
+- **So** derive a key from run id and node, as in `ticket:send`, and pass it downstream so the second
+  execution is a no-op; model-calling nodes should simply be safe to repeat.
+
+### When would you choose choreography over a central orchestrator?
+
+- **Orchestrator per run** for LLM applications, because budgets and approvals are enforced per run and
+  "where is run 42 and why did it stop?" needs one answer.
+- **Choreography between runs and systems:** a finished run emits an event another team's pipeline
+  consumes, which couples components less and scales organisationally.
+
+### What would you monitor to catch stuck or misbehaving runs in production?
+
+- **Status mix:** run completion versus interruption versus budget exhaustion, plus retries per run.
+- **Per-node latency and failure rates,** so a regression points at one node rather than the whole run.
+- **Staleness alert:** running runs whose last event or checkpoint is older than their expected
+  duration are stuck, and the event stream says which node they are in.
 
 ## Quiz
 ### Q: What is the main reason to represent an agent application as explicit state plus nodes and edges?

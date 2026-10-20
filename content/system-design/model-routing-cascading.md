@@ -5,7 +5,7 @@ name: Model routing / cascading
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/model-selection
   - system-design/slm-vs-llm-trade-offs
@@ -21,30 +21,25 @@ sources:
 ---
 
 ## TL;DR
-Requests vary enormously in difficulty, so sending everything to the strongest model overpays and
-sending everything to the cheapest underdelivers. Routing picks a model per request *before* the call,
-using rules, a classifier or a learned router; cascading calls the cheap model first and escalates only
-when a quality check fails. Both trade some router or check error and extra tail latency for large cost
-savings, and both are only as good as the quality signal that drives them.
+Routing picks a model per request *before* the call; cascading calls the cheap model first and escalates
+when a quality check fails. Both cut cost sharply, pay with router error or tail latency, and are only as
+good as their quality signal.
 
 ## Why it exists
-The price gap between a small model and a frontier model is commonly one to two orders of magnitude per
-token (treat that as an illustrative range; it changes with every price sheet), and the latency gap is
-several-fold. Yet in most products a large share of requests are easy: a lookup, a reformulation, a
-yes/no classification, a short summary. Paying frontier prices for those is waste, and it is waste that
-scales linearly with success.
-
-The naive alternatives all fail in a specific way. One big model for everything makes cost and latency
-the product's ceiling. One small model for everything fails on the hard tail, and the hard tail is
-exactly the set of requests users remember and escalate. Letting a product manager choose a model per
-feature is better but coarse: within a single feature, difficulty still varies by an order of magnitude,
-so the per-feature choice is always too expensive for some requests and too weak for others.
-
-What forced the pattern into existence is that the decision has to be made per request, and it has to
-be made cheaply. FrugalGPT showed that a cascade of models with a learned "is this answer good enough"
-scorer can match the strongest model's accuracy on several benchmarks at a fraction of its cost;
-RouteLLM showed that a router trained on human preference data can send most traffic to a cheaper model
-with little quality loss. The engineering question is where the quality signal comes from.
+- **Requests vary enormously in difficulty.** Everything on the strongest model overpays; everything on the
+  cheapest underdelivers.
+- **The price gap is huge.** Small vs frontier is commonly one to two orders of magnitude per token
+  (an illustrative range that changes with every price sheet), and the latency gap is several-fold. Yet a
+  large share of requests are easy: a lookup, a reformulation, a yes/no classification, a short summary.
+  Paying frontier prices for those is waste that scales linearly with success.
+- **The naive alternatives each fail.** One big model makes cost and latency the product's ceiling. One
+  small model fails on the hard tail, exactly the requests users remember and escalate. A model per
+  feature is coarse: difficulty within one feature still varies by an order of magnitude.
+- **So the decision must be per request, and cheap.** FrugalGPT showed a cascade with a learned "is this
+  answer good enough" scorer can match the strongest model's accuracy on several benchmarks at a fraction
+  of its cost. RouteLLM showed a router trained on human preference data can send most traffic to a
+  cheaper model with little quality loss.
+- **The engineering question** is where the quality signal comes from.
 
 ## How it works
 ### Routing: decide before the call
@@ -60,53 +55,98 @@ state) and returns a model. In rough order of sophistication:
 4. **LLM-as-router.** Ask a small model to grade difficulty. Useful when you have no labels yet, but it
    adds a model call to every request.
 
-Routers make two kinds of error. Routing a hard request down costs quality; routing an easy request up
-costs money. The threshold is set by the cost ratio and the quality penalty you are willing to accept,
-tuned on an eval set, and then monitored per route in production because the error rates drift as prompts
-and models change. The router's own cost must be small next to the saving *because* it runs on every
-request: a 30 ms classifier is free, a 2 s LLM call usually is not.
+**Two kinds of router error:**
 
-The threshold has a simple form worth deriving. Let the router estimate `p`, the probability that the
-small model's answer is adequate, and let `L` be the cost of an inadequate answer in the same units as
-tokens (a retry, a human escalation, a lost customer). Sending the request small is worth it when
-`c_small + (1 − p) × L < c_large`, so route small when `p > 1 − (c_large − c_small) / L`. With
-illustrative costs c_small = 1 and c_large = 15, a bad answer costing 50 gives a threshold of p > 0.72;
-a bad answer costing 500 (a billing dispute) pushes it to p > 0.972, and only requests the router is
-almost certain about go small. The threshold therefore encodes the business cost of a miss, not the
-router's accuracy, which is why one router can need a different threshold per feature.
+| Error | Cost |
+|---|---|
+| Hard request routed down | Quality |
+| Easy request routed up | Money |
+
+- **Set the threshold** from the cost ratio and the quality penalty you accept, tune it on an eval set,
+  then monitor per route in production, because error rates drift as prompts and models change.
+- **Keep the router cheap** *because* it runs on every request: a 30 ms classifier is free, a 2 s LLM call
+  usually is not.
+
+### Deriving the routing threshold
+- The router estimates `p`, the probability that the small model's answer is adequate.
+- `L` is the cost of an inadequate answer in the same units as tokens (a retry, a human escalation, a lost
+  customer).
+- Send small when `c_small + (1 − p) × L < c_large`, so route small when `p > 1 − (c_large − c_small) / L`.
+
+| c_small | c_large | Cost of a bad answer | Route small when |
+|---|---|---|---|
+| 1 | 15 | 50 | p > 0.72 |
+| 1 | 15 | 500 (a billing dispute) | p > 0.972: only near-certain requests go small |
+
+The threshold encodes the business cost of a miss, not the router's accuracy, which is why one router can
+need a different threshold per feature (costs illustrative).
 
 ### Cascading: decide after a cheap attempt
-Call the small model; run a check; return if it passes, escalate if it fails. The check is the whole
-design. Options, from cheapest to most expensive: a deterministic gate (JSON parses, required fields are
-present, the cited document id exists, the generated SQL executes); agreement across *n* sampled answers
-(disagreement is a usable proxy for uncertainty); a verifier model or LLM judge; a grounding check against
-retrieved passages. The small model's self-reported confidence is the tempting option and the least
-reliable one, because models are poorly calibrated about their own correctness.
+1. Call the small model.
+2. Run a check.
+3. Return if it passes; escalate if it fails.
 
-Expected cost per request is `c_small + c_check + p_escalate × c_large`. With illustrative units of
-1 for the small model, 0.5 for a judge and 15 for the large model, and a 25% escalation rate, a cascade
-costs 1 + 0.5 + 3.75 = 5.25 units against 15 for always-large, a 65% saving. The price is latency: the
-25% of requests that escalate pay the small call, the check and the large call *in series*, so p95
-latency gets worse even as mean cost falls.
+**The check is the whole design.** Options, cheapest first:
+- **Deterministic gate:** JSON parses, required fields are present, the cited document id exists, the
+  generated SQL executes.
+- **Agreement across *n* sampled answers:** disagreement is a usable proxy for uncertainty.
+- **Verifier model or LLM judge.**
+- **Grounding check** against retrieved passages.
+- **Not self-reported confidence:** tempting and the least reliable, because models are poorly calibrated
+  about their own correctness.
+
+**Expected cost** per request is `c_small + c_check + p_escalate × c_large`. With illustrative units of 1
+(small), 0.5 (judge) and 15 (large) at a 25% escalation rate: 1 + 0.5 + 3.75 = 5.25 units against 15 for
+always-large, a 65% saving.
+
+**The price is latency.** The 25% that escalate pay the small call, the check and the large call *in
+series*, so p95 latency gets worse even as mean cost falls.
 
 ### Routing versus cascading
-Routing makes one call, so latency is bounded, but its risk is prediction error and it needs labelled
-data to train. Cascading needs no training data and has a quality floor set by the check, but it pays
-serial latency and the check's cost on escalations. In practice they combine: route the obvious cases,
-cascade the ambiguous band in the middle.
+| | Routing | Cascading |
+|---|---|---|
+| Calls | One, so latency is bounded | Two or more on escalation, in series |
+| Main risk | Prediction error | Serial latency and check cost on escalations |
+| Needs | Labelled data to train | A reliable cheap check; no training data |
+| Quality floor | Router accuracy | Set by the check |
+
+In practice they combine: route the obvious cases, cascade the ambiguous band in the middle.
 
 ### Operating it
-Log the route taken and why. Evaluate quality *per route*, not only in aggregate, since a healthy
-average can hide a failing hard tail. Keep a small random slice (a few per cent) always served by the
-strong model as a continuous baseline, so you can see the quality gap move when a provider silently
-updates the small model. Put a budget and an alert on the escalation rate, because a degraded small model
-turns into 100% escalation and a cost spike on the large one. Decide the consistency policy: the same
-question may get different answers depending on the route, which is acceptable for chat and not for an
-audit trail.
+- **Log the route taken and why.**
+- **Evaluate quality *per route*,** not only in aggregate, since a healthy average can hide a failing hard
+  tail.
+- **Keep a continuous baseline:** a small random slice (a few per cent) always served by the strong model,
+  so you see the gap move when a provider silently updates the small model.
+- **Budget and alert on the escalation rate,** because a degraded small model turns into 100% escalation
+  and a cost spike on the large one.
+- **Decide the consistency policy:** the same question may get different answers depending on the route,
+  acceptable for chat and not for an audit trail.
 
-## Example
-A two-rung cascade with a deterministic gate followed by a small judge, using LiteLLM so the same code
-talks to several providers. The number to watch in production is `escalated`; its rate is what you tune.
+## Diagram
+The combined pattern: a cheap router sends obvious cases straight to one model, and only the ambiguous
+middle band pays for the small call, the check and, on failure, the large call in series.
+
+```mermaid
+flowchart TD
+    R["Request plus metadata"] --> RT{"Router score, cheap and on every request"}
+    RT -->|"clearly easy"| SM["Small model"]
+    RT -->|"clearly hard"| LG["Large model"]
+    RT -->|"ambiguous band"| CS["Small model attempt"]
+    CS --> G{"Deterministic gate: JSON parses, fields present"}
+    G -->|"fail"| LG
+    G -->|"pass"| J{"Cheap judge from a different model"}
+    J -->|"FAIL, escalate"| LG
+    J -->|"PASS"| OUT["Answer"]
+    SM --> OUT
+    LG --> OUT
+    OUT -.->|"log route, score, check result, escalated flag"| M[("Metrics and per-route evals")]
+```
+
+## Examples
+### Two-rung cascade with LiteLLM
+A deterministic gate, then a small judge, using LiteLLM so the same code talks to several providers. The
+number to watch in production is `escalated`; its rate is what you tune.
 
 ```python
 import json, litellm
@@ -144,46 +184,103 @@ print(cascade("Our invoice says net-45 but the signed contract says net-30. Whic
 # Emit `escalated`, both usages and the judge verdict as metrics; alert when the escalation rate jumps.
 ```
 
-Note that the deterministic gate runs first *because* it is free and catches the most common failure
-(unparseable output); the judge only spends tokens on answers that are at least well-formed. The judge is
-deliberately a different model from the small generator: LLMs show self-preference bias when grading their
-own outputs, so a same-model judge under-escalates, and the judge itself needs a calibration check against
-human labels before its verdicts drive production routing.
+- **Gate first** *because* it is free and catches the most common failure (unparseable output); the judge
+  only spends tokens on well-formed answers.
+- **Judge is a different model** from the small generator: LLMs show self-preference bias when grading
+  their own outputs, so a same-model judge under-escalates.
+- **Calibrate the judge** against human labels before its verdicts drive production routing.
+
+### Threshold and saving calculator
+Pure Python; plug in your own unit costs.
+
+```python
+def route_threshold(c_small, c_large, miss_cost):
+    """Route small when P(small answer adequate) exceeds this."""
+    return 1 - (c_large - c_small) / miss_cost
+
+def cascade_cost(c_small, c_check, c_large, p_escalate):
+    return c_small + c_check + p_escalate * c_large
+
+for miss in (50, 500):
+    print(f"miss costs {miss:>3}: route small when p > {route_threshold(1, 15, miss):.3f}")
+# miss costs  50: route small when p > 0.720
+# miss costs 500: route small when p > 0.972
+
+for p in (0.10, 0.25, 0.40, 0.60):
+    cost = cascade_cost(1, 0.5, 15, p)
+    print(f"escalate {p:.0%}: {cost:5.2f} units, saving {1 - cost / 15:.0%} vs always-large")
+# 10%: 3.00 (80%)   25%: 5.25 (65%)   40%: 7.50 (50%)   60%: 10.50 (30%)
+```
+
+### Worked scenario: mean cost falls, p95 rises
+Illustrative latencies: small 0.8 s, judge 0.4 s, large 3.0 s; 25% escalate.
+
+| Path | Share | Latency |
+|---|---|---|
+| Always-large | 100% | 3.0 s |
+| Cascade, passes | 75% | 0.8 + 0.4 = 1.2 s |
+| Cascade, escalates | 25% | 0.8 + 0.4 + 3.0 = 4.2 s |
+| Cascade mean | | 0.75 × 1.2 + 0.25 × 4.2 = 1.95 s |
+| Cascade p95 | | 4.2 s, because more than 5% of requests escalate |
+
+Mean latency and cost both drop, but the tail is 40% slower than always-large. For a strict p95 product,
+route instead.
+
+## Production patterns
+- **Route the obvious, cascade the band.** When you have some labels, send high-confidence easy requests
+  straight to small and high-confidence hard ones straight to large; cascade only the middle band of
+  router scores. Monitor the share of traffic in each band and per-band judged quality.
+- **Deterministic baseline slice.** Serve a few per cent of requests on the strong model regardless of
+  route, chosen by a stable hash of the request id (for example `sha256(request_id) % 100 < 3`, not
+  Python's per-process salted `hash()`) so it is replayable. Monitor the quality gap between the slice and the routed traffic, per route.
+- **Escalation-rate budget.** Alert when the escalation rate over a rolling window leaves its normal band,
+  and cap large-model spend per hour so a small-model regression cannot become an unbounded bill. Monitor
+  escalation rate, large-model 429s and cost per successful task.
+- **Thresholds as versioned config.** Keep per-feature thresholds in config, not code, so a change is a
+  reviewed config edit with a rollback. Monitor misroute rate after each change against the eval set.
+- **Log route, reason and scores on every request.** Emit model chosen, router score, check result and
+  escalated flag as structured fields, so a complaint can be traced to the decision that produced it.
+  Monitor quality and latency sliced by these fields.
+- **Retrain the router on fresh labels.** Rebuild the labelled set from recent traffic after any
+  prompt-template or model change, because routers trained on old prompts drift. Monitor misroute rate on
+  a held-out slice of recent traffic.
 
 ## Trade-offs
-- Mean cost falls substantially, but tail latency rises on escalated requests; this flips when the
+- **Lower mean cost vs higher tail latency.** Escalated requests pay in series. This flips when the
   product has a strict p95 (voice, autocomplete), where routing or hedging beats cascading.
-- Routing needs labelled data and a classifier you must retrain; cascading needs only a reliable cheap
-  check; which is cheaper depends on whether you already have an eval set with judgments.
-- Per-request model choice means the same question can get different answers; fine for chat, a
+- **Training data vs a cheap check.** Routing needs labelled data and a classifier you must retrain;
+  cascading needs only a reliable cheap check. Which is cheaper depends on whether you already have an
+  eval set with judgments.
+- **Per-request choice vs consistency.** The same question can get different answers; fine for chat, a
   problem for reproducible or audited workflows where one pinned model is required.
-- Savings scale with the share of easy traffic; a workload that is uniformly hard yields little and
-  adds a moving part, so measure the difficulty distribution before building.
-- The check bounds the cascade's quality: a judge that favours verbose answers or misses subtle errors
-  lets bad small-model answers through, so judge calibration is part of the system's eval.
+- **Savings vs easy share.** Savings scale with the share of easy traffic; a uniformly hard workload yields
+  little and adds a moving part, so measure the difficulty distribution before building.
+- **The check bounds quality.** A judge that favours verbose answers or misses subtle errors lets bad
+  small-model answers through, so judge calibration is part of the system's eval.
 
 ## Pitfalls
-- Using the small model's self-reported confidence as the escalation signal; the symptom is an
-  escalation rate near zero while judged quality on the small route is poor.
-- Measuring only aggregate quality; the symptom is a healthy dashboard metric while complaints
-  concentrate in the hard tail that was misrouted or wrongly passed.
-- No continuous baseline; the symptom is quality drift that nobody notices for weeks after a provider
-  silently updates the small model, because nothing compares it with the strong one.
-- Escalation storms: a small-model outage or regression sends everything to the large model; the
-  symptom is 429s and a cost spike on the large model during an incident that was not about it.
-- Unbounded cascades (retry small with a new prompt, then medium, then large); the symptom is p99
-  latency several times the single-call latency and users abandoning before the answer arrives.
-- A router trained on last quarter's prompts; the symptom is a misroute rate that creeps up after a
+- **Self-reported confidence as the escalation signal.** Symptom: escalation rate near zero while judged
+  quality on the small route is poor. Fix: use an external check.
+- **Measuring only aggregate quality.** Symptom: a healthy dashboard metric while complaints concentrate
+  in the hard tail that was misrouted or wrongly passed. Fix: per-route evals.
+- **No continuous baseline.** Symptom: quality drift nobody notices for weeks after a provider silently
+  updates the small model, because nothing compares it with the strong one.
+- **Escalation storms.** A small-model outage or regression sends everything to the large model. Symptom:
+  429s and a cost spike on the large model during an incident that was not about it.
+- **Unbounded cascades** (retry small with a new prompt, then medium, then large). Symptom: p99 latency
+  several times the single-call latency and users abandoning before the answer arrives.
+- **A router trained on last quarter's prompts.** Symptom: a misroute rate that creeps up after a
   prompt-template change with no code change in the router.
 
 ## When to use
-Reach for routing or cascading when traffic has a visible easy/hard split and cost or latency is a
-product KPI; skip it for low-volume features or uniformly hard tasks where a single pinned model is
-simpler and more consistent. Before building, sample traffic, run both models, and judge the results: that
-single experiment tells you the easy share, gives you router labels and sets expectations for the saving.
-In production measure escalation rate, quality per route, cost per successful task and latency per route.
-In interviews, derive the expected-cost formula, name the latency penalty, and explain where the quality
-signal comes from and why self-reported confidence is not it.
+- **Use when** traffic has a visible easy/hard split and cost or latency is a product KPI.
+- **Avoid when** features are low-volume or uniformly hard; a single pinned model is simpler and more
+  consistent.
+- **Before building,** sample traffic, run both models and judge the results. That single experiment gives
+  the easy share, router labels and a realistic saving.
+- **Measure:** escalation rate, quality per route, cost per successful task and latency per route.
+- **Interviews:** derive the expected-cost formula, name the latency penalty, and explain where the
+  quality signal comes from and why self-reported confidence is not it.
 
 ## Role lens
 - **Engineer:** Implements the router or the check, logs the route and reason on every request, builds the
@@ -207,6 +304,43 @@ target; if it does not, no router will, and the conversation moves to prompt len
 all-large baseline on resolution rate and satisfaction; a permanent few-per-cent shadow slice served by
 the large model to track the gap continuously; and alerts on escalation rate and judge disagreement. Also
 check tail latency per route and that answer consistency is acceptable for the product.
+
+## Interview questions
+### Why not just put every request on the strongest model and skip routing?
+- **Cost scales linearly with success.** Small versus frontier is commonly one to two orders of magnitude per
+  token (illustrative), so paying frontier prices for lookups, reformulations and yes/no classifications is
+  pure waste.
+- **Latency becomes the product's ceiling** too, because the latency gap is several-fold. Routing exists
+  because difficulty varies per request, even within one feature.
+
+### How would you derive the routing threshold for a feature where a wrong answer causes a billing dispute?
+- **Write the expected cost:** route small when `c_small + (1 − p) × L < c_large`, so the threshold is
+  `p > 1 − (c_large − c_small) / L`.
+- **Plug in the miss cost:** with units 1, 15 and a miss cost of 500, only requests with p above 0.972 go
+  small, versus 0.72 when a miss costs 50.
+- **So thresholds are per feature,** because they encode the business cost of a miss, not router accuracy.
+
+### When would you choose routing over cascading?
+- **When p95 latency is strict** (voice, autocomplete), because escalated requests in a cascade pay the small
+  call, the check and the large call in series.
+- **When you already have labelled data** from offline evals to train a classifier.
+- **Choose cascading instead** when there is no training data but a reliable cheap check exists, such as
+  schema validation or SQL execution.
+
+### Escalations jumped from 25% to 90% overnight with no deploy. What happened and what do you do?
+- **Likely causes:** the small provider silently updated or degraded the model, or a prompt-template change
+  broke its JSON output so the deterministic gate fails.
+- **Contain first:** the escalation-rate alert fires and the hourly cap on large-model spend stops an
+  unbounded bill; watch large-model 429s.
+- **Then diagnose** with logged route, gate result and judge verdict per request, and compare against the
+  continuous baseline slice served by the strong model.
+
+### How do you keep a cascade's judge honest?
+- **Use a different model from the generator,** because LLMs show self-preference bias when grading their
+  own outputs, so a same-model judge under-escalates.
+- **Calibrate against human labels** before its verdicts drive routing, and re-check periodically.
+- **Watch for verbosity bias:** a judge that favours long answers lets bad small-model answers through, so
+  judge calibration belongs in the system's eval.
 
 ## Quiz
 ### Q: What is the essential difference between routing and cascading?

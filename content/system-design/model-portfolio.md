@@ -5,7 +5,7 @@ name: Model portfolio
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/model-selection
   - system-design/model-routing-cascading
@@ -20,163 +20,263 @@ sources:
 ---
 
 ## TL;DR
-A model portfolio is a deliberately small, governed set of models, each with a role: a frontier tier
-for hard reasoning, a workhorse for the bulk, small fast models for classification and routing,
-embeddings and rerankers, plus specialised and fine-tuned variants. Each entry has an owner, eval
-baselines, a cost card, approved data classes and a retirement plan. It exists because one model
-everywhere overpays on easy work and underdelivers on hard work, while unmanaged per-team choices
-create sprawl nobody can evaluate, secure or exit.
+A model portfolio is a small, governed set of models, each with a role, owner, eval baselines, cost
+card and retirement plan. One model everywhere overpays on easy work; unmanaged per-team choices create
+sprawl nobody can evaluate, secure or exit.
 
 ## Why it exists
-Two failure modes bracket the problem. The first is **one model for everything**: the frontier model
-classifies support intents at frontier prices and frontier latency, cannot be deployed in the region a
-customer requires, and when its provider has an outage or announces a deprecation, every product is
-affected at once. The second is **every team picks its own**: eighteen months later there are a dozen
-models across half a dozen providers, a dozen sets of prompt lore, no shared evaluation, a separate
-security review and data-processing agreement per provider, incompatible data-use terms, no record of
-which model is allowed to see personal data, and when a provider retires a version nobody knows which
-systems depend on it.
-
-The reasoning that resolves this is a cost curve. Every model in the set carries a **fixed** cost
-regardless of how much traffic it serves: an eval baseline per task family, a security and privacy
-review, prompt expertise, monitoring, quota management, and a deprecation watch. The **marginal**
-benefit of adding a model diminishes fast once the main tiers are covered, because the tasks that
-remain are already served well enough by something on the list. So the optimum is small but greater
-than one: enough variety to match task difficulty to price and to satisfy deployment constraints, few
-enough that the task-by-model evaluation matrix is actually run. Engineering organisations already do
-this with approved languages and databases; the portfolio applies the same discipline to the most
-expensive dependency in the system.
+- **Failure mode 1: one model for everything.** The frontier model classifies support intents at
+  frontier prices and latency, cannot be deployed in the region a customer requires, and one provider
+  outage or deprecation hits every product at once.
+- **Failure mode 2: every team picks its own.** Eighteen months later: a dozen models across half a
+  dozen providers, a dozen sets of prompt lore, no shared evaluation, a security review and
+  data-processing agreement per provider, incompatible data-use terms, no record of which model may see
+  personal data, and nobody knows which systems depend on a retired version.
+- **Every model has a fixed cost regardless of traffic.** An eval baseline per task family, a security
+  and privacy review, prompt expertise, monitoring, quota management and a deprecation watch.
+- **Marginal benefit falls fast.** Once the main tiers are covered, remaining tasks are already served
+  well enough by something on the list. So the optimum is small but greater than one: enough variety to
+  match difficulty to price and meet deployment constraints, few enough that the task-by-model eval
+  matrix is actually run.
+- **It is familiar discipline.** Engineering organisations already keep approved languages and
+  databases; the portfolio applies that to the most expensive dependency in the system.
 
 ## How it works
 ### Roles, and why each exists
-- **Frontier or reasoning tier.** The hardest work: long-horizon agentic flows, complex code, low-volume
-  high-value analysis. Slow and expensive, so it is used by exception, typically behind a router or an
-  explicit task assignment.
-- **Workhorse tier.** The mid-size model that handles most retrieval-augmented answers, drafting and
-  summarisation. Chosen by the model-selection funnel as the cheapest model that clears the bar for
-  the typical task families.
-- **Small and fast tier.** Classification, routing, schema-bound extraction, PII detection and
-  guardrail checks. Often fine-tuned, sometimes self-hosted, expected to answer in well under a second.
-  This tier exists *because* most traffic is easy and the price gap between tiers is roughly an order
-  of magnitude per step (illustrative, provider-dependent).
-- **Embeddings and rerankers.** The retrieval stack. Versioned with extra care *because* changing an
-  embedding model invalidates every stored vector; vectors from two models are not comparable.
-- **Specialised models.** Vision and document understanding, speech-to-text, text-to-speech, code.
-- **Fine-tuned variants.** Derived from a base for a specific high-volume task; owned by the team that
-  trained them but registered centrally so their lifecycle is visible.
+| Role | Used for | Why it exists |
+|---|---|---|
+| **Frontier or reasoning tier** | long-horizon agentic flows, complex code, low-volume high-value analysis | the hardest work; slow and expensive, so used by exception, behind a router or explicit task assignment |
+| **Workhorse tier** | most retrieval-augmented answers, drafting, summarisation | chosen by the model-selection funnel as the cheapest model that clears the bar for typical task families |
+| **Small and fast tier** | classification, routing, schema-bound extraction, PII detection, guardrail checks | most traffic is easy and the price gap between tiers is roughly an order of magnitude per step (illustrative, provider-dependent) |
+| **Embeddings and rerankers** | the retrieval stack | versioned with extra care |
+| **Specialised models** | vision and document understanding, speech-to-text, text-to-speech, code | modalities the text tiers do not cover |
+| **Fine-tuned variants** | a specific high-volume task, derived from a base | owned by the training team but registered centrally so their lifecycle is visible |
+
+- **Small tier specifics.** Often fine-tuned, sometimes self-hosted, expected to answer in well under a
+  second.
+- **Embedding care, because vectors are model-specific.** Changing an embedding model invalidates every
+  stored vector; vectors from two models are not comparable.
 
 ### The registry entry
-Each model has a record: exact pinned version, provider and deployment location, data-use and
-retention terms, approved data classifications (may it see customer PII, source code, regulated
-data?), eval baselines per task family that uses it, a cost card (list price plus measured average
-tokens per request type), quota and rate limits, owner, announced deprecation date, and its designated
-fallback. The record is what turns "we use several models" into something an auditor, a finance team
-and an on-call engineer can each read.
+Each model has a record containing:
+- **Identity:** exact pinned version, provider and deployment location.
+- **Data terms:** data-use and retention terms; approved data classifications (may it see customer PII,
+  source code, regulated data?).
+- **Quality:** eval baselines per task family that uses it.
+- **Cost card:** list price plus measured average tokens per request type; quota and rate limits.
+- **Lifecycle:** owner, announced deprecation date, designated fallback.
+
+The record turns "we use several models" into something an auditor, a finance team and an on-call
+engineer can each read.
 
 ### Sizing the set: when a tier earns its place
-The fixed-versus-marginal argument becomes a rule you can compute. Moving a task family from model A
-to a cheaper model B is worth a new portfolio entry when
+The fixed-versus-marginal argument as a rule you can compute. Moving a task family from model A to a
+cheaper model B is worth a new portfolio entry when
 
 ```
 requests per month × (cost per request on A − cost per request on B)
   − added errors per month × cost per error   >   fixed monthly cost of running B as an entry
 ```
 
-where the fixed cost is the eval runs, the security and contract review amortised, prompt maintenance,
-monitoring and on-call attention. The rule explains both failure modes at once: a small, high-volume
-task family clears it easily (the classification move in the example below saves about 2,300 units a
-day), while a ninth model added for one team's low-volume task does not, even if it is slightly better.
-It also says *when* to re-run the question: when volume grows, when prices shift, or when an incumbent
-gets cheaper.
+- **Fixed cost** = eval runs, amortised security and contract review, prompt maintenance, monitoring
+  and on-call attention.
+- **It explains both failure modes.** A small, high-volume task family clears it easily (the
+  classification move below saves about 2,300 units a day); a ninth model for one team's low-volume
+  task does not, even if slightly better.
+- **Re-run it** when volume grows, prices shift, or an incumbent gets cheaper.
 
 ### Assignment versus routing
-Most tasks are **assigned** statically: the configuration says this task family uses `workhorse`, and
-it is changed only after an eval. **Routing** chooses a tier per request at run time (by difficulty,
-confidence or input length) and needs its own evaluation of the router. Start with assignment *because*
-it is cheap and auditable; add routing only for families where tracing shows a clear mix of easy and
-hard requests, which is exactly what the agentic slice in the example turns out to be.
+- **Assignment (default).** Configuration says this task family uses `workhorse`; it changes only after
+  an eval. Start here *because* it is cheap and auditable.
+- **Routing.** Chooses a tier per request at run time (by difficulty, confidence or input length) and
+  needs its own evaluation of the router. Add it only for families where tracing shows a clear mix of
+  easy and hard requests, exactly what the agentic slice in the example turns out to be.
 
 ### Entry and exit rules
-A model enters only if it beats an incumbent on a shared eval for some task family, or unlocks a
-constraint the set cannot meet (a new modality, a cheaper tier, a residency requirement). This rule
-is what keeps the set from regrowing. A model exits through a planned migration: deprecation notice →
-list of consuming tasks from gateway logs → regression evals on each → cutover behind the gateway →
-removal. Because provider deprecations are routine, the process has to be routine too.
+- **Entry.** A model enters only if it beats an incumbent on a shared eval for some task family, or
+  unlocks a constraint the set cannot meet (a new modality, a cheaper tier, a residency requirement).
+  This rule is what keeps the set from regrowing.
+- **Exit, as a planned migration:**
+  1. Deprecation notice.
+  2. List of consuming tasks from gateway logs.
+  3. Regression evals on each.
+  4. Cutover behind the gateway.
+  5. Removal.
+- **Routine by necessity.** Provider deprecations are routine, so the process has to be routine too.
 
 ### Enforcement through indirection
-Applications reference **logical names** such as `workhorse`, `classifier-small` or `embed-v3`, and
-the gateway maps those to the pinned vendor model. Only registered models are routable. This
-indirection is the mechanism that makes fallback, rotation and vendor exit possible *because* the
-dependency lives in one configuration table rather than in a dozen code bases. It does not make
-prompts magically portable; a rotation still runs regression evals on every consuming task.
+- **Logical names.** Applications reference names such as `workhorse`, `classifier-small` or `embed-v3`;
+  the gateway maps them to the pinned vendor model. Only registered models are routable.
+- **Why it works.** Fallback, rotation and vendor exit become possible *because* the dependency lives
+  in one configuration table rather than in a dozen code bases.
+- **What it does not do.** It does not make prompts magically portable; a rotation still runs
+  regression evals on every consuming task.
 
 ### Diversity and concentration
-Critical tiers should have a second source on a different provider, for outage resilience and for
-negotiating leverage. Every additional provider, though, is another security review and contract, so
-diversity is bought per tier, not blanket. Two concentration metrics tell you whether the portfolio is
-working: share of spend per provider, and share of requests landing on the frontier tier. If the
-frontier handles a large fraction of volume, routing or task assignment is wrong.
+- **Second source per critical tier,** on a different provider, for outage resilience and negotiating
+  leverage.
+- **Bought per tier, not blanket,** because every additional provider is another security review and
+  contract.
+- **Two concentration metrics:** share of spend per provider, and share of requests landing on the
+  frontier tier. If the frontier handles a large fraction of volume, routing or task assignment is wrong.
 
-## Example
-A worked scenario with **illustrative price ratios** (frontier 10 units per million input tokens and 30
-per million output; workhorse 1 and 3; small 0.1 and 0.3; real prices vary by provider and date).
-Daily traffic is 1,000,000 requests: 70% intent classification (300 input, 10 output tokens), 25% RAG
-answers (3,000 in, 250 out), 5% agentic tasks averaging 6 model calls each (20,000 in, 2,000 out per call).
+## Diagram
+Applications only ever name a role; the gateway resolves it through the registry to a pinned model,
+and models enter and leave the registry only through the entry rule and the deprecation runbook.
 
-**Everything on the frontier model.** Classification: 700,000 × (300×10 + 10×30)/10⁶ = 2,310 units.
-RAG: 250,000 × (3,000×10 + 250×30)/10⁶ = 9,375. Agentic: 300,000 calls × (20,000×10 + 2,000×30)/10⁶ =
-78,000. Total ≈ 89,700 units per day.
+```mermaid
+flowchart LR
+    A["Application"] -->|"calls workhorse, classifier-small, embed-v3"| G["Gateway routing table"]
+    G -->|"lookup logical name"| R[("Registry: pinned version, data classes, baselines, cost card, owner, fallback")]
+    G --> F["Frontier or reasoning tier"]
+    G --> W["Workhorse tier"]
+    G --> S["Small and fast tier"]
+    G --> E["Embeddings and rerankers"]
+    G -.->|"outage or 429"| B["Second source on another provider"]
+    N["Candidate model"] -->|"beats incumbent on shared eval or unlocks a constraint"| R
+    R -->|"deprecation notice: consumers from logs, regression evals, cutover"| X["Removed"]
+    G -.->|"spend share and frontier share"| M["Monthly concentration report"]
+```
 
-**Tiered portfolio.** Classification on the small tier: 700,000 × (300×0.1 + 10×0.3)/10⁶ ≈ 23 units.
-RAG on the workhorse: 250,000 × (3,000×1 + 250×3)/10⁶ ≈ 938. Agentic still on the frontier: 78,000.
-Total ≈ 78,960, only a 12% saving, because the agentic 5% of requests is 87% of spend.
+## Examples
+### Worked scenario: tiering and routing a million requests a day
+**Illustrative price ratios** (units per million tokens; real prices vary by provider and date):
 
-**Portfolio plus routing inside the agentic task.** Tracing shows that 4 of the 6 calls per task are
-tool-result summarisation and formatting that the workhorse handles at the same eval score. Frontier:
-100,000 calls × 0.26 = 26,000. Workhorse: 200,000 × (20,000×1 + 2,000×3)/10⁶ = 5,200. Agentic total
-31,200; grand total ≈ 32,160 units, a 64% reduction against the single-model baseline. The lesson is
-that the portfolio's first job is to make spend legible: the biggest lever was not the obvious 70% of
-traffic but the step-level routing inside the smallest slice, and prefix caching of the shared 20k
-context would cut it further.
+| Tier | Input | Output |
+|---|---|---|
+| Frontier | 10 | 30 |
+| Workhorse | 1 | 3 |
+| Small | 0.1 | 0.3 |
+
+Daily traffic is 1,000,000 requests:
+- **70% intent classification:** 300 input, 10 output tokens.
+- **25% RAG answers:** 3,000 in, 250 out.
+- **5% agentic tasks:** averaging 6 model calls each (20,000 in, 2,000 out per call).
+
+| Slice | Everything on frontier | Tiered portfolio | Portfolio + routing in agentic |
+|---|---|---|---|
+| Classification | 700,000 × (300×10 + 10×30)/10⁶ = 2,310 | small: 700,000 × (300×0.1 + 10×0.3)/10⁶ ≈ 23 | ≈ 23 |
+| RAG | 250,000 × (3,000×10 + 250×30)/10⁶ = 9,375 | workhorse: 250,000 × (3,000×1 + 250×3)/10⁶ ≈ 938 | ≈ 938 |
+| Agentic | 300,000 calls × (20,000×10 + 2,000×30)/10⁶ = 78,000 | still frontier: 78,000 | frontier 100,000 calls × 0.26 = 26,000 + workhorse 200,000 × (20,000×1 + 2,000×3)/10⁶ = 5,200 → 31,200 |
+| **Total per day** | **≈ 89,700** | **≈ 78,960 (only 12% saving)** | **≈ 32,160 (64% reduction)** |
+
+- **Why tiering alone saved little.** The agentic 5% of requests is 87% of spend.
+- **Where routing came from.** Tracing showed 4 of the 6 calls per task are tool-result summarisation
+  and formatting that the workhorse handles at the same eval score.
+- **The lesson.** The portfolio's first job is to make spend legible: the biggest lever was not the
+  obvious 70% of traffic but step-level routing inside the smallest slice. Prefix caching of the shared
+  20k context would cut it further.
+
+### The same numbers as a runnable calculator
+Swap in your own traffic mix and price card; the sizing rule is the last function.
+
+```python
+PRICE = {"frontier": (10, 30), "workhorse": (1, 3), "small": (0.1, 0.3)}  # illustrative, per 1M tokens
+
+def daily_cost(slices):
+    """slices: list of (calls_per_day, in_tokens, out_tokens, tier)."""
+    total = 0.0
+    for calls, n_in, n_out, tier in slices:
+        p_in, p_out = PRICE[tier]
+        total += calls * (n_in * p_in + n_out * p_out) / 1e6
+    return total
+
+single = [(700_000, 300, 10, "frontier"), (250_000, 3_000, 250, "frontier"),
+          (300_000, 20_000, 2_000, "frontier")]
+tiered = [(700_000, 300, 10, "small"), (250_000, 3_000, 250, "workhorse"),
+          (300_000, 20_000, 2_000, "frontier")]
+routed = tiered[:2] + [(100_000, 20_000, 2_000, "frontier"), (200_000, 20_000, 2_000, "workhorse")]
+
+base = daily_cost(single)
+for name, s in (("single", single), ("tiered", tiered), ("routed", routed)):
+    c = daily_cost(s)
+    print(f"{name:7s} {c:9,.0f} units/day  saving {1 - c / base:4.0%}")
+# single 89,685 (0%), tiered 78,961 (12%), routed 32,161 (64%)
+
+def earns_a_place(req_per_month, cost_a, cost_b, added_errors, cost_per_error, fixed_monthly):
+    return req_per_month * (cost_a - cost_b) - added_errors * cost_per_error > fixed_monthly
+```
+
+With an illustrative fixed cost of 2,000 units a month per entry: the classification family (about 21M
+requests a month) saves ≈ 68,600 units a month and clears it easily; a 30,000-request-a-month team task
+with the same per-request saving gains ≈ 98 units and does not.
+
+### A registry record
+Field names are this lesson's schema, not a specific product's format; values are illustrative.
+
+```yaml
+logical_name: classifier-small
+pinned_version: "<provider model id with date or version>"
+provider: provider-b
+deployment: eu-west, private endpoint
+data_classes_approved: [internal, customer_pii]
+data_use_terms: no training on inputs; 30-day retention   # copy from the signed agreement
+eval_baselines:
+  intent-classification: {metric: exact_match, score: 0.94, set: intents-v3}
+cost_card: {price_in: 0.1, price_out: 0.3, avg_in: 300, avg_out: 10}
+quota: {rpm: 6000}
+owner: platform-ml
+deprecation_date: null
+fallback: classifier-small-secondary
+```
+
+## Production patterns
+- **Logical names enforced at the gateway.** As soon as two applications call models. Applications send
+  `workhorse` or `embed-v3`; the gateway's routing table maps each to a pinned vendor model and rejects
+  unregistered names. Monitor requests that bypass the gateway (direct vendor keys found in billing).
+- **Registry-driven deprecation runbook.** When any provider announces a retirement. Query gateway logs
+  for every consumer of the logical name, run each consumer's regression eval on the replacement, cut
+  over in the routing table, then delete the old mapping. Monitor days from notice to completed cutover.
+- **Monthly concentration report.** Ongoing. Publish spend share per tier and per provider and the share
+  of requests on the frontier tier. A rising frontier share is the alert that routing or assignment has
+  drifted.
+- **Sandbox tier for unregistered models.** For experimentation. Allow any model on non-sensitive data
+  in a sandbox project with its own keys and budget cap; registration is required before production
+  traffic. Monitor sandbox spend and how many sandbox models request registration.
+- **Embedding rotation as a re-index project.** When changing `embed-*` entries. Build a new index with
+  the new model alongside the old, measure retrieval quality on the golden set, then switch the logical
+  name and the index together. Monitor recall on the golden queries before and after.
 
 ## Trade-offs
-- Tiering cuts spend, but every tier adds evaluation, prompt and monitoring overhead; once a tier's
-  monthly saving falls below that fixed overhead (the sizing rule above), a two-model portfolio, one
-  strong and one small, is the right size.
-- A central approved list gives governance and purchasing leverage but slows experimentation; the
-  usual fix is a sandbox tier for unregistered models on non-sensitive data, with registration
-  required before anything reaches production.
-- Multi-provider diversity buys resilience and negotiating power, but each provider is another review,
-  contract and set of behavioural quirks; for low-stakes tasks a single provider with graceful
-  degradation is enough.
-- Logical model names decouple applications from vendors, but prompts and tool-calling behaviour are
-  not fully portable, so a rotation still costs a regression run per consuming task.
-- Fine-tuned variants give the best cost-quality on narrow tasks but multiply lifecycle work, since
-  each must be retrained or re-evaluated when its base model is retired.
+- **Tiering vs overhead.** Tiering cuts spend, but every tier adds evaluation, prompt and monitoring
+  overhead. Once a tier's monthly saving falls below that fixed overhead (the sizing rule), a two-model
+  portfolio, one strong and one small, is the right size.
+- **Central approved list vs experimentation.** It gives governance and purchasing leverage but slows
+  experimentation. The usual fix is a sandbox tier for unregistered models on non-sensitive data, with
+  registration required before anything reaches production.
+- **Multi-provider diversity vs review burden.** It buys resilience and negotiating power, but each
+  provider is another review, contract and set of behavioural quirks. For low-stakes tasks a single
+  provider with graceful degradation is enough.
+- **Logical names vs portability.** They decouple applications from vendors, but prompts and
+  tool-calling behaviour are not fully portable, so a rotation still costs a regression run per
+  consuming task.
+- **Fine-tuned variants vs lifecycle work.** They give the best cost-quality on narrow tasks but
+  multiply lifecycle work, since each must be retrained or re-evaluated when its base model is retired.
 
 ## Pitfalls
-- The portfolio exists on paper while applications call vendor model IDs directly. Symptom: a single
-  deprecation notice turns into code changes and releases across a dozen repositories.
-- The frontier tier carries bulk traffic because "it works". Symptom: frontier share of spend far
-  exceeds the share of tasks that need it, and cost grows linearly with adoption.
-- Rotating the embedding model like any other model. Symptom: retrieval quality collapses overnight
+- **Portfolio on paper, vendor IDs in code.** Symptom: a single deprecation notice turns into code
+  changes and releases across a dozen repositories. Fix: logical names enforced at the gateway.
+- **Frontier tier carries bulk traffic because "it works".** Symptom: frontier share of spend far exceeds
+  the share of tasks that need it, and cost grows linearly with adoption.
+- **Rotating the embedding model like any other model.** Symptom: retrieval quality collapses overnight
   because the index was not rebuilt with the new model's vectors.
-- No per-task eval baselines in the registry. Symptom: a rotation approved on one team's evaluation
+- **No per-task eval baselines in the registry.** Symptom: a rotation approved on one team's evaluation
   silently degrades another team's task.
-- Too many registered models. Symptom: the task-by-model evaluation matrix is never fully run, so the
-  quality of most combinations is unknown.
-- Skipping data-classification approval per model. Symptom: an audit finds personal data flowing to a
-  model whose terms never permitted it.
+- **Too many registered models.** Symptom: the task-by-model evaluation matrix is never fully run, so
+  the quality of most combinations is unknown.
+- **Skipping data-classification approval per model.** Symptom: an audit finds personal data flowing to
+  a model whose terms never permitted it.
 
 ## When to use
-Start a portfolio as soon as more than one task family or more than one team uses models; even a
-single product benefits from a small-plus-strong pair with explicit assignment. A lone prototype does
-not need one. Measure spend share per tier and provider, the fraction of requests on the frontier
-tier, the number of registered models (it should stay roughly flat), time to complete a migration
-after a deprecation notice, and eval coverage of the task-by-model matrix. In daily work this is the
-question "which model should this new feature use", answered by the registry rather than by habit. In
-interviews, "how would you manage models across an organisation" is looking for tiers, a registry,
-entry and exit rules, logical names behind a gateway, and the concentration metrics.
+- **Use when:** more than one task family or more than one team uses models; even a single product
+  benefits from a small-plus-strong pair with explicit assignment.
+- **Avoid when:** it is a lone prototype; it does not need one.
+- **Measure:** spend share per tier and provider, fraction of requests on the frontier tier, number of
+  registered models (should stay roughly flat), time to complete a migration after a deprecation
+  notice, and eval coverage of the task-by-model matrix.
+- **Daily work:** "which model should this new feature use" is answered by the registry, not by habit.
+- **Interviews:** "how would you manage models across an organisation" is looking for tiers, a registry,
+  entry and exit rules, logical names behind a gateway, and the concentration metrics.
 
 ## Role lens
 - **Engineer:** Calls models by logical name through the gateway, adds eval baselines for any task that
@@ -199,6 +299,45 @@ evals, moving applications onto logical names behind the gateway as you go so th
 configuration only. Keep a second provider for the tiers that matter. To prevent regrowth, enforce the
 entry rule, a new model must beat an incumbent on a shared eval or unlock a constraint, give every
 entry an owner and a retirement date, and publish spend share and frontier-tier share monthly.
+
+## Interview questions
+### What is a model portfolio, and why is its optimal size small but greater than one?
+- **A governed set of models,** each with a role, owner, eval baselines, cost card and retirement plan,
+  registered centrally and called by logical name.
+- **One model overpays and concentrates risk:** frontier prices on easy work, and one outage or
+  deprecation hits every product at once.
+- **Every extra model has a fixed cost** (evals, security review, monitoring, deprecation watch) while
+  marginal benefit falls once the tiers are covered.
+
+### You tiered your traffic and saved only 12%. Where do you look next?
+- **Look at spend share, not request share.** In the worked scenario the agentic 5% of requests was 87%
+  of spend, so tiering the 70% classification slice barely moved the total.
+- **Trace the expensive slice step by step.** Four of six calls per agentic task were summarisation and
+  formatting the workhorse handled at the same eval score.
+- **Route at step level inside that slice;** it took the saving from 12% to 64%, and prefix caching of
+  the shared context would cut it further.
+
+### A team wants to add a ninth model because it scores slightly better on their task. How do you decide?
+- **Apply the entry rule:** it must beat an incumbent on a shared eval for some task family, or unlock a
+  constraint such as a modality, a cheaper tier or residency.
+- **Apply the sizing rule:** monthly saving minus added error cost must exceed the entry's fixed monthly
+  cost. A low-volume task rarely clears it, even with a better score.
+- **Offer the sandbox tier** for experimentation on non-sensitive data instead of production
+  registration.
+
+### How do you handle a provider deprecation notice across many applications?
+- **Find consumers from gateway logs,** by logical name, rather than searching repositories.
+- **Run each consumer's regression eval on the replacement,** because prompts and tool-calling
+  behaviour are not fully portable even behind a logical name.
+- **Cut over in the routing table, then remove the old mapping.** Track days from notice to completed
+  cutover as the health metric of the process.
+
+### Why is rotating the embedding model different from rotating any other model?
+- **Vectors are model-specific.** Vectors from two embedding models are not comparable, so changing the
+  model invalidates every stored vector.
+- **Treat it as a re-index project:** build a new index alongside the old one, measure recall on the
+  golden queries, then switch the logical name and the index together.
+- **The symptom of skipping this** is retrieval quality collapsing overnight with no code change.
 
 ## Quiz
 ### Q: What is the main reason to keep a model portfolio small rather than registering every useful model?

@@ -5,7 +5,7 @@ name: Synchronous vs asynchronous execution
 kind: decision
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - system-design/event-driven-architecture
   - fastapi-for-ai/job-queues-and-durable-workers
@@ -23,103 +23,107 @@ sources:
 ---
 
 ## TL;DR
-Synchronous execution means the caller holds a connection open until the result arrives; asynchronous
-execution means the caller gets an acknowledgement (a job id) and the result arrives later by polling,
-push or callback. LLM calls take seconds and agent runs take minutes, which is longer than load
-balancers, mobile networks and humans will wait, so most AI workloads need the asynchronous shape, with
-streaming as the middle ground when a person is watching.
+Synchronous: the caller holds a connection until the result arrives. Asynchronous: it gets a job id and
+the result later. LLM calls take seconds and agent runs minutes, longer than proxies and people wait, so
+most AI work goes asynchronous, with streaming in between.
 
 ## Why it exists
-A classic web request completes in tens of milliseconds, so holding the connection is free. An LLM
-completion takes seconds; a tool-using agent run takes minutes; a batch of a thousand document
-summaries takes an hour. Holding a connection for that long collides with limits you do not control.
-Every hop in the path has an idle timeout: load balancers and reverse proxies commonly default to around
-a minute (the exact value varies by product), and mobile networks drop connections when the device
-changes cells. When a hop times out, the client sees an error and retries, but the server is still
-working on the original request. Now the same expensive run executes twice, you pay twice for tokens,
-and if the run has side effects (it posted a comment, it charged a card) they happen twice.
-
-Capacity is the second problem. By Little's law, concurrent in-flight requests ≈ arrival rate × time in
-system. At 10 requests per second averaging 30 seconds each, the fleet holds about 300 open connections
-at any moment, each with a goroutine, thread or coroutine, its buffers and its partial state; double the
-run time and the count doubles even though the useful work per run is unchanged. Scale-out is driven by
-connection count rather than by useful work, and a deploy that restarts an instance drops every run it
-was holding.
-
-The third problem is loss. If the server process restarts mid-request, a synchronous run vanishes; the
-client learns only that the socket closed. There is no record that the work existed, so there is
-nothing to resume.
-
-The naive fix, "raise every timeout to ten minutes", only hides the issue: long-lived connections pile
-up, one deploy drops them all, and the client still cannot distinguish "slow" from "dead". The real fix
-is to separate *accepting* the work from *doing* it, which is what asynchronous execution means.
+- **AI work outlives connections.** A classic web request completes in tens of milliseconds, so holding
+  the connection is free. An LLM completion takes seconds, a tool-using agent run minutes, a batch of a
+  thousand document summaries an hour.
+- **Every hop has an idle timeout you do not control.** Load balancers and reverse proxies commonly
+  default to around a minute (the exact value varies by product); mobile networks drop connections when
+  the device changes cells. On timeout the client sees an error and retries while the server is still
+  working, so the same expensive run executes twice, tokens are paid twice, and side effects (a posted
+  comment, a charged card) happen twice.
+- **Capacity scales with run time, not work.** By Little's law, in-flight requests ≈ arrival rate × time
+  in system. At 10 requests per second averaging 30 seconds, the fleet holds about 300 open connections,
+  each with a goroutine, thread or coroutine, buffers and partial state. Double the run time and the count
+  doubles though useful work is unchanged; a deploy that restarts an instance drops every run it held.
+- **Synchronous work is lost on restart.** If the process restarts mid-request the run vanishes; the client
+  only learns the socket closed. There is no record the work existed, so nothing to resume.
+- **"Raise every timeout to ten minutes" only hides it.** Long-lived connections pile up, one deploy drops
+  them all, and the client still cannot tell "slow" from "dead". The real fix separates *accepting* work
+  from *doing* it, which is what asynchronous execution means.
 
 ## How it works
 ### Two meanings of "asynchronous"
-Inside one process, *async I/O* (`asyncio`, Node's event loop) lets a thread wait on many sockets at once
-instead of blocking per request. That improves how many connections a server can hold; it does not
-change the interaction model, and it is covered in the language modules. This lesson is about the
-*interaction* model between a caller and a service: does the caller wait for the result or not?
+- **Async I/O inside a process** (`asyncio`, Node's event loop) lets one thread wait on many sockets
+  instead of blocking per request. It raises how many connections a server can hold but does not change
+  the interaction model; the language modules cover it.
+- **This lesson** is the *interaction* model between caller and service: does the caller wait for the
+  result or not?
+
+### The three shapes at a glance
+| Shape | Caller's state lives in | Fits | Breaks when |
+|---|---|---|---|
+| Synchronous | the connection | work well inside every timeout, caller needs the answer to continue | p99 nears the shortest timeout |
+| Streaming | the connection, with partial results | a person watching, seconds to about a minute | reconnects without resume re-run the generation |
+| Asynchronous job | a durable job record | long, retried, restart-surviving or unattended work | sub-second work, where it is pure overhead |
 
 ### The synchronous shape
-Client sends a request, the server does the work, the response carries the result. The caller's state is
-the connection itself. This is the right shape when work completes well inside every timeout in the path
-and when the caller needs the answer to continue. Its failure semantics are simple: an error means the
-result was not delivered, but it does *not* mean the work did not happen, which is why even synchronous
-calls that have side effects need an idempotency key.
+- Client sends a request, server does the work, response carries the result.
+- **Failure semantics:** an error means the result was not delivered, *not* that the work did not happen.
+  That is why even synchronous calls with side effects need an idempotency key.
 
 ### Streaming: synchronous with incremental delivery
-Server-sent events or chunked responses keep the connection synchronous but push partial results as they
-are produced (tokens, tool-call progress). Time-to-first-byte drops from the full generation time to the
-prefill time, which is what makes a 40-second answer tolerable to a person. The connection is still held,
-so timeouts and retries still apply; a reconnecting client needs a way to resume ("give me events after
-sequence 812") or it re-runs the generation.
+- Server-sent events or chunked responses push partial results as produced (tokens, tool-call progress).
+- Time-to-first-byte drops from full generation time to prefill time, which makes a 40-second answer
+  tolerable to a person.
+- The connection is still held, so timeouts and retries still apply. A reconnecting client needs a way to
+  resume ("give me events after sequence 812") or it re-runs the generation.
 
 ### The asynchronous shape
 1. **Submit.** The client sends the request with a client-generated idempotency key. The server validates
    it, persists a job record (`status=queued`, inputs, key, tenant, created_at) and returns `202 Accepted`
-   with a job id and a status URL. The write to the job store is the only thing that must succeed inside
-   the request, so the request is fast and the work survives a process restart *because* it exists in
-   durable storage before anyone starts on it. A repeated key returns the existing job; a repeated key
-   with a *different* body is rejected (`409` or `422`), because silently returning the old job would
-   hand the client a result for a request it did not make.
+   with a job id and a status URL.
+   - Only the job-store write must succeed inside the request, so it is fast, and the work survives a
+     restart *because* it is durable before anyone starts on it.
+   - A repeated key returns the existing job. A repeated key with a *different* body is rejected (`409`
+     or `422`), because returning the old job would hand the client a result for a request it did not make.
 2. **Execute.** A worker claims the job from a queue (Redis, SQS, Postgres with `SKIP LOCKED`), marks it
-   `running` with a lease or heartbeat, performs the work, and writes the result and `succeeded` or
-   `failed` status. A lease matters because a worker that dies mid-job must have its job reclaimed by
-   another worker after the lease expires; without it the job stays `running` forever.
-3. **Deliver.** The client learns the outcome by polling `GET /jobs/{id}` (simple, works through any
-   proxy, costs requests), by a webhook the server calls (efficient, but the server must retry and the
-   receiver must verify and deduplicate), or by a push channel such as SSE or WebSocket subscribed to the
-   job (best UX for interactive clients).
+   `running` with a lease or heartbeat, does the work, and writes the result and `succeeded` or `failed`.
+   The lease matters because a worker that dies mid-job must have its job reclaimed after the lease
+   expires; without it the job stays `running` forever.
+3. **Deliver.** The client learns the outcome by one of:
 
-The status model is a small state machine: `queued → running → succeeded | failed | cancelled`, often
-with a `progress` field and an `attempt` counter. Results need a retention policy; a job store that keeps
-every result forever becomes the biggest table in the system.
+| Channel | Strength | Cost |
+|---|---|---|
+| Polling `GET /jobs/{id}` | simple, works through any proxy | costs requests |
+| Webhook the server calls | efficient | server must retry; receiver must verify and deduplicate |
+| Push (SSE or WebSocket) subscribed to the job | best UX for interactive clients | holds a connection |
+
+- **Status model:** a small state machine, `queued → running → succeeded | failed | cancelled`, often with
+  a `progress` field and an `attempt` counter.
+- **Retention:** results need a policy; a job store that keeps every result forever becomes the biggest
+  table in the system.
 
 ### Cancellation is a request, not a guarantee
-Once work is detached from the connection, closing the browser tab no longer stops it, so the job API
-needs an explicit `POST /jobs/{id}/cancel`. The server can only set `cancel_requested`; the worker checks
-the flag between steps (between tool calls, between batches of documents) and stops at the next safe
-point, *because* interrupting mid-step can leave a half-applied side effect. Side effects already
-performed stay performed, so a cancelled agent run may still have created a ticket; cancellation of
-multi-step work with effects is really a saga question (compensate or leave), and the final status
-should say which steps completed.
+- Detached work no longer stops when the browser tab closes, so the API needs `POST /jobs/{id}/cancel`.
+- The server can only set `cancel_requested`. The worker checks it between steps (between tool calls,
+  between document batches) and stops at the next safe point, *because* interrupting mid-step can leave a
+  half-applied side effect.
+- Effects already performed stay performed: a cancelled agent run may still have created a ticket.
+  Cancelling multi-step work with effects is a saga question (compensate or leave), and the final status
+  should say which steps completed.
 
 ### The hybrid: respond if fast, otherwise hand back a job
-Many APIs accept a `wait` budget: the server runs the job and, if it finishes within, say, 20 seconds,
-returns the result inline; otherwise it returns the job id. The client code handles both outcomes. This
-keeps short requests simple without making long ones fragile.
+- Many APIs accept a `wait` budget. If the job finishes within, say, 20 seconds, the result returns inline;
+  otherwise the job id does.
+- Client code handles both outcomes. Short requests stay simple; long ones are not fragile.
 
 ### Backpressure
-An asynchronous front door accepts work faster than workers drain it, so the queue is where overload
-becomes visible. Bound it: reject submissions with `429` or `503` when queue depth or estimated wait
-exceeds a threshold, and expose that wait estimate to clients. An unbounded queue turns an outage into a
-multi-hour backlog that keeps failing after the cause is fixed.
+- An asynchronous front door accepts work faster than workers drain it, so the queue is where overload
+  becomes visible.
+- **Bound it:** reject submissions with `429` or `503` when queue depth or estimated wait exceeds a
+  threshold, and expose that wait estimate to clients.
+- An unbounded queue turns an outage into a multi-hour backlog that keeps failing after the cause is fixed.
 
-## Example
-A minimal FastAPI service with the asynchronous shape: submit returns `202` and a job id, a worker drains
-a queue, and a status endpoint reports progress. The in-memory queue and dict are for illustration; in
-production they are a durable queue and a database table so jobs survive restarts.
+## Examples
+### FastAPI job service: submit, worker, status
+Submit returns `202` and a job id, a worker drains a queue, a status endpoint reports progress. The
+in-memory queue and dict are for illustration; production uses a durable queue and a table so jobs
+survive restarts.
 
 ```python
 import asyncio, uuid
@@ -171,56 +175,121 @@ async def status(job_id: str):
     return jobs[job_id]
 ```
 
-A client retrying the `POST` with the same `idempotency_key` gets the same job back instead of a second
-five-second run; a full queue is refused immediately rather than silently growing. Trace one request:
-`POST {"text": "...", "idempotency_key": "k1"}` returns `202` with `Location: /analyses/k1` in a few
-milliseconds; a `GET` one second later shows `running`; the client's network drops and it re-sends the
-same `POST`, which returns the same job, still `running`, rather than enqueuing a second; a `GET` after
-five seconds returns `succeeded` with the result. What the sketch omits is exactly what production
-needs: a restart loses `jobs` and the queue (so both must be durable), a crashed worker leaves the job
-`running` forever (so claims need a lease), and a key held only in memory cannot deduplicate across
-instances (so the key needs a unique constraint in the job table).
+Trace one request:
+1. `POST {"text": "...", "idempotency_key": "k1"}` returns `202` with `Location: /analyses/k1` in a few
+   milliseconds.
+2. A `GET` one second later shows `running`.
+3. The client's network drops and it re-sends the same `POST`; it gets the same job, still `running`,
+   rather than a second five-second run. A full queue is refused immediately rather than growing silently.
+4. A `GET` after five seconds returns `succeeded` with the result.
+
+What the sketch omits is exactly what production needs:
+- **Durability:** a restart loses `jobs` and the queue, so both must be durable.
+- **Leases:** a crashed worker leaves the job `running` forever, so claims need a lease.
+- **Cross-instance dedupe:** a key held only in memory cannot deduplicate across instances, so the key
+  needs a unique constraint in the job table.
+
+### Runnable: pick the shape from p99 and Little's law
+```python
+def in_flight(rate_per_s, avg_seconds):
+    return rate_per_s * avg_seconds            # Little's law: L = lambda * W
+
+def shape(p99_s, smallest_timeout_s, human_watching):
+    if p99_s < 0.5 * smallest_timeout_s and p99_s <= 5:
+        return "synchronous"
+    if human_watching and p99_s < smallest_timeout_s:
+        return "stream"
+    return "async job"
+
+print(in_flight(10, 30), in_flight(10, 60))    # 300 600 open connections
+print(shape(2, 60, True))                      # synchronous
+print(shape(40, 60, True))                     # stream
+print(shape(120, 30, False))                   # async job
+```
+The thresholds (half the timeout, 5 seconds) are illustrative defaults to tune, not standards.
+
+### Production snippet: claiming a job with a lease in Postgres
+```sql
+UPDATE jobs
+SET status = 'running', attempt = attempt + 1,
+    lease_until = now() + interval '60 seconds'
+WHERE id = (
+  SELECT id FROM jobs
+  WHERE status = 'queued'
+     OR (status = 'running' AND lease_until < now())   -- reclaim from a dead worker
+  ORDER BY created_at
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+RETURNING id, input;
+```
+`SKIP LOCKED` lets many workers poll the same table without blocking on each other's rows; the worker
+extends `lease_until` as a heartbeat while it runs.
+
+## Production patterns
+- **`202` plus `Location` plus `Retry-After`.** For any endpoint whose p99 nears a proxy timeout, return
+  `202 Accepted` with a `Location` status URL and a `Retry-After` hint so clients poll at a sane interval.
+  Monitor the ratio of status polls to submits; a high ratio is the cue for push delivery.
+- **Idempotency key with a unique constraint.** Store the client key in the job table under a unique
+  index scoped by tenant, plus a hash of the request body to detect reuse with a different body. Monitor
+  retried submits versus unique jobs.
+- **Leases and a reaper.** Workers set `lease_until` on claim and extend it on heartbeat; expired leases
+  are reclaimed (as in the SQL above) with an `attempt` cap before dead-lettering. Alert on jobs whose
+  `attempt` hits the cap and on the age of the oldest `running` job.
+- **Resumable streams.** For SSE, give each event an `id:` so a reconnecting browser sends the standard
+  `Last-Event-ID` header and the server replays from there instead of re-running generation. Monitor
+  reconnect rate and duplicate-generation count.
+- **Signed webhooks with retries.** Sign the payload with an HMAC over a timestamp and body, retry with
+  exponential backoff for a bounded window, and include the job id so receivers deduplicate. Monitor
+  delivery failure rate per receiver.
+- **Bounded queue with load shedding.** Reject with `429` or `503` when queue depth or estimated wait
+  exceeds the budget. Track queue depth, oldest-job age and estimated wait as first-class metrics.
 
 ## Trade-offs
-- Synchronous calls are simple to build, test and reason about, but their reliability is bounded by the
-  shortest timeout in the path; once p99 work time approaches that timeout, the shape must change.
-- Asynchronous jobs survive restarts and absorb bursts, but they add a job store, a worker fleet, a status
-  API and client-side polling or callback logic; for sub-second work that machinery is pure overhead.
-- Streaming gives the best perceived latency for a human reader, yet it holds connections, complicates
-  retries and resumption, and offers nothing to a machine caller that only wants the final answer.
-- Polling is proxy-friendly and stateless but wastes requests and adds up to one interval of latency;
-  webhooks are efficient but make you responsible for retries, signatures and the receiver's uptime.
-- The hybrid "wait up to N seconds" keeps simple cases simple, but clients must handle both response
-  shapes, and a poorly chosen N recreates the timeout problem it was meant to avoid.
+- **Simplicity vs timeout ceiling.** Synchronous calls are simple to build, test and reason about, but
+  their reliability is bounded by the shortest timeout in the path; once p99 work time approaches it, the
+  shape must change.
+- **Durability vs machinery.** Asynchronous jobs survive restarts and absorb bursts, but add a job store, a
+  worker fleet, a status API and client polling or callback logic; for sub-second work that is pure overhead.
+- **Perceived latency vs held connections.** Streaming gives the best perceived latency for a human, yet
+  holds connections, complicates retries and resumption, and offers nothing to a machine caller that only
+  wants the final answer.
+- **Polling vs webhooks.** Polling is proxy-friendly and stateless but wastes requests and adds up to one
+  interval of latency; webhooks are efficient but make you responsible for retries, signatures and the
+  receiver's uptime.
+- **Hybrid wait vs two response shapes.** "Wait up to N seconds" keeps simple cases simple, but clients
+  must handle both shapes, and a poorly chosen N recreates the timeout problem it was meant to avoid.
 
 ## Pitfalls
-- Raising timeouts layer by layer instead of changing the shape; the symptom is duplicate runs and double
+- **Raising timeouts layer by layer instead of changing the shape.** Symptom: duplicate runs and double
   token spend after clients retry requests the server was still processing.
-- Accepting jobs without an idempotency key; every client retry of the submit creates a new job, visible
-  as bursts of identical jobs seconds apart.
-- Workers with no lease or heartbeat; a worker crash leaves jobs in `running` indefinitely and users see
-  spinners that never resolve.
-- Unbounded queues; an upstream outage builds a backlog that takes hours to drain, during which fresh
+- **Accepting jobs without an idempotency key.** Every client retry of the submit creates a new job,
+  visible as bursts of identical jobs seconds apart.
+- **Workers with no lease or heartbeat.** A worker crash leaves jobs in `running` indefinitely and users
+  see spinners that never resolve.
+- **Unbounded queues.** An upstream outage builds a backlog that takes hours to drain, during which fresh
   requests wait behind stale ones nobody still wants.
-- Polling with a fixed short interval from thousands of clients; status endpoints become the top traffic
-  source and the database behind them the bottleneck, which is the cue to add push delivery or backoff.
-- Results kept forever with no TTL and no size limit; the jobs table becomes the largest and slowest
-  table and its backups the longest.
-- Treating a disconnect or a cancel as "the work stopped"; the symptom is tickets or emails produced by
-  runs the UI reports as cancelled, because the worker never checked the cancel flag or the effect had
-  already happened.
+- **Fixed short polling from thousands of clients.** Status endpoints become the top traffic source and
+  the database behind them the bottleneck; add push delivery or backoff.
+- **Results kept forever.** No TTL and no size limit make the jobs table the largest and slowest table and
+  its backups the longest.
+- **Treating a disconnect or cancel as "the work stopped".** Symptom: tickets or emails produced by runs
+  the UI reports as cancelled, because the worker never checked the cancel flag or the effect had already
+  happened.
 
 ## When to use
-Decide from the p99 of the work, not the median, against the smallest timeout in the path and against
-how long a human will wait. Work that finishes within a few seconds at p99 stays synchronous. Work that
-takes several seconds to roughly a minute with a person watching should stream. Anything longer, anything
-that must survive a restart, anything with retries and compensation, and anything with no human waiting
-(batch summarisation, re-indexing, nightly evaluations) is an asynchronous job. Measure time-to-first-byte,
-end-to-end completion time, queue depth and the ratio of retried submits to unique jobs. In day-to-day
-work this shows up as the decision of whether an endpoint returns `200` with a body or `202` with a
-`Location` header, and whether your agent framework exposes a `run` call or a `submit` plus `events`
-pair. In interviews, name the three shapes, justify each with a timeout or a human-attention argument,
-and mention idempotency keys and leases without being prompted.
+Decide from the p99 of the work, not the median, against the smallest timeout in the path and how long a
+human will wait.
+- **Synchronous:** work that finishes within a few seconds at p99.
+- **Stream:** several seconds to roughly a minute with a person watching.
+- **Asynchronous job:** anything longer, anything that must survive a restart, anything with retries and
+  compensation, and anything with no human waiting (batch summarisation, re-indexing, nightly evaluations).
+- **Measure:** time-to-first-byte, end-to-end completion time, queue depth and the ratio of retried
+  submits to unique jobs.
+- **Day to day:** whether an endpoint returns `200` with a body or `202` with a `Location` header, and
+  whether your agent framework exposes a `run` call or a `submit` plus `events` pair.
+- **Interviews:** name the three shapes, justify each with a timeout or human-attention argument, and
+  mention idempotency keys and leases without being prompted.
 
 ## Role lens
 - **Engineer:** Builds the `202` + status endpoint pair, adds idempotency keys to submits, implements

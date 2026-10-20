@@ -5,7 +5,7 @@ name: JSON / JSONL
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - prompting/structured-outputs-json-mode
   - python-for-ai/pydantic
@@ -22,79 +22,105 @@ sources:
 ---
 
 ## TL;DR
-JSON is the lingua franca of LLM systems: API payloads, tool arguments, structured outputs. JSONL (JSON
-Lines) puts one complete JSON value on each line, which makes a file appendable, streamable and
-splittable, so it is the standard container for eval sets, fine-tuning data, batch requests and logs.
-Use JSON for one document, JSONL for many records; and know the edges (NaN, big integers, encoding)
-where Python's defaults produce output other parsers reject.
+JSON is the lingua franca of LLM payloads, tool arguments and structured outputs; JSONL puts one JSON
+value per line, making files appendable, streamable and splittable for evals, fine-tuning, batches and
+logs. Watch NaN, big integers and encoding.
 
 ## Why it exists
-Almost everything an AI engineer moves around is a record with nested, loosely structured fields: a
-chat transcript with a variable number of messages, a tool call with arguments, a model response with
-metadata. CSV cannot represent nesting without inventing an escaping scheme, and binary formats need a
-schema up front and are not readable in a terminal. JSON represents nested objects and arrays directly,
-every language parses it, and LLMs produce it reliably enough that providers expose JSON modes.
-
-But a single JSON document is a bad container for *many* records. A file holding one big array
-`[{...}, {...}, ...]` must be parsed in full before you can use the first record, cannot be appended to
-without rewriting the closing bracket, cannot be split across workers without parsing, and is corrupted
-as a whole if a writer crashes before the final `]`. With a million eval cases that means holding the
-whole dataset in memory just to read one.
-
-JSONL fixes this with one rule: each line is a self-contained JSON value, separated by `\n`. Appending
-is writing a line. Reading is iterating lines. Splitting is `split -l`. A crash damages at most the last
-line. Because standard JSON encoders escape newlines inside strings as `\n`, any JSON value can be
-serialized onto one line, so the rule costs nothing in expressiveness.
+- **AI data is nested records.** A chat transcript with a variable number of messages, a tool call with
+  arguments, a model response with metadata.
+- **The alternatives fail.** CSV cannot represent nesting without inventing an escaping scheme; binary
+  formats need a schema up front and are not readable in a terminal. JSON represents nested objects and
+  arrays directly, every language parses it, and LLMs produce it reliably enough that providers expose
+  JSON modes.
+- **One JSON array is a bad container for many records.** `[{...}, {...}, ...]` must be parsed in full
+  before you use the first record, cannot be appended to without rewriting the closing bracket, cannot be
+  split across workers without parsing, and is corrupted as a whole if a writer crashes before the final
+  `]`. With a million eval cases you hold the whole dataset in memory just to read one.
+- **JSONL's one rule.** Each line is a self-contained JSON value, separated by `\n`. Appending is writing
+  a line, reading is iterating lines, splitting is `split -l`, and a crash damages at most the last line.
+- **It costs no expressiveness.** Standard encoders escape newlines inside strings as `\n`, so any JSON
+  value fits on one line.
 
 ## How it works
 ### JSON's data model
-RFC 8259 defines six types: object, array, string, number, `true`/`false`, `null`. There are no comments,
-no trailing commas, no dates, no bytes and no NaN or Infinity. Strings are Unicode and, for interchange,
-the text must be UTF-8. Python's `json` maps these to `dict`, `list`, `str`, `int`/`float`, `bool` and
-`None`. Anything else (datetimes, `Decimal`, sets, most numpy scalars such as `np.int64` and
-`np.float32`) raises `TypeError` on `dumps` unless you convert it (`np.float64` slips through only
-because it subclasses Python `float`), typically with a `default=` function or by serializing a
-Pydantic model with `model_dump_json()`.
+RFC 8259 defines six types: object, array, string, number, `true`/`false`, `null`.
+
+| JSON | Python `json` maps to |
+|---|---|
+| object / array | `dict` / `list` |
+| string | `str` |
+| number | `int`/`float` |
+| `true`/`false` / `null` | `bool` / `None` |
+
+- **Not in JSON:** comments, trailing commas, dates, bytes, NaN or Infinity.
+- **Encoding:** strings are Unicode and, for interchange, the text must be UTF-8.
+- **Anything else raises `TypeError` on `dumps`:** datetimes, `Decimal`, sets, most numpy scalars such as
+  `np.int64` and `np.float32`. (`np.float64` slips through only because it subclasses Python `float`.)
+- **Convert first:** with a `default=` function, or serialize a Pydantic model with `model_dump_json()`.
 
 ### The edges where Python's defaults bite
 - **NaN and Infinity.** `json.dumps(float("nan"))` emits `NaN`, which is *not* valid JSON; JavaScript's
   `JSON.parse` and strict parsers reject it. Pass `allow_nan=False` to fail at write time instead.
 - **Big integers.** Python round-trips any integer exactly, but parsers that use IEEE doubles (JavaScript)
   lose precision above 2^53. IDs from Snowflake-style generators should travel as strings.
-- **Non-ASCII.** `ensure_ascii=True` is the default, so `café` is written as `caf\u00e9`. That is valid,
-  but inflates files and hurts readability for multilingual data; `ensure_ascii=False` writes UTF-8, which
-  is correct as long as the file is opened with `encoding="utf-8"`.
+- **Non-ASCII.** `ensure_ascii=True` is the default, so `café` is written as `caf\u00e9`: valid, but it
+  inflates files and hurts readability for multilingual data. `ensure_ascii=False` writes UTF-8, which is
+  correct as long as the file is opened with `encoding="utf-8"`.
 - **Duplicate keys.** The RFC leaves them undefined; Python keeps the last one silently.
 
 ### JSONL mechanics
-Write: `f.write(json.dumps(obj) + "\n")` per record, with no pretty-printing, because `indent=` inserts
-newlines and breaks the one-record-per-line rule. Read: iterate the file object line by line and
-`json.loads` each, which keeps memory proportional to one record. Writers should treat the file as
-append-only and flush per record or per batch; readers should report errors with line numbers so a bad
-record can be located, and decide explicitly whether to skip or stop. Compression composes cleanly:
-`gzip.open(path, "wt")` gives `.jsonl.gz` with the same line semantics.
+1. **Write** `f.write(json.dumps(obj) + "\n")` per record, with no pretty-printing, because `indent=`
+   inserts newlines and breaks one-record-per-line.
+2. **Read** by iterating the file object line by line and calling `json.loads` on each, so memory stays
+   proportional to one record.
+3. **Writers** treat the file as append-only and flush per record or per batch.
+4. **Readers** report errors with line numbers so a bad record can be located, and decide explicitly
+   whether to skip or stop.
+5. **Compress** with `gzip.open(path, "wt")` for `.jsonl.gz`; line semantics are unchanged.
 
-Three details decide whether the crash-isolation promise actually holds:
-- **What counts as a line.** Iterating a text file splits only on `\n` (and `\r\n`), which is what
-  JSONL means. `str.splitlines()` also splits on characters such as U+2028 and U+0085, which
-  `json.dumps(..., ensure_ascii=False)` leaves unescaped inside strings, so reading a file via
-  `text.splitlines()` can cut a valid record in half. Iterate the file, or split on `"\n"` explicitly.
+### Three details that decide crash isolation
+- **What counts as a line.** Iterating a text file splits only on `\n` (and `\r\n`), which is what JSONL
+  means. `str.splitlines()` also splits on U+2028 and U+0085, which `json.dumps(..., ensure_ascii=False)`
+  leaves unescaped inside strings, so `text.splitlines()` can cut a valid record in half. Iterate the
+  file, or split on `"\n"` explicitly.
 - **The torn last line.** A writer killed mid-write leaves a final line with no trailing newline that
-  usually fails to parse. A reader resuming a job should tolerate exactly that case (drop it, then
-  truncate or rewrite the file) and treat a bad line anywhere else as real corruption.
-- **One writer per file.** Several processes appending to the same file can interleave their bytes
-  when records are large or the file lives on network storage, producing lines that are two half
-  records. Give each worker its own shard (`results-00.jsonl`, `results-01.jsonl`) or funnel writes
-  through one process.
+  usually fails to parse. A resuming reader should tolerate exactly that case (drop it, then truncate or
+  rewrite the file) and treat a bad line anywhere else as real corruption.
+- **One writer per file.** Several processes appending to one file can interleave bytes when records are
+  large or the file is on network storage, producing two half records on a line. Give each worker its own
+  shard (`results-00.jsonl`, `results-01.jsonl`) or funnel writes through one process.
 
 ### Where you meet it
-OpenAI-style fine-tuning datasets are JSONL with one `{"messages": [...]}` object per line; the OpenAI
-Batch API takes a JSONL file of requests, each with a `custom_id` so results can be matched back; eval
-harnesses store cases and results as JSONL; structured logs are usually one JSON object per line. For
-analytics over millions of rows, JSONL is usually converted to a columnar format such as Parquet, since
-re-parsing text on every query is slow.
+| Use | Shape |
+|---|---|
+| OpenAI-style fine-tuning data | One `{"messages": [...]}` object per line |
+| OpenAI Batch API | JSONL of requests, each with a `custom_id` so results match back |
+| Eval harnesses | Cases and results as JSONL |
+| Structured logs | Usually one JSON object per line |
 
-## Example
+For analytics over millions of rows, JSONL is usually converted to a columnar format such as Parquet,
+since re-parsing text on every query is slow.
+
+## Diagram
+The write side keeps one record per line; the read side streams line by line, tolerates only a torn
+final line, and pins any other failure to a line number.
+
+```mermaid
+flowchart TD
+    R["Record: dict or Pydantic model"] --> W["json.dumps with allow_nan=False, no indent"]
+    W --> A["Append line plus newline, flush"]
+    A --> F[("Shard file per worker")]
+    F --> I["Reader iterates the file line by line"]
+    I --> T{"Line ends with a newline?"}
+    T -->|"no, last line"| X["Torn tail: drop or truncate"]
+    T -->|"yes"| L["json.loads, then validate the record"]
+    L -->|"valid"| U["Use one record, memory stays flat"]
+    L -->|"invalid"| E["Raise with path and line number"]
+```
+
+## Examples
+### Write an eval set safely, read it as a stream
 Writing an eval set safely and reading it back as a stream, with failures pinned to a line.
 
 ```python
@@ -132,43 +158,101 @@ for case in read_jsonl(p):                             # one record in memory at
     print(case["id"], len(case["messages"]))
 ```
 
-Without the fix, `write_jsonl` raises `ValueError: Out of range float values are not JSON compliant`
-on the second record, at write time, instead of producing a file that a TypeScript dashboard later
-refuses to parse.
+- **Without the fix,** `write_jsonl` raises `ValueError: Out of range float values are not JSON compliant`
+  on the second record, at write time, instead of producing a file a TypeScript dashboard later refuses
+  to parse.
+
+### Resumable batch output that survives a torn last line
+A worker appends one result per request and can be killed at any time. On restart it drops a torn tail,
+skips finished `custom_id`s and appends the rest.
+
+```python
+import json
+from pathlib import Path
+
+def resume(path: Path) -> set[str]:
+    done, good_bytes = set(), 0
+    if not path.exists():
+        return done
+    with path.open("rb") as f:
+        for raw in f:                          # binary iteration splits on b"\n" only
+            if not raw.endswith(b"\n"):        # torn last line: writer died mid-record
+                break
+            if raw.strip():                    # a bad *complete* line is real corruption: let it raise
+                done.add(json.loads(raw)["custom_id"])
+            good_bytes += len(raw)
+    with path.open("r+b") as f:
+        f.truncate(good_bytes)                 # cut the torn tail before appending again
+    return done
+
+def run(requests, out: Path, call_model):
+    done = resume(out)
+    with out.open("a", encoding="utf-8") as f:
+        for req in requests:
+            if req["custom_id"] in done:
+                continue
+            result = call_model(req)
+            f.write(json.dumps({"custom_id": req["custom_id"], **result}, allow_nan=False) + "\n")
+            f.flush()                          # durability matches progress
+```
+
+| Event | Effect on `results.jsonl` |
+|---|---|
+| Pod killed while writing record 1,800,001 | 1,800,000 complete lines plus a partial one |
+| Restart calls `resume` | Partial line truncated; 1,800,000 IDs marked done |
+| Job continues | Only the remaining requests are sent, so it is idempotent |
+
+## Production patterns
+- **Strict writer by default.** Wrap `json.dumps` with `allow_nan=False`, an explicit `default=` for
+  datetimes and numpy scalars, and `encoding="utf-8"` on every open. Monitor write-time `ValueError` and
+  `TypeError` counts; they are bugs caught early, not noise to suppress.
+- **Validate every line at the boundary.** Define a Pydantic model per record type and call
+  `Model.model_validate_json(line)` while reading, raising with the file and line number. Track the
+  rejected-line count per dataset version; schema drift shows up there first.
+- **Shard by worker, merge by concatenation.** Each process writes `results-{worker:02d}.jsonl`, never a
+  shared file, and downstream jobs read the shard glob. Watch for shards with no trailing newline, which
+  mark workers that died mid-write.
+- **Key every record for idempotent resume.** Carry a stable `custom_id` (strings, not big integers) and
+  resume as in the second example. Monitor duplicate-ID counts after merges.
+- **Promote to Parquet for analytics.** Keep JSONL as the append and interchange format, and convert
+  finished files (for example `pd.read_json(path, lines=True).to_parquet(...)`) before repeated queries.
+  Watch query latency and file size; a gzip-compressed `.jsonl.gz` is the cheaper archive.
 
 ## Trade-offs
-- JSONL streams and appends record by record, but loses the single-document guarantees: there is no
-  enclosing schema, so a malformed middle line is only found when a reader reaches it.
-- Text JSON is human-readable and universal, yet it is several times larger and slower to parse than
-  columnar binary formats; once you run repeated analytical queries over millions of rows, Parquet wins.
-- Schemaless records make it easy to add fields to eval or log data, but readers drift silently
-  unless a Pydantic model or JSON Schema validates each line at the boundary.
-- `ensure_ascii=False` keeps multilingual data compact and readable, but any consumer that guesses the
-  wrong encoding will mangle it; ASCII escapes are safer when you do not control the reader.
+- **Streaming vs document guarantees.** JSONL streams and appends record by record but has no enclosing
+  schema, so a malformed middle line is only found when a reader reaches it.
+- **Readable vs fast.** Text JSON is human-readable and universal, yet several times larger and slower to
+  parse than columnar binary formats; for repeated analytical queries over millions of rows, Parquet wins.
+- **Schemaless vs drift.** Adding fields to eval or log data is easy, but readers drift silently unless a
+  Pydantic model or JSON Schema validates each line at the boundary.
+- **`ensure_ascii=False` vs safety.** Multilingual data stays compact and readable, but a consumer that
+  guesses the wrong encoding mangles it; ASCII escapes are safer when you do not control the reader.
 
 ## Pitfalls
-- Using `json.dump(obj, f, indent=2)` in a JSONL writer; the symptom is a `JSONDecodeError` on the very
-  first line (a lone `{` is not a complete value) because each record now spans many lines.
-- Serializing NaN from pandas or numpy metrics; the symptom is a JavaScript or Go consumer rejecting
-  the file while Python reads it fine.
-- Calling `f.readlines()` or building `[json.loads(l) for l in f]` on a multi-gigabyte JSONL file; the
-  symptom is memory climbing to several times the file size (parsed Python objects are far larger than
-  their text) and the process being OOM-killed. (`json.load` on JSONL fails outright with "Extra data".)
-- Reading with `path.read_text().splitlines()`; the symptom is a `JSONDecodeError` ("Unterminated
-  string") on a handful of records that contain U+2028 or similar characters, often scraped web text.
-- Opening files without `encoding="utf-8"`; the symptom is `UnicodeDecodeError` or mojibake on
-  Windows or in containers with a non-UTF-8 locale.
-- Passing numpy types into `json.dumps`; the symptom is `TypeError: Object of type float32 is not JSON
-  serializable` deep inside an eval run.
+- **`json.dump(obj, f, indent=2)` in a JSONL writer.** Symptom: `JSONDecodeError` on the very first line
+  (a lone `{` is not a complete value) because each record spans many lines. Fix: no `indent`.
+- **Serializing NaN from pandas or numpy metrics.** Symptom: a JavaScript or Go consumer rejects the file
+  while Python reads it fine. Fix: `allow_nan=False` and map NaN to `null`.
+- **`f.readlines()` or `[json.loads(l) for l in f]` on a multi-gigabyte file.** Symptom: memory climbs to
+  several times the file size (parsed objects are far larger than their text) and the process is
+  OOM-killed. (`json.load` on JSONL fails outright with "Extra data".) Fix: a generator reader.
+- **Reading with `path.read_text().splitlines()`.** Symptom: `JSONDecodeError` ("Unterminated string") on
+  a handful of records containing U+2028 or similar, often scraped web text. Fix: iterate the file.
+- **Opening files without `encoding="utf-8"`.** Symptom: `UnicodeDecodeError` or mojibake on Windows or
+  in containers with a non-UTF-8 locale.
+- **Passing numpy types into `json.dumps`.** Symptom: `TypeError: Object of type float32 is not JSON
+  serializable` deep inside an eval run. Fix: `.item()`, `.tolist()` or a `default=` hook.
 
 ## When to use
-Use JSON for single payloads: API requests and responses, tool arguments, config documents, a model's
-structured output. Use JSONL whenever you have a collection of records that grows over time or is
-processed one at a time: eval datasets, fine-tuning data, batch-inference inputs and outputs, agent
-traces and logs. Validate each line at ingestion with a Pydantic model so bad records fail with a line
-number. Move to Parquet or a database when you need column-wise queries, joins or typed schemas across
-millions of rows. Interviewers often ask why JSONL rather than a JSON array; the answer is streaming,
-appending and crash isolation.
+- **JSON for single payloads:** API requests and responses, tool arguments, config documents, a model's
+  structured output.
+- **JSONL for growing or one-at-a-time collections:** eval datasets, fine-tuning data, batch-inference
+  inputs and outputs, agent traces and logs.
+- **Validate at ingestion** with a Pydantic model so bad records fail with a line number.
+- **Move to Parquet or a database** for column-wise queries, joins or typed schemas across millions of
+  rows.
+- **Interviews:** "why JSONL rather than a JSON array?" The answer is streaming, appending and crash
+  isolation.
 
 ## Role lens
 - **Engineer:** Writes JSONL readers as generators with line-numbered errors, sets `allow_nan=False`, and
@@ -187,6 +271,42 @@ resume, read the existing file, collect completed IDs and only submit the rest, 
 idempotent. Flush after each batch so durability matches progress. Downstream consumers can stream the
 file without loading 2 million objects, and shards can be split by line for parallel scoring. If the
 results feed analytics, convert the finished JSONL to Parquet.
+
+## Interview questions
+### What is JSONL, and why do fine-tuning, eval and batch APIs use it instead of a JSON array?
+- **Definition:** one self-contained JSON value per line, separated by `\n`; encoders escape newlines
+  inside strings, so any value fits on one line.
+- **Why:** a reader handles one record at a time, a writer appends without rewriting a closing `]`, a file
+  splits by line across workers, and a crash damages at most the last line.
+- **Example:** OpenAI-style fine-tuning data is one `{"messages": [...]}` object per line.
+
+### Python reads your results file fine, but a TypeScript dashboard rejects it. What do you check?
+- **NaN or Infinity first:** Python's `json.dumps` emits `NaN` by default, which is not valid JSON, so
+  strict parsers like `JSON.parse` fail. Write with `allow_nan=False` and map NaN to `null`.
+- **Big integers next:** JavaScript parses numbers as IEEE doubles and loses precision above 2^53, so IDs
+  should travel as strings.
+- **Then encoding:** confirm the file is UTF-8 and was opened with `encoding="utf-8"` on both sides.
+
+### A reader fails with "Unterminated string" on a few records of scraped web text. Why?
+- **Likely cause:** the code splits with `str.splitlines()`, which also breaks on U+2028 and U+0085.
+  `ensure_ascii=False` leaves those unescaped inside strings, so a valid record is cut in half.
+- **Fix:** iterate the file object, which splits only on `\n` and `\r\n`, or split on `"\n"` explicitly.
+- **Prevent it:** keep a regression case containing U+2028 in the reader's tests.
+
+### How should several workers write results without corrupting the output?
+- **One writer per file:** concurrent appends to one file can interleave bytes for large records or on
+  network storage, leaving two half records on one line.
+- **Shard and concatenate:** each worker writes `results-00.jsonl`, `results-01.jsonl` and so on, and
+  downstream jobs read the glob.
+- **Monitor:** a shard without a trailing newline marks a worker that died mid-write; duplicate
+  `custom_id` counts after a merge reveal double processing.
+
+### When would you not keep data in JSONL?
+- **Repeated analytics:** text JSON is larger and slower to parse than columnar formats, so finished
+  datasets queried column by column across millions of rows belong in Parquet or a database.
+- **Typed joins and schemas:** JSONL has no enclosing schema, so drift is found only when a reader hits
+  the bad line.
+- **Keep JSONL for:** append-heavy interchange, such as eval cases, batch inputs and outputs, and traces.
 
 ## Quiz
 ### Q: Why is JSONL preferred over a single JSON array for a large, growing eval dataset?

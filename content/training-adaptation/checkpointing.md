@@ -5,7 +5,7 @@ name: Checkpointing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - training-adaptation/gradient-checkpointing
   - training-adaptation/distributed-training
@@ -23,104 +23,109 @@ sources:
 ---
 
 ## TL;DR
-Checkpointing saves the complete training state (weights, optimizer moments, scheduler, RNG and data
-position) to durable storage at intervals, so a run can resume after a failure, be rolled back, and be
-selected from: the best checkpoint on validation is early stopping made concrete. Long runs fail, at
-cluster scale they fail often, and a full training checkpoint of a 7B model is on the order of 100 GB,
-so frequency, format, sharding and retention are engineering decisions. It is unrelated to gradient
-checkpointing, which recomputes activations to save memory.
+Checkpointing saves the full training state (weights, optimizer, scheduler, RNG, data position) durably
+so runs can resume, roll back and pick the best step. A 7B checkpoint is ~100 GB, so frequency, format
+and retention are engineering decisions. Unrelated to gradient checkpointing.
 
 ## Why it exists
-Training is a long, stateful computation on hardware that fails. A single-GPU fine-tune runs for hours on
-a spot instance that can be reclaimed at any minute; a pretraining run occupies thousands of accelerators
-for weeks, and with that many parts, hardware faults are routine rather than exceptional. The Llama 3
-report, for example, counts hundreds of job interruptions during a 54-day pretraining window, most of
-them unexpected. Without checkpoints every failure restarts from zero; with independent failures the
-expected time to finish grows exponentially in the ratio of run length to mean time between failures
-(roughly `MTBF·(e^(L/MTBF) − 1)`), so a run many times longer than the MTBF effectively never finishes. With checkpoints every *T*
-minutes, a failure costs on average *T/2* minutes of recomputation plus the restart time.
-
-Resumability is the forcing reason; two more follow from having the artefacts. Model selection: the best
-model is usually not the last one, because validation performance peaks and then overfitting sets in, so
-you need the weights from the peak step, which only exist if you saved them. Rollback and reproducibility:
-a deployed model that misbehaves needs a known-good predecessor, and a result nobody can reconstruct is
-not a result. The naive alternative, saving only the weights at the end or at epoch boundaries, fails on
-all three counts: it cannot resume correctly (the optimizer state is gone), misses the peak, and leaves
-nothing to roll back to.
+- **Long runs on failing hardware.** A single-GPU fine-tune runs for hours on a spot instance that can be
+  reclaimed at any minute; a pretraining run occupies thousands of accelerators for weeks, where hardware
+  faults are routine. The Llama 3 report counts hundreds of job interruptions in a 54-day pretraining
+  window, most of them unexpected.
+- **Without checkpoints, cost explodes.** Every failure restarts from zero. With independent failures the
+  expected time to finish grows exponentially in run length over mean time between failures (roughly
+  `MTBF·(e^(L/MTBF) − 1)`), so a run many times longer than the MTBF effectively never finishes.
+- **With checkpoints, cost is bounded.** Saving every *T* minutes, a failure costs on average *T/2*
+  minutes of recomputation plus the restart time.
+- **Model selection and rollback.** The best model is usually not the last, because validation peaks and
+  then overfitting sets in, so the peak's weights exist only if saved. A misbehaving deployed model needs
+  a known-good predecessor, and a result nobody can reconstruct is not a result.
+- **Weights at the end, or per epoch, fails all three.** It cannot resume correctly (optimizer state is
+  gone), misses the peak, and leaves nothing to roll back to.
 
 ## How it works
 ### What a resumable checkpoint contains
 Resuming means continuing the exact same trajectory, so everything that influences the next step must be
 saved:
-- **Model weights**, in the training precision plus fp32 master weights under mixed precision.
-- **Optimizer state.** AdamW keeps two fp32 moments per parameter. In mixed precision a checkpoint holds
-  about 14 bytes per parameter: 2 for bf16/fp16 weights plus 12 for the fp32 master copy and the two
-  moments (ZeRO's often-quoted 16 bytes also counts the 2-byte gradients, which live only in memory). A 7B
-  model's resumable state is therefore roughly 100 GB, most of it fp32 optimizer state. Dropping it and
-  resuming with fresh moments produces a loss spike, because Adam's first steps after a reset are badly scaled.
-- **Scheduler state and step counter**, so the learning rate continues from where it was instead of
-  restarting warmup.
-- **Mixed-precision loss-scaler state**, where used.
-- **RNG states** (Python, NumPy, PyTorch CPU and CUDA) and the **data-loader position** (epoch, batches
-  consumed, sampler seed), so dropout masks and example order after resume match an uninterrupted run and
-  no example is skipped or seen twice.
-- **Config and tokenizer**, so the artefact can be loaded without the training code.
+
+| Component | Why it is needed |
+|---|---|
+| **Model weights** (training precision, plus fp32 master weights under mixed precision) | the parameters themselves |
+| **Optimizer state** (AdamW: two fp32 moments per parameter) | fresh moments after resume cause a loss spike, because Adam's first steps after a reset are badly scaled |
+| **Scheduler state and step counter** | the learning rate continues instead of restarting warmup |
+| **Mixed-precision loss-scaler state**, where used | keeps the scale where it was |
+| **RNG states** (Python, NumPy, PyTorch CPU and CUDA) and **data-loader position** (epoch, batches consumed, sampler seed) | dropout masks and example order match an uninterrupted run; no example skipped or seen twice |
+| **Config and tokenizer** | the artefact loads without the training code |
+
+- **Size arithmetic.** In mixed precision a checkpoint holds about 14 bytes per parameter: 2 for
+  bf16/fp16 weights plus 12 for the fp32 master copy and the two moments.
+- **ZeRO's often-quoted 16 bytes** also counts the 2-byte gradients, which live only in memory.
+- **So a 7B model's resumable state is roughly 100 GB,** most of it fp32 optimizer state.
 
 ### Frequency
-The expected loss from a failure is half the interval, and each save costs write time during which the
-GPUs may idle. Saving a 100 GB state over a 1 GB/s link is about 100 seconds; saving every 30 minutes
-costs about 5% of throughput in exchange for losing at most 30 minutes. Two techniques shrink the cost:
-asynchronous checkpointing snapshots the state to host memory (a stall of seconds or less per GPU, bounded
-by device-to-host bandwidth) and writes to storage in the background while training continues; incremental
-or differential schemes save only what changed, which pays off mainly when much of the state is static,
-such as large sparse embedding tables.
+- **The basic trade.** Expected loss from a failure is half the interval; each save costs write time
+  during which GPUs may idle.
+- **Example.** Saving 100 GB over a 1 GB/s link is about 100 seconds; saving every 30 minutes costs about
+  5% of throughput in exchange for losing at most 30 minutes.
+- **Asynchronous checkpointing** snapshots the state to host memory (a stall of seconds or less per GPU,
+  bounded by device-to-host bandwidth) and writes to storage in the background while training continues.
+- **Incremental or differential schemes** save only what changed; they pay off mainly when much of the
+  state is static, such as large sparse embedding tables.
 
-The classic first-order answer to "how often" is the Young–Daly interval. If a save stalls training for
-*C* seconds and failures arrive with mean time *M* between them, the overhead per unit time is roughly
-`C/T` (saving) plus `T/(2M)` (expected recomputation), and minimising the sum gives
+### The Young–Daly interval
+If a save stalls training for *C* seconds and failures arrive with mean time *M* between them, overhead
+per unit time is roughly `C/T` (saving) plus `T/(2M)` (expected recomputation). Minimising the sum gives:
 
 ```
 T_opt ≈ sqrt(2 · C · M)
 ```
 
-With a 100-second synchronous save and a failure every three hours (M = 10,800 s), T_opt ≈ 1,470 s, about
-25 minutes, and the two overheads together come to roughly 14% of the run. Cut the stall to 5 seconds
-with an asynchronous snapshot and T_opt drops to about 5.5 minutes with a total overhead near 3%: cheaper
-saves buy both more frequent saves and less waste. The square root also says that save cost matters as
-much as failure rate. The formula ignores restart time and assumes failures are memoryless, so treat it as
-the starting point, then save more often near the end of a run, where losing work costs the most.
+| Save stall C | M | T_opt | Total overhead |
+|---|---|---|---|
+| 100 s (synchronous) | 10,800 s (a failure every three hours) | ≈ 1,470 s, about 25 minutes | roughly 14% |
+| 5 s (asynchronous snapshot) | 10,800 s | about 5.5 minutes | near 3% |
+
+- **Cheaper saves buy both** more frequent saves and less waste.
+- **The square root** says save cost matters as much as failure rate.
+- **Caveats.** The formula ignores restart time and assumes memoryless failures. Treat it as the start,
+  then save more often near the end of a run, where losing work costs the most.
 
 ### Distributed layout
-Under data parallelism every rank holds the same state and one rank writes it. Under ZeRO or FSDP the
-optimizer state and weights are sharded, so each rank writes its own shard in parallel, which is fast but
-ties the checkpoint to that world size and sharding scheme. Resuming on a different number of GPUs
-requires a resharding step; libraries such as PyTorch Distributed Checkpoint and DeepSpeed provide
-consolidation utilities. Keep a consolidated, weights-only export alongside the sharded training state for
-evaluation and serving.
+- **Data parallelism:** every rank holds the same state and one rank writes it.
+- **ZeRO or FSDP:** optimizer state and weights are sharded, so each rank writes its own shard in
+  parallel. Fast, but it ties the checkpoint to that world size and sharding scheme.
+- **Resuming on a different GPU count** requires a resharding step; PyTorch Distributed Checkpoint and
+  DeepSpeed provide consolidation utilities.
+- **Keep a consolidated, weights-only export** alongside the sharded training state for evaluation and
+  serving.
 
 ### Atomicity and retention
-Write to a temporary path and rename on completion, so a crash mid-write never leaves a truncated file
-masquerading as the latest checkpoint; a manifest with a hash catches silent corruption. On a local or
-network filesystem, flush the file to disk before the rename, or a power loss can still leave the new
-name pointing at incomplete data. Object stores have no atomic rename of a directory of shards, so the
-equivalent is to upload every shard first and write a small manifest or "latest" pointer last; a reader
-trusts only checkpoints whose manifest exists. Retention policy:
-keep the last *k* for resume, the best on validation for selection, and periodic ones (every *n* steps or
-every epoch) for analysis, and delete the rest, because 100 GB per save fills any disk quickly.
+1. **Temp path, then rename.** A crash mid-write never leaves a truncated file masquerading as the latest
+   checkpoint.
+2. **Manifest with a hash** catches silent corruption.
+3. **Flush before rename** on a local or network filesystem, or a power loss can leave the new name
+   pointing at incomplete data.
+4. **Object stores have no atomic directory rename.** Upload every shard first and write a small manifest
+   or "latest" pointer last; readers trust only checkpoints whose manifest exists.
+5. **Retention:** keep the last *k* for resume, the best on validation for selection, and periodic ones
+   (every *n* steps or every epoch) for analysis. Delete the rest, because 100 GB per save fills any disk
+   quickly.
 
 ### Selection, averaging and formats
-Record the validation metric with each checkpoint so "best" is a lookup, not a re-evaluation. Averaging
-the weights of the last several checkpoints is a cheap, old trick that often improves the final model;
-the original Transformer paper averaged the last 5 (base) or 20 (big) checkpoints. For export, prefer
-`safetensors` over pickled `torch.save` files: a pickle can execute arbitrary code on load, which is why
-`torch.load` defaults to `weights_only=True` since PyTorch 2.6 and why weights from untrusted sources should never be
-unpickled. With adapters, the checkpoint is the adapter weights plus an exact reference (name and hash)
-to the base model they were trained on; without that reference the adapter is unusable.
+- **Record the validation metric with each checkpoint,** so "best" is a lookup, not a re-evaluation.
+- **Average the last several checkpoints.** A cheap, old trick that often improves the final model; the
+  original Transformer paper averaged the last 5 (base) or 20 (big) checkpoints.
+- **Export as `safetensors`, not pickled `torch.save` files.** A pickle can execute arbitrary code on
+  load, which is why `torch.load` defaults to `weights_only=True` since PyTorch 2.6 and why weights from
+  untrusted sources should never be unpickled.
+- **Adapters need their base.** The checkpoint is the adapter weights plus an exact reference (name and
+  hash) to the base model they were trained on; without it the adapter is unusable.
 
-## Example
-A compact save/load pair for a single-process PyTorch loop: full state, atomic rename, keep-last-*k*
-retention, and RNG restoration. The Hugging Face `Trainer` does the same through `save_steps`,
-`save_total_limit`, `load_best_model_at_end`, `metric_for_best_model` and `resume_from_checkpoint`.
+## Examples
+### Save and load the full state in PyTorch
+A compact pair for a single-process loop: full state, atomic rename, keep-last-*k* retention, and RNG
+restoration. The Hugging Face `Trainer` does the same through `save_steps`, `save_total_limit`,
+`load_best_model_at_end`, `metric_for_best_model` and `resume_from_checkpoint`.
 
 ```python
 import os, random, numpy as np, torch
@@ -153,47 +158,96 @@ def load_checkpoint(path, model, opt, sched, scaler):
 # On startup:   step, sampler = load_checkpoint(latest, model, opt, sched, scaler); skip `consumed` batches.
 ```
 
-The caller restores the data order by reseeding the sampler with the saved epoch seed and skipping the
-consumed batches, which is the part most hand-written loops forget.
+- **The part most hand-written loops forget:** the caller restores data order by reseeding the sampler
+  with the saved epoch seed and skipping the consumed batches.
+
+### Choosing the save interval
+A runnable Young–Daly calculator. The third scenario is a spot-GPU fine-tune with a three-minute
+synchronous write, preempted about every four hours.
+
+```python
+from math import sqrt
+
+def young_daly(save_stall_s, mtbf_s):
+    t = sqrt(2 * save_stall_s * mtbf_s)                  # optimal interval between saves
+    overhead = save_stall_s / t + t / (2 * mtbf_s)        # saving + expected recomputation
+    return t, overhead
+
+scenarios = {                                             # (stall per save, mean time between failures)
+    "sync save, failure every 3 h": (100, 10_800),
+    "async snapshot, failure every 3 h": (5, 10_800),
+    "spot GPUs: 3-min sync save, preempted every 4 h": (180, 14_400),
+}
+for name, (c, m) in scenarios.items():
+    t, ov = young_daly(c, m)
+    print(f"{name:48s} save every {t / 60:5.1f} min  overhead ~{ov:.0%}")
+# sync save, failure every 3 h          save every  24.5 min  overhead ~14%
+# async snapshot, failure every 3 h     save every   5.5 min  overhead ~3%
+# spot GPUs: 3-min sync save, ...       save every  37.9 min  overhead ~16%
+```
+
+- **Reading it.** Saving once per three-hour epoch on the spot fleet would lose about 1.5 hours per
+  preemption on average; cutting the stall is worth more than tuning the interval.
+
+## Production patterns
+- **Trainer-managed checkpoints for fine-tunes.** In the Hugging Face `Trainer`, set `save_steps` from the
+  interval calculation, `save_total_limit` for retention, and `load_best_model_at_end=True` with
+  `metric_for_best_model` so the best checkpoint is retained. Resume with
+  `trainer.train(resume_from_checkpoint=True)`. Monitor save time per checkpoint and free disk.
+- **Asynchronous sharded saves at scale.** For FSDP or ZeRO jobs, write per-rank shards with PyTorch
+  Distributed Checkpoint or DeepSpeed, using an asynchronous save so the GPU stall is only the copy to host
+  memory. Monitor stall seconds per save, host-memory headroom, and background-write failures, which
+  otherwise fail silently.
+- **Manifest-last on object storage.** Upload all shards, then write a manifest listing files and hashes,
+  then update a "latest" pointer. The resume logic reads only checkpoints with a valid manifest. Monitor
+  for orphaned shard directories without a manifest.
+- **Two artefacts per milestone.** Keep the full sharded training state for resume and a consolidated,
+  weights-only `safetensors` export for evaluation and serving, registered with step, validation metric,
+  data version and (for adapters) the base model's name and hash.
+- **Kill-and-resume drill.** Before a long run, kill the job on purpose mid-epoch and check that the
+  resumed loss curve overlays the uninterrupted one. Monitor recovery time after the simulated
+  preemption.
 
 ## Trade-offs
-- Frequent saves bound the work lost to a failure but cost write time and storage; the balance moves toward
-  more frequent saves as failure rates rise and toward fewer as the save itself becomes slow relative to
+- **Frequent saves vs write time and storage.** They bound the work lost to a failure; the balance moves
+  toward more frequent saves as failure rates rise, and toward fewer as the save becomes slow relative to
   the interval.
-- Sharded checkpoints write in parallel and avoid gathering 100 GB onto one rank, but tie the artefact to a
-  world size and need a resharding step to resume elsewhere.
-- Weights-only exports are small and serve directly but cannot resume training; full state resumes
-  exactly but is several times larger, so most teams keep both.
-- Keeping many checkpoints enables rollback, averaging and post-hoc analysis, but at 100 GB each the
-  storage bill becomes the constraint, which is what retention policies trade against.
-- Asynchronous checkpointing hides the write latency but needs host-memory headroom for a full copy of
-  the state and adds a failure mode in which the background write itself fails silently.
+- **Sharded vs consolidated.** Sharded checkpoints write in parallel and avoid gathering 100 GB onto one
+  rank, but tie the artefact to a world size and need a resharding step to resume elsewhere.
+- **Weights-only vs full state.** Weights-only exports are small and serve directly but cannot resume
+  training; full state resumes exactly but is several times larger, so most teams keep both.
+- **Many checkpoints vs storage bill.** Keeping many enables rollback, averaging and post-hoc analysis,
+  but at 100 GB each storage becomes the constraint, which is what retention policies trade against.
+- **Asynchronous vs complexity.** It hides write latency but needs host-memory headroom for a full copy
+  of the state and adds a failure mode in which the background write itself fails silently.
 
 ## Pitfalls
-- Saving only weights and resuming with a fresh optimizer; the symptom is a loss spike immediately after
+- **Saving only weights and resuming with a fresh optimizer.** Symptom: a loss spike immediately after
   resume and a resumed run that never rejoins the original curve.
-- Not saving the data-loader position; the symptom is examples seen twice or never in the resumed epoch,
-  and a loss curve after resume that differs from an uninterrupted run.
-- Writing checkpoints in place without a temporary file and rename; the symptom is a truncated latest
+- **Not saving the data-loader position.** Symptom: examples seen twice or never in the resumed epoch, and
+  a loss curve after resume that differs from an uninterrupted run.
+- **Writing checkpoints in place without a temporary file and rename.** Symptom: a truncated latest
   checkpoint after a crash and no resumable state at all.
-- Letting the checkpoint directory fill the disk; the symptom is the run dying during a save, often
-  taking the latest good checkpoint with it.
-- A retention rule that deletes the best checkpoint because it is old; the symptom is a final model worse
+- **Letting the checkpoint directory fill the disk.** Symptom: the run dies during a save, often taking
+  the latest good checkpoint with it.
+- **A retention rule that deletes the best checkpoint because it is old.** Symptom: a final model worse
   than one that existed an hour earlier. The Hugging Face `Trainer` retains the best checkpoint when
   `load_best_model_at_end` is set; hand-written loops must do the same explicitly.
-- Saving adapters without recording the base model's exact version; the symptom is an adapter that loads
-  without error onto a different base and produces garbage.
-- Loading pickled checkpoints from untrusted sources; the symptom is arbitrary code running on load.
+- **Saving adapters without the base model's exact version.** Symptom: an adapter that loads without error
+  onto a different base and produces garbage.
+- **Loading pickled checkpoints from untrusted sources.** Symptom: arbitrary code running on load. Fix:
+  `safetensors`, and `weights_only=True`.
 
 ## When to use
-Every training run longer than a few minutes should checkpoint, and every run whose output will be
-deployed should keep the best checkpoint by validation metric. Decide the interval from failure rate and
-save cost, decide the format from how the run is parallelised and who consumes the artefact, and decide
-retention from storage and the need for rollback. Measure save time as a share of step time and the
-recovery time after a simulated preemption. In day-to-day work this is a configuration task in the
-training framework; in a platform role it becomes storage layout, model registry integration and
-promotion rules. In interviews, expect to list what a resumable checkpoint must contain and to explain
-why weights alone are insufficient.
+- **Always checkpoint** any training run longer than a few minutes; keep the best checkpoint by
+  validation metric for every run whose output will be deployed.
+- **Decide:** the interval from failure rate and save cost, the format from how the run is parallelised
+  and who consumes the artefact, and retention from storage and the need for rollback.
+- **Measure:** save time as a share of step time, and recovery time after a simulated preemption.
+- **Day to day** it is a configuration task in the training framework; in a platform role it becomes
+  storage layout, model registry integration and promotion rules.
+- **Interviews:** list what a resumable checkpoint must contain and explain why weights alone are
+  insufficient.
 
 ## Role lens
 - **Engineer:** Configures save interval, retention and best-checkpoint selection in the trainer, tests a

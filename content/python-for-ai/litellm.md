@@ -5,7 +5,7 @@ name: LiteLLM
 kind: tool
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -20,84 +20,96 @@ sources:
 ---
 
 ## TL;DR
-LiteLLM is an open-source Python library and proxy server that puts many LLM providers behind one
-OpenAI-style interface: `completion(model="anthropic/...", messages=...)` returns the same response shape
-whichever provider served it. On top it adds routing, retries, fallbacks, cost tracking and, as a proxy,
-virtual keys and budgets. It exists because multi-provider code otherwise means one integration per
-vendor, and its main cost is that translation can hide or lag provider-specific features.
+LiteLLM is an open-source library and proxy that puts many LLM providers behind one OpenAI-style call,
+adding routing, retries, fallbacks, cost tracking, virtual keys and budgets. Its main cost: translation
+can hide or lag provider-specific features.
 
 ## Why it exists
-Teams rarely stay on one model. They want a cheap model for classification and a strong one for
-reasoning, a second provider for when the first has an outage or rate-limits them, a self-hosted model
-for sensitive data, and the ability to evaluate a new model without rewriting call sites. Each provider
-has its own SDK, message format, tool-call shape, error classes, streaming events and usage fields. If
-product code calls them directly, every new provider touches every call site, fallbacks are implemented
-ad hoc in each service, and nobody can answer "what did we spend on model X for feature Y last month"
-because usage is logged in five shapes.
-
-The naive fix is an internal wrapper. That works for two providers and one capability, but it grows
-into a maintained translation layer for tool schemas, streaming, error mapping and pricing tables,
-which is precisely the boring, fast-changing work a shared library amortises. LiteLLM centralises that
-translation, and its proxy mode moves it out of application code entirely: services talk to one
-OpenAI-compatible endpoint, and the platform team controls which models exist, who may use them, and
-how much they may spend. The trade is a dependency that sits on every LLM call, so its correctness,
-latency and update cadence become yours.
+- **Teams rarely stay on one model.** A cheap model for classification, a strong one for reasoning, a
+  second provider for outages or rate limits, a self-hosted model for sensitive data, and new models to
+  evaluate without rewriting call sites.
+- **Every provider differs.** Each has its own SDK, message format, tool-call shape, error classes,
+  streaming events and usage fields.
+- **Direct calls spread the cost everywhere.** Every new provider touches every call site, fallbacks are
+  ad hoc per service, and nobody can answer "what did we spend on model X for feature Y last month",
+  because usage is logged in five shapes.
+- **An internal wrapper grows into a product.** Fine for two providers and one capability, it becomes a
+  maintained translation layer for tool schemas, streaming, error mapping and pricing tables: the boring,
+  fast-changing work a shared library amortises.
+- **Proxy mode moves it out of apps entirely.** Services talk to one OpenAI-compatible endpoint; the
+  platform team controls which models exist, who may use them and how much they may spend. The trade: a
+  dependency on every LLM call, whose correctness, latency and update cadence become yours.
 
 ## How it works
 ### Unified call
-`litellm.completion(model="<provider>/<model>", messages=[...])` (and `acompletion` for asyncio) parses
-the provider prefix (`openai/`, `anthropic/`, `bedrock/`, `vertex_ai/`, `ollama/`, `hosted_vllm/` and
-many more), translates the OpenAI-format request into that provider's native request, calls it, and
-translates the response back into an OpenAI-format object: `choices[0].message`, `tool_calls`, and
-`usage`. Credentials come from provider-specific environment variables. Parameters a provider does not
-support raise an error by default; `drop_params=True` silently drops them instead, which is convenient
-and dangerous in equal measure.
+`litellm.completion(model="<provider>/<model>", messages=[...])` (and `acompletion` for asyncio):
+1. **Parse the provider prefix:** `openai/`, `anthropic/`, `bedrock/`, `vertex_ai/`, `ollama/`,
+   `hosted_vllm/` and many more.
+2. **Translate** the OpenAI-format request into that provider's native request and call it.
+3. **Translate back** into an OpenAI-format object: `choices[0].message`, `tool_calls` and `usage`.
 
-### What translation actually does
-Take one OpenAI-format request sent to `anthropic/...`. The `system` message is pulled out of `messages`
-into Anthropic's top-level `system` field; a `max_tokens` value is supplied if you omitted one, because
-Anthropic requires it; each OpenAI `tools[].function` becomes a `name`/`description`/`input_schema`
-tool; an assistant message's `tool_calls` become `tool_use` blocks, and each `role: "tool"` message
-becomes a `tool_result` block inside a user message. On the way back, `tool_use` blocks become
-`tool_calls` with `arguments` re-serialised as a JSON string, `stop_reason` maps to `finish_reason`
-(`end_turn` to `stop`, `tool_use` to `tool_calls`, `max_tokens` to `length`), and `input_tokens` /
-`output_tokens` become `prompt_tokens` / `completion_tokens`. Every one of these mappings is a place where
-a provider feature with no OpenAI equivalent (thinking blocks, cache breakpoints, citations) has to be
-carried in an extra field or is lost, which is why translation fidelity is the thing to test.
+- **Same shape whichever provider served it:** `completion(model="anthropic/...", messages=...)` returns
+  the same response object as an OpenAI call.
+- **Credentials** come from provider-specific environment variables.
+- **Unsupported parameters raise by default.** `drop_params=True` silently drops them instead, which is
+  convenient and dangerous in equal measure.
+
+### What translation actually does (OpenAI format to `anthropic/...`)
+| OpenAI side | Anthropic side |
+|---|---|
+| `system` message in `messages` | top-level `system` field |
+| `max_tokens` omitted | a value is supplied, because Anthropic requires it |
+| `tools[].function` | `name`/`description`/`input_schema` tool |
+| assistant `tool_calls` | `tool_use` blocks |
+| `role: "tool"` message | `tool_result` block inside a user message |
+| `tool_calls` with `arguments` re-serialised as a JSON string | `tool_use` blocks (on the way back) |
+| `finish_reason`: `stop`, `tool_calls`, `length` | `stop_reason`: `end_turn`, `tool_use`, `max_tokens` |
+| `prompt_tokens` / `completion_tokens` | `input_tokens` / `output_tokens` |
+
+- **Every mapping is a fidelity risk.** A feature with no OpenAI equivalent (thinking blocks, cache
+  breakpoints, citations) must ride in an extra field or is lost, which is why translation fidelity is the
+  thing to test.
 
 ### Errors
-Provider errors are mapped onto OpenAI-style exception types (rate limit, context window exceeded,
-authentication, bad request), so retry and fallback logic can be written once against one hierarchy.
+- **One hierarchy.** Provider errors map onto OpenAI-style exception types (rate limit, context window
+  exceeded, authentication, bad request), so retry and fallback logic is written once.
 
 ### Router
-`litellm.Router` takes a `model_list` where several deployments can share one logical `model_name`
-(for example two Azure regions plus OpenAI direct). It load-balances across them with a configurable
-`routing_strategy` (random `simple-shuffle` by default, or options that prefer the least busy, lowest
-latency or least used deployment), tracks failures and puts a deployment in cooldown once it exceeds
-`allowed_fails` (for `cooldown_time` seconds), retries with `num_retries`, and applies `fallbacks` that
-map one logical model to others, plus specialised `context_window_fallbacks` (overflow to a
-longer-context model) and `content_policy_fallbacks`. Callers ask for the logical name; topology lives
-in config. The order matters: retries happen within the group first, and fallback to another group only
-when the group as a whole has failed, because a different model is a bigger behavioural change than a
-different deployment of the same one.
+`litellm.Router` takes a `model_list` where several deployments share one logical `model_name` (for
+example two Azure regions plus OpenAI direct).
+
+| Setting | Effect |
+|---|---|
+| `routing_strategy` | load balancing: random `simple-shuffle` by default, or prefer the least busy, lowest latency or least used deployment |
+| `allowed_fails`, `cooldown_time` | a deployment exceeding `allowed_fails` goes into cooldown for `cooldown_time` seconds |
+| `num_retries` | retries within the group |
+| `fallbacks` | map one logical model to others |
+| `context_window_fallbacks` | overflow to a longer-context model |
+| `content_policy_fallbacks` | reroute on content-policy errors |
+
+- **Callers ask for the logical name; topology lives in config.**
+- **Order matters.** Retries happen within the group first; fallback to another group only when the whole
+  group has failed, because a different model is a bigger behavioural change than a different deployment
+  of the same one.
 
 ### Cost and callbacks
-LiteLLM maintains a model price map and computes per-call cost from usage (`completion_cost`), as
-prompt tokens × input price + completion tokens × output price, looked up by model name. A custom
-deployment name (an Azure deployment called `my-gpt4o-mini-eu`) is not in that map, so you declare its
-`base_model` in the deployment's `model_info` for the lookup to work.
-Callbacks send each call's inputs, outputs, latency and cost to logging and observability backends.
+- **Price map.** `completion_cost` computes per-call cost from usage: prompt tokens × input price +
+  completion tokens × output price, looked up by model name.
+- **Custom names need `base_model`.** An Azure deployment called `my-gpt4o-mini-eu` is not in the map, so
+  declare its `base_model` in the deployment's `model_info` for the lookup to work.
+- **Callbacks** send each call's inputs, outputs, latency and cost to logging and observability backends.
 
 ### Proxy (gateway) mode
-The proxy runs the same machinery as a server exposing OpenAI-compatible endpoints, configured by a
-YAML file of models, routing and fallbacks. It adds virtual API keys mapped to teams or users, budgets
-and rate limits per key, spend logs in a database, and central guardrail hooks. Applications then use any
-OpenAI-compatible client, in any language, pointed at the proxy's `base_url`. The core is open source,
-but some proxy features aimed at enterprises (for example SSO and certain audit and admin controls) sit
-behind a commercial licence, so check which ones you need before standardising on it.
+- **Same machinery as a server** exposing OpenAI-compatible endpoints, configured by a YAML file of models,
+  routing and fallbacks.
+- **Governance features:** virtual API keys mapped to teams or users, budgets and rate limits per key,
+  spend logs in a database, and central guardrail hooks.
+- **Any client, any language**, pointed at the proxy's `base_url`.
+- **Licensing.** The core is open source, but some enterprise proxy features (for example SSO and certain
+  audit and admin controls) need a commercial licence; check which you need before standardising.
 
-## Example
-A router with a logical "chat" model, two deployments, retries and a cross-provider fallback.
+## Examples
+### Router with two deployments, retries and a cross-provider fallback
 Model names are illustrative; take them from config.
 
 ```python
@@ -125,47 +137,116 @@ print(resp.model, resp.choices[0].message.content)
 print(resp.usage.prompt_tokens, resp.usage.completion_tokens, litellm.completion_cost(resp))
 ```
 
-Scenario: OpenAI returns 429s for a minute. By default the router spreads "chat" traffic across both
-deployments (simple shuffle); the failing calls are retried, the OpenAI deployment is put in cooldown
-after repeated failures, so traffic lands on the EU Azure deployment, and only if the "chat" group as a
-whole fails does the request go to the Anthropic backup, with the caller still receiving an
-OpenAI-shaped response.
+Scenario: OpenAI returns 429s for a minute.
+1. By default the router spreads "chat" traffic across both deployments (simple shuffle).
+2. Failing calls are retried, and the OpenAI deployment goes into cooldown after repeated failures.
+3. Traffic lands on the EU Azure deployment.
+4. Only if the "chat" group as a whole fails does the request go to the Anthropic backup; the caller still
+   receives an OpenAI-shaped response.
+
+### The same topology as a proxy config
+Applications then call the proxy with any OpenAI-compatible client and a virtual key.
+
+```yaml
+model_list:
+  - model_name: chat
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: chat
+    litellm_params:
+      model: azure/my-gpt4o-mini-eu
+      api_base: https://example-eu.openai.azure.com
+      api_key: os.environ/AZURE_API_KEY
+    model_info:
+      base_model: azure/gpt-4o-mini      # so the price map can cost this custom name
+  - model_name: chat-backup
+    litellm_params:
+      model: anthropic/claude-haiku-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+router_settings:
+  num_retries: 2
+  timeout: 20
+  allowed_fails: 3
+  cooldown_time: 30
+  fallbacks: [{"chat": ["chat-backup"]}]
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:4000", api_key="sk-team-virtual-key", max_retries=0)
+client.chat.completions.create(model="chat", messages=[{"role": "user", "content": "hi"}])
+```
+
+`max_retries=0` on the app client leaves retries to the proxy, so they live in exactly one layer.
+
+### Worked scenario: how stacked retries amplify an incident
+Illustrative settings, during an outage where every upstream call fails:
+
+| Layer | Attempts |
+|---|---|
+| Application client retries 2 times | 3 |
+| Router `num_retries=2` per group | × 3 |
+| Groups tried: "chat", then "chat-backup" | × 2 |
+| **Upstream calls for one user request** | **18** |
+
+That is more than the "dozen" that already hurts, sent exactly when the provider is rate limiting. With
+retries owned only by the router, the same request makes 3 × 2 = 6 calls.
+
+## Production patterns
+- **Own retries in one layer.** Set `num_retries` and `timeout` in the router or proxy, and `max_retries=0`
+  on clients that call the proxy. Monitor upstream calls per user request during incidents.
+- **Eval every fallback pair.** Run the eval suite on each `fallbacks` target before enabling it, and alert
+  on fallback rate per route, so a silent permanent failover with worse quality is noticed.
+- **Make cost attribution complete.** Declare `base_model` for every custom deployment, pass `metadata`
+  (feature, tenant) on each call, and reconcile computed spend against provider invoices monthly before
+  using it for chargeback.
+- **Run the proxy highly available.** At least two replicas behind a load balancer, sharing one database
+  for keys and spend logs, with the proxy's health endpoints wired to the orchestrator's liveness and
+  readiness probes. Monitor proxy-added latency and error rate.
+- **Pin the version, keep `drop_params` off globally.** Lock the LiteLLM version and upgrade deliberately
+  with an eval run; enable dropping only where a known parameter gap is accepted. Watch for cost or format
+  changes after upgrades.
 
 ## Trade-offs
-- One interface across providers makes switching and A/B testing cheap, but the lowest common
-  denominator hides features; Claude cache breakpoints or Responses-API tools may need provider-specific params.
-- The in-process library adds no network hop, but every service needs credentials and config; the proxy
-  centralises keys, budgets and logs at the price of an extra hop and a component you must run highly available.
-- Automatic fallbacks raise availability, but a fallback model may behave differently on your prompts;
-  without evals per fallback pair, an outage silently becomes a quality regression.
-- Built-in price maps make cost visible immediately, but they can lag price changes and negotiated rates;
-  reconcile against provider invoices before using them for chargeback.
+- **One interface vs lowest common denominator.** Switching and A/B testing become cheap, but features get
+  hidden; Claude cache breakpoints or Responses-API tools may need provider-specific params.
+- **Library vs proxy.** The in-process library adds no network hop, but every service needs credentials
+  and config; the proxy centralises keys, budgets and logs at the price of an extra hop and a component you
+  must run highly available.
+- **Availability vs behaviour drift.** Automatic fallbacks raise availability, but a fallback model may
+  behave differently on your prompts; without evals per fallback pair, an outage silently becomes a
+  quality regression.
+- **Instant cost visibility vs accuracy.** Built-in price maps show cost immediately but can lag price
+  changes and negotiated rates; reconcile against provider invoices before using them for chargeback.
 
 ## Pitfalls
-- Enabling `drop_params=True` globally: a parameter you rely on (structured output, a stop sequence) is
-  quietly discarded for one provider, and outputs change format only when a fallback fires.
-- Assuming tool calling and streaming behave identically everywhere: translation edge cases show up as
+- **`drop_params=True` globally.** A parameter you rely on (structured output, a stop sequence) is quietly
+  discarded for one provider, and outputs change format only when a fallback fires.
+- **Assuming tool calling and streaming behave identically everywhere.** Translation edge cases show up as
   malformed tool arguments or missing usage in streamed responses from one provider.
-- Fallback chains without evals: during an incident, users see a different model's style or lower
+- **Fallback chains without evals.** During an incident users see a different model's style or lower
   accuracy, and support tickets spike with no error in the logs.
-- Unpinned versions of a fast-moving dependency on every LLM call: an upgrade changes defaults or
-  pricing data, and the symptom is a behaviour or cost change nobody deployed deliberately.
-- Stacking retry layers: application retries × router `num_retries` × any retries the underlying
-  client performs × each fallback group; the symptom is a single user request turning into a dozen upstream
-  calls during an incident, amplifying the provider's rate limiting. Own retries in exactly one layer.
-- Cost reports showing zero or raising for some deployments: the custom deployment name is not in the
+- **Unpinned versions of a fast-moving dependency on every LLM call.** An upgrade changes defaults or
+  pricing data. Symptom: a behaviour or cost change nobody deployed deliberately.
+- **Stacking retry layers.** Application retries × router `num_retries` × any retries the underlying client
+  performs × each fallback group. Symptom: one user request becomes a dozen upstream calls during an
+  incident, amplifying the provider's rate limiting. Own retries in exactly one layer.
+- **Cost reports showing zero or raising for some deployments.** The custom deployment name is not in the
   price map; declare `base_model` so spend attribution is not silently undercounted.
-- Running the proxy as a single instance: it becomes the single point of failure for every AI feature,
+- **Running the proxy as a single instance.** It becomes the single point of failure for every AI feature,
   and one restart takes them all down.
 
 ## When to use
-Reach for LiteLLM when you genuinely use, or must be able to switch between, several providers: routing
-by cost or capability, cross-provider fallbacks, evaluation harnesses comparing many models, or a
-platform team that needs central keys, budgets and spend attribution across many services (proxy mode).
-Stay with a native SDK when one provider is strategic and you depend on its newest features, or when the
-call volume is small and an extra abstraction is not worth owning. Measure fallback rate, per-model
-latency and error rates, cost per feature and tenant, and quality on an eval set for each fallback pair.
-Interviewers often ask how you would build provider failover and where the abstraction should stop.
+- **Use when** you genuinely use, or must be able to switch between, several providers: routing by cost or
+  capability, cross-provider fallbacks, eval harnesses comparing many models.
+- **Use proxy mode when** a platform team needs central keys, budgets and spend attribution across many
+  services.
+- **Stay with a native SDK when** one provider is strategic and you depend on its newest features, or call
+  volume is small and an extra abstraction is not worth owning.
+- **Measure** fallback rate, per-model latency and error rates, cost per feature and tenant, and quality on
+  an eval set for each fallback pair.
+- **Interviews:** how you would build provider failover and where the abstraction should stop.
 
 ## Role lens
 - **Engineer:** Calls models through one interface, writes retry and fallback config, attaches

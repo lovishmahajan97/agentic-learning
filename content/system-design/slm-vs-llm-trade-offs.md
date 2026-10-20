@@ -5,7 +5,7 @@ name: SLM vs LLM trade-offs
 kind: decision
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - model-internals/small-language-models
   - model-internals/scaling-laws
@@ -22,153 +22,235 @@ sources:
 ---
 
 ## TL;DR
-Small language models (roughly up to the low tens of billions of parameters, runnable on one GPU or a
-laptop; a fuzzy, moving boundary) trade breadth for cost, latency and deployability. On narrow,
-in-distribution tasks, especially after fine-tuning, an SLM often matches a large model; on open-ended
-reasoning, long-horizon tool use and broad world knowledge it does not. The decision turns on the
-task's shape: how narrow, what a tail error costs, and where the data may go.
+Small language models trade breadth for cost, latency and deployability. On narrow, in-distribution
+tasks, especially fine-tuned, they often match large models; on open reasoning, long tool use and world
+knowledge they do not. Decide by task narrowness, tail-error cost and data location.
 
 ## Why it exists
-The gap between a 7B-class model and a frontier model is not ten percent. It is an order of magnitude
-or more in price per token, a similar factor in weight bytes read per generated token and therefore in
-latency, and the difference between "fits in the customer's VPC on one GPU, or on the device" and
-"requires an external API". A choice with that much leverage needs a reasoned basis rather than a
-default.
-
-Both defaults are wrong. "Always use the biggest model" overpays on the large fraction of traffic that
-is easy, blows latency budgets for interactive and on-device use, and is simply unavailable wherever
-data cannot leave the premises. "Small models are good enough now" fails on the tail: the hard five
-percent of inputs where errors concentrate, which is also where incidents and compliance findings come
-from. Small models follow long, complex instruction sets less reliably, hallucinate more on knowledge
-questions because fewer facts fit in fewer parameters, and degrade more sharply in long contexts.
-
-What makes the decision genuinely hard is that the gap is task-dependent. Pattern-following tasks
-(classify, extract, reformat, answer from supplied text) saturate early: beyond some size, a bigger
-model does not do them measurably better, and fine-tuning closes whatever gap remains. Broad reasoning
-and knowledge tasks keep improving with scale. So the question is never "are SLMs good enough" in the
-abstract; it is "is this task the kind that saturates", and that has to be measured.
+- **What "small" means.** Roughly up to the low tens of billions of parameters, runnable on one GPU or a
+  laptop; a fuzzy, moving boundary.
+- **The gap is not ten percent.** Between a 7B-class and a frontier model it is an order of magnitude or
+  more in price per token, a similar factor in weight bytes read per generated token and therefore
+  latency, and the difference between "fits in the customer's VPC on one GPU, or on the device" and
+  "requires an external API". That leverage needs a reasoned basis, not a default.
+- **"Always use the biggest model" is wrong.** It overpays on the large fraction of easy traffic, blows
+  latency budgets for interactive and on-device use, and is unavailable wherever data cannot leave the
+  premises.
+- **"Small models are good enough now" is wrong too.** It fails on the hard five percent of inputs where
+  errors, incidents and compliance findings concentrate. Small models follow long, complex instructions
+  less reliably, hallucinate more on knowledge (fewer facts fit in fewer parameters) and degrade more
+  sharply in long contexts.
+- **The gap is task-dependent.** Pattern-following tasks (classify, extract, reformat, answer from
+  supplied text) saturate early, and fine-tuning closes the remaining gap; broad reasoning and knowledge
+  keep improving with scale. The question is "does this task saturate", and that must be measured.
 
 ## How it works
 ### What shrinks when a model shrinks
-Scaling-law work established that loss falls smoothly with parameters and training tokens, and the
-compute-optimal follow-up showed that smaller models trained on far more tokens recover much of the
-gap, which is why current small models are much stronger than their parameter count once suggested.
-But capabilities do not shrink uniformly. The first to go are **stored world knowledge** (facts live in
-parameters; fewer parameters, fewer facts, more confident invention unless retrieval supplies the
-facts), **multi-step reasoning and planning**, **robustness to long or intricate instruction sets**,
-and **long-context use**. What holds up is in-distribution pattern behaviour, because a narrow task
-occupies a small region of input space that fine-tuning can cover directly.
+- **Scaling laws.** Loss falls smoothly with parameters and training tokens. The compute-optimal
+  follow-up showed smaller models trained on far more tokens recover much of the gap, which is why
+  current small models are much stronger than their parameter count once suggested.
+- **Capabilities do not shrink uniformly.** First to go:
+  - **stored world knowledge**: facts live in parameters, so fewer parameters means fewer facts and more
+    confident invention unless retrieval supplies them;
+  - **multi-step reasoning and planning**;
+  - **robustness to long or intricate instruction sets**;
+  - **long-context use**.
+- **What holds up:** in-distribution pattern behaviour, *because* a narrow task occupies a small region
+  of input space that fine-tuning can cover directly.
 
 ### The physical arithmetic
-Weight memory is parameters × bytes per parameter: a 7B model is about 14 GB in fp16 and roughly 3.5
-to 4 GB at 4-bit, which fits a consumer GPU or a laptop; a 70B model is about 140 GB in fp16 and
-needs several GPUs or aggressive quantization. Decode is memory-bandwidth bound: every generated token
-reads the model's active weights once, so single-stream tokens per second are approximately bandwidth
-divided by weight bytes, and a model ten times smaller generates roughly ten times faster on the same
-card (approximate; batching, KV-cache traffic and mixture-of-experts designs change the constant). The
-KV cache is smaller too, since there are fewer layers and heads. This is why SLMs win on latency and
-on edge deployment, not only on price. Mixture-of-experts models blur the size label: decode speed
-tracks the *active* parameters read per token, but memory must hold *all* experts, so an MoE with a
-small active count decodes like a small model while needing the memory footprint of a large one.
+| Quantity | 7B model | 70B model |
+|---|---|---|
+| Weights, fp16 (parameters × bytes per parameter) | about 14 GB | about 140 GB |
+| Weights, 4-bit | roughly 3.5 to 4 GB: a consumer GPU or a laptop | needs several GPUs or aggressive quantization |
+| Single-stream decode speed, same card | roughly ten times faster | baseline |
+
+- **Decode is memory-bandwidth bound.** Every generated token reads the active weights once, so
+  single-stream tokens per second ≈ bandwidth ÷ weight bytes. A model ten times smaller generates
+  roughly ten times faster (approximate; batching, KV-cache traffic and mixture-of-experts designs
+  change the constant).
+- **The KV cache is smaller too,** since there are fewer layers and heads. So SLMs win on latency and
+  edge deployment, not only on price.
+- **Mixture-of-experts blurs the size label.** Decode speed tracks the *active* parameters read per
+  token, but memory must hold *all* experts: an MoE with a small active count decodes like a small model
+  but needs the memory of a large one.
 
 ### Closing the gap: fine-tuning and distillation
-The standard path is to use the large model as a teacher: run it over your task's inputs to produce
-labels or target outputs, verify a sample by hand, and fine-tune the small model on the result,
-typically with a parameter-efficient method. The student learns the **task behaviour**, not the
-teacher's general capability, so it matches in-distribution and falls off out of distribution. Narrow
-tasks commonly need hundreds to a few thousand examples (an order of magnitude, not a rule). The
-student also inherits the teacher's mistakes, which is why the test set must be human-labelled rather
-than teacher-labelled.
+1. **Use the large model as a teacher.** Run it over your task's inputs to produce labels or target
+   outputs.
+2. **Verify a sample by hand.**
+3. **Fine-tune the small model** on the result, typically with a parameter-efficient method. Narrow
+   tasks commonly need hundreds to a few thousand examples (an order of magnitude, not a rule).
+4. **Test on human labels.** The student learns the **task behaviour**, not the teacher's general
+   capability, so it matches in-distribution and falls off out of distribution. It also inherits the
+   teacher's mistakes, which is why the test set must be human-labelled, not teacher-labelled.
 
 ### The decision dimensions
-- **Task breadth:** closed schema and bounded inputs favour the SLM; open-ended generation favours the LLM.
-- **Tail cost:** if one error in the hard cases is expensive, the LLM or a cascade; if errors are cheap
-  and reviewable, the SLM.
-- **Latency budget:** sub-second interactive or on-device targets usually force the SLM.
-- **Volume:** self-hosted SLM cost is fixed per GPU-hour and amortises only at volume.
-- **Residency and connectivity:** on-prem, air-gapped or offline rules out external APIs.
-- **Knowledge need:** if answers depend on facts, pair the SLM with retrieval or choose the LLM.
-- **Change rate:** a task whose definition shifts monthly makes retraining a treadmill.
-- **Operational capacity:** a self-hosted model needs someone to own serving, monitoring and upgrades.
+| Dimension | Favours SLM | Favours LLM (or cascade) |
+|---|---|---|
+| **Task breadth** | closed schema, bounded inputs | open-ended generation |
+| **Tail cost** | errors cheap and reviewable | one error in the hard cases is expensive |
+| **Latency budget** | sub-second interactive or on-device targets usually force it | relaxed budgets |
+| **Volume** | self-hosted SLM cost is fixed per GPU-hour and amortises only at volume | low volume |
+| **Residency and connectivity** | on-prem, air-gapped or offline rules out external APIs | data may leave |
+| **Knowledge need** | pair the SLM with retrieval | answers depend on facts the SLM lacks |
+| **Change rate** | stable task | definition shifts monthly, so retraining is a treadmill |
+| **Operational capacity** | someone owns serving, monitoring and upgrades | no one to run it |
 
-### The hybrid
-A cascade runs the SLM first and escalates to the LLM on low confidence, failed validation, or a
-trigger condition. It captures most of the saving while giving LLM quality on the tail, at the price of
-a confidence signal that itself needs calibration. For classification with a self-hosted SLM the
-signal is cheap: the probability the model assigns to its chosen label, read from the logits. Raw
-probabilities from fine-tuned models are often overconfident, so the threshold is set empirically: on
-a held-out human-labelled set, sort predictions by confidence and pick the cut-off at which accuracy on
-the accepted items still meets the bar. Everything below it escalates, so the threshold directly sets
-the trade between escalation rate (cost) and accepted-item accuracy (quality). For free-form output,
-the signal comes from validators instead: schema checks, citation checks, or agreement between two
-samples. Routing and cascading have their own lesson; the point here is that the choice is rarely
-binary.
+### The hybrid: a cascade
+- **Shape.** Run the SLM first; escalate to the LLM on low confidence, failed validation or a trigger
+  condition. It captures most of the saving with LLM quality on the tail, at the price of a confidence
+  signal that needs calibration.
+- **Classification signal is cheap.** With a self-hosted SLM, read the probability assigned to the
+  chosen label from the logits.
+- **Set the threshold empirically,** because raw probabilities from fine-tuned models are often
+  overconfident. On a held-out human-labelled set, sort by confidence and pick the cut-off at which
+  accuracy on accepted items still meets the bar; everything below escalates.
+- **The threshold is the dial.** It directly sets the trade between escalation rate (cost) and
+  accepted-item accuracy (quality).
+- **Free-form output** uses validators instead: schema checks, citation checks, or agreement between
+  two samples.
+- **Rarely binary.** Routing and cascading have their own lesson; the point here is the choice is
+  rarely SLM-or-LLM.
 
-## Example
-A worked scenario with **illustrative figures**. A support platform classifies 5,000,000 inbound
-messages a day into intents and PII categories; each call is about 300 input and 10 output tokens.
+## Examples
+### Worked scenario: classifying 5M support messages a day
+**Illustrative figures.** A support platform classifies 5,000,000 inbound messages a day into intents
+and PII categories; each call is about 300 input and 10 output tokens.
 
-Evaluation on 1,000 human-labelled messages: the frontier API model scores 97%; a 7B open-weight model
-zero-shot scores 90%; the same 7B model fine-tuned on 3,000 teacher-labelled examples (500 of them
-human-verified) scores 96%, with a 95% interval of about ±1 point.
+**Evaluation on 1,000 human-labelled messages:**
 
-Cost per day. API at an illustrative 1 unit per million input tokens and 3 per million output:
-5M × (300×1 + 10×3)/10⁶ = 1,650 units. Self-hosted SLM on a GPU node at an illustrative fixed 100 units
-per day, capacity-planned separately. Naive saving: 1,550 units, about 94%.
+| Candidate | Accuracy |
+|---|---|
+| Frontier API model | 97% |
+| 7B open-weight, zero-shot | 90% |
+| Same 7B fine-tuned on 3,000 teacher-labelled examples (500 of them human-verified) | 96%, 95% interval about ±1 point |
 
-Check the break-even and the load before trusting that. An API request costs 330 / 10⁶ ≈ 0.00033
-units, so the GPU's fixed 100 units a day only pays for itself above about 300,000 requests a day; at
-5M the SLM wins on cost, at 100k it would lose. And 5M a day is about 58 requests a second on average,
-roughly 17,000 input tokens a second of prefill, with peaks well above that. Whether one node carries
-the peak must be load-tested; if it takes two, the fixed term doubles and the break-even moves with it.
+**Cost and load, step by step:**
+1. **API cost** at an illustrative 1 unit per million input tokens and 3 per million output:
+   5M × (300×1 + 10×3)/10⁶ = 1,650 units a day.
+2. **Self-hosted SLM:** a GPU node at an illustrative fixed 100 units per day, capacity-planned
+   separately. Naive saving: 1,550 units, about 94%.
+3. **Break-even.** An API request costs 330 / 10⁶ ≈ 0.00033 units, so the GPU's fixed 100 units a day
+   pays for itself only above about 300,000 requests a day: at 5M the SLM wins, at 100k it would lose.
+4. **Load.** 5M a day is about 58 requests a second on average, roughly 17,000 input tokens a second
+   of prefill, with peaks well above. Load-test whether one node carries the peak; if it takes two, the
+   fixed term doubles and the break-even moves with it.
+5. **Price the quality gap.** One point of accuracy on 5M messages is 50,000 misrouted messages a day.
+   At 0.02 units of human rework each, the SLM-only path's extra point costs 1,000 units a day: the
+   real saving is 550 units, and the interval means it could be close to zero.
+6. **Cascade.** The fine-tuned SLM is confident (calibrated probability above threshold) on about 85%
+   of traffic, with accuracy close to the LLM's; the remaining 15% escalates. API cost falls to
+   0.15 × 1,650 ≈ 248 units, plus 100 for the GPU: ≈ 348 units a day, with overall accuracy
+   indistinguishable from 97% on the test set. Saving about 79% with no measurable quality loss.
 
-Now price the quality gap. One point of accuracy on 5M messages is 50,000 misrouted messages a day. If
-each costs 0.02 units of human rework, the SLM-only path's extra point of error costs 1,000 units a
-day, so the real saving is 550 units, and the confidence interval means it could be close to zero.
+**Lesson:** the error-cost term, quality gap × volume × cost per error, must be in the comparison; once
+it is, the cascade usually dominates both pure options at this volume.
 
-Cascade. The fine-tuned SLM is confident (calibrated probability above threshold) on about 85% of
-traffic, where its accuracy is close to the LLM's; the remaining 15% escalates. API cost falls to
-0.15 × 1,650 ≈ 248 units, plus 100 for the GPU, total ≈ 348 units a day, with overall accuracy
-indistinguishable from 97% on the test set. The saving is about 79% with no measurable quality loss.
-The lesson: the error-cost term, quality gap × volume × cost per error, must appear in the comparison,
-and once it does, the cascade usually dominates both pure options at this volume.
+### The comparison as a function
+Reproduces the scenario, including the error-cost term and the break-even.
+
+```python
+def daily(volume, in_tok=300, out_tok=10, p_in=1, p_out=3, gpu_fixed=100,
+          acc_gap=0.01, rework=0.02, escalate=0.0):
+    api_per_req = (in_tok * p_in + out_tok * p_out) / 1e6
+    api_only = volume * api_per_req
+    slm_only = gpu_fixed + volume * acc_gap * rework          # error-cost term included
+    cascade = gpu_fixed + escalate * api_only                  # tail goes to the API model
+    return {"api": api_only, "slm": slm_only, "cascade": cascade,
+            "break_even_req": gpu_fixed / api_per_req}
+
+for v in (100_000, 5_000_000):
+    r = daily(v, escalate=0.15)
+    print(v, {k: round(x) for k, x in r.items()})
+# 100000  {'api': 33, 'slm': 120, 'cascade': 105, 'break_even_req': 303030}   API wins
+# 5000000 {'api': 1650, 'slm': 1100, 'cascade': 348, 'break_even_req': 303030} cascade wins
+```
+
+### Calibrating the cascade threshold
+Runnable, standard library only; the held-out set is synthetic. In production `scored` comes from the
+SLM's top-label probability on human-labelled items.
+
+```python
+import random
+
+def pick_threshold(scored, bar):
+    """scored: (confidence, correct) pairs from a held-out human-labelled set.
+    Returns (threshold, escalation_rate, accepted_accuracy) for the largest accepted share meeting the bar."""
+    ranked = sorted(scored, key=lambda x: -x[0])
+    best, correct = None, 0
+    for i, (conf, ok) in enumerate(ranked, 1):
+        correct += ok
+        if correct / i >= bar:
+            best = (conf, 1 - i / len(ranked), correct / i)
+    return best
+
+# Synthetic held-out set (illustrative): mostly easy, confident items plus a hard tail
+random.seed(0)
+held_out = [(random.uniform(0.90, 1.00), random.random() < 0.985) for _ in range(850)]
+held_out += [(random.uniform(0.40, 0.95), random.random() < 0.70) for _ in range(150)]
+t, esc, acc = pick_threshold(held_out, bar=0.97)
+print(f"threshold {t:.3f}  escalate {esc:.0%}  accepted accuracy {acc:.1%}")
+# threshold 0.789  escalate 10%  accepted accuracy 97.0%
+```
+
+Raising `bar` raises the threshold and the escalation rate; that is the cost-quality dial in one number.
+
+## Production patterns
+- **Prototype large, distil when stable.** For any new task. Ship on the LLM first, log inputs and
+  outputs, and distil into an SLM once the task definition has stopped changing. Monitor how often the
+  task's schema or labels change; frequent changes mean stay on the LLM.
+- **Evaluate the exact deployed artefact.** Whenever quantizing or changing the serving engine. Run the
+  human-labelled set against the specific 4-bit (or other) build you will serve, not the fp16
+  original. Monitor task accuracy per artefact version.
+- **Recalibrate the cascade threshold on a schedule.** Monthly or after any retrain. Re-run the
+  threshold search on fresh human-labelled samples and update the config value. Monitor escalation rate
+  and accepted-item accuracy on sampled reviews; a drifting escalation rate signals input drift.
+- **Load-test the peak before signing the cost case.** Before replacing an API with a self-hosted SLM.
+  Replay peak-hour traffic at production prompt lengths against one node and record p95 latency and
+  throughput. Monitor GPU utilisation and queue depth; under-utilised GPUs erase the saving.
+- **Retrieval for facts, SLM for form.** For knowledge-heavy tasks on small models. Supply facts in the
+  context and keep the SLM's job to formatting or extracting from them. Monitor answers without a
+  supporting citation.
 
 ## Trade-offs
-- An SLM gives roughly an order of magnitude lower cost and latency but a narrower competence; it flips
-  as soon as the task needs world knowledge or multi-step reasoning that retrieval cannot supply.
-- Fine-tuning an SLM closes the in-distribution gap but creates an artefact you must retrain when the
-  input distribution shifts or the base model is retired; it flips when the task changes faster than
-  you can label.
-- Self-hosting an SLM delivers residency, offline operation and fixed cost, but needs operations
-  capacity and only pays at volume; at low volume a small model behind a hosted API is the better middle.
-- The LLM through an API gives breadth and zero infrastructure, at the price of variable cost, external
-  data flow and exposure to the provider's deprecation schedule.
-- A cascade captures most of the saving with LLM-level quality, but adds a confidence estimator that
-  must be calibrated and monitored, and a second code path to operate.
+- **SLM cost and latency vs competence.** Roughly an order of magnitude lower cost and latency but a
+  narrower competence; it flips as soon as the task needs world knowledge or multi-step reasoning that
+  retrieval cannot supply.
+- **Fine-tuning vs maintenance.** It closes the in-distribution gap but creates an artefact to retrain
+  when the input distribution shifts or the base model is retired; it flips when the task changes
+  faster than you can label.
+- **Self-hosting vs operations.** It delivers residency, offline operation and fixed cost, but needs
+  operations capacity and pays only at volume; at low volume a small model behind a hosted API is the
+  better middle.
+- **LLM via API vs dependency.** Breadth and zero infrastructure, at the price of variable cost,
+  external data flow and exposure to the provider's deprecation schedule.
+- **Cascade vs complexity.** It captures most of the saving with LLM-level quality, but adds a
+  confidence estimator to calibrate and monitor, and a second code path to operate.
 
 ## Pitfalls
-- Judging the SLM on zero-shot results and discarding it. Symptom: the fine-tuned version would have
+- **Judging the SLM on zero-shot results and discarding it.** Symptom: the fine-tuned version would have
   matched the bar, but the comparison never got that far.
-- Using an SLM for knowledge-heavy question answering without retrieval. Symptom: fluent, confident,
-  wrong answers about facts the model never held.
-- Handing an SLM a 3,000-token instruction set written for a frontier model. Symptom: rules late in the
-  prompt are ignored and output format drifts.
-- Comparing price per token only. Symptom: the business case omits the cost of errors and escalations,
-  and the GPU's fixed cost at low utilisation.
-- Assuming quantization is free. Symptom: the 4-bit artefact that looked fine on a general benchmark
+- **SLM for knowledge-heavy QA without retrieval.** Symptom: fluent, confident, wrong answers about facts
+  the model never held.
+- **Handing an SLM a 3,000-token instruction set written for a frontier model.** Symptom: rules late in
+  the prompt are ignored and output format drifts.
+- **Comparing price per token only.** Symptom: the business case omits the cost of errors and
+  escalations, and the GPU's fixed cost at low utilisation.
+- **Assuming quantization is free.** Symptom: the 4-bit artefact that looked fine on a general benchmark
   loses several points on your task; always evaluate the exact artefact you deploy.
-- Distilling without a human-labelled test set. Symptom: 99% agreement with the teacher, and the same
-  systematic errors the teacher makes.
+- **Distilling without a human-labelled test set.** Symptom: 99% agreement with the teacher, and the
+  same systematic errors the teacher makes.
 
 ## When to use
-Reach for an SLM for narrow, high-volume, latency-sensitive work: classification, routing, schema-bound
-extraction, guardrail checks, on-device or on-prem features, and anywhere data cannot leave. Reach for
-the LLM for open-ended generation, complex tool use, low-volume high-value analysis, and for any task
-still being discovered: prototype with the large model, and distil once the task definition is stable.
-Measure accuracy with a confidence interval on your own set, cost per successful task including the
-cost of errors, p95 latency, and the escalation rate if you cascade. In interviews, the expected depth
-is naming which capabilities degrade with size, the bandwidth arithmetic behind the latency gain,
-distillation with a human-labelled test set, and the cascade as the usual answer.
+- **Use an SLM for:** narrow, high-volume, latency-sensitive work: classification, routing, schema-bound
+  extraction, guardrail checks, on-device or on-prem features, and anywhere data cannot leave.
+- **Use the LLM for:** open-ended generation, complex tool use, low-volume high-value analysis, and any
+  task still being discovered: prototype with the large model, distil once the definition is stable.
+- **Measure:** accuracy with a confidence interval on your own set, cost per successful task including
+  the cost of errors, p95 latency, and the escalation rate if you cascade.
+- **Interviews:** name which capabilities degrade with size, the bandwidth arithmetic behind the latency
+  gain, distillation with a human-labelled test set, and the cascade as the usual answer.
 
 ## Role lens
 - **Engineer:** Builds the eval that compares the candidates on the real task, runs the distillation

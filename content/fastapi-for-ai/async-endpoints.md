@@ -5,7 +5,7 @@ name: Async endpoints
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - python-for-ai/async-await
   - python-for-ai/asyncio
@@ -22,106 +22,121 @@ sources:
 ---
 
 ## TL;DR
-FastAPI runs `async def` endpoints on the single event loop and plain `def` endpoints in a worker thread
-pool. An `async def` handler that awaits I/O (an LLM API, a database, Redis) lets one process hold
-hundreds of in-flight requests; an `async def` handler that *blocks* (a sync SDK call, a local model
-forward pass) freezes every request in the process. The rule for AI services: await remote models,
-thread or offload local ones, and never mix the two up.
+FastAPI runs `async def` endpoints on the one event loop and `def` endpoints in a thread pool. Awaiting
+I/O lets one process hold hundreds of requests; blocking inside `async def` freezes them all. Await remote
+models, offload local ones.
 
 ## Why it exists
-An AI endpoint spends almost all of its wall-clock time waiting. A chat completion call to a hosted
-model can take anywhere from two to sixty seconds; the Python work around it — validate the request,
-build messages, parse the response — takes about a millisecond. With one thread per request, serving
-300 concurrent chats means 300 threads that are asleep nearly all the time, each holding a stack and
-competing for the GIL during the tiny slices of work they do. Scaling that to thousands of users means
-more processes, more memory and more money for CPU that sits idle.
-
-Cooperative concurrency inverts this. A coroutine that hits `await client.post(...)` hands the loop
-back; the loop runs other coroutines until the socket has data. One process can keep thousands of such
-waits in flight on a single thread, because waiting is free. That is the whole reason `async def`
-exists in a web framework, and for AI workloads the gain is unusually large because the wait-to-work
-ratio is so extreme.
-
-The naive version — "write `async def` everywhere, it is the modern way" — fails in the opposite
-direction. The loop has exactly one thread. If a coroutine calls `requests.post`, `time.sleep`,
-`model.generate(...)` on a CPU or GPU, or a sync database driver, it holds the loop for the whole
-duration and nothing else in the process runs: not other requests, not health checks, not the
-heartbeat that keeps the load balancer happy. The symptom is a server that is fast at one request per
-second and collapses, every latency equal to the slowest call, at twenty. Knowing which code is
-cooperative and which is not is the real content of this topic.
+- **AI endpoints mostly wait.** A hosted chat completion takes anywhere from two to sixty seconds; the
+  Python work around it (validate, build messages, parse) takes about a millisecond.
+- **Thread-per-request wastes that wait.** Serving 300 concurrent chats means 300 threads asleep nearly
+  all the time, each holding a stack and competing for the GIL. Scaling to thousands of users means more
+  processes, memory and money for idle CPU.
+- **Cooperative concurrency makes waiting free.** A coroutine at `await client.post(...)` hands the loop
+  back until the socket has data, so one thread keeps thousands of waits in flight. For AI workloads the
+  gain is unusually large because the wait-to-work ratio is so extreme.
+- **"`async def` everywhere" fails the other way.** The loop has exactly one thread. `requests.post`,
+  `time.sleep`, `model.generate(...)` on a CPU or GPU, or a sync database driver holds it, so nothing else
+  runs: not other requests, not health checks, not the load-balancer heartbeat.
+- **The symptom is a cliff.** Fast at one request per second, collapsing at twenty with every latency
+  equal to the slowest call. Knowing which code is cooperative is the real content of this topic.
 
 ## How it works
 ### Two execution paths
 When a request reaches a route, FastAPI resolves dependencies and calls the endpoint:
-- `async def` endpoints (and dependencies) are awaited directly on the event loop. They must only
-  `await` cooperative libraries.
-- `def` endpoints (and dependencies) are handed to `run_in_threadpool`, which uses AnyIO's
-  `to_thread.run_sync`. The loop keeps running while the thread blocks. AnyIO's default thread limiter
-  allows 40 concurrent threads per process, so the 41st blocking call queues behind the others; you can
-  raise it, at the cost of memory and GIL contention.
-Request parsing and body validation happen on the loop in both cases; response-model validation runs
-on the loop for `async def` endpoints and in the thread pool for `def` ones. This is CPU work, normally
-sub-millisecond for chat-sized payloads, which is acceptable *because* it is bounded, unlike a model
-forward pass; it grows with payload size, so megabyte documents or thousands of vectors are the
-exception worth measuring.
+
+| Declared as | Runs on | Rule |
+|---|---|---|
+| `async def` endpoint or dependency | awaited directly on the event loop | must only `await` cooperative libraries |
+| `def` endpoint or dependency | `run_in_threadpool`, which uses AnyIO's `to_thread.run_sync` | the loop keeps running while the thread blocks |
+
+- **The thread pool is bounded.** AnyIO's default thread limiter allows 40 concurrent threads per
+  process, so the 41st blocking call queues; you can raise it, at the cost of memory and GIL contention.
+- **Validation also costs CPU.** Request parsing and body validation run on the loop in both cases;
+  response-model validation runs on the loop for `async def` and in the thread pool for `def`.
+- **That is acceptable because it is bounded**, normally sub-millisecond for chat-sized payloads, unlike a
+  forward pass. It grows with payload size, so megabyte documents or thousands of vectors are worth
+  measuring.
 
 ### What counts as blocking
-Blocking means the thread cannot be used for anything else until the call returns. In an AI service
-the usual offenders are synchronous HTTP clients (`requests`, the sync variants of provider SDKs),
-`time.sleep`, synchronous database drivers, file I/O on large files, tokenising a very long document,
-and any local model inference (PyTorch, ONNX Runtime, llama.cpp bindings) whether on CPU or GPU, since
-a GPU call blocks the calling thread until the result is back unless the library offers an async API.
-The cooperative equivalents are `httpx.AsyncClient`, the `Async*` provider clients, async drivers
-(asyncpg, aiomysql), `aiofiles`, and `anyio.to_thread.run_sync` for anything that has no async form.
+Blocking means the thread can do nothing else until the call returns.
 
-### Fan-out and ordering
-Because awaits yield, one request can run several provider calls concurrently with `asyncio.gather`
-or an AnyIO task group: embed three chunks at once, call two models and pick the better answer, or run
-a guardrail classifier in parallel with the main completion. Latency becomes the maximum of the calls
-instead of the sum. This is only possible on the async path; a `def` endpoint would need its own
-threads to achieve the same overlap.
+| Usual offender | Cooperative equivalent |
+|---|---|
+| sync HTTP clients (`requests`, sync variants of provider SDKs) | `httpx.AsyncClient`, the `Async*` provider clients |
+| `time.sleep` | `await asyncio.sleep` / `anyio.sleep` |
+| synchronous database drivers | async drivers (asyncpg, aiomysql) |
+| file I/O on large files | `aiofiles` |
+| tokenising a very long document, local model inference (PyTorch, ONNX Runtime, llama.cpp bindings) | `anyio.to_thread.run_sync` for anything with no async form |
+
+- **GPU calls block too.** A GPU call blocks the calling thread until the result is back, on CPU or GPU,
+  unless the library offers an async API.
+
+### Fan-out
+- **Awaits yield, so calls overlap.** One request can run several provider calls with `asyncio.gather`
+  or an AnyIO task group: embed three chunks at once, call two models and pick the better answer, or run a
+  guardrail classifier beside the main completion.
+- **Latency becomes the maximum, not the sum.**
+- **Async path only.** A `def` endpoint would need its own threads for the same overlap.
 
 ### Threads and the GIL
-`def` endpoints parallelise waiting, not Python computation: two threads running pure-Python
-tokenisation share one interpreter lock. They do help for C and CUDA code that releases the GIL, which
-PyTorch and NumPy do for most heavy kernels, so a `def` endpoint running `model.generate()` lets the
-loop keep serving health checks while the GPU works. It does not make the GPU any less of a single
-shared resource; concurrency limits still apply.
+- **`def` endpoints parallelise waiting, not Python computation.** Two threads running pure-Python
+  tokenisation share one interpreter lock.
+- **They do help for C and CUDA code that releases the GIL**, which PyTorch and NumPy do for most heavy
+  kernels, so a `def` endpoint running `model.generate()` lets the loop keep serving health checks.
+- **The GPU is still one shared resource**; concurrency limits still apply.
 
 ### Capacity arithmetic
-Little's law, `concurrency = throughput × latency`, turns the two paths into numbers. With hosted LLM
-calls that take 10 s:
-- `def` endpoint: at most 40 requests in flight (the thread limiter), so the ceiling is 40 ÷ 10 s =
-  4 requests/s per process, however idle the CPU is. Request 41 waits for a thread.
-- `async def` endpoint: in-flight requests are bounded by the HTTP client's connection pool instead
-  (`httpx` defaults to 100 connections), giving 100 ÷ 10 s = 10 requests/s per client, and you can
-  raise that limit cheaply because a parked coroutine costs kilobytes, not a thread.
-- Blocking call on the loop: each request holds the *whole process* for its blocking time *b*, so
-  throughput can never exceed 1 ÷ *b*; 40 ms of synchronous work caps the worker at 25 requests/s.
-The async path does not remove limits; it moves them from threads to sockets and provider quotas,
-which are the limits you actually want to be bound by.
+Little's law, `concurrency = throughput × latency`, with hosted LLM calls that take 10 s:
+
+| Path | What bounds in-flight requests | Ceiling per process |
+|---|---|---|
+| `def` endpoint | thread limiter: at most 40 | 40 ÷ 10 s = 4 requests/s, however idle the CPU; request 41 waits for a thread |
+| `async def` endpoint | HTTP client's connection pool (`httpx` defaults to 100 connections) | 100 ÷ 10 s = 10 requests/s per client; raise it cheaply, since a parked coroutine costs kilobytes, not a thread |
+| blocking call on the loop | each request holds the *whole process* for its blocking time *b* | 1 ÷ *b*: 40 ms of sync work caps the worker at 25 requests/s |
+
+The async path moves limits from threads to sockets and provider quotas, which are the limits you
+actually want to be bound by.
 
 ### Cancellation and disconnects
-Uvicorn does not cancel a handler when the client leaves; it delivers a disconnect event. On the async
-path your code can act on it: race the provider call against `request.is_disconnected()` in a task
-group and cancel the call, so you stop paying for tokens nobody will read. Cancelling a coroutine
-raises `CancelledError` at its current `await`, which closes the provider socket. A thread blocked in a
-sync call cannot be cancelled from outside in Python; it runs to completion. That asymmetry is another
-reason to keep remote model calls on the async path.
+- **Uvicorn does not cancel a handler when the client leaves**; it delivers a disconnect event.
+- **On the async path you can act on it.** Race the provider call against `request.is_disconnected()` in
+  a task group and cancel it, so you stop paying for tokens nobody will read.
+- **Cancelling a coroutine** raises `CancelledError` at its current `await`, which closes the provider socket.
+- **A thread blocked in a sync call cannot be cancelled from outside in Python**; it runs to completion.
+  Another reason to keep remote model calls on the async path.
 
 ### Choosing per endpoint
-- Calls a hosted LLM, embedding API, vector database, Redis, or Postgres over an async driver →
-  `async def`.
-- Runs a local model or a sync-only library you cannot change → `def`, or `async def` with
+- **Hosted LLM, embedding API, vector database, Redis, or Postgres over an async driver** → `async def`.
+- **Local model or a sync-only library you cannot change** → `def`, or `async def` with
   `await run_in_threadpool(fn, ...)` around just the blocking part.
-- Heavy local inference in production → neither; put the model behind a dedicated inference server and
-  go back to the first case.
+- **Heavy local inference in production** → neither; put the model behind a dedicated inference server
+  and go back to the first case.
 
-## Example
+## Diagram
+The decision path FastAPI and you take per endpoint: `async def` runs on the single loop thread, `def` is
+dispatched to the bounded thread pool, and a blocking call on the loop is the one branch that stalls
+the whole process.
+
+```mermaid
+flowchart TD
+    R["Request reaches route"] --> Q{"Endpoint declared as?"}
+    Q -->|"async def"| L["Awaited on the event loop (one thread)"]
+    Q -->|"def"| T["run_in_threadpool (40 threads by default)"]
+    L --> B{"Every call cooperative?"}
+    B -->|"yes: await httpx.AsyncClient, asyncpg"| OK["Loop parks the wait, serves other requests"]
+    B -->|"no: requests, time.sleep, model.generate"| X["Loop blocked: every request in the process waits"]
+    X -->|"fix"| OFF["await run_in_threadpool(fn) or a model server"]
+    T --> P{"Free thread?"}
+    P -->|"yes"| RUN["Blocks a thread, loop stays free"]
+    P -->|"no: request 41"| WAIT["Queues for a thread"]
+```
+
+## Examples
+### RAG endpoint: offload the reranker, fan out the calls
 The commented-out version blocks the loop twice: a CPU reranker and a sync HTTP call. The live version
-runs the reranker in the thread pool, borrows the shared async client created in lifespan, and fans
-out the completion and a safety classifier so the request's latency is the slower of the two, not
-their sum.
+runs the reranker in the thread pool, borrows the shared async client created in lifespan, and fans out
+the completion and a safety classifier so latency is the slower of the two, not their sum.
 
 ```python
 import anyio, httpx
@@ -162,38 +177,97 @@ async def ask(body: Ask, request: Request):
     return {"answer": results["answer"], "sources": ranked[:3]}
 ```
 
+### Runnable: measure the stall with an event-loop lag probe
+Pure asyncio, no server. Fifty "requests" each do 40 ms of blocking work, once on the loop and once
+offloaded, while a probe records how late its 100 ms timer fires.
+
+```python
+import asyncio, time
+
+async def lag_probe(samples, interval=0.1):
+    while True:
+        t0 = time.perf_counter()
+        await asyncio.sleep(interval)
+        samples.append((time.perf_counter() - t0 - interval) * 1000)
+
+def embed_sync():                     # stand-in for 40 ms of CPU-bound embedding
+    time.sleep(0.04)
+
+async def handler(offload: bool):
+    if offload:
+        await asyncio.to_thread(embed_sync)   # loop stays free
+    else:
+        embed_sync()                          # holds the loop for 40 ms
+
+async def run(offload: bool, n: int = 50):
+    samples = []
+    probe = asyncio.create_task(lag_probe(samples))
+    t0 = time.perf_counter()
+    await asyncio.gather(*(handler(offload) for _ in range(n)))
+    elapsed = time.perf_counter() - t0
+    await asyncio.sleep(0.15)                 # let the probe take one more sample
+    probe.cancel()
+    print(f"offload={offload}: {n} calls in {elapsed:.2f}s, worst loop lag {max(samples):.0f} ms")
+
+asyncio.run(run(offload=False))   # ~2.2 s total, loop lag ~2,000 ms: everything serialised
+asyncio.run(run(offload=True))    # ~0.2 s total, loop lag ~1 ms
+```
+
+- **Read the numbers as illustrative.** `time.sleep` releases the GIL, so offloading overlaps perfectly
+  here; real pure-Python CPU work overlaps only if the library releases the GIL (NumPy, PyTorch kernels).
+- **The lag number is the point.** On the blocking path, a health check would have waited two seconds.
+
+## Production patterns
+- **Export an event-loop lag gauge.** Use on every async worker: start a probe task like the one above in
+  lifespan and publish its lateness as a metric. Alert when lag stays above a few milliseconds under load,
+  because it means something is blocking the loop.
+- **One shared async client with explicit limits.** Use for every provider and internal API: create
+  `httpx.AsyncClient(limits=httpx.Limits(max_connections=...), timeout=...)` once in lifespan and store it
+  on `app.state`. Monitor pool wait time and provider 429s, since the pool is now your concurrency cap.
+- **Size the thread limiter deliberately.** Use when `def` endpoints or `run_in_threadpool` calls queue:
+  in lifespan, set `anyio.to_thread.current_default_thread_limiter().total_tokens` to a measured value.
+  Monitor memory and throughput together; more threads only help code that releases the GIL.
+- **Bound fan-out per request and per process.** Use when one request triggers several provider calls:
+  wrap them in an `anyio.CapacityLimiter` or `asyncio.Semaphore` sized to your provider quota. Monitor
+  in-flight provider calls and 429 rates.
+- **Catch blocking calls before production.** Use in CI and staging: enable ruff's flake8-async (`ASYNC`)
+  rules to flag blocking calls in `async def`, and run staging with `PYTHONASYNCIODEBUG=1` so asyncio logs
+  callbacks slower than `loop.slow_callback_duration` (default 0.1 s).
+
 ## Trade-offs
-- `async def` gives huge concurrency per process for I/O-bound work, but one accidental blocking call
-  degrades every request; the win flips to a loss exactly when a sync library sneaks in.
-- `def` endpoints are safe by default and tolerate sync libraries, but each in-flight request occupies a
-  thread from a bounded pool (40 by default), so throughput caps far lower under long calls.
-- Fan-out with `gather` or task groups cuts latency to the slowest call, but multiplies provider
-  concurrency and cost, and needs per-request concurrency limits once traffic grows.
-- Running blocking inference in the thread pool keeps the loop alive, yet threads cannot be cancelled
-  on disconnect and still contend for the GIL on the pure-Python parts.
+- **Huge I/O concurrency vs fragility.** `async def` gives huge concurrency per process for I/O-bound
+  work, but one accidental blocking call degrades every request; the win flips to a loss exactly when a
+  sync library sneaks in.
+- **`def` safety vs a low ceiling.** `def` endpoints are safe by default and tolerate sync libraries, but
+  each in-flight request occupies a thread from a bounded pool (40 by default), so throughput caps far
+  lower under long calls.
+- **Fan-out latency vs provider load.** `gather` or task groups cut latency to the slowest call, but
+  multiply provider concurrency and cost, and need per-request concurrency limits once traffic grows.
+- **Thread-pool inference vs control.** Blocking inference in the thread pool keeps the loop alive, yet
+  threads cannot be cancelled on disconnect and still contend for the GIL on the pure-Python parts.
 
 ## Pitfalls
-- Using a sync provider SDK (`OpenAI()` rather than `AsyncOpenAI()`, or `requests`) inside `async def`;
-  symptom: p50 latency fine in isolation, every latency equal to the slowest call under modest load,
+- **A sync provider SDK inside `async def`.** `OpenAI()` rather than `AsyncOpenAI()`, or `requests`.
+  Symptom: p50 latency fine in isolation, every latency equal to the slowest call under modest load,
   health checks timing out.
-- Calling `time.sleep` for retry back-off inside a coroutine; symptom: a single rate-limited request
-  pauses the whole process for the back-off period.
-- Declaring dependencies `async def` and doing blocking work in them (sync DB session creation, sync
-  JWKS fetch); symptom: the same stall, but harder to find because it is outside the endpoint body.
-- Running a GPU model directly in `async def` to "keep it async"; symptom: throughput equals one request
-  at a time with no overlap of network waits, and the loop-lag metric spikes to the model's latency.
-- Raising the thread limiter to hundreds to fix slow `def` endpoints; symptom: memory growth and GIL
+- **`time.sleep` for retry back-off inside a coroutine.** Symptom: a single rate-limited request pauses
+  the whole process for the back-off period. Fix: `await asyncio.sleep`.
+- **Blocking work in `async def` dependencies.** Sync DB session creation, sync JWKS fetch. Symptom: the
+  same stall, but harder to find because it is outside the endpoint body.
+- **A GPU model directly in `async def` to "keep it async".** Symptom: throughput equals one request at a
+  time with no overlap of network waits, and the loop-lag metric spikes to the model's latency.
+- **Raising the thread limiter to hundreds to fix slow `def` endpoints.** Symptom: memory growth and GIL
   thrash with no throughput gain for Python-bound code.
 
 ## When to use
-Default to `async def` for any endpoint whose time goes to remote calls, which is most AI gateway, RAG
-and agent endpoints, and make sure every library on that path is actually async. Use `def` or
-`run_in_threadpool` for unavoidable blocking work, and bound how much of it can run at once. Measure
-event-loop lag (schedule a no-op every second and record how late it runs) and the thread-pool queue
-depth; lag above a few milliseconds under load means something is blocking. Day to day this shows up
-as a code-review comment on imports: `import requests` in an async service is a bug until proven
-otherwise. In interviews, expect "what happens if you call a sync function in an async endpoint?" and
-"when would you use `def` instead?"; the answers are the stall and the thread pool.
+- **Default to `async def`** for any endpoint whose time goes to remote calls, which is most AI gateway,
+  RAG and agent endpoints, and make sure every library on that path is actually async.
+- **Use `def` or `run_in_threadpool`** for unavoidable blocking work, and bound how much can run at once.
+- **Measure:** event-loop lag (schedule a no-op every second and record how late it runs) and thread-pool
+  queue depth; lag above a few milliseconds under load means something is blocking.
+- **Code review:** `import requests` in an async service is a bug until proven otherwise.
+- **Interviews:** expect "what happens if you call a sync function in an async endpoint?" and "when would
+  you use `def` instead?"; the answers are the stall and the thread pool.
 
 ## Role lens
 - **Engineer:** Picks the async client of every SDK, wraps leftover sync calls in `run_in_threadpool`,
@@ -218,6 +292,46 @@ embedding throughput stays near the same ceiling, now without stalling everythin
 batch embeddings across concurrent requests or move the embedder to a separate service, so the API
 process is purely I/O-bound and its throughput is set by provider latency and connection limits rather
 than by CPU time spent on the loop.
+
+## Interview questions
+### How does FastAPI decide where an endpoint runs, and why does that matter for LLM calls?
+- **By its declaration.** `async def` endpoints and dependencies are awaited directly on the event loop;
+  `def` ones go through `run_in_threadpool`, which uses AnyIO's `to_thread.run_sync`.
+- **It matters because LLM calls mostly wait.** A 2-60 second completion around a millisecond of Python
+  work is ideal for `await`: one thread keeps thousands of waits in flight instead of one sleeping thread
+  per request.
+
+### Health checks start timing out at about twenty concurrent users, though each request is fast alone. How do you debug it?
+- **Suspect a blocking call on the loop.** The signature is a cliff: fine at one request per second,
+  then every latency equals the slowest call.
+- **Measure event-loop lag** with a no-op task scheduled every second; lag in the hundreds of
+  milliseconds confirms it.
+- **Find the call:** a sync provider SDK (`OpenAI()` rather than `AsyncOpenAI()`), `requests`,
+  `time.sleep` in a retry, or a sync driver in an `async def` dependency. Swap in the async client or wrap
+  it with `run_in_threadpool`.
+
+### When would you deliberately write a `def` endpoint instead of `async def`?
+- **When the work is blocking and has no async form**, such as a local model or a sync-only library you
+  cannot change; the thread pool keeps the loop free, and PyTorch and NumPy release the GIL in heavy
+  kernels.
+- **Cost:** the pool is bounded (40 threads by default), so long calls cap throughput, and a thread
+  blocked in a sync call cannot be cancelled when the client disconnects.
+- **For heavy production inference neither fits**: put the model behind a dedicated inference server and
+  call it with `async def`.
+
+### Hosted LLM calls take 10 seconds. What throughput ceiling does one process have on each path?
+- **`def` endpoint:** at most 40 in flight, so 40 ÷ 10 s = 4 requests/s however idle the CPU.
+- **`async def` endpoint:** bounded by the client's connection pool; `httpx` defaults to 100 connections,
+  so 100 ÷ 10 s = 10 requests/s per client, cheap to raise because a parked coroutine costs kilobytes.
+- **A blocking call of *b* seconds on the loop** caps the worker at 1 ÷ *b*: 40 ms of sync work means
+  25 requests/s.
+
+### What does fanning out calls with `asyncio.gather` buy you, and what does it cost?
+- **Gain:** latency becomes the maximum of the calls instead of their sum, for example a completion and a
+  guardrail classifier running side by side.
+- **Cost:** provider concurrency and spend multiply per request, so you need a per-process limit such as
+  an `asyncio.Semaphore` or `anyio.CapacityLimiter` sized to the provider quota.
+- **Limit:** it overlaps waits only; CPU-bound work on one loop thread still runs one piece at a time.
 
 ## Quiz
 ### Q: What happens when an `async def` endpoint calls a synchronous HTTP client that takes 5 seconds?

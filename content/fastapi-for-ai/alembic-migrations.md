@@ -5,7 +5,7 @@ name: Alembic migrations
 kind: tool
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
   - fastapi-for-ai/async-database-access-and-connection-pooling
@@ -21,82 +21,93 @@ sources:
 ---
 
 ## TL;DR
-Alembic is SQLAlchemy's migration tool: each schema change is a versioned Python script with an
-`upgrade()` and `downgrade()`, chained by revision IDs, and the database records which revision it is
-at. That turns "what schema does production have?" into a fact you can query and replay. Autogenerate
-drafts scripts by diffing your models against the live database, but it is a draft: renames, data
-moves and lock-heavy operations still need a human, and safe deploys need expand-contract.
+Alembic versions every schema change as a Python script with `upgrade()` and `downgrade()`, and each
+database records its revision, so "what schema does production have?" is queryable. Autogenerate only
+drafts; renames, data moves and locks need a human and expand-contract.
 
 ## Why it exists
-An AI backend's schema changes constantly: a `tool_calls` JSONB column on messages, a `status` and
-`progress` on jobs, an `embedding vector(1024)` on chunks, then a second embedding column when you
-switch models. Every environment (laptops, CI, staging, each customer's VPC) must end up with exactly
-the same schema, and each must get there from wherever it is today.
-
-The naive alternatives fail in predictable ways. `Base.metadata.create_all()` at startup only creates
-tables that do not exist; it never adds a column to an existing table, so the first schema change
-after launch silently does nothing and the app crashes on a missing column. Hand-run SQL files
-pasted into a console have no record of which ones ran where, so staging and production drift, and
-nobody can say whether a given customer deployment has the `idx_chunks_tenant` index. Writing ad-hoc
-`ALTER` statements in app code that run "if the column is missing" spreads schema logic across the
-codebase and races when ten replicas start at once.
-
-Alembic's answer is the standard one from Rails and Django: an ordered, version-controlled list of
-changes plus a one-row table in each database saying how far along the list it is. Because it reads
-SQLAlchemy metadata, it can also propose the next change from your model diff instead of making you
-type every column twice.
+- **AI schemas change constantly.** A `tool_calls` JSONB column on messages, a `status` and `progress` on
+  jobs, an `embedding vector(1024)` on chunks, then a second embedding column when you switch models.
+- **Every environment must converge.** Laptops, CI, staging and each customer's VPC must end up with
+  exactly the same schema, each starting from wherever it is today.
+- **`Base.metadata.create_all()` at startup fails silently.** It only creates missing tables and never
+  adds a column to an existing one, so the first schema change after launch does nothing and the app
+  crashes on a missing column.
+- **Hand-run SQL and ad-hoc `ALTER` drift and race.** Console-pasted files leave no record of what ran
+  where, so nobody can say whether a customer deployment has the `idx_chunks_tenant` index; "if the
+  column is missing" code spreads schema logic and races when ten replicas start at once.
+- **Alembic uses the standard answer from Rails and Django.** An ordered, version-controlled list of
+  changes plus a one-row table per database saying how far along it is; because it reads SQLAlchemy
+  metadata, it can propose the next change from your model diff instead of making you type every column
+  twice.
 
 ## How it works
 ### The revision chain
-`alembic init migrations` creates `alembic.ini`, a `migrations/env.py` and a `versions/` folder. Each
-file in `versions/` declares `revision = "7c1e..."` and `down_revision = "3d5f..."`, so the scripts form
-a linked list (a directed graph, once branches appear). IDs are random hashes rather than sequence
-numbers *because* two developers on separate branches would otherwise both create "migration 12".
+- **Scaffold:** `alembic init migrations` creates `alembic.ini`, a `migrations/env.py` and a `versions/`
+  folder.
+- **Linked list of scripts:** each file declares `revision = "7c1e..."` and `down_revision = "3d5f..."`,
+  forming a linked list (a directed graph, once branches appear).
+- **Random IDs, not sequence numbers,** *because* two developers on separate branches would otherwise
+  both create "migration 12".
+- **Position in the database:** a table named `alembic_version` holds the current revision ID.
 
-The database stores its position in a table named `alembic_version` holding the current revision ID.
-`alembic upgrade head` walks the graph from that ID to the newest revision, running each `upgrade()`
-in order, and updates the row. `alembic downgrade -1` runs the latest `downgrade()`. `alembic current`
-and `alembic history` show where you are. On PostgreSQL, DDL is transactional and Alembic by default runs the whole
-`upgrade` invocation in one transaction (`transaction_per_migration=True` in `env.py` makes it one per
-revision), so a failed migration rolls back cleanly instead of leaving a half-altered table; on MySQL most DDL commits
-implicitly, so a failure midway can leave you between two revisions.
+| Command | Effect |
+|---|---|
+| `alembic upgrade head` | walks the graph from the stored ID to the newest revision, running each `upgrade()` in order, and updates the row |
+| `alembic downgrade -1` | runs the latest `downgrade()` |
+| `alembic current` / `alembic history` | show where you are |
+
+**Transactions differ by backend:**
+- **PostgreSQL:** DDL is transactional, and Alembic by default runs the whole `upgrade` invocation in one
+  transaction (`transaction_per_migration=True` in `env.py` makes it one per revision), so a failed
+  migration rolls back cleanly instead of leaving a half-altered table.
+- **MySQL:** most DDL commits implicitly, so a failure midway can leave you between two revisions.
 
 ### env.py: the bridge to your app
-`env.py` is ordinary Python that Alembic runs for every command. It sets `target_metadata =
-Base.metadata` (or `SQLModel.metadata`) so autogenerate knows the desired schema, and it builds the
-connection. Read the URL from the same settings object the app uses, *because* a hard-coded URL in
-`alembic.ini` is how migrations end up pointed at the wrong database. For an async app,
-`alembic init -t async migrations` generates an `env.py` that creates an async engine and calls
-`await connection.run_sync(do_run_migrations)`, since Alembic's operations themselves are synchronous.
+- **Ordinary Python** that Alembic runs for every command.
+- **Desired schema:** set `target_metadata = Base.metadata` (or `SQLModel.metadata`) so autogenerate
+  knows what to diff against.
+- **Connection:** read the URL from the same settings object the app uses, *because* a hard-coded URL in
+  `alembic.ini` is how migrations end up pointed at the wrong database.
+- **Async apps:** `alembic init -t async migrations` generates an `env.py` that creates an async engine
+  and calls `await connection.run_sync(do_run_migrations)`, since Alembic's operations are synchronous.
 
 ### Autogenerate: a diff, not an oracle
 `alembic revision --autogenerate -m "add embedding_model"` connects to a database at head, reflects its
-schema, compares it to `target_metadata`, and writes `op.add_column`, `op.create_index` and similar
-calls. It reliably sees added and dropped tables and columns, nullability changes, and indexes and
-foreign keys that have names. It cannot see intent: a renamed column looks like one column dropped
-and another added, which would destroy data if run as written. Server-default comparison is off
-unless you enable it, and custom types (pgvector's `Vector`, enum changes on some backends) may need
-manual imports or edits. Set a `naming_convention` on your `MetaData` *because* constraints then get
-deterministic names that a later migration can drop by name.
+schema, compares it to `target_metadata`, and writes `op.add_column`, `op.create_index` and similar.
+
+| Reliably detects | Cannot see or needs help with |
+|---|---|
+| added and dropped tables and columns | intent: a renamed column looks like one dropped and another added, which destroys data if run as written |
+| nullability changes | server defaults (comparison is off unless you enable it) |
+| indexes and foreign keys that have names | custom types (pgvector's `Vector`, enum changes on some backends) may need manual imports or edits |
+
+Set a `naming_convention` on your `MetaData` *because* constraints then get deterministic names that a
+later migration can drop by name.
 
 ### Operations that are not schema diffs
-`op.execute()` runs raw SQL for things autogenerate never produces: `CREATE EXTENSION IF NOT EXISTS
-vector`, a backfill `UPDATE`, or `SET lock_timeout`. Some PostgreSQL statements refuse to run inside a
-transaction block, notably `CREATE INDEX CONCURRENTLY`, so Alembic provides
-`op.get_context().autocommit_block()` for them. A concurrent build that fails or hits the lock
-timeout is not rolled back: it leaves an `INVALID` index behind, which must be dropped before retrying. SQLite cannot alter most columns in place; Alembic's
-`op.batch_alter_table` works around this by copying the table. `alembic upgrade head --sql` (offline
-mode) renders the SQL without connecting, for DBAs who must review or run it themselves.
+- **`op.execute()`** runs raw SQL autogenerate never produces: `CREATE EXTENSION IF NOT EXISTS vector`, a
+  backfill `UPDATE`, or `SET lock_timeout`.
+- **No-transaction statements.** Some PostgreSQL statements refuse to run inside a transaction block,
+  notably `CREATE INDEX CONCURRENTLY`, so Alembic provides `op.get_context().autocommit_block()`.
+- **Failed concurrent builds are not rolled back.** A build that fails or hits the lock timeout leaves an
+  `INVALID` index behind, which must be dropped before retrying.
+- **SQLite** cannot alter most columns in place; `op.batch_alter_table` works around this by copying the
+  table.
+- **Offline mode.** `alembic upgrade head --sql` renders the SQL without connecting, for DBAs who must
+  review or run it themselves.
 
 ### Branches and merges
-When two pull requests each add a revision on the same parent, the graph has two heads and
-`alembic upgrade head` refuses to guess an order. `alembic merge heads` creates an empty revision
-whose `down_revision` is a tuple of both, restoring a single head. A CI check that `alembic heads`
-prints exactly one line catches this before deploy.
+1. Two pull requests each add a revision on the same parent, so the graph has two heads and
+   `alembic upgrade head` refuses to guess an order.
+2. `alembic merge heads` creates an empty revision whose `down_revision` is a tuple of both, restoring a
+   single head.
+3. A CI check that `alembic heads` prints exactly one line catches this before deploy.
 
-## Example
-An expand step for re-embedding chunks with a new model, safe to run while the old code still serves
-traffic. The new column is nullable with no default, so old code that never writes it keeps working.
+## Examples
+### Expand step: add a column and index for re-embedding
+Safe to run while the old code still serves traffic: the new column is nullable with no default, so old
+code that never writes it keeps working.
 
 ```python
 """chunks: add embedding_model (expand step)
@@ -137,52 +148,108 @@ def downgrade() -> None:
     op.drop_column("chunks", "embedding_model")
 ```
 
-The deploy then runs in three releases. Release 1 applies this migration as a pre-deploy job, then
-ships code that writes `embedding_model` for new chunks. A background job backfills old rows in
-batches of a few thousand, committing per batch so no single transaction holds locks for minutes.
-Release 2, once the backfill reports zero NULLs, adds `NOT NULL`. A plain `SET NOT NULL` scans the whole
-table under an `ACCESS EXCLUSIVE` lock, so on a large table add `CHECK (embedding_model IS NOT NULL)
-NOT VALID` (instant), then `VALIDATE CONSTRAINT` (scans, but under a lock that lets reads and writes
-continue), then `SET NOT NULL`, which PostgreSQL 12 and later can apply without re-scanning because the
-validated check already proves it, and finally drop the redundant check. Release 3, the
-contract step, drops whatever the old column was, after no running code reads it.
+### The three-release rollout
+| Release | Schema | Code | Notes |
+|---|---|---|---|
+| 1 | apply the migration above as a pre-deploy job | writes `embedding_model` for new chunks | a background job backfills old rows in batches of a few thousand, committing per batch so no transaction holds locks for minutes |
+| 2 | add `NOT NULL` once the backfill reports zero NULLs | unchanged | see the safe sequence below |
+| 3 (contract) | drop whatever the old column was | no running code reads it | only after release 2 is fully rolled out |
+
+Safe `NOT NULL` on a large table, because a plain `SET NOT NULL` scans the whole table under an
+`ACCESS EXCLUSIVE` lock:
+1. Add `CHECK (embedding_model IS NOT NULL) NOT VALID` (instant), then validate it.
+2. `VALIDATE CONSTRAINT` (scans, but under a lock that lets reads and writes continue).
+3. `SET NOT NULL`, which PostgreSQL 12 and later can apply without re-scanning, because the validated
+   check already proves it.
+4. Drop the redundant check.
+
+### Release 2 as a migration
+The sequence above, with each statement in its own transaction so the brief `ACCESS EXCLUSIVE` lock of
+the `ADD CONSTRAINT` is not still held while `VALIDATE` scans.
+
+```python
+def upgrade() -> None:
+    # autocommit_block: every statement commits on its own, so no lock is carried into the next step.
+    with op.get_context().autocommit_block():
+        op.execute("SET lock_timeout = '5s'")                      # session-level: applies to each step
+        op.execute("ALTER TABLE chunks ADD CONSTRAINT ck_chunks_embedding_model_nn "
+                   "CHECK (embedding_model IS NOT NULL) NOT VALID")          # instant, brief lock
+        op.execute("ALTER TABLE chunks VALIDATE CONSTRAINT ck_chunks_embedding_model_nn")  # scans; reads/writes continue
+        op.execute("ALTER TABLE chunks ALTER COLUMN embedding_model SET NOT NULL")         # PG 12+: no re-scan
+        op.execute("ALTER TABLE chunks DROP CONSTRAINT ck_chunks_embedding_model_nn")
+
+
+def downgrade() -> None:
+    op.execute("ALTER TABLE chunks ALTER COLUMN embedding_model DROP NOT NULL")
+```
+
+### CI gate for migrations
+Run against a real, empty Postgres service in the pipeline.
+
+```bash
+set -euo pipefail
+test "$(alembic heads | wc -l)" -eq 1 || { echo "multiple heads: run alembic merge heads"; exit 1; }
+alembic upgrade head          # every revision applies from empty
+alembic check                 # fails if autogenerate would still produce changes (recent Alembic)
+alembic downgrade base && alembic upgrade head   # optional: downgrades are at least runnable
+```
+
+## Production patterns
+- **Migrate as a pre-deploy job, once.** For any multi-replica service, run `alembic upgrade head` in a
+  single job (a Kubernetes Job or a pipeline step) before new pods roll out, never at app startup on
+  every replica. Monitor job duration and fail the deploy if the job fails.
+- **Lock timeouts on every DDL migration.** Start each `upgrade()` touching hot tables with
+  `op.execute("SET lock_timeout = '5s'")`, so a migration waiting behind a long query fails fast instead
+  of queueing every reader behind it. Monitor lock waits during deploys and retry failed runs off-peak.
+- **`CONCURRENTLY` plus an INVALID-index check.** Build indexes on large tables with
+  `postgresql_concurrently=True` inside `autocommit_block()`, and after a failure query
+  `pg_index.indisvalid` to find and drop the leftover `INVALID` index before retrying.
+- **Data migrations without app models.** Write backfills with `op.execute()` or a minimal
+  `sa.table("chunks", sa.column("embedding_model"))` declared inside the script, so the migration still
+  runs on a fresh database after the ORM models change. Test by upgrading from empty in CI.
+- **Offline SQL for customer DBAs.** For VPC installs where every statement is reviewed, ship the output of
+  `alembic upgrade <from>:<to> --sql` with the release and keep data migrations expressible as plain SQL.
+  Verify afterwards with `alembic current` against their database.
 
 ## Trade-offs
-- Autogenerate saves typing and catches forgotten columns, but it produces destructive drafts for
-  renames; it is a net win only when every generated script is read in review.
-- Running migrations as a separate pre-deploy job keeps replicas from racing, at the cost of a
-  deploy step; tiny single-instance apps can run `upgrade head` at startup instead.
-- Expand-contract gives zero-downtime changes but triples the releases per change; for an internal
-  tool that can take a two-minute maintenance window, a single breaking migration is simpler.
-- Writing real `downgrade()` functions buys fast rollback of schema-only changes, but a downgrade
-  that drops a populated column destroys data; past the first deploy, roll forward instead.
-- Offline `--sql` mode satisfies customers whose DBAs must review every statement, but you lose
-  Python-side logic and must keep data migrations expressible as plain SQL.
+- **Less typing vs destructive drafts.** Autogenerate saves typing and catches forgotten columns, but
+  produces destructive drafts for renames; it is a net win only when every generated script is read in
+  review.
+- **Pre-deploy job vs startup.** A separate job keeps replicas from racing, at the cost of a deploy step;
+  tiny single-instance apps can run `upgrade head` at startup instead.
+- **Zero downtime vs three releases.** Expand-contract avoids downtime but triples the releases per
+  change; for an internal tool that can take a two-minute maintenance window, a single breaking
+  migration is simpler.
+- **Fast rollback vs data loss.** Real `downgrade()` functions roll back schema-only changes quickly, but
+  a downgrade that drops a populated column destroys data; past the first deploy, roll forward instead.
+- **DBA review vs Python logic.** Offline `--sql` mode satisfies customers whose DBAs must review every
+  statement, but you lose Python-side logic and must keep data migrations expressible as plain SQL.
 
 ## Pitfalls
-- Accepting an autogenerated rename as written; the symptom is a migration containing
+- **Accepting an autogenerated rename as written.** Symptom: a migration containing
   `drop_column("content")` and `add_column("body")`, followed by an empty column in production.
-- Importing app ORM models inside a data migration; months later the model has changed and the
-  old migration fails on a fresh database with an attribute or column error.
-- Adding an index without `CONCURRENTLY` on a large, hot table; writes block for the whole build
-  and the symptom is a spike of request timeouts exactly during the deploy.
-- Merging two branches that each added a revision; `alembic upgrade head` fails with a "multiple
-  head revisions" error on the deploy pipeline, not on either developer's laptop.
-- Running `alembic stamp head` to "fix" a failing upgrade; the version row now claims changes that
-  were never applied, and the missing column surfaces later as an application crash.
-- Forgetting `CREATE EXTENSION vector` or the `pgvector` import in the script; the upgrade fails
-  with an unknown type error on a fresh customer database but passes on yours.
+- **Importing app ORM models inside a data migration.** Symptom: months later the model has changed and
+  the old migration fails on a fresh database with an attribute or column error.
+- **Adding an index without `CONCURRENTLY` on a large, hot table.** Writes block for the whole build;
+  symptom: a spike of request timeouts exactly during the deploy.
+- **Merging two branches that each added a revision.** Symptom: `alembic upgrade head` fails with a
+  "multiple head revisions" error on the deploy pipeline, not on either developer's laptop.
+- **Running `alembic stamp head` to "fix" a failing upgrade.** The version row now claims changes that
+  were never applied; the missing column surfaces later as an application crash.
+- **Forgetting `CREATE EXTENSION vector` or the `pgvector` import in the script.** Symptom: the upgrade
+  fails with an unknown type error on a fresh customer database but passes on yours.
 
 ## When to use
-Use Alembic for any SQLAlchemy or SQLModel service whose database outlives a single deploy, which is
-every real one; `create_all()` is acceptable only in throwaway prototypes and test fixtures. Wire it in
-early: an empty initial revision costs nothing, while retrofitting onto a drifted production database
-means hand-writing a baseline and `stamp`ing it. In CI, run `upgrade head` against a real Postgres
-from empty, assert a single head, and fail if autogenerate would still produce changes (recent Alembic
-versions offer `alembic check` for this). In production, run migrations once per deploy as a job
-before the new code rolls out, and design each migration to be compatible with the code already
-running. In interviews, the expected depth is explaining expand-contract for a column rename and
-why autogenerate cannot be trusted with it.
+- **Use Alembic** for any SQLAlchemy or SQLModel service whose database outlives a single deploy, which is
+  every real one; `create_all()` is acceptable only in throwaway prototypes and test fixtures.
+- **Wire it in early.** An empty initial revision costs nothing; retrofitting onto a drifted production
+  database means hand-writing a baseline and `stamp`ing it.
+- **In CI,** run `upgrade head` against a real Postgres from empty, assert a single head, and fail if
+  autogenerate would still produce changes (recent Alembic versions offer `alembic check` for this).
+- **In production,** run migrations once per deploy as a job before the new code rolls out, and design
+  each migration to be compatible with the code already running.
+- **Interviews:** explain expand-contract for a column rename and why autogenerate cannot be trusted
+  with it.
 
 ## Role lens
 - **Engineer:** Writes and reviews each revision, fixes autogenerate's renames, adds lock timeouts

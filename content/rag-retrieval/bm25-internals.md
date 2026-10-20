@@ -5,7 +5,7 @@ name: BM25 internals
 kind: concept
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/inverted-indexes
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -20,29 +20,25 @@ sources:
 ---
 
 ## TL;DR
-BM25 scores a document for a query by summing, over query terms, a rarity weight (IDF) times a
-term-frequency term that saturates and is normalized by document length. Each piece fixes a specific
-failure of raw term counting: IDF stops common words dominating, saturation stops a term repeated 50
-times beating one repeated 5 times by 10×, and length normalization stops long documents winning by
-having more words. Two parameters, k1 and b, set how strong those corrections are.
+BM25 sums, over query terms, a rarity weight (IDF) times a saturating, length-normalized term frequency.
+Each piece fixes one failure of raw counting, and two parameters, k1 and b, set how strong those
+corrections are.
 
 ## Why it exists
-The simplest ranking function counts how many times each query term appears in a document and adds the
-counts up. Three things go wrong immediately. Common words swamp the score: "the" appears everywhere, so
-a query "the indemnification cap" is dominated by a term that carries no information. Raw counts scale
-without limit: a document that mentions "cap" fifty times scores ten times higher than one that mentions
-it five times, although the second is already clearly about caps and the first is probably a glossary.
-And long documents win by default: a 400-page manual mentions almost every term more often than a focused
-two-page note simply because it has more words.
-
-TF-IDF addressed the first problem by weighting terms with inverse document frequency and partly the
-second with a logarithm of term frequency, but it was a heuristic, not derived from any model of
-relevance. BM25 came out of the probabilistic relevance framework developed by Robertson, Spärck Jones
-and colleagues and tested at TREC in the 1990s: it asks what score ranks documents by probability of
-relevance under a simple generative assumption, then approximates the intractable result with a
-two-parameter function that behaves sensibly at the extremes. The output is cheap to compute from an
-inverted index, has only two knobs, and has been the default lexical ranking in Lucene, Elasticsearch and
-OpenSearch for years because it is hard to beat without training data.
+- **Common words swamp raw counts.** "the" appears everywhere, so the query "the indemnification cap" is
+  dominated by a term that carries no information. IDF fixes this.
+- **Raw counts scale without limit.** A document mentioning "cap" fifty times scores ten times one that
+  mentions it five times, although the second is clearly about caps and the first is probably a glossary.
+  Saturation (k1) stops a term repeated 50 times beating one repeated 5 times by 10×.
+- **Long documents win by default.** A 400-page manual mentions almost every term more often than a
+  focused two-page note simply because it has more words. Length normalization (b) fixes this.
+- **TF-IDF was a heuristic.** It weighted terms by inverse document frequency and partly tamed counts with
+  a logarithm, but derived from no model of relevance.
+- **BM25 is principled and cheap.** It came from the probabilistic relevance framework (Robertson, Spärck
+  Jones and colleagues, tested at TREC in the 1990s): approximate the probability-of-relevance ranking with
+  a two-parameter function that behaves sensibly at the extremes. It is cheap from an inverted index and
+  has been the default in Lucene, Elasticsearch and OpenSearch for years, because it is hard to beat
+  without training data.
 
 ## How it works
 ### The formula
@@ -54,95 +50,123 @@ score(D, Q) = Σᵢ IDF(qᵢ) ·            f(qᵢ, D) · (k1 + 1)
                             f(qᵢ, D) + k1 · (1 − b + b · |D| / avgdl)
 ```
 
-where `f(qᵢ, D)` is the term's count in D, `|D|` is D's length in tokens, `avgdl` is the mean document
-length in the collection, and (in Lucene's form)
+- `f(qᵢ, D)` is the term's count in D.
+- `|D|` is D's length in tokens.
+- `avgdl` is the mean document length in the collection.
+- N is the number of documents and n(q) the number containing q.
+
+IDF in Lucene's form:
 
 ```
 IDF(q) = ln( (N − n(q) + 0.5) / (n(q) + 0.5) + 1 )
 ```
 
-with N the number of documents and n(q) the number containing q. (Recent Lucene versions also drop the
-constant `(k1 + 1)` from the numerator; it scales every score equally and so never changes the ranking,
-but it is why Lucene's raw scores are smaller than a textbook implementation's.) Each piece answers one
-of the three failures above.
+- Recent Lucene versions drop the constant `(k1 + 1)` from the numerator. It scales every score equally,
+  so it never changes the ranking, but it is why Lucene's raw scores are smaller than a textbook
+  implementation's.
+- Each piece answers one of the three failures above.
 
 ### IDF: rarity as information
-A term present in nearly every document tells you nothing about which one is relevant, so its weight
-should approach zero; a term present in a handful should carry most of the score. The ratio
-(N − n + 0.5)/(n + 0.5) does that: for n ≪ N it is large, for n ≈ N it is below one. The 0.5 terms
-smooth the estimate for very small counts. The original Robertson–Spärck Jones form can go negative for
-terms in more than half the documents, which would let a matching term lower a score; Lucene adds 1
-inside the log so IDF is always positive and such terms simply contribute almost nothing. With N = 1,000:
-a term in 10 documents has IDF ≈ ln(95.3) ≈ 4.56; a term in 600 has IDF ≈ ln(1.67) ≈ 0.51; a term in all
-1,000 has IDF ≈ ln(1.0005) ≈ 0.0005.
+- **Goal:** a term in nearly every document should weigh near zero; a term in a handful should carry most
+  of the score.
+- **The ratio** (N − n + 0.5)/(n + 0.5) is large for n ≪ N and below one for n ≈ N. The 0.5 terms smooth
+  the estimate for very small counts.
+- **Why Lucene adds 1:** the original Robertson–Spärck Jones form goes negative for terms in more than half
+  the documents, letting a matching term lower a score. With +1 inside the log, IDF is always positive and
+  such terms contribute almost nothing.
+
+| N = 1,000; term appears in | IDF |
+|---|---|
+| 10 documents | ln(95.3) ≈ 4.56 |
+| 600 documents | ln(1.67) ≈ 0.51 |
+| all 1,000 | ln(1.0005) ≈ 0.0005 |
 
 ### Term-frequency saturation: k1
-Write L for the length factor `1 − b + b·|D|/avgdl`. The fraction `f·(k1 + 1) / (f + k1·L)` is zero at
-f = 0, equals 1 at f = 1 when L = 1, and rises toward k1 + 1 as f → ∞. It is a saturating curve: the
-second occurrence of a term adds a lot, the twentieth adds almost nothing, because once a document is
-clearly about a term, more repetitions are weak extra evidence. k1 controls how fast saturation sets in.
-With Lucene's default k1 = 1.2 and L = 1, f = 1, 2, 5, 10, 50 give 1.00, 1.38, 1.77, 1.96, 2.15; the curve
-is already flat by ten. Set k1 = 0 and term frequency stops mattering entirely (a binary "contains"
-model); set it large and the function approaches raw counts.
+Write L for the length factor `1 − b + b·|D|/avgdl`. The fraction `f·(k1 + 1) / (f + k1·L)`:
+- is zero at f = 0, equals 1 at f = 1 when L = 1, and rises toward k1 + 1 as f → ∞;
+- saturates: the second occurrence adds a lot, the twentieth almost nothing, because once a document is
+  clearly about a term, more repetitions are weak extra evidence;
+- k1 sets how fast saturation sets in. k1 = 0 makes term frequency irrelevant (a binary "contains"
+  model); a large k1 approaches raw counts.
+
+| f (k1 = 1.2, Lucene's default; L = 1) | 1 | 2 | 5 | 10 | 50 |
+|---|---|---|---|---|---|
+| TF factor | 1.00 | 1.38 | 1.77 | 1.96 | 2.15 |
+
+The curve is already flat by ten.
 
 ### Length normalization: b
-L = 1 − b + b·|D|/avgdl rescales the denominator by how long the document is relative to average. A
-document at average length has L = 1. A document twice the average with b = 0.75 has L = 1.75, so each
-term count is effectively divided by 1.75 before saturation: the same five mentions in a long document
-count less than in a short one. b = 0 switches normalization off (counts are absolute); b = 1 makes it
-fully proportional. The default 0.75 encodes the observation that long documents are partly long because
-they cover more topics (so their counts should be discounted) and partly because they say more about the
-same topic (so not fully).
-
-### Putting it together: one worked term
-N = 1,000 documents, avgdl = 200 tokens, k1 = 1.2, b = 0.75. The term "indemnification" occurs in 10
-documents, so IDF ≈ 4.56. Document A is 100 tokens and contains it 3 times: L = 1 − 0.75 + 0.75·0.5 =
-0.625; denominator 3 + 1.2·0.625 = 3.75; term score 4.56 × 6.6 / 3.75 ≈ 8.0. Document B is 400 tokens
-with the same 3 occurrences: L = 1.75; denominator 3 + 2.1 = 5.1; score 4.56 × 6.6 / 5.1 ≈ 5.9. Same
-counts, roughly a quarter lower score for the document four times longer. A third document mentioning
-"contract" (in 600 documents, IDF ≈ 0.51) ten times at average length scores only 0.51 × 1.96 ≈ 1.0 for
-that term: a common word repeated ten times is worth an eighth of a rare word mentioned three times.
+- **L = 1 − b + b·|D|/avgdl** rescales the denominator by length relative to average; at average length
+  L = 1.
+- **Twice the average with b = 0.75** gives L = 1.75: each count is effectively divided by 1.75 before
+  saturation, so five mentions in a long document count less than in a short one.
+- **b = 0** switches normalization off (counts are absolute); **b = 1** makes it fully proportional.
+- **Why 0.75 by default:** long documents are partly long because they cover more topics (discount their
+  counts) and partly because they say more about the same topic (so not fully).
 
 ### Where the shape comes from
-The two halves of the formula have different origins in the probabilistic framework. The IDF factor is
-the Robertson–Spärck Jones term weight with no relevance information available: the log-odds that a
-term appears in relevant versus non-relevant documents, estimated by assuming almost every document is
-non-relevant. The term-frequency factor comes from the "eliteness" idea: a document is either about a
-term or not, and occurrence counts are modelled as a mixture of two Poisson distributions, one for
-elite and one for non-elite documents. The exact weight under that model has no usable closed form, but
-its shape is known: zero at f = 0, increasing, and bounded. `f/(f + k1)` is the simplest function with
-that shape, and length normalization is applied by rescaling k1. That lineage is why BM25 has so few
-parameters and why the saturation is not an arbitrary engineering hack.
+- **IDF factor:** the Robertson–Spärck Jones term weight with no relevance information: log-odds that a
+  term appears in relevant vs non-relevant documents, assuming almost every document is non-relevant.
+- **TF factor:** the "eliteness" idea. A document is about a term or not; counts are modelled as a mixture
+  of two Poisson distributions, one for elite and one for non-elite documents.
+- **The approximation:** the exact weight has no usable closed form, but its shape is known: zero at
+  f = 0, increasing, bounded. `f/(f + k1)` is the simplest function with that shape, and length
+  normalization rescales k1.
+- **Why it matters:** this lineage is why BM25 has so few parameters and why saturation is not an
+  arbitrary engineering hack.
 
 ### How an engine evaluates it
-Nothing in the formula needs the document text at query time. The posting list for each query term
-stores, per document, the term frequency f; the per-document length |D| lives in a per-field norms
-structure (Lucene encodes it lossily into a single byte, so long lengths are approximate); N, n(q) and
-avgdl are index statistics. Scoring is therefore a walk over the query terms' postings, adding one
-precomputable IDF times one small arithmetic expression per matching document. Because each term's
-contribution is bounded by IDF × (k1 + 1), the engine also knows the maximum any document can gain from
-a term, which is what dynamic pruning (WAND, MaxScore; see inverted indexes) uses to skip documents that
-cannot reach the top k.
+Nothing needs the document text at query time:
+- **Posting lists** store, per document, the term frequency f.
+- **Norms** hold |D| per field; Lucene encodes it lossily into a single byte, so long lengths are
+  approximate.
+- **Index statistics** give N, n(q) and avgdl.
+- **Scoring** walks the query terms' postings, adding one precomputable IDF times one small expression
+  per matching document.
+- **Pruning:** each term's contribution is bounded by IDF × (k1 + 1), so the engine knows the most any
+  document can gain from a term. Dynamic pruning (WAND, MaxScore; see inverted indexes) uses this to skip
+  documents that cannot reach the top k.
 
 ### What BM25 does not do
-It treats terms as independent, ignores order and proximity (phrase matching is a separate query feature
-over positions), and has no notion of synonymy; everything semantic is delegated to the analyzer
-(tokenization, lowercasing, stemming, stopword removal) that runs before scoring. Because the analyzer
-defines what a "term" is, index-time and query-time analysis must be identical, and most "BM25 is
-broken" bugs are analyzer mismatches. Multi-field documents (title, body) are handled either by scoring
-fields separately and combining with boosts, or by BM25F, which merges field counts with per-field
-weights before saturation so a title hit is not saturated away by body mentions.
+- **Terms are independent;** order and proximity are ignored (phrase matching is a separate query feature
+  over positions); there is no synonymy.
+- **Semantics live in the analyzer** (tokenization, lowercasing, stemming, stopword removal), which runs
+  before scoring. Because it defines what a "term" is, index-time and query-time analysis must be
+  identical; most "BM25 is broken" bugs are analyzer mismatches.
+- **Multi-field documents** (title, body): score fields separately and combine with boosts, or use BM25F,
+  which merges field counts with per-field weights before saturation so a title hit is not saturated away
+  by body mentions.
 
 ### Scores are query-relative
-A BM25 score is a sum over query terms of unbounded positive quantities. It is not normalized: a
-three-term query produces larger numbers than a one-term query, and scores from different indexes or
-corpora are not comparable. This matters when you fuse BM25 with dense scores, which is why fusion
-methods work on ranks or normalize per query.
+- A score is a sum over query terms of unbounded positive quantities, not normalized.
+- A three-term query produces larger numbers than a one-term query, and scores from different indexes or
+  corpora are not comparable.
+- So fusing BM25 with dense scores needs rank-based methods or per-query normalization.
 
-## Example
-A from-scratch implementation over three short contract passages makes every term in the formula
-visible. The analyzer is deliberately trivial (lowercase, alphanumerics) and shared by index and query;
-change it in one place and both sides change together.
+## Diagram
+Follow one query term through scoring: the analyzer defines the term, IDF comes from index statistics,
+and the TF factor combines the posting's count with the length factor L before the per-term scores sum.
+
+```mermaid
+flowchart TD
+    Q["Query text"] --> AN["Analyzer, identical at index time"]
+    AN --> T["Query term q"]
+    T --> ST[("Index stats: N, n of q, avgdl")]
+    T --> PL[("Posting list: f per document")]
+    ST --> IDF["IDF: rarity weight, always positive in Lucene"]
+    PL --> NR["Norms: document length"]
+    NR -->|"b sets strength"| L["L = 1 - b + b times length over avgdl"]
+    PL --> TF["TF factor: saturates toward k1 + 1"]
+    L --> TF
+    IDF --> M["Term score = IDF times TF factor"]
+    TF --> M
+    M -->|"sum over query terms"| S["BM25 score, query-relative"]
+```
+
+## Examples
+### BM25 from scratch
+Three short contract passages make every term visible. The analyzer is deliberately trivial (lowercase,
+alphanumerics) and shared by index and query; change it in one place and both sides change together.
 
 ```python
 import math, re
@@ -178,48 +202,100 @@ for q in ["indemnification cap", "contract term", "the"]:
     print(f"{q!r:24}", [(d, round(bm25(q, d), 2)) for d in ranked])
 ```
 
-The query "the" scores every document low and nearly equally because it appears in all three;
-"indemnification cap" prefers A (two occurrences of a rarer term plus the only "cap") over C; "contract
-term" prefers B. Set `k1=0` and watch A's advantage from repetition disappear.
+- **"the"** scores every document low and nearly equally, because it appears in all three.
+- **"indemnification cap"** prefers A (two occurrences of a rarer term plus the only "cap") over C.
+- **"contract term"** prefers B. Set `k1=0` and watch A's advantage from repetition disappear.
+
+### Worked scenario: one term, three documents
+N = 1,000 documents, avgdl = 200 tokens, k1 = 1.2, b = 0.75 (so k1 + 1 = 2.2).
+
+| Document | Term, IDF | Length, count | L | Denominator | Term score |
+|---|---|---|---|---|---|
+| A | "indemnification" (in 10 docs), 4.56 | 100 tokens, f = 3 | 1 − 0.75 + 0.75·0.5 = 0.625 | 3 + 1.2·0.625 = 3.75 | 4.56 × 6.6 / 3.75 ≈ 8.0 |
+| B | same, 4.56 | 400 tokens, f = 3 | 1.75 | 3 + 2.1 = 5.1 | 4.56 × 6.6 / 5.1 ≈ 5.9 |
+| C | "contract" (in 600 docs), 0.51 | average length, f = 10 | 1 | TF factor 1.96 | 0.51 × 1.96 ≈ 1.0 |
+
+- Same counts, roughly a quarter lower score for the document four times longer.
+- A common word repeated ten times is worth an eighth of a rare word mentioned three times.
+
+### Production snippet: tuning k1 and b in Elasticsearch
+A custom similarity is declared in index settings and assigned per field; `explain` shows the IDF and TF
+pieces for one hit.
+
+```json
+PUT /manuals
+{
+  "settings": {
+    "index": {
+      "similarity": { "short_sections": { "type": "BM25", "k1": 1.2, "b": 0.3 } }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "title": { "type": "text" },
+      "body":  { "type": "text", "similarity": "short_sections" }
+    }
+  }
+}
+
+GET /manuals/_search
+{
+  "explain": true,
+  "query": { "multi_match": { "query": "PX-200 fuser", "fields": ["title^3", "body"] } }
+}
+```
+
+## Production patterns
+- **Grid-search k1 and b on labeled queries.** When the corpus is unlike TREC-style news (tweets, 200-page
+  manuals, short snippets), sweep k1 over roughly 0.5 to 2 and b over 0 to 1 offline and record the values
+  with the experiment. Monitor recall@k per query type before and after any change on a live index.
+- **Debug ranking with explain and the analyzer API.** Use `explain` on a surprising hit to see each
+  term's IDF and TF factor, and Elasticsearch's `_analyze` endpoint to compare index-time and query-time
+  tokens. Monitor zero-result rate for queries copied verbatim from documents.
+- **Index sections, boost identity fields.** Split long manuals into sections near average length, and put
+  "this is the manual for X" into a title or product field with a boost (`"title^3"`) or BM25F instead of
+  bending b. Monitor where the canonical document ranks for its own product name.
+- **Use global statistics where shards are small or uneven.** Run tests and small indexes on one shard, or
+  use the `dfs_query_then_fetch` search type when per-shard IDF skews results. Monitor score drift for the
+  same document across shards.
+- **Normalize before fusion.** Never threshold or add raw BM25 scores to cosine scores; fuse by rank or
+  normalize per query first. Monitor fused-result overlap with each arm alone.
 
 ## Trade-offs
-- BM25 needs no training data and no GPU, so it is the cheapest retriever to stand up and the easiest to
-  debug; it flips to insufficient once queries stop sharing vocabulary with documents, which no parameter
-  tuning fixes.
-- Term-frequency saturation makes ranking robust to keyword stuffing and long repetitive documents, but
-  it also caps the signal from genuinely term-dense passages; raise k1 when your corpus is short, focused
-  snippets where repetition is meaningful.
-- Length normalization at b = 0.75 suits mixed-length prose; for corpora where length is itself a quality
-  signal (full articles versus stubs), lowering b stops penalizing the complete documents.
-- Field-aware scoring (BM25F or boosted fields) lets a title match outrank a body mention, at the cost of
-  boosts that must be tuned per corpus and re-validated whenever the document schema changes.
+- **No training data, no GPU.** BM25 is the cheapest retriever to stand up and the easiest to debug; it
+  becomes insufficient once queries stop sharing vocabulary with documents, which no parameter tuning fixes.
+- **Saturation resists keyword stuffing and repetitive documents,** but caps the signal from genuinely
+  term-dense passages; raise k1 for corpora of short, focused snippets where repetition is meaningful.
+- **b = 0.75 suits mixed-length prose.** Where length is itself a quality signal (full articles versus
+  stubs), lowering b stops penalizing the complete documents.
+- **Field-aware scoring (BM25F or boosted fields)** lets a title match outrank a body mention, at the cost
+  of boosts that must be tuned per corpus and re-validated whenever the document schema changes.
 
 ## Pitfalls
-- Index-time and query-time analyzers that differ (stemming on one side, a different tokenizer, or hyphen
-  handling); the symptom is exact phrases copied from a document returning zero results.
-- Leaving stopwords in a corpus where they are meaningful ("the Who", "to be or not to be") or stripping
-  them where they are not; the symptom is either noisy hits or impossible queries, and IDF does not fully
-  compensate.
-- Treating BM25 scores as absolute relevance and thresholding them; the symptom is a cutoff that works
-  for three-word queries and rejects everything for one-word queries, because the score scales with query
-  length.
-- Changing k1 or b on a live index without re-measuring; the defaults were chosen on TREC-style
-  collections, and a corpus of tweets or of 200-page manuals can want very different values. The symptom
-  is a silent shift in which documents win.
-- Forgetting that avgdl and IDF are collection statistics; in sharded engines each shard may compute its
-  own unless the engine fetches global statistics first (Elasticsearch's `dfs_query_then_fetch` search
-  type does this at extra cost), which makes the same document score differently depending on where it
-  lives. The symptom is most visible on small or unevenly filled shards and in tests with few documents.
+- **Index and query analyzers differ** (stemming on one side, a different tokenizer, or hyphen handling).
+  Symptom: exact phrases copied from a document return zero results.
+- **Wrong stopword policy.** Keeping them where meaningless or stripping them where meaningful ("the Who",
+  "to be or not to be"). Symptom: noisy hits or impossible queries; IDF does not fully compensate.
+- **Thresholding BM25 scores as absolute relevance.** Symptom: a cutoff that works for three-word queries
+  rejects everything for one-word queries, because the score scales with query length.
+- **Changing k1 or b on a live index without re-measuring.** The defaults were chosen on TREC-style
+  collections; tweets or 200-page manuals can want very different values. Symptom: a silent shift in
+  which documents win.
+- **Forgetting avgdl and IDF are collection statistics.** In sharded engines each shard may compute its own
+  unless the engine fetches global statistics first (Elasticsearch's `dfs_query_then_fetch` search type
+  does this at extra cost). Symptom: the same document scores differently by shard, most visible on small
+  or uneven shards and in tests with few documents.
 
 ## When to use
-BM25 is the right first retriever for any corpus, and the baseline every other retriever must beat on
-your labeled queries before it earns its cost. Reach for it as the sole retriever when queries are
-identifier-heavy, the corpus churns fast or the serving budget is CPU-only; reach for it as one arm of
-hybrid retrieval everywhere else. What to measure: recall@k on labeled queries, broken down by query
-type, with the analyzer and the k1, b values recorded as part of the experiment. In day-to-day work the
-formula shows up when you explain why a long document ranks low, why a repeated keyword stopped helping,
-or why a fused score needs normalization. Interviewers ask for the formula's pieces and, more
-importantly, the failure each piece prevents.
+- **Always first:** BM25 is the right first retriever for any corpus and the baseline every other
+  retriever must beat on your labeled queries before it earns its cost.
+- **Sole retriever when** queries are identifier-heavy, the corpus churns fast or the serving budget is
+  CPU-only; **one arm of hybrid** everywhere else.
+- **Measure:** recall@k on labeled queries by query type, with the analyzer and the k1, b values recorded
+  as part of the experiment.
+- **Day to day,** the formula explains why a long document ranks low, why a repeated keyword stopped
+  helping, or why a fused score needs normalization.
+- **Interviews:** give the formula's pieces and, more importantly, the failure each piece prevents.
 
 ## Role lens
 - **Engineer:** Configures analyzers consistently across index and query, exposes k1 and b as tunables,
@@ -248,6 +324,40 @@ the signal "this document is the manual for X" is not a term-density fact at all
 see it, in a title or product field with its own boost (or BM25F), rather than bending b until the body
 text happens to agree. Then re-measure recall on labeled queries, because lowering b also helps every
 long, loosely relevant document.
+
+## Interview questions
+### Explain the three components of BM25 and the failure each one fixes.
+- **IDF** down-weights terms found in most documents, so "the" in "the indemnification cap" carries
+  almost nothing while the rare term carries most of the score.
+- **TF saturation (k1)** makes the second occurrence count a lot and the twentieth almost nothing, so
+  repetition and keyword stuffing cannot dominate.
+- **Length normalization (b)** divides counts by length relative to `avgdl`, so a long manual does not win
+  just by containing more words.
+
+### A user copies an exact phrase from a document and gets zero results. How do you debug it?
+- **Suspect the analyzer first:** most "BM25 is broken" bugs are index-time and query-time analysis that
+  differ, for example stemming on one side or different hyphen handling.
+- **Compare tokens** with Elasticsearch's `_analyze` endpoint for both analyzers, then use `explain` on a
+  document that should match to see which terms contributed.
+
+### Why can you not threshold BM25 scores or add them directly to cosine scores?
+- **Scores are query-relative:** a sum of unbounded positive terms, so a three-term query scores higher
+  than a one-term query and a fixed cutoff fails on short queries.
+- **Scales differ across indexes and retrievers,** so fusion needs rank-based methods such as RRF or
+  per-query normalization first.
+
+### When would you change k1 or b from the defaults of 1.2 and 0.75?
+- **Lower b** when length is itself a quality signal (complete articles versus stubs), so complete
+  documents stop being penalized.
+- **Raise k1** for short, focused snippets where repetition is meaningful evidence.
+- **Only after a grid search** on labeled queries per query type, because the defaults came from
+  TREC-style collections and a change silently shifts which documents win.
+
+### The same document scores differently depending on which shard serves it. Why?
+- **IDF and avgdl are collection statistics,** and each shard computes its own unless the engine fetches
+  global statistics first.
+- **The effect is largest on small or uneven shards and in tests;** use one shard for small indexes or the
+  `dfs_query_then_fetch` search type, which costs an extra round trip.
 
 ## Quiz
 ### Q: Why does BM25 saturate term frequency instead of using raw counts?

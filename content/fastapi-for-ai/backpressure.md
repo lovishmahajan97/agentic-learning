@@ -5,7 +5,7 @@ name: Backpressure
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/concurrency-limits
   - fastapi-for-ai/streamingresponse
@@ -22,83 +22,97 @@ sources:
 ---
 
 ## TL;DR
-Backpressure is a slow consumer's signal travelling back to a fast producer, so the producer slows
-down instead of piling work into a buffer. Without it, overload turns into unbounded queues: latency
-grows until every request times out and memory grows until the process dies. In a FastAPI AI service
-it takes three forms: bounded internal queues, rejecting at the edge with 429/503 and `Retry-After`,
-and the flow control that pauses a streaming generator when the client reads slowly.
+Backpressure carries a slow consumer's signal back to a fast producer so it slows down instead of
+filling buffers. In FastAPI it means bounded queues, early 429/503 with `Retry-After`, and stream flow
+control; without it, overload grows latency and memory until collapse.
 
 ## Why it exists
-Every pipeline has a slowest stage, and in AI services it is almost always the model: a GPU that can
-decode for a fixed number of sequences, a provider quota, an embedding service with a throughput
-ceiling. When work arrives faster than that stage completes it, the difference has to go somewhere.
-If each stage simply accepts everything and buffers it, the excess accumulates in queues: in
-`asyncio` tasks waiting on a semaphore, in an unbounded `asyncio.Queue`, in the provider's own queue,
-in socket buffers.
-
-Queues do not add capacity; they convert overload into waiting. If capacity is 8 requests per second
-and 12 arrive per second, the queue grows by 4 every second forever. Work at the back of the queue
-waits longer than the client's timeout, so the server spends capacity on answers nobody receives, the
-clients retry and add more load, and the system collapses at exactly the moment it is busiest. The
-naive response, adding a bigger buffer, only delays the collapse and makes it worse, because a deeper
-queue means longer waits for everything in it.
-
-Backpressure replaces "accept and hope" with a feedback loop: each stage advertises how much it can
-take, and when it is full the stage upstream either waits briefly, slows down, or is told no. The
-system then runs at the bottleneck's rate with bounded latency, and the excess is handled
-deliberately rather than by timeouts.
+- **Every pipeline has a slowest stage,** and in AI services it is almost always the model: a GPU that
+  can decode for a fixed number of sequences, a provider quota, an embedding service with a throughput
+  ceiling.
+- **The excess has to go somewhere.** If each stage accepts everything and buffers it, the excess
+  accumulates in queues: in `asyncio` tasks waiting on a semaphore, in an unbounded `asyncio.Queue`, in
+  the provider's own queue, in socket buffers.
+- **Queues do not add capacity; they convert overload into waiting.** If capacity is 8 requests per
+  second and 12 arrive per second, the queue grows by 4 every second forever. The back of the queue
+  waits past the client's timeout, the server spends capacity on answers nobody receives, clients retry
+  and add load, and the system collapses at exactly the moment it is busiest.
+- **A bigger buffer makes it worse.** It only delays the collapse, *because* a deeper queue means longer
+  waits for everything in it.
+- **Backpressure replaces "accept and hope" with a feedback loop.** Each stage advertises how much it can
+  take; when it is full, the stage upstream waits briefly, slows down, or is told no. The system runs at
+  the bottleneck's rate with bounded latency, and the excess is handled deliberately rather than by
+  timeouts.
 
 ## How it works
 ### The core rule: every buffer is bounded
-A bounded buffer is what turns "slow" into a signal. `asyncio.Queue(maxsize=n)` makes `await
-q.put(x)` suspend when full, which slows a producer coroutine to the consumer's pace, and
-`q.put_nowait(x)` raise `QueueFull`, which lets an endpoint reject instead of waiting. A semaphore
-with a bounded acquire timeout is the same idea for in-flight calls. Size bounds from the latency
-you can tolerate, *because* the wait at the back of a queue of length *L* in front of a stage with
-throughput *X* is about *L / X* (Little's law with arrivals matched to throughput). Inverting it gives
-the bound directly: `L_max = X × W_budget`. A stage doing 16 items per second with a 15-second wait
-budget should hold at most about 240 waiting items; anything deeper guarantees that the tail of the
-queue misses its deadline.
+A bounded buffer is what turns "slow" into a signal.
+
+| Mechanism | Behaviour when full | Use |
+|---|---|---|
+| `await q.put(x)` on `asyncio.Queue(maxsize=n)` | Suspends | Slows a producer coroutine to the consumer's pace |
+| `q.put_nowait(x)` | Raises `QueueFull` | Lets an endpoint reject instead of waiting |
+| Semaphore with a bounded acquire timeout | Times out | Same idea for in-flight calls |
+
+- **Size bounds from the latency you can tolerate,** *because* the wait at the back of a queue of length
+  *L* in front of a stage with throughput *X* is about *L / X* (Little's law with arrivals matched to
+  throughput).
+- **Inverting it gives the bound directly:**
+
+```
+L_max = X × W_budget
+```
+
+- **Example:** a stage doing 16 items per second with a 15-second wait budget should hold at most about
+  240 waiting items; anything deeper guarantees the tail of the queue misses its deadline.
 
 ### At the HTTP edge you cannot slow the client, only answer it
-An HTTP client is a producer you do not control. The server's only backpressure tools are refusing
-early and telling the client when to come back: `503 Service Unavailable` (or `429 Too Many Requests`
-when it is a per-client quota) with a `Retry-After` header. Do it before reading large bodies or
-calling anything expensive, *because* rejection is only cheap if it happens first. Note that FastAPI
-reads and parses a declared body parameter before your endpoint function or its dependencies run, so
-a check inside the endpoint happens after the upload. For large bodies, admit in middleware or take
-the raw `Request` and read the body only once admitted. Uvicorn's
-`--limit-concurrency` gives a blunt server-wide version, returning 503 above a connection or task
-count; per-dependency semaphores give the precise version. Upstream load balancers and well-behaved
-clients turn these signals into retries with backoff or into routing to another replica.
+- **The client is a producer you do not control.** The only tools are refusing early and saying when to
+  come back: `503 Service Unavailable` (or `429 Too Many Requests` when it is a per-client quota) with a
+  `Retry-After` header.
+- **Reject before reading large bodies or calling anything expensive,** *because* rejection is only cheap
+  if it happens first.
+- **FastAPI parses a declared body first.** It reads and parses a declared body parameter before your
+  endpoint function or its dependencies run, so a check inside the endpoint happens after the upload. For
+  large bodies, admit in middleware or take the raw `Request` and read the body only once admitted.
+- **Blunt vs precise.** Uvicorn's `--limit-concurrency` returns 503 server-wide above a connection or task
+  count; per-dependency semaphores give the precise version.
+- **Who acts on the signal:** upstream load balancers and well-behaved clients turn it into retries with
+  backoff or routing to another replica.
 
 ### Inside a stream, flow control is automatic but partial
-When a `StreamingResponse` generator yields a chunk, the server's `send` writes it to the socket. If
-the client reads slowly, the kernel's send buffer and the server's write buffer fill, the server
-pauses writing, and the `await` on `send` stops returning, so the generator stops being iterated.
-That is real backpressure from the client to your code. It effectively stops at your code, though:
-if the generator is reading tokens from a provider stream, TCP flow control may eventually reach the
-provider's front end once you stop reading, but generation on its side is typically decoupled from
-socket writes, so it keeps decoding and buffers or bills tokens regardless. For an expensive upstream, a stalled or vanished client
-should become an explicit decision to cancel, not an implicit pause.
+1. A `StreamingResponse` generator yields a chunk, and the server's `send` writes it to the socket.
+2. If the client reads slowly, the kernel's send buffer and the server's write buffer fill.
+3. The server pauses writing, the `await` on `send` stops returning, and the generator stops being
+   iterated. That is real backpressure from the client to your code.
+- **It effectively stops at your code.** If the generator reads tokens from a provider stream, TCP flow
+  control may eventually reach the provider's front end once you stop reading, but generation on its side
+  is typically decoupled from socket writes, so it keeps decoding and buffers or bills tokens regardless.
+- **So for an expensive upstream,** a stalled or vanished client should become an explicit decision to
+  cancel, not an implicit pause.
 
 ### Upstream signals
-Your service is also a producer for the provider. A 429 or 503 from the provider, especially with
-`Retry-After`, is backpressure aimed at you. Honour it: back off, retry with jitter within the
-deadline, and reduce your own concurrency rather than retrying at full rate. Adaptive limiters lower
-concurrency when latency or error rates rise and raise it slowly when they recover, the same
-additive-increase, multiplicative-decrease shape TCP congestion control uses.
+- **Your service is also a producer for the provider.** A 429 or 503 from the provider, especially with
+  `Retry-After`, is backpressure aimed at you.
+- **Honour it:** back off, retry with jitter within the deadline, and reduce your own concurrency rather
+  than retrying at full rate.
+- **Adaptive limiters** lower concurrency when latency or error rates rise and raise it slowly when they
+  recover: the same additive-increase, multiplicative-decrease shape TCP congestion control uses.
 
 ### Backpressure versus load shedding versus queuing
-Backpressure slows the producer. Load shedding drops work when slowing is impossible, preferably the
-least valuable work first (free tier before paid, background re-indexing before interactive chat).
-Durable job queues move work that can wait, like batch embedding, out of the request path entirely,
-with depth limits of their own. A well-built service uses all three.
+| Tool | What it does | Example |
+|---|---|---|
+| Backpressure | Slows the producer | Bounded queue, early 503 |
+| Load shedding | Drops work when slowing is impossible, least valuable first | Free tier before paid, background re-indexing before interactive chat |
+| Durable job queue | Moves work that can wait out of the request path, with its own depth limit | Batch embedding |
 
-## Example
-An ingest endpoint feeding a bounded queue drained by a fixed pool of embedding workers. When the
-queue is full the endpoint rejects at once instead of queueing more work than the workers can finish
-within the latency budget.
+A well-built service uses all three.
+
+## Examples
+### Bounded ingest queue with all-or-nothing admission
+An ingest endpoint feeding a bounded queue drained by a fixed pool of embedding workers. When the queue is
+full the endpoint rejects at once instead of queueing more work than the workers can finish within the
+latency budget.
 
 ```python
 import asyncio, logging
@@ -138,47 +152,102 @@ async def ingest(body: dict, request: Request):
     return {"accepted": len(body["chunks"]), "queued": q.qsize()}
 ```
 
-Numbers (illustrative): if each embed call takes 0.5 s, 8 workers drain 16 chunks per second, so a
-full queue of 200 waits about 200 / 16 ≈ 12.5 s. If the product needs ingested text searchable within
-15 s, the ceiling is 16 × 15 = 240, and 200 leaves margin for the embed call itself and for slow
-calls; an unbounded queue under a 30-chunks-per-second burst would grow by 14 chunks every second;
-after five minutes it holds about 4,200 chunks, a wait of over four minutes for the newest one. Two details make the bound real.
-The worker catches errors, *because* a worker task that dies on one bad chunk silently cuts drain
-rate, and the queue then fills at a load it used to handle. And admission checks the whole batch
-before enqueuing any of it, so a client never gets a 503 for a request that was half accepted. This in-process queue is lost on restart; work that
-must survive belongs in a durable job queue with the same depth limit.
+Numbers (illustrative):
+| Quantity | Value |
+|---|---|
+| Embed call | 0.5 s each |
+| Drain rate | 8 workers → 16 chunks per second |
+| Wait at a full queue of 200 | 200 / 16 ≈ 12.5 s |
+| Ceiling for a 15 s searchable-within budget | 16 × 15 = 240; 200 leaves margin for the embed call itself and slow calls |
+| Unbounded queue, 30-chunks-per-second burst | grows by 14 chunks every second |
+| After five minutes | about 4,200 chunks, a wait of over four minutes for the newest |
+
+Two details make the bound real:
+- **The worker catches errors,** *because* a worker task that dies on one bad chunk silently cuts drain
+  rate, and the queue then fills at a load it used to handle.
+- **Admission checks the whole batch before enqueuing any of it,** so a client never gets a 503 for a
+  request that was half accepted.
+- **Caveat:** this in-process queue is lost on restart; work that must survive belongs in a durable job
+  queue with the same depth limit.
+
+### Runnable: bounded vs unbounded under the same burst
+Thirty arrivals per second against a 16-per-second stage for 300 seconds. Pure Python, no dependencies.
+
+```python
+def simulate(arrive, drain, seconds, bound=None):
+    depth = rejected = 0
+    for _ in range(seconds):
+        admitted = arrive if bound is None else min(arrive, bound - depth)
+        rejected += arrive - admitted          # in FastAPI: 503 with Retry-After
+        depth = max(0, depth + admitted - drain)
+    return depth, depth / drain, rejected
+
+for bound in (None, 200):
+    depth, wait, rej = simulate(arrive=30, drain=16, seconds=300, bound=bound)
+    print(f"bound={bound}: depth={depth}, newest waits ~{wait:.1f}s, rejected={rej}")
+# bound=None: depth=4200, newest waits ~262.5s, rejected=0
+# bound=200: depth=184, newest waits ~11.5s, rejected=4016
+```
+
+- **Unbounded:** nothing is rejected, but the newest item waits over four minutes, so in practice it
+  times out and the work was wasted anyway.
+- **Bounded:** the excess gets fast, honest 503s while admitted work stays inside the 15 s budget.
+
+## Production patterns
+- **Expose queue depth and time in queue as metrics.** For every bounded queue, publish `qsize()` as a
+  gauge and record enqueue-to-dequeue time per item. Alert on depth approaching the bound and on p99 time
+  in queue, which move before average latency does.
+- **Admit before the body is read.** For upload and ingest routes, check capacity in middleware (or take
+  the raw `Request`) and reject with 503 and `Retry-After` before streaming the body in. Monitor how much
+  request-body bandwidth rejected requests still consume.
+- **Retry upstream 429s with capped, jittered backoff.** Wrap provider calls in a retry policy that
+  honours `Retry-After` when present, otherwise uses exponential backoff with jitter (for example
+  tenacity's `wait_random_exponential` with `stop_after_delay` set inside the request deadline). Monitor
+  retry rate and whether 429s fall after a throttle or keep climbing.
+- **Shed by priority at the edge.** Classify requests by tier or route before admission and give
+  low-priority traffic a smaller bound, so it is rejected first. Monitor rejection rate per class and
+  latency of the protected class during overload.
+- **Uvicorn `--limit-concurrency` as a last resort.** Set it above the sum of your own bounds so the
+  server-wide 503 only fires if the precise limits fail. Monitor its 503 count separately.
+- **Durable queue for work that can wait.** Route batch embedding and re-indexing to a durable job queue
+  with a depth limit and return 202, keeping in-process queues for short-lived work. Monitor job age and
+  dead-letter counts.
 
 ## Trade-offs
-- Bounded queues keep latency predictable but reject work during bursts the system might have absorbed
-  later; deeper bounds suit batch work with loose deadlines, shallow ones interactive chat.
-- Rejecting early with 503 protects everyone already admitted, but pushes retry handling onto clients;
-  it only works when clients honour `Retry-After` and back off with jitter.
-- Waiting briefly on a full stage smooths spikes, while waiting long just converts overload into
-  timeouts; the wait should be a small fraction of the client's deadline.
-- Shedding by priority keeps paid or interactive traffic healthy under overload, at the cost of
-  classifying requests up front and occasionally failing work that was cheap to serve.
+- **Predictable latency vs absorbed bursts.** Bounded queues keep latency predictable but reject work
+  during bursts the system might have absorbed later; deeper bounds suit batch work with loose
+  deadlines, shallow ones interactive chat.
+- **Early 503 vs client burden.** Rejecting early protects everyone already admitted, but pushes retry
+  handling onto clients; it only works when clients honour `Retry-After` and back off with jitter.
+- **Brief vs long waits.** Waiting briefly on a full stage smooths spikes, while waiting long just
+  converts overload into timeouts; the wait should be a small fraction of the client's deadline.
+- **Priority shedding vs classification cost.** Shedding by priority keeps paid or interactive traffic
+  healthy under overload, at the cost of classifying requests up front and occasionally failing work that
+  was cheap to serve.
 
 ## Pitfalls
-- Using unbounded `asyncio.Queue()` or unbounded task creation with `create_task` per request; memory
-  climbs during a burst and p99 latency rises steadily while CPU looks idle.
-- Retrying provider 429s immediately at full concurrency; the error rate increases after the first
-  throttle instead of recovering, because retries add load to a saturated dependency.
-- Rejecting only after reading the full body or calling the model; overload responses are as
+- **Unbounded `asyncio.Queue()` or unbounded task creation with `create_task` per request.** Symptom:
+  memory climbs during a burst and p99 latency rises steadily while CPU looks idle.
+- **Retrying provider 429s immediately at full concurrency.** Symptom: the error rate increases after the
+  first throttle instead of recovering, because retries add load to a saturated dependency.
+- **Rejecting only after reading the full body or calling the model.** Overload responses are as
   expensive as successes, so shedding does not relieve anything.
-- Assuming a paused stream pauses the provider; a slow or stalled client keeps upstream tokens billing
+- **Assuming a paused stream pauses the provider.** A slow or stalled client keeps upstream tokens billing
   while the generator waits on `send`.
-- Measuring only average latency; queue growth shows up first in p99 and in queue depth, so averages
+- **Measuring only average latency.** Queue growth shows up first in p99 and in queue depth, so averages
   hide the collapse until it is total.
-- Consumer tasks that die on an unhandled exception; the symptom is queue depth and 503s rising at a
-  load the service handled yesterday, with fewer active workers than configured.
+- **Consumer tasks that die on an unhandled exception.** Symptom: queue depth and 503s rising at a load
+  the service handled yesterday, with fewer active workers than configured.
 
 ## When to use
-Design for backpressure in any service whose slowest stage is a model, a quota or a GPU, which is
-nearly every AI service. Bound every queue and in-flight pool, decide which requests to reject first,
-return 503 or 429 with `Retry-After`, and honour the same signals from your providers. Move work that
-can wait into a durable queue. Measure queue depth, time in queue, rejection rate, p99 latency and
-upstream 429s. In interviews, expect to explain why bigger buffers make overload worse and to show
-where in a request path you would shed load.
+- **Design for it** in any service whose slowest stage is a model, a quota or a GPU, which is nearly
+  every AI service.
+- **Do:** bound every queue and in-flight pool, decide which requests to reject first, return 503 or 429
+  with `Retry-After`, honour the same signals from your providers, and move work that can wait into a
+  durable queue.
+- **Measure** queue depth, time in queue, rejection rate, p99 latency and upstream 429s.
+- **Interviews:** expect to explain why bigger buffers make overload worse and to show where in a request
+  path you would shed load.
 
 ## Role lens
 - **Engineer:** Bounds queues and semaphores, returns fast 503s with `Retry-After`, honours upstream

@@ -5,7 +5,7 @@ name: Agentic architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -21,101 +21,129 @@ sources:
 ---
 
 ## TL;DR
-An agentic architecture is a system in which a model chooses the next action at runtime, observes the
-result, and repeats until a stopping condition. The system-design job is to wrap that loop in boundaries
-the model does not control: a typed tool layer with least privilege, externalized state so runs survive
-crashes, step and cost budgets, approval gates for consequential actions, and tracing. The model owns
-judgment; the architecture owns guarantees.
+An agentic architecture lets a model choose the next action at runtime, observe, and repeat. The system
+wraps that loop in boundaries it cannot control: least-privilege typed tools, external state, budgets,
+approval gates and tracing. The model owns judgment; the architecture owns guarantees.
 
 ## Why it exists
-Most software encodes its control flow in advance: a request comes in, a known sequence of steps runs,
-a response goes out. That works when the path through the task is known when you write the code. A
-large class of valuable tasks is not like that. "Resolve this support ticket", "find out why this deploy
-failed", "reconcile these two ledgers" take a different number of steps each time, the next step depends
-on what the previous one revealed, and the space of possible paths is too large to enumerate as
-branches.
-
-The first naive answer is a fixed chain of prompts: classify, then extract, then look up, then draft. It
-is predictable and testable, and for many tasks it is the right design (see workflows vs agents). It
-fails when the chain needs a branch you did not anticipate: the lookup returns two candidates, the
-document is in a language the extractor was not prompted for, the ticket is actually three tickets.
-Every such case becomes another hard-coded branch and the chain ossifies.
-
-The second naive answer is the opposite: hand the model every tool and a long system prompt, and let it
-run. This produces demos quickly and incidents shortly after. Nothing bounds how many steps it takes or
-how much it costs. A crash mid-task loses everything, because the state lived in a Python list. A tool
-with write access to production is one bad tool call away from damage. And when it goes wrong, nobody
-can reconstruct what happened.
-
-Agentic architecture is the discipline between those two: let the model decide *what* to do next, and
-build a system that decides what it is *allowed* to do, how long it may keep going, what happens when
-it fails, and how every step is recorded.
+- **Some tasks have no fixed path.** "Resolve this support ticket", "find out why this deploy failed",
+  "reconcile these two ledgers" take a different number of steps each time, the next step depends on
+  what the previous one revealed, and the space of paths is too large to enumerate as branches.
+- **A fixed prompt chain ossifies.** Classify, extract, look up, draft is predictable and testable, and
+  often right (see workflows vs agents). It fails on unanticipated branches: two lookup candidates, a
+  document in an unexpected language, a ticket that is really three. Each becomes another hard-coded
+  branch.
+- **"Give the model every tool and let it run" fails the other way.** Demos come quickly and incidents
+  shortly after: nothing bounds steps or cost, a crash loses everything because state lived in a Python
+  list, a production write tool is one bad call from damage, and nobody can reconstruct what happened.
+- **The discipline in between.** Let the model decide *what* to do next; build a system that decides
+  what it is *allowed* to do, how long it may keep going, what happens when it fails, and how every step
+  is recorded.
 
 ## How it works
 ### The core loop
-The unit of execution is a loop: build the context (instructions, task, state, recent observations),
-call the model with a set of tool definitions, and then branch. If the model returns a tool call,
-validate the arguments, execute the tool, append the result as an observation and repeat. If it returns
-a final answer, stop. ReAct-style interleaving of reasoning and acting is the pattern underneath; every
-agent framework is a wrapper around this loop plus the boundaries below. A common variant,
-plan-and-execute, asks the model for an explicit plan first and then runs steps against it, re-planning
-when an observation contradicts the plan; it costs an extra call but gives the runtime something to
-checkpoint, show a human and compare progress against, which a pure ReAct loop does not.
+1. **Build the context:** instructions, task, state, recent observations.
+2. **Call the model** with a set of tool definitions.
+3. **Branch.** A tool call: validate the arguments, execute the tool, append the result as an
+   observation, repeat. A final answer: stop.
+
+- **ReAct underneath.** ReAct-style interleaving of reasoning and acting is the pattern; every agent
+  framework wraps this loop plus the boundaries below.
+- **Plan-and-execute variant.** The model writes an explicit plan first, runs steps against it, and
+  re-plans when an observation contradicts it. It costs an extra call but gives the runtime something to
+  checkpoint, show a human and measure progress against, which a pure ReAct loop does not.
 
 ### The cost shape of the loop
-Each step re-sends the accumulated context, so input tokens grow with the *sum* of context sizes, not the
-final size. Illustratively, a run that starts at 3k tokens and adds 1k per step sends
-Σ(3k + i·1k) for i = 0…11 ≈ 102k input tokens over 12 steps, though its final context is only 14k. That
-near-quadratic growth is why the architecture caps steps, stores large tool outputs as references, and
-keeps the stable prefix (instructions, tool definitions) byte-identical so provider prompt caching can
-discount it.
+Each step re-sends the accumulated context, so input tokens grow with the *sum* of context sizes, not
+the final size.
+
+```
+total_input = Σ(3k + i·1k) for i = 0…11 ≈ 102k input tokens over 12 steps   (final context only 14k)
+```
+
+That near-quadratic growth (illustrative numbers) is why the architecture:
+- **caps steps;**
+- **stores large tool outputs as references** instead of pasting them;
+- **keeps the stable prefix byte-identical** (instructions, tool definitions) so provider prompt caching
+  can discount it.
 
 ### The layers around the loop
-1. **Interface layer.** Where tasks enter (chat UI, API, event, schedule) and where results and
-   intermediate events leave. For anything that may take more than a few seconds this is asynchronous:
-   accept the task, return a run id, stream events, deliver the result later. Agents are long-running by
-   nature *because* each step is a model call plus a tool call and the number of steps is unknown;
-   holding an HTTP request open across that is fragile.
-2. **Orchestration and runtime layer.** Owns the loop and its policies: step budget, token and cost
-   budget, wall-clock timeout, loop detection (same tool with the same arguments repeatedly), retries
-   with backoff for transient tool failures, cancellation. It persists state after every step *because*
-   a run that cannot resume after a worker restart will, at scale, fail constantly for reasons unrelated
-   to the task. Durable execution engines are one way to get this; a checkpoint store plus idempotent
-   steps is another.
-3. **Model gateway.** A single place that calls models: routing between models, rate limiting,
-   caching, cost accounting, fallbacks. Agents multiply model calls by the number of steps, so cost
-   control lives here, not in prompts.
+| Layer | Owns | Because |
+|---|---|---|
+| 1. Interface | where tasks enter and events leave | runs are long; HTTP requests held open are fragile |
+| 2. Orchestration / runtime | loop, budgets, retries, checkpoints | runs must resume after restarts |
+| 3. Model gateway | routing, rate limits, caching, cost | steps multiply model calls |
+| 4. Tool layer | typed contracts, credentials, approvals | confidence is not permission |
+| 5. State and memory | task state, artifacts | context is the scarcest resource |
+| 6. Observability and audit | one event per step | evaluation and incident review |
+
+1. **Interface layer.** Tasks enter via chat UI, API, event or schedule. For anything over a few seconds
+   it is asynchronous: accept the task, return a run id, stream events, deliver the result later. Agents
+   are long-running *because* each step is a model call plus a tool call and the step count is unknown.
+2. **Orchestration and runtime layer.** Enforces step budget, token and cost budget, wall-clock timeout,
+   loop detection (same tool, same arguments, repeatedly), retries with backoff for transient tool
+   failures, and cancellation.
+   - It persists state after every step *because* a run that cannot resume after a worker restart will,
+     at scale, fail constantly for reasons unrelated to the task.
+   - Durable execution engines are one way to get this; a checkpoint store plus idempotent steps is
+     another.
+3. **Model gateway.** One place that calls models: routing, rate limiting, caching, cost accounting,
+   fallbacks. Agents multiply model calls by the number of steps, so cost control lives here, not in
+   prompts.
 4. **Tool layer.** Each tool is a typed contract: schema-validated inputs, structured outputs, an
-   explicit side-effect classification (read-only versus consequential), and its own credentials scoped
-   to what that tool needs. The agent never holds credentials; the tool adapter does. Consequential tools
-   route through an approval gate, human or policy, *because* the model's confidence is not a
-   permission. Tools that execute code or browse run in a sandbox *because* their inputs may come from
-   untrusted content, which makes prompt injection a system-level threat rather than a prompt-level one.
+   explicit side-effect class (read-only versus consequential), and credentials scoped to that tool.
+   - **The agent never holds credentials;** the tool adapter does.
+   - **Consequential tools route through an approval gate,** human or policy, *because* the model's
+     confidence is not a permission.
+   - **Code-executing and browsing tools run in a sandbox** *because* their inputs may come from untrusted
+     content, which makes prompt injection a system-level threat rather than a prompt-level one.
 5. **State and memory.** Task state (plan, completed steps, artifacts) is separate from conversation
-   history and from long-term memory. Keep it external and addressable by run id. Large tool outputs are
-   stored as artifacts and referenced, not pasted into the context, *because* context is the agent's
-   scarcest resource and raw tool results are the fastest way to exhaust it.
+   history and long-term memory, external and addressable by run id. Large tool outputs are stored as
+   artifacts and referenced *because* raw tool results are the fastest way to exhaust context.
 6. **Observability and audit.** Every step emits a structured event: model input hash, tool name,
-   arguments, result size, latency, cost, under a run id and tenant id. This is what makes trajectory
-   evaluation and incident review possible.
+   arguments, result size, latency, cost, under a run id and tenant id. This makes trajectory evaluation
+   and incident review possible.
 
 ### Where control flow should be code, and where model
-A useful rule: put the model in decisions that require judgment about content, and put code in
-decisions that require guarantees. "Which document is relevant" is judgment. "May this user issue
-refunds above 500" is a guarantee, enforced in the tool layer regardless of what the model asks. Mixed
-systems, where a deterministic workflow calls an agent for one open-ended step, or an agent calls a
-deterministic sub-workflow as a tool, are the norm in production, not the exception.
+- **Model for judgment about content:** "which document is relevant".
+- **Code for guarantees:** "may this user issue refunds above 500" is enforced in the tool layer
+  regardless of what the model asks.
+- **Mixed systems are the production norm:** a deterministic workflow calls an agent for one open-ended
+  step, or an agent calls a deterministic sub-workflow as a tool.
 
 ### Stopping
-Every agent needs explicit termination: a final-answer action, a maximum number of steps, a budget, and
-a stuck detector. Without all four, the loop's failure mode is not a wrong answer but an unbounded one.
-Each terminal state should be distinct in the run record (`done`, `budget_exhausted`, `stuck`,
-`awaiting_approval`, `cancelled`) *because* they demand different follow-ups: a retry, a human, or a
-bug report.
+Every agent needs four explicit terminators; without all four the failure mode is not a wrong answer
+but an unbounded one.
+1. **A final-answer action.**
+2. **A maximum number of steps.**
+3. **A budget.**
+4. **A stuck detector.**
 
-## Example
-A minimal runtime that shows the boundaries rather than the cleverness: a budget, schema-validated
-tools with a side-effect flag, an approval gate for consequential actions that interrupts rather than
+Record each terminal state distinctly (`done`, `budget_exhausted`, `stuck`, `awaiting_approval`,
+`cancelled`) *because* they demand different follow-ups: a retry, a human, or a bug report.
+
+## Diagram
+One step of the runtime loop. Follow the tool-call branch: validation, the approval gate and the
+checkpoint all sit in code around the model, and every exit lands in a distinct terminal state.
+
+```mermaid
+flowchart TD
+    C["Build context: instructions, task, state"] --> B{"Step or cost budget left?"}
+    B -->|"no"| BX["budget_exhausted"]
+    B -->|"yes"| M["Call model via gateway"]
+    M -->|"final answer"| D["done"]
+    M -->|"tool call"| V["Validate args against schema"]
+    V --> G{"Consequential and not yet approved?"}
+    G -->|"yes"| P["Save pending call: awaiting_approval"]
+    G -->|"no"| X["Execute tool with idempotency key"]
+    X --> K[("Checkpoint state by run id")]
+    K -->|"next step"| C
+    P -.->|"approval event resumes stored call"| X
+```
+
+## Examples
+### A minimal runtime that shows the boundaries
+A budget, schema-validated tools with a side-effect flag, an approval gate that interrupts rather than
 blocks, and a checkpoint after every step. `call_model` is whatever model API you use and returns either
 a tool call or a final answer; `validate` is a JSON Schema check.
 
@@ -166,52 +194,99 @@ def run(run_id, task, store, max_steps=12, budget_usd=0.50):
     store.save(run_id, {**state, "status": "budget_exhausted"})
 ```
 
-Three boundaries are visible. The hard cap (`maximum: 5000`) lives in the schema, so a larger refund is
-rejected however persuasively the model argued for it. The policy threshold (above 500 needs approval) is
-a predicate in code, and the gate *interrupts* the run, saving the exact pending call, rather than holding
-a thread while a human decides; on resume the approved call runs without asking the model again, so the
-human approved precisely what executes. And the idempotency key is derived from run id and step, so a
-worker that crashes after the refund but before the checkpoint re-executes the step without paying twice.
-Walk one run: step 0 searches tickets (read-only, runs), step 1 proposes a 750 refund, the predicate
-fires, the run is saved as `awaiting_approval` with zero further cost; an approver accepts, `run()` is
-re-invoked, the refund executes with key `run_id:1`, and the model writes the final answer at step 2.
+Three boundaries are visible:
+- **Hard cap in the schema.** `maximum: 5000` rejects a larger refund however persuasively the model
+  argued for it.
+- **Policy threshold in code, gate as interrupt.** Above 500 needs approval. The gate saves the exact
+  pending call instead of holding a thread while a human decides; on resume the approved call runs
+  without asking the model again, so the human approved precisely what executes.
+- **Idempotency key from run id and step.** A worker that crashes after the refund but before the
+  checkpoint re-executes the step without paying twice.
+
+### Walking one run through the runtime
+| Step | What happens | Status after |
+|---|---|---|
+| 0 | `search_tickets` (read-only) runs | running |
+| 1 | model proposes a 750 refund; the predicate fires | `awaiting_approval`, zero further cost |
+| — | approver accepts; `run()` is re-invoked | running |
+| 1 (resume) | refund executes with key `run_id:1`, no new model call | running |
+| 2 | model writes the final answer | `done` |
+
+### Runnable: what offloading tool output saves
+Pure Python, illustrative numbers. Same 12-step run, with raw tool output pasted (1k per step) versus
+artifacts stored by reference with a short summary (0.2k per step).
+
+```python
+def loop_input_tokens(start_k, growth_k, steps):
+    sent = [start_k + i * growth_k for i in range(steps)]
+    return sum(sent), sent[-1]
+
+for label, growth in [("raw output in context", 1.0), ("artifacts by reference", 0.2)]:
+    total, last = loop_input_tokens(3, growth, 12)
+    print(f"{label:24s} total={total:6.1f}k  last step={last:4.1f}k")
+# raw output in context    total= 102.0k  last step=14.0k
+# artifacts by reference   total=  49.2k  last step= 5.2k
+```
+
+## Production patterns
+- **Durable execution for the loop.** When runs last minutes to hours or touch money, run each model and
+  tool call as a recorded step in a durable engine (for example a Temporal workflow with one activity per
+  call) or a checkpoint store keyed by run id. Monitor runs resumed after restarts and runs stuck in a
+  non-terminal state.
+- **Idempotency keys derived from run and step.** Pass `f"{run_id}:{step}"` to every consequential API
+  that accepts one (payment providers such as Stripe take an `Idempotency-Key` header). Monitor
+  duplicate side effects per thousand runs; it should be zero.
+- **Approval as interrupt, not wait.** Persist the pending call, notify the approver, end the worker, and
+  resume from an approval event that executes the stored call verbatim. Monitor approval latency, the
+  approval rate per tool, and runs that expire in `awaiting_approval`.
+- **Budgets enforced in the runtime and gateway.** Set max steps, max cost and a wall-clock timeout per
+  run, plus a repeated-call stuck detector. Alert on the fraction of runs ending `budget_exhausted` or
+  `stuck` per task type, because a rise usually means a tool or prompt regression.
+- **Cache-friendly stable prefix.** Put instructions and tool definitions first and keep them
+  byte-identical across steps, so provider prompt caching can discount them. Monitor the cached-token
+  share of input tokens that the provider reports in usage data.
 
 ## Trade-offs
-- Flexibility on unknown task paths versus predictability and testability; when the path is known in
-  advance, a deterministic workflow is cheaper, faster and far easier to evaluate.
-- Externalized, checkpointed state makes runs resumable and auditable but adds a store write per step;
-  for sub-second, read-only agents an in-memory loop is acceptable.
-- Approval gates stop damage from bad tool calls but add latency and human load; the threshold for what
-  counts as consequential is a product decision, not a technical one.
-- Giving an agent many tools broadens what it can do while lowering tool-selection accuracy and inflating
-  context; narrow tool sets per task, or sub-agents, win once the tool list grows large (the exact
-  threshold is model-dependent, so measure tool-selection accuracy rather than assume a number).
-- Asynchronous execution with streamed events fits long runs and survives restarts, but complicates
-  clients, which must handle partial results, resumption and cancellation.
+- **Flexibility vs predictability.** Flexibility on unknown task paths costs predictability and
+  testability. When the path is known in advance, a deterministic workflow is cheaper, faster and far
+  easier to evaluate.
+- **Checkpointed state vs a write per step.** Externalized state makes runs resumable and auditable but
+  adds a store write per step; for sub-second, read-only agents an in-memory loop is acceptable.
+- **Approval gates vs latency and human load.** Gates stop damage from bad tool calls but add delay and
+  reviewer work; what counts as consequential is a product decision, not a technical one.
+- **Many tools vs selection accuracy.** More tools broaden what the agent can do while lowering
+  tool-selection accuracy and inflating context. Narrow tool sets per task, or sub-agents, win once the
+  list grows large (the threshold is model-dependent, so measure tool-selection accuracy rather than
+  assume a number).
+- **Async with streamed events vs client complexity.** Fits long runs and survives restarts, but clients
+  must handle partial results, resumption and cancellation.
 
 ## Pitfalls
-- Keeping run state in process memory; the symptom is runs that vanish on deploys or autoscale events,
-  and users who retry, doubling side effects.
-- No budget or step cap; the symptom is a single stuck run consuming a day's token budget while repeating
-  the same failing tool call.
-- Trusting the model to enforce permissions ("only refund if the policy allows"); the symptom is a
-  prompt-injected document that convinces the agent to call a write tool, which then succeeds.
-- Letting the model re-propose an action after approval instead of executing the stored pending call;
-  the symptom is an approved 750 refund that executes as 800, because the second model call differed.
-- Pasting full tool outputs into context; the symptom is cost growing step over step and quality falling
-  as the window fills with raw JSON.
-- Treating a demo loop as the architecture; the symptom is that the first production requirement
-  (resume, audit, cancel, approve) requires a rewrite.
+- **Keeping run state in process memory.** Symptom: runs vanish on deploys or autoscale events, and
+  users who retry double the side effects. Fix: checkpoint by run id after every step.
+- **No budget or step cap.** Symptom: a single stuck run consumes a day's token budget while repeating
+  the same failing tool call. Fix: all four terminators plus distinct terminal states.
+- **Trusting the model to enforce permissions** ("only refund if the policy allows"). Symptom: a
+  prompt-injected document convinces the agent to call a write tool, which then succeeds. Fix: enforce in
+  the tool layer.
+- **Letting the model re-propose an action after approval.** Symptom: an approved 750 refund executes as
+  800, because the second model call differed. Fix: execute the stored pending call.
+- **Pasting full tool outputs into context.** Symptom: cost grows step over step and quality falls as
+  the window fills with raw JSON. Fix: store artifacts and reference them.
+- **Treating a demo loop as the architecture.** Symptom: the first production requirement (resume,
+  audit, cancel, approve) requires a rewrite.
 
 ## When to use
-Build an agentic system when the number and order of steps genuinely depend on intermediate results,
-when tools exist to act on those results, and when you can define "done" well enough to evaluate it.
-Prefer a workflow when steps are known, when latency must be tight, or when the cost of a wrong action
-is high and you cannot gate it. Measure task completion rate, steps and cost per task, tool-call success
-rate, and the fraction of runs that hit budgets or require approval. Day to day this appears as decisions
-about which tools are read-only, what the step budget is, and where state lives. In interviews, be ready
-to draw the layers, explain why state must be external, and argue where model judgment ends and
-code-enforced guarantees begin.
+- **Use when:** the number and order of steps genuinely depend on intermediate results, tools exist to
+  act on those results, and you can define "done" well enough to evaluate it.
+- **Prefer a workflow when:** steps are known, latency must be tight, or the cost of a wrong action is
+  high and you cannot gate it.
+- **Measure:** task completion rate, steps and cost per task, tool-call success rate, and the fraction of
+  runs that hit budgets or require approval.
+- **Day to day:** decisions about which tools are read-only, what the step budget is, and where state
+  lives.
+- **Interviews:** draw the layers, explain why state must be external, and argue where model judgment
+  ends and code-enforced guarantees begin.
 
 ## Role lens
 - **Engineer:** Implements the loop with budgets and checkpoints, writes tool adapters with schemas and
@@ -233,6 +308,44 @@ execute again. The fix is to externalize state by run id and checkpoint after ev
 resume rather than restart, make tool execution idempotent with a key derived from run id and step,
 route consequential tools through an approval or at least a dedupe layer, and emit structured events so
 disappearing runs become visible as "interrupted at step n" instead of silence.
+
+## Interview questions
+### What is an agentic architecture, and how does it differ from a prompt chain?
+
+- **Definition:** the model chooses the next action at runtime, observes the result and repeats, while
+  the system around it owns tools, state, budgets, approvals and tracing.
+- **Versus a chain:** a chain fixes the path in code, which is predictable and testable but ossifies on
+  unanticipated branches; an agent handles paths you cannot enumerate, at the cost of predictability.
+
+### How would you stop an agent from issuing a refund it should not?
+
+- **Enforce in the tool layer, not the prompt.** A schema cap such as `maximum: 5000` rejects the call
+  outright, and a code predicate (amount above 500) routes it to approval.
+- **Gate as an interrupt.** Save the exact pending call, end the worker, and on approval execute that
+  stored call without asking the model again, so the human approves precisely what runs.
+- **Scope credentials to the adapter** so the agent never holds them, and a prompt-injected document
+  cannot borrow broader permissions.
+
+### Why does agent cost grow faster than the context size suggests, and what do you do about it?
+
+- **Each step re-sends the accumulated context,** so input tokens follow the sum of context sizes: 12
+  steps starting at 3k and growing 1k per step send about 102k input tokens for a 14k final context.
+- **Levers:** cap steps, store large tool outputs as artifacts by reference (about 49.2k in the same
+  illustrative run at 0.2k growth), and keep the stable prefix byte-identical for prompt caching.
+
+### When would you not build an agent?
+
+- **Known steps:** if the path is known in advance, a deterministic workflow is cheaper, faster and far
+  easier to evaluate.
+- **Tight latency or ungateable risk:** when a wrong action is costly and you cannot put an approval
+  gate in front of it, keep control flow in code and call a model only for one bounded judgment.
+
+### Which terminal states do you record, and why keep them distinct?
+
+- **The four terminators** are a final-answer action, a step cap, a budget and a stuck detector;
+  without all four the failure is an unbounded run, not a wrong answer.
+- **Distinct states** (`done`, `budget_exhausted`, `stuck`, `awaiting_approval`, `cancelled`) map to
+  different follow-ups: a retry, a human, or a bug report, and their rates are what you alert on.
 
 ## Quiz
 ### Q: Why should agent run state be persisted outside the process after every step?

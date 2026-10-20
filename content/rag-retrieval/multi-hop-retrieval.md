@@ -5,7 +5,7 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/agentic-rag
@@ -23,104 +23,126 @@ sources:
 ---
 
 ## TL;DR
-Some questions cannot be answered from any single passage because the second fact is only findable once
-you know the first: "who manages the author of the report for incident 4812?" needs the author's name
-before "manager of Alice" is even a query. One-shot retrieval finds the first hop at best, since the
-terms that would retrieve the second do not exist yet. Multi-hop retrieval interleaves retrieving and
-reading: retrieve, extract the bridging fact, form the next query, repeat under a hop limit, then answer.
+Some answers need a second fact that is only findable once you know the first. Multi-hop retrieval
+interleaves retrieving and reading: retrieve, extract the bridging fact, form the next query, repeat under
+a hop limit, then answer.
 
 ## Why it exists
-The failure here is not a ranking problem, so none of the usual ranking fixes apply. The document that
-says "Alice reports to Bob" shares no distinctive terms and no topic with "incident 4812"; its embedding
-is nowhere near the question's, and its BM25 score is at best an incidental match on a common word such
-as "report". Raising k does not help, because the passage is not in the affordable tail of the ranking:
-it sits so far down, among thousands of unrelated passages, that it is effectively outside it. A reranker cannot promote a candidate
-that was never retrieved. Query rewriting cannot invent the name Alice before anyone has read the
-incident report. The only way to reach the second document is to read the first, pull out the bridging
-entity, and search again with it.
-
-Benchmarks such as HotpotQA were built precisely to expose this: "bridge" questions, where an
-intermediate entity links two documents, and "comparison" questions, where two entities must be
-looked up and compared. Comparison questions fan out in parallel (that is query decomposition); bridge
-questions are inherently sequential. Press et al. add the model-side observation that even when a model
-can answer each hop, composing them fails at a measurable rate, and that making the hops explicit
-narrows that gap.
-
-The alternatives have their place. A knowledge graph answers "manager of the author of X" in one
-traversal, but someone must have extracted the entities and relations offline and kept them fresh.
-Stuffing the whole corpus into a long context works for small corpora and fails on cost and size for the
-rest. Multi-hop retrieval needs neither preparation nor a giant window; it pays per question instead.
+- **The second query does not exist yet.** "Who manages the author of the report for incident 4812?" needs
+  the author's name before "manager of Alice" is even a query. One-shot retrieval finds the first hop at
+  best, since the terms that would retrieve the second do not exist yet.
+- **It is not a ranking problem, so ranking fixes do not apply.** "Alice reports to Bob" shares no
+  distinctive terms or topic with "incident 4812": its embedding is nowhere near the question's, and its
+  BM25 score is at best an incidental match on a common word such as "report".
+  - **Raising k fails:** the passage sits so far down, among thousands of unrelated passages, that it is
+    effectively outside the affordable tail.
+  - **A reranker fails:** it cannot promote a candidate that was never retrieved.
+  - **Query rewriting fails:** it cannot invent the name Alice before anyone has read the incident report.
+- **Benchmarks were built to expose it.** HotpotQA has "bridge" questions (an intermediate entity links two
+  documents, inherently sequential) and "comparison" questions (two entities looked up and compared; they
+  fan out in parallel, which is query decomposition). Press et al.: even when a model can answer each hop,
+  composing them fails at a measurable rate, and making the hops explicit narrows that gap.
+- **The alternatives cost more up front.** A knowledge graph answers "manager of the author of X" in one
+  traversal, but someone must extract entities and relations offline and keep them fresh. Stuffing the
+  whole corpus into context works for small corpora and fails on cost and size for the rest. Multi-hop
+  needs neither; it pays per question instead.
 
 ## How it works
 ### The loop
-The state is the original question, the evidence gathered so far, and a hop counter.
+State: the original question, the evidence gathered so far, and a hop counter.
 
-1. **Plan the next query.** An LLM reads the question and the evidence collected so far and emits either
-   the next search query or a signal that the evidence is sufficient. The next query is generated from
-   the evidence, not from the question, because the bridging entity lives in the evidence.
-2. **Retrieve.** Run the query through the normal retriever (hybrid plus reranker if you have one).
-   Precision matters more here than in single-shot RAG, because a wrong top passage sends the next hop in
-   the wrong direction.
-3. **Accumulate.** Append new passages to the evidence, deduplicating by id. The evidence accumulates
-   rather than being replaced, because the final answer needs both hops.
-4. **Terminate.** Stop when the planner says "enough", when the hop cap is reached, or when a hop adds no
-   new passages. All three conditions exist because each alone fails: the model alone may loop or stop
-   early; a cap alone wastes hops on questions answered at hop one; no-progress detection catches the
-   case where the planner keeps issuing the same query.
-5. **Answer.** A final prompt with the question and all evidence produces the answer with citations per
-   hop.
+1. **Plan the next query.** An LLM reads the question and the evidence so far and emits the next search
+   query or a "sufficient" signal. The query is generated from the evidence, not the question, because the
+   bridging entity lives in the evidence.
+2. **Retrieve.** Use the normal retriever (hybrid plus reranker if you have one). Precision matters more
+   than in single-shot RAG, because a wrong top passage sends the next hop in the wrong direction.
+3. **Accumulate.** Append new passages, deduplicating by id. Evidence accumulates rather than being
+   replaced, because the final answer needs both hops.
+4. **Terminate.** Stop when the planner says "enough", the hop cap is reached, or a hop adds no new
+   passages.
+5. **Answer.** A final prompt with the question and all evidence produces the answer with citations per hop.
+
+Why all three stop conditions, because each alone fails:
+
+| Condition alone | Failure |
+|---|---|
+| Planner "done" signal | the model may loop or stop early |
+| Hop cap | wastes hops on questions answered at hop one |
+| No-progress detection | needed to catch a planner that keeps issuing the same query |
 
 ### Three named formulations
-- **Self-ask** (Press et al.) has the model write "Follow up: ..." questions, answers each with a search
-  call ("Intermediate answer: ..."), and finishes with "So the final answer is". The scaffold makes the
-  hops legible and easy to log.
-- **IRCoT** (Trivedi et al.) interleaves chain-of-thought with retrieval: each reasoning sentence the
-  model writes becomes the next query, and retrieved passages feed the next sentence. It exploits the fact
-  that a reasoning step naturally names the thing to look up next.
-- **ReAct-style agent loops** generalise both: thought, action (search), observation, repeat. Agentic RAG
-  is this with the retriever exposed as a tool; the discipline of hop caps and progress checks is the
-  same.
+| Name | Mechanism | Why it helps |
+|---|---|---|
+| **Self-ask** (Press et al.) | model writes "Follow up: ..." questions, answers each with a search call ("Intermediate answer: ..."), ends with "So the final answer is" | the scaffold makes hops legible and easy to log |
+| **IRCoT** (Trivedi et al.) | interleaves chain-of-thought with retrieval: each reasoning sentence becomes the next query; retrieved passages feed the next sentence | a reasoning step naturally names the thing to look up next |
+| **ReAct-style agent loops** | thought, action (search), observation, repeat; agentic RAG exposes the retriever as a tool | generalises both; hop caps and progress checks still apply |
 
 ### Forming a good second-hop query
-The planner must extract the bridge entity and ask something specific: "Alice Chen manager" or "who does
-Alice Chen report to", not "who is the manager?". Few-shot examples in the planner prompt showing the
-extraction step are the cheapest way to get this right. Where entities are ambiguous (two Alices), the
-planner should carry a disambiguating attribute (team, email) from hop one.
+- **Extract the bridge entity and ask something specific:** "Alice Chen manager" or "who does Alice Chen
+  report to", not "who is the manager?".
+- **Few-shot examples of the extraction step** in the planner prompt are the cheapest way to get this right.
+- **Carry a disambiguating attribute** (team, email) from hop one when entities are ambiguous (two Alices).
 
 ### What to carry between hops
-The evidence grows every hop, and the planner prompt grows with it. Two options: carry the full passages
-(faithful, but by hop three the planner reads thousands of tokens, mostly irrelevant to the next query),
-or have each hop also emit a short note of the bridging fact ("INC-4812 author: Alice Chen, Payments")
-and give the planner the notes plus the passage ids. Notes keep the planner focused and cheap; the final
-answer prompt still receives the full passages, because notes are model-written and cannot be cited.
-Passing the list of queries already tried also helps, because a planner that can see its previous query
-is less likely to reissue it.
+| Option | Gains | Costs |
+|---|---|---|
+| Full passages to the planner | faithful | by hop three the planner reads thousands of tokens, mostly irrelevant to the next query |
+| Short bridging notes ("INC-4812 author: Alice Chen, Payments") plus passage ids | focused, cheap planner | notes are model-written and cannot be cited, so the final answer prompt still gets the full passages |
+
+- **Pass the queries already tried,** because a planner that can see its previous query is less likely to
+  reissue it.
 
 ### Compounding error
-If hop one retrieves the right passage with probability r1 and hop two succeeds with probability r2
-*given* a correct hop one, the chain succeeds at r1 × r2, assuming a wrong first hop is never recovered
-(the realistic case, since a wrong bridge entity produces a confidently wrong second query).
-Illustratively, 0.9 × 0.9 ≈ 0.81 for two hops and ≈ 0.73 for three. Three responses follow from the
-product. Raise per-hop precision, usually with a reranker, which buys more here than in single-shot RAG.
-Keep hop count minimal. And do not commit greedily when hop one is ambiguous: keep the top two or three
-candidate bridge entities (a small beam), run the next hop for each, and let the final step pick the
-chain whose evidence agrees, which costs b times the retrievals but turns one fragile chain into several.
+```
+P(chain succeeds) = r1 × r2 × ...      # r2 is hop-two success *given* a correct hop one
+```
+
+- **Assumes a wrong first hop is never recovered,** the realistic case, since a wrong bridge entity produces
+  a confidently wrong second query.
+- **Illustratively,** 0.9 × 0.9 ≈ 0.81 for two hops and ≈ 0.73 for three.
+- **Three responses follow from the product:**
+  1. **Raise per-hop precision,** usually with a reranker, which buys more here than in single-shot RAG.
+  2. **Keep hop count minimal.**
+  3. **Do not commit greedily when hop one is ambiguous.** Keep the top two or three candidate bridge
+     entities (a small beam), run the next hop for each, and let the final step pick the chain whose
+     evidence agrees. It costs b times the retrievals but turns one fragile chain into several.
 
 ### Learned alternatives
-The loop above uses an off-the-shelf retriever and puts the intelligence in the prompt. Multi-hop dense
-retrieval (Xiong et al.) instead trains the query encoder to take the question plus the previously
-retrieved passage as input, so the second-hop vector is computed from both without a generated query.
-It removes an LLM call per hop but needs multi-hop training data resembling your domain, which is why
-prompted loops dominate in enterprise settings.
+- **Multi-hop dense retrieval (Xiong et al.)** trains the query encoder on the question plus the previously
+  retrieved passage, so the second-hop vector comes from both without a generated query.
+- **It removes an LLM call per hop** but needs multi-hop training data resembling your domain, which is why
+  prompted loops with off-the-shelf retrievers dominate in enterprise settings.
 
 ### Evaluating
-Score each hop's supporting-fact recall (HotpotQA labels supporting sentences for exactly this), the
-final answer, the hop-count distribution, and cost per question. Final-answer accuracy alone hides where
-chains die.
+- **Per-hop supporting-fact recall** (HotpotQA labels supporting sentences for exactly this).
+- **Final answer, hop-count distribution and cost per question.**
+- **Final-answer accuracy alone hides where chains die.**
 
-## Example
-A bounded multi-hop loop. `llm` returns text, `retrieve` returns `(id, text)` pairs; the planner emits
-JSON so termination is explicit and loggable.
+## Diagram
+Follow one bridge question through the loop: each hop's query comes from the evidence, and three
+independent stop conditions guard the exit.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant P as Planner LLM
+    participant R as Retriever plus reranker
+    participant A as Answer LLM
+    U->>P: Who manages the author of the INC-4812 report
+    P->>R: hop 0 query, INC-4812 incident report author
+    R-->>P: report passage, Author Alice Chen (Payments)
+    Note over P: extract bridge entity, accumulate evidence
+    P->>R: hop 1 query, Alice Chen Payments team manager
+    R-->>P: org page, Alice Chen reports to Bob Ruiz
+    Note over P: stop on done signal, hop cap or no new passages
+    P->>A: question plus all evidence from both hops
+    A-->>U: Bob Ruiz, citing both passages
+```
+
+## Examples
+### A bounded multi-hop loop
+`llm` returns text, `retrieve` returns `(id, text)` pairs; the planner emits JSON so termination is
+explicit and loggable.
 
 ```python
 import json
@@ -163,42 +185,90 @@ ans, trace = multi_hop("Who manages the engineer who wrote the report for incide
 # Cost of this 2-hop answer: 3 planner calls + 2 retrievals + 1 answer call, all sequential.
 ```
 
+### Runnable: compounding error and the cost of a beam
+Pure Python. Illustrative per-hop rates; substitute your measured per-hop recall.
+
+```python
+from math import prod
+
+def chain_success(per_hop):          # a wrong hop is never recovered
+    return prod(per_hop)
+
+def retrievals(hops, beam=1):        # hop one once, later hops once per kept bridge entity
+    return 1 + beam * (hops - 1)
+
+for hops in (1, 2, 3):
+    p = chain_success([0.9] * hops)
+    print(f"{hops} hops: success {p:.2f}, retrievals {retrievals(hops)} greedy / {retrievals(hops, 3)} beam=3")
+print(f"rerank lifts per-hop to 0.95: 3 hops -> {chain_success([0.95] * 3):.2f}")
+# 1 hops: success 0.90, retrievals 1 greedy / 1 beam=3
+# 2 hops: success 0.81, retrievals 2 greedy / 4 beam=3
+# 3 hops: success 0.73, retrievals 3 greedy / 7 beam=3
+# rerank lifts per-hop to 0.95: 3 hops -> 0.86
+```
+
+- **Per-hop precision compounds:** a hypothetical lift from 0.9 to 0.95 per hop moves a three-hop chain
+  from 0.73 to 0.86.
+- **A beam is linear in width:** three bridge candidates turn 3 retrievals into 7, worth it only when hop
+  one is genuinely ambiguous.
+
+## Production patterns
+- **Gate the loop behind hop one.** Run normal single-shot retrieval first and enter the loop only when the
+  planner says the evidence is insufficient, so single-hop traffic pays nothing extra. Monitor the share of
+  questions that take more than one hop.
+- **Hard ceilings in config.** Set a hop cap (the example uses `max_hops=3`), a per-question token or cost
+  budget and a wall-clock timeout, and answer from partial evidence with an "insufficient" note when any
+  trips. Monitor how often each ceiling fires.
+- **Rerank every hop.** Put the cross-encoder on each hop's candidates, not only the last, because a wrong
+  bridge poisons later hops. Monitor per-hop supporting-fact recall on the multi-hop golden slice.
+- **Log the trace.** Persist the `trace` (query, new passages, hop) and the bridging notes per request, so
+  a failed chain shows where it died. Alert on rising no-progress stops, which often mean a missing
+  document type in the index.
+- **Cite-or-refuse for every hop.** Require a retrieved passage id for each bridging fact in the final
+  answer and reject answers whose second fact has no citation. Monitor the uncited-fact rate, the signal
+  for parametric-memory shortcuts.
+
 ## Trade-offs
-- Latency grows with hop count and hops are strictly sequential; gate with a classifier or let hop one
-  decide, so single-hop questions never pay for a loop.
-- The model can recover from a weak retriever by reformulating, but a wrong bridge entity poisons every
-  later hop; reranking each hop raises per-hop precision and pays for itself here.
-- A small beam over candidate bridge entities protects against a wrong first hop but multiplies later
-  retrievals by the beam width; it pays when hop-one entities are ambiguous (common names, duplicate
-  reports) and is waste when the bridge is an exact identifier.
-- Versus a knowledge graph there is no offline extraction and fresh data works immediately, but each
-  question pays runtime cost; when the same relations are queried constantly, build the graph.
-- Versus long-context stuffing the cost is bounded per hop rather than per corpus; for a corpus that fits
-  comfortably in the window with caching, stuffing is simpler and often better.
+- **Reach vs latency.** Latency grows with hop count and hops are strictly sequential; gate with a
+  classifier or let hop one decide, so single-hop questions never pay for a loop.
+- **Recovery by reformulation vs poisoned chains.** The model can recover from a weak retriever by
+  reformulating, but a wrong bridge entity poisons every later hop; reranking each hop raises per-hop
+  precision and pays for itself here.
+- **Beam robustness vs retrievals.** A small beam over candidate bridge entities protects against a wrong
+  first hop but multiplies later retrievals by the beam width; it pays when hop-one entities are ambiguous
+  (common names, duplicate reports) and is waste when the bridge is an exact identifier.
+- **No offline extraction vs per-question cost.** Versus a knowledge graph, fresh data works immediately,
+  but each question pays runtime cost; when the same relations are queried constantly, build the graph.
+- **Bounded cost vs simplicity.** Versus long-context stuffing, cost is bounded per hop rather than per
+  corpus; for a corpus that fits comfortably in the window with caching, stuffing is simpler and often
+  better.
 
 ## Pitfalls
-- No hop cap or no-progress check; the symptom is runaway cost and timeouts on questions the corpus
+- **No hop cap or no-progress check.** The symptom is runaway cost and timeouts on questions the corpus
   cannot answer.
-- The model answers hop two from parametric memory and skips the search; the symptom is a confident
-  final answer whose second fact cites no retrieved passage and cannot be reproduced for private entities.
-- A generic second-hop query because the bridge entity was not extracted; the symptom is the same
+- **Answering hop two from parametric memory.** The symptom is a confident final answer whose second fact
+  cites no retrieved passage and cannot be reproduced for private entities.
+- **A generic second-hop query** because the bridge entity was not extracted. The symptom is the same
   passages retrieved twice and a chain that stalls at hop two.
-- Evidence overflowing the context across hops; the symptom is hop-one evidence truncated away by the time
-  the answer is generated.
-- Scoring only the final answer; the symptom is a dashboard that cannot show that most failures die at the
-  second hop.
-- Running comparison questions as sequential chains; the symptom is latency double what a parallel fan-out
-  would cost.
+- **Evidence overflowing the context across hops.** The symptom is hop-one evidence truncated away by the
+  time the answer is generated.
+- **Scoring only the final answer.** The symptom is a dashboard that cannot show that most failures die at
+  the second hop.
+- **Running comparison questions as sequential chains.** The symptom is latency double what a parallel
+  fan-out would cost.
 
 ## When to use
-Use multi-hop when questions chain through entities the question itself does not name: org charts and
-ownership (incident → service → owner), dependency graphs, legal cross-references ("as defined in section
-3"), and "the author of X's other work". If the corpus already has a maintained knowledge graph, traverse
-it instead. If questions are overwhelmingly single-hop, the loop should be gated so it only engages when
-hop one leaves the question unanswered. Measure hop-level recall, hop-count distribution, final accuracy
-on a multi-hop golden slice, and cost per question. In interviews, "what if the answer needs information
-from two documents that share no terms" is the multi-hop question; the strong answer names the bridge
-entity, the loop, its termination rules and compounding error.
+- **Use when** questions chain through entities the question does not name: org charts and ownership
+  (incident → service → owner), dependency graphs, legal cross-references ("as defined in section 3"), and
+  "the author of X's other work".
+- **Avoid when** the corpus already has a maintained knowledge graph: traverse it instead.
+- **Gate it** when questions are overwhelmingly single-hop, so the loop only engages when hop one leaves the
+  question unanswered.
+- **Measure:** hop-level recall, hop-count distribution, final accuracy on a multi-hop golden slice, and
+  cost per question.
+- **Interviews:** "what if the answer needs information from two documents that share no terms" is the
+  multi-hop question; the strong answer names the bridge entity, the loop, its termination rules and
+  compounding error.
 
 ## Role lens
 - **Engineer:** Implements the planner prompt, the bounded loop with deduplication and progress checks, and
@@ -220,6 +290,42 @@ a stale duplicate report names a different service, so rerank for precision. Hop
 query ("service owner") retrieves the wrong service, or the model fills in a name from memory, so require
 that the final answer cite a retrieved passage for the owner and evaluate per-hop recall on a golden
 slice.
+
+## Interview questions
+### What makes a question multi-hop, and why can a better single-shot retriever not solve it?
+- **Definition:** the answer needs a second fact that is only findable once a first fact (the bridge
+  entity) has been read, as in HotpotQA's "bridge" questions.
+- **Why ranking fails:** the second passage shares no distinctive terms or topic with the question, so it
+  is never in the candidate list; raising k, reranking or rewriting cannot surface it.
+- **The fix is sequential:** retrieve, extract the bridge, form the next query from the evidence, repeat.
+
+### Your multi-hop agent's costs spiked and many requests time out. How do you debug it?
+- **Read the logged traces** for the expensive requests: repeated queries point to a missing no-progress
+  check or a planner that cannot see the queries already tried.
+- **Check the ceilings:** a hop cap, a per-question cost budget and a wall-clock timeout should each fire
+  and fall back to a partial, "insufficient evidence" answer.
+- **Look for unanswerable questions:** if the corpus lacks the second document, the loop can only waste
+  hops, so alert on rising no-progress stops.
+
+### When would you build a knowledge graph instead of running multi-hop retrieval?
+- **When the same relations are queried constantly** (owner of service, manager of person): one traversal
+  replaces several sequential LLM and retrieval calls per question.
+- **The cost moves offline:** someone must extract entities and relations and keep them fresh, whereas the
+  loop works on fresh data immediately.
+- **For small corpora,** long-context stuffing with caching can be simpler than either.
+
+### Per-hop success is 0.9. What is a three-hop chain's success rate, and how would you raise it?
+- **The probabilities multiply:** 0.9 × 0.9 × 0.9 ≈ 0.73, because a wrong bridge entity is almost never
+  recovered.
+- **Raise per-hop precision** with a reranker on every hop: illustratively 0.95 per hop gives about 0.86.
+- **Keep hops minimal** and, when hop one is ambiguous, keep a small beam of bridge candidates, accepting
+  about b times the later retrievals (3 retrievals become 7 at beam 3).
+
+### How do you stop the final answer from inventing the second fact?
+- **Require a citation per bridging fact** and reject answers whose second fact cites no retrieved passage.
+- **Let the answer prompt say "insufficient"** when the chain did not complete, so an empty hop is not
+  filled from parametric memory.
+- **Monitor the uncited-fact rate,** which shows parametric shortcuts, especially for private entities.
 
 ## Quiz
 ### Q: Why does increasing top-k not help a bridge-type multi-hop question?

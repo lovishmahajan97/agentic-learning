@@ -5,7 +5,7 @@ name: Race conditions & synchronization primitives (asyncio.Lock, Semaphore)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -20,36 +20,36 @@ sources:
 ---
 
 ## TL;DR
-asyncio runs on one thread, yet it still has race conditions: any `await` between reading shared state
-and writing it lets another coroutine change that state in between. `asyncio.Lock` makes such a
-check-then-act sequence exclusive, and `asyncio.Semaphore` caps how many coroutines may be inside a
-section at once, which is how you bound concurrent calls to an LLM provider. Neither is thread-safe,
-and a semaphore limits concurrency, not requests per second.
+Single-threaded asyncio still races whenever an `await` separates reading shared state from writing it.
+`asyncio.Lock` makes check-then-act exclusive; `asyncio.Semaphore` caps concurrent calls to a provider.
+Neither is thread-safe, and a semaphore limits concurrency, not requests per second.
 
 ## Why it exists
-A common belief is that single-threaded async code cannot race. It is half true: between two awaits a
-coroutine runs uninterrupted, so `self.count += 1` on its own is safe in asyncio, unlike in threaded
-code. But real logic spans awaits. "If the auth token is expired, fetch a new one and store it" reads
-state, awaits a network call, then writes. While it waits, a hundred other requests run the same check,
-see the same expired token, and each starts its own refresh. That is a thundering herd against the
-auth server, and if refreshes invalidate earlier tokens, some requests end up holding revoked ones.
-
-The second forcing problem is resource limits. `gather` over 5,000 prompts starts 5,000 HTTP requests
-immediately. The provider answers most with 429s, the client's connection pool queues the rest, memory
-fills with pending responses, and timeouts fire on requests that never left the process. You need a
-gate that lets N coroutines through and makes the rest wait.
-
-Naive fixes fail. A boolean `refreshing` flag is itself check-then-act and needs a way to wait for
-the refresh to finish, which is a lock with extra steps. A `threading.Lock` blocks the whole event loop
-when contended, stalling every coroutine instead of just the waiter. asyncio's primitives exist because
-waiting must itself be an `await` that yields to the loop.
+- **"Async cannot race" is half true.** Between two awaits a coroutine runs uninterrupted, so
+  `self.count += 1` on its own is safe in asyncio, unlike in threaded code. But real logic spans awaits.
+- **Check-then-act across an await races.** "If the auth token is expired, fetch a new one and store it"
+  reads, awaits a network call, then writes. Meanwhile a hundred other requests see the same expired
+  token and each starts a refresh: a thundering herd on the auth server, and if refreshes invalidate
+  earlier tokens, some requests hold revoked ones.
+- **Unbounded fan-out exhausts resources.** `gather` over 5,000 prompts starts 5,000 HTTP requests at
+  once. The provider answers most with 429s, the connection pool queues the rest, memory fills with
+  pending responses, and timeouts fire on requests that never left the process. You need a gate that
+  lets N through.
+- **A boolean `refreshing` flag fails**, because it is itself check-then-act and needs a way to wait for
+  the refresh to finish, which is a lock with extra steps.
+- **A `threading.Lock` fails**, because when contended it blocks the whole event loop, stalling every
+  coroutine instead of just the waiter. Waiting must itself be an `await` that yields to the loop.
 
 ## How it works
 ### Where races come from
-In asyncio a race needs three things: shared mutable state, a read and a dependent write, and an
-`await` between them. Every `await` is a point where the loop may run any other ready coroutine. So
-the audit question for a coroutine is: "what shared state did I read before this await, and do I still
-rely on it after?"
+An asyncio race needs all three:
+1. **Shared mutable state.**
+2. **A read and a dependent write.**
+3. **An `await` between them**, because every `await` is a point where the loop may run any other ready
+   coroutine.
+
+**Audit question per coroutine:** "what shared state did I read before this await, and do I still rely
+on it after?"
 
 The interleaving for the token refresh, with two requests A and B:
 
@@ -62,54 +62,83 @@ A: store token_1
                                B: store token_2        (token_1 now revoked)
 ```
 
-Nothing here is a torn write or a corrupted object, which is what threads give you; it is a stale
-decision. That is why asyncio races are logic bugs that pass unit tests (which run one coroutine at a
-time) and appear only under concurrent load.
+- **Not a torn write but a stale decision.** Nothing is corrupted, which is what threads give you.
+- **So it hides from tests.** asyncio races are logic bugs that pass unit tests (which run one coroutine at
+  a time) and appear only under concurrent load.
 
 ### asyncio.Lock
-A lock is owned by at most one coroutine. `async with lock:` awaits `acquire()`; if the lock is held,
-the coroutine is parked in a FIFO queue of waiters and the loop runs other work. On release the next
-waiter is woken. Waiting costs nothing but a queued future, *because* no thread is blocked. The
-standard pattern for a shared cache is **double-checked locking**: check without the lock on the fast
-path, take the lock on a miss, then check again inside, *because* another coroutine may have refreshed
-the value while you waited for the lock. The lock is not reentrant: acquiring it again from the
-coroutine that holds it deadlocks. An uncontended `acquire()` returns without suspending, so a lock
-costs almost nothing until there is contention. Because `async with` releases in its exit, a
-coroutine cancelled while holding the lock still releases it, and one cancelled while *waiting* is
-removed from the queue.
+- **Ownership.** At most one coroutine owns it. `async with lock:` awaits `acquire()`; if held, the
+  coroutine parks in a FIFO queue of waiters and the loop runs other work. Release wakes the next waiter.
+- **Waiting is nearly free**, *because* no thread is blocked; it costs a queued future.
+- **Uncontended is nearly free:** `acquire()` returns without suspending.
+- **Double-checked locking** for shared caches: check without the lock on the fast path, take the lock on a
+  miss, then check again inside, *because* another coroutine may have refreshed the value while you waited.
+- **Not reentrant.** Acquiring it again from the coroutine that holds it deadlocks.
+- **Cancellation-safe with `async with`.** A coroutine cancelled while holding the lock still releases it
+  in the exit; one cancelled while *waiting* is removed from the queue.
 
 ### Single-flight: share the in-flight work instead of locking around it
-An alternative to the lock for "compute once, many waiters" is to store the in-flight task itself:
-the first caller on a miss creates `self._refresh = asyncio.create_task(fetch())`, and every caller,
-first or later, does `await self._refresh`. All waiters get the same result, or the same exception, from
-one network call. It needs care with failure (clear the stored task when it raises, or every later
-caller re-reads the cached error) and with cancellation (one caller being cancelled should not cancel
-the shared task, which is what `asyncio.shield` around the await is for).
+For "compute once, many waiters", store the in-flight task itself:
+1. The first caller on a miss creates `self._refresh = asyncio.create_task(fetch())`.
+2. Every caller, first or later, does `await self._refresh`.
+3. All waiters get the same result, or the same exception, from one network call.
+
+Two cares:
+- **Failure:** clear the stored task when it raises, or every later caller re-reads the cached error.
+- **Cancellation:** one caller being cancelled should not cancel the shared task; that is what
+  `asyncio.shield` around the await is for.
 
 ### asyncio.Semaphore
-A semaphore holds a counter initialised to N. `acquire()` decrements it, or waits if it is zero;
-`release()` increments it and wakes a waiter. `async with sem:` around an LLM call therefore keeps at
-most N calls in flight no matter how many tasks exist. `BoundedSemaphore` additionally raises if you
-release more times than you acquired, which catches bookkeeping bugs. A semaphore caps *concurrency*.
-Throughput is concurrency divided by latency (Little's law), so if latency rises, the same semaphore
-yields fewer requests per second. The same law sizes it: to sustain λ requests per second against
-latency W seconds you need N ≈ λ × W slots, so 20 requests/s at 1.5 s latency needs about 30. Fewer and
-you cannot reach the target; many more and you only queue inside the provider instead of inside your
-process. A provider limit expressed in requests or tokens per minute needs a rate limiter, such as a
-token bucket, often combined with a semaphore.
+- **Mechanism.** A counter initialised to N. `acquire()` decrements it, or waits if it is zero;
+  `release()` increments it and wakes a waiter.
+- **Effect.** `async with sem:` around an LLM call keeps at most N calls in flight, however many tasks exist.
+- **`BoundedSemaphore`** also raises if you release more times than you acquired, catching bookkeeping bugs.
+- **It caps *concurrency*, not rate.** Throughput is concurrency divided by latency (Little's law), so if
+  latency rises, the same semaphore yields fewer requests per second.
+- **Sizing:** to sustain λ requests per second at latency W seconds, you need N ≈ λ × W slots.
+
+```
+N ≈ λ × W        e.g. 20 requests/s × 1.5 s latency ≈ 30 slots
+```
+
+- **Too few slots** and you cannot reach the target; **many more** and you only queue inside the provider
+  instead of inside your process.
+- **Per-minute quotas need a rate limiter.** A limit in requests or tokens per minute needs something like a
+  token bucket, often combined with a semaphore.
 
 ### The other primitives
-`asyncio.Event` lets many coroutines wait until one sets a flag, useful for "model warmed up" or
-"shutdown started". `asyncio.Condition` combines a lock with wait/notify for more complex predicates.
-`asyncio.Queue(maxsize=N)` is often the best primitive of all: a bounded producer/consumer queue
-gives you concurrency limits and backpressure without explicit locking.
+| Primitive | What it does | Typical use |
+|---|---|---|
+| `asyncio.Event` | Many coroutines wait until one sets a flag | "model warmed up", "shutdown started" |
+| `asyncio.Condition` | A lock plus wait/notify | More complex predicates |
+| `asyncio.Queue(maxsize=N)` | Bounded producer/consumer queue | Often the best primitive: concurrency limits and backpressure without explicit locking |
 
 ### What they do not cover
-These primitives coordinate coroutines on one event loop. They are not thread-safe and do nothing
-across processes or replicas. Two Uvicorn workers each holding their own `Semaphore(8)` allow 16
-concurrent calls; a cross-replica limit needs a shared store such as Redis or a gateway.
+- **One event loop only.** They coordinate coroutines on one loop; they are not thread-safe and do nothing
+  across processes or replicas.
+- **Limits multiply per process.** Two Uvicorn workers each holding their own `Semaphore(8)` allow 16
+  concurrent calls.
+- **Cross-replica limits** need a shared store such as Redis or a gateway.
 
-## Example
+## Diagram
+The token-cache request path: the semaphore caps calls in flight, and the lock plus a second validity
+check makes sure only the first waiter refreshes while the rest reuse its token.
+
+```mermaid
+flowchart TD
+    R["Request coroutine"] --> S["async with Semaphore(N): wait for a free slot"]
+    S --> V{"Token valid? (fast path, no lock)"}
+    V -->|"yes"| C["Call the LLM"]
+    V -->|"no"| L["async with Lock: park in FIFO queue until owner releases"]
+    L --> V2{"Still invalid? (re-check inside lock)"}
+    V2 -->|"no, another waiter refreshed"| C
+    V2 -->|"yes"| F["await refresh() then store token"]
+    F --> C
+    C --> X["Release slot, wake next waiter"]
+```
+
+## Examples
+### Token cache plus concurrency cap
 ```python
 import asyncio, time
 
@@ -146,43 +175,108 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
-This prints `100 calls, 1 token refresh`. Remove the lock and the first eight coroutines through the
-semaphore all see no token, all await the auth call, and you get eight refreshes. Raise the semaphore
-to 100 and you get 100. The bug scales with your concurrency setting, which is why it often appears
-only under load.
+
+| Variant | Refreshes |
+|---|---|
+| As written | 1 (prints `100 calls, 1 token refresh`) |
+| Lock removed, `Semaphore(8)` | 8: the first eight through the semaphore all see no token and all await the auth call |
+| Lock removed, semaphore raised to 100 | 100 |
+
+The bug scales with your concurrency setting, which is why it often appears only under load.
+
+### Single-flight loader
+Fifty callers, one load. The shield keeps one caller's cancellation from killing the shared work, and the
+callback clears a failed task so the next caller retries.
+
+```python
+import asyncio
+
+class SingleFlight:
+    def __init__(self, fetch):
+        self._fetch = fetch
+        self._task: asyncio.Task | None = None
+
+    async def get(self):
+        if self._task is None:                        # first caller on a miss starts the work
+            self._task = asyncio.create_task(self._fetch())
+            self._task.add_done_callback(self._clear_on_error)
+        return await asyncio.shield(self._task)       # a cancelled caller must not cancel the shared fetch
+
+    def _clear_on_error(self, t: asyncio.Task) -> None:
+        if t.cancelled() or t.exception() is not None:
+            self._task = None                         # next caller retries instead of re-reading the error
+
+calls = 0
+async def load_index():
+    global calls
+    calls += 1
+    await asyncio.sleep(0.2)                          # stands in for loading a model or index
+    return "index"
+
+async def main():
+    sf = SingleFlight(load_index)
+    results = await asyncio.gather(*(sf.get() for _ in range(50)))
+    print(len(results), "callers,", calls, "load")    # 50 callers, 1 load
+
+asyncio.run(main())
+```
+
+### Worked numbers: sizing with Little's law
+| Setting | Latency | Result |
+|---|---|---|
+| Target 20 requests/s | 1.5 s | Needs about 30 slots |
+| `Semaphore(10)` | 1 s | About 10 requests/s |
+| Same `Semaphore(10)` | latency improves to 0.25 s | About 40 requests/s: the rate quadruples with no config change |
+| `Semaphore(8)` × 2 Uvicorn workers | any | 16 concurrent calls, not 8 |
+
+## Production patterns
+- **Size per-worker slots from the fleet target.** Compute N ≈ λ × W for the whole fleet, then divide by
+  worker count × replicas. Monitor in-flight requests and the time spent waiting to acquire the semaphore.
+- **Shared rate limiter for quotas.** Enforce requests- and tokens-per-minute with a token bucket in a shared
+  store such as Redis or at a gateway, and keep the local semaphore only to bound memory and connections.
+  Monitor 429 rate; honour `Retry-After` with jittered backoff.
+- **Timeout inside the gate.** Write `async with sem:` then `async with asyncio.timeout(...)`, so one hung
+  upstream call cannot hold a slot forever. Monitor timeouts per dependency and slot wait time.
+- **Single-flight for expensive shared loads.** Use the pattern above for tokens, clients, and lazy model or
+  index loading. Monitor load counts; more than one per expiry window means the guard is missing.
+- **Create primitives inside the running loop.** Build locks and semaphores in app startup (FastAPI
+  lifespan) or per test, not at import time, so each belongs to the loop that uses it. Watch for
+  "bound to a different event loop" errors in CI.
 
 ## Trade-offs
-- A lock makes a critical section correct, but serialises it; if the section contains a slow await,
-  throughput collapses to one call at a time, so keep only the minimum inside the lock.
-- A tight semaphore protects the provider and your memory, but leaves capacity unused; when the provider
-  quota is generous and latency is high, a larger limit gives more throughput.
-- In-process primitives are fast and simple, but are invisible to other workers and replicas; once
-  you scale horizontally, limits must move to a shared store or an API gateway.
-- A bounded `asyncio.Queue` with fixed workers is easier to reason about than many tasks behind a
-  semaphore, at the cost of more structure; it wins when work arrives continuously rather than in batches.
+- **Correctness vs serialisation.** A lock makes a critical section correct but serialises it; with a slow
+  await inside, throughput collapses to one call at a time. Keep only the minimum inside the lock.
+- **Protection vs unused capacity.** A tight semaphore protects the provider and your memory but leaves
+  capacity unused; when quota is generous and latency high, a larger limit gives more throughput.
+- **Simple vs fleet-wide.** In-process primitives are fast and simple but invisible to other workers and
+  replicas; once you scale horizontally, limits move to a shared store or an API gateway.
+- **Queue vs semaphore.** A bounded `asyncio.Queue` with fixed workers is easier to reason about than many
+  tasks behind a semaphore, at the cost of more structure. It wins when work arrives continuously rather
+  than in batches.
 
 ## Pitfalls
-- Assuming single-threaded means race-free; the symptom is duplicate refreshes, duplicate writes or
+- **Assuming single-threaded means race-free.** Symptom: duplicate refreshes, duplicate writes or
   double-spent budgets that only show up under concurrent load.
-- Creating a primitive at module import time and using it from different event loops, as tests often
-  do; since 3.10 a primitive binds to the loop on which it first has to wait and raises `RuntimeError`
-  ("bound to a different event loop") when it must wait on another loop, so the failure appears only
-  under contention and looks flaky.
-- Using a semaphore to enforce a requests-per-minute quota; the symptom is 429s returning when
-  provider latency drops, because the same concurrency then produces more requests per minute.
-- Re-acquiring the same `asyncio.Lock` in a nested call; the coroutine waits on itself forever and the
+- **Creating a primitive at import time and using it from different loops**, as tests often do. Since 3.10
+  a primitive binds to the loop on which it first has to wait and raises `RuntimeError` ("bound to a
+  different event loop") when it must wait on another. The failure appears only under contention and
+  looks flaky.
+- **Using a semaphore to enforce a requests-per-minute quota.** Symptom: 429s return when provider latency
+  drops, because the same concurrency then produces more requests per minute.
+- **Re-acquiring the same `asyncio.Lock` in a nested call.** The coroutine waits on itself forever and the
   request hangs with no error.
-- Holding a lock or semaphore across a call with no timeout; one hung upstream request starves
-  every waiter behind it.
+- **Holding a lock or semaphore across a call with no timeout.** One hung upstream request starves every
+  waiter behind it.
 
 ## When to use
-Reach for a lock when a coroutine reads shared state, awaits, then writes based on what it read:
-token and client caches, lazy model or index loading, per-conversation state in an agent, budget
-counters. Reach for a semaphore (or a bounded queue) whenever you fan out to an external dependency
-with finite capacity: LLM providers, embedding APIs, vector stores, scrapers. Do not add locks around
-code with no await inside; it is already atomic with respect to other coroutines. Measure in-flight
-requests, 429 rate and queue wait time; if wait time dominates latency, the limit is too tight or the
-dependency is saturated. In interviews, be ready to explain why asyncio can race at all.
+- **Lock when** a coroutine reads shared state, awaits, then writes based on what it read: token and
+  client caches, lazy model or index loading, per-conversation agent state, budget counters.
+- **Semaphore (or bounded queue) when** you fan out to a dependency with finite capacity: LLM providers,
+  embedding APIs, vector stores, scrapers.
+- **Avoid** locks around code with no await inside; it is already atomic with respect to other coroutines.
+- **Measure:** in-flight requests, 429 rate and queue wait time. If wait time dominates latency, the limit
+  is too tight or the dependency is saturated.
+- **Interviews:** be ready to explain why asyncio can race at all.
 
 ## Role lens
 - **Engineer:** Wraps provider calls in a semaphore sized from the quota, and uses double-checked
@@ -201,6 +295,43 @@ minute (illustrative numbers), double the quota, and if latency drops the rate r
 a rate limiter based on requests and tokens per minute, shared across workers through Redis or enforced
 by a gateway, with the semaphore kept only to bound memory and connections. Retries on 429 should honour
 `Retry-After` with jittered backoff so they do not amplify the burst.
+
+## Interview questions
+### How can single-threaded asyncio code have a race condition at all?
+- **Interleaving happens at every await.** The loop can run any ready coroutine there, so shared state
+  read before an `await` may be stale after it.
+- **The race needs three things:** shared mutable state, a read and a dependent write, and an `await`
+  between them. Code with no await in between is atomic with respect to other coroutines.
+- **It is a stale decision, not a torn write**, which is why it passes unit tests and appears only
+  under concurrent load.
+
+### Fifty concurrent requests all trigger a reload of the same vector index. How would you fix it?
+- **Single-flight the load.** The first caller on a miss stores `asyncio.create_task(load())`, and
+  every caller awaits that same task, so one load serves all fifty.
+- **Shield the shared await** so one caller's cancellation does not cancel the load for the others.
+- **Clear the stored task on failure**, or every later caller re-reads the cached exception; monitor load
+  counts per expiry window.
+
+### Why not just use threading.Lock in async code?
+- **A contended `threading.Lock` blocks the thread**, and in asyncio that thread is the event loop, so
+  every coroutine stalls instead of just the waiter.
+- **`asyncio.Lock` waits with an await**, parking the coroutine in a FIFO queue of futures while the loop
+  keeps running other work.
+- **The reverse also holds:** asyncio primitives are not thread-safe, so code shared with real threads
+  needs thread-safe hand-off such as `loop.call_soon_threadsafe`.
+
+### When is a semaphore the wrong tool for protecting a provider?
+- **When the limit is a rate, not concurrency.** A requests- or tokens-per-minute quota needs a token
+  bucket, because throughput is concurrency divided by latency and rises when latency falls.
+- **When you scale out**, because each process has its own semaphore: `Semaphore(8)` on 2 workers allows
+  16 calls. Fleet-wide limits belong in a shared store such as Redis or a gateway.
+- **When work arrives continuously**, a bounded `asyncio.Queue` with fixed workers is often clearer.
+
+### How many semaphore slots do you need to sustain 20 requests per second at 1.5 seconds latency?
+- **Little's law:** N ≈ λ × W, so 20 × 1.5 ≈ 30 slots.
+- **Fewer slots** cannot reach the target; **many more** only move the queue into the provider.
+- **Divide across the fleet:** with several workers and replicas, each process gets its share, and you
+  monitor in-flight count and slot wait time to validate the sizing.
 
 ## Quiz
 ### Q: In single-threaded asyncio code, when can two coroutines interfere with each other's view of shared state?

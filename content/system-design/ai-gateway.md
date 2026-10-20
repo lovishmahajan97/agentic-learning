@@ -5,7 +5,7 @@ name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - python-for-ai/litellm
   - system-design/model-fallback-strategies
@@ -21,102 +21,139 @@ sources:
 ---
 
 ## TL;DR
-An AI gateway is a proxy that every model call passes through: one OpenAI-style API in front of many
-providers, with key custody, budgets, rate limits, routing, fallbacks, caching and logging handled once
-instead of re-implemented in every application. LiteLLM's proxy is the open-source, Python,
-config-file-driven option you run yourself; Portkey is a hosted gateway driven by declarative JSON
-configs, with an open-source core. Both buy control and visibility at the price of an extra hop and a
-new single point of failure.
+An AI gateway is a proxy every model call passes through: one OpenAI-style API over many providers,
+handling keys, budgets, limits, routing, fallbacks, caching and logging once. It buys control and
+visibility for an extra hop and a new single point of failure.
 
 ## Why it exists
-Without a gateway, the second team to ship an LLM feature copies the first team's retry loop, pastes
-the same provider key into its own secret store, and starts spending against the same organisation
-quota with no coordination. By the fifth team nobody can answer basic questions: how much does feature X
-cost per month, which models are in production, what data is sent to which vendor, and how do we switch
-everything off if a key leaks or a provider has an incident. Rate limits hit unpredictably because five
-services share one quota. A provider migration touches every codebase.
-
-The naive fix is a shared client library. It helps with code reuse but cannot *enforce* anything: teams
-pin old versions, polyglot stacks need one library per language, keys still live in every service, and
-org-wide rate-limit and budget coordination needs shared state a library does not have. The same
-problem in microservices produced the API gateway; the AI gateway is that idea with model-specific
-concerns added: token accounting, model aliasing, provider translation, streaming passthrough, prompt
-logging and guardrails. It moves cross-cutting policy to a network boundary where it applies to every
-caller whether or not they remembered to.
+- **Without one, every team re-implements the same plumbing.** The second team copies the first team's
+  retry loop, pastes the same provider key into its own secret store, and spends against the same
+  organisation quota with no coordination.
+- **By the fifth team nobody can answer basic questions:** what feature X costs per month, which models are
+  in production, what data goes to which vendor, how to switch everything off if a key leaks or a provider
+  has an incident. Rate limits hit unpredictably because five services share one quota, and a provider
+  migration touches every codebase.
+- **A shared client library cannot *enforce* anything.** Teams pin old versions, polyglot stacks need one
+  library per language, keys still live in every service, and org-wide rate-limit and budget coordination
+  needs shared state a library does not have.
+- **It is the API gateway idea with model concerns added:** token accounting, model aliasing, provider
+  translation, streaming passthrough, prompt logging and guardrails.
+- **Policy moves to a network boundary,** where it applies to every caller whether or not they remembered.
 
 ## How it works
 ### The request path
-A client sends an OpenAI-compatible request (`/v1/chat/completions`, embeddings and so on) to the gateway
-with a *virtual* key. The gateway authenticates the key, resolves the requested model alias to one or
-more deployments, applies policy (budget remaining, requests and tokens per minute, guardrails), picks a
-deployment by its routing strategy, translates to the provider's native API, streams the response back,
-and records usage (tokens, computed cost, latency, key, tags) for logging and export. The API is
-OpenAI-shaped *because* most SDKs already speak it, so adoption is changing a base URL and a key.
+1. A client sends an OpenAI-compatible request (`/v1/chat/completions`, embeddings and so on) with a
+   *virtual* key.
+2. The gateway authenticates the key.
+3. It resolves the requested model alias to one or more deployments.
+4. It applies policy: budget remaining, requests and tokens per minute, guardrails.
+5. It picks a deployment by its routing strategy.
+6. It translates to the provider's native API and streams the response back.
+7. It records usage (tokens, computed cost, latency, key, tags) for logging and export.
 
-### LiteLLM proxy
-An open-source Python server (`litellm --config config.yaml`) and a matching in-process `Router` class.
-The YAML config has a `model_list` of deployments (an alias name plus `litellm_params` with the provider
-and model, keys referenced as `os.environ/VAR`), `router_settings` (routing strategy, retries, fallbacks,
-cooldowns for failing deployments), `litellm_settings` (caching, logging callbacks to tracing backends)
-and `general_settings` (the master key, the database). Virtual keys with budgets and rate limits per key,
-team or user are stored in Postgres; Redis holds shared state such as rate-limit counters, cache entries
-and cooldowns across replicas. The same alias can point at several deployments, which is how
-load-balancing and same-model failover work.
+The API is OpenAI-shaped *because* most SDKs already speak it, so adoption is changing a base URL and a key.
 
-### Portkey
-A hosted gateway (the core gateway is also open source, written in TypeScript) where behaviour is
-declared in a config: a `strategy` (fallback or load-balance) over `targets`, each with its own virtual key
-and optional retry, cache (exact or semantic) and timeout settings. Clients pass a config id or inline
-config in request headers; provider credentials live in Portkey's vault and clients reference them by
-an id rather than holding them (virtual keys, in Portkey's terms); traces, cost and
-metadata tags appear in its dashboards; guardrails attach to configs. Hosted removes the operational
-burden but adds a third-party processor to your data path, which compliance must review, unless you
-deploy the gateway inside your own environment.
+### LiteLLM proxy vs Portkey
+| | LiteLLM proxy | Portkey |
+|---|---|---|
+| What | Open-source Python server (`litellm --config config.yaml`) plus a matching in-process `Router` class | Hosted gateway; the core gateway is also open source, written in TypeScript |
+| Behaviour defined in | YAML config file you run yourself | Declarative JSON configs: a `strategy` (fallback or load-balance) over `targets` |
+| Credentials | Keys referenced as `os.environ/VAR`; virtual keys per key, team or user | Provider credentials in Portkey's vault; clients reference them by an id (virtual keys, in Portkey's terms) |
+| State | Postgres for virtual keys, budgets and rate limits; Redis for rate-limit counters, cache entries and cooldowns across replicas | Managed by Portkey |
+| Per-target options | Retries, fallbacks, cooldowns in `router_settings` | Each target has its own virtual key and optional retry, cache (exact or semantic) and timeout settings |
+| Client side | OpenAI SDK pointed at the proxy | Config id or inline config in request headers |
+| Observability | Logging callbacks to tracing backends | Traces, cost and metadata tags in its dashboards; guardrails attach to configs |
+| Compliance | Prompts stay in your network | A third-party processor in your data path, unless you deploy the gateway in your own environment |
+
+**LiteLLM config sections:**
+- `model_list`: deployments, each an alias name plus `litellm_params` with provider and model.
+- `router_settings`: routing strategy, retries, fallbacks, cooldowns for failing deployments.
+- `litellm_settings`: caching, logging callbacks to tracing backends.
+- `general_settings`: the master key, the database.
+- **The same alias can point at several deployments,** which is how load-balancing and same-model failover
+  work.
 
 ### Enforcing budgets and rate limits
-Budgets and limits are counters in shared state, and LLM traffic makes them awkward in one specific way:
-a request's cost is not known until it finishes, because the model decides the output length. A gateway
-therefore checks *before* the call (requests per minute, and tokens per minute from the prompt's token
-count plus `max_tokens` or an estimate) and charges actual usage *after* the response completes. Two
-consequences follow. A budget can be overshot by whatever is in flight when it runs out, so a hard cap
-needs headroom or a per-request ceiling enforced through `max_tokens`. And with several replicas the
-counters must live in Redis or similar, not in each process, or every replica enforces the full limit
-on its own and the effective limit is multiplied by the replica count.
+Budgets and limits are counters in shared state. LLM traffic makes them awkward because a request's cost is
+not known until it finishes: the model decides the output length.
 
-Choosing among deployments of one alias is a routing strategy (LiteLLM offers simple shuffle,
-least-busy, latency-based and usage-based routing, among others), and a deployment that fails
-repeatedly is put into a cooldown and skipped for a period: a circuit breaker under another name. These
-strategies only see what the gateway sees, latency and errors, never answer quality.
+1. **Check *before* the call:** requests per minute, and tokens per minute from the prompt's token count
+   plus `max_tokens` or an estimate.
+2. **Charge actual usage *after*** the response completes.
+
+Two consequences:
+- **Budgets overshoot by whatever is in flight** when they run out, so a hard cap needs headroom or a
+  per-request ceiling enforced through `max_tokens`.
+- **Counters must live in Redis or similar** with several replicas, not in each process. Otherwise every
+  replica enforces the full limit on its own and the effective limit is multiplied by the replica count.
+
+### Routing among deployments
+- **Strategies:** LiteLLM offers simple shuffle, least-busy, latency-based and usage-based routing, among
+  others.
+- **Cooldowns:** a deployment that fails repeatedly is skipped for a period: a circuit breaker under another
+  name.
+- **Blind to quality:** these strategies only see what the gateway sees, latency and errors, never answer
+  quality.
 
 ### Alternatives
-Other products occupy the same slot. API-gateway vendors added AI plugins (Kong AI Gateway), CDNs offer
-hosted gateways (Cloudflare AI Gateway), and Envoy AI Gateway builds on Envoy for teams already running it
-on Kubernetes. The choice follows the same axes as LiteLLM versus Portkey: where prompts flow, who
-operates the component, which providers and provider-specific features pass through intact, and whether
-it fits the traffic infrastructure you already run. At the light end, an in-process library such as the
-LiteLLM SDK's `Router` gives the same routing and fallbacks with no extra hop, but no central
-enforcement: every service holds keys again and budgets are per process.
+- **API-gateway vendors with AI plugins** (Kong AI Gateway).
+- **CDN-hosted gateways** (Cloudflare AI Gateway).
+- **Envoy AI Gateway,** built on Envoy, for teams already running it on Kubernetes.
+- **The choice axes** are the same as LiteLLM versus Portkey: where prompts flow, who operates it, which
+  providers and provider-specific features pass through intact, and fit with traffic infrastructure you
+  already run.
+- **The light end:** an in-process library such as the LiteLLM SDK's `Router` gives the same routing and
+  fallbacks with no extra hop, but no central enforcement: every service holds keys again and budgets are
+  per process.
 
 ### What it centralises
-Key custody; budgets and quotas per team or customer; rate-limit coordination; retries and fallbacks;
-caching; PII redaction and guardrails; logging and cost attribution via tags; and model aliases, so
-applications call `fast` or `strong` while the platform team decides what those resolve to, which makes
-migrations and deprecations configuration changes rather than code changes.
+- Key custody.
+- Budgets and quotas per team or customer.
+- Rate-limit coordination.
+- Retries and fallbacks.
+- Caching.
+- PII redaction and guardrails.
+- Logging and cost attribution via tags.
+- **Model aliases:** applications call `fast` or `strong` while the platform team decides what those
+  resolve to, so migrations and deprecations become configuration changes rather than code changes.
 
 ### Sharp edges
-It is a lowest-common-denominator API: provider-specific features (prompt-cache controls, extended
-reasoning parameters, tool-call nuances, vision input formats) lag or are dropped unless passthrough is
-verified. It is a new single point of failure and a new hop: run several replicas per region, keep it
-close to callers, and decide what happens when its Postgres or Redis is unavailable (fail open on budget
-checks, or fail closed and take every AI feature down with the database). Streaming must be forwarded
-without buffering or time-to-first-token suffers. Token counts across tokenisers are approximations.
-Gateway logs contain prompts, so they need a retention policy. And someone must own the config, or
-aliases rot and fallbacks go untested.
+- **Lowest-common-denominator API.** Provider-specific features (prompt-cache controls, extended reasoning
+  parameters, tool-call nuances, vision input formats) lag or are dropped unless passthrough is verified.
+- **A new single point of failure and a new hop.** Run several replicas per region and keep it close to
+  callers.
+- **Decide the database failure mode.** When its Postgres or Redis is unavailable: fail open on budget
+  checks, or fail closed and take every AI feature down with the database.
+- **Streaming must be forwarded without buffering,** or time-to-first-token suffers.
+- **Token counts across tokenisers are approximations.**
+- **Gateway logs contain prompts,** so they need a retention policy.
+- **Someone must own the config,** or aliases rot and fallbacks go untested.
 
-## Example
-A LiteLLM configuration with two deployments behind one alias, a stronger fallback, caching and logging,
-followed by the application code, which only needs the OpenAI SDK pointed at the proxy. Replace the
-model ids with current ones for your providers.
+## Diagram
+Follow one request: policy checks happen before the provider call using an estimate, and actual usage is
+charged only after the response completes, which is why budgets can overshoot by what is in flight.
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant GW as AI gateway
+    participant ST as Postgres and Redis
+    participant P as Provider deployment
+    App->>GW: POST /v1/chat/completions, model fast, virtual key
+    GW->>ST: authenticate key, check budget, RPM and TPM estimate
+    ST-->>GW: allowed
+    Note over GW: resolve alias fast to deployments, pick one by routing strategy
+    GW->>P: translated native request
+    P-->>GW: streamed tokens
+    GW-->>App: stream forwarded without buffering
+    GW->>ST: charge actual tokens and cost, with tags
+    Note over GW,P: on errors, retry, cool down the deployment, then fall back to strong
+```
+
+## Examples
+### LiteLLM config and the application call
+Two deployments behind one alias, a stronger fallback, caching and logging. The application only needs the
+OpenAI SDK pointed at the proxy. Replace the model ids with current ones for your providers.
 
 ```yaml
 # config.yaml: applications call "fast" or "strong"; the platform team decides what those mean
@@ -155,47 +192,101 @@ r = client.chat.completions.create(
 print(r.choices[0].message.content)
 ```
 
-The application never sees a provider key, and moving `fast` to a different model is a config change
-and a canary, not a deploy of every service.
+- **The application never sees a provider key.**
+- **Moving `fast` to a different model** is a config change and a canary, not a deploy of every service.
+
+### Portkey config: fallback with retries
+The same idea declared as a Portkey config. Check field names against the current Portkey docs; the shape
+is a `strategy` over `targets`.
+
+```json
+{
+  "strategy": { "mode": "fallback" },
+  "retry": { "attempts": 2 },
+  "targets": [
+    { "virtual_key": "openai-prod", "override_params": { "model": "gpt-4o-mini" } },
+    { "virtual_key": "anthropic-prod", "override_params": { "model": "claude-sonnet-4-20250514" } }
+  ]
+}
+```
+
+- **Fallback mode** tries targets in order; a load-balance strategy spreads traffic across targets instead.
+- **The client** sends this config (or its saved id) in a request header; provider keys stay in the vault.
+
+### Worked scenario: why counters overshoot
+Illustrative numbers for one team key.
+
+| Situation | Arithmetic | Effect |
+|---|---|---|
+| Daily budget $100, 40 requests in flight when it runs out, `max_tokens` 4,000 at $15 per 1M output tokens | 40 × 4,000 × $15 / 1M = $2.40 | Overshoot of up to $2.40, bounded only because `max_tokens` caps each request |
+| Same, but no `max_tokens` ceiling | Unbounded per request | The "hard" cap is not hard |
+| 600 requests/min limit, 3 replicas with in-process counters | 3 × 600 | Effective limit 1,800 per minute; provider 429s while the gateway never trips |
+| Same, counters in Redis | One shared counter | Effective limit 600, as configured |
+
+## Production patterns
+- **A virtual key per team or feature.** When more than one team calls models, issue each its own key
+  through the gateway's key API with a budget, a budget period and RPM/TPM limits (LiteLLM's key
+  generation accepts `max_budget`, `budget_duration`, `rpm_limit` and `tpm_limit`). Monitor spend and
+  429s per key; a leaked key is revoked alone.
+- **Shared state for every replica.** Before running more than one LiteLLM replica, point the router at
+  Redis (`redis_host`, `redis_port`, `redis_password` in `router_settings`) so limits, cooldowns and
+  cache are shared. Monitor gateway-side limit hits against provider 429s; a gap means counters are not
+  shared.
+- **Cooldowns tuned to the provider.** Set how many failures put a deployment into cooldown and for how
+  long (`allowed_fails` and `cooldown_time` in LiteLLM's `router_settings`). Monitor deployments in
+  cooldown and the share of traffic each alias actually sends to each deployment.
+- **Fail open on soft budgets.** Decide explicitly what happens when Postgres is down; for internal
+  traffic, let requests through and reconcile spend later (LiteLLM documents a general setting for
+  allowing requests when the database is unavailable). Monitor database health and unreconciled spend.
+- **Streaming and health in CI.** After every gateway upgrade, compare time-to-first-token through the
+  gateway with a direct call, and wire the proxy's liveness and readiness endpoints into the load
+  balancer. Monitor added latency at p50 and p99 and gateway availability.
+- **Prompt-log retention.** Treat gateway logs as sensitive data: set a retention period, redact or omit
+  message content where policy requires, and scope cache keys per tenant. Monitor log volume, retention
+  jobs and cache hit rate per tenant.
 
 ## Trade-offs
-- One place for keys, budgets and logs, against one more network hop and a shared failure point; the
-  balance tips badly if you run a single replica or place it in a different region from callers.
-- Aliases make provider migrations cheap, but the unified API lags provider features; it flips when a
-  provider-specific capability such as cache controls is core to your product and is not passed through.
-- A hosted gateway removes operations and gives dashboards on day one, while a self-hosted LiteLLM keeps
-  prompts in your VPC but makes you run Postgres, Redis and upgrades; compliance usually decides.
-- Central routing policy lets a platform team move traffic without touching applications, at the cost
-  of application teams losing fine control; a single app with unusual needs may be better served
+- **Central control vs an extra hop.** One place for keys, budgets and logs, against one more network hop
+  and a shared failure point; the balance tips badly with a single replica or a different region from
+  callers.
+- **Cheap migrations vs lagging features.** Aliases make provider migrations cheap, but the unified API
+  lags provider features; it flips when a provider-specific capability such as cache controls is core to
+  your product and is not passed through.
+- **Hosted vs self-hosted.** A hosted gateway removes operations and gives dashboards on day one; a
+  self-hosted LiteLLM keeps prompts in your VPC but makes you run Postgres, Redis and upgrades. Compliance
+  usually decides.
+- **Central policy vs app control.** A platform team can move traffic without touching applications, at
+  the cost of application teams losing fine control; a single app with unusual needs may be better served
   in-process.
-- Gateway-level caching is a one-line win but is context-blind; its safety depends entirely on keys and
-  tags scoping entries per tenant.
+- **One-line caching vs context blindness.** Gateway-level caching is a one-line win but context-blind; its
+  safety depends entirely on keys and tags scoping entries per tenant.
 
 ## Pitfalls
-- A fail-closed dependency on the gateway's database; the symptom is every AI feature in the company
-  going down when Postgres restarts for maintenance.
-- Buffering streamed responses in the proxy; the symptom is time-to-first-token jumping from hundreds
-  of milliseconds to seconds right after adoption.
-- A shared cache without tenant scoping; the symptom is a cached answer containing one customer's data
-  served to another, which is an incident, not a bug.
-- Assuming feature parity across providers; the symptom is provider-specific parameters silently
-  dropped and cost or quality regressing after a migration that "worked".
-- One master key shared by all applications; the symptom is zero cost attribution and an unbounded blast
+- **A fail-closed dependency on the gateway's database.** Symptom: every AI feature in the company goes down
+  when Postgres restarts for maintenance.
+- **Buffering streamed responses in the proxy.** Symptom: time-to-first-token jumps from hundreds of
+  milliseconds to seconds right after adoption.
+- **A shared cache without tenant scoping.** Symptom: a cached answer containing one customer's data served
+  to another, which is an incident, not a bug.
+- **Assuming feature parity across providers.** Symptom: provider-specific parameters silently dropped and
+  cost or quality regressing after a migration that "worked".
+- **One master key shared by all applications.** Symptom: zero cost attribution and an unbounded blast
   radius when the key leaks.
-- Nobody owning the configuration; the symptom is dozens of aliases, half pointing at deprecated models,
-  with fallbacks that have never been exercised.
-- Rate-limit counters kept per replica instead of in shared state; the symptom is provider 429s and
-  budget overruns while the gateway's own limits never trip, worsening each time a replica is added.
+- **Nobody owning the configuration.** Symptom: dozens of aliases, half pointing at deprecated models, with
+  fallbacks that have never been exercised.
+- **Rate-limit counters per replica instead of in shared state.** Symptom: provider 429s and budget
+  overruns while the gateway's own limits never trip, worsening each time a replica is added.
 
 ## When to use
-Adopt a gateway once more than one team or more than one provider is involved, or as soon as finance or
-compliance asks for spend by team and a list of what is sent where; for a single application an
-in-process router (LiteLLM's SDK or a thin client) is lighter. Choose the LiteLLM proxy when you want an
-open-source component inside your own network and can operate a small Python service with Postgres and
-Redis; choose Portkey when hosted observability and declarative configs matter more and your data rules
-allow a processor. Measure added latency at p50 and p99, gateway availability, cache hit rate and spend
-per key. In interviews, be able to say what a gateway centralises and what it cannot do, which is make
-outputs correct.
+- **Adopt a gateway** once more than one team or more than one provider is involved, or as soon as finance
+  or compliance asks for spend by team and a list of what is sent where.
+- **Skip it for a single application:** an in-process router (LiteLLM's SDK or a thin client) is lighter.
+- **Choose the LiteLLM proxy** when you want an open-source component inside your own network and can
+  operate a small Python service with Postgres and Redis.
+- **Choose Portkey** when hosted observability and declarative configs matter more and your data rules
+  allow a processor.
+- **Measure:** added latency at p50 and p99, gateway availability, cache hit rate and spend per key.
+- **Interviews:** say what a gateway centralises and what it cannot do, which is make outputs correct.
 
 ## Role lens
 - **Engineer:** Points the SDK at the gateway, calls aliases rather than model ids, tags requests for
@@ -217,6 +308,46 @@ reconciliation and alerts, reserving fail-closed for hard compliance limits on u
 the proposal says nothing about operations: verify streaming passthrough, test the fallback chains, set a
 retention policy for logged prompts, assign an owner for aliases, and document an emergency bypass. The
 gateway is the right idea; the single-instance, fail-closed shape is what needs to change.
+
+## Interview questions
+### Why use an AI gateway instead of a shared client library?
+- **A library cannot enforce anything:** teams pin old versions, polyglot stacks need one library per
+  language, and keys still live in every service.
+- **Org-wide limits need shared state** that a library does not have, so five services sharing one quota
+  hit rate limits unpredictably.
+- **A network boundary applies policy to every caller,** whether or not they remembered: key custody,
+  budgets, logging and model aliases in one place.
+
+### Provider 429s keep appearing but the gateway's own rate limits never trip. What is wrong?
+- **Most likely per-replica counters:** with 3 replicas each enforcing 600 requests per minute in process,
+  the effective limit is 1,800.
+- **Fix:** move counters, cooldowns and cache to Redis so every replica shares one counter, and the
+  configured limit becomes the real one.
+- **Verify:** gateway-side limit hits should now rise as provider 429s fall; the gap between them is the
+  signal.
+
+### When would you not put a gateway in front of model calls?
+- **For a single application,** where an in-process router such as the LiteLLM SDK's `Router` gives routing
+  and fallbacks with no extra hop.
+- **When a provider-specific feature is core** (prompt-cache controls, extended reasoning parameters) and the
+  unified API does not pass it through intact.
+- **When you cannot operate it well:** a single replica in another region adds latency and a company-wide
+  single point of failure.
+
+### How do you make a budget cap actually hard when cost is unknown until the response ends?
+- **Check before, charge after:** pre-check using prompt tokens plus `max_tokens`, then charge actual usage
+  when the response completes.
+- **Bound the overshoot with `max_tokens`:** 40 in-flight requests at 4,000 tokens and $15 per 1M output
+  tokens can overshoot by at most $2.40; without a ceiling the cap is not hard.
+- **Leave headroom** below the true limit, and reserve fail-closed for hard compliance limits on untrusted
+  keys.
+
+### How would you choose between the LiteLLM proxy and Portkey for a regulated customer?
+- **Where prompts flow decides first:** a self-hosted LiteLLM proxy keeps prompts in your network, while hosted
+  Portkey is a third-party processor unless you deploy its gateway in your own environment.
+- **Who operates it:** LiteLLM means running Postgres, Redis and upgrades yourself; Portkey gives dashboards
+  and declarative configs on day one.
+- **Check passthrough** of the provider features the product depends on before committing to either.
 
 ## Quiz
 ### Q: Which concern is an AI gateway least able to solve?

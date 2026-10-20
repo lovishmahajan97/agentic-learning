@@ -5,7 +5,7 @@ name: Decorators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-await
@@ -22,29 +22,23 @@ sources:
 ---
 
 ## TL;DR
-A decorator is a callable that takes a function and returns a replacement, applied with `@name` above the
-definition. It exists so cross-cutting behaviour (retries, timing, tracing, caching, registering a function as
-an LLM tool or an HTTP route) is written once and attached declaratively instead of copied into every function.
-The sharp edges are metadata loss without `functools.wraps`, wrapping async functions with sync wrappers, and
-stacking order.
+A decorator takes a function and returns a replacement, applied with `@name`. Retries, tracing, caching
+and tool or route registration are written once and attached declaratively. Watch three edges: missing
+`functools.wraps`, sync wrappers on async functions, and stacking order.
 
 ## Why it exists
-An AI service has dozens of functions that call models, tools and stores, and almost all of them need the
-same surrounding behaviour: retry on 429 and timeouts with backoff, record latency and token counts,
-open a trace span, check permissions, cache identical calls. Written inline, every function starts with the
-same fifteen lines of try/except/sleep/log, the copies drift apart, and one forgotten retry is an outage.
-
-The naive alternatives are worse. Helper calls at the top and bottom of each function (`start = timer();
-...; log(start)`) still repeat in every function, and they miss early returns and exceptions unless each
-is wrapped in `try/finally`. Base-class inheritance forces unrelated functions into class hierarchies.
-Higher-order wrapping by hand, `fetch = with_retry(fetch)`, works, but it is separated from the definition,
-easy to forget and hard to see.
-
-Python functions are first-class objects, so a function can take another function and return a new one
-that adds behaviour around the call. The `@` syntax (PEP 318) puts that wrapping on the definition
-itself, where readers see it. Frameworks lean on the same mechanism for registration: `@app.get("/chat")`
-in FastAPI, `@mcp.tool()` in the MCP SDK and the tool decorators in agent frameworks record your function
-and read its signature and docstring to build a schema.
+- **Every model and tool call needs the same wrapping:** retry on 429 and timeouts with backoff, record
+  latency and token counts, open a trace span, check permissions, cache identical calls.
+- **Inline copies drift.** Every function starts with the same fifteen lines of try/except/sleep/log, the
+  copies diverge, and one forgotten retry is an outage.
+- **Helper calls at top and bottom still repeat** (`start = timer(); ...; log(start)`), and miss early
+  returns and exceptions unless each is wrapped in `try/finally`.
+- **Base classes and manual wrapping are worse.** Inheritance forces unrelated functions into class
+  hierarchies; `fetch = with_retry(fetch)` works but sits apart from the definition, easy to forget.
+- **Functions are first-class objects**, so a function can take another and return a new one that adds
+  behaviour. `@` (PEP 318) puts that on the definition, where readers see it. Frameworks use it for
+  registration: `@app.get("/chat")` in FastAPI, `@mcp.tool()` in the MCP SDK and agent-framework tool
+  decorators record your function and read its signature and docstring to build a schema.
 
 ## How it works
 ### Desugaring
@@ -52,43 +46,50 @@ and read its signature and docstring to build a schema.
 @timed
 def embed(texts): ...
 ```
-is exactly `embed = timed(embed)`, executed once, at definition time (usually import time). `timed`
-typically defines an inner `wrapper(*args, **kwargs)` that does work before and after calling the
-original, and returns `wrapper`. The wrapper is a closure: it keeps a reference to the original function
-in its enclosing scope, which is how it can call it later.
+- **Is exactly `embed = timed(embed)`,** executed once, at definition time (usually import time).
+- **Typical shape:** `timed` defines an inner `wrapper(*args, **kwargs)` that does work before and after
+  calling the original, and returns `wrapper`.
+- **The wrapper is a closure:** it keeps a reference to the original function in its enclosing scope,
+  which is how it can call it later.
 
 ### Preserve identity with functools.wraps
-The returned wrapper has its own `__name__`, `__doc__` and signature, so without care every decorated
-function looks like `wrapper(*args, **kwargs)` to logs, debuggers and, critically, to frameworks that
-build tool or API schemas from the signature and docstring. `@functools.wraps(fn)` copies the name,
-docstring, module and annotations, and sets `__wrapped__` so `inspect.signature` reports the original
-signature.
+- **The problem.** The wrapper has its own `__name__`, `__doc__` and signature, so every decorated function
+  looks like `wrapper(*args, **kwargs)` to logs, debuggers and, critically, frameworks that build tool or
+  API schemas from signature and docstring.
+- **The fix.** `@functools.wraps(fn)` copies the name, docstring, module and annotations, and sets
+  `__wrapped__` so `inspect.signature` reports the original signature.
 
 ### Decorators with arguments are factories
-`@retry(attempts=3)` calls `retry(attempts=3)` first, which returns the real decorator, which then
-receives the function. That is three levels of nesting: factory, decorator, wrapper. Class decorators
-(PEP 3129) work the same way on classes; `@dataclass` is one.
+1. `@retry(attempts=3)` calls `retry(attempts=3)` first.
+2. That returns the real decorator, which receives the function.
+3. The decorator returns the wrapper.
+
+Three levels of nesting: factory, decorator, wrapper. Class decorators (PEP 3129) work the same way on
+classes; `@dataclass` is one.
 
 ### Async functions need async wrappers
-Calling an `async def` function returns a coroutine without running it. A plain sync wrapper around it
-measures how long it took to *create* the coroutine (microseconds) and its `try/except` never sees the
-real errors, which happen later at `await`. A decorator meant for both must check
-`inspect.iscoroutinefunction(fn)` and return an `async def` wrapper that awaits the call.
+- **Calling an `async def` returns a coroutine without running it.**
+- **So a plain sync wrapper** measures how long it took to *create* the coroutine (microseconds), and its
+  `try/except` never sees the real errors, which happen later at `await`.
+- **Fix:** a decorator meant for both checks `inspect.iscoroutinefunction(fn)` and returns an `async def`
+  wrapper that awaits the call.
 
 ### Typing: runtime metadata is not static types
-`wraps` fixes what `inspect` sees at runtime, but a type checker only sees the wrapper's declared
-type. Annotate a decorator as `Callable[..., Any] -> Callable[..., Any]` and every decorated function
-loses its parameter types in mypy and the IDE. `ParamSpec` (PEP 612, 3.10+) carries them through:
-`def deco(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]`, with the wrapper taking
-`*args: P.args, **kwargs: P.kwargs`. A decorator that changes the signature (injecting a client
-argument, say) needs `Concatenate` to say so.
+- **`wraps` fixes runtime only.** A type checker sees the wrapper's declared type. Annotate a decorator as
+  `Callable[..., Any] -> Callable[..., Any]` and every decorated function loses its parameter types in mypy
+  and the IDE.
+- **`ParamSpec` (PEP 612, 3.10+) carries them through:**
+  `def deco(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]`, with the wrapper taking
+  `*args: P.args, **kwargs: P.kwargs`.
+- **Signature-changing decorators** (injecting a client argument, say) need `Concatenate` to say so.
 
 ### Class-based decorators and methods
-Any callable works as a decorator, including a class whose `__call__` wraps the function; that is
-convenient when the decorator holds state such as counters or a cache. The catch is method binding.
-Plain functions are descriptors, so `obj.method` binds `self` automatically; an instance of your class
-is not, so decorating a method with it silently drops `self` unless the class implements `__get__`.
-Function-based wrappers avoid this because the wrapper is itself a function.
+- **Any callable works**, including a class whose `__call__` wraps the function; handy when the decorator
+  holds state such as counters or a cache.
+- **The catch is method binding.** Plain functions are descriptors, so `obj.method` binds `self`
+  automatically. An instance of your class is not, so decorating a method with it silently drops `self`
+  unless the class implements `__get__`.
+- **Function-based wrappers avoid this**, because the wrapper is itself a function.
 
 ### Stacking order
 ```
@@ -96,14 +97,16 @@ Function-based wrappers avoid this because the wrapper is itself a function.
 @retry(attempts=3)
 def call(): ...
 ```
-equals `call = traced(retry(attempts=3)(call))`. Decorators apply bottom-up, so at call time the
-outermost one, `traced`, runs first: here one span covers all three attempts. Swap them and each attempt
-gets its own span. Order is a design decision, not style. Registration decorators make this sharper:
-`@mcp.tool()` or `@app.get(...)` registers whatever object it receives, so it must sit on top. Put it
-below `@retry` and the framework registers the un-retried function, while the retrying wrapper is bound
-to a module name nobody calls.
+- **Equals `call = traced(retry(attempts=3)(call))`.** Decorators apply bottom-up, so at call time the
+  outermost one, `traced`, runs first.
+- **Here one span covers all three attempts;** swap them and each attempt gets its own span. Order is a
+  design decision, not style.
+- **Registration decorators go on top.** `@mcp.tool()` or `@app.get(...)` registers whatever object it
+  receives. Put it below `@retry` and the framework registers the un-retried function, while the retrying
+  wrapper is bound to a module name nobody calls.
 
-## Example
+## Examples
+### An async retry decorator with backoff and jitter
 ```python
 import asyncio, functools, inspect, random, time
 from collections.abc import Awaitable, Callable
@@ -145,49 +148,126 @@ async def complete(prompt: str) -> str:
 print(complete.__name__, complete.__doc__)     # complete Call the model provider.
 print(asyncio.run(complete("hi")))
 ```
-With 4 attempts and a 0.1 s base delay, the waits between failures are about 0.1, 0.2 and 0.4 s with
-±50% jitter, so a call that never succeeds gives up after roughly 0.7 s of backoff plus four call
-durations (0.2 s here). With a 50% failure rate, all four attempts fail with probability 0.5⁴ = 1/16,
-so about 6% of calls still raise; retries change the error rate, they do not remove it. Trace what ran
-when: `retry(...)` executed once at import and returned `decorator`; `decorator(complete)` also ran once
-at import and rebound the name `complete` to `wrapper`; only `wrapper`'s body runs per call. The jitter
-matters because many clients failing on the same 429 would otherwise retry in lockstep and hit the
-provider together again. In production you would usually use `tenacity` rather than hand-roll this.
+
+**The numbers** (4 attempts, 0.1 s base delay, 50% failure rate):
+| Quantity | Value |
+|---|---|
+| Waits between failures | about 0.1, 0.2 and 0.4 s, with ±50% jitter |
+| A call that never succeeds | gives up after roughly 0.7 s of backoff plus four call durations (0.2 s here) |
+| Probability all four attempts fail | 0.5⁴ = 1/16, so about 6% of calls still raise |
+
+- **Retries change the error rate; they do not remove it.**
+- **What ran when:** `retry(...)` executed once at import and returned `decorator`; `decorator(complete)`
+  also ran once at import and rebound the name `complete` to `wrapper`; only `wrapper`'s body runs per call.
+- **Why jitter:** many clients failing on the same 429 would otherwise retry in lockstep and hit the
+  provider together again.
+- **In production** you would usually use `tenacity` rather than hand-roll this.
+
+### A tool registry that survives decoration
+Registration plus an async-aware timer, stacked in the right order. Remove the `@functools.wraps(fn)`
+above `async_wrapper` and the registry records `async_wrapper` with no docstring and params
+`['args', 'kwargs']`: exactly the schema an LLM would then guess against.
+
+```python
+import asyncio, functools, inspect, time
+
+TOOLS: dict[str, dict] = {}
+
+def tool(fn):                                    # registration: records whatever it receives
+    TOOLS[fn.__name__] = {"doc": inspect.getdoc(fn),
+                          "params": list(inspect.signature(fn).parameters)}  # follows __wrapped__
+    return fn
+
+def timed(fn):
+    def report(start: float) -> None:
+        print(f"{fn.__name__} took {(time.perf_counter() - start) * 1000:.0f} ms")
+
+    if inspect.iscoroutinefunction(fn):          # async in, async out
+        @functools.wraps(fn)
+        async def async_wrapper(*args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)  # time the awaited work, not coroutine creation
+            finally:
+                report(start)
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            report(start)
+    return wrapper
+
+@tool                                            # on top, so it registers the timed wrapper
+@timed
+async def search_docs(query: str, k: int = 5) -> list[str]:
+    """Search the knowledge base."""
+    await asyncio.sleep(0.12)                    # stands in for a vector-store query
+    return [query] * k
+
+print(TOOLS)       # {'search_docs': {'doc': 'Search the knowledge base.', 'params': ['query', 'k']}}
+print(inspect.iscoroutinefunction(search_docs))  # True: frameworks will await it
+asyncio.run(search_docs("refund policy"))        # search_docs took 120 ms (about)
+```
+
+## Production patterns
+- **Retries via tenacity, scoped to transient errors.** Use
+  `@retry(stop=stop_after_attempt(4), wait=wait_random_exponential(multiplier=0.5, max=10), retry=retry_if_exception_type(...))`
+  listing only rate-limit, timeout and 5xx errors, with `before_sleep=before_sleep_log(logger, logging.WARNING)`.
+  Monitor retries per call and final failure rate.
+- **Retry only idempotent tools.** Mark side-effecting tools (email, CRM writes) as non-retryable, or pass an
+  idempotency key the downstream API honours, so a timeout after the write cannot duplicate it. Alert on
+  duplicate-key rejections.
+- **Order deadlines deliberately.** For per-attempt timeouts put `@retry` above the timeout decorator; wrap
+  the whole call in an outer deadline as well. Check traces: each attempt's span should end at its own timeout.
+- **Check library decorators handle async.** Before adopting a tracing or metrics decorator, decorate an
+  `async def` and assert the recorded duration includes the awaited work, because a sync wrapper inside a
+  library has the same microsecond-latency bug.
+- **Bounded caches with visibility.** Use `functools.lru_cache(maxsize=...)` only for pure functions on hashable
+  arguments (prompt templates, tokenizer loading), and export `fn.cache_info()` hits and misses. Use a TTL
+  cache elsewhere.
+- **Test the generated schema.** Add a unit test that every registered tool has a docstring and no
+  `args`/`kwargs` parameters, which catches a missing `wraps` or a misplaced registration decorator.
 
 ## Trade-offs
-- Decorators remove duplicated cross-cutting code and make it visible at the definition, but hide control
-  flow; when behaviour depends on per-call context, an explicit wrapper or context manager is clearer.
-- Registration decorators make tool and route definitions concise, but run at import time, so import
-  order and module side effects start to matter; that bites in large packages and test setups.
-- `functools.lru_cache` and `cache` give instant memoisation, but key on arguments and live for the
+- **Less duplication vs hidden control flow.** Decorators remove duplicated cross-cutting code and make it
+  visible at the definition, but hide control flow. When behaviour depends on per-call context, an explicit
+  wrapper or context manager is clearer.
+- **Concise registration vs import-time effects.** Registration decorators make tool and route definitions
+  concise but run at import time, so import order and module side effects start to matter, which bites in
+  large packages and test setups.
+- **Instant memoisation vs lifetime.** `functools.lru_cache` and `cache` key on arguments and live for the
   process; they are wrong for unhashable inputs, per-user data or anything that must expire.
-- Generic decorators for both sync and async functions are convenient, at the cost of branching and
-  harder typing; separate decorators are simpler when a codebase is all-async.
+- **One decorator for both vs simplicity.** Generic sync-and-async decorators are convenient, at the cost of
+  branching and harder typing; separate decorators are simpler when a codebase is all-async.
 
 ## Pitfalls
-- Omitting `functools.wraps`; the symptom is every tool in an agent's schema named `wrapper` with no
+- **Omitting `functools.wraps`.** Symptom: every tool in an agent's schema named `wrapper` with no
   description, or FastAPI dependencies resolving the wrong parameters.
-- Wrapping an `async def` with a sync wrapper; latency metrics show microseconds and retries never fire,
-  because the error only appears when the coroutine is awaited elsewhere.
-- Applying `lru_cache` or `cache` to a method; the cache holds a reference to `self` in every key, so
-  instances stay alive while cached (forever under `cache`), which shows up as steadily growing memory.
-- Stacking retry outside a timeout when you meant per-attempt timeouts, or the reverse; traces show either
-  one timeout killing all retries or retries continuing far past the deadline.
-- Doing expensive work in the decorator body rather than in the wrapper; it runs once at import, which
-  slows startup or freezes a value that should be read per call.
-- Placing a framework's registration decorator below your own wrappers; the framework registers the
-  bare function, and the symptom is tools or routes that work but never retry, trace or check auth.
-- Retrying non-idempotent calls (a tool that sends an email or writes a CRM row) with a generic retry
-  decorator; a timeout after the side effect happened shows up as duplicate emails or rows.
+- **A sync wrapper on an `async def`.** Latency metrics show microseconds and retries never fire, because the
+  error only appears when the coroutine is awaited elsewhere.
+- **`lru_cache` or `cache` on a method.** The cache holds a reference to `self` in every key, so instances
+  stay alive while cached (forever under `cache`). Symptom: steadily growing memory.
+- **Retry and timeout stacked the wrong way round.** Traces show either one timeout killing all retries or
+  retries continuing far past the deadline.
+- **Expensive work in the decorator body instead of the wrapper.** It runs once at import, which slows
+  startup or freezes a value that should be read per call.
+- **A framework's registration decorator below your wrappers.** The framework registers the bare function.
+  Symptom: tools or routes that work but never retry, trace or check auth.
+- **Generic retry on non-idempotent calls** (a tool that sends an email or writes a CRM row). A timeout after
+  the side effect happened shows up as duplicate emails or rows.
 
 ## When to use
-Use a decorator when the same behaviour wraps many functions and does not depend on their internals:
-retries, timeouts, tracing spans, metrics, auth checks, caching, and registration with a framework. Prefer
-established libraries (tenacity for retries, OpenTelemetry or your tracing SDK's decorator, `functools.cache`)
-over hand-rolled versions. Avoid decorators for logic that varies per call or that the reader must see to
-understand the function. When reviewing code, check that every wrapper uses `wraps`, handles async
-correctly and is stacked in the intended order. In interviews, expect to write a parameterised decorator
-and explain the desugaring.
+- **Use when** the same behaviour wraps many functions and does not depend on their internals: retries,
+  timeouts, tracing spans, metrics, auth checks, caching, framework registration.
+- **Prefer established libraries:** tenacity for retries, OpenTelemetry or your tracing SDK's decorator,
+  `functools.cache`, over hand-rolled versions.
+- **Avoid** decorators for logic that varies per call or that the reader must see to understand the function.
+- **Review checklist:** every wrapper uses `wraps`, handles async correctly, and is stacked in the intended order.
+- **Interviews:** write a parameterised decorator and explain the desugaring.
 
 ## Role lens
 - **Engineer:** Writes async-aware decorators with `functools.wraps` for retries and tracing, and uses

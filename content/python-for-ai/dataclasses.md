@@ -5,7 +5,7 @@ name: dataclasses
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
@@ -19,101 +19,113 @@ sources:
 ---
 
 ## TL;DR
-`@dataclass` generates `__init__`, `__repr__`, `__eq__` and optionally ordering, hashing and
-`__slots__` from a class's annotated fields, so a record type is five lines instead of thirty. It
-exists because AI code is full of small structured records (generation configs, agent steps,
-retrieved chunks) that need equality, readable reprs and sometimes immutability, and hand-writing
-those methods is where bugs and inconsistencies creep in. It validates nothing; that is Pydantic's
-job.
+`@dataclass` generates `__init__`, `__repr__`, `__eq__` and optionally ordering, hashing and `__slots__`
+from annotated fields, so a record is five lines, not thirty. It suits AI records (configs, agent steps,
+chunks) but validates nothing; that is Pydantic's job.
 
 ## Why it exists
-Every system accumulates classes that are mostly data: a `GenerationConfig` with a model name and a
-temperature, a `RetrievedChunk` with text and a score, an agent `Step` with a tool name, arguments
-and output. Written by hand, each needs an `__init__` that assigns every field, a `__repr__` so
-logs are readable, an `__eq__` so tests can compare them, and sometimes `__hash__` so they can be
-cache keys. That is thirty lines of boilerplate per class, and the boilerplate is where the bugs
-live: a field added to `__init__` but forgotten in `__eq__`, a repr that omits the one field you
-needed in the incident log, a `__hash__` that disagrees with `__eq__` and silently breaks sets.
-
-The naive alternatives each fail in a specific way. A plain dict has no field names the checker
-can verify, no repr beyond braces and no way to attach methods. A tuple or `NamedTuple` is
-immutable and hashable but also iterable and indexable, so `chunk[1]` compiles and the meaning of
-position 1 changes when you add a field. Writing the dunder methods by hand is correct until the
-second person edits the class.
-
-Dataclasses generate the methods from the single source of truth, the annotated field list, so
-they cannot disagree with it. The design choice to generate code at class creation (rather than
-use a dynamic `__getattr__` trick) was made so the resulting class is an ordinary class: fast
-attribute access, normal inheritance, nothing magic at call time.
+- **Systems fill up with mostly-data classes.** A `GenerationConfig` with a model name and temperature, a
+  `RetrievedChunk` with text and a score, an agent `Step` with a tool name, arguments and output.
+- **Hand-written, each costs thirty lines.** An `__init__` assigning every field, a `__repr__` for readable
+  logs, an `__eq__` for tests, and sometimes `__hash__` for cache keys.
+- **The boilerplate is where bugs live.** A field added to `__init__` but forgotten in `__eq__`, a repr
+  missing the one field you needed in the incident log, a `__hash__` that disagrees with `__eq__` and
+  silently breaks sets.
+- **The alternatives fail specifically.** A plain dict has no checkable field names, no repr beyond braces
+  and no methods. A tuple or `NamedTuple` is immutable and hashable but also indexable, so `chunk[1]`
+  compiles and position 1 changes meaning when you add a field. Hand-written dunders are correct until
+  the second person edits the class.
+- **One source of truth, ordinary class.** Methods are generated from the annotated field list, so they
+  cannot disagree with it. Generating code at class creation (not a dynamic `__getattr__` trick) keeps
+  fast attribute access, normal inheritance and nothing magic at call time.
 
 ## How it works
 ### What the decorator generates
-`@dataclass` inspects the class's `__annotations__` in definition order and, for each annotated
-name, creates a field. It then synthesizes methods and attaches them to the class:
+`@dataclass` reads the class's `__annotations__` in definition order, creates a field per annotated name,
+then attaches methods:
 
-- `__init__(self, a, b=default)` assigning each field, with fields that have defaults after those
-  that do not (the same rule as function parameters, and for the same reason).
-- `__repr__` printing `ClassName(a=..., b=...)`, which is what makes agent traces readable.
-- `__eq__` comparing instances field by field as tuples, only when the other object is the same
-  class.
-- With `order=True`, `__lt__` and friends comparing field tuples in order.
-- With `frozen=True`, `__setattr__` and `__delattr__` that raise `FrozenInstanceError`.
-- `__hash__` only when it is safe: `frozen=True` with `eq=True` gives a hash of the field tuple;
-  `eq=True` alone sets `__hash__ = None`, making instances unhashable *because* a mutable object
-  whose hash can change would corrupt any set or dict it lives in. `unsafe_hash=True` overrides
-  this when you promise not to mutate.
-- With `slots=True` (3.10), a `__slots__` declaration, which removes the per-instance `__dict__`,
-  cuts memory per instance and speeds attribute access, and rejects assignment to undeclared
-  attributes. That last property catches typos like `cfg.temprature = 0.5`.
-- With `kw_only=True` (3.10), all fields become keyword-only, which lets you add fields in any
-  order and avoids positional-argument mistakes on classes with many same-typed fields.
+| Option | Generated behaviour |
+|---|---|
+| default | `__init__(self, a, b=default)` assigning each field; defaulted fields after non-defaulted ones (the function-parameter rule, for the same reason) |
+| default | `__repr__` printing `ClassName(a=..., b=...)`, which makes agent traces readable |
+| default | `__eq__` comparing field tuples, only when the other object is the same class |
+| `order=True` | `__lt__` and friends comparing field tuples in order |
+| `frozen=True` | `__setattr__` and `__delattr__` that raise `FrozenInstanceError` |
+| `slots=True` (3.10) | `__slots__`: no per-instance `__dict__`, less memory, faster attribute access, and assignment to undeclared attributes is rejected, catching typos like `cfg.temprature = 0.5` |
+| `kw_only=True` (3.10) | all fields keyword-only: add fields in any order, avoid positional mistakes on many same-typed fields |
+
+### When `__hash__` is generated
+| Settings | `__hash__` | Why |
+|---|---|---|
+| `frozen=True` with `eq=True` | hash of the field tuple | Fields cannot change, so the hash is stable |
+| `eq=True` alone | `__hash__ = None` (unhashable) | *Because* a mutable object whose hash changes would corrupt any set or dict holding it |
+| `unsafe_hash=True` | forced | You promise not to mutate |
 
 ### Defaults and `field()`
-`x: list[str] = []` is rejected with `ValueError: mutable default ... use default_factory`,
-because a class-level default is evaluated once and would be shared by every instance; the module
-checks for this explicitly since the aliasing bug is otherwise silent. The check is a heuristic,
-not a guarantee: it rejects defaults whose type is unhashable (`list`, `dict`, `set`; before 3.11
-exactly those three), so a mutable but hashable object, such as an instance of an ordinary class,
-passes and is shared. `field(default_factory=list)`
-calls the factory per instance. `field()` also controls participation: `repr=False` hides large
-payloads from logs, `compare=False` excludes a timestamp from equality, `init=False` marks a
-derived field set in `__post_init__`.
+- **Mutable defaults are rejected.** `x: list[str] = []` raises `ValueError: mutable default ... use default_factory`,
+  because a class-level default is evaluated once and shared by every instance; the module checks
+  explicitly since the aliasing bug is otherwise silent.
+- **The check is a heuristic.** It rejects unhashable defaults (`list`, `dict`, `set`; before 3.11 exactly
+  those three). A mutable but hashable object, such as an instance of an ordinary class, passes and is
+  shared.
+- **`field(default_factory=list)`** calls the factory per instance.
+- **`field()` controls participation:** `repr=False` hides large payloads from logs, `compare=False`
+  excludes a timestamp from equality, `init=False` marks a derived field set in `__post_init__`.
 
 ### Hooks and helpers
-`__post_init__` runs after the generated `__init__` and is where derived fields and cheap
-invariant checks go (`if not 0 <= self.temperature <= 2: raise ValueError`). `InitVar[T]` declares
-an init-only parameter that is passed to `__post_init__` but not stored. `dataclasses.replace(obj,
-**changes)` returns a new instance with some fields changed, which is the idiom for "modifying" a
-frozen instance. `asdict(obj)` converts recursively into dicts and lists, deep-copying along the
-way, so it is convenient for logging but expensive for large nested structures; `fields(cls)`
-exposes the field metadata for generic code. `match_args` (3.10) lets instances be destructured in
-`match` statements positionally.
+| Helper | What it does |
+|---|---|
+| `__post_init__` | Runs after the generated `__init__`; derived fields and cheap invariant checks (`if not 0 <= self.temperature <= 2: raise ValueError`) |
+| `InitVar[T]` | Init-only parameter passed to `__post_init__` but not stored |
+| `dataclasses.replace(obj, **changes)` | New instance with some fields changed; the idiom for "modifying" a frozen instance |
+| `asdict(obj)` | Recursive conversion to dicts and lists, deep-copying along the way: convenient for logging, expensive for large nested structures |
+| `fields(cls)` | Field metadata for generic code |
+| `match_args` (3.10) | Positional destructuring in `match` statements |
 
-### Inheritance and frozen derived fields
-Fields are collected by walking the class's bases in reverse MRO order: base-class fields come
-first, in their declaration order, then the subclass's, with a redeclared name keeping its original
-position. The generated `__init__` is one flat parameter list in that order, *which is why* a
-subclass cannot add a required field after a base that has a default: the signature would be
-`(model, temperature=0.0, tenant)`, which Python rejects. `kw_only=True` on the subclass, or a
-`_: KW_ONLY` sentinel before the new fields, moves them out of the positional sequence and the
-conflict disappears.
+### Inheritance
+1. **Fields are collected in reverse MRO order:** base-class fields first, in declaration order, then the
+   subclass's; a redeclared name keeps its original position.
+2. **The generated `__init__` is one flat parameter list in that order**, *which is why* a subclass cannot
+   add a required field after a base with a default: the signature would be
+   `(model, temperature=0.0, tenant)`, which Python rejects.
+3. **Fix:** `kw_only=True` on the subclass, or a `_: KW_ONLY` sentinel before the new fields, moves them
+   out of the positional sequence and the conflict disappears.
 
-Frozen classes have one sharp interaction with `__post_init__`. The generated `__init__` sets
-fields through `object.__setattr__` to bypass the freeze, but your `__post_init__` does not get that
-privilege: `self.n_tokens = ...` raises `FrozenInstanceError`. A derived field on a frozen class
-(`n_tokens: int = field(init=False)`) must be set with `object.__setattr__(self, "n_tokens", ...)`,
-the same escape hatch the decorator itself uses.
+### Frozen classes and derived fields
+- **The generated `__init__` bypasses the freeze** by setting fields through `object.__setattr__`.
+- **Your `__post_init__` does not get that privilege:** `self.n_tokens = ...` raises `FrozenInstanceError`.
+- **Fix:** a derived field (`n_tokens: int = field(init=False)`) is set with
+  `object.__setattr__(self, "n_tokens", ...)`, the same escape hatch the decorator uses.
 
 ### Where it stops
-A dataclass does not validate types: `GenConfig(temperature="hot")` constructs happily. It does not
-parse JSON, generate schemas or coerce input. Those are Pydantic's responsibilities, and Pydantic
-even offers `pydantic.dataclasses.dataclass` that adds validation to the stdlib form. The dividing
-line: dataclasses for records *you* construct from already-trusted values; Pydantic for data that
-arrives from outside.
+- **No type validation:** `GenConfig(temperature="hot")` constructs happily.
+- **No JSON parsing, schemas or coercion.** Those are Pydantic's job, and Pydantic even offers
+  `pydantic.dataclasses.dataclass`, which adds validation to the stdlib form.
+- **The dividing line:** dataclasses for records *you* construct from already-trusted values; Pydantic for
+  data that arrives from outside.
 
-## Example
-A frozen, slotted config that works as a cache key, and a mutable step record with a per-instance
-default list. `replace` produces a varied config without touching the original.
+## Diagram
+What happens once, at class creation: the decorator reads the annotated fields and generates methods,
+and the `eq` and `frozen` settings decide whether instances can be hashed (and so used as cache keys).
+
+```mermaid
+flowchart TD
+    C["class body with annotated fields"] --> D["@dataclass reads __annotations__ in order"]
+    D --> MD{"Mutable default such as a list?"}
+    MD -->|"yes"| ERR["ValueError: use default_factory"]
+    MD -->|"no"| G["Generate __init__, __repr__, __eq__"]
+    G --> O["Options: order, slots, kw_only add methods or __slots__"]
+    O --> H{"frozen and eq?"}
+    H -->|"frozen=True, eq=True"| HS["__hash__ from field tuple: usable as a key"]
+    H -->|"eq=True only"| HN["__hash__ = None: unhashable"]
+    H -->|"unsafe_hash=True"| HF["Hash forced: you promise not to mutate"]
+    HS -.->|"a list field inside"| TE["TypeError: unhashable type at hash time"]
+```
+
+## Examples
+### Frozen config as a cache key, mutable step record
+A frozen, slotted config works as a cache key; the step record gets a per-instance default list; `replace`
+produces a varied config without touching the original.
 
 ```python
 import time
@@ -159,51 +171,93 @@ print(s1)                                                  # Step(tool='search',
 print(asdict(s1)["notes"] is s1.notes)                     # False: asdict deep-copies
 ```
 
-Change `stop` to `list[str]` with a `default_factory` and `lru_cache` raises `TypeError:
-unhashable type`, because a frozen dataclass's hash is built from its fields and a list has none.
+- **Break it on purpose:** change `stop` to `list[str]` with a `default_factory` and `lru_cache` raises
+  `TypeError: unhashable type`, because a frozen dataclass's hash is built from its fields and a list
+  has none.
+
+### Derived field on a frozen class, plus a required subclass field
+The `object.__setattr__` escape hatch sets `n_tokens`, and `KW_ONLY` lets a subclass add a required
+`tenant` after a defaulted base field. Passes `mypy --strict`.
+
+```python
+from dataclasses import KW_ONLY, dataclass, field, fields
+
+@dataclass(frozen=True)
+class Chunk:
+    text: str
+    score: float = 0.0
+    n_tokens: int = field(init=False)          # derived, not a constructor argument
+
+    def __post_init__(self) -> None:
+        # self.n_tokens = ... would raise FrozenInstanceError here
+        object.__setattr__(self, "n_tokens", len(self.text.split()))
+
+@dataclass(frozen=True)
+class TenantChunk(Chunk):
+    _: KW_ONLY
+    tenant: str                                # required, yet after a defaulted base field
+
+c = TenantChunk("kv cache stores keys and values", 0.82, tenant="acme")
+print(c.n_tokens, c.tenant)                    # 6 acme
+print([f.name for f in fields(c)])             # ['text', 'score', 'n_tokens', 'tenant']
+print(c == TenantChunk("kv cache stores keys and values", 0.82, tenant="acme"))  # True
+print(len({c, c}))                             # 1: frozen + eq gives a hash
+```
+
+## Production patterns
+- **Frozen configs as cache and dedup keys.** Model generation settings as `@dataclass(frozen=True)` with
+  tuple-typed collections, and key `lru_cache` or a response cache on them. Monitor cache hit rate via
+  `cache_info()`; a hit rate near zero often means a field like a timestamp should be `compare=False`.
+- **Slots for high-volume records.** Use `slots=True` on chunks, token events and trace spans created in
+  large numbers. Verify the saving with `tracemalloc` snapshots before and after, because on 3.11+ the
+  gain is smaller than older benchmarks suggest.
+- **`repr=False` on large or sensitive fields.** Raw documents, embeddings and prompt bodies stay out of
+  logs and tracebacks. Watch log volume per request; a jump often means a new field leaked into a repr.
+- **Validate at the edge, dataclass inside.** Parse external input with Pydantic, then build internal
+  dataclasses from the validated values. Keep only cheap invariant checks in `__post_init__`.
+- **`kw_only=True` on wide records.** Records with many same-typed fields (several `float` scores, several
+  `str` IDs) become keyword-only, so a reordered field never silently swaps two values.
 
 ## Trade-offs
-- You get correct, consistent dunder methods for free, but no validation; the moment input comes
-  from outside the process, a Pydantic model is the right tool despite its extra weight.
-- `frozen=True` gives hashability and safe sharing across threads and cache keys, but every update
-  allocates a new object via `replace`, which matters only in tight loops over large records.
-- `slots=True` saves memory and catches attribute typos, but instances lose `__dict__`, so
-  libraries that stash attributes on objects or rely on `vars(obj)` break.
-- `order=True` gives sorting for free, but it compares fields positionally in declaration order,
-  which is rarely the ordering you actually mean for a domain object.
-- `asdict` is convenient for logging and serialization, yet it deep-copies the whole tree; for large
-  nested records a hand-written `to_dict` (or `vars(obj)`, on non-slotted classes) is cheaper.
+- **Free dunders vs no validation.** Methods are correct and consistent, but once input comes from outside
+  the process, a Pydantic model is the right tool despite its extra weight.
+- **`frozen=True`: safe sharing vs allocation.** Hashability and safe sharing across threads and cache keys,
+  but every update allocates a new object via `replace`, which matters only in tight loops over large
+  records.
+- **`slots=True`: memory and typo safety vs no `__dict__`.** Libraries that stash attributes on objects or
+  rely on `vars(obj)` break.
+- **`order=True`: free sorting vs wrong ordering.** It compares fields positionally in declaration order,
+  rarely the ordering you mean for a domain object.
+- **`asdict`: convenience vs deep copy.** It copies the whole tree; for large nested records a hand-written
+  `to_dict` (or `vars(obj)`, on non-slotted classes) is cheaper.
 
 ## Pitfalls
-- Assuming the mutable-default check catches everything; `field(default=[])` is rejected like
-  `= []`, but `field(default=RetryPolicy())` (a hashable object of an ordinary class) or an
-  unannotated class attribute on a base class is silently shared, and the symptom is one instance's
-  changes showing up in every other instance.
-- Adding `__eq__` by hand or setting `eq=True` on a mutable class and then using instances as dict
-  keys; the symptom is `TypeError: unhashable type` or, with `unsafe_hash`, items vanishing from
-  sets after mutation.
-- Putting a required field after a defaulted one in a subclass; the symptom is `TypeError:
-  non-default argument follows default argument` at import, fixed by `kw_only=True`.
-- Assigning a derived field in `__post_init__` of a frozen dataclass; the symptom is
-  `FrozenInstanceError` raised from inside the constructor, which looks like the object was frozen
-  too early. Use `object.__setattr__` for that one assignment.
-- Expecting `GenConfig(temperature="0.7")` to coerce or fail; it stores the string, and the error
-  appears later as a `TypeError` in arithmetic. Validate in `__post_init__` or use Pydantic.
-- Storing a list in a frozen dataclass and assuming the whole object is immutable; the reference is
-  frozen but the list is not, and hashing fails or, worse, the "immutable" config changes.
+- **Trusting the mutable-default check completely.** `field(default=[])` is rejected like `= []`, but
+  `field(default=RetryPolicy())` (a hashable object of an ordinary class) or an unannotated base-class
+  attribute is silently shared. Symptom: one instance's changes appear in every other instance.
+- **Hand-written `__eq__` or `eq=True` on a mutable class used as dict keys.** Symptom:
+  `TypeError: unhashable type` or, with `unsafe_hash`, items vanishing from sets after mutation.
+- **Required field after a defaulted one in a subclass.** Symptom:
+  `TypeError: non-default argument follows default argument` at import, fixed by `kw_only=True`.
+- **Assigning a derived field in a frozen class's `__post_init__`.** `FrozenInstanceError` from inside the
+  constructor looks like the object was frozen too early. Use `object.__setattr__` for that assignment.
+- **Expecting coercion.** `GenConfig(temperature="0.7")` stores the string, and the error appears later as
+  a `TypeError` in arithmetic. Validate in `__post_init__` or use Pydantic.
+- **A list inside a frozen dataclass.** The reference is frozen but the list is not, so hashing fails or,
+  worse, the "immutable" config changes.
 
 ## When to use
-Use a dataclass for records you construct from trusted values inside your process: configs,
-intermediate results, agent steps, cache keys, test fixtures. Prefer `frozen=True` for anything
-shared across tasks or used as a key, and `slots=True` for anything created in large numbers
-(retrieved chunks, token events). Switch to Pydantic when the data crosses a trust boundary or
-needs a schema, and to `NamedTuple` only when tuple unpacking is genuinely the interface. Measure
-memory with `tracemalloc` when instance counts reach the millions; slots remove the per-instance
-`__dict__`, which can be a large share of a small record's footprint, though the saving is smaller
-on 3.11+ where instance dicts are stored more compactly, so measure rather than assume.
-Day to day, dataclasses are the default container for anything with more than two fields; in
-interviews, expect to explain `default_factory`, when `__hash__` is generated and why, and the line
-between dataclasses and Pydantic.
+- **Use for trusted in-process records:** configs, intermediate results, agent steps, cache keys, test
+  fixtures. Day to day, the default container for anything with more than two fields.
+- **Prefer `frozen=True`** for anything shared across tasks or used as a key, and `slots=True` for anything
+  created in large numbers (retrieved chunks, token events).
+- **Switch away** to Pydantic when data crosses a trust boundary or needs a schema, and to `NamedTuple`
+  only when tuple unpacking is genuinely the interface.
+- **Measure** memory with `tracemalloc` when instance counts reach the millions. Slots remove the
+  per-instance `__dict__`, which can be a large share of a small record's footprint, though the saving is
+  smaller on 3.11+ where instance dicts are stored more compactly, so measure rather than assume.
+- **Interviews:** explain `default_factory`, when `__hash__` is generated and why, and the line between
+  dataclasses and Pydantic.
 
 ## Role lens
 - **Engineer:** Models generation configs and agent steps as frozen, slotted dataclasses so they
@@ -223,6 +277,39 @@ a hashable object must not change its hash, and a mutable record can. Even with 
 The fix is `@dataclass(frozen=True)` with `stop: tuple[str, ...]` instead of a list, which gives a
 stable hash and lets `replace` produce variants. If the config really must be mutable, derive an
 explicit immutable key (a tuple of the fields) and cache on that instead.
+
+## Interview questions
+### What does `@dataclass` actually do, and why generate code instead of using a dynamic base class?
+- **It generates methods at class creation** (`__init__`, `__repr__`, `__eq__`, optionally ordering,
+  hashing and `__slots__`) from the annotated field list, so they cannot disagree with it.
+- **Why generation:** the result is an ordinary class with fast attribute access, normal inheritance and
+  nothing magic at call time, unlike a `__getattr__`-style trick.
+
+### One agent step's notes are appearing on every other step. How do you find the cause?
+- **Suspect a shared default.** The dataclass check rejects `list`, `dict` and `set` defaults, but a
+  hashable object of an ordinary class (`field(default=RetryPolicy())`) or an unannotated base-class
+  attribute is silently shared.
+- **Confirm** with `a.notes is b.notes` on two fresh instances.
+- **Fix:** `field(default_factory=...)` so each instance gets its own object.
+
+### When would you not use a dataclass?
+- **At a trust boundary:** it validates and coerces nothing, so `GenConfig(temperature="hot")`
+  constructs happily; use Pydantic for external input or when you need a schema.
+- **When tuple unpacking is the interface:** a `NamedTuple` fits that better.
+- **When a library relies on `vars(obj)`** or stashes attributes on objects, `slots=True` breaks it.
+
+### Your pipeline creates millions of chunk records and memory is high. What would you try, and how would you check it helped?
+- **Try `slots=True`:** it removes the per-instance `__dict__`, which can be a large share of a small
+  record's footprint, and rejects typo attributes as a bonus.
+- **Measure, do not assume:** compare `tracemalloc` snapshots before and after, because on 3.11+ instance
+  dicts are stored more compactly and the saving is smaller than older benchmarks suggest.
+- **Also check** whether `asdict` is deep-copying large trees on a hot path.
+
+### A subclass adds a required `tenant` field and the module fails at import. Why, and what is the fix?
+- **Why:** fields are collected base first, and the generated `__init__` is one flat parameter list, so a
+  required field after a defaulted base field gives `non-default argument follows default argument`.
+- **Fix:** `kw_only=True` on the subclass, or a `_: KW_ONLY` sentinel before the new fields, which moves
+  them out of the positional sequence.
 
 ## Quiz
 ### Q: Why does `@dataclass` reject `tags: list[str] = []` with a ValueError?

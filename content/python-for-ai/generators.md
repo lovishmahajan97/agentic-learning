@@ -5,7 +5,7 @@ name: Generators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/async-await
   - python-for-ai/context-managers-resource-cleanup
@@ -22,71 +22,83 @@ sources:
 ---
 
 ## TL;DR
-A generator is a function that `yield`s values one at a time and pauses between them, keeping its local
-state. It exists so you can process data lazily: a 10 GB JSONL corpus or an endless token stream becomes
-a pipeline of small stages, each holding one item or batch in memory instead of the whole dataset. Async
-generators do the same for streams that arrive over the network, which is how LLM token streaming is
-usually exposed.
+A generator `yield`s values one at a time, pausing with its state intact. A 10 GB JSONL corpus or an
+endless token stream becomes a lazy pipeline holding one item or batch at a time; async generators do
+the same for LLM token streams.
 
 ## Why it exists
-AI work is full of sequences too large or too slow to materialise: a corpus to chunk and embed, an eval
-set of 50,000 prompts, rows from a vector store export, server-sent events from a model. The naive
-approach builds lists: read every line, parse every document, chunk everything, then embed. Memory grows
-with the dataset, the first embedding call waits until the entire corpus is parsed, and a crash at item
-900,000 loses all the work in flight.
-
-The classic alternative is a hand-written iterator class with `__iter__`, `__next__` and explicit state
-fields for "which file, which line, which chunk offset". It works, but the control flow that would be a
-simple nested loop gets turned inside out into a state machine, which is error-prone and hard to read.
-
-Generators let you write the natural loop and have the interpreter keep the state for you. The function's
-frame is suspended at `yield` and resumed on the next request, so local variables, the open file and the
-loop position survive between items. The consumer pulls items as fast as it can use them, which gives
-streaming, early results and bounded memory for free.
+- **AI data is too big or too slow to materialise:** a corpus to chunk and embed, an eval set of 50,000
+  prompts, a vector store export, server-sent events from a model.
+- **Lists fail three ways.** Read every line, parse every document, chunk everything, then embed: memory
+  grows with the dataset, the first embedding call waits for the whole corpus, and a crash at item
+  900,000 loses all work in flight.
+- **Hand-written iterator classes are inside-out.** `__iter__`, `__next__` and explicit state fields
+  ("which file, which line, which chunk offset") turn a simple nested loop into an error-prone state
+  machine.
+- **Generators keep the natural loop.** The frame is suspended at `yield` and resumed on the next request,
+  so locals, the open file and the loop position survive between items.
+- **The consumer pulls**, so streaming, early results and bounded memory come for free.
 
 ## How it works
 ### The protocol
-Calling a function that contains `yield` runs none of its body; it returns a generator object, which is
-an iterator. Each `next()` resumes execution until the next `yield`, which hands a value out and freezes
-the frame. When the function returns, the generator raises `StopIteration` (carrying the return value),
-and `for` loops treat that as the end. A generator is single-pass: once exhausted, iterating it again
-yields nothing, with no error.
+1. **Calling creates, does not run.** Calling a function that contains `yield` runs none of its body; it
+   returns a generator object, which is an iterator.
+2. **`next()` resumes** execution until the next `yield`, which hands a value out and freezes the frame.
+3. **Return ends it.** The generator raises `StopIteration` (carrying the return value), and `for` loops
+   treat that as the end.
+4. **Single-pass.** Once exhausted, iterating again yields nothing, with no error.
 
-Mechanically, the generator object owns a frame: the local variables, the evaluation stack and the
-position of the last executed instruction. An ordinary call creates a frame and discards it on
-return; a generator keeps its frame alive between `next()` calls, which is the whole trick. You can
-watch the lifecycle with `inspect.getgeneratorstate(g)`: `GEN_CREATED` before the first `next()`,
-`GEN_RUNNING` while executing, `GEN_SUSPENDED` at a `yield`, `GEN_CLOSED` once finished. A generator
-cannot be resumed while it is running, so calling `next()` on one already executing, for example from
-a second thread, raises `ValueError: generator already executing`.
+**Mechanically:** the generator object owns a frame (locals, evaluation stack, position of the last
+executed instruction). An ordinary call discards its frame on return; a generator keeps it alive between
+`next()` calls, which is the whole trick.
+
+| `inspect.getgeneratorstate(g)` | Meaning |
+|---|---|
+| `GEN_CREATED` | Before the first `next()` |
+| `GEN_RUNNING` | Currently executing |
+| `GEN_SUSPENDED` | Paused at a `yield` |
+| `GEN_CLOSED` | Finished |
+
+- **No re-entry.** A running generator cannot be resumed, so `next()` on one already executing (say from a
+  second thread) raises `ValueError: generator already executing`.
 
 ### Pipelines compose lazily
-Generators chain: `chunks(read_jsonl(path))` builds a pipeline, but no work happens until the consumer
-asks for the first item. Then one line is read, parsed, chunked and passed down. Memory is bounded by
-what each stage holds, not by the dataset, *because* items flow one at a time. The flow is
-**pull-based**: the consumer's `next()` propagates up the chain, so a slow consumer (an embedding API
-at its rate limit) automatically slows reading, and nothing piles up between stages. That is
-backpressure without any queue. Generator expressions,
-`(f(x) for x in xs)`, are the inline form; `itertools` (`islice`, `chain`, and `batched` from 3.12)
-supplies the standard pipeline stages.
+- **Building does no work.** `chunks(read_jsonl(path))` builds a pipeline; nothing happens until the
+  consumer asks for the first item. Then one line is read, parsed, chunked and passed down.
+- **Memory is bounded by what each stage holds**, not by the dataset, *because* items flow one at a time.
+- **Pull-based backpressure.** The consumer's `next()` propagates up the chain, so a slow consumer (an
+  embedding API at its rate limit) automatically slows reading and nothing piles up between stages. That
+  is backpressure without any queue.
+- **Standard parts.** Generator expressions, `(f(x) for x in xs)`, are the inline form; `itertools`
+  (`islice`, `chain`, and `batched` from 3.12) supplies the standard pipeline stages.
 
 ### Two-way communication and delegation
-`yield` is an expression: `gen.send(value)` resumes the generator and makes the paused `yield` evaluate
-to that value; `gen.throw(exc)` raises an exception at that point; `gen.close()` raises `GeneratorExit`
-there so `finally` blocks run. `yield from sub` (PEP 380) delegates to a sub-generator, passing sends and
-throws through and evaluating to its return value, *because* refactoring a generator into helpers would
-otherwise need hand-written forwarding. This send-and-suspend machinery is the ancestor of coroutines:
-`async`/`await` grew out of generator-based coroutines.
+`yield` is an expression, so the caller can talk back:
+
+| Call | Effect at the paused `yield` |
+|---|---|
+| `gen.send(value)` | Resumes; the `yield` evaluates to `value` |
+| `gen.throw(exc)` | Raises the exception there |
+| `gen.close()` | Raises `GeneratorExit` there, so `finally` blocks run |
+| `yield from sub` (PEP 380) | Delegates to a sub-generator, forwarding sends and throws, evaluating to its return value |
+
+- **`yield from` exists** *because* refactoring a generator into helpers would otherwise need hand-written
+  forwarding.
+- **Ancestor of coroutines.** This send-and-suspend machinery is where `async`/`await` came from:
+  generator-based coroutines.
 
 ### Cleanup and async generators
-A generator that holds a resource (an open file inside `with`) releases it when it finishes, when
-`close()` is called, or when it is garbage-collected, since `close()` runs the `finally`. If a consumer
-breaks out early and keeps a reference, the resource stays open until that happens. `async def` with
-`yield` makes an async generator (PEP 525), consumed with `async for`; its `finally` may need to await,
-so early exit should be handled with `contextlib.aclosing()` (3.10+) to close it deterministically
-rather than leaving cleanup to the event loop's finaliser.
+- **When resources are released.** A generator holding a resource (an open file inside `with`) releases it
+  when it finishes, when `close()` is called, or when it is garbage-collected, since `close()` runs the
+  `finally`.
+- **Early exit leaks until then.** If a consumer breaks out early and keeps a reference, the resource stays
+  open.
+- **Async generators** (PEP 525): `async def` with `yield`, consumed with `async for`. Their `finally` may
+  need to await, so handle early exit with `contextlib.aclosing()` (3.10+) to close deterministically rather
+  than leaving cleanup to the event loop's finaliser.
 
-## Example
+## Examples
+### A lazy embedding pipeline
 ```python
 import itertools, json
 from collections.abc import Iterator
@@ -114,54 +126,110 @@ def embed_corpus(path: str, batch_size: int = 64) -> int:
         sent += len(batch)
     return sent
 ```
-Illustrative sizes: for a 4 GB JSONL corpus, the list-based version holds the parsed corpus plus every
-chunk in memory before the first API call. This pipeline holds one line, one parsed document and one
-batch of 64 × 800 characters (about 50 KB of text) at a time, and the first batch is ready to send within
-milliseconds of starting, instead of after the whole corpus is parsed. A malformed line is skipped and logged rather than killing a long job.
 
-To see the laziness, put a `print` in each stage and run it on a two-document file with 2,000-character
-texts. The output interleaves: read doc 1, chunk 1a, chunk 1b, chunk 1c, read doc 2, chunk 2a, and so on,
-with the batch closing once 64 chunks (or the end of input) arrive. A list pipeline would print every
-"read" before the first "chunk". The interleaving is the mechanism: `batched` pulls a chunk, `chunks`
-needs a document, `read_jsonl` resumes inside its `for` over the file, reads one line, and suspends
-again at `yield`, with the file still open and the line counter intact.
+**Worked sizes (illustrative), 4 GB JSONL corpus:**
+| | List-based | This pipeline |
+|---|---|---|
+| Held in memory | Parsed corpus plus every chunk, before the first API call | One line, one parsed document, one batch of 64 × 800 characters (about 50 KB of text) |
+| First batch ready | After the whole corpus is parsed | Within milliseconds of starting |
+| Malformed line | Often kills the job | Skipped and logged |
+
+**See the laziness:** put a `print` in each stage and run it on a two-document file with 2,000-character
+texts.
+1. Output interleaves: read doc 1, chunk 1a, chunk 1b, chunk 1c, read doc 2, chunk 2a, and so on.
+2. The batch closes once 64 chunks (or the end of input) arrive.
+3. A list pipeline would print every "read" before the first "chunk".
+4. The mechanism: `batched` pulls a chunk, `chunks` needs a document, `read_jsonl` resumes inside its `for`
+   over the file, reads one line, and suspends again at `yield`, with the file still open and the line
+   counter intact.
+
+### Stop a token stream early, cleanly
+An async generator stands in for a provider's SSE stream. With `aclosing`, breaking out runs the
+generator's async `finally` before the next line, so the connection is released at a known point.
+
+```python
+import asyncio
+from contextlib import aclosing
+
+async def token_stream(prompt: str):
+    print("open connection")
+    try:
+        for tok in ["The", " answer", " is", " 42", "."]:
+            await asyncio.sleep(0.01)          # stands in for an SSE chunk arriving
+            yield tok
+    finally:
+        await asyncio.sleep(0)                 # async cleanup, e.g. await response.aclose()
+        print("connection closed")
+
+async def first_n(n: int) -> str:
+    out = []
+    async with aclosing(token_stream("q")) as stream:
+        async for tok in stream:
+            out.append(tok)
+            if len(out) == n:
+                break                          # aclosing awaits aclose() as the block exits
+    print("after block")
+    return "".join(out)
+
+print(asyncio.run(first_n(2)))
+# open connection / connection closed / after block / The answer
+```
+Without `aclosing`, "connection closed" would print only when the event loop finalises the generator,
+which under load means connections held open well past the request.
+
+## Production patterns
+- **Batch at the boundary to the API.** Feed generator stages into `itertools.batched(it, n)` (3.12+), or on
+  older Pythons `while batch := tuple(islice(it, n)): ...`, sized to the provider's max inputs per call.
+  Monitor peak RSS and items per second.
+- **Checkpoint the position, not the data.** Yield the line number or record id with each item and persist the
+  last fully processed one every N batches, so a crash at item 900,000 resumes instead of restarting.
+  Monitor checkpoint age.
+- **Count and quarantine bad records.** Replace the `print` in `read_jsonl` with a counter and a write to a
+  dead-letter file. Alert on malformed-record rate, because a spike usually means an upstream format change.
+- **Stream responses with an async generator.** Pass an async generator to FastAPI's `StreamingResponse`,
+  open the upstream stream inside it, and release it in `finally`. Monitor open upstream connections and
+  stream duration after client disconnects.
+- **Paginate APIs as a generator.** Wrap cursor pagination in a generator that yields items and fetches the
+  next page only when the consumer needs it, so `islice(items(), 100)` stops after the pages it used. Monitor
+  pages fetched per job.
 
 ## Trade-offs
-- Lazy pipelines keep memory flat and deliver first results early, but each item is produced once; if
-  you need random access, `len()` or several passes, materialise to a list or reopen the source.
-- Generators make streaming code read like a plain loop, but errors surface at consumption time, not
-  at the call, so a traceback may point at the consumer far from the faulty stage.
-- Per-item generator overhead is negligible for I/O-bound work, but for numeric hot loops over millions
-  of small values, vectorised NumPy or Polars operations are far faster than yielding Python objects.
-- Async generators expose network streams naturally, at the cost of trickier cleanup when consumers
-  stop early; for complex flows a bounded `asyncio.Queue` between tasks can be clearer.
+- **Flat memory vs single pass.** Lazy pipelines keep memory flat and deliver first results early, but each
+  item is produced once. For random access, `len()` or several passes, materialise to a list or reopen the
+  source.
+- **Plain-loop readability vs late errors.** Streaming code reads like a plain loop, but errors surface at
+  consumption time, not at the call, so a traceback may point at the consumer far from the faulty stage.
+- **Negligible overhead vs numeric hot loops.** Per-item overhead is negligible for I/O-bound work, but over
+  millions of small values vectorised NumPy or Polars operations are far faster than yielding Python objects.
+- **Natural streams vs cleanup.** Async generators expose network streams naturally, at the cost of trickier
+  cleanup when consumers stop early. For complex flows, a bounded `asyncio.Queue` between tasks can be clearer.
 
 ## Pitfalls
-- Iterating the same generator twice, for example once to count and once to process; the second pass
+- **Iterating the same generator twice**, for example once to count and once to process. The second pass
   silently yields nothing and an eval reports zero results.
-- Calling a generator function and expecting side effects; nothing runs until it is iterated, so a
-  "write records" generator that is never consumed writes nothing.
-- Breaking out of an async generator that wraps an HTTP stream without `aclosing`; the symptom is
+- **Expecting side effects from a call.** Nothing runs until iteration, so a "write records" generator that
+  is never consumed writes nothing.
+- **Breaking out of an async generator wrapping an HTTP stream without `aclosing`.** Symptom:
   connection-pool exhaustion or "unclosed" warnings under load.
-- Wrapping a generator call in `try/except` expecting to catch its errors; exceptions are raised later
-  during iteration, outside the handler, so the guard never triggers.
-- Converting the pipeline to a list for debugging (`list(gen)`) and leaving it in; memory use returns
-  to dataset-sized and the job slows on large inputs.
-- Calling `next(it)` inside a generator on an iterator that may be exhausted; since PEP 479 the stray
-  `StopIteration` is converted to `RuntimeError: generator raised StopIteration` instead of silently
-  ending the outer generator, so use `next(it, None)` or catch it explicitly.
-- Sharing one generator between threads or DataLoader-style workers; the symptom is
-  `ValueError: generator already executing` or duplicated and missing items, so give each worker its own
-  source or put a `queue.Queue` between them.
+- **`try/except` around the generator call.** Exceptions are raised later during iteration, outside the
+  handler, so the guard never triggers.
+- **Leaving a debugging `list(gen)` in.** Memory returns to dataset-sized and the job slows on large inputs.
+- **Bare `next(it)` inside a generator on an iterator that may be exhausted.** Since PEP 479 the stray
+  `StopIteration` becomes `RuntimeError: generator raised StopIteration` instead of silently ending the outer
+  generator. Use `next(it, None)` or catch it explicitly.
+- **Sharing one generator between threads or DataLoader-style workers.** Symptom:
+  `ValueError: generator already executing` or duplicated and missing items. Give each worker its own source
+  or put a `queue.Queue` between them.
 
 ## When to use
-Use generators whenever you process sequences that are large, slow to arrive or potentially unbounded:
-reading JSONL and Parquet exports row by row, chunking documents for embedding, batching requests,
-paginating through an API, and streaming model output to a client. FastAPI's `StreamingResponse` and most
-SDK streaming interfaces accept or return (async) iterators. Prefer a list when the data is small and you
-need it more than once. Measure peak memory before and after converting a list pipeline. In interviews,
-expect to explain laziness, single-pass behaviour, `yield from`, and how async generators relate to
-token streaming.
+- **Use when** sequences are large, slow to arrive or potentially unbounded: reading JSONL and Parquet exports
+  row by row, chunking documents for embedding, batching requests, paginating an API, streaming model output
+  to a client. FastAPI's `StreamingResponse` and most SDK streaming interfaces accept or return (async)
+  iterators.
+- **Prefer a list when** the data is small and you need it more than once.
+- **Measure:** peak memory before and after converting a list pipeline.
+- **Interviews:** explain laziness, single-pass behaviour, `yield from`, and how async generators relate to
+  token streaming.
 
 ## Role lens
 - **Engineer:** Writes ingestion and eval pipelines as generator stages with batching, and wraps

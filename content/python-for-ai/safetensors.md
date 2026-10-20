@@ -5,7 +5,7 @@ name: safetensors
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: reviewed
+status: crisp
 related:
   - python-for-ai/pytorch
   - python-for-ai/hugging-face
@@ -19,19 +19,29 @@ sources:
 ---
 
 ## TL;DR
-safetensors is a file format for storing tensors: a small JSON header describing each tensor's name,
-dtype, shape and byte offsets, followed by the raw bytes. It replaced pickle-based PyTorch checkpoints
-on the Hugging Face Hub because loading a pickle can execute arbitrary code, while loading safetensors
-only reads numbers, and because its layout lets weights be memory-mapped and loaded lazily and fast.
+safetensors stores tensors as a small JSON header (name, dtype, shape, byte offsets) plus raw bytes.
+It replaced pickle checkpoints on the Hugging Face Hub because loading it runs no code, and its layout
+allows fast, lazy, memory-mapped loading.
 
 ## Why it exists
-For years the default way to save PyTorch weights was `torch.save`, which uses Python's `pickle`. Pickle
-is not a data format; it is a small program that the unpickler executes to rebuild objects, and that
-program can call any importable function, including `os.system`. So a `.bin` or `.pt` checkpoint
-downloaded from the internet is executable code. Once model hubs made it routine to pull weights from
-strangers, "load a model" became "run an untrusted program", and malicious pickles were found in the
-wild. The mechanism fits in four lines: any object can tell pickle how to rebuild it via `__reduce__`,
-and the rebuild recipe is "call this function with these arguments".
+- **Pickle checkpoints are programs.** `torch.save` uses Python's `pickle`, which is not a data format: it
+  is a small program the unpickler executes to rebuild objects, and it can call any importable function,
+  including `os.system`. A downloaded `.bin` or `.pt` checkpoint is executable code.
+- **Hubs made that routine.** Once pulling weights from strangers was normal, "load a model" became "run
+  an untrusted program", and malicious pickles were found in the wild.
+- **Pickle loading is also slow and all-or-nothing.** Unpickling copies data into freshly allocated
+  memory, sometimes twice when moving to GPU, and you cannot read one tensor without parsing the whole
+  file, so partial loading (sharding across GPUs, inspecting one layer) was awkward.
+- **`weights_only=True` narrows but does not remove the risk.** `torch.load(..., weights_only=True)`
+  restricts the unpickler to an allow-list of types; it is the right default for legacy files (recent
+  PyTorch releases made it the default). But it still runs a pickle interpreter over untrusted input, and
+  its safety rests on the allow-list having no holes.
+- **safetensors removes the interpreter.** The format cannot express code, so there is nothing to
+  restrict. (`torch.load(..., mmap=True)` on the newer zip-based checkpoint format narrows the speed gap,
+  but not the security one.)
+
+The mechanism fits in four lines: any object can tell pickle how to rebuild it via `__reduce__`, and the
+rebuild recipe is "call this function with these arguments".
 
 ```python
 import pickle
@@ -43,61 +53,49 @@ pickle.loads(pickle.dumps(Payload()))               # prints: the call happens i
 
 Nothing in a checkpoint file distinguishes "rebuild a tensor" from "call os.system"; both are calls.
 
-There was also a performance problem. Unpickling builds tensors by copying data into freshly allocated
-memory, so loading a large model needs the bytes read and copied, sometimes twice when moving to GPU,
-and you cannot read one tensor without parsing the whole file. Partial loading, needed to shard a model
-across GPUs or to load one layer for inspection, was awkward.
-
-The naive fix, `torch.load(..., weights_only=True)`, restricts the unpickler to an allow-list of types
-and is the right default for legacy files (recent PyTorch releases made it the default). But it still
-runs a pickle interpreter over untrusted input, and its safety rests on the allow-list having no holes.
-(`torch.load(..., mmap=True)` on the newer zip-based checkpoint format narrows the speed gap, but not
-the security one.)
-safetensors removes the interpreter entirely: the format has no way to express code, so there is nothing
-to restrict.
-
 ## How it works
 ### File layout
 1. **8 bytes:** an unsigned little-endian 64-bit integer N, the size of the header.
 2. **N bytes:** a UTF-8 JSON object. Each key is a tensor name mapping to
-   `{"dtype": "BF16", "shape": [4096, 4096], "data_offsets": [begin, end]}`; an optional
-   `"__metadata__"` key holds string-to-string metadata such as the format or training info.
-   The reference writer pads the header with spaces so the data buffer starts 8-byte aligned, which
-   lets loaders view tensors in place without an alignment copy.
-3. **The rest:** one contiguous byte buffer; each tensor occupies `[begin, end)` relative to the start
-   of this buffer, stored row-major with no padding inside a tensor.
+   `{"dtype": "BF16", "shape": [4096, 4096], "data_offsets": [begin, end]}`. An optional `"__metadata__"`
+   key holds string-to-string metadata such as the format or training info.
+3. **The rest:** one contiguous byte buffer. Each tensor occupies `[begin, end)` relative to the start of
+   this buffer, stored row-major with no padding inside a tensor.
 
-Every design choice follows from "the loader should only ever read". JSON can only describe data. The
-header is parsed first and validated (offsets must be in bounds and not overlap, sizes must match
-`dtype × shape`) before any tensor bytes are touched, which blocks malformed files that try to trigger
-out-of-bounds reads.
+- **Aligned data.** The reference writer pads the header with spaces so the data buffer starts 8-byte
+  aligned, letting loaders view tensors in place without an alignment copy.
+
+### Why each choice: "the loader should only ever read"
+- **JSON can only describe data.**
+- **Validate before touching bytes.** The header is parsed and checked first (offsets in bounds and
+  non-overlapping, sizes matching `dtype × shape`), which blocks malformed files that try to trigger
+  out-of-bounds reads.
 
 ### Zero-copy and lazy loading
-Because each tensor sits at a known offset in raw form, the file can be memory-mapped: the operating
-system maps it into the address space and pages in only the bytes actually read. Locating a slice is
-pure arithmetic: for a row-major `[rows, cols]` tensor of element size `b` starting at `begin`, row `i`
-lives at bytes `begin + i·cols·b` to `begin + (i+1)·cols·b`, so no parsing of the payload is needed. `safe_open` returns a
-handle where `get_tensor(name)` materialises one tensor and `get_slice(name)[a:b]` reads only a slice,
-which is how tensor-parallel loaders give each GPU just its shard of a weight matrix without reading the
-rest.
+- **Memory-mapped.** Each tensor sits raw at a known offset, so the OS maps the file into the address space
+  and pages in only the bytes actually read.
+- **Slices are pure arithmetic.** For a row-major `[rows, cols]` tensor of element size `b` starting at
+  `begin`, row `i` lives at bytes `begin + i·cols·b` to `begin + (i+1)·cols·b`; no payload parsing.
+- **`safe_open` handles.** `get_tensor(name)` materialises one tensor and `get_slice(name)[a:b]` reads only
+  a slice. That is how tensor-parallel loaders give each GPU just its shard of a weight matrix without
+  reading the rest.
 
 ### Sharding
-Large models are split into several files (`model-00001-of-00004.safetensors`, ...) plus
-`model.safetensors.index.json`, which maps each tensor name to its shard. Loaders read the index,
-then open only the shards they need.
+- **Several files plus an index:** `model-00001-of-00004.safetensors`, ... and
+  `model.safetensors.index.json`, which maps each tensor name to its shard.
+- **Loaders read the index**, then open only the shards they need.
 
 ### Framework neutrality
-The format stores dtype and raw bytes, not Python objects, so the same file loads into PyTorch, NumPy,
-JAX/Flax, TensorFlow or Rust code (`safetensors.torch`, `safetensors.numpy`, ...).
+- **Raw bytes plus dtype, not Python objects**, so one file loads into PyTorch, NumPy, JAX/Flax,
+  TensorFlow or Rust code (`safetensors.torch`, `safetensors.numpy`, ...).
 
 ### What it deliberately does not store
-No optimizer state objects, no model class, no arbitrary Python. Tensors that share memory (tied
-embedding weights) cannot be saved as aliases; `save_file` refuses them, and helpers such as
-`save_model` deduplicate them and rely on the loading code to re-tie.
+- **No optimizer state objects, no model class, no arbitrary Python.**
+- **No aliases.** Tensors sharing memory (tied embedding weights) cannot be saved as aliases: `save_file`
+  refuses them, while helpers such as `save_model` deduplicate them and rely on the loading code to re-tie.
 
-## Example
-Save, load lazily, and read the header by hand to see that it is just JSON.
-
+## Examples
+### Save, load lazily, and read the header by hand
 ```python
 import json, struct, torch
 from safetensors.torch import save_file, load_file
@@ -122,42 +120,89 @@ with safe_open("model.safetensors", framework="pt", device="cpu") as f:
 full = load_file("model.safetensors")                  # dict[str, Tensor]
 ```
 
-The embedding is 32,000 × 512 × 2 bytes = 32,768,000 bytes, exactly `end - begin` in its
-`data_offsets`; where each tensor starts depends on the writer's ordering, so read offsets, never assume them.
-The 1,000-row slice touches 1,000 × 512 × 2 = 1,024,000 bytes, about 3% of the tensor, which is the
-whole argument for lazy loading when each of eight tensor-parallel ranks needs only an eighth of every
-matrix. Note the header is readable with `json` and `struct` alone: an auditor can list every tensor,
-dtype and shape in a file without installing any ML library or trusting any code.
+| Quantity | Value |
+|---|---|
+| Embedding size | 32,000 × 512 × 2 bytes = 32,768,000 bytes, exactly `end - begin` in its `data_offsets` |
+| 1,000-row slice | 1,000 × 512 × 2 = 1,024,000 bytes, about 3% of the tensor |
+
+- **Read offsets, never assume them**, because where each tensor starts depends on the writer's ordering.
+- **Lazy loading pays off** when each of eight tensor-parallel ranks needs only an eighth of every matrix.
+- **Auditable with the standard library.** `json` and `struct` alone list every tensor, dtype and shape,
+  with no ML library installed and no code trusted.
+
+### Convert a legacy checkpoint in a sandbox
+The intake step for an external `.bin`: load with the restricted unpickler in an isolated job, write
+safetensors, ship only the result.
+
+```python
+import torch
+from safetensors.torch import save_file
+
+sd = torch.load("pytorch_model.bin", map_location="cpu", weights_only=True)   # allow-list unpickler
+sd = {k: v.contiguous() for k, v in sd.items()}        # save_file requires contiguous tensors
+save_file(sd, "model.safetensors", metadata={"format": "pt", "source": "pytorch_model.bin"})
+# Tied weights raise a shared-tensor error here; for a full model use safetensors.torch.save_model.
+```
+
+### Worked scenario: one weight matrix across eight ranks
+A `[4096, 4096]` BF16 projection split row-wise for tensor parallelism:
+
+| Item | Bytes |
+|---|---|
+| Whole matrix: 4096 × 4096 × 2 | 33,554,432 |
+| One rank's 512 rows: 512 × 4096 × 2 | 4,194,304 |
+| Read by all 8 ranks with `get_slice` | 33,554,432 in total, each byte once |
+| Read by all 8 ranks with full loads | 268,435,456, then 7/8 discarded |
+
+## Production patterns
+- **Reject external pickles at the door.** CI or the model registry blocks `.bin`/`.pt`/`.pkl` artifacts
+  from outside sources unless converted in a sandbox (as above). Monitor rejection counts and who tried.
+- **Force safetensors at load.** Pass `use_safetensors=True` to `from_pretrained` so Transformers errors
+  instead of silently falling back to a pickle file in the repo. Alert on any load error that someone
+  "fixes" with `weights_only=False`.
+- **Stage weights on local NVMe.** Copy checkpoints from network or object storage to local disk before
+  memory-mapped loading. Monitor cold-start time to first token per storage path.
+- **Stamp provenance in metadata.** Write source repo, revision and training run into `__metadata__`
+  (string-to-string), and read it back with `f.metadata()` at deploy time. Fail the deploy if it is
+  missing.
+- **Audit headers before promotion.** Parse the header with `json` and `struct`, and check tensor names,
+  dtypes and shapes against the expected config. Flag unexpected tensors or dtypes.
 
 ## Trade-offs
-- No code execution on load removes a whole class of supply-chain attacks, but the format can only
-  hold tensors; tokenizer files, configs and training state need their own (also non-executable) formats.
-- Memory-mapping makes loading fast and lazy on local disk, but on network filesystems or object
-  storage mounts page faults can be slow; copying to local NVMe first often wins for large models.
-- Framework-neutral raw bytes make files portable, but you lose the convenience of pickling an entire
-  object graph; full training checkpoints with optimizer and scheduler state still often use `torch.save`.
-- safetensors is the standard for Transformers-style checkpoints, but llama.cpp-style local inference
-  uses GGUF, which also embeds tokenizer metadata and quantized types; conversion is a deployment step.
+- **No code on load vs tensors only.** It removes a whole class of supply-chain attacks, but the format
+  only holds tensors; tokenizer files, configs and training state need their own (also non-executable)
+  formats.
+- **Memory-mapped speed vs slow storage.** Loading is fast and lazy on local disk, but on network
+  filesystems or object storage mounts page faults can be slow; copying to local NVMe first often wins
+  for large models.
+- **Portability vs object graphs.** Framework-neutral raw bytes travel anywhere, but you lose pickling an
+  entire object graph; full training checkpoints with optimizer and scheduler state still often use
+  `torch.save`.
+- **Transformers standard vs GGUF.** safetensors is the standard for Transformers-style checkpoints, but
+  llama.cpp-style local inference uses GGUF, which also embeds tokenizer metadata and quantized types;
+  conversion is a deployment step.
 
 ## Pitfalls
-- Assuming safetensors makes a model trustworthy: it only guarantees loading runs no code; the weights
+- **Assuming safetensors makes a model trustworthy.** It only guarantees loading runs no code; weights
   can still be backdoored, and `trust_remote_code` model classes can still execute arbitrary Python.
-- Loading legacy `.bin` files with `weights_only=False` because a load error appeared: this re-enables
-  arbitrary code execution, and the symptom you were fixing was the safety check working.
-- Saving a model with tied weights via `save_file` directly: it raises an error about shared tensors,
-  and naive workarounds that clone the tensors store the bytes twice; the tie then survives only if the
-  loading code re-ties the parameters, which `save_model` / `load_model` handle for you.
-- Forgetting the index file when copying sharded checkpoints: loaders fail to find tensors or load
-  only part of the model, and the error names a missing key rather than a missing file.
+- **Loading legacy `.bin` files with `weights_only=False` because a load error appeared.** This re-enables
+  arbitrary code execution; the symptom you were fixing was the safety check working.
+- **Saving tied weights via `save_file` directly.** It raises an error about shared tensors; naive
+  workarounds that clone the tensors store the bytes twice, and the tie then survives only if loading code
+  re-ties the parameters, which `save_model` / `load_model` handle for you.
+- **Forgetting the index file when copying sharded checkpoints.** Loaders fail to find tensors or load only
+  part of the model, and the error names a missing key rather than a missing file.
 
 ## When to use
-Use safetensors for any weights you publish, download, mirror or move between teams, and convert legacy
-pickle checkpoints when you take them in. Make "no pickle from outside" a policy: CI or the model
-registry rejects `.bin`/`.pt`/`.pkl` artifacts from external sources unless they are converted in a
-sandbox. Keep `torch.save` only for internal training-resume checkpoints that hold optimizer state, and
-never load those from untrusted locations. When loading time matters, measure time to first token after
-a cold start with memory-mapped local files versus network storage. In interviews, be ready to explain
-why pickle is unsafe and what memory mapping buys.
+- **Use for** any weights you publish, download, mirror or move between teams; convert legacy pickle
+  checkpoints when you take them in.
+- **Policy:** "no pickle from outside". CI or the model registry rejects `.bin`/`.pt`/`.pkl` artifacts
+  from external sources unless converted in a sandbox.
+- **Keep `torch.save` only** for internal training-resume checkpoints holding optimizer state, and never
+  load those from untrusted locations.
+- **Measure** time to first token after a cold start with memory-mapped local files versus network
+  storage, when loading time matters.
+- **Interviews:** explain why pickle is unsafe and what memory mapping buys.
 
 ## Role lens
 - **Engineer:** Saves and loads weights with safetensors, converts legacy checkpoints, and uses

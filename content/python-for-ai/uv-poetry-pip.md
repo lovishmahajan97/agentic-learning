@@ -5,7 +5,7 @@ name: uv / poetry / pip
 kind: tool
 difficulty: intro
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -21,27 +21,23 @@ sources:
 ---
 
 ## TL;DR
-pip installs packages; Poetry and uv manage whole projects: declared dependencies in `pyproject.toml`, a
-resolved lockfile, virtual environments and builds. The reason to care is reproducibility: an AI service
-depends on a deep, fast-moving stack (SDKs, torch, tokenizers), and "it worked on my machine" is almost
-always two environments resolving to different versions. uv does what pip, pip-tools, virtualenv, pyenv and
-pipx do, much faster, which is why many new projects now default to it.
+pip installs packages; Poetry and uv manage projects: `pyproject.toml` dependencies, a lockfile,
+environments and builds. AI stacks are deep and fast-moving, so reproducibility matters; uv replaces pip,
+pip-tools, virtualenv, pyenv and pipx, much faster.
 
 ## Why it exists
-A Python project needs four things: a list of what it depends on, an exact resolved set of versions that
-satisfies all constraints, an isolated environment holding those versions, and a way to build and publish
-itself. pip historically did only the install step. It has a real resolver (it backtracks to satisfy
-constraints), but out of the box it does not record the result in a lockfile, does not create environments,
-and does not distinguish "what I asked for" from "what I ended up with". (A standard lockfile format,
-`pylock.toml`, was only accepted as PEP 751 in 2025, and pip's `pip lock` command that writes it is still
-marked experimental; most teams therefore still get locking from pip-tools, Poetry or uv.)
-
-The naive workflow, `pip install` things into a venv and `pip freeze > requirements.txt`, mixes those
-concerns. The freeze captures whatever happens to be installed, including leftovers from experiments, for
-one OS and one Python version, with no record of which packages were direct requirements. Upgrading one
-library means hand-editing pins and hoping the set is still consistent. Tools such as pip-tools, Poetry and
-uv exist to separate *intent* (ranges in `pyproject.toml`) from *resolution* (an exact lockfile), and to make
-recreating the environment one deterministic command.
+- **A project needs four things.** A list of what it depends on, an exact resolved set of versions satisfying
+  all constraints, an isolated environment holding them, and a way to build and publish itself.
+- **pip historically did only the install step.** It has a real backtracking resolver, but out of the box it
+  records no lockfile, creates no environments, and does not distinguish "what I asked for" from "what I
+  ended up with".
+- **Standard locking is new.** `pylock.toml` was accepted as PEP 751 only in 2025, and pip's `pip lock`
+  command that writes it is still marked experimental; most teams get locking from pip-tools, Poetry or uv.
+- **`pip freeze > requirements.txt` mixes concerns.** It captures whatever is installed, including experiment
+  leftovers, for one OS and one Python version, with no record of which packages were direct requirements.
+  Upgrading one library means hand-editing pins and hoping the set is still consistent.
+- **The fix is separation.** pip-tools, Poetry and uv separate *intent* (ranges in `pyproject.toml`) from
+  *resolution* (an exact lockfile), and make recreating the environment one deterministic command.
 
 ## How it works
 ### What every tool is doing underneath
@@ -58,124 +54,201 @@ All three run the same pipeline, and knowing it explains most failures:
    back to the source distribution and build it locally.
 4. **Install.** Unpack into the environment's `site-packages` and write the record of what was installed.
 
-Two consequences follow. Resolution is slow when metadata is expensive to get: an sdist with a dynamic
-`setup.py` has to be *built* just to learn its dependencies, which is why a resolve can stall on one old
-package. And the answer depends on the platform, *because* markers and available wheels differ between a
-Mac laptop and a Linux container, which is the root of "the lock works for me but not in CI".
+Two consequences follow:
+- **Resolution is slow when metadata is expensive.** An sdist with a dynamic `setup.py` must be *built* just
+  to learn its dependencies, which is why a resolve can stall on one old package.
+- **The answer depends on the platform,** *because* markers and available wheels differ between a Mac laptop
+  and a Linux container: the root of "the lock works for me but not in CI".
 
 ### pip (+ venv, + pip-tools)
-`python -m venv .venv` creates an isolated interpreter environment; `pip install -r requirements.txt` resolves
-and installs into it from PyPI or another index. pip prefers wheels (pre-built archives) and falls back to
-building from source distributions, which is where compiler and CUDA errors come from. pip-tools adds
-`pip-compile`, which turns a short `requirements.in` (or `pyproject.toml`) into a fully pinned, optionally
-hashed `requirements.txt`, and `pip-sync`, which makes the environment match it exactly. This is the minimal,
-widely understood baseline, and every other tool can export to it.
+- **Environment:** `python -m venv .venv` creates an isolated interpreter environment.
+- **Install:** `pip install -r requirements.txt` resolves and installs from PyPI or another index.
+- **Wheels first:** pip prefers wheels (pre-built archives) and falls back to building source distributions,
+  which is where compiler and CUDA errors come from.
+- **pip-tools:** `pip-compile` turns a short `requirements.in` (or `pyproject.toml`) into a fully pinned,
+  optionally hashed `requirements.txt`; `pip-sync` makes the environment match it exactly.
+- **Role:** the minimal, widely understood baseline; every other tool can export to it.
 
 ### Poetry
-Poetry is a project manager: `poetry add httpx` updates `pyproject.toml`, re-resolves and writes
-`poetry.lock`; `poetry install` creates or reuses a virtual environment and installs exactly what the lock
-says; dependency groups separate dev and test tools; `poetry build` and `poetry publish` handle packaging.
-Recent major versions also read standard PEP 621 `[project]` metadata rather than only its own
-`[tool.poetry]` tables. Poetry's strength is a mature, integrated workflow for libraries and applications;
-its historical weaknesses were resolution speed on large graphs and friction with non-PyPI wheel indexes.
+| Command | Effect |
+|---|---|
+| `poetry add httpx` | updates `pyproject.toml`, re-resolves, writes `poetry.lock` |
+| `poetry install` | creates or reuses a venv, installs exactly what the lock says |
+| dependency groups | separate dev and test tools |
+| `poetry build` / `poetry publish` | packaging |
+
+- **Standards:** recent major versions read PEP 621 `[project]` metadata, not only `[tool.poetry]` tables.
+- **Strength:** a mature, integrated workflow for libraries and applications.
+- **Historical weaknesses:** resolution speed on large graphs and friction with non-PyPI wheel indexes.
 
 ### uv
 uv, from Astral, is written in Rust and covers the whole toolchain:
-- **Project workflow:** `uv init`, `uv add`, `uv lock` (writes `uv.lock`), `uv sync` (makes `.venv` match the
-  lock), `uv run <cmd>` (syncs if needed, then runs inside the environment). In CI, `uv sync --locked` fails if
-  the lock is out of date with `pyproject.toml`, and `--frozen` uses the lock without checking.
-- **Universal lockfile:** `uv.lock` records resolutions for all platforms and Python versions the project
-  supports, so one lock serves macOS laptops and Linux containers.
-- **Python versions:** `uv python install 3.12` downloads interpreters, replacing pyenv for many teams.
-- **pip-compatible interface:** `uv pip install`, `uv pip compile`, `uv pip sync` work as drop-ins for
-  existing requirements-based projects, which makes adoption incremental.
-- **Tools and scripts:** `uvx ruff` runs a CLI tool in a throwaway environment; `uv run script.py` honors
-  inline script metadata (PEP 723) so a one-file script can declare its own dependencies.
-- **Indexes:** per-package index pinning (`[tool.uv.sources]`) handles the classic AI pain of installing
-  `torch` from a CUDA-specific index while everything else comes from PyPI.
 
-uv is fast *because* of a parallel resolver and downloader, a global cache whose files are cloned
-(copy-on-write, the default on macOS), hard-linked (the default on Linux) or copied into environments instead
-of being re-downloaded and re-unpacked, and reading wheel metadata without fetching whole wheels
-where indexes allow. The practical effect is that recreating an environment becomes cheap enough to do on
-every CI run and in every Docker build.
+| Area | Commands and behaviour |
+|---|---|
+| **Project workflow** | `uv init`, `uv add`, `uv lock` (writes `uv.lock`), `uv sync` (makes `.venv` match the lock), `uv run <cmd>` (syncs if needed, then runs in the environment) |
+| **CI flags** | `uv sync --locked` fails if the lock is out of date with `pyproject.toml`; `--frozen` uses the lock without checking |
+| **Universal lockfile** | `uv.lock` records resolutions for all platforms and Python versions the project supports, so one lock serves macOS laptops and Linux containers |
+| **Python versions** | `uv python install 3.12` downloads interpreters, replacing pyenv for many teams |
+| **pip-compatible interface** | `uv pip install`, `uv pip compile`, `uv pip sync` are drop-ins for requirements-based projects, so adoption is incremental |
+| **Tools and scripts** | `uvx ruff` runs a CLI in a throwaway environment; `uv run script.py` honors inline script metadata (PEP 723) |
+| **Indexes** | per-package index pinning (`[tool.uv.sources]`) installs `torch` from a CUDA-specific index while everything else comes from PyPI |
 
-## Example
-The same project, three ways. The scenario: a FastAPI RAG service that needs `openai`, `httpx` and
-`torch` (CPU wheels in CI), plus `pytest` as a dev dependency.
+uv is fast *because* of:
+- a parallel resolver and downloader;
+- a global cache whose files are cloned (copy-on-write, the default on macOS), hard-linked (the default on
+  Linux) or copied into environments instead of being re-downloaded and re-unpacked;
+- reading wheel metadata without fetching whole wheels where indexes allow.
 
-- **pip + pip-tools:** keep `requirements.in` with `openai>=1.40`, `httpx`, `torch`; run
-  `pip-compile --generate-hashes requirements.in` to get a pinned, hashed `requirements.txt`; a separate
-  `dev.in` with `-c requirements.txt` and `pytest`. CI runs `python -m venv .venv` then
-  `pip install --require-hashes -r requirements.txt`. Two files per environment, and a Mac developer who
-  needs different wheels may need a separately compiled file.
-- **Poetry:** `poetry add openai httpx torch` and `poetry add --group dev pytest`; commit `pyproject.toml` and
-  `poetry.lock`; CI runs `poetry install`. Pointing torch at the PyTorch CPU index needs a configured source
-  and an explicit source on that dependency.
-- **uv:** `uv init`, `uv add openai httpx torch`, `uv add --dev pytest`, then route only `torch` to the
-  PyTorch CPU index:
+Effect: recreating an environment is cheap enough to do on every CI run and in every Docker build.
 
-  ```toml
-  [[tool.uv.index]]
-  name = "pytorch-cpu"
-  url = "https://download.pytorch.org/whl/cpu"
-  explicit = true            # used only by packages that name it, never as a general fallback
+## Diagram
+Humans edit intent, a resolver turns it into an exact lock, and every environment (laptop, CI, Docker) is
+built only from that lock; the resolve step is where markers and wheel tags make the answer platform-specific.
 
-  [tool.uv.sources]
-  torch = { index = "pytorch-cpu" }
-  ```
+```mermaid
+flowchart LR
+    I["pyproject.toml: direct deps as ranges"] --> C["Collect constraints and markers recursively"]
+    C --> RS["Resolve: backtracking or PubGrub search"]
+    RS -->|"conflict"| X["Explanation chain: fix the constraint"]
+    RS -->|"one version per package"| L[("Lockfile: uv.lock, poetry.lock or pinned requirements.txt")]
+    L --> A["Pick artifacts: matching wheel tag, else build sdist"]
+    A --> V["Install into .venv site-packages"]
+    V --> D1["Laptop: uv sync"]
+    V --> D2["CI: uv sync --locked"]
+    V --> D3["Docker: uv sync --locked --no-dev"]
+```
 
-  `explicit = true` matters *because* an index that is searched for every package lets a same-named
-  package on it shadow the PyPI one, the dependency-confusion pattern. Commit `pyproject.toml` and
-  `uv.lock`. CI runs `uv sync --locked` then `uv run pytest`. The Docker build copies the
-  two files first and runs `uv sync --locked --no-dev`, so the dependency layer is cached until the lock
-  changes.
+## Examples
+### The same project, three ways
+A FastAPI RAG service needs `openai`, `httpx` and `torch` (CPU wheels in CI), plus `pytest` as a dev
+dependency.
 
-In all three, the rule is the same: humans edit ranges, a tool writes the exact lock, and CI and production
-install only from the lock.
+| | pip + pip-tools | Poetry | uv |
+|---|---|---|---|
+| Declare | `requirements.in` with `openai>=1.40`, `httpx`, `torch`; `dev.in` with `-c requirements.txt` and `pytest` | `poetry add openai httpx torch`; `poetry add --group dev pytest` | `uv init`; `uv add openai httpx torch`; `uv add --dev pytest` |
+| Lock | `pip-compile --generate-hashes requirements.in` → pinned, hashed `requirements.txt` | `poetry.lock` | `uv.lock` |
+| CI | `python -m venv .venv` then `pip install --require-hashes -r requirements.txt` | `poetry install` | `uv sync --locked` then `uv run pytest` |
+| Torch CPU index | separate index option | a configured source and an explicit source on that dependency | `[tool.uv.sources]` (below) |
+| Catch | two files per environment; a Mac developer needing different wheels may need a separately compiled file | | |
 
-When resolution fails, read the explanation rather than loosening pins at random. An illustrative case:
-the service needs `pydantic>=2`, and an older internal helper library declares `pydantic<2`. No version
-assignment satisfies both, so a PubGrub-style resolver reports the chain ("because helper==0.3 depends on
-pydantic<2 and you require pydantic>=2, helper==0.3 cannot be used..."). The fixes are, in order of
-preference: upgrade the helper to a release that supports pydantic 2, drop it, or, as a last resort, use
-an override and own the risk of running it against a version it never declared support for.
+Route only `torch` to the PyTorch CPU index with uv:
+
+```toml
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true            # used only by packages that name it, never as a general fallback
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+```
+
+- **`explicit = true` matters** *because* an index searched for every package lets a same-named package on it
+  shadow the PyPI one, the dependency-confusion pattern.
+- **Commit** `pyproject.toml` and `uv.lock`. The Docker build copies those two files first and runs
+  `uv sync --locked --no-dev`, so the dependency layer is cached until the lock changes.
+- **The rule in all three:** humans edit ranges, a tool writes the exact lock, and CI and production install
+  only from the lock.
+
+### Docker build that caches the dependency layer
+A common uv layout: dependencies install from the two lock files before the source is copied, so code
+changes do not reinstall packages.
+
+```dockerfile
+FROM python:3.12-slim
+# pin an exact uv release
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /uvx /bin/
+WORKDIR /app
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+# dependency layer: rebuilt only when the lock changes
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project
+# the project itself
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev
+CMD ["/app/.venv/bin/python", "-m", "myapp.entrypoints.api"]
+```
+
+### A one-file script that declares its own dependencies
+PEP 723 inline metadata; `uv run fetch_version.py` creates a throwaway environment with `httpx` and runs it.
+
+```python
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx>=0.27"]
+# ///
+import httpx
+
+info = httpx.get("https://pypi.org/pypi/openai/json", timeout=10).json()["info"]
+print(info["name"], info["version"])
+```
+
+### Worked scenario: reading a resolution failure
+Read the explanation rather than loosening pins at random. Illustrative case:
+
+| Step | What happens |
+|---|---|
+| Constraint A | the service needs `pydantic>=2` |
+| Constraint B | an older internal helper library declares `pydantic<2` |
+| Resolver | no assignment satisfies both; a PubGrub-style resolver reports the chain ("because helper==0.3 depends on pydantic<2 and you require pydantic>=2, helper==0.3 cannot be used...") |
+| Fix 1 (best) | upgrade the helper to a release that supports pydantic 2 |
+| Fix 2 | drop the helper |
+| Fix 3 (last resort) | an override, owning the risk of running it against a version it never declared support for |
+
+## Production patterns
+- **Locked installs everywhere.** CI runs `uv sync --locked` (or `poetry install` / `pip-sync` from a
+  compiled file) so an edited `pyproject.toml` without a re-lock fails the build. Monitor for lock drift
+  failures as a signal that developers skip `uv lock`.
+- **Pin the tool, not just the packages.** Pin the uv (or Poetry) version in CI and in the Docker image, for
+  example via the version input of the setup action or an exact image tag, so a tool upgrade does not change
+  lock behaviour under you. Upgrade it deliberately in its own pull request.
+- **Explicit per-package indexes.** Route `torch` and private packages to named indexes with
+  `explicit = true` instead of `--extra-index-url`. Check images for the expected wheel variant
+  (`torch.cuda.is_available()` on GPU hosts, image size on CPU ones).
+- **Export for platforms that want requirements files.** Keep uv or Poetry as the source of truth and
+  generate a pinned `requirements.txt` for the customer's mirror or platform from the lock, never by
+  hand.
+- **Lowest-bound CI job for libraries.** Run tests once with `--resolution lowest-direct` so declared lower
+  bounds are real. Watch it like any other required check.
+- **Refuse installs outside a venv.** Set `PIP_REQUIRE_VIRTUALENV=1` on developer machines and build hosts so
+  pip refuses to install into a system or base interpreter.
 
 ## Trade-offs
-- pip with pip-tools is the most portable and universally understood option, but you assemble venv, pinning,
-  syncing and Python versions yourself; it wins when an organization's tooling is already built around
-  requirements files.
-- Poetry gives an integrated, mature workflow with good publishing support, but is slower on large graphs and
-  adds its own conventions; it remains a reasonable choice for teams already standardized on it.
-- uv is dramatically faster and replaces several tools, but is younger, and new features have evolved
+- **pip + pip-tools: portable vs assembled by hand.** Universally understood, but you assemble venv, pinning,
+  syncing and Python versions yourself; wins when tooling is already built around requirements files.
+- **Poetry: integrated vs slower.** A mature workflow with good publishing support, but slower on large graphs
+  and with its own conventions; reasonable for teams already standardized on it.
+- **uv: fast vs young.** Dramatically faster and replaces several tools, but new features have evolved
   quickly; pin the uv version in CI so a tool upgrade does not change lock behaviour under you.
-- Resolving to the newest allowed versions is right for applications, but a library's declared lower
-  bounds are then never tested; for libraries, run CI once with uv's `--resolution lowest-direct` so
-  `httpx>=0.23` means what it claims.
-- A universal lockfile serves every platform from one file, but resolves for platforms you may never deploy
-  to, which can surface conflicts (often around CUDA wheels) that a single-platform lock would never hit.
+- **Newest versions vs tested lower bounds.** Resolving to the newest allowed versions is right for
+  applications, but a library's lower bounds are then never tested; run CI once with uv's
+  `--resolution lowest-direct` so `httpx>=0.23` means what it claims.
+- **Universal lock vs extra conflicts.** One file serves every platform, but resolves for platforms you may
+  never deploy to, which can surface conflicts (often around CUDA wheels) a single-platform lock never hits.
 
 ## Pitfalls
-- Installing into the system or base conda interpreter instead of a project environment; the symptom is a
-  package upgrade for one project breaking another, permission errors on `pip install`, or (on distro and
-  Homebrew Pythons that adopt PEP 668) pip refusing with `externally-managed-environment`.
-- Committing `pyproject.toml` but not the lockfile for an application; the symptom is CI and production
-  resolving newer transitive versions than developers tested.
-- Mixing tools in one project (running `pip install` inside a uv- or Poetry-managed venv); the symptom is an
-  environment that drifts from the lock and gets silently reset or reports a different set on the next sync.
-- Adding an extra index with pip's `--extra-index-url` for one private package; the symptom is the
-  public index and the private one being treated as equals, so a public package with the same name (and a
-  higher version) can be installed in place of yours.
-- Letting the default index provide `torch`; the symptom is a multi-gigabyte CUDA wheel in a CPU-only image,
-  or a CPU-only build on a GPU host, discovered as slow images or `torch.cuda.is_available()` being False.
+- **Installing into the system or base conda interpreter.** Symptom: one project's upgrade breaks another,
+  permission errors on `pip install`, or (on distro and Homebrew Pythons that adopt PEP 668) pip refusing
+  with `externally-managed-environment`. Fix: a project environment.
+- **Committing `pyproject.toml` but not the lockfile** for an application. Symptom: CI and production resolve
+  newer transitive versions than developers tested.
+- **Mixing tools in one project** (`pip install` inside a uv- or Poetry-managed venv). Symptom: the
+  environment drifts from the lock and is silently reset, or reports a different set, on the next sync.
+- **`--extra-index-url` for one private package.** Symptom: public and private indexes are treated as equals,
+  so a public package with the same name (and a higher version) can replace yours.
+- **Letting the default index provide `torch`.** Symptom: a multi-gigabyte CUDA wheel in a CPU-only image, or
+  a CPU-only build on a GPU host, discovered as slow images or `torch.cuda.is_available()` being False.
 
 ## When to use
-For a new application or service, uv is a strong default: one tool for Python versions, environments,
-locking and running, fast enough for CI and Docker. Keep Poetry where a team already uses it well; migrating
-buys speed but costs churn. Use pip with pip-tools, or uv's pip interface, when your deployment platform or
-organization expects requirements files. Whatever the tool, measure success by one property: a fresh clone
-plus one command reproduces the exact environment CI tested. In interviews, explain the separation of
-intent from resolution rather than tool preferences.
+- **New application or service:** uv is a strong default: one tool for Python versions, environments,
+  locking and running, fast enough for CI and Docker.
+- **Team already on Poetry:** keep it if used well; migrating buys speed but costs churn.
+- **Platform expects requirements files:** pip with pip-tools, or uv's pip interface.
+- **Measure:** a fresh clone plus one command reproduces the exact environment CI tested.
+- **Interviews:** explain the separation of intent from resolution rather than tool preferences.
 
 ## Role lens
 - **Engineer:** Uses `uv add`/`uv sync` daily, keeps dev tools in a dev group, and configures the torch index
@@ -195,6 +268,40 @@ with ranges in `pyproject.toml`, generate a lock with a resolver (uv lock, Poetr
 the target platform), commit it, and have CI install only from it (`uv sync --locked`). The lock contains
 only what the declared dependencies need, so stray packages disappear, and it is resolved for Linux, so
 platform mismatches stop.
+
+## Interview questions
+### What is the difference between declaring dependencies and locking them?
+- **Declaring is intent:** ranges such as `openai>=1.40` in `pyproject.toml`, edited by humans.
+- **Locking is resolution:** one exact version (and usually hashes) for every direct and transitive package,
+  written by a tool into `uv.lock`, `poetry.lock` or a compiled `requirements.txt`.
+- **Why separate them:** upgrades re-resolve a consistent set in one command, and CI and production install
+  exactly what was tested.
+
+### Why might a lock that works on your Mac fail in a Linux CI container?
+- **Markers and wheels differ by platform:** a dependency may apply only on one OS, and the available wheel
+  tags (for example `manylinux_2_17_x86_64`) differ between machines.
+- **A single-platform lock** (such as a `pip freeze` or a pip-compile run on macOS) encodes the Mac answer.
+- **Fixes:** a universal `uv.lock`, or compile the requirements file for the target platform.
+
+### Your Docker image is several gigabytes larger than expected after adding `torch`. What happened and how do you fix it?
+- **Likely cause:** the default index supplied the CUDA build of `torch` in a CPU-only image.
+- **Fix with uv:** declare the PyTorch CPU index with `explicit = true` and route only `torch` to it via
+  `[tool.uv.sources]`.
+- **Avoid `--extra-index-url`** for this, because it treats both indexes as equals and opens the
+  dependency-confusion path.
+
+### When would you not migrate a team from Poetry to uv?
+- **When Poetry is used well:** locks committed, CI installs from them, and builds are fast enough; migration
+  buys speed but costs churn across repos and habits.
+- **When the platform dictates the format:** if a customer mirror accepts only requirements files, the
+  export step matters more than the tool.
+- **Migrate when** resolution speed, Python version management or per-package indexes are real pain.
+
+### How do you keep Docker builds fast when dependencies rarely change?
+- **Copy only `pyproject.toml` and `uv.lock` first** and run `uv sync --locked --no-dev --no-install-project`,
+  so that layer is cached until the lock changes.
+- **Copy the source afterwards** and run the final sync, so code edits do not reinstall packages.
+- **Use a cache mount** for the uv cache and pin an exact uv image tag so tool upgrades are deliberate.
 
 ## Quiz
 ### Q: What does `uv sync --locked` do in CI that plain `uv sync` does not?

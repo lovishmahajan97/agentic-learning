@@ -5,7 +5,7 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/hyde
@@ -21,89 +21,93 @@ sources:
 ---
 
 ## TL;DR
-The text a user types is written for a human, not for an index: it is short, refers to earlier turns,
-uses different words from the documents, and often buries one useful identifier in a wall of paste.
-Query rewriting inserts an LLM step between the user and the retriever that turns the raw input into
-one or more retrieval-friendly queries, because fixing the key at query time is far cheaper than
-re-indexing the corpus to tolerate every way a human might ask.
+Query rewriting puts a small LLM step between the user and the retriever that turns raw, conversational
+input into retrieval-friendly queries, because fixing the key at query time is far cheaper than
+re-indexing the corpus for every way a human might ask.
 
 ## Why it exists
-Every retriever rests on one assumption: the query and the relevant passage look alike. BM25 needs
-shared terms; dense retrieval needs nearby embeddings. Real queries break the assumption in predictable
-ways. A follow-up turn like "and on Android?" contains nothing retrievable on its own, because the
-subject lives three messages back and the retriever has no memory. A user writes "cancel my
-subscription" while the documentation says "terminate your plan", so the sparse leg finds nothing and the
-dense leg scores it as merely similar. A pasted stack trace of 200 lines swamps the embedding with
-boilerplate and drowns the one line, an error code, that would have matched exactly. Product names are
-abbreviated, misspelled or replaced by nicknames the documents never use.
-
-The naive alternatives each fail somewhere. Embedding the entire conversation history as the query
-dilutes the current intent with everything said before. Asking users to phrase questions better does not
-survive contact with users. Expanding the index with synonyms helps vocabulary mismatch but does nothing
-for conversational references or long pastes, and it bloats every document. The rewrite step sits at the
-one point where all the information is available at once: the conversation so far, the user's current
-message, and (via its prompt) the conventions of the corpus. An LLM is good at exactly this
-transformation, and a small one is enough.
+- **Retrievers assume the query looks like the passage.** BM25 needs shared terms; dense retrieval needs
+  nearby embeddings. User text is written for a human, not an index: short, referring to earlier turns,
+  in different words, or burying one useful identifier in a wall of paste.
+- **Real queries break the assumption predictably.**
+  - "and on Android?" has nothing retrievable alone: the subject is three messages back and the retriever
+    has no memory.
+  - "cancel my subscription" vs docs saying "terminate your plan": the sparse leg finds nothing, the dense
+    leg scores it merely similar.
+  - A 200-line stack trace swamps the embedding with boilerplate and drowns the one line, an error code,
+    that would have matched exactly.
+  - Product names are abbreviated, misspelled or replaced by nicknames the documents never use.
+- **The naive fixes each fail somewhere.** Embedding the whole history dilutes current intent. Asking users
+  to phrase better does not survive contact with users. Synonym expansion of the index helps vocabulary
+  but not references or long pastes, and bloats every document.
+- **The rewrite step sees everything at once.** The conversation so far, the current message and (via its
+  prompt) the corpus conventions. An LLM is good at exactly this transformation, and a small one is enough.
 
 ## How it works
 ### Where it sits
-The user turn and the recent history go to a rewriter prompt. Its output is a small structured object:
-one or more search strings, optionally a set of metadata filters, and optionally a flag saying no
-retrieval is needed. Each search string goes to the retriever(s); the result lists are fused; the fused
-context plus the *original* question go to the generator. The generator still sees the user's words,
-because the rewrite is for the index, not for the answer.
+1. **Input:** the user turn plus recent history go to a rewriter prompt.
+2. **Output:** a small structured object: one or more search strings, optional metadata filters, and an
+   optional "no retrieval needed" flag.
+3. **Retrieve:** each search string goes to the retriever(s); the result lists are fused.
+4. **Generate:** the fused context plus the *original* question go to the generator. The generator still
+   sees the user's words, because the rewrite is for the index, not for the answer.
 
 ### The forms a rewrite takes
-1. **Condensing (conversational RAG).** Turn "and on Android?" into "How do I enable push notifications
-   on Android?" using the history. This exists because retrievers are stateless; the standalone question
-   is the only thing they can act on.
-2. **Normalisation.** Fix typos, expand abbreviations, map aliases to canonical product names. This exists
-   because BM25 matches exact terms and an embedding of a misspelled name is not reliably near the correct
-   one.
-3. **Multi-query expansion.** Generate several paraphrases, retrieve for each, and fuse with reciprocal
-   rank fusion. A single embedding is one point; several points cover the neighbourhood where the
-   relevant passage might sit. The cost is several retrievals instead of one.
-4. **Keyword extraction.** From a long paste, pull the identifiers (error codes, function names, version
-   strings) for the sparse leg and a one-line summary for the dense leg, because long inputs dilute both.
-5. **Step-back abstraction.** From "why did key K-7 get HTTP 429 at 3pm Tuesday", also ask "what are the
-   API rate-limit rules". Documents describe general rules, not specific incidents, so the abstract
-   question is what the corpus can answer; retrieve for both.
-6. **Routing and filtering.** Emit structured filters (product, date range, document type) alongside the
-   query so the retriever can restrict the candidate pool, and emit "no retrieval" for greetings or
-   requests that are about the conversation itself.
-7. **Document-shaped rewriting.** Instead of a better question, write a hypothetical answer passage and
-   search with that (HyDE). It targets a different mismatch, question shape versus passage shape in
-   embedding space, and has its own lesson.
+| # | Form | Example | Mismatch it fixes, and why |
+|---|---|---|---|
+| 1 | **Condensing** (conversational RAG) | "and on Android?" → "How do I enable push notifications on Android?" | Missing references; retrievers are stateless, so the standalone question is all they can act on. |
+| 2 | **Normalisation** | fix typos, expand abbreviations, map aliases to canonical product names | Spelling and aliases; BM25 matches exact terms and a misspelled name's embedding is not reliably near the correct one. |
+| 3 | **Multi-query expansion** | several paraphrases, retrieve each, fuse with reciprocal rank fusion | Vocabulary; one embedding is one point, several cover the neighbourhood. Costs several retrievals instead of one. |
+| 4 | **Keyword extraction** | from a long paste, pull error codes, function names, version strings for the sparse leg plus a one-line summary for the dense leg | Dilution; long inputs dilute both legs. |
+| 5 | **Step-back abstraction** | "why did key K-7 get HTTP 429 at 3pm Tuesday" → also "what are the API rate-limit rules" | Abstraction; documents describe general rules, not incidents, so retrieve for both. |
+| 6 | **Routing and filtering** | emit filters (product, date range, document type); emit "no retrieval" for greetings or questions about the conversation itself | Scope; restricts the candidate pool. |
+| 7 | **Document-shaped rewriting** (HyDE) | write a hypothetical answer passage and search with it | Question shape vs passage shape in embedding space; has its own lesson. |
 
-Each form fixes one specific mismatch, which is why a rewriter should be built from failure analysis
-rather than switched on wholesale: condensing fixes missing references, normalisation fixes spelling and
-aliases, expansion and step-back fix vocabulary and abstraction gaps, extraction fixes dilution, routing
-fixes scope.
-
-The research framing (Ma et al.) treats the rewriter as a trainable module optimised by feedback from
-downstream answer quality, with the LLM reader frozen. In production the same shape is usually a
-prompted small model, because the input is short and the output is shorter.
+- **Build from failure analysis, not wholesale.** Each form fixes one specific mismatch, so switch on only
+  the forms your failures call for.
+- **Research vs production.** Ma et al. treat the rewriter as a trainable module optimised by downstream
+  answer-quality feedback, with the LLM reader frozen. In production the same shape is usually a prompted
+  small model, because the input is short and the output is shorter.
 
 ### Design choices and why
-- **Always retrieve for the original query too, but weight it.** A rewrite can drift; fusing results from
-  the original and the rewrite(s) means a bad rewrite degrades gracefully instead of replacing a working
-  path. The original is not always a good list, though: "and on Android?" retrieves noise, and with
-  plain RRF over two lists that noise takes roughly half the fused top-k. Give the original a lower fusion
-  weight when the rewriter reports it is not standalone, and an equal weight when it is.
-- **Protect literals.** Instruct the rewriter never to alter quoted strings, codes, numbers or version
-  identifiers. Normalisation that "fixes" `ERR_4012` into `error 4012` breaks the one exact match you had.
-- **Use a small, fast model and cache.** The rewrite adds a sequential LLM call to every request. Keying
-  a cache on (hash of recent history, query) removes it for repeats.
+- **Always retrieve for the original too, but weight it.** A rewrite can drift; fusing original and
+  rewrite(s) means a bad rewrite degrades gracefully instead of replacing a working path. But "and on
+  Android?" retrieves noise, and with plain RRF over two lists that noise takes roughly half the fused
+  top-k. Lower the original's fusion weight when the rewriter says it is not standalone; equal weight when
+  it is.
+- **Protect literals.** Never alter quoted strings, codes, numbers or version identifiers. "Fixing"
+  `ERR_4012` into `error 4012` breaks the one exact match you had.
+- **Use a small, fast model and cache.** The rewrite adds a sequential LLM call to every request; a cache
+  keyed on (hash of recent history, query) removes it for repeats.
 - **Tell the rewriter about the corpus.** A sentence such as "documents are organised per product and use
   the terms plan, seat and workspace" produces rewrites in the index's vocabulary.
-- **Log the pair.** Store the original and the rewrite with every request, because retrieval failures must
-  be attributable to the rewrite or to the index.
+- **Log the pair.** Store original and rewrite with every request, because retrieval failures must be
+  attributable to the rewrite or to the index.
 - **Treat the input as untrusted.** The rewriter is an LLM reading user text; a query containing
   instructions can hijack it, so constrain the output format and validate it.
 
-## Example
-A condensing-plus-expansion rewriter with reciprocal rank fusion. `llm(prompt)` returns text and
-`retrieve(query, k)` returns ranked chunk ids; any provider or vector store works.
+## Diagram
+Trace one follow-up turn: the rewriter decides whether to retrieve at all, both the original and the
+rewrites are searched, and the generator still answers the user's own words.
+
+```mermaid
+flowchart TD
+    U["User turn plus recent history"] --> C{"Cached plan for this history and query?"}
+    C -->|"no"| RW["Small LLM rewriter"]
+    RW --> V["Validate JSON and literal guard"]
+    V --> C2[("Plan cache")]
+    C -->|"yes"| P["Plan: queries, standalone, needs_retrieval"]
+    C2 --> P
+    P -->|"needs_retrieval is false"| G["Generator with original question"]
+    P -->|"retrieve"| R["Retrieve original plus 1 to 3 rewrites"]
+    R --> F["Weighted RRF, original down-weighted if not standalone"]
+    F -->|"top-k chunks"| G
+```
+
+## Examples
+### Condensing plus expansion with weighted RRF
+`llm(prompt)` returns text and `retrieve(query, k)` returns ranked chunk ids; any provider or vector store
+works.
 
 ```python
 import json, hashlib
@@ -153,41 +157,94 @@ ctx = search("user: how do I turn on push notifications?\nassistant: In Settings
 # list (generic Android pages) only fills slots the rewrite's list leaves weakly supported
 ```
 
+### Runnable: why the non-standalone original needs a lower weight
+Two disjoint 20-item lists, fused into a top-8, exactly as `search` does. Pure Python.
+
+```python
+def rrf(ranked_lists, weights, c=60):
+    scores = {}
+    for lst, w in zip(ranked_lists, weights):
+        for rank, cid in enumerate(lst):
+            scores[cid] = scores.get(cid, 0.0) + w / (c + rank + 1)
+    return sorted(scores, key=scores.get, reverse=True)
+
+original = [f"android-generic-{i}" for i in range(20)]   # "and on Android?" alone
+rewrite = [f"push-android-{i}" for i in range(20)]       # "enable push notifications on Android"
+for w in (1.0, 0.3):
+    top = rrf([original, rewrite], [w, 1.0])[:8]
+    print(w, sum(c.startswith("android-generic") for c in top), "of 8 generic")
+# 1.0 4 of 8 generic   <- plain RRF: noise takes half the context
+# 0.3 0 of 8 generic   <- down-weighted: generic pages only appear if the rewrite's list runs thin
+```
+
+With weight 0.3 the original's best item scores 0.3/61 ≈ 0.0049, below the rewrite's 8th item at
+1/68 ≈ 0.0147, so the original only matters when it agrees with the rewrite.
+
+### Worked scenario: what each form changed in a failure review
+Illustrative review of a support bot's 40 worst retrievals, grouped by cause:
+
+| Raw input | Failure | Form applied | Retrieved after |
+|---|---|---|---|
+| "and on Android?" | generic Android pages | condensing | push-notification setup for Android |
+| "cancel my subscripton" | no BM25 hits | normalisation + docs vocabulary ("terminate your plan") | plan termination page |
+| 200-line stack trace with `ERR_4012` | boilerplate matches | keyword extraction | the error-code reference page |
+| "why did key K-7 get 429?" | incident threads only | step-back | rate-limit rules plus the original's hits |
+
+## Production patterns
+- **Rewrite only when it is needed.** For multi-turn chat, have the rewriter return `standalone` and
+  `needs_retrieval` flags; skip the second retrieval when the turn is already standalone and skip retrieval
+  entirely for small talk. Monitor the share of turns rewritten and the rewrite-call p95 latency.
+- **Literal-preservation guard.** After rewriting, check that every quoted string, code-like token (for
+  example matching a pattern such as `[A-Z]+_\d+`) and number in the input still appears in at least one
+  rewrite; if not, fall back to the original. Monitor the guard's fallback rate per release of the prompt.
+- **Cache keyed on history plus query.** Hash the truncated recent history and the message (as in
+  `rewrite` above) and store the plan in an in-process or shared cache with a TTL. Monitor hit rate; a drop
+  after a prompt change is expected, a drop otherwise means history formatting changed.
+- **Version and log rewrites.** Store prompt version, original, rewrites and fused ids per request, so a
+  bad answer can be traced to the rewrite or the index. Review a weekly sample of rewrites that
+  introduced entities absent from the history.
+- **Gate prompt changes on a multi-turn golden set.** Compare recall@k with and without the rewriter, and
+  across prompt versions, before shipping. Monitor recall@k on follow-up turns separately from first turns.
+
 ## Trade-offs
-- One extra sequential LLM call per request adds latency and cost; it is worth it for conversational or
-  noisy input and not for well-formed single-turn queries from trained users.
-- Multi-query expansion raises recall but multiplies retrieval cost and admits drifted paraphrases that
-  lower precision; it pays off when retrieval is cheap relative to a wrong answer.
-- Putting corpus conventions in the rewriter prompt improves vocabulary matching but couples the prompt
+- **Better retrieval vs an extra sequential call.** Adds latency and cost per request; worth it for
+  conversational or noisy input, not for well-formed single-turn queries from trained users.
+- **Multi-query recall vs cost and precision.** Raises recall but multiplies retrieval cost and admits
+  drifted paraphrases that lower precision; pays off when retrieval is cheap relative to a wrong answer.
+- **Corpus conventions in the prompt vs staleness.** Improves vocabulary matching but couples the prompt
   to the corpus, so it goes stale when products are renamed or documents restructured.
-- Condensing to a single standalone question loses nuance from long conversations, such as a constraint
-  the user corrected earlier; including the last few turns verbatim in the rewriter prompt limits this.
+- **One standalone question vs nuance.** Condensing loses detail from long conversations, such as a
+  constraint the user corrected earlier; including the last few turns verbatim in the rewriter prompt
+  limits this.
 
 ## Pitfalls
-- The rewriter invents specifics, turning "the API" into a named third-party API; the symptom is fluent
+- **The rewriter invents specifics.** "the API" becomes a named third-party API; the symptom is fluent
   answers about the wrong product that cite real documents.
-- Normalisation rewrites exact identifiers; the symptom is that the BM25 leg stops matching the one
-  document containing the error code, right after rewriting was introduced.
-- Retrieving only for the rewrite and never the original; the symptom is a regression on simple queries
-  that worked before the rewriter shipped.
-- Fusing a non-standalone original at full weight; the symptom is follow-up answers whose context is half
-  generic passages matching only the fragment ("Android", "pricing") rather than the actual question.
-- Rewriting and retrieving for every turn including "thanks"; the symptom is wasted calls and odd snippets
-  injected into small talk.
-- Judging the feature by reading rewrites that "look better" instead of measuring recall@k before and
-  after on a golden set; the symptom is a launch with no metric that moved.
-- Letting user text steer the rewriter; the symptom is rewrites containing instructions or filters the
+- **Normalisation rewrites exact identifiers.** The symptom is the BM25 leg no longer matching the one
+  document containing the error code, right after rewriting shipped.
+- **Retrieving only for the rewrite.** The symptom is a regression on simple queries that worked before
+  the rewriter shipped.
+- **Fusing a non-standalone original at full weight.** The symptom is follow-up answers whose context is
+  half generic passages matching only the fragment ("Android", "pricing").
+- **Rewriting every turn, including "thanks".** The symptom is wasted calls and odd snippets injected
+  into small talk.
+- **Judging rewrites that "look better".** Measure recall@k before and after on a golden set instead;
+  the symptom is a launch with no metric that moved.
+- **Letting user text steer the rewriter.** The symptom is rewrites containing instructions or filters the
   user should not be able to set, a prompt-injection path into the retrieval layer.
 
 ## When to use
-Reach for condensing the moment the interface is conversational; without it, follow-up questions retrieve
-garbage. Add normalisation and keyword extraction when failure analysis shows vocabulary mismatch or long
-pasted inputs, and multi-query or step-back expansion when recall@k is the measured bottleneck and
-retrieval is cheap. Skip it when queries are well-formed single turns in the corpus's own vocabulary or
-when the latency budget has no room for a sequential call. Measure recall@k with and without the rewriter
-on a golden set, the p95 latency it adds, and the fraction of queries where the rewrite differs from the
-input. In interviews, "how do you handle follow-up questions in a RAG chatbot" and "what if users use
-different terminology than the docs" are both query-rewriting questions.
+- **Use condensing** the moment the interface is conversational; without it, follow-up questions retrieve
+  garbage.
+- **Add normalisation and keyword extraction** when failure analysis shows vocabulary mismatch or long
+  pasted inputs; add multi-query or step-back expansion when recall@k is the measured bottleneck and
+  retrieval is cheap.
+- **Avoid when** queries are well-formed single turns in the corpus's own vocabulary, or the latency
+  budget has no room for a sequential call.
+- **Measure:** recall@k with and without the rewriter on a golden set, the p95 latency it adds, and the
+  fraction of queries where the rewrite differs from the input.
+- **Interviews:** "how do you handle follow-up questions in a RAG chatbot" and "what if users use
+  different terminology than the docs" are both query-rewriting questions.
 
 ## Role lens
 - **Engineer:** Writes and versions the rewriter prompt, guards identifiers, fuses results with RRF, and
@@ -208,6 +265,44 @@ so keep the original query in the fusion and log both; it adds a sequential call
 cache on history plus query; it must not alter codes or quoted strings; and it reads untrusted text, so
 constrain its output format. Validate with recall@k on a golden set of multi-turn conversations before
 and after.
+
+## Interview questions
+### What is query rewriting in RAG, and why do it at query time rather than at index time?
+- **Definition:** a small LLM step between user and retriever that turns raw input into standalone,
+  index-friendly search strings, plus optional filters and a "no retrieval" flag.
+- **Why query time:** fixing the key per request is far cheaper than re-indexing the corpus for every way a
+  human might phrase a question.
+- **Why it works:** the rewriter sees the history, the message and the corpus conventions at once, which the
+  stateless retriever never does.
+
+### After shipping a rewriter, simple single-turn queries got worse. How do you debug it?
+- **Pull the logged pairs** (original, rewrite, fused ids) for the regressed queries and compare recall@k
+  with and without the rewriter on the golden set.
+- **Look for drift:** invented entities, altered literals such as `ERR_4012`, or paraphrases away from the
+  docs vocabulary.
+- **Check the fusion:** if only the rewrite is retrieved, add the original back; if the turn is standalone,
+  give the original equal weight.
+
+### When would you not add a query rewriter?
+- **Well-formed single-turn input:** trained users already write in the corpus's vocabulary, so the step
+  adds a sequential call with no recall gain.
+- **Tight latency budgets:** the rewrite runs before retrieval and cannot be parallelised with it.
+- **No failure evidence:** each form fixes a specific mismatch, so without failure analysis you are paying
+  for drift risk without a measured benefit.
+
+### Why down-weight the original query in RRF for a non-standalone follow-up?
+- **Plain RRF splits the context:** two disjoint 20-item lists fused at equal weight give the fragment's
+  generic hits about half of a top-8.
+- **At weight 0.3** the original's best item scores about 0.0049, below the rewrite's 8th item at about
+  0.0147, so it only contributes where the rewrite's list runs thin or agrees.
+- **Keep equal weight** when the turn is standalone, because then the original is a good query in its own
+  right.
+
+### How do you keep the rewriter from becoming a prompt-injection path?
+- **Treat user text as untrusted:** constrain the output to a JSON schema and validate types and lengths
+  before use.
+- **Never let it set access-control filters** freely; allow-list the filter fields and values it may emit.
+- **Monitor:** sample rewrites containing instructions or filters absent from the conversation.
 
 ## Quiz
 ### Q: Why should the original user query still be retrieved for after rewriting?

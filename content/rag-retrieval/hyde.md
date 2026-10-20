@@ -5,7 +5,7 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -22,77 +22,69 @@ sources:
 ---
 
 ## TL;DR
-HyDE asks an LLM to write a plausible answer passage first, embeds that hypothetical instead of (or
-alongside) the question, and retrieves the real passages nearest to it. It exists because a short
-question and a long answer are different kinds of text in different regions of embedding space; a
-hypothetical answer lands in the answer region even when its facts are wrong, because the encoder keeps
-topic and vocabulary and washes out detail. It costs one generation per query.
+HyDE has an LLM write a plausible answer passage, embeds that instead of (or with) the question, and
+retrieves the real passages nearest to it. Answer-shaped text lands near real answers even with wrong
+facts; it costs one generation per query.
 
 ## Why it exists
-Dense retrieval compares two vectors, but the two texts being compared are not symmetric. A query is
-"how do I rotate an API key?": short, interrogative, carrying almost no topical content beyond three
-words. The passage that answers it reads "To generate a new key, open Settings, then Keys, and choose
-Regenerate; the previous key remains valid for 24 hours." It is declarative, longer, and full of the
-vocabulary the question never used. Encoders trained on large sets of (query, passage) pairs learn to map
-the two shapes near each other, but an encoder used zero-shot, out of its training domain, or trained
-without such pairs (the original paper's setting used an unsupervised encoder) does not close the gap
-well. The question's vector sits in a "questions about keys" region, the passage's in a "procedures
-about keys" region, and the nearest neighbours of the question are other questions, which the corpus
-does not contain.
-
-The direct fix is to train the retriever on in-domain labelled pairs, which needs labels you usually
-do not have. Instruction-prefixed embedding models ("query:" versus "passage:") are the cheap modern
-version of that fix and should be tried first. HyDE takes a different route that needs no labels and no
-training: if the problem is that the query is the wrong shape, generate something of the right shape.
-An LLM can write a passage that looks like an answer, and even a partly wrong answer is closer to the
-real one than the question was.
+- **Queries and passages are different shapes.** "how do I rotate an API key?" is short, interrogative,
+  with almost no topical content beyond three words. The answer reads "To generate a new key, open Settings,
+  then Keys, and choose Regenerate; the previous key remains valid for 24 hours": declarative, longer, full
+  of vocabulary the question never used.
+- **Some encoders do not close the gap.** Encoders trained on large sets of (query, passage) pairs learn to
+  map the two shapes together. Used zero-shot, out of domain, or trained without such pairs (the original
+  paper used an unsupervised encoder), they do not: the question sits in a "questions about keys" region,
+  the passage in "procedures about keys", and the question's nearest neighbours are other questions, which
+  the corpus does not contain.
+- **The direct fix needs labels.** Training the retriever on in-domain labelled pairs needs labels you
+  usually do not have. Instruction-prefixed embedding models ("query:" versus "passage:") are the cheap
+  modern version of that fix and should be tried first.
+- **HyDE needs no labels and no training.** If the query is the wrong shape, generate something of the
+  right shape. Even a partly wrong answer is closer to the real one than the question was.
 
 ## How it works
 ### The steps
-1. **Generate.** Prompt the LLM with "write a passage that answers: {question}". The original work
-   sampled several hypothetical documents per query rather than one; multiple samples cost linearly and
-   reduce the variance introduced by any single hallucinated detail.
-2. **Encode with the document encoder.** Each hypothetical passage is embedded with the same model that
-   embedded the corpus, because the comparison must be passage-to-passage in the same space. Using a
-   different encoder for the hypothetical than for the index defeats the whole point.
-3. **Aggregate.** Average the hypothetical embeddings; optionally include the embedding of the original
-   query as one more vector in the average. Averaging exists because it keeps what the samples agree on
-   (topic, entities, structure) and suppresses what they disagree on (invented numbers); including the
-   query anchors the result to the user's actual words.
-4. **Search.** Run nearest-neighbour search with the aggregated vector and return the real passages.
-5. **Answer from real passages only.** The hypothetical never reaches the generation prompt. It is a
-   search key, not evidence, and treating it as evidence is how hallucinations get cited.
+1. **Generate.** Prompt the LLM: "write a passage that answers: {question}". The original work sampled
+   several hypothetical documents per query; samples cost linearly and reduce the variance from any single
+   hallucinated detail.
+2. **Encode with the document encoder.** Embed each hypothetical with the same model that embedded the
+   corpus, because the comparison must be passage-to-passage in one space. A different encoder defeats the
+   whole point.
+3. **Aggregate.** Average the hypothetical embeddings, optionally adding the original query's embedding.
+   Averaging keeps what samples agree on (topic, entities, structure) and suppresses what they disagree on
+   (invented numbers); the query anchors the result to the user's actual words.
+4. **Search.** Nearest-neighbour search with the aggregated vector returns real passages.
+5. **Answer from real passages only.** The hypothetical never reaches the generation prompt. It is a search
+   key, not evidence; treating it as evidence is how hallucinations get cited.
 
 ### Why hallucinated details mostly do not matter
-An embedding model is a lossy compressor. It preserves the gist (what the passage is about, which
-entities and terms appear, how it is structured) and gives little weight to a specific number or date.
-So a hypothetical that says keys stay valid for 48 hours when the truth is 24 still lands next to the
-passage about key rotation, because everything except the number matched. The paper frames this as the
-encoder acting as a filter that grounds the generated text in the real corpus. The exception is
-entity-level error: if the model writes about the wrong product or confuses two similarly named
-services, the vector lands in the wrong neighbourhood and no amount of averaging rescues it.
+- **An embedding model is a lossy compressor.** It preserves the gist (what the passage is about, which
+  entities and terms appear, how it is structured) and gives little weight to a specific number or date.
+- **So a wrong number still lands right.** A hypothetical saying keys stay valid for 48 hours when the
+  truth is 24 still lands next to the key-rotation passage, because everything except the number matched.
+- **The paper's framing:** the encoder acts as a filter that grounds the generated text in the real corpus.
+- **The exception is entity-level error.** Writing about the wrong product, or confusing two similarly
+  named services, puts the vector in the wrong neighbourhood, and no amount of averaging rescues it.
 
 ### Where it fits with neighbouring techniques
-- It is a special case of query rewriting: rewriting the query into document-shaped text. Query2doc is
-  a close relative that concatenates the original query with the generated pseudo-document (repeating
-  the query so it is not drowned out) and was shown to help sparse BM25 retrieval as well as dense.
-- The mirror image works at index time. Doc2query-style expansion has a model write the questions each
-  chunk answers and indexes them with (or as keys for) the chunk, so the corpus side becomes
-  question-shaped instead. The generation cost moves from every query to ingestion, which suits high
-  query volume and stable corpora; HyDE suits the reverse, or a corpus you cannot re-index.
-- It can feed the sparse leg of hybrid search too, since the hypothetical contains answer vocabulary the
-  question lacked; but it also contains invented terms, so keep the original query for BM25 as well.
-- It is query-side; contextual retrieval and parent-document retrieval are index-side, and they combine.
-- A final reranker should score the real candidates against the original question, not the hypothetical.
+| Technique | Relation to HyDE |
+|---|---|
+| **Query rewriting** | HyDE is a special case: rewriting the query into document-shaped text. |
+| **Query2doc** | Close relative: concatenates the original query with the generated pseudo-document (repeating the query so it is not drowned out); shown to help sparse BM25 as well as dense. |
+| **Doc2query-style expansion** | The mirror image at index time: a model writes the questions each chunk answers, indexed with (or as keys for) the chunk, so the corpus becomes question-shaped. Generation moves from every query to ingestion: suits high query volume and stable corpora. HyDE suits the reverse, or a corpus you cannot re-index. |
+| **Hybrid search** | The hypothetical can feed the sparse leg, since it has answer vocabulary the question lacked; but it also has invented terms, so keep the original query for BM25 too. |
+| **Contextual / parent-document retrieval** | Index-side; HyDE is query-side, and they combine. |
+| **Reranker** | Score the real candidates against the original question, not the hypothetical. |
 
 ### When the gap is already closed
-Modern embedding models trained with instructions and large query-passage corpora have narrowed the
-question-to-passage gap substantially. On such a model HyDE's gain can be small, zero or negative, and
-it always adds a generation call. The honest position is model- and corpus-dependent: measure recall@k
-on your golden set with and without it.
+- **Modern instruction-tuned embedders** trained on large query-passage corpora have narrowed the gap
+  substantially.
+- **On such a model HyDE's gain can be small, zero or negative,** and it always adds a generation call.
+- **The honest position is model- and corpus-dependent:** measure recall@k on your golden set with and
+  without it.
 
-## Example
-HyDE with multiple samples, aggregation with the query embedding, and a search over the real index.
+## Examples
+### HyDE with multiple samples and a query anchor
 `llm`, `embed` and `index.search` are stubs for any provider, encoder and vector store.
 
 ```python
@@ -116,46 +108,106 @@ hits, hypos = hyde_search("How do I rotate an API key without downtime?")
 # from it, never from the hypothetical.
 ```
 
+### Runnable toy: the question finds questions, the hypothetical finds the answer
+Pure Python with a bag-of-words stand-in for an embedding, so it shows the shape mismatch lexically, not
+dense-model behaviour. Note the hypothetical's wrong "48 hours" barely matters.
+
+```python
+import math, re
+from collections import Counter
+
+def vec(text):                                   # toy bag-of-words "embedding"
+    return Counter(re.findall(r"[a-z0-9]+", text.lower()))
+
+def cos(a, b):
+    dot = sum(a[t] * b[t] for t in a)
+    return dot / (math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values())))
+
+corpus = {
+    "key-rotation": "To generate a new key, open Settings, then Keys, and choose Regenerate; "
+                    "the previous key remains valid for 24 hours.",
+    "faq-billing": "How do I update my billing address? Open Billing and edit the address.",
+    "sso-setup": "To enable single sign-on, open Settings, then Security, and upload the IdP metadata.",
+}
+question = "how do I rotate an API key?"
+hypo = ("To rotate an API key, open Settings, then Keys, generate a new key and update clients; "
+        "the previous key remains valid for 48 hours.")
+for name, q in (("question", question), ("hypothetical", hypo)):
+    ranked = sorted(corpus, key=lambda d: cos(vec(q), vec(corpus[d])), reverse=True)
+    print(f"{name:12}", [(d, round(cos(vec(q), vec(corpus[d])), 2)) for d in ranked])
+# question     [('faq-billing', 0.28), ('key-rotation', 0.16), ('sso-setup', 0.0)]
+# hypothetical [('key-rotation', 0.82), ('sso-setup', 0.29), ('faq-billing', 0.18)]
+```
+
+The bare question's best match is the other "How do I ..." text; the answer-shaped hypothetical ranks the
+real procedure first.
+
+### Worked scenario: deciding whether to ship it
+Illustrative A/B on a golden set for an internal wiki; the shape of the decision, not a benchmark.
+
+| Variant | recall@10 | Added p95 latency | Verdict |
+|---|---|---|---|
+| Generic encoder, plain query | 0.6 | none | baseline |
+| Generic encoder + HyDE (3 samples + query) | higher | one generation | ship if the gain beats the latency cost |
+| Instruction-prefixed encoder, plain query | test first | none | if it matches HyDE, skip HyDE |
+| Instruction-prefixed encoder + HyDE | often flat | one generation | usually not worth it |
+
+## Production patterns
+- **HyDE as a fallback, not the default path.** Run plain retrieval first; only when the top score or
+  reranker score is below a cut-off tuned on your golden set, generate the hypothetical and search again.
+  Monitor the fallback rate and recall@k on the fallback slice.
+- **Short, capped hypotheticals.** Ask for a short passage and cap generation with the provider's max
+  output tokens setting, keeping it under the encoder's input limit so nothing is silently truncated.
+  Monitor generation latency at p95, which dominates HyDE's cost.
+- **Parallel samples, one embedding batch.** Issue the n generations concurrently and embed them in one
+  batch call with the index's own encoder and document mode. Monitor that the encoder version used at
+  query time matches the one recorded for the index.
+- **Keep the original query in every leg.** Average the query embedding into the dense vector and send the
+  original text (not the hypothetical) to BM25 and to the reranker. Monitor identifier-heavy queries as a
+  separate slice, where dropping the query regresses first.
+- **Firewall the hypothetical.** Log it for debugging but strip it before the generation prompt; add an
+  eval check that flags answer facts found in the hypothetical but in no retrieved passage.
+
 ## Trade-offs
-- The largest gains appear with zero-shot or out-of-domain encoders and question-shaped queries over
-  passage-shaped corpora; with an instruction-tuned embedder trained on your query type the gain shrinks
-  or reverses.
-- One generation per query adds latency on the order of several hundred milliseconds to a few seconds
-  (a whole passage must be decoded before search can start) and a per-query cost; applying it only
-  as a fallback when first-pass scores are weak keeps the cost off the common path.
-- Robust to small factual errors in the hypothetical but fragile to entity confusion; on private or novel
-  domains the model writes a generic passage and retrieval becomes generic with it.
-- Several samples stabilise the aggregated vector at linear cost; one sample is cheaper and noisier, and
-  the right number depends on how much the hypotheticals disagree.
+- **Big gains on mismatched encoders vs none on matched ones.** Largest with zero-shot or out-of-domain
+  encoders and question-shaped queries over passage-shaped corpora; with an instruction-tuned embedder
+  trained on your query type the gain shrinks or reverses.
+- **Recall vs latency and cost.** One generation per query adds latency on the order of several hundred
+  milliseconds to a few seconds (a whole passage must be decoded before search starts) and a per-query
+  cost; using it only as a fallback when first-pass scores are weak keeps it off the common path.
+- **Robust to small errors vs fragile to entity confusion.** On private or novel domains the model writes a
+  generic passage, and retrieval becomes generic with it.
+- **Stability vs cost of samples.** Several samples stabilise the aggregated vector at linear cost; one is
+  cheaper and noisier, and the right number depends on how much the hypotheticals disagree.
 
 ## Pitfalls
-- Feeding the hypothetical into the answer prompt as if it were retrieved; the symptom is fluent answers
-  containing facts that appear in no retrieved passage.
-- Encoding the hypothetical with a different model than the index; the symptom is retrieval worse than
+- **Feeding the hypothetical into the answer prompt.** The symptom is fluent answers containing facts that
+  appear in no retrieved passage.
+- **Encoding the hypothetical with a different model than the index.** The symptom is retrieval worse than
   the plain-query baseline.
-- Dropping the original query entirely; the symptom is regressions on queries with exact identifiers,
+- **Dropping the original query entirely.** The symptom is regressions on queries with exact identifiers,
   such as ticket numbers, that the hypothetical paraphrased away.
-- Using HyDE on time-sensitive questions (current prices, latest version); the model writes stale
-  details and the vector drifts toward old passages, so the symptom is retrieval of outdated versions.
-- Adopting it because the paper reported gains, without measuring; the symptom is added latency and a
-  flat recall@k.
-- Running the reranker against the hypothetical instead of the question; the symptom is a top result
-  that matches the invented details (the "48 hours" passage from an old version) over the true answer.
-- Letting the hypothetical exceed the encoder's input limit; the symptom is silent truncation and a
-  vector that represents only the opening sentences.
+- **Using it on time-sensitive questions** (current prices, latest version). The model writes stale
+  details and the vector drifts toward old passages; the symptom is retrieval of outdated versions.
+- **Adopting it because the paper reported gains.** The symptom is added latency and a flat recall@k.
+- **Reranking against the hypothetical.** The symptom is a top result matching the invented details (the
+  "48 hours" passage from an old version) over the true answer.
+- **Exceeding the encoder's input limit.** The symptom is silent truncation and a vector that represents
+  only the opening sentences.
 
 ## When to use
-Reach for HyDE when queries are question-shaped, the corpus is passage-shaped, and the embedding model
-was not trained for that asymmetry; in practice that means a generic or older encoder, or a domain far
-from its training data. If the corpus is itself question-shaped (an FAQ indexed on its questions, or
-chunks expanded with generated questions), the shapes already match and HyDE has little left to fix. If
-query volume is high and the corpus stable, compare against index-time question generation, which pays
-the generation cost once per chunk rather than once per query. Try instruction-prefixed embeddings and hybrid search first, since they are
-free at query time. Avoid it for identifier lookups, for time-sensitive facts, and for domains the LLM
-knows nothing about. Measure recall@k and MRR on a golden set with and without it, and the latency it
-adds at p95. In interviews, HyDE is the standard answer to "how would you improve dense retrieval
-without labelled data", and the strong candidate also explains why hallucinations in the hypothetical
-are mostly harmless and when they are not.
+- **Use when** queries are question-shaped, the corpus is passage-shaped, and the embedder was not trained
+  for that asymmetry: a generic or older encoder, or a domain far from its training data.
+- **Little to fix when** the corpus is itself question-shaped (an FAQ indexed on its questions, or chunks
+  expanded with generated questions).
+- **Compare against index-time question generation** when query volume is high and the corpus stable; it
+  pays the generation cost once per chunk rather than once per query.
+- **Try first:** instruction-prefixed embeddings and hybrid search, since they are free at query time.
+- **Avoid for** identifier lookups, time-sensitive facts, and domains the LLM knows nothing about.
+- **Measure:** recall@k and MRR on a golden set with and without it, and the latency it adds at p95.
+- **Interviews:** the standard answer to "how would you improve dense retrieval without labelled data";
+  the strong candidate also explains why hallucinations in the hypothetical are mostly harmless and when
+  they are not.
 
 ## Role lens
 - **Engineer:** Implements the generate, embed, average, search path, keeps the hypothetical out of the

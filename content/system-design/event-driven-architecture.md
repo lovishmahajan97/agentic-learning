@@ -5,7 +5,7 @@ name: Event-driven architecture
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/synchronous-vs-asynchronous-execution
   - system-design/outbox-inbox-patterns
@@ -23,105 +23,111 @@ sources:
 ---
 
 ## TL;DR
-In an event-driven architecture a service records that something happened ("DocumentUploaded",
-"RunCompleted") as an immutable event on a broker, and any number of consumers react on their own
-schedule. The producer no longer knows or waits for its consumers, which is what lets you add a billing
-meter, an eval sampler and an audit log to an agent pipeline without touching the agent. The price is
-eventual consistency, at-least-once delivery and a flow of control that no single stack trace shows.
+A service records an immutable fact ("DocumentUploaded", "RunCompleted") on a broker and any number of
+consumers react on their own schedule. Producers stop knowing about consumers; the price is eventual
+consistency, at-least-once delivery and no single stack trace.
 
 ## Why it exists
-Start with the naive design. The ingestion endpoint receives a PDF and then, in the same request,
-calls the parser, the chunker, the embedder, the index writer, the notification service and the
-analytics API. Three things go wrong as the system grows.
-
-First, **temporal coupling**: the upload succeeds only if all six downstream services are up at that
-instant. If each is available 99.9% of the time, the chain is available roughly 0.999⁶ ≈ 99.4%, and
-its latency is the sum of six latencies. The slowest or flakiest consumer sets the user's experience.
-
-Second, **knowledge coupling**: every new consumer (a compliance team wants a copy of every upload) means
-a code change and a redeploy of the producer, plus a new failure mode inside the producer's request path.
-The producer accumulates reasons to change that have nothing to do with uploading.
-
-Third, **lost history**: once the request returns, the fact that an upload happened exists only as a row
-the producer chose to keep. You cannot replay last Tuesday's uploads through a fixed chunker, because
-the calls were ephemeral.
-
-Events invert the dependency. The producer's only job is to durably record the fact. Consumers depend on
-the event contract, not on the producer; the producer depends on nothing. Availability becomes "can I
-write to the broker", and history becomes the log itself. That inversion, not the broker technology, is
-the idea.
+The naive design: the ingestion endpoint receives a PDF and, in the same request, calls the parser,
+chunker, embedder, index writer, notification service and analytics API. Three things go wrong as it grows.
+- **Temporal coupling.** The upload succeeds only if all six downstream services are up at that instant.
+  At 99.9% each, the chain is roughly 0.999⁶ ≈ 99.4% available, and its latency is the sum of six
+  latencies. The slowest or flakiest consumer sets the user's experience.
+- **Knowledge coupling.** Every new consumer (compliance wants a copy of every upload) means a producer
+  code change and redeploy, plus a new failure mode in its request path. The producer accumulates
+  reasons to change that have nothing to do with uploading.
+- **Lost history.** Once the request returns, the upload exists only as a row the producer chose to keep.
+  You cannot replay last Tuesday's uploads through a fixed chunker, because the calls were ephemeral.
+- **Events invert the dependency.** The producer only durably records the fact; consumers depend on the
+  event contract, the producer on nothing. Availability becomes "can I write to the broker" and history
+  becomes the log. That inversion, not the broker technology, is the idea.
+- **What it buys in AI systems.** You can add a billing meter, an eval sampler and an audit log to an
+  agent pipeline without touching the agent.
 
 ## How it works
 ### Events versus commands
-An **event** is a past-tense, immutable statement of fact owned by the producer: `OrderPlaced`,
-`EmbeddingGenerated`. It has no addressee and no expected reply. A **command** (`ChargeCard`) is
-imperative, has exactly one handler and implies an outcome the sender cares about. The distinction
-matters because an event lets the producer stay ignorant of consumers, whereas a command re-introduces
-the coupling you were escaping. If you find yourself publishing `SendWelcomeEmail` as an event, you have
-written a remote procedure call with extra steps.
+| | Event | Command |
+|---|---|---|
+| Grammar | past tense: `OrderPlaced`, `EmbeddingGenerated` | imperative: `ChargeCard` |
+| Mutability | immutable statement of fact, owned by the producer | a request that may be refused |
+| Addressee | none, no expected reply | exactly one handler |
+| Coupling | producer stays ignorant of consumers | re-introduces the coupling you were escaping |
+
+- **Why it matters:** an event implies no outcome the sender cares about; a command does.
+- **Smell:** publishing `SendWelcomeEmail` as an event is a remote procedure call with extra steps.
 
 ### The envelope
-Every event carries metadata separate from its payload: a globally unique `event_id` (so consumers can
-deduplicate), `type` and `schema_version` (so consumers can evolve independently), `occurred_at`, the
-`aggregate_id` it belongs to (the partition key, see below), and a `trace_id` for observability. The
-payload is either a thin notification ("document 42 changed, fetch it") or a self-contained snapshot
-("document 42 now has these fields"). Fowler calls these *event notification* and *event-carried state
-transfer*; the second removes a callback to the producer at the cost of larger messages and consumers
-holding copies of data that can go stale.
+Every event carries metadata separate from its payload:
+- **`event_id`** — globally unique, so consumers can deduplicate.
+- **`type` and `schema_version`** — so consumers can evolve independently.
+- **`occurred_at`** — when the fact happened.
+- **`aggregate_id`** — the entity it belongs to; this is the partition key (see below).
+- **`trace_id`** — for observability across hops.
+
+Payload styles (Fowler's names):
+- **Event notification** — thin: "document 42 changed, fetch it". Always fresh, but consumers call back.
+- **Event-carried state transfer** — a snapshot: "document 42 now has these fields". Removes the callback,
+  at the cost of larger messages and consumers holding copies of data that can go stale.
 
 ### The broker and its guarantees
-A log-style broker (Kafka, Pulsar, Redpanda) appends events to **partitions** and lets each consumer
-group keep its own **offset**. Ordering is guaranteed only within a partition, so you choose the
-partition key to be the thing whose order matters, usually the aggregate id: all events for document 42
-land in one partition and are seen in order, while documents 42 and 43 may interleave arbitrarily.
-Because the log is retained, a new consumer can start from offset 0 and rebuild its state, which is the
-replay property the naive design lacked. Queue-style brokers (RabbitMQ, SQS) instead delete a message
-once a consumer acknowledges it and hand each message to one competing consumer; they are simpler for
-work distribution but lose replay.
+| | Log-style (Kafka, Pulsar, Redpanda) | Queue-style (RabbitMQ, SQS) |
+|---|---|---|
+| Storage | appends to **partitions**, retained | message deleted once a consumer acknowledges it |
+| Consumers | each consumer group keeps its own **offset** | each message goes to one competing consumer |
+| Replay | yes: a new consumer starts from offset 0 and rebuilds state | no |
+| Best for | fan-out, history, rebuilds | simple work distribution |
 
-Both styles deliver **at least once**: a consumer that crashes after processing but before acknowledging
-will see the message again. Consumers must therefore be idempotent, by recording processed `event_id`s or
-by making the effect naturally repeatable. Exactly-once is a property you build at the consumer, not one
-the broker gives you end to end: Kafka's transactional producers cover only Kafka-to-Kafka read-process-write
-loops, and any effect outside the log (a database write, an HTTP call) still needs idempotence.
-
-Partitions are also the unit of parallelism: within one consumer group each partition is read by at most
-one consumer at a time, so a topic with 12 partitions can keep at most 12 consumers of a group busy.
-Choosing the partition count is therefore a capacity decision you make up front, because adding
-partitions later changes which partition a key hashes to and breaks per-key ordering across the change.
+- **Ordering is per partition only.** Choose the partition key to be the thing whose order matters,
+  usually the aggregate id: all events for document 42 land in one partition in order, while documents 42
+  and 43 may interleave arbitrarily.
+- **Delivery is at least once in both styles.** A consumer that crashes after processing but before
+  acknowledging sees the message again, so consumers must be idempotent: record processed `event_id`s or
+  make the effect naturally repeatable.
+- **Exactly-once is built at the consumer, not given end to end.** Kafka's transactional producers cover
+  only Kafka-to-Kafka read-process-write loops; any effect outside the log (a database write, an HTTP
+  call) still needs idempotence.
+- **Partitions are the unit of parallelism.** Within one consumer group each partition is read by at most
+  one consumer at a time, so a topic with 12 partitions keeps at most 12 consumers of a group busy.
+- **Pick partition count up front.** It is a capacity decision, because adding partitions later changes
+  which partition a key hashes to and breaks per-key ordering across the change.
 
 ### When a consumer cannot process an event
-A message that fails every time (a malformed payload, a PDF that crashes the parser) is a **poison
-message**, and the way you retry it decides what you lose. Retrying in place preserves order but blocks
-the whole partition behind it: every later event on that partition, for every document that hashes
-there, waits. Moving it to a retry topic or dead-letter queue (DLQ) unblocks the partition, but if a
-later event for the *same* key is processed while the failed one sits in the DLQ, that key's order is
-broken (an `Updated` overtakes its `Created`). The careful middle path is to park the key: record it as
-blocked, divert its subsequent events to the side as well, and release them in order once the head
-event is fixed or discarded. Which of the three is right depends on whether per-key order or partition
-throughput matters more for that event type, and it should be decided per topic, not discovered.
+A message that fails every time (malformed payload, a PDF that crashes the parser) is a **poison
+message**. How you retry it decides what you lose:
+
+| Strategy | Keeps per-key order? | Keeps partition flowing? | Cost |
+|---|---|---|---|
+| Retry in place | yes | no | every later event on that partition, for every document hashed there, waits |
+| Retry topic or dead-letter queue (DLQ) | no | yes | a later event for the *same* key can overtake it (an `Updated` before its `Created`) |
+| Park the key | yes | yes | mark the key blocked, divert its later events aside too, release them in order once the head event is fixed or discarded |
+
+Choose by whether per-key order or partition throughput matters more for that event type, and decide it
+per topic, not by discovery in an incident.
 
 ### Producing reliably
-The producer writes its own database row and publishes the event. Doing those as two separate operations
-is the **dual-write problem**: a crash between them loses the event or emits one for a rolled-back
-transaction. The transactional outbox pattern fixes it by writing the event into the same database
-transaction and relaying it afterwards.
+1. The producer writes its own database row and publishes the event.
+2. Doing those as two separate operations is the **dual-write problem**: a crash between them loses the
+   event or emits one for a rolled-back transaction.
+3. The **transactional outbox** fixes it: write the event into the same database transaction, relay it
+   afterwards.
 
 ### Choreography versus orchestration
-With **choreography** each service reacts to events and emits new ones; the workflow is emergent. With
-**orchestration** a dedicated component listens for events and issues commands to drive the steps. For
-two or three steps choreography is lighter; beyond that nobody can answer "where is order 42 right now"
-without an orchestrator or a very good trace. Multi-step agent workflows with compensation needs usually
-end up orchestrated.
+- **Choreography:** each service reacts to events and emits new ones; the workflow is emergent. Lighter
+  for two or three steps.
+- **Orchestration:** a dedicated component listens for events and issues commands to drive the steps.
+- **The switch point:** beyond a few steps nobody can answer "where is order 42 right now" without an
+  orchestrator or a very good trace. Multi-step agent workflows with compensation needs usually end up
+  orchestrated.
 
 ### Flavours worth naming
-*Event sourcing* goes further and makes the event log the system of record, rebuilding current state by
-folding the events. *CQRS* separates the write model from read models that are built from events. Both
-are separate commitments with their own costs; "event-driven" does not require either.
+- **Event sourcing** makes the event log the system of record and rebuilds current state by folding events.
+- **CQRS** separates the write model from read models built from events.
+- Both are separate commitments with their own costs; "event-driven" does not require either.
 
-## Example
-A document-ingestion flow expressed as events. `publish` and `consume` stand in for any broker client;
-the parts that matter are the envelope, the partition key and the idempotent consumer.
+## Examples
+### Document ingestion as events
+`publish` and `consume` stand in for any broker client; what matters is the envelope, the partition key
+and the idempotent consumer.
 
 ```python
 import uuid, json, datetime as dt
@@ -157,59 +163,113 @@ def on_document_uploaded(raw, chunk_and_embed, vector_upsert, publish):
                    {"chunks": chunk_count}, ev["trace_id"])))
 ```
 
-Adding a billing meter later means one more consumer of `DocumentIndexed`; the upload service and the
-embedder do not change. If the embedder is down for an hour, the events wait on the topic and are
-processed when it returns, in per-document order. Two details carry the design. A random chunk id would
-make every redelivery add a second copy of the document to the index; the deterministic id turns the
-redelivery into an overwrite. And the downstream `publish` after the upsert can itself be lost or
-duplicated, which is acceptable only because the next consumer is idempotent too; if it were not, the
-embedder would need its own outbox. Note one gap the sketch leaves: if a re-upload produces *fewer*
-chunks, the old high-numbered chunks survive, so a real indexer deletes `doc_id:*` ids beyond the new
-count or versions chunks by document revision.
+What this design buys and where it is thin:
+- **New consumers are free.** A billing meter is one more consumer of `DocumentIndexed`; the upload service
+  and embedder do not change.
+- **Outages become lag.** If the embedder is down for an hour, events wait on the topic and are processed
+  in per-document order when it returns.
+- **Deterministic ids carry idempotence.** A random chunk id would add a second copy of the document on
+  every redelivery; the deterministic id turns redelivery into an overwrite.
+- **The downstream publish can be lost or duplicated.** That is acceptable only because the next consumer
+  is idempotent too; otherwise the embedder would need its own outbox.
+- **Gap:** if a re-upload produces *fewer* chunks, old high-numbered chunks survive. A real indexer deletes
+  `doc_id:*` ids beyond the new count or versions chunks by document revision.
+
+### Runnable: redelivery with and without an idempotent consumer
+Simulates a broker that redelivers after a crash, and shows why the dedupe key matters.
+
+```python
+deliveries = [("e1", "doc42", 5), ("e2", "doc43", 3), ("e1", "doc42", 5)]  # e1 redelivered
+
+def naive(events):
+    billed = 0
+    for _eid, _doc, chunks in events:
+        billed += chunks                  # counts the redelivery twice
+    return billed
+
+def idempotent(events):
+    seen, billed = set(), 0
+    for eid, _doc, chunks in events:
+        if eid in seen:                   # inbox check on event_id
+            continue
+        seen.add(eid)
+        billed += chunks
+    return billed
+
+print(naive(deliveries), idempotent(deliveries))   # 13 8
+```
+
+### Worked numbers: synchronous chain vs events
+| Design | What must be up for an upload to succeed | Availability (99.9% each) | Upload latency |
+|---|---|---|---|
+| Six synchronous calls | producer + 6 services | 0.999⁷ ≈ 99.3% | sum of 7 latencies |
+| Event on a broker | producer + broker | 0.999² ≈ 99.8% | producer write + one broker append |
+
+The six consumers still do the same work, but their outages show up as consumer lag instead of failed
+uploads (illustrative arithmetic, assuming independent failures).
+
+## Production patterns
+- **Outbox relay instead of dual writes.** When a service changes its database and must emit an event,
+  write the event row in the same transaction and relay it with a poller or change-data capture (for
+  example Debezium reading the outbox table). Monitor outbox backlog age; alert when the oldest
+  unpublished row exceeds your freshness budget.
+- **Idempotent producer settings on Kafka.** Set `acks=all` and `enable.idempotence=true` so broker-side
+  retries do not duplicate or reorder within a partition. This does not make consumers exactly-once;
+  monitor producer retry and error rates.
+- **Schema registry with compatibility checks.** Register every event schema and enforce a compatibility
+  mode (for example backward compatibility in Confluent Schema Registry) in CI, so a breaking payload
+  change fails the build instead of a consumer. Monitor schema versions in use per consumer.
+- **Lag-based alerting per consumer group.** Track lag per partition (Kafka's
+  `kafka-consumer-groups.sh --describe` prints it; managed services export it as a metric). Alert on lag
+  that grows over minutes, and on one partition lagging while others are at zero, the poison-message shape.
+- **Bounded retries then DLQ.** On SQS set a redrive policy with `maxReceiveCount` (for example 5) to a
+  dead-letter queue; on Kafka route to a retry topic after N attempts. Page on DLQ depth above zero for
+  topics where order or completeness matters, and keep a replay tool.
 
 ## Trade-offs
-- Producers gain independence from consumers, but you lose the synchronous answer: the uploader cannot
-  tell the user "indexed, ask away" unless something waits for `DocumentIndexed`; this flips back toward
-  a synchronous call when the user needs the result in the same interaction.
-- Replayable logs let you rebuild indexes and backfill new consumers, but every event schema becomes a
-  long-lived public contract; once events are retained for months, a breaking payload change needs
-  versioning and dual-reading consumers.
-- Choreography keeps services small and decoupled, yet end-to-end visibility degrades with each hop;
-  past roughly four or five steps, or whenever compensation is needed, orchestration pays for itself.
-- Event-carried state transfer removes callbacks and lets consumers survive producer outages, at the
-  cost of duplicated data that drifts; thin notifications stay fresh but create a thundering herd of
-  reads on the producer when a hot event fans out.
-- At-least-once delivery with idempotent consumers is robust and cheap, but it pushes deduplication
-  state into every consumer; exactly-once brokers trade throughput and operational complexity for it.
+- **Producer independence vs the synchronous answer.** The uploader cannot tell the user "indexed, ask
+  away" unless something waits for `DocumentIndexed`. This flips back toward a synchronous call when the
+  user needs the result in the same interaction.
+- **Replay vs long-lived contracts.** Replayable logs rebuild indexes and backfill new consumers, but every
+  event schema becomes a public contract. Once events are retained for months, a breaking payload change
+  needs versioning and dual-reading consumers.
+- **Choreography vs visibility.** Small decoupled services, yet end-to-end visibility degrades with each
+  hop. Past roughly four or five steps, or whenever compensation is needed, orchestration pays for itself.
+- **Event-carried state vs freshness.** Snapshots remove callbacks and survive producer outages, at the cost
+  of duplicated data that drifts; thin notifications stay fresh but create a thundering herd of reads on
+  the producer when a hot event fans out.
+- **At-least-once vs exactly-once.** At-least-once with idempotent consumers is robust and cheap but pushes
+  deduplication state into every consumer; exactly-once brokers trade throughput and operational
+  complexity for it.
 
 ## Pitfalls
-- Commands disguised as events (`SendEmailRequested`) with exactly one intended handler; the symptom is
-  producers that break when "their" consumer changes, which means the coupling never left.
-- Dual writes without an outbox: rows exist with no corresponding event, usually noticed as "the index
-  is missing documents that are in the database" after a deploy or a crash.
-- Assuming global ordering; a consumer that processes `DocumentDeleted` before `DocumentUploaded` because
-  the two were keyed differently will resurrect deleted content in the index.
-- Non-idempotent consumers; duplicate embeddings, double-counted billing and repeated notifications
-  appear after any consumer restart or broker rebalance.
-- Event soup: dozens of topics with no owner, no schema registry and no documented consumers; the
-  symptom is that nobody dares delete or change anything, and the system's behaviour is discovered by
-  reading consumer code.
-- Treating the broker as infinitely fast: a slow consumer accumulates lag silently until a dashboard
-  shows events processed hours after they occurred; consumer lag must be a first-class alert.
-- Retrying a poison message in place forever; the symptom is lag climbing on one partition while every
-  other partition of the group sits at zero, and the same offset appearing in the error log on a loop.
+- **Commands disguised as events.** `SendEmailRequested` with exactly one intended handler. Symptom:
+  producers break when "their" consumer changes, so the coupling never left. Fix: send a command, or
+  publish the underlying fact.
+- **Dual writes without an outbox.** Rows exist with no corresponding event, usually noticed as "the index
+  is missing documents that are in the database" after a deploy or crash. Fix: transactional outbox.
+- **Assuming global ordering.** A consumer that processes `DocumentDeleted` before `DocumentUploaded`,
+  because the two were keyed differently, resurrects deleted content in the index. Fix: key by aggregate id.
+- **Non-idempotent consumers.** Duplicate embeddings, double-counted billing and repeated notifications
+  appear after any consumer restart or broker rebalance. Fix: inbox table or deterministic ids.
+- **Event soup.** Dozens of topics with no owner, no schema registry and no documented consumers. Symptom:
+  nobody dares delete or change anything, and behaviour is discovered by reading consumer code.
+- **Treating the broker as infinitely fast.** A slow consumer accumulates lag silently until a dashboard
+  shows events processed hours after they occurred. Fix: consumer lag as a first-class alert.
+- **Retrying a poison message in place forever.** Symptom: lag climbing on one partition while every other
+  partition of the group sits at zero, and the same offset looping in the error log.
 
 ## When to use
-Reach for events when more than one party cares about a fact, when consumers may be down while
-producers are up, when you need to replay history, or when the producer's latency budget cannot absorb
-the consumers' work. Typical AI examples: ingestion pipelines (upload, parse, chunk, embed, index),
-agent run telemetry fanned out to billing, evaluation sampling and audit, and model-output moderation
-that must not block the response. Do not use events when the caller needs the result now, when there is
-exactly one consumer and the workflow is short, or when the team has no way to trace a flow across
-services yet. Measure consumer lag, redelivery rate and dead-letter volume; those three numbers tell you
-whether the architecture is healthy. In interviews, the expected depth is to state the dual-write
-problem unprompted, explain per-partition ordering, and say "at-least-once plus idempotent consumers"
-before anyone asks about exactly-once.
+- **Use when:** more than one party cares about a fact, consumers may be down while producers are up, you
+  need to replay history, or the producer's latency budget cannot absorb the consumers' work.
+- **Typical AI uses:** ingestion pipelines (upload, parse, chunk, embed, index); agent run telemetry fanned
+  out to billing, evaluation sampling and audit; model-output moderation that must not block the response.
+- **Avoid when:** the caller needs the result now, there is exactly one consumer and the workflow is short,
+  or the team has no way to trace a flow across services yet.
+- **Measure:** consumer lag, redelivery rate and dead-letter volume; those three numbers tell you whether
+  the architecture is healthy.
+- **Interviews:** state the dual-write problem unprompted, explain per-partition ordering, and say
+  "at-least-once plus idempotent consumers" before anyone asks about exactly-once.
 
 ## Role lens
 - **Engineer:** Designs event envelopes, chooses partition keys, writes idempotent consumers with an

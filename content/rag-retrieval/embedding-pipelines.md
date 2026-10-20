@@ -5,7 +5,7 @@ name: Embedding pipelines
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/embedding-models
@@ -22,99 +22,120 @@ sources:
 ---
 
 ## TL;DR
-An embedding pipeline is the job that turns source documents into indexed vectors and keeps them that
-way: parse, chunk, enrich, embed, upsert, and later update and delete. It exists because the "loop over
-files and call the API" script fails the moment a document changes, a batch half-fails, or the model is
-upgraded. The design goals are idempotency (same input, same chunk id, no duplicates), incremental
-updates, and strict parity between how text is embedded at index time and at query time.
+An embedding pipeline turns source documents into indexed vectors and keeps them in sync: parse, chunk,
+enrich, embed, upsert, update, delete. Its goals are idempotent chunk ids, incremental updates, and
+identical embedding at index time and query time.
 
 ## Why it exists
-The demo version is ten lines: read every file, split it, embed each piece, insert. It works once. Three
-things break it. The first is change: documents are edited, re-uploaded and deleted, and re-running the
-script either duplicates every chunk or leaves ghosts of removed content that keep showing up in
-answers. The second is scale and failure: two million chunks through a rate-limited API takes hours, a
-single timeout halfway through leaves the index half-built with no record of which half, and the naive
-fix, "run it again", doubles the cost and the duplicates. The third is drift: the query service must
-embed text exactly the way the indexer did, with the same model version, the same prefix, the same
-normalization and the same text cleaning, or every search compares vectors from two different spaces.
-This is the retrieval version of training/serving skew, and it is just as invisible: no error is raised,
-recall simply decays.
-
-A pipeline makes these properties explicit. Every chunk gets a deterministic identity, every run knows
-what already exists, the embedding call lives in one place shared with the query path, and failures are
-retried per batch instead of per corpus. The cost of not having this shows up as the most common RAG
-incident: "search got worse and nobody changed anything".
+- **The demo works once.** Ten lines: read every file, split, embed each piece, insert. Three things
+  break it.
+- **Change.** Documents are edited, re-uploaded and deleted; re-running the script duplicates every
+  chunk or leaves ghosts of removed content that keep showing up in answers.
+- **Scale and failure.** Two million chunks through a rate-limited API takes hours. One timeout halfway
+  leaves the index half-built with no record of which half, and "run it again" doubles cost and
+  duplicates.
+- **Drift.** The query service must embed exactly as the indexer did (same model version, prefix,
+  normalization, text cleaning), or searches compare vectors from two spaces. This is retrieval's
+  training/serving skew: no error, recall simply decays.
+- **A pipeline makes these properties explicit.** Deterministic chunk identity, knowledge of what exists,
+  one shared embedding call, and per-batch retries. Without it you get the most common RAG incident:
+  "search got worse and nobody changed anything".
 
 ## How it works
 ### The stages
-1. **Ingest.** Pull documents from their sources (object storage, a CMS, a wiki, a database) and record
-   `doc_id`, source URI, last-modified time and access-control metadata. Detect change by content hash
-   or by change-data-capture events so unchanged documents cost nothing.
-2. **Parse and normalize.** Convert each document to text plus structure (headings, tables, page numbers).
-   This step must be deterministic: the same bytes must always produce the same text, because the chunk
-   ids below depend on it.
-3. **Chunk.** Apply the chunking strategy and attach `chunk_index`, heading path and character offsets.
-4. **Enrich.** Add the metadata that filters will need later (tenant, ACL groups, document date, section
-   title) and any contextual prefix the retrieval design calls for.
-5. **Embed.** Batch the chunks, apply the model's prefix, call the model with a concurrency limit, retry
-   on rate limits and transient errors with backoff, normalize, and record the model name and version.
-6. **Upsert.** Write vector, payload and text (or a pointer to the text) under the deterministic id.
-7. **Reconcile.** Delete the chunks that belonged to the previous version of the document, then verify
-   counts match what the chunker produced.
-8. **Observe.** Emit documents processed, chunks embedded, tokens spent, failures, and the lag between a
-   source change and its visibility in search.
+1. **Ingest.** Pull from sources (object storage, a CMS, a wiki, a database) and record `doc_id`, source
+   URI, last-modified time and access-control metadata. Detect change by content hash or
+   change-data-capture events, so unchanged documents cost nothing.
+2. **Parse and normalize.** Convert to text plus structure (headings, tables, page numbers).
+   Deterministic, because the same bytes must always produce the same text and chunk ids depend on it.
+3. **Chunk.** Apply the chunking strategy; attach `chunk_index`, heading path and character offsets.
+4. **Enrich.** Add filter metadata (tenant, ACL groups, document date, section title) and any contextual
+   prefix the retrieval design calls for.
+5. **Embed.** Batch, apply the model's prefix, call with a concurrency limit, retry rate limits and
+   transient errors with backoff, normalize, and record model name and version.
+6. **Upsert.** Write vector, payload and text (or a pointer to it) under the deterministic id.
+7. **Reconcile.** Delete the previous version's chunks, then verify counts match what the chunker
+   produced.
+8. **Observe.** Emit documents processed, chunks embedded, tokens spent, failures, and the lag from
+   source change to visibility in search.
 
 ### Idempotency through content-addressed ids
-The central trick is `chunk_id = hash(model_version, doc_id, chunk_index, chunk_text)`. Re-running the
-pipeline on an unchanged document finds every id already present and embeds nothing. An edit that
-changes the text of one or two chunks without changing how many chunks precede them gives only those
-chunks new ids and new embeddings; the old ids become stale and are deleted. Because `chunk_index` is in
-the hash, an edit that inserts or removes a chunk shifts the index of every later chunk and re-embeds
-all of them. If such edits are common, keep an embedding cache keyed by `hash(model_version,
-chunk_text)` so moved-but-unchanged text is not sent to the model again, or drop the index from the id
-and store it as a field (then disambiguate identical chunks within one document, such as repeated
-boilerplate). Because the model version is part of the hash, a model upgrade naturally produces
-a complete new set of ids, which makes the migration a normal run rather than a special case. LangChain's
-indexing API and LlamaIndex's ingestion pipeline implement this same idea with a record manager or
-docstore that maps document ids to content hashes.
+```
+chunk_id = hash(model_version, doc_id, chunk_index, chunk_text)
+```
+| Event | Effect |
+|---|---|
+| Re-run on unchanged document | every id already present; nothing embedded |
+| Edit changes one or two chunks, same count before them | only those get new ids and embeddings; old ids deleted as stale |
+| Edit inserts or removes a chunk | every later `chunk_index` shifts, so all later chunks re-embed |
+| Model upgrade | complete new id set, so migration is a normal run, not a special case |
+
+- **If inserts are common:** keep an embedding cache keyed by `hash(model_version, chunk_text)` so
+  moved-but-unchanged text is not re-sent, or drop the index from the id and store it as a field (then
+  disambiguate identical chunks within one document, such as repeated boilerplate).
+- **Frameworks do the same:** LangChain's indexing API and LlamaIndex's ingestion pipeline map document
+  ids to content hashes via a record manager or docstore.
 
 ### Write new before deleting old
-Upsert the new chunks first, then delete the stale ones. If the process dies in between, the index holds
-both versions for a while, which is a mild duplicate problem; the reverse order would leave a gap where
-the document is unsearchable. For stricter atomicity, index into a new collection and switch an alias.
+- **Upsert the new chunks first, then delete the stale ones.** A crash in between leaves both versions
+  for a while, a mild duplicate problem; the reverse order leaves a gap where the document is
+  unsearchable.
+- **Stricter atomicity:** index into a new collection and switch an alias.
 
 ### Model versioning and re-indexing
-Two strategies. Blue/green: embed the whole corpus into a second collection with the new model, evaluate
-it side by side, flip the query service, drop the old one; it doubles storage during the migration but is
-clean and reversible. In place: store `model` on every record and filter on it at query time while the
-backfill runs; cheaper but easy to get wrong. Estimate the backfill before choosing: chunks × average
-tokens gives total tokens, and as an illustrative order of magnitude a million 300-token chunks is 300
-million tokens, which at hosted embedding prices of cents per million tokens (vendor- and
-time-dependent) costs on the order of dollars to tens of dollars; the real constraint is usually the
-API rate limit, which turns that into hours, or GPU throughput for a self-hosted model. The duration
-is `total tokens ÷ tokens per minute you are allowed (or can serve)`: 300 million tokens against an
-illustrative quota of one million tokens per minute is 300 minutes, five hours before retries. That
-number, more than the bill, decides whether a migration fits overnight, and it also caps concurrency:
-workers × tokens per request × requests per worker per minute must stay under the quota, or extra
-workers only buy 429s.
+| Strategy | How | Cost and risk |
+|---|---|---|
+| Blue/green | embed the corpus into a second collection, evaluate side by side, flip the query service, drop the old | doubles storage during migration; clean and reversible |
+| In place | store `model` on every record and filter on it at query time while the backfill runs | cheaper, easy to get wrong |
+
+Estimate the backfill before choosing (illustrative orders of magnitude):
+- **Tokens:** chunks × average tokens. A million 300-token chunks is 300 million tokens.
+- **Bill:** at hosted prices of cents per million tokens (vendor- and time-dependent), on the order of
+  dollars to tens of dollars.
+- **Duration, the real constraint:** `total tokens ÷ tokens per minute you are allowed (or can serve)`.
+  Against an illustrative quota of one million tokens per minute, 300 minutes: five hours before retries.
+  For self-hosted models, GPU throughput sets the rate.
+- **Concurrency cap:** workers × tokens per request × requests per worker per minute must stay under the
+  quota, or extra workers only buy 429s.
 
 ### Batch versus streaming
-A nightly batch is enough for slowly changing corpora. When users notice staleness, run the same
-per-document function from a queue consumer triggered by change events. Keeping one shared function for
-both modes is what keeps the two paths identical.
+- **Nightly batch** is enough for slowly changing corpora.
+- **Queue consumer on change events** when users notice staleness.
+- **One shared per-document function for both modes** keeps the two paths identical.
 
 ### Query-time parity
-Put the embedding call, prefix logic and normalization in one module imported by both the indexer and the
-query service. Add a "golden vector" test: embed a fixed sentence and compare against a stored vector
-with a tolerance that is tight but allows the tiny run-to-run noise some hosted endpoints show (compare
-cosine to the stored vector rather than requiring exact equality), so a silent model change behind a hosted endpoint or a dependency bump fails CI
-instead of degrading production.
+- **One module** holds the embedding call, prefix logic and normalization; indexer and query service both
+  import it.
+- **Golden-vector test:** embed a fixed sentence and compare with a stored vector. Compare cosine within
+  a tight tolerance rather than exact equality, because some hosted endpoints show tiny run-to-run noise.
+  A silent model change behind a hosted endpoint, or a dependency bump, then fails CI instead of
+  degrading production.
 
-## Example
-An idempotent per-document indexing step. The store is any vector database with upsert, delete and a
-way to list ids by document; `embed_fn` is the shared function the query service also imports. Only
-changed chunks are embedded, stale chunks are removed after the new ones are live, and the model version
-is part of every id.
+## Diagram
+Follow one document through the per-document step: unchanged documents exit early, only new ids are
+embedded, and stale ids are deleted only after their replacements are live.
+
+```mermaid
+flowchart TD
+    S["Source change event or nightly scan"] --> H{"Content hash changed?"}
+    H -->|"no"| SKIP["Skip, nothing embedded"]
+    H -->|"yes"| P["Parse and normalize, deterministic"]
+    P --> C["Chunk and enrich with metadata"]
+    C --> ID["chunk_id from model_version, doc_id, index, text"]
+    ID --> DIFF{"Id already in store?"}
+    DIFF -->|"yes"| KEEP["Keep existing vector"]
+    DIFF -->|"no"| EMB["Shared embed fn: batch, rate limit, retry"]
+    EMB -->|"repeated failure"| DLQ[("Dead-letter queue")]
+    EMB --> UP[("Upsert vectors with model and payload")]
+    UP --> DEL["Delete stale ids for this doc"]
+    DEL --> OBS["Emit counts, tokens, lag"]
+```
+
+## Examples
+### An idempotent per-document indexing step
+The store is any vector database with upsert, delete and a way to list ids by document; `embed_fn` is the
+shared function the query service also imports. Only changed chunks are embedded, stale chunks are
+removed after the new ones are live, and the model version is part of every id.
 
 ```python
 import hashlib, random, time
@@ -154,44 +175,104 @@ def index_document(doc_id, chunks, store, embed_fn, batch_size=64):
     return {"embedded": len(todo), "deleted": len(stale), "unchanged": len(existing & wanted.keys())}
 ```
 
+### A golden-vector test in CI
+`embedder.embed` is the shared function; `tests/golden_vector.json` was written once from a known-good
+run. The 0.999 tolerance is illustrative: set it just below the noise you observe from your endpoint.
+
+```python
+import json, math
+from embedder import embed, MODEL      # the module the indexer and query service both import
+
+GOLDEN = "Refunds are issued to the original payment method within 5-7 business days."
+
+def cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    return dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+
+def test_embedding_output_unchanged():
+    with open("tests/golden_vector.json") as f:
+        stored = json.load(f)
+    assert stored["model"] == MODEL, "model label changed: run a re-index, then refresh the golden file"
+    v = embed([GOLDEN])[0]
+    assert len(v) == len(stored["vector"]), "dimension changed"
+    assert cosine(v, stored["vector"]) > 0.999, "embedding output drifted: treat as a model upgrade"
+```
+
+### Worked scenario: planning a model-upgrade backfill
+Illustrative quota and latency; plug in your own.
+
+| Quantity | Value |
+|---|---|
+| Corpus | 1,000,000 chunks × 300 tokens = 300M tokens |
+| Quota | 1M tokens per minute |
+| Minimum duration | 300M ÷ 1M = 300 minutes (five hours) before retries |
+| Tokens per request (batch of 64) | 64 × 300 = 19,200 |
+| Requests per minute the quota allows | 1,000,000 ÷ 19,200 ≈ 52 |
+| Worker doing one 2-second request at a time | 30 requests per minute |
+| Useful workers | about 2; a third worker only adds 429s and backoff |
+
+Run blue/green: the old collection keeps serving for the five hours, so the overnight window, not the
+bill, is the decision.
+
+## Production patterns
+- **Record-manager incremental indexing** — when you use LangChain, call its `index(...)` function with
+  a `SQLRecordManager`, a `source_id_key` and `cleanup="incremental"`, so re-runs skip unchanged
+  documents and delete stale chunks. Monitor skipped versus embedded counts per run; a re-run on an
+  unchanged corpus should embed close to zero.
+- **Docstore-backed ingestion pipeline** — in LlamaIndex, give `IngestionPipeline` a docstore and a
+  vector store so documents whose hash has not changed are skipped and changed ones are upserted.
+  Monitor the lag from source change to searchable.
+- **Shared rate limiter sized to the quota** — one token-bucket limiter (in Redis or the queue) that all
+  workers draw from, set below the vendor's tokens-per-minute and requests-per-minute limits. Monitor the
+  429 rate; above a few percent means the limiter is set too high.
+- **Validate, then dead-letter** — count tokens per chunk before the call, re-chunk anything over the
+  model limit, and send repeated failures to a dead-letter queue with the document id. Alert on queue
+  depth so one poison pill cannot stall the run.
+- **Golden-vector check on a schedule** — run the test above in CI and hourly against production
+  credentials. Page when it fails, because a hosted model change silently splits index and query spaces.
+
 ## Trade-offs
-- Content-hashed ids make re-runs free and safe, but any change to the chunker configuration, parser or
-  model version re-embeds the entire corpus by design; that is what you want for a model upgrade and a
-  surprise when a whitespace change in the parser triggers it.
-- Larger batches mean fewer calls and higher throughput, but one bad input fails and retries more work,
-  and per-request token limits cap the batch size; smaller batches isolate failures at some throughput cost.
-- Streaming per-document updates deliver minutes-level freshness at the cost of queues, ordering and
-  deduplication logic; a nightly batch is far simpler and wins until users notice stale answers.
-- Storing chunk text inside the vector store makes retrieval a single hop but duplicates data and
-  inflates memory; a pointer to a document store saves memory and adds a lookup per result.
-- Blue/green re-indexing is clean and allows side-by-side evaluation but doubles storage during the
-  migration; in-place migration is cheaper and riskier.
+- **Free re-runs vs surprise re-embeds.** Content-hashed ids make re-runs free and safe, but any change
+  to chunker config, parser or model version re-embeds the whole corpus by design; wanted for a model
+  upgrade, a surprise when a parser whitespace change triggers it.
+- **Large vs small batches.** Larger batches mean fewer calls and higher throughput, but one bad input
+  fails and retries more work, and per-request token limits cap batch size; smaller batches isolate
+  failures at some throughput cost.
+- **Streaming vs nightly batch.** Per-document streaming gives minutes-level freshness at the cost of
+  queues, ordering and dedup logic; a nightly batch is far simpler and wins until users notice stale
+  answers.
+- **Text in the vector store vs a pointer.** Storing chunk text makes retrieval a single hop but
+  duplicates data and inflates memory; a pointer to a document store saves memory and adds a lookup per
+  result.
+- **Blue/green vs in-place re-indexing.** Blue/green is clean and allows side-by-side evaluation but
+  doubles storage during migration; in-place is cheaper and riskier.
 
 ## Pitfalls
-- Non-deterministic chunking, for example a splitter whose boundaries depend on library version or on
-  randomness; symptom: every run re-embeds everything, so the cost of a re-run on an unchanged corpus
-  never drops toward zero (and, if reconciliation fails, the index grows with no new documents).
-- The query service embeds with a different model, version or prefix than the indexer; symptom: recall
-  collapses after a deploy that "only touched the API".
-- Deletions never propagated to the index; symptom: answers cite documents that were removed weeks ago.
-- No model version stored on the record; symptom: after an upgrade nobody can tell which chunks still
-  need re-embedding.
-- A poison-pill input, such as one chunk over the model's token limit, failing the whole batch on every
-  retry; symptom: the pipeline stalls at the same document forever. Validate token counts before the call
-  and route failures to a dead-letter queue.
-- Unbounded worker concurrency against a rate-limited API; symptom: adding workers lowers throughput
-  because most calls return 429 and retry.
-- Embedding boilerplate (navigation, headers, legal footers) repeated across thousands of pages; symptom:
-  top-k results are near-duplicate chunks of the same boilerplate.
+- **Non-deterministic chunking.** A splitter whose boundaries depend on library version or randomness
+  re-embeds everything every run, so re-run cost never drops toward zero (and, if reconciliation fails,
+  the index grows with no new documents).
+- **Query service embeds differently from the indexer.** A different model, version or prefix makes
+  recall collapse after a deploy that "only touched the API".
+- **Deletions never propagated.** Answers cite documents that were removed weeks ago.
+- **No model version on the record.** After an upgrade nobody can tell which chunks still need
+  re-embedding.
+- **A poison-pill input.** One chunk over the model's token limit fails the whole batch on every retry,
+  and the pipeline stalls at the same document forever. Validate token counts before the call and route
+  failures to a dead-letter queue.
+- **Unbounded concurrency against a rate-limited API.** Adding workers lowers throughput, because most
+  calls return 429 and retry.
+- **Embedding repeated boilerplate.** Navigation, headers and legal footers across thousands of pages
+  make top-k results near-duplicate chunks of the same boilerplate.
 
 ## When to use
-Build a real pipeline as soon as the corpus will be updated more than once, which is almost always. Keep
-the single-script version only for a throwaway prototype on a static dump. Decide batch versus streaming
-from how fast users need to see changes, and blue/green versus in-place from how often you expect to
-change models. Measure index lag (source change to searchable), re-run cost on an unchanged corpus
-(should be near zero), duplicate rate, and the golden-vector test in CI. In day-to-day work this is
-where most RAG engineering time goes, and in interviews the expected answer to "how do you keep the
-index in sync with the documents" is content-hashed ids, incremental upserts and versioned re-indexing.
+- **Build a real pipeline** as soon as the corpus will be updated more than once, which is almost always;
+  keep the single script only for a throwaway prototype on a static dump.
+- **Batch vs streaming:** decide from how fast users need to see changes.
+- **Blue/green vs in-place:** decide from how often you expect to change models.
+- **Measure:** index lag (source change to searchable), re-run cost on an unchanged corpus (near zero),
+  duplicate rate, and the golden-vector test in CI.
+- **Day to day and interviews:** most RAG engineering time goes here; "how do you keep the index in sync"
+  is answered by content-hashed ids, incremental upserts and versioned re-indexing.
 
 ## Role lens
 - **Engineer:** Implements the per-document idempotent step, the batching and backoff around the model
@@ -212,6 +293,41 @@ bump the version string that is part of every chunk id, run a blue/green re-inde
 compare recall@k on labelled queries between old and new, and flip the query service only when the new
 collection passes. Pin to a dated model identifier where the vendor offers one, and keep the old
 collection until the comparison is done.
+
+## Interview questions
+### How do you make an embedding pipeline idempotent?
+- **Deterministic ids:** derive each chunk id from model version, document id, chunk index and chunk text,
+  so a re-run on unchanged content finds every id present and embeds nothing.
+- **Deterministic parsing and chunking:** the same bytes must always yield the same text, or ids churn.
+- **Reconcile per document:** upsert new ids, then delete the document's ids that are no longer wanted.
+
+### Users report answers citing a policy page that was deleted last month. How do you debug and fix it?
+- **Confirm:** list the vector store's ids for that `doc_id`; surviving chunks mean deletions never
+  propagated.
+- **Cause:** the pipeline only processes documents it sees, so a removed source document never triggers
+  its own cleanup.
+- **Fix:** consume delete events or diff source document ids against the store on each run, delete
+  orphaned chunks, and track an orphan count as a metric.
+
+### Batch or streaming ingestion: how do you choose?
+- **Nightly batch** is far simpler and fine for slowly changing corpora.
+- **Streaming on change events** gives minutes-level freshness, at the cost of queues, ordering and dedup
+  logic.
+- **Decide from the freshness SLA,** and share one per-document function across both modes so the paths
+  never diverge.
+
+### Plan the backfill for re-embedding two million 300-token chunks under a one-million-tokens-per-minute quota.
+- **Tokens:** 2,000,000 × 300 = 600M tokens.
+- **Minimum duration:** 600M ÷ 1M = 600 minutes, ten hours before retries, so the time window, not the
+  bill, is the constraint.
+- **Concurrency:** batches of 64 × 300 tokens allow about 52 requests per minute, so size workers to stay
+  under the quota and run blue/green so the old collection serves meanwhile.
+
+### Why would one oversized chunk stall the whole ingestion run, and how do you prevent it?
+- **Cause:** a chunk over the model's token limit fails its batch on every retry, so the pipeline loops on
+  the same document.
+- **Prevent:** count tokens with the model's tokenizer before the call and re-chunk anything over.
+- **Contain:** route repeated failures to a dead-letter queue with the document id and alert on its depth.
 
 ## Quiz
 ### Q: Why include the embedding model version in the hash that forms each chunk id?

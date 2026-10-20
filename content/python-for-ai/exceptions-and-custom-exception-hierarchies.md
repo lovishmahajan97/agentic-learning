@@ -5,7 +5,7 @@ name: Exceptions and custom exception hierarchies
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -21,94 +21,105 @@ sources:
 ---
 
 ## TL;DR
-Exceptions carry a failure up the call stack until something that knows what to do catches it. A
-custom hierarchy organises failures by *how they should be handled* (retry, shrink the input,
-re-prompt, give up) rather than by where they came from, so callers catch one base class or one
-precise leaf and never string-match messages. It is what keeps a rate limit from being treated like
-an invalid API key, and a bug in your own code from being retried at provider prices.
+Exceptions carry a failure up the stack to code that can handle it. A custom hierarchy groups failures
+by *handling policy* (retry, shrink, re-prompt, give up), so rate limits differ from bad keys and your
+bugs never retry at provider prices.
 
 ## Why it exists
-An LLM call can fail a dozen different ways, and the correct response differs for each. A rate limit
-wants a wait and a retry. A timeout wants a retry, maybe with a smaller request. A context-length
-error wants the input shrunk and never a plain retry. Output that fails schema validation wants a
-corrective re-prompt. An authentication error or content-policy refusal wants no retry at all and a
-human. A `KeyError` in your own parsing code wants a bug fix, not a retry loop that quietly triples
-your bill. If all of these arrive as "an exception", the handler can only pick one policy for all.
+- **One LLM call, a dozen failure modes, different fixes.**
 
-The naive alternatives each break. `except Exception: retry()` retries the unretryable, including
-your own bugs, and hides them behind success-after-retry statistics. Return codes and `None`
-results are ignored by the first caller that forgets to check, lose the stack trace, and spread
-`if result is None` through every layer. Matching on message text (`if "rate limit" in str(e)`)
-couples your logic to a vendor's wording and breaks on the next SDK release. Catching the vendor's
-own exception classes everywhere couples the whole application to one provider, so switching or
-adding a fallback model means touching every call site.
+| Failure | Correct response |
+|---|---|
+| Rate limit | Wait and retry |
+| Timeout | Retry, maybe with a smaller request |
+| Context-length error | Shrink the input; never a plain retry |
+| Output fails schema validation | Corrective re-prompt |
+| Authentication error or content-policy refusal | No retry; a human |
+| `KeyError` in your own parsing code | A bug fix, not a retry loop that quietly triples your bill |
 
-Custom hierarchies solve this because `except` matches by class *and all subclasses*. A tree whose
-inner nodes are handling policies (`Transient`, `Permanent`) and whose leaves carry structured data
-(`RateLimited.retry_after`, `ContextTooLong.limit`) lets each layer catch at the granularity it can act
-on. Translating vendor exceptions into that tree once, at the adapter, keeps the rest of the code
-vendor-neutral.
+- **`except Exception: retry()` is wrong.** If all of these arrive as "an exception", the handler can
+  only pick one policy. It retries the unretryable, including your own bugs, and hides them behind
+  success-after-retry statistics.
+- **Return codes, `None` and message matching are worse.** Codes and `None` get ignored by the first
+  caller that forgets to check, lose the stack trace, and spread `if result is None` everywhere.
+  `if "rate limit" in str(e)` couples logic to vendor wording and breaks on the next SDK release.
+- **Vendor classes everywhere couple you to one provider.** Switching or adding a fallback model means
+  touching every call site.
+- **Hierarchies fix this because `except` matches a class *and all subclasses*.** Inner nodes are policies
+  (`Transient`, `Permanent`); leaves carry data (`RateLimited.retry_after`, `ContextTooLong.limit`). Each
+  layer catches what it can act on, and translating vendor errors once, at the adapter, keeps the rest
+  vendor-neutral.
 
 ## How it works
 ### Raising, unwinding and catching
-`raise X(...)` creates an exception instance, attaches a traceback, and unwinds the stack frame by
-frame until a `try` block with a matching `except` is found. Matching uses `isinstance`, so
-`except Transient` catches every subclass; handlers are tested in order, which is why a subclass
-handler must appear before its base or it is unreachable. `else` runs when no exception occurred,
-`finally` always runs, and a bare `raise` inside a handler re-raises the current exception with its
-original traceback intact. Since Python 3.11 a `try` block costs nothing when no exception is raised;
-raising and unwinding still costs, so exceptions are for failures, not for routine control flow in
-hot loops.
+1. **`raise X(...)`** creates an instance, attaches a traceback, and unwinds frame by frame until a `try`
+   with a matching `except` is found.
+2. **Matching uses `isinstance`,** so `except Transient` catches every subclass.
+3. **Handlers are tested in order,** which is why a subclass handler must come before its base or it is
+   unreachable.
+4. **`else`** runs when no exception occurred; **`finally`** always runs; a **bare `raise`** in a handler
+   re-raises the current exception with its original traceback intact.
+5. **Cost:** since Python 3.11 a `try` block costs nothing when nothing is raised; raising and unwinding
+   still cost, so exceptions are for failures, not routine control flow in hot loops.
 
 ### The built-in tree and what `except Exception` means
-Everything derives from `BaseException`. `Exception` is the branch for errors a program may want to
-recover from. `KeyboardInterrupt`, `SystemExit`, `GeneratorExit` and `asyncio.CancelledError` hang
-directly off `BaseException` *so that* `except Exception` does not swallow them: a handler that
-catches "any error" must not stop Ctrl-C, interpreter shutdown or task cancellation. Catching
-`BaseException` or writing a bare `except:` breaks exactly those mechanisms.
+- **Everything derives from `BaseException`;** `Exception` is the branch for errors a program may recover
+  from.
+- **`KeyboardInterrupt`, `SystemExit`, `GeneratorExit` and `asyncio.CancelledError` hang directly off
+  `BaseException`** *so that* `except Exception` does not swallow them: an "any error" handler must not
+  stop Ctrl-C, interpreter shutdown or task cancellation.
+- **Catching `BaseException` or writing a bare `except:`** breaks exactly those mechanisms.
 
 ### Designing the hierarchy
-Start with one base per subsystem (`LLMError(Exception)`) so a caller can always say "anything from
-the LLM layer". Under it, split by handling policy, not by source: `Transient` (safe to retry) versus
-`Permanent` (do not retry), optionally `Recoverable` (retry after changing something). Leaves carry
-the data the handler needs as attributes: `retry_after` seconds, token counts and limits, the list of
-validation errors. Give leaves a clear `__str__` for logs. Keep the tree shallow; three levels is
-usually enough, and every class must correspond to a different decision somewhere, otherwise it is
-noise.
+```
+LLMError(Exception)              one base per subsystem: "anything from the LLM layer"
+├── Transient                    safe to retry
+│   └── RateLimited              .retry_after seconds
+├── Permanent                    do not retry
+└── Recoverable                  retry only after changing something
+    └── ContextTooLong           .tokens, .limit
+```
 
-Two refinements keep the tree honest. First, a leaf may also inherit a built-in when callers outside
-your code already catch that built-in: `class ProviderTimeout(Transient, TimeoutError)` is caught by
-your retry loop *and* by any generic `except TimeoutError` in a framework, because `except` checks
-the whole MRO. Second, when the handling decision depends on data rather than kind (the same
-`ProviderHTTPError` is retryable for 503 and not for 400), an attribute such as `retryable: bool`
-can beat a class split; the rule of thumb is classes for decisions made by `except`, attributes for
-decisions made by an `if` inside the handler. Prefer classes where you can, because an `except`
-clause cannot forget to check a flag.
+- **Split by handling policy, not by source.**
+- **Leaves carry what the handler needs** as attributes: `retry_after` seconds, token counts and limits,
+  the list of validation errors. Give leaves a clear `__str__` for logs.
+- **Keep it shallow.** Three levels is usually enough, and every class must match a different decision
+  somewhere, otherwise it is noise.
+- **Also inherit a built-in when outsiders catch it.** `class ProviderTimeout(Transient, TimeoutError)` is
+  caught by your retry loop *and* any framework's `except TimeoutError`, because `except` checks the
+  whole MRO.
+- **Classes for `except` decisions, attributes for `if` decisions.** When handling depends on data (the
+  same `ProviderHTTPError` is retryable for 503, not for 400), a `retryable: bool` attribute can beat a
+  split. Prefer classes where you can, because an `except` clause cannot forget to check a flag.
 
 ### Chaining: keep the cause
-Raising a domain exception inside an `except` block links the original automatically as
-`__context__`, and the traceback prints "During handling of the above exception, another exception
-occurred", which misreads as a second bug. `raise Domain(...) from e` sets `__cause__` and prints
-"The above exception was the direct cause", which is the honest story and keeps the vendor stack
-trace for debugging. `from None` suppresses the context when the original is irrelevant noise.
-`e.add_note("request_id=...")` (3.11) attaches context without changing the type.
+| Form | Sets | Traceback says |
+|---|---|---|
+| `raise Domain(...)` inside `except` | `__context__` (automatic) | "During handling of the above exception, another exception occurred", which misreads as a second bug |
+| `raise Domain(...) from e` | `__cause__` | "The above exception was the direct cause": the honest story, vendor stack trace kept |
+| `raise Domain(...) from None` | suppresses context | Only the new error, for when the original is irrelevant noise |
+
+- **`e.add_note("request_id=...")`** (3.11) attaches context without changing the type.
 
 ### Translate at the boundary, decide at the top
-Wrap vendor SDK or HTTP errors into your hierarchy in the one adapter that talks to the vendor. Let
-exceptions propagate through the layers that cannot act on them; do not catch-log-reraise at every
-level, which produces the same stack trace five times. Decide at the layer that owns the policy: the
-retry loop catches `Transient`, the request handler maps `Permanent` to an HTTP status, the top-level
-catches `LLMError` for the user-facing message. Keep `__init__` signatures compatible with pickling
-(pass the constructor arguments to `super().__init__`) if exceptions cross process boundaries.
+1. **Translate** vendor SDK or HTTP errors into your hierarchy in the one adapter that talks to the vendor.
+2. **Propagate** through layers that cannot act. Do not catch-log-reraise at every level, which prints the
+   same stack trace five times.
+3. **Decide** where the policy lives: the retry loop catches `Transient`, the request handler maps
+   `Permanent` to an HTTP status, the top level catches `LLMError` for the user-facing message.
+4. **Stay picklable** if exceptions cross process boundaries: pass the constructor arguments to
+   `super().__init__`.
 
 ### Concurrent failures
-When several tasks fail at once (an `asyncio.TaskGroup` fanning out tool calls), there is no single
-exception to raise. `ExceptionGroup` (3.11) bundles them and `except* Transient` selects the matching
-members while re-raising the rest, which keeps the retry/no-retry split correct even for parallel work.
+- **Several tasks can fail at once** (an `asyncio.TaskGroup` fanning out tool calls), so there is no
+  single exception to raise.
+- **`ExceptionGroup` (3.11) bundles them,** and `except* Transient` selects the matching members while
+  re-raising the rest, keeping the retry/no-retry split correct for parallel work.
 
-## Example
-A small hierarchy, translation of HTTP failures at the adapter, and a retry loop that only retries
-what is marked retryable. The error-body shape is illustrative; map your provider's codes the same way.
+## Examples
+### A hierarchy, an adapter and a policy-aware retry loop
+HTTP failures are translated once at the adapter; the loop retries only what is marked retryable. The
+error-body shape is illustrative; map your provider's codes the same way.
 
 ```python
 import time, httpx
@@ -164,54 +175,107 @@ def answer(client: httpx.Client, prompt: str, attempts: int = 3) -> str:
     raise Permanent(f"gave up after {attempts} attempts") from last   # Permanent: propagates
 ```
 
-Trace one failure through it. The provider answers 429 with `retry-after: 7`. The adapter turns the
-`HTTPStatusError` into `RateLimited(7.0)`, chained to the original so the vendor trace survives.
-`answer` matches `except RateLimited` first (it is listed before its base), sleeps seven seconds and
-loops. A 401 instead becomes `Permanent`, which no handler in `answer` names, so it propagates
-immediately to the request handler with zero retries spent. A `KeyError` from a changed response
-body (`r.json()["text"]`) is not an `LLMError` at all, so it escapes on the first attempt as the bug
-it is. The handlers never inspect a status code or a message string; the classification happened
-once, in the adapter.
+### Worked trace: three failures through that code
+| Provider response | Adapter raises | What `answer` does | Cost |
+|---|---|---|---|
+| 429 with `retry-after: 7` | `RateLimited(7.0)`, chained to the `HTTPStatusError` so the vendor trace survives | Matches `except RateLimited` first (listed before its base), sleeps seven seconds, loops | One wait, one retry |
+| 401 | `Permanent` | No handler names it, so it propagates immediately to the request handler | Zero retries spent |
+| 200 with a changed body | `r.json()["text"]` raises `KeyError`, not an `LLMError` | Escapes on the first attempt as the bug it is | Zero retries, one clear trace |
+
+- **The handlers never inspect a status code or a message string;** the classification happened once, in
+  the adapter.
+
+### Parallel tool calls with `except*` (Python 3.11+)
+A `TaskGroup` fails with an `ExceptionGroup`; `except*` splits it by policy.
+
+```python
+import asyncio
+
+class LLMError(Exception): ...
+class Transient(LLMError): ...
+class Permanent(LLMError): ...
+
+async def tool(name: str) -> str:
+    await asyncio.sleep(0.01)
+    if name == "search":
+        raise Transient("search timed out")
+    if name == "crm":
+        raise Permanent("crm: 403 forbidden")
+    return f"{name}: ok"
+
+async def fan_out(names: list[str]) -> None:
+    async with asyncio.TaskGroup() as tg:
+        for n in names:
+            tg.create_task(tool(n))
+
+async def main() -> None:
+    try:
+        await fan_out(["search", "crm", "calendar"])
+    except* Transient as eg:                      # only the retryable members
+        print("retry:", [str(e) for e in eg.exceptions])
+    except* Permanent as eg:                      # the rest, handled separately
+        print("stop:", [str(e) for e in eg.exceptions])
+
+asyncio.run(main())
+# retry: ['search timed out']
+# stop: ['crm: 403 forbidden']
+```
+
+## Production patterns
+- **Retry by class, not by catch-all.** With tenacity, use `retry=retry_if_exception_type(Transient)` plus
+  `stop_after_attempt(3)` and exponential waits, so `Permanent` and your own bugs fail on the first
+  attempt. Monitor retries per exception class; a rise in one leaf points at one cause.
+- **One adapter per provider, unmapped means `Permanent`.** Every vendor exception is translated in a
+  single module with `raise ... from e`, and anything unrecognised becomes `Permanent`, not a silent
+  retry. Alert on a new or rising count of unmapped errors after SDK upgrades.
+- **Map the hierarchy to HTTP once.** In FastAPI, register `@app.exception_handler(Permanent)` and friends
+  so `RateLimited` becomes 429 and `ContextTooLong` a 4xx with the limit in the body. Track the status
+  mix per route.
+- **Log once, at the top, with notes.** Add identifiers on the way up with `e.add_note(...)`, and call
+  `logger.exception` only in the top-level handler, so one failure is one trace with the full chain.
+- **Trip a breaker on `Transient` rate.** When `Transient` errors from one provider exceed a threshold in
+  a window, route to a fallback model instead of retrying; this works because classification is already
+  done. Monitor breaker open time per provider.
 
 ## Trade-offs
-- A policy-based tree lets callers catch exactly what they can handle, but every class must map to a
-  distinct decision; a hierarchy mirroring the vendor's twenty error codes is coupling in disguise.
-- Translating at the adapter keeps the application vendor-neutral, at the cost of a mapping that
-  must be maintained as providers add codes; unmapped errors should land in `Permanent`, not vanish.
-- Carrying structured data on exceptions (`retry_after`, `limit`) makes handlers precise, but
+- **Precise catching vs class sprawl.** A policy-based tree lets callers catch exactly what they can handle,
+  but every class must map to a distinct decision; a tree mirroring the vendor's twenty error codes is
+  coupling in disguise.
+- **Vendor neutrality vs mapping upkeep.** Translating at the adapter costs a mapping maintained as
+  providers add codes; unmapped errors should land in `Permanent`, not vanish.
+- **Structured data vs pickling.** Attributes like `retry_after` and `limit` make handlers precise, but
   non-trivial constructors must stay pickle-compatible if the exception ever crosses a process pool.
-- Exception groups model parallel failures faithfully, but `except*` semantics (partial matching,
-  re-raising the remainder) are harder to read than a sequential loop; use them only where fan-out
-  genuinely happens.
+- **Faithful parallel failures vs readability.** `except*` semantics (partial matching, re-raising the
+  remainder) are harder to read than a sequential loop; use them only where fan-out genuinely happens.
 
 ## Pitfalls
-- `except Exception:` around the provider call with a retry; the symptom is a `KeyError` in your own
-  parser appearing in logs five times, each with a paid request behind it.
-- A bare `except:` or `except BaseException:`; the symptom is Ctrl-C being ignored and async tasks
-  that refuse to cancel, because `CancelledError` and `KeyboardInterrupt` were swallowed.
-- Listing `except Transient` before `except RateLimited`; the leaf handler is unreachable and the
+- **`except Exception:` with a retry around the provider call.** Symptom: a `KeyError` in your own parser
+  appears in logs five times, each with a paid request behind it.
+- **A bare `except:` or `except BaseException:`.** Ctrl-C is ignored and async tasks refuse to cancel,
+  because `CancelledError` and `KeyboardInterrupt` were swallowed.
+- **`except Transient` before `except RateLimited`.** The leaf handler is unreachable and the
   `retry_after` hint is ignored, so you hammer a rate-limited endpoint with exponential backoff instead.
-- Raising a domain error without `from e`; the traceback says "during handling of the above
-  exception, another exception occurred", and the on-call engineer chases a phantom second bug.
-- Using `assert` to reject bad model output or tool arguments; asserts are removed under
-  `python -O`, so the symptom is validation that works in tests and silently vanishes in an
-  optimised deployment. Raise a real exception.
-- Matching on `str(e)` from an SDK; it works until a minor SDK release rewords the message and every
-  rate limit becomes a permanent failure overnight.
-- Logging with `logger.exception` at every layer and re-raising; the symptom is one failure producing
-  a dozen stack traces, which trains people to ignore logs.
-- A custom `__init__` that takes keyword-only arguments but passes a formatted string to `super()`;
-  the symptom is `TypeError` when a worker process tries to unpickle the exception.
+- **A domain error raised without `from e`.** The traceback says "during handling of the above exception,
+  another exception occurred", and on-call chases a phantom second bug.
+- **`assert` to reject bad model output or tool arguments.** Asserts are removed under `python -O`, so
+  validation works in tests and silently vanishes in an optimised deployment. Raise a real exception.
+- **Matching on `str(e)` from an SDK.** It works until a minor release rewords the message and every rate
+  limit becomes a permanent failure overnight.
+- **`logger.exception` at every layer, then re-raise.** One failure produces a dozen stack traces, which
+  trains people to ignore logs.
+- **A custom `__init__` with keyword-only arguments that passes a formatted string to `super()`.** Symptom:
+  `TypeError` when a worker process tries to unpickle the exception.
 
 ## When to use
-Introduce a hierarchy as soon as a subsystem has more than one failure policy, which for anything
-that calls a model or an external API is immediately. Keep it to one base plus policy branches plus
-data-carrying leaves; add a class only when a handler would treat it differently. Translate at the
-adapter, propagate through the middle, decide at the top. Measure by counting retries per error type
-and by checking that no handler in the codebase catches `Exception` around a paid call. In
-day-to-day work this is the shape of every provider client wrapper; in interviews, the question is
-"how do you decide what to retry", and the answer is "by exception class, with the mapping done once
-where the vendor error enters the system".
+- **Introduce a hierarchy** as soon as a subsystem has more than one failure policy, which for anything
+  calling a model or external API is immediately.
+- **Keep it small:** one base plus policy branches plus data-carrying leaves; add a class only when a
+  handler would treat it differently.
+- **Flow:** translate at the adapter, propagate through the middle, decide at the top.
+- **Measure:** retries per error type, and that no handler catches `Exception` around a paid call.
+- **Day to day,** this is the shape of every provider client wrapper.
+- **Interviews:** "how do you decide what to retry" has the answer "by exception class, with the mapping
+  done once where the vendor error enters the system".
 
 ## Role lens
 - **Engineer:** Writes the adapter that maps SDK and HTTP errors into `Transient`/`Permanent` leaves

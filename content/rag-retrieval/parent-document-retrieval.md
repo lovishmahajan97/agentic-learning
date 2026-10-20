@@ -5,7 +5,7 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -21,92 +21,88 @@ sources:
 ---
 
 ## TL;DR
-The best unit for matching a query is small, because a sentence or short paragraph embeds as a sharp
-key; the best unit for answering is larger, because the surrounding section carries the definitions,
-table headers and caveats the passage depends on. Parent-document retrieval separates the two: index
-small child chunks, each linked to a larger parent, search on the children, and hand the generator the
-parents. You get the recall of small chunks and the context of big ones, paying in context tokens.
+Small chunks match queries best; larger sections answer best. Parent-document retrieval indexes small
+child chunks linked to larger parents, searches the children and hands the generator the parents: the
+recall of small chunks with the context of big ones, paid for in tokens.
 
 ## Why it exists
-A single chunk size is a compromise that is wrong in both directions. Take the sentence "The limit is 50
-requests per minute." As a chunk of its own it is an excellent key: a query about rate limits lands on
-it with a high score. As an answer it is useless, because it does not say which endpoint, which plan,
-or that bursts up to 100 are tolerated for ten seconds; those facts sit in the surrounding 1,500-token
-section. Embed that whole section instead and the key goes blurry: the section also discusses
-authentication and pagination, the vector is an average of all three, and the rate-limit query now
-scores middling against it and may lose to a short FAQ entry that merely mentions limits.
-
-The usual workarounds patch one side and break the other. Large chunks give context but lower recall
-and mix topics. Small chunks with a large k return a pile of fragments that the generator must stitch
-together, with no guarantee that the fragments it needs come from the same section, and with duplicates
-of the same neighbourhood crowding the prompt. Overlap smears a little context across boundaries but
-cannot carry a table header 1,000 tokens back to the row that needs it.
-
-The observation that resolves this is that retrieval and generation do not have to consume the same
-unit. The index can hold whatever unit matches best, and each indexed unit can carry a pointer to the
-unit that answers best. Retrieval becomes a lookup on small keys followed by a join to large values.
+- **One chunk size is wrong in both directions.** "The limit is 50 requests per minute." alone is an
+  excellent key: a rate-limit query lands on it with a high score. As an answer it is useless: it does not
+  say which endpoint, which plan, or that bursts up to 100 are tolerated for ten seconds. Those facts sit
+  in the surrounding 1,500-token section.
+- **Embedding the whole section blurs the key.** The section also covers authentication and pagination, so
+  the vector averages all three; the rate-limit query scores middling and may lose to a short FAQ entry
+  that merely mentions limits.
+- **The usual workarounds patch one side and break the other.**
+  - **Large chunks:** context, but lower recall and mixed topics.
+  - **Small chunks with large k:** a pile of fragments to stitch, no guarantee they come from the same
+    section, and duplicates of one neighbourhood crowding the prompt.
+  - **Overlap:** smears a little context across boundaries but cannot carry a table header 1,000 tokens
+    back to the row that needs it.
+- **Retrieval and generation need not use the same unit.** Index the unit that matches best, give each a
+  pointer to the unit that answers best: a lookup on small keys followed by a join to large values.
 
 ## How it works
 ### Data model
-Two stores with a join key:
-
-- **Vector index of children.** Small chunks (a sentence, or roughly 100–300 tokens as an illustrative
-  range) with metadata `{parent_id, doc_id, offset}`. Only children are embedded.
-- **Parent store.** A plain key-value or document store mapping `parent_id` to the parent text (a section,
-  a page, or roughly 1–2k tokens) and its metadata. Parents are never searched, so they need no vectors.
-
-Children carry `parent_id` because retrieval is a join; parents live outside the vector index because
-embedding them would waste space and tempt someone to search them.
+| Store | Holds | Embedded? | Why |
+|---|---|---|---|
+| **Vector index of children** | small chunks (a sentence, or roughly 100–300 tokens as an illustrative range) with metadata `{parent_id, doc_id, offset}` | yes, only children | children carry `parent_id` because retrieval is a join |
+| **Parent store** | plain key-value or document store: `parent_id` → parent text (a section, a page, or roughly 1–2k tokens) plus metadata | no | parents are never searched; embedding them wastes space and tempts someone to search them |
 
 ### Indexing
-Split each document into parents, preferably at structural boundaries (headings, sections) so each
-parent is coherent, with a size cap so a runaway section is cut. Split each parent into children, embed
-the children, store the parents. Illustratively, a 40-page manual of roughly 25k tokens might become about
-20 section parents of ~1,200 tokens and about 125 children of ~200 tokens; the index holds 125 vectors,
-the parent store holds 20 texts.
+1. **Split each document into parents,** preferably at structural boundaries (headings, sections) so each
+   parent is coherent, with a size cap so a runaway section is cut.
+2. **Split each parent into children,** embed the children, store the parents.
+
+Illustratively, a 40-page manual of roughly 25k tokens:
+
+| Unit | Count | Size |
+|---|---|---|
+| Section parents | about 20 | ~1,200 tokens |
+| Children | about 125 | ~200 tokens |
+| Vectors in the index | 125 | |
+| Texts in the parent store | 20 | |
 
 ### Query path
-1. Search the child index with a k larger than the number of parents you will return, say 20, because
-   several children usually belong to the same parent.
-2. Group hits by `parent_id`. Score each parent, typically by its best child's score (good for pinpoint
-   questions) or by the number or fraction of its children that hit (good for "which section is about
-   this" questions).
-3. Deduplicate and take the top-n parents that fit the context budget: n × parent tokens must fit.
-4. Optionally rerank the parents, or rerank children first and then regroup, with a cross-encoder.
-5. Send parents to the generator, but keep the matched child spans for citations and highlighting, since
-   a 2k-token citation is not something a user can verify.
+1. **Over-fetch children.** Search with k larger than the parents you will return, say 20, because several
+   children usually belong to one parent.
+2. **Group by `parent_id` and score each parent:** by its best child's score (pinpoint questions) or by the
+   number or fraction of its children that hit ("which section is about this" questions).
+3. **Deduplicate and budget.** Take the top-n parents that fit: n × parent tokens must fit the context.
+4. **Optionally rerank** the parents, or rerank children first and then regroup, with a cross-encoder.
+5. **Send parents, cite children.** Keep the matched child spans for citations and highlighting, since a
+   2k-token citation is not something a user can verify.
 
 ### Variants
-- **Sentence-window retrieval.** The child is a single sentence; the "parent" is not a fixed node but a
-  window of a few sentences either side of the hit, assembled at query time. The window is centred on the
-  match, which suits dense prose where fixed section boundaries are arbitrary.
-- **Hierarchical or auto-merging retrieval.** Three or more levels (document, section, paragraph). If
-  enough children of one node are retrieved, they are replaced by the node itself. The rule exists because
-  many hits in one section are evidence that the section, not the fragments, is the right unit.
-- **Document as parent.** The parent is the whole document. Fine for short, self-contained records (FAQ
-  entries, tickets); for long documents it collapses back into context stuffing.
+| Variant | Parent is | Why it exists |
+|---|---|---|
+| **Sentence-window retrieval** | a window of a few sentences either side of a single-sentence hit, assembled at query time | centred on the match; suits dense prose where fixed section boundaries are arbitrary |
+| **Hierarchical / auto-merging** | three or more levels (document, section, paragraph); enough retrieved children of one node are replaced by the node | many hits in one section are evidence the section, not the fragments, is the right unit |
+| **Document as parent** | the whole document | fine for short self-contained records (FAQ entries, tickets); for long documents it collapses into context stuffing |
 
 ### Choosing the score aggregation
-Max-child scoring finds the parent containing the single best passage. Count-based scoring favours
-parents with many moderate hits, which can be broad overview sections, and it has a size bias: a parent
-with 30 children has more chances to place hits in the top-20 than one with 4, regardless of relevance.
-Normalising by the parent's child count (the fraction rule) removes that bias but then over-rewards tiny
-parents with one lucky hit. Pick by question type, and measure: the rules rank parents differently on
-the same child hits.
+| Rule | Favours | Bias |
+|---|---|---|
+| **Max child** | the parent with the single best passage | none by size; misses "broad section" questions |
+| **Count of hits** | parents with many moderate hits, often broad overview sections | size bias: a parent with 30 children has more chances to place hits in the top-20 than one with 4, regardless of relevance |
+| **Fraction of children hit** | removes the size bias | over-rewards tiny parents with one lucky hit |
+
+Pick by question type, and measure: the rules rank parents differently on the same child hits.
 
 ### What it does not fix
-Parent-document retrieval fixes what the generator *sees*; it does nothing for what the index can
-*match*. The child is still embedded alone, so a child whose subject lives elsewhere in the section
-("The limit is 50 requests per minute." under a heading that names the endpoint and plan) only matches
-queries that do not mention the endpoint or plan. A query for "search endpoint Pro plan rate limit" can
-miss it, and the parent never gets fetched. The cheap remedy is to embed each child with its heading
-path prepended (`"API > Search > Pro plan: The limit is 50..."`) while storing the bare child for
-citation; the stronger one is contextual retrieval, which writes a chunk-specific context with an LLM.
-The two compose: contextualised children for matching, parents for answering.
+- **It fixes what the generator *sees*, not what the index can *match*.** The child is still embedded alone.
+- **Children lose their subject.** "The limit is 50 requests per minute." under a heading naming the
+  endpoint and plan only matches queries that do not mention them; "search endpoint Pro plan rate limit"
+  can miss it, and the parent never gets fetched.
+- **Cheap remedy:** embed each child with its heading path prepended
+  (`"API > Search > Pro plan: The limit is 50..."`) while storing the bare child for citation.
+- **Stronger remedy:** contextual retrieval, which writes a chunk-specific context with an LLM.
+- **They compose:** contextualised children for matching, parents for answering.
 
-## Example
-A minimal two-store implementation and the query-side join, with heading paths prepended to children
-for matching. `embed`, `index.add`, `index.search` and `split` are stubs for your encoder, vector store and chunker.
+## Examples
+### Two stores and the query-side join
+Heading paths are prepended to children for matching. `embed`, `index.add`, `index.search` and `split` are
+stubs for your encoder, vector store and chunker.
 
 ```python
 from collections import defaultdict
@@ -141,43 +137,98 @@ ctx = retrieve_parents("What is the rate limit for the search endpoint on the Pr
 # exceptions, and the citation points at the matched child span rather than the whole section.
 ```
 
+### Runnable: three aggregation rules, three different winners
+Pure Python. The same eight child hits, ranked by max, count and fraction.
+
+```python
+from collections import defaultdict
+
+children_per_parent = {"overview": 30, "rate-limits": 4, "changelog-note": 1}
+hits = [  # (score, parent_id) for the top child hits of one query
+    (0.91, "rate-limits"), (0.62, "overview"), (0.60, "overview"), (0.59, "overview"),
+    (0.58, "overview"), (0.57, "changelog-note"), (0.55, "overview"), (0.52, "rate-limits"),
+]
+by_parent = defaultdict(list)
+for score, pid in hits:
+    by_parent[pid].append(score)
+
+rules = {
+    "max":      lambda pid, s: max(s),
+    "count":    lambda pid, s: len(s),
+    "fraction": lambda pid, s: len(s) / children_per_parent[pid],
+}
+for name, rule in rules.items():
+    ranked = sorted(by_parent, key=lambda pid: rule(pid, by_parent[pid]), reverse=True)
+    print(f"{name:9}", ranked)
+# max       ['rate-limits', 'overview', 'changelog-note']    <- pinpoint answer wins
+# count     ['overview', 'rate-limits', 'changelog-note']    <- big section wins on volume
+# fraction  ['changelog-note', 'rate-limits', 'overview']    <- one lucky hit on a tiny parent wins
+```
+
+### Worked scenario: context cost per request
+Illustrative, using the manual above with a 6,000-token evidence budget:
+
+| Design | Unit sent | Units that fit | Distinct sources |
+|---|---|---|---|
+| Children only | ~200-token child | 30 | many fragments, often from the same section |
+| Parent-document | ~1,200-token parent | 5 (after dedup) | 5 coherent sections |
+| Whole document as parent | ~25k-token manual | 0 | overflow |
+
+## Production patterns
+- **Use the framework retriever when it fits.** LangChain's `ParentDocumentRetriever` takes a child
+  splitter, an optional parent splitter, a vector store for children and a document store for parents;
+  LlamaIndex ships sentence-window and auto-merging retrievers. Monitor unique parents per query and
+  tokens per request after adopting either.
+- **Heading-path children.** Embed `heading path + child` and store the bare child for citation, as in
+  `ingest` above. Measure child recall@k on queries that name a product or plan, the slice this fixes.
+- **Over-fetch, group, budget.** Fetch roughly 4–5 children per parent you plan to return (20 for 4 in the
+  example), group by `parent_id`, then fill a token budget rather than a fixed n. Monitor how often the
+  budget truncates the last parent.
+- **Keep the stores consistent.** Re-index by document: delete every child whose `doc_id` matches and
+  replace the parents in one job, then verify each child's `parent_id` resolves. Alert on parent-lookup
+  misses, which otherwise silently produce empty contexts.
+- **Cite the matched span.** Return `matched_spans` with offsets to the UI and highlight them inside the
+  parent. Track citation-verification complaints or reviewer disagreement as the signal.
+
 ## Trade-offs
-- Each hit now costs parent-sized context rather than child-sized, so fewer distinct sources fit a
-  budget; this favours depth and flips against you when questions need breadth across many documents.
-- Compared with indexing at parent size, children give sharp keys but the index holds several times more
-  vectors per document (125 versus 20 in the manual above), raising storage and ANN cost; the trade is
-  worth it until index size, not quality, is the constraint.
-- Deduplication removes redundant parents but collapses several strong hits into one source; for
-  aggregation questions that want evidence from many places, return more parents or use sentence windows.
-- Structural parents (by heading) are coherent but vary wildly in size; fixed-size parents are
-  predictable but cut mid-topic, and the right choice follows the corpus's formatting discipline.
+- **Depth vs breadth.** Each hit costs parent-sized context, so fewer distinct sources fit a budget; this
+  favours depth and flips against you when questions need breadth across many documents.
+- **Sharp keys vs index size.** Children give sharp keys but the index holds several times more vectors
+  per document than parent-size indexing (125 versus 20 in the manual above), raising storage and ANN
+  cost; worth it until index size, not quality, is the constraint.
+- **Deduplication vs evidence count.** It removes redundant parents but collapses several strong hits into
+  one source; for aggregation questions that want evidence from many places, return more parents or use
+  sentence windows.
+- **Structural vs fixed-size parents.** By heading they are coherent but vary wildly in size; fixed-size
+  parents are predictable but cut mid-topic; the right choice follows the corpus's formatting discipline.
 
 ## Pitfalls
-- Making the whole document the parent for long documents; the symptom is context overflow, lost-in-the-
-  middle effects and a cost spike, with no recall gain over stuffing.
-- Skipping deduplication; the symptom is the same parent repeated several times in the prompt and fewer
-  unique sources than the budget allowed.
-- Citing the parent instead of the matched child span; the symptom is citations pointing at a 2k-token
-  section that users cannot verify, and reviewers calling the citations wrong.
-- Reranking children and then emitting parents in child order without regrouping; the symptom is parent
+- **The whole document as parent for long documents.** The symptom is context overflow, lost-in-the-middle
+  effects and a cost spike, with no recall gain over stuffing.
+- **Skipping deduplication.** The symptom is the same parent repeated in the prompt and fewer unique
+  sources than the budget allowed.
+- **Citing the parent instead of the matched child span.** The symptom is citations pointing at a
+  2k-token section users cannot verify, and reviewers calling the citations wrong.
+- **Reranking children, then emitting parents in child order without regrouping.** The symptom is parent
   order that does not reflect the strongest evidence.
-- Parent store and child index falling out of sync after re-indexing or deletion; the symptom is
-  `parent_id` lookups that miss and silently produce an empty context.
-- Children so small they are generic ("See below.", "Note:"); the symptom is high similarity scores on
+- **Parent store and child index out of sync** after re-indexing or deletion. The symptom is `parent_id`
+  lookups that miss and silently produce an empty context.
+- **Children so small they are generic** ("See below.", "Note:"). The symptom is high similarity scores on
   sentences that carry no information.
-- Assuming parents fix matching; the symptom is queries that name the product or plan still missing a
+- **Assuming parents fix matching.** The symptom is queries naming the product or plan still missing a
   section whose children never mention it, until heading paths or contexts are prepended to children.
 
 ## When to use
-Use it for long, structured documents where answers depend on surrounding context: manuals, contracts,
-runbooks, codebases with file-level context, research papers. Skip it for corpora of short,
-self-contained records such as tickets, FAQ entries or product listings, where the record already is the
-right unit for both matching and answering. Measure child-level recall@k against a single-chunk-size
-baseline, then answer faithfulness and the tokens per request, since the gain in context is paid for in
-budget. Day to day it is the first structural change to try when answers are "right passage, wrong
-details" because the generator lacked the surrounding section. In interviews it appears as
-"small-to-big" retrieval, and the strong answer covers the join, the score aggregation and the citation
-granularity.
+- **Use for** long, structured documents where answers depend on surrounding context: manuals, contracts,
+  runbooks, codebases with file-level context, research papers.
+- **Skip for** short, self-contained records (tickets, FAQ entries, product listings), where the record is
+  already the right unit for matching and answering.
+- **First change to try** when answers are "right passage, wrong details" because the generator lacked the
+  surrounding section.
+- **Measure:** child-level recall@k against a single-chunk-size baseline, then answer faithfulness and
+  tokens per request, since the gain in context is paid for in budget.
+- **Interviews:** appears as "small-to-big" retrieval; the strong answer covers the join, the score
+  aggregation and the citation granularity.
 
 ## Role lens
 - **Engineer:** Builds the two-store pipeline, the parent grouping and deduplication, and keeps child

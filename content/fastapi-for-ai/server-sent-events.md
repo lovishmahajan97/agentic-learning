@@ -5,7 +5,7 @@ name: Server-Sent Events
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/streamingresponse
   - fastapi-for-ai/websockets
@@ -20,30 +20,26 @@ sources:
 ---
 
 ## TL;DR
-Server-Sent Events (SSE) is a one-directional, text-based streaming format carried in an ordinary HTTP
-response of type `text/event-stream`: events are blocks of `field: value` lines separated by a blank
-line. It exists because a raw chunked body has no message boundaries and WebSockets are a heavier,
-stateful protocol for what is usually a one-way token flow. Browsers reconnect automatically and resend
-`Last-Event-ID`, which is why LLM vendor APIs and most chat UIs stream tokens over SSE.
+Server-Sent Events is a one-way text streaming format in a normal `text/event-stream` HTTP response:
+`field: value` lines, blank line between events. Typed events and resumable ids make it the default for
+LLM token streams.
 
 ## Why it exists
-`StreamingResponse` gets bytes out early, but bytes are not messages. A chat client needs to tell a
-token delta from a tool-call announcement from a usage report from an error, and TCP may split or
-merge whatever the server yielded. Every team that starts with raw chunks ends up inventing a framing,
-and every client then reimplements the parser slightly differently.
-
-The obvious alternative is WebSockets, and for one-way traffic it is the wrong tool: an upgrade
-handshake, a stateful connection pinned to one process, no automatic reconnection, no standard way to
-resume, and infrastructure that must understand upgrades. Token streaming is server-to-client; the
-only client input is the request that started it.
-
-SSE sits in the gap. It was standardised as part of the HTML specification, so every browser ships a
-parser (`EventSource`), the stream is a normal HTTP response that proxies, load balancers and
-authentication middleware already understand, HTTP/2 multiplexes many streams over one connection, and
-the format has two features a token stream needs: a typed `event:` field so one stream can carry tokens
-and control messages, and an `id:` field so a client that drops mid-answer can ask for the rest instead
-of paying for the generation again. Those two fields are the whole reason it beats "newline-delimited
-JSON" for user-facing LLM streams.
+- **Bytes are not messages.** `StreamingResponse` gets bytes out early, but a chat client must tell a
+  token delta from a tool-call announcement, a usage report or an error, and TCP may split or merge
+  whatever the server yielded.
+- **Ad-hoc framing repeats.** Every team that starts with raw chunks invents a framing, and every client
+  then reimplements the parser slightly differently.
+- **WebSockets are the wrong tool for one-way traffic.** An upgrade handshake, a stateful connection
+  pinned to one process, no automatic reconnection, no standard way to resume, and infrastructure that
+  must understand upgrades. Token streaming is server-to-client; the only client input is the request
+  that started it.
+- **SSE is plain HTTP with a standard parser.** It is part of the HTML specification, so every browser
+  ships `EventSource`; proxies, load balancers and auth middleware already understand the response, and
+  HTTP/2 multiplexes many streams over one connection.
+- **Two fields beat NDJSON for user-facing streams.** A typed `event:` field lets one stream carry tokens
+  and control messages; an `id:` field lets a client that drops mid-answer ask for the rest instead of
+  paying for the generation again.
 
 ## How it works
 ### The wire format
@@ -62,69 +58,110 @@ event: done
 data: {"output_tokens": 2}
 
 ```
-Each line is `field: value`. A blank line dispatches the event. Rules that matter in practice: `data:`
-is the payload and several `data:` lines in one event are joined with newlines; `event:` names the type
-(default `message`); `id:` sets the client's last-event id; `retry:` tells the client how many
-milliseconds to wait before reconnecting; a line starting with `:` is a comment that clients discard,
-which makes it a free keepalive. The body is UTF-8 text, so binary payloads must be base64-encoded.
-The response carries `Content-Type: text/event-stream` and should carry `Cache-Control: no-cache`;
-behind nginx add `X-Accel-Buffering: no`.
+Each line is `field: value`; a blank line dispatches the event.
+
+| Field | Meaning |
+|---|---|
+| `data:` | the payload; several `data:` lines in one event are joined with newlines |
+| `event:` | the type (default `message`) |
+| `id:` | sets the client's last-event id |
+| `retry:` | how many milliseconds the client waits before reconnecting |
+| line starting with `:` | a comment clients discard, so a free keepalive |
+
+- **UTF-8 text only**, so binary payloads must be base64-encoded.
+- **Headers:** `Content-Type: text/event-stream`, plus `Cache-Control: no-cache`; behind nginx add
+  `X-Accel-Buffering: no`.
 
 ### The client side
-`EventSource` is built into browsers: it opens a GET, parses events, fires listeners by `event:` name,
-reconnects automatically when the connection drops and sends the `Last-Event-ID` header on reconnect.
-Reconnection is driven by the browser: after a drop it waits the `retry:` interval (a few seconds by
-default, browser-dependent) and reissues the GET; a server that wants a stream to end for good must
-respond to that reconnect with HTTP 204, or the client must call `close()`, otherwise a finished run is
-re-requested forever. Its limits decide how chat UIs are built: it can only GET, cannot set an `Authorization` header or a
-body, and sends credentials only via cookies. A chat prompt is a POST with a JSON body and a bearer
-token, so production frontends use `fetch()` and parse the stream themselves (a `ReadableStream`, a
-`TextDecoder` and a line splitter, or a small library), which means they also own reconnection logic.
-Server-side consumers use `httpx`'s `client.stream("POST", ...)` context manager with `aiter_lines()`
-(`stream=True` is the `requests` spelling, not httpx's); vendor SDKs parse the vendor's own SSE for you.
+- **`EventSource` is built into browsers.** It opens a GET, parses events, fires listeners by `event:`
+  name, reconnects when the connection drops and sends the `Last-Event-ID` header on reconnect.
+- **The browser drives reconnection.** After a drop it waits the `retry:` interval (a few seconds by
+  default, browser-dependent) and reissues the GET.
+- **Ending for good needs a signal.** The server answers that reconnect with HTTP 204, or the client
+  calls `close()`; otherwise a finished run is re-requested forever.
+- **Its limits shape chat UIs.** It can only GET, cannot set an `Authorization` header or a body, and
+  sends credentials only via cookies.
+- **So production frontends use `fetch()`.** A chat prompt is a POST with a JSON body and a bearer token,
+  so they parse the stream themselves (a `ReadableStream`, a `TextDecoder` and a line splitter, or a
+  small library) and therefore own reconnection logic.
+- **Server-side consumers** use `httpx`'s `client.stream("POST", ...)` context manager with
+  `aiter_lines()` (`stream=True` is the `requests` spelling, not httpx's); vendor SDKs parse the
+  vendor's own SSE for you.
 
 ### The server side in FastAPI
-The minimum is a `StreamingResponse` whose generator yields correctly formatted strings with
-`media_type="text/event-stream"`. The `sse-starlette` package adds an `EventSourceResponse` that
-formats dict events, sends periodic ping comments, and handles client disconnects, which removes the
-most common mistakes. Either way the endpoint is an ordinary route: dependencies, auth and validation
-run before the first byte, which is exactly when errors can still be reported with a status code.
+- **Minimum:** a `StreamingResponse` whose generator yields correctly formatted strings, with
+  `media_type="text/event-stream"`.
+- **`sse-starlette`** adds an `EventSourceResponse` that formats dict events, sends periodic ping
+  comments and handles client disconnects, removing the most common mistakes.
+- **It is an ordinary route.** Dependencies, auth and validation run before the first byte, which is
+  exactly when errors can still be reported with a status code.
 
 ### Keepalives and intermediaries
-Load balancers and proxies drop connections that carry no bytes for a configurable idle period, often
-on the order of a minute by default (vendor-dependent). An agent that spends ninety seconds inside a
-tool call before producing the next token looks idle. Sending a comment line every 10 to 20 seconds
-keeps the timers reset at no cost to the client. The same intermediaries must also not buffer; see
-the StreamingResponse lesson.
+- **Idle connections get dropped.** Load balancers and proxies close connections that carry no bytes for
+  a configurable idle period, often on the order of a minute by default (vendor-dependent).
+- **Agents look idle.** One that spends ninety seconds inside a tool call before the next token is silent.
+- **Fix:** send a comment line every 10 to 20 seconds; it resets the timers at no cost to the client.
+- **Intermediaries must also not buffer**; see the StreamingResponse lesson.
 
 ### HTTP/1.1 connection limits
-Browsers limit concurrent HTTP/1.1 connections per origin to a small number, around six, and every open
-`EventSource` holds one. Several tabs with live streams can starve the rest of the app. HTTP/2 lifts
-the limit by multiplexing, so terminate HTTP/2 at the edge; uvicorn speaking HTTP/1.1 behind that
-proxy is fine.
+- **Browsers cap HTTP/1.1 connections per origin** at a small number, around six, and every open
+  `EventSource` holds one, so several tabs with live streams can starve the rest of the app.
+- **HTTP/2 lifts the limit by multiplexing.** Terminate HTTP/2 at the edge; uvicorn speaking HTTP/1.1
+  behind that proxy is fine.
 
 ### Resumability
-`Last-Event-ID` is only useful if the server can replay. The pattern: give each run an id, assign
-monotonic event ids, append every event to a short-lived buffer (a Redis list with a TTL keyed by run
-id) as it is produced, and on a request carrying `Last-Event-ID` replay the buffered events after that
-id before continuing live. For agent runs that cost real money per attempt this converts a flaky
-mobile connection from "re-run the whole thing" into "catch up".
+`Last-Event-ID` is only useful if the server can replay:
+1. Give each run an id.
+2. Assign monotonic event ids.
+3. Append every event, as it is produced, to a short-lived buffer (a Redis list with a TTL keyed by run id).
+4. On a request carrying `Last-Event-ID`, replay the buffered events after that id, then continue live.
+
+For agent runs that cost real money per attempt, this turns a flaky mobile connection from "re-run the
+whole thing" into "catch up".
 
 ### Event vocabularies
-Vocabularies differ by vendor and by API generation, so check the current docs. OpenAI's Chat
-Completions API streams untyped JSON chunks in `data:` lines and ends with a literal `data: [DONE]`,
-while its newer Responses API uses named events such as `response.output_text.delta`; Anthropic's
-Messages API streams typed events such as `message_start`, `content_block_delta` and `message_stop`.
-Your own API should define its own small vocabulary (`token`, `tool_call`, `usage`, `done`, `error`)
-and translate, so that swapping the model provider never changes the frontend.
+Vocabularies differ by vendor and by API generation, so check the current docs.
 
-## Example
-A FastAPI SSE endpoint built directly on `StreamingResponse`. The model stream runs in its own task
-feeding a queue, so the consumer can wait with a timeout and emit a keepalive comment during silent
-phases without cancelling the producer. Each event carries a monotonic id; this endpoint does not
-replay, but those ids are exactly what a resume endpoint (see Resumability) would key its buffer on.
-With tokens 0.3 s apart nothing is silent for 15 s, so here the ping only fires if the model stalls,
-for instance during a long tool call.
+| API | Streaming shape |
+|---|---|
+| OpenAI Chat Completions | untyped JSON chunks in `data:` lines, ending with a literal `data: [DONE]` |
+| OpenAI Responses | named events such as `response.output_text.delta` |
+| Anthropic Messages | typed events such as `message_start`, `content_block_delta`, `message_stop` |
+
+Define your own small vocabulary (`token`, `tool_call`, `usage`, `done`, `error`) and translate, so
+swapping the model provider never changes the frontend.
+
+## Diagram
+A resumable run: the worker writes every event to a per-run buffer, so a reconnect with `Last-Event-ID`
+replays the gap instead of starting a second billed generation.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as SSE route
+    participant B as Run buffer (Redis list)
+    participant W as Worker
+    C->>A: POST /runs then GET /runs/r1/events
+    W->>B: append event id 1..42
+    A->>C: event token, id 42
+    A->>C: comment ping every 15 s
+    C--xA: connection drops
+    W->>B: append event id 43..60
+    C->>A: GET /runs/r1/events with Last-Event-ID 42
+    Note over A: check caller owns run r1
+    B->>A: events after id 42
+    A->>C: replay 43..60, then tail live, then event done
+```
+
+## Examples
+### FastAPI SSE endpoint with keepalives
+Built directly on `StreamingResponse`:
+- **Producer task plus queue.** The model stream feeds a queue, so the consumer can wait with a timeout
+  and emit a keepalive comment during silent phases without cancelling the producer.
+- **Monotonic ids.** This endpoint does not replay, but those ids are exactly what a resume endpoint (see
+  Resumability) would key its buffer on.
+- **When the ping fires.** With tokens 0.3 s apart nothing is silent for 15 s, so the ping fires only if
+  the model stalls, for instance during a long tool call.
 
 ```python
 import asyncio, json
@@ -174,45 +211,103 @@ async def chat(body: Ask):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 ```
 
+### A minimal SSE parser (the rules in 20 lines)
+What a `fetch()`-based client or a server-side consumer has to do. Runnable as is; note the final event
+is lost because the stream ends without a blank line.
+
+```python
+def parse_sse(lines):
+    """Yield (event, data, id) from an iterable of decoded lines, per the WHATWG rules."""
+    event, data, last_id = "message", [], None
+    for line in lines:
+        if line == "":                               # blank line dispatches
+            if data:
+                yield event, "\n".join(data), last_id
+            event, data = "message", []
+            continue
+        if line.startswith(":"):                     # comment: keepalive, ignore
+            continue
+        field, _, value = line.partition(":")
+        value = value[1:] if value.startswith(" ") else value
+        if field == "data":
+            data.append(value)                       # several data: lines join with "\n"
+        elif field == "event":
+            event = value
+        elif field == "id":
+            last_id = value                          # persists; send it back as Last-Event-ID
+    # end of stream without a blank line: the pending event is discarded
+
+stream = "event: token\ndata: {\"delta\": \"Hel\"}\nid: 1\n\n: ping\n\ndata: line one\ndata: line two\n\nevent: done\ndata: {}"
+for ev in parse_sse(stream.split("\n")):
+    print(ev)
+# ('token', '{"delta": "Hel"}', '1')
+# ('message', 'line one\nline two', '1')      <- the "done" event never dispatches
+```
+
+### Worked scenario: an agent run behind a 60-second idle timeout
+Illustrative numbers: a corporate proxy with a 60 s idle timeout, an agent that waits ninety seconds on
+one tool call.
+
+| Setup | What happens at t = 60 s | Outcome |
+|---|---|---|
+| No keepalive | proxy sees no bytes, closes the stream | client reconnects; without a buffer, a second billed run |
+| `: ping` every 15 s | idle timer reset four times before t = 60 s | stream survives the tool call |
+| Ping + per-run buffer | drop on mobile instead, reconnect with `Last-Event-ID: 42` | events 43+ replayed, no second run |
+
+## Production patterns
+- **Own a small event vocabulary.** For any user-facing stream, translate vendor events into `token`,
+  `tool_call`, `usage`, `done`, `error` in one adapter module, so a provider switch is a backend change.
+  Monitor parser errors reported by the frontend.
+- **Comment keepalive below the shortest idle timeout.** Emit `: ping` every 10 to 20 seconds (or rely on
+  `sse-starlette`'s periodic pings) and set the interval below the smallest idle timeout on the path.
+  Monitor stream durations clustering at a fixed value, the signature of an idle cut.
+- **Resumable runs via a per-run buffer.** For long or expensive runs, generate in a worker, append each
+  event to a Redis list keyed by run id (`RPUSH` then `EXPIRE`), and have the SSE route replay with
+  `LRANGE` after `Last-Event-ID` before tailing live. Monitor reconnect rate and replay length.
+- **Terminate finished runs explicitly.** Send a `done` event the client acts on with `close()`, and
+  answer reconnects for completed run ids with 204. Monitor GETs per run id after completion.
+- **HTTP/2 at the edge.** Terminate HTTP/2 at the load balancer or CDN so many tabs share one connection,
+  keeping HTTP/1.1 to uvicorn. Monitor concurrent streams per client and stalled non-stream requests.
+
 ## Trade-offs
-- Plain HTTP means SSE passes through proxies, auth middleware and HTTP/2 multiplexing untouched, but
-  it is one-directional: an "interrupt generation" button needs a second request plus shared state,
-  and once the client must talk continuously (voice, collaborative editing) WebSockets win.
-- Text-only framing keeps parsers trivial, but binary payloads such as audio must be base64-encoded,
+- **Plain HTTP vs one direction.** SSE passes through proxies, auth middleware and HTTP/2 multiplexing
+  untouched, but an "interrupt generation" button needs a second request plus shared state; once the
+  client must talk continuously (voice, collaborative editing) WebSockets win.
+- **Trivial text parsers vs binary overhead.** Binary payloads such as audio must be base64-encoded,
   adding about a third to their size; at that point a binary WebSocket frame is cheaper.
-- Automatic reconnection with `Last-Event-ID` gives resumability for almost no client code, but only if
-  the server buffers events per run; without the buffer a reconnect silently restarts and double-bills
-  the generation.
-- `EventSource` is zero code but GET-only and header-less; parsing with `fetch()` gives you POST bodies
-  and bearer tokens at the cost of owning reconnection and the parser yourself.
+- **Free resumability vs a server buffer.** Automatic reconnection with `Last-Event-ID` needs almost no
+  client code, but only works if the server buffers events per run; without it a reconnect silently
+  restarts and double-bills the generation.
+- **`EventSource` vs `fetch()`.** `EventSource` is zero code but GET-only and header-less; parsing with
+  `fetch()` gives POST bodies and bearer tokens at the cost of owning reconnection and the parser.
 
 ## Pitfalls
-- Forgetting the blank line that ends each event (a single newline only separates fields); the
-  symptom is a client that receives nothing, because a conforming parser discards an undispatched
-  event at end of stream, or a hand-rolled parser that glues everything into one malformed event.
-- Putting raw text with embedded newlines into one `data:` line; the symptom is events split at the
-  wrong place, which JSON-encoding the payload (newlines become `\n`) avoids entirely.
-- No keepalive during long tool calls; the symptom is streams that die at a fixed wall-clock interval,
-  often exactly the load balancer's idle timeout, only when the agent is "thinking".
-- A buffering proxy or compression middleware on the route; the symptom is all events arriving in a
-  burst at the end, with the server logs showing they were produced on time.
-- Ending a run by simply closing the response while the client uses `EventSource`; the symptom is a
-  fresh GET, and possibly a fresh billed generation, every few seconds after each answer finishes,
-  because the browser treats a closed stream as a dropped one; send a `done` event the client acts on
-  by calling `close()`, and answer reconnects for finished runs with 204.
-- Leaking the vendor's event schema straight to the browser; the symptom is a model-provider switch
-  that breaks the frontend parser.
-- Replaying a run from `Last-Event-ID` without re-checking that the caller owns that run; the symptom
-  is one user resuming another user's stream by guessing an id.
+- **Forgetting the blank line that ends each event** (a single newline only separates fields). Symptom: a
+  client that receives nothing, because a conforming parser discards an undispatched event at end of
+  stream, or a hand-rolled parser that glues everything into one malformed event.
+- **Raw text with embedded newlines in one `data:` line.** Symptom: events split at the wrong place.
+  Fix: JSON-encode the payload, so newlines become `\n`.
+- **No keepalive during long tool calls.** Symptom: streams die at a fixed wall-clock interval, often
+  exactly the load balancer's idle timeout, only when the agent is "thinking".
+- **A buffering proxy or compression middleware on the route.** Symptom: all events arrive in a burst at
+  the end, while server logs show they were produced on time.
+- **Ending a run by just closing the response under `EventSource`.** The browser treats a closed stream
+  as a dropped one, so you get a fresh GET, and possibly a fresh billed generation, every few seconds.
+  Fix: send a `done` event the client acts on by calling `close()`, and answer reconnects with 204.
+- **Leaking the vendor's event schema to the browser.** Symptom: a model-provider switch breaks the
+  frontend parser.
+- **Replaying from `Last-Event-ID` without re-checking ownership.** Symptom: one user resumes another
+  user's stream by guessing an id. Fix: authorise the run id on every resume.
 
 ## When to use
-Use SSE for anything the server pushes and the client only consumes: token streams, agent progress
-and tool-call events, job status updates, live evaluation dashboards. Prefer it over WebSockets by
-default because it keeps the stateless HTTP model, and move to WebSockets only when the client must
-send during the stream or needs binary frames. Measure client-observed time to first event, event
-counts per run, reconnect rate and the share of streams lost to idle timeouts. In interviews, expect to
-write the frame format from memory, explain why chat UIs cannot use `EventSource` for POST, and
-describe how `id:` plus a per-run buffer makes a stream resumable.
+- **Use when** the server pushes and the client only consumes: token streams, agent progress and
+  tool-call events, job status updates, live evaluation dashboards.
+- **Prefer it over WebSockets by default**, because it keeps the stateless HTTP model; move to WebSockets
+  only when the client must send during the stream or needs binary frames.
+- **Measure** client-observed time to first event, event counts per run, reconnect rate and the share of
+  streams lost to idle timeouts.
+- **Interviews:** write the frame format from memory, explain why chat UIs cannot use `EventSource` for
+  POST, and describe how `id:` plus a per-run buffer makes a stream resumable.
 
 ## Role lens
 - **Engineer:** Implements the event vocabulary, the formatter and the keepalive, and makes sure every
@@ -232,6 +327,42 @@ in the same step that sends them. On reconnect the client sends `Last-Event-ID` 
 owns the run, replays buffered events after that id, then attaches to the live stream. Generation
 itself must keep running independently of the HTTP connection, so it belongs in a worker task or job
 rather than inside the request's generator, and the response generator becomes a reader of the buffer.
+
+## Interview questions
+### What is SSE, and why is it the usual choice for LLM token streams?
+- **A text framing over one HTTP response.** `field: value` lines in a `text/event-stream` body, with a
+  blank line dispatching each event; `event:` types it and `id:` makes it resumable.
+- **It fits one-way traffic.** Tokens flow server to client, so SSE keeps the stateless HTTP model that
+  proxies, auth middleware and HTTP/2 already understand, without a WebSocket upgrade.
+
+### Streams die at exactly 60 seconds, but only when the agent is inside a tool call. Debug it.
+- **The fixed duration is the clue.** Stream durations clustering at one value point at an idle timeout
+  on a load balancer or proxy, which fires only when no bytes flow.
+- **Confirm** by correlating cuts with silent phases in server logs and by testing each hop.
+- **Fix** with a `: ping` comment every 10 to 20 seconds, below the shortest idle timeout on the path,
+  rather than asking for longer timeouts.
+
+### Why do most chat frontends not use the browser's EventSource?
+- **It is GET-only and cannot set headers.** A chat prompt needs a POST body and an `Authorization`
+  bearer token; `EventSource` sends credentials only via cookies.
+- **So they parse with `fetch()`.** A `ReadableStream`, `TextDecoder` and line splitter replace it, and
+  the client then owns reconnection and `Last-Event-ID` handling.
+
+### When would you choose WebSockets over SSE?
+- **When the client must send during the stream:** voice, collaborative editing, or continuous
+  interrupts rather than a single separate cancel request.
+- **When payloads are binary.** SSE is UTF-8 only, so audio must be base64-encoded, adding about a third
+  to its size.
+- **Otherwise stay on SSE,** because it avoids sticky stateful connections and upgrade-aware
+  infrastructure.
+
+### A user reports a second charge after their phone dropped mid-answer. What went wrong in the design?
+- **The reconnect restarted generation.** `EventSource` reconnects automatically, but without a per-run
+  buffer the server treats the new GET as a fresh run.
+- **Or a finished run was never closed.** Closing the response without a `done` event makes the browser
+  reconnect every few seconds.
+- **Fix:** run generation in a worker, buffer events by run id with a TTL, replay after `Last-Event-ID`,
+  and answer reconnects for completed runs with 204.
 
 ## Quiz
 ### Q: What does a line beginning with a colon mean in an SSE stream?

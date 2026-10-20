@@ -5,7 +5,7 @@ name: Similarity search (cosine, dot product)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/embedding-dimension-and-normalization
@@ -20,29 +20,25 @@ sources:
 ---
 
 ## TL;DR
-Dense retrieval reduces to one operation: score a query vector against every stored vector and keep the
-top k. Dot product and cosine are the two scores that matter; cosine is the dot product of unit-length
-vectors, and squared Euclidean distance is the same quantity rearranged. The right choice is whichever
-the embedding model was trained against, because training shaped the geometry. Pick the wrong one and
-rankings degrade silently, with no error to catch.
+Dense retrieval scores a query vector against every stored vector and keeps the top k. Use the
+similarity the embedding model was trained with (cosine or dot product); the wrong one degrades
+rankings silently, with no error to catch.
 
 ## Why it exists
-Lexical search answers "which documents contain these words"; it cannot see that "cancel my
-subscription" and "stop billing me" ask for the same thing. Embedding models fix that by mapping text to
-vectors such that inputs with similar meaning land near each other. But "near" is not a given. A vector
-is just an array of floats, and retrieval needs a scalar score per candidate that (a) is cheap enough to
-evaluate millions of times per query and (b) agrees with what the model learned.
-
-The naive answer, Euclidean distance on raw outputs, fails on (b). Modern embedding models are trained
-with a contrastive objective: the query vector is pulled toward its positive passage and pushed away from
-in-batch negatives, and the loss is computed on one specific similarity, most often cosine scaled by a
-temperature, sometimes a plain dot product. The model never sees Euclidean distance, so vector magnitudes
-are whatever the optimizer happened to leave behind. Comparing raw distances then mixes a signal the model
-learned (angle) with one it did not (length).
-
-That is why this lesson has two halves: the algebra that relates the three scores, and the rule that the
-score must match the training objective. The algebra tells you when the choice does not matter; the rule
-tells you what to do when it does.
+- **Lexical search misses meaning.** It answers "which documents contain these words", so it cannot see
+  that "cancel my subscription" and "stop billing me" ask for the same thing. Embedding models map text
+  to vectors so that similar meanings land near each other.
+- **"Near" is not a given.** A vector is just an array of floats. Retrieval needs a scalar score per
+  candidate that (a) is cheap enough to evaluate millions of times per query and (b) agrees with what the
+  model learned.
+- **Euclidean on raw outputs fails (b).** Embedding models are trained contrastively: the query is pulled
+  toward its positive passage and pushed from in-batch negatives, with the loss on one similarity, most
+  often cosine scaled by a temperature, sometimes a plain dot product.
+- **Magnitudes are leftovers.** The model never sees Euclidean distance, so vector lengths are whatever
+  the optimizer left behind. Raw distances mix a signal the model learned (angle) with one it did not
+  (length).
+- **Two halves to master.** The algebra relating the three scores tells you when the choice does not
+  matter; the rule "score must match the training objective" tells you what to do when it does.
 
 ## How it works
 ### The three scores and how they relate
@@ -54,72 +50,107 @@ cos(q, d)   = dot(q, d) / (‖q‖·‖d‖)
 ‖q − d‖²    = ‖q‖² + ‖d‖² − 2·dot(q, d)
 ```
 
-Two consequences fall straight out. If every vector has unit length, `cos = dot` exactly and
-`‖q − d‖² = 2 − 2·cos`, so all three produce the identical ranking; only sign and scale differ. If lengths
-vary, dot product prefers long vectors regardless of direction, cosine ignores length entirely, and
-Euclidean penalizes both angle and length mismatch. The whole metric debate is about what to do with ‖d‖.
+| Vectors | Dot product | Cosine | Euclidean (L2) |
+|---|---|---|---|
+| Unit length | `cos = dot` exactly | same ranking | `‖q − d‖² = 2 − 2·cos`, same ranking |
+| Lengths vary | prefers long vectors regardless of direction | ignores length entirely | penalizes both angle and length mismatch |
 
-### Why normalization at index time is the standard move
-Normalizing is one division per vector, done once when the vector is written. After that, the cheapest
-score (a dot product: d multiplies and adds, no square root) returns the cosine ranking, and any index
-built for inner product or L2 gives cosine results too. This is why pgvector's docs, for example,
-recommend the inner-product operator when vectors are already unit length: the engine does not detect
-normalization for you, but choosing inner product skips the per-candidate norm work. It is also why most embedding pipelines
-normalize before writing and why several API providers return unit-length vectors already; check the
-model card rather than assuming.
+- On unit vectors all three give the identical ranking; only sign and scale differ.
+- The whole metric debate is about what to do with ‖d‖.
+
+### Why normalize at index time
+- **Cheap, once.** One division per vector, done when the vector is written.
+- **Cheapest score, cosine result.** A dot product (d multiplies and adds, no square root) then returns
+  the cosine ranking, and any index built for inner product or L2 gives cosine results too.
+- **Engines do not detect it for you.** pgvector's docs recommend the inner-product operator when vectors
+  are already unit length, because choosing inner product skips the per-candidate norm work.
+- **Many pipelines already do it.** Most normalize before writing, and several API providers return
+  unit-length vectors already; check the model card rather than assuming.
 
 ### When magnitude carries meaning
-Some retrievers are deliberately trained with an unnormalized dot product (DPR is the classic example).
-There the model can learn to give "generally useful" passages a larger norm, a kind of built-in prior.
-(The query norm never changes the ranking for a single query; it only rescales that query's scores.)
-Normalizing the document vectors of such a model throws the prior away.
-Conversely, a cosine-trained model has no incentive to keep norms meaningful, so dot product on its raw
-outputs adds noise. The rule: use the similarity the model card names. If it is silent, normalize and use
-cosine; it is the choice that cannot be badly wrong.
+- **Dot-product-trained retrievers** (DPR is the classic example) can give "generally useful" passages a
+  larger norm, a built-in prior. Normalizing their document vectors throws that prior away.
+- **The query norm never changes the ranking** for a single query; it only rescales that query's scores.
+- **Cosine-trained models** have no incentive to keep norms meaningful, so dot product on raw outputs adds
+  noise.
+- **The rule:** use the similarity the model card names. If it is silent, normalize and use cosine; it is
+  the choice that cannot be badly wrong.
 
 ### Inner product is not a distance, and indexes notice
-L2 is a proper metric: a vector is its own nearest neighbor and the triangle inequality holds, so "close
-to close is close". Cosine distance (1 − cos) is not itself a metric, but on unit vectors it is a
-monotone function of L2, so it ranks and navigates like one. Raw inner product has neither property. Under dot product a vector's best match is not itself but any longer
-vector pointing roughly the same way, and two documents that both score highly against a query need not
-score highly against each other. This search problem has its own name, maximum inner product search
-(MIPS), and it matters because graph and cluster indexes are built on the intuition that neighbors of
-neighbors are good candidates; with widely varying norms that intuition weakens and recall at a given
-search effort can drop. Libraries accept inner product directly, but the standard reduction is worth
-knowing: let M be the largest document norm, append the coordinate √(M² − ‖d‖²) to every document and 0
-to the query. Every augmented document now has norm M, the query's dot product is unchanged, and
-nearest-neighbor search by L2 on the augmented vectors returns exactly the MIPS ranking. If your vectors
-are normalized, none of this applies, which is one more reason normalization is the default.
+- **L2 is a proper metric.** A vector is its own nearest neighbor and the triangle inequality holds, so
+  "close to close is close".
+- **Cosine distance (1 − cos) is not a metric**, but on unit vectors it is a monotone function of L2, so
+  it ranks and navigates like one.
+- **Raw inner product has neither property.** A vector's best match is any longer vector pointing roughly
+  the same way, and two documents that both score highly against a query need not score highly against
+  each other.
+- **This is MIPS** (maximum inner product search). Graph and cluster indexes assume neighbors of neighbors
+  are good candidates; with widely varying norms that weakens and recall at a given search effort can drop.
+
+The standard reduction from MIPS to L2 search (libraries also accept inner product directly):
+1. Let M be the largest document norm.
+2. Append the coordinate √(M² − ‖d‖²) to every document and 0 to the query.
+3. Every augmented document now has norm M and the query's dot product is unchanged.
+4. Nearest-neighbor search by L2 on the augmented vectors returns exactly the MIPS ranking.
+
+If your vectors are normalized, none of this applies, which is one more reason normalization is the default.
 
 ### How the computation runs
-Exact search is a matrix–vector product: stack N document vectors into a matrix D (N × d) and compute
-`D·q`. The cost is N·d multiply-adds, but in practice the bound is memory bandwidth, because every byte
-of D is read once per query. One million 1024-dimensional fp32 vectors is 4 GB. As an illustrative order
-of magnitude, streaming that through a single CPU core takes hundreds of milliseconds; a GPU with roughly
-a terabyte per second of bandwidth does it in a few milliseconds. Batching queries into a matrix–matrix
-product (D·Qᵀ) amortizes the read across many queries, which is why offline evaluation is cheap while
-online single-query latency is not. Selecting the top k from N scores does not need a full sort: a heap
-or partial selection (`np.argpartition`) is O(N), so the scan, not the selection, dominates. Past a few million vectors you stop scanning and build an approximate
-index (see ANN indexes), trading a little recall for sublinear search.
+- **Exact search is a matrix–vector product.** Stack N document vectors into D (N × d) and compute `D·q`:
+  N·d multiply-adds.
+- **The bound is memory bandwidth**, because every byte of D is read once per query. One million
+  1024-dimensional fp32 vectors is 4 GB.
+- **Illustrative orders of magnitude:** a single CPU core streams that in hundreds of milliseconds; a GPU
+  with roughly a terabyte per second of bandwidth does it in a few milliseconds.
+- **Batching amortizes the read.** A matrix–matrix product (D·Qᵀ) reads D once for many queries, which is
+  why offline evaluation is cheap while online single-query latency is not.
+- **Top-k needs no full sort.** A heap or partial selection (`np.argpartition`) is O(N), so the scan, not
+  the selection, dominates.
+- **Past a few million vectors** you stop scanning and build an approximate index (see ANN indexes),
+  trading a little recall for sublinear search.
 
 ### Scores are not probabilities
-Cosine lies in [−1, 1], but for a given text embedding model almost all query–document pairs land in a
-narrow band whose location depends on the model, and unrelated pairs are rarely near zero (embedding
-spaces are anisotropic: everything points roughly the same way). A score of 0.78 means nothing without a
-calibration set from the same model and the same kind of pairs. Thresholds must be measured, not copied,
-and they are invalid the moment the model changes.
+- **Narrow, model-specific band.** Cosine lies in [−1, 1], but almost all query–document pairs for a given
+  text embedding model land in a narrow band whose location depends on the model.
+- **Unrelated pairs are rarely near zero**, because embedding spaces are anisotropic: everything points
+  roughly the same way.
+- **0.78 means nothing alone.** A score needs a calibration set from the same model and the same kind of
+  pairs. Thresholds must be measured, not copied, and are invalid the moment the model changes.
 
 ### Operators in real systems
-pgvector exposes `<->` (L2 distance), `<=>` (cosine distance, 1 − cos) and `<#>` (negative inner
-product, negated so that `ORDER BY ... ASC` works for all three). FAISS has `IndexFlatL2` and
-`IndexFlatIP`. An index is built for exactly one operator class, and a query that uses a different
-operator cannot use the index; the database silently falls back to a full scan.
+| System | L2 | Cosine | Inner product |
+|---|---|---|---|
+| pgvector | `<->` (L2 distance) | `<=>` (cosine distance, 1 − cos) | `<#>` (negative inner product) |
+| FAISS | `IndexFlatL2` | normalize, then `IndexFlatIP` | `IndexFlatIP` |
 
-## Example
-Random vectors stand in for embeddings; 5% of the corpus is given a three-times-larger norm, the way a
-dot-product-trained model might inflate "important" passages. Watch the dot-product top-k fill up with
-those rows while cosine ignores length, and see that normalizing at index time makes the cheap dot
-product reproduce the cosine ranking exactly.
+- pgvector negates inner product so that `ORDER BY ... ASC` works for all three.
+- An index is built for exactly one operator class. A query using a different operator cannot use the
+  index; the database silently falls back to a full scan.
+
+## Diagram
+Follow the decision from the model card to the operator: the metric is fixed by training, and the index
+must be built for the same operator the query uses, or the engine falls back to a full scan.
+
+```mermaid
+flowchart TD
+    MC["Model card: training similarity"] --> Q1{"Cosine or dot product?"}
+    Q1 -->|"cosine, or card is silent"| N["Normalize vectors at write time"]
+    Q1 -->|"dot product, norm is a prior"| R["Keep raw vectors"]
+    N --> IP["Index and query with inner product"]
+    R --> MIPS["MIPS: inner product index, check recall"]
+    IP --> OP{"Query operator matches index operator class?"}
+    MIPS --> OP
+    OP -->|"yes"| IX["Index scan, top k"]
+    OP -->|"no"| SEQ["Silent sequential scan, latency grows with N"]
+    IX --> REC["Recall at k vs exact brute force on labeled set"]
+```
+
+## Examples
+### Magnitude bias, and how normalization removes it
+Random vectors stand in for embeddings; 5% of the corpus gets a three-times-larger norm, the way a
+dot-product-trained model might inflate "important" passages. The dot-product top-k fills with those
+rows, cosine ignores length, and after normalizing at index time the cheap dot product reproduces the
+cosine ranking exactly.
 
 ```python
 import numpy as np
@@ -148,39 +179,90 @@ print("l2 on unit vectors  == cosine ranking:",
       np.array_equal(topk(-np.linalg.norm(Dn - qn, axis=1)), topk(cos)))
 ```
 
+### Production snippet: pgvector with a matching operator class
+Vectors are normalized before insert, so the inner-product operator returns the cosine ranking and the
+index and query use the same operator class.
+
+```sql
+CREATE TABLE chunks (id bigserial PRIMARY KEY, body text, embedding vector(1024));
+-- vectors written unit-length, so inner product == cosine ranking
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops);
+
+-- <#> returns the NEGATIVE inner product, so ascending order = most similar first
+SELECT id, body, -(embedding <#> $1) AS score
+FROM chunks
+ORDER BY embedding <#> $1
+LIMIT 10;
+
+-- Check the plan: an index scan on chunks_embedding_idx, not "Seq Scan on chunks"
+EXPLAIN SELECT id FROM chunks ORDER BY embedding <#> $1 LIMIT 10;
+```
+
+### Worked scenario: can brute force meet the latency budget?
+Exact scan cost is bytes read per query, N × d × bytes per element (1M vectors, d = 1024).
+
+| Precision | Bytes per vector | Corpus size | Read per query |
+|---|---|---|---|
+| fp32 | 4,096 | 4 GB | all 4 GB |
+| fp16 | 2,048 | 2 GB | half the bandwidth |
+| int8 | 1,024 | 1 GB | a quarter of the bandwidth |
+
+At roughly a terabyte per second (GPU), fp32 takes about 4 ms per query; a single CPU core at an
+illustrative ~10 GB/s takes ~400 ms. If the budget is 50 ms on CPU, quantize, batch queries, or move to an
+ANN index; the scan, not the top-k selection, is what you are paying for.
+
+## Production patterns
+- **Normalize at write, use inner product.** When the model card says cosine, encode with
+  `normalize_embeddings=True` (sentence-transformers) or divide by the norm yourself, then index with
+  `vector_ip_ops` in pgvector or `IndexFlatIP` in FAISS. Monitor a sample of stored norms in the
+  ingestion job; alert if any drifts from 1.0.
+- **Gate the query plan in CI.** Run `EXPLAIN` on the exact SQL your ORM emits and fail the build if it
+  shows a sequential scan on the vector table. Monitor p95 query latency against row count; linear
+  growth means the index is not used.
+- **Keep an exact reference.** Hold a labeled query set and compute recall@k of the production path
+  against a brute-force scan whenever the model, metric or precision changes. Monitor recall@10 per
+  release, because a wrong metric degrades quality without raising an error.
+- **One collection per embedding version.** Store the model name and version with the collection;
+  re-embed into a new collection and switch reads only after the recall check passes. Monitor that no
+  collection contains rows from two model versions.
+- **Calibrate thresholds per model.** If you filter on score, pick the cutoff from labeled pairs at a
+  target precision for this model version and store it next to the version. Monitor the share of
+  queries that return zero results after each model upgrade.
+
 ## Trade-offs
-- Dot product is the cheapest score and preserves any magnitude prior the model learned; it flips to
-  harmful the moment the model was cosine-trained, because then norms are noise and long vectors win for
-  no reason.
-- Cosine is scale-invariant, so verbose and terse passages compete on direction alone; the cost is a
+- **Dot product: cheapest and keeps the magnitude prior.** It flips to harmful the moment the model was
+  cosine-trained, because then norms are noise and long vectors win for no reason.
+- **Cosine: scale-invariant.** Verbose and terse passages compete on direction alone. The cost is a
   normalization pass and the loss of any information the model encoded in vector length.
-- Exact brute-force scoring has perfect recall and zero index maintenance; it stops being viable when
-  N·d·bytes can no longer be streamed within your latency budget, typically somewhere in the low millions
-  of vectors on CPU.
-- Storing vectors in fp16 or int8 halves or quarters the bandwidth per query at a small ranking cost; the
-  cost stops being small when you threshold scores, because near-ties at the cutoff move first.
+- **Exact brute force: perfect recall, zero index maintenance.** It stops being viable when N·d·bytes can
+  no longer be streamed within your latency budget, typically somewhere in the low millions of vectors
+  on CPU.
+- **fp16 or int8 storage: half or a quarter of the bandwidth.** The ranking cost is small, until you
+  threshold scores, because near-ties at the cutoff move first.
 
 ## Pitfalls
-- Building the index with one operator class (`vector_cosine_ops`) and querying with another (`<->`); the
-  symptom is query time that grows linearly with corpus size and `EXPLAIN` showing a sequential scan.
-- Running L2 or dot product on unnormalized outputs from a cosine-trained model; the symptom is rankings
-  that disagree with the vendor's playground for the same query, usually favoring long passages.
-- Copying a similarity threshold (say 0.8) from a blog post or a previous model; after an embedding
-  upgrade either everything or nothing passes the filter, because the score distribution shifted.
-- Treating score as confidence across queries; a 0.72 for one query and a 0.72 for another say nothing
-  comparable, so "answer only if score > t" needs per-model calibration on labeled pairs.
-- Mixing vectors from two embedding models or versions in one collection; the symptom is that documents
-  indexed after the switch are never retrieved (or only they are), since the two spaces are unrelated.
+- **Index and query operators disagree.** The index uses `vector_cosine_ops`, the query uses `<->`.
+  Symptom: query time grows linearly with corpus size and `EXPLAIN` shows a sequential scan. Fix: query
+  with the matching operator or build a matching index.
+- **L2 or dot product on raw outputs of a cosine-trained model.** Symptom: rankings disagree with the
+  vendor's playground for the same query, usually favoring long passages. Fix: normalize.
+- **Copying a similarity threshold** (say 0.8) from a blog post or a previous model. Symptom: after an
+  embedding upgrade everything or nothing passes, because the score distribution shifted. Fix: recalibrate.
+- **Treating score as confidence across queries.** A 0.72 for one query and a 0.72 for another say
+  nothing comparable, so "answer only if score > t" needs per-model calibration on labeled pairs.
+- **Mixing two embedding models or versions in one collection.** Symptom: documents indexed after the
+  switch are never retrieved (or only they are), since the two spaces are unrelated. Fix: re-embed.
 
 ## When to use
-Every dense retrieval system makes this choice, usually implicitly. Decide it explicitly when you create a
-collection: read the model card, pick its similarity, normalize at write time unless the model relies on
-magnitude, and create the index with the matching operator class. Measure recall@k against an exact
-brute-force scan on a labeled set whenever you change the model, the metric or the precision, because a
-wrong metric degrades quality without raising an error. Reach for brute force when the corpus is small or
-when you need an exact reference; move to an approximate index when latency or memory forces it. In
-interviews, expect to derive the relationship between the three scores and to explain why a
-cosine-trained model should not be queried with dot product on raw vectors.
+Every dense retrieval system makes this choice, usually implicitly.
+- **Decide at collection creation:** read the model card, pick its similarity, normalize at write time
+  unless the model relies on magnitude, and create the index with the matching operator class.
+- **Measure:** recall@k against an exact brute-force scan on a labeled set whenever you change the model,
+  the metric or the precision, because a wrong metric degrades quality without raising an error.
+- **Use brute force when** the corpus is small or you need an exact reference; move to an approximate
+  index when latency or memory forces it.
+- **Interviews:** derive the relationship between the three scores and explain why a cosine-trained model
+  should not be queried with dot product on raw vectors.
 
 ## Role lens
 - **Engineer:** Chooses `normalize_embeddings=True` and the matching operator class, writes the
@@ -204,6 +286,38 @@ and cosine produce the same ordering, so switching operators changes only speed.
 normalized, the L2 ranking was mixing magnitude into the score, and moving to cosine will change rankings,
 probably for the better if the model was cosine-trained. A strong answer also mentions validating with a
 brute-force recall check on a labeled sample before and after.
+
+## Interview questions
+### Why do cosine, dot product and L2 give the same ranking on normalized vectors, and why does that matter?
+- **The algebra:** with unit norms, cosine equals the dot product, and ‖q − d‖² = 2 − 2·cos, a
+  monotone transform, so all three order candidates identically.
+- **Why it matters:** normalizing once at write time lets you use the cheapest score (dot product) and
+  any index built for inner product or L2 while still getting cosine results.
+
+### Search quality dropped after a team swapped embedding models. How do you debug it?
+- **Check the contract first:** which similarity does the new model card name, are vectors normalized,
+  and does the collection mix rows from the old and new model?
+- **Check thresholds:** a score cutoff calibrated on the old model sits at an arbitrary point in the new
+  model's score distribution, so everything or nothing passes.
+- **Measure:** recall@10 of the production path against an exact brute-force scan on a labeled query set.
+
+### When would you deliberately not normalize your embeddings?
+- **When the model was trained with a dot-product objective** and uses norm as a prior, as DPR-style
+  retrievers can for "generally useful" passages; normalizing throws that signal away.
+- **The cost:** raw inner product is not a metric, so graph and cluster indexes navigate worse and recall
+  at a fixed search effort can drop; verify against brute force.
+
+### How large a corpus can you search exactly within a 50 ms budget?
+- **Exact search is bandwidth-bound:** bytes read per query are N × d × bytes per element; 1M
+  1024-dimensional fp32 vectors are 4 GB.
+- **Rough numbers:** about 4 ms on a GPU at roughly a terabyte per second, about 400 ms on one CPU core at
+  an illustrative ~10 GB/s, so a CPU needs int8, batching or an ANN index to hit 50 ms at that size.
+
+### What does a cosine score of 0.78 tell you about relevance?
+- **On its own, nothing.** Embedding spaces are anisotropic, so scores for one model cluster in a narrow,
+  model-specific band and unrelated pairs are rarely near zero.
+- **To use it as a filter**, calibrate a cutoff on labeled pairs for that model version at a target
+  precision, store it with the version, and recalibrate on every model change.
 
 ## Quiz
 ### Q: Why do cosine similarity, dot product and Euclidean distance produce the same ranking on unit-length vectors?

@@ -5,7 +5,7 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - evals/model-evaluation
   - evals/dataset-contamination
@@ -22,117 +22,160 @@ sources:
 ---
 
 ## TL;DR
-A benchmark is a fixed dataset with a fixed scoring rule, so models can be compared on the same
-task. MMLU measures broad knowledge by multiple choice, HumanEval measures Python function synthesis
-by unit tests, SWE-bench measures resolving real GitHub issues, and GPQA measures expert science
-reasoning that web search cannot shortcut. Benchmarks exist so model comparison is not anecdote, but
-each measures something narrow, saturates and leaks into training data: treat a leaderboard as a
-screening filter, never as evidence your task will work.
+A benchmark is a fixed dataset plus a fixed scoring rule so models can be compared on one task.
+MMLU, HumanEval, SWE-bench and GPQA each measure something narrow, saturate and leak: use leaderboards
+to screen, never as proof your task works.
 
 ## Why it exists
-Before shared benchmarks, every lab reported results on tasks of its own choosing, with its own
-prompts and scoring, and no two numbers were comparable. A benchmark freezes three things, the items,
-the prompt format and the scoring rule, so that a score from one lab means the same as a score from
-another. That is what makes model selection, progress tracking and claim verification possible at all.
-
-Why are there so many? Because each benchmark targets one capability, and each has a lifetime. A
-benchmark is informative while models score well below its ceiling and have not seen its items. As
-models improve it saturates (differences at the top are within noise or within label error), and as
-its items spread across the web it becomes contaminated (scores reflect memorization). Newer, harder,
-better-guarded benchmarks replace older ones: GPQA and SWE-bench (both 2023) took over from MMLU
-(2020) and HumanEval (2021) as the numbers people watch, and they in turn are approaching their own
-ceilings at the frontier as harder successors appear. Which benchmarks are "current" changes yearly;
-the cycle is the stable fact.
-
-The naive alternative is picking a model from the table in a vendor's announcement. It fails because
-numbers across reports are rarely comparable (different shot counts, chain-of-thought or not, pass@1
-versus pass@k, subsets, sampling settings, agent scaffolds), because contamination inflates some models
-more than others, and because a benchmark measures the model alone, not your prompt, retrieval and
-tools around it.
+- **Before benchmarks, nothing was comparable.** Every lab reported results on tasks of its own choosing,
+  with its own prompts and scoring.
+- **A benchmark freezes three things:** the items, the prompt format and the scoring rule. A score from
+  one lab then means the same as one from another, which makes model selection, progress tracking and
+  claim verification possible at all.
+- **Many exist because each targets one capability and has a lifetime.** It is informative while models
+  score well below its ceiling and have not seen its items.
+  - *Saturation:* as models improve, differences at the top fall within noise or label error.
+  - *Contamination:* as items spread across the web, scores reflect memorization.
+  - *Succession:* GPQA and SWE-bench (both 2023) took over from MMLU (2020) and HumanEval (2021) as the
+    numbers people watch, and are themselves approaching their ceilings at the frontier as harder
+    successors appear. Which benchmarks are "current" changes yearly; the cycle is the stable fact.
+- **Picking from a vendor's announcement table fails** because:
+  - numbers across reports are rarely comparable (different shot counts, chain-of-thought or not,
+    pass@1 versus pass@k, subsets, sampling settings, agent scaffolds);
+  - contamination inflates some models more than others;
+  - a benchmark measures the model alone, not your prompt, retrieval and tools around it.
 
 ## How it works
 ### Anatomy of a benchmark
-Items, a prompt format, a scoring rule, and a reporting convention. The scoring rule is the part
-engineers underestimate: a multiple-choice benchmark can be scored by comparing the log-probability of
-the four answer letters, or by generating text and parsing a letter out of it, and the two methods give
-different numbers for the same model. Always read how a score was produced before comparing it.
+- **Four parts:** items, a prompt format, a scoring rule, and a reporting convention.
+- **The scoring rule is underestimated.** A multiple-choice benchmark can be scored by comparing the
+  log-probability of the four answer letters, or by generating text and parsing a letter out of it. The
+  two give different numbers for the same model.
+- **Always read how a score was produced** before comparing it.
+
+### The four benchmarks at a glance
+| | MMLU | HumanEval | SWE-bench | GPQA |
+|---|---|---|---|---|
+| Measures | Breadth of knowledge | Functional correctness of code | Resolving real issues | Expert reasoning search cannot shortcut |
+| Size | ~14,000 test items, 57 subjects | 164 problems | ~2,300 instances; Lite 300; Verified 500 | 448 questions; Diamond 198 |
+| Format | 4-option multiple choice, 5-shot | Python signature + docstring | Issue text + repo at pre-fix commit → patch | 4-option multiple choice |
+| Scored by | Accuracy (chance 25%) | Hidden unit tests, pass@k | FAIL_TO_PASS and PASS_TO_PASS tests | Accuracy |
+| Main weakness | Near ceiling, label errors, extraction-sensitive, everywhere on the web | Tiny, Python only, saturated, contaminated, sparse tests | A system score: scaffold moves it as much as the model | Size: wide confidence interval |
 
 ### MMLU: breadth of knowledge
-Multiple-choice questions, four options each, across 57 subjects from elementary mathematics to
-professional law and medicine, roughly 14,000 test items in total; the original protocol is 5-shot.
-Scored by accuracy, chance is 25%. It measures recall of world knowledge plus reading comprehension,
-not multi-step reasoning. Its weaknesses are now well known: top models are close to its ceiling, later
-audits found a non-trivial number of mislabeled or ill-posed questions in some subjects, scores are
-sensitive to the answer-extraction method, and its items are everywhere on the web. Successors such as
-MMLU-Pro raise the option count and the reasoning load to restore headroom.
+- **What it is:** multiple-choice questions, four options each, across 57 subjects from elementary
+  mathematics to professional law and medicine; roughly 14,000 test items. Original protocol is 5-shot.
+- **Scoring:** accuracy; chance is 25%.
+- **Measures** recall of world knowledge plus reading comprehension, not multi-step reasoning.
+- **Known weaknesses:**
+  - top models are close to its ceiling;
+  - later audits found a non-trivial number of mislabeled or ill-posed questions in some subjects;
+  - scores are sensitive to the answer-extraction method;
+  - its items are everywhere on the web.
+- **Successors** such as MMLU-Pro raise the option count and the reasoning load to restore headroom.
 
 ### HumanEval: functional correctness of code
-164 hand-written Python problems, each a function signature with a docstring; the model completes the
-body and hidden unit tests decide pass or fail. The metric is pass@k: the probability that at least one
-of *k* samples passes, estimated without bias from *n* ≥ *k* samples by
-`pass@k = 1 − C(n−c, k) / C(n, k)` where *c* samples passed. Read the formula as counting: of all
-ways to choose *k* of the *n* samples, C(n−c, k) contain only failures, so the fraction of size-*k*
-subsets with at least one pass is the estimate. The obvious plug-in, 1 − (1 − c/n)^k, is biased low,
-*because* that function is concave in the pass probability, so averaging it over noisy per-problem
-estimates understates the true value; drawing many samples and counting subsets avoids this. pass@k
-also rewards diversity: a model that solves a problem 1 time in 10 scores 0.1 at pass@1 but 0.5 at
-pass@5 on that problem, which is why pass@k suits settings with a verifier that can pick the
-passing sample and misleads when a user gets one shot. Its design point was to grade code by
-*executing* it rather than by text similarity to a reference, which is why it displaced BLEU-style
-code metrics. Weaknesses: tiny (one problem is 0.6 points), Python only, saturated at the top, heavily
-contaminated because solutions are all over GitHub, and its original tests are sparse enough that
-extended test suites (HumanEval+ from the EvalPlus project) catch solutions the originals passed.
+- **What it is:** 164 hand-written Python problems, each a function signature with a docstring. The
+  model completes the body; hidden unit tests decide pass or fail.
+- **Metric: pass@k,** the probability that at least one of *k* samples passes, estimated without bias
+  from *n* ≥ *k* samples, where *c* samples passed:
+
+```
+pass@k = 1 − C(n−c, k) / C(n, k)
+```
+
+- **Read it as counting.** Of all ways to choose *k* of the *n* samples, C(n−c, k) contain only
+  failures; the fraction of size-*k* subsets with at least one pass is the estimate.
+- **The plug-in 1 − (1 − c/n)^k is biased low,** *because* that function is concave in the pass
+  probability, so averaging it over noisy per-problem estimates understates the true value. Drawing
+  many samples and counting subsets avoids this.
+- **pass@k rewards diversity.** A model that solves a problem 1 time in 10 scores 0.1 at pass@1 but 0.5
+  at pass@5 on that problem. So pass@k suits settings with a verifier that can pick the passing sample,
+  and misleads when a user gets one shot.
+- **Design point:** grade code by *executing* it rather than by text similarity to a reference, which is
+  why it displaced BLEU-style code metrics.
+- **Weaknesses:** tiny (one problem is 0.6 points), Python only, saturated at the top, heavily
+  contaminated because solutions are all over GitHub. Its original tests are sparse enough that
+  extended suites (HumanEval+ from the EvalPlus project) catch solutions the originals passed.
 
 ### SWE-bench: resolving real issues
-Task instances built from real GitHub issues in popular Python repositories: the model receives the
-issue text and the repository at the pre-fix commit and must produce a patch. Grading applies the patch
-and runs the tests that the human fix made pass (FAIL_TO_PASS) while checking that previously passing
-tests still pass (PASS_TO_PASS). The full set has about 2,300 instances from a dozen repositories;
-SWE-bench Lite is a 300-instance subset and SWE-bench Verified is a 500-instance subset screened by
-humans for solvable issues and fair tests. It measures agentic software engineering: navigating a
-codebase, editing, running tests. The sharp edge is that a score is a *system* score: the scaffold
-(agent loop, tools, retries) moves results as much as the model, so "model X scores Y%" is incomplete
-without the scaffold and the cost per task.
+- **Task:** instances built from real GitHub issues in popular Python repositories. The model receives
+  the issue text and the repository at the pre-fix commit and must produce a patch.
+- **Grading:** apply the patch, run the tests the human fix made pass (FAIL_TO_PASS), and check that
+  previously passing tests still pass (PASS_TO_PASS).
+- **Sizes:** the full set has about 2,300 instances from a dozen repositories. SWE-bench Lite is a
+  300-instance subset; SWE-bench Verified is a 500-instance subset screened by humans for solvable
+  issues and fair tests.
+- **Measures** agentic software engineering: navigating a codebase, editing, running tests.
+- **Sharp edge: it is a *system* score.** The scaffold (agent loop, tools, retries) moves results as
+  much as the model, so "model X scores Y%" is incomplete without the scaffold and the cost per task.
 
 ### GPQA: expert reasoning that search cannot shortcut
-448 four-option questions in biology, physics and chemistry written by domain experts who have or
-are pursuing PhDs, and validated by other experts. The construction target was that experts score high while skilled
-non-experts with unrestricted web access score low (the paper reports roughly 65% for experts, about
-74% discounting clear expert mistakes, versus about 34% for non-experts), hence "Google-proof". The
-Diamond subset (198 questions) keeps only items that both expert validators answered correctly (or
-where the expert who erred later acknowledged the mistake) and that most non-experts got wrong, and is
-the number usually reported. It measures reasoning beyond retrieval and is where reasoning-oriented
-models separate from others. Its weakness is size: 198 items means a wide confidence interval.
+- **What it is:** 448 four-option questions in biology, physics and chemistry, written by domain experts
+  who have or are pursuing PhDs, and validated by other experts.
+- **"Google-proof" target:** experts score high while skilled non-experts with unrestricted web access
+  score low. The paper reports roughly 65% for experts (about 74% discounting clear expert mistakes)
+  versus about 34% for non-experts.
+- **Diamond subset (198 questions):** keeps only items both expert validators answered correctly (or
+  where the expert who erred later acknowledged the mistake) and that most non-experts got wrong. It is
+  the number usually reported.
+- **Measures** reasoning beyond retrieval; it is where reasoning-oriented models separate from others.
+- **Weakness:** size; 198 items means a wide confidence interval.
 
 ### Reading a score
-Before comparing two numbers, align: shots, chain-of-thought, pass@1 versus pass@k, sampling
-temperature and number of samples averaged, subset (Diamond, Verified, Lite), scaffold, evaluation
-date, and whether the score is self-reported. Then apply statistics: a score is a proportion with
-standard error √(p(1−p)/n). On GPQA Diamond at p = 0.6 that is ±3.5 points standard error, so two
-models four points apart are not distinguishable at 95% confidence; on MMLU's ~14k items the same
-calculation gives ±0.4. Two refinements matter in practice. Models evaluated on the *same* items can
-be compared paired (count the items where exactly one model is right), which is tighter than the
-independent intervals suggest, *because* item difficulty is shared; but this needs per-item results,
-which published tables do not give you. And for sampled or reasoning models, a single run adds
-sampling noise on top of item noise, so careful reports average several runs per item; a score from
-one run on a 198-item set can move by several points on a re-run with nothing changed.
+1. **Align the protocol:** shots, chain-of-thought, pass@1 versus pass@k, sampling temperature and
+   number of samples averaged, subset (Diamond, Verified, Lite), scaffold, evaluation date, and whether
+   the score is self-reported.
+2. **Apply statistics:** a score is a proportion with standard error √(p(1−p)/n).
 
-Saturation has a precise meaning here. A benchmark's effective ceiling is below 100% whenever some
-items are mislabeled or ambiguous, so as top scores approach that ceiling, the remaining differences
-reflect which models happen to agree with the label errors rather than capability. Finally ask about contamination: the dataset-contamination lesson covers how
-to detect it.
+| Benchmark | n | SE at p = 0.6 | Meaning |
+|---|---|---|---|
+| GPQA Diamond | 198 | ±3.5 points | Two models four points apart are not distinguishable at 95% confidence |
+| MMLU | ~14k | ±0.4 points | Small gaps can be real (if uncontaminated) |
+
+- **Paired comparison is tighter.** Models evaluated on the *same* items can be compared by counting
+  items where exactly one model is right, *because* item difficulty is shared. This needs per-item
+  results, which published tables do not give you.
+- **Repeat runs for sampled or reasoning models.** A single run adds sampling noise on top of item
+  noise, so careful reports average several runs per item. One run on a 198-item set can move several
+  points on a re-run with nothing changed.
+- **Saturation, precisely.** The effective ceiling is below 100% whenever some items are mislabeled or
+  ambiguous. Near that ceiling, remaining differences reflect which models happen to agree with the
+  label errors rather than capability.
+- **Ask about contamination;** the dataset-contamination lesson covers how to detect it.
 
 ### From benchmark to decision
-Use benchmarks to shortlist: a coding assistant looks at SWE-bench-style results and the scaffold used;
-a knowledge-heavy assistant looks at MMLU-style results; a scientific reasoning tool looks at GPQA. Then
-build your own golden dataset, because none of these contain your documents, your prompt or your
-failure modes. The benchmark answers "is this model capable enough to try"; your eval answers "does it
-work here".
+- **Shortlist by capability:** a coding assistant looks at SWE-bench-style results and the scaffold
+  used; a knowledge-heavy assistant at MMLU-style results; a scientific reasoning tool at GPQA.
+- **Then build your own golden dataset,** because none of these contain your documents, your prompt or
+  your failure modes.
+- **Division of labour:** the benchmark answers "is this model capable enough to try"; your eval answers
+  "does it work here".
 
-## Example
+## Diagram
+The decision path for a leaderboard number: each check can send the claim back for re-running, and
+even a clean claim only earns a place on the shortlist.
+
+```mermaid
+flowchart TD
+    R["Reported benchmark score"] --> P{"Same protocol? shots, CoT, pass@1 or pass@k, subset, scaffold"}
+    P -->|"no"| RR["Re-run both under one protocol, or discard"]
+    RR --> P
+    P -->|"yes"| N{"Gap larger than the interval for this n?"}
+    N -->|"no"| NOISE["Treat as a tie"]
+    N -->|"yes"| C{"Contamination ruled out? private look-alike set"}
+    C -->|"no"| DISC["Discount the score"]
+    C -->|"yes"| SL["Shortlist the model"]
+    NOISE --> SL
+    DISC --> SL
+    SL --> G["Decide on your golden dataset, scaffold, cost and latency"]
+```
+
+## Examples
+### pass@k and benchmark intervals in pure Python
 The unbiased pass@k estimator and a confidence interval for a reported score. With 10 samples per
-problem of which 3 pass, pass@1 is 0.30 but pass@5 is about 0.92, which is why the two must never be
-compared as if they were the same metric.
+problem of which 3 pass, pass@1 is 0.30 but pass@5 is about 0.92, so the two must never be compared as
+if they were the same metric.
 
 ```python
 from math import comb, sqrt
@@ -160,47 +203,78 @@ for name, n in benchmarks.items():
 # Per-problem resolution: one HumanEval problem moves the score by 1/164 ≈ 0.61 points.
 ```
 
-The printed intervals are the point: a 5-point lead on GPQA Diamond or HumanEval is inside the noise
-of a single evaluation run, while on MMLU it is not, and only a paired comparison on the same items
-with the same protocol can tighten that.
+- **The intervals are the point:** a 5-point lead on GPQA Diamond or HumanEval is inside the noise of a
+  single evaluation run, while on MMLU it is not.
+- **Only a paired comparison** on the same items with the same protocol can tighten that.
+
+### Worked scenario: auditing a vendor's leaderboard claim
+A vendor table (numbers illustrative) shows model A ahead of model B. Walk the checklist before it
+reaches a selection memo.
+
+| Check | Finding | Effect on the claim |
+|---|---|---|
+| Metric | A reported pass@5 on HumanEval, B pass@1 | Not the same metric; the "20-point lead" may vanish under one protocol |
+| Subset | A on SWE-bench Verified, B on Lite | Different item sets; not comparable |
+| Scaffold | A used the vendor's own agent with retries | A system score, not a model property |
+| Size | GPQA Diamond lead of 4 points, one run each | Inside ±7 points at 95%; does not rank the models |
+| Source | B's number copied from an older report | Re-run both under one protocol or discard |
+| Decision | Both models shortlisted | Run both through your golden dataset and scaffold |
+
+## Production patterns
+- **Model-selection memo with protocol and intervals.** For each shortlisted model, record the score,
+  the subset, shots, chain-of-thought setting, pass@1 or pass@k, scaffold, date, and the 95% interval
+  computed as above. Monitor how often memo rankings agree with the golden-dataset run that follows.
+- **Reproduce before trusting.** Re-run claimed scores with an open harness such as EleutherAI's
+  lm-evaluation-harness (for example `lm_eval --tasks mmlu --num_fewshot 5`) or Inspect, pinning the
+  same protocol for every model. Monitor the gap between your number and the reported one.
+- **Benchmark in your own scaffold.** For coding agents, run SWE-bench Verified instances through your
+  agent loop and tools, and log resolved rate and cost per task together. Monitor cost per resolved
+  issue across model candidates, not just resolved rate.
+- **Repeat small benchmarks.** For sampled or reasoning models on sets like GPQA Diamond, average
+  several runs per item and report mean and spread. Monitor run-to-run spread; if it exceeds the gap
+  you are deciding on, the benchmark cannot decide.
+- **Private look-alike set.** Keep a small unpublished set of items in the style of the public
+  benchmark, written in-house. Monitor the gap between public and private scores as a contamination
+  signal.
 
 ## Trade-offs
-- Standardized items and scoring make models comparable across labs, but the standardization also
-  makes items easy to find and train on, so comparability decays with time.
-- Execution-based grading (HumanEval, SWE-bench) is objective and resists paraphrase problems, but it
-  needs sandboxes, dependencies and time per item, and test coverage bounds what "correct" means.
-- Small expert-written sets (GPQA) are high in quality and were released with measures meant to keep
-  them out of crawls (a canary string and a request not to post items in plain text), but they are
-  public and not immune to contamination, and their size makes confidence intervals wide and
+- **Comparability vs decay.** Standardized items and scoring make models comparable across labs, but
+  also make items easy to find and train on, so comparability decays with time.
+- **Execution grading vs cost.** Execution-based grading (HumanEval, SWE-bench) is objective and resists
+  paraphrase problems, but needs sandboxes, dependencies and time per item, and test coverage bounds
+  what "correct" means.
+- **Small expert sets vs precision.** Sets like GPQA are high in quality and were released with measures
+  meant to keep them out of crawls (a canary string and a request not to post items in plain text).
+  They are still public and not immune to contamination, and their size makes intervals wide and
   single-run comparisons unreliable.
-- Agentic benchmarks (SWE-bench) reflect real work far better than multiple choice, but they measure
-  model plus scaffold, so a score is reproducible only with the full harness and its cost.
+- **Agentic realism vs reproducibility.** SWE-bench reflects real work far better than multiple choice,
+  but measures model plus scaffold, so a score is reproducible only with the full harness and its cost.
 
 ## Pitfalls
-- Comparing pass@1 from one report with pass@k or best-of-n from another; the symptom is a "20-point
-  lead" that disappears when both are run under the same protocol.
-- Reading a 3-point difference on a 198-item set as a ranking; the symptom is model rankings that
-  reorder between runs with no change to the models.
-- Treating a SWE-bench number as a model property; the symptom is a model that scores far lower in your
-  own agent scaffold than in the vendor's report.
-- Ignoring contamination; the symptom is a model that aces HumanEval and fails on your private coding
-  tasks of similar difficulty.
-- Choosing a model for a domain task by its MMLU score; the symptom is a broad-knowledge leader that
-  underperforms a cheaper model on your extraction job because the task needs instruction following,
-  not trivia.
-- Quoting self-reported scores as independent; the symptom is a leaderboard entry that nobody outside
-  the vendor can reproduce.
+- **Comparing pass@1 with pass@k or best-of-n** from another report. Symptom: a "20-point lead" that
+  disappears when both are run under the same protocol.
+- **Reading a 3-point difference on a 198-item set as a ranking.** Symptom: model rankings reorder
+  between runs with no change to the models.
+- **Treating a SWE-bench number as a model property.** Symptom: the model scores far lower in your own
+  agent scaffold than in the vendor's report.
+- **Ignoring contamination.** Symptom: a model aces HumanEval and fails on your private coding tasks of
+  similar difficulty.
+- **Choosing a domain model by MMLU score.** Symptom: a broad-knowledge leader underperforms a cheaper
+  model on your extraction job because the task needs instruction following, not trivia.
+- **Quoting self-reported scores as independent.** Symptom: a leaderboard entry nobody outside the
+  vendor can reproduce.
 
 ## When to use
-Use benchmarks at the start of model selection to shortlist candidates for the capability your task
-needs, and when tracking the field to understand which capabilities are moving. Do not use them as the
-release gate for a product, as evidence that a specific prompt works, or to compare models whose
-scores came from different protocols. Measure what the benchmark measures: for coding, run a
-SWE-bench-style harness yourself with your scaffold; for knowledge or reasoning, confirm on your own
-items. In day-to-day work this looks like a one-page model-selection memo citing benchmark scores with
-their protocol and intervals, followed by a golden-dataset run that actually decides. In interviews,
-the expected depth is naming what each of these four benchmarks measures and how, computing pass@k,
-and explaining why a leaderboard lead can be noise, contamination or a scaffold effect.
+- **Use when:** starting model selection, to shortlist candidates for the capability your task needs;
+  and when tracking the field to see which capabilities are moving.
+- **Avoid when:** gating a product release, proving a specific prompt works, or comparing models whose
+  scores came from different protocols.
+- **Measure what it measures:** for coding, run a SWE-bench-style harness yourself with your scaffold;
+  for knowledge or reasoning, confirm on your own items.
+- **Day to day:** a one-page model-selection memo citing scores with protocol and intervals, followed by
+  a golden-dataset run that actually decides.
+- **Interviews:** name what each of the four benchmarks measures and how, compute pass@k, and explain
+  why a leaderboard lead can be noise, contamination or a scaffold effect.
 
 ## Role lens
 - **Engineer:** Reproduces a benchmark score locally with an open harness before trusting it, and
@@ -222,6 +296,47 @@ items and repeated; HumanEval has 164 items, so 9 points is about 15 problems, b
 dependent on contamination, since HumanEval solutions are widespread online. Finally relevance: neither
 benchmark contains my task. The claim supports shortlisting the model for a pilot on our own golden set,
 nothing more.
+
+## Interview questions
+### What does each of MMLU, HumanEval, SWE-bench and GPQA measure, and how is it scored?
+- **MMLU:** breadth of knowledge, about 14,000 four-option questions across 57 subjects, 5-shot,
+  scored by accuracy with chance at 25%.
+- **HumanEval:** functional correctness of 164 Python problems, graded by hidden unit tests and
+  reported as pass@k.
+- **SWE-bench:** patches for real GitHub issues, graded by FAIL_TO_PASS and PASS_TO_PASS tests.
+  **GPQA:** 448 expert-written science questions (Diamond 198) that web search cannot shortcut.
+
+### Explain pass@k and why the plug-in estimate is wrong.
+- **Definition:** the probability that at least one of *k* samples passes, estimated from *n* ≥ *k*
+  samples with *c* passes as 1 − C(n−c, k) / C(n, k).
+- **The plug-in 1 − (1 − c/n)^k is biased low** because the function is concave, so averaging it over
+  noisy per-problem estimates understates the true value.
+- **Why it matters:** with 10 samples and 3 passes, pass@1 is 0.30 but pass@5 is about 0.92, so the two
+  must never be compared as one metric.
+
+### A model scores far lower in your coding agent than in the vendor's SWE-bench report. Why?
+- **SWE-bench is a system score:** the scaffold (agent loop, tools, retries) moves the result as much as
+  the model, and the vendor likely used its own.
+- **Check the subset and protocol:** Verified (500), Lite (300) and the full set (about 2,300) are
+  different item sets, and attempts allowed per task change the number.
+- **Fix the comparison:** run SWE-bench Verified instances through your own scaffold and log resolved
+  rate together with cost per task.
+
+### When would you not use a public benchmark to choose a model?
+- **For the final decision:** no benchmark contains your documents, prompt or failure modes, so the
+  decision belongs to your golden dataset.
+- **When scores came from different protocols** or one number was copied from an older report; re-run
+  both or discard.
+- **Trade-off:** benchmarks give free comparability for shortlisting, but that comparability decays as
+  items saturate and leak into training data.
+
+### Two models are 4 points apart on GPQA Diamond. Is that a real difference?
+- **Compute the interval:** at p ≈ 0.6 and n = 198 the standard error is about ±3.5 points, so the 95%
+  interval is roughly ±7 points, wider than the gap.
+- **Reasoning models add run-to-run noise;** one run on 198 items can move several points on a re-run,
+  so average several runs per item.
+- **Only a paired comparison** on the same items with per-item results can tighten it; published tables
+  do not give you that.
 
 ## Quiz
 ### Q: Why did HumanEval grade solutions by running unit tests instead of comparing them to a reference solution?

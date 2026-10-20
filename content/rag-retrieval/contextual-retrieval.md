@@ -5,7 +5,7 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/parent-document-retrieval
@@ -20,64 +20,63 @@ sources:
 ---
 
 ## TL;DR
-Chunking destroys context: "revenue grew 3% over the previous quarter" no longer says which company or
-which quarter, so neither its embedding nor its BM25 terms can match a query that names them. Contextual
-retrieval fixes the index rather than the query: at ingestion an LLM reads the whole document plus each
-chunk and writes a short context that is prepended to the chunk before embedding and before BM25
-indexing. It costs one LLM call per chunk, made affordable by prompt caching, and adds no query-time
-latency.
+Chunks lose their subject when cut from a document. Contextual retrieval fixes the index: at ingestion an
+LLM reads the whole document and writes a short context for each chunk, prepended before embedding and
+BM25 indexing. One cached LLM call per chunk, no query latency.
 
 ## Why it exists
-A chunk is embedded and indexed in isolation, but it was written as part of a document. The author relied
-on the surrounding pages to supply the subject: "the company", "this method", "Table 3", "the previous
-quarter", "it". Once the chunk is cut out, those references dangle. A query like "ACME Corp revenue
-growth Q2 2023" shares no terms with a chunk that says "The company's revenue grew by 3% over the
-previous quarter", so BM25 scores it near zero, and the chunk's embedding lands in a generic
-"revenue growth" region that hundreds of other companies' chunks also occupy. The evidence is in the
-index and still cannot be retrieved. This is a recall failure caused by the indexing unit, and it shows
-up most in corpora of many similar documents: quarterly filings, per-customer contracts, per-service
-runbooks.
-
-The cheap fix, prepending the document title and heading path to every chunk, recovers a lot and should
-always be tried first. It fails when the title does not carry the facts a chunk needs (the quarter, the
-product variant, the entity under discussion three paragraphs up). Bigger chunks blur every embedding.
-Parent-document retrieval gives the generator the context but does nothing for matching, because the
-child is still what gets embedded. Document-level summaries are not specific to each chunk. What is
-needed is a chunk-specific, document-grounded sentence that says what this chunk is about in terms a
-query would use, and an LLM reading the whole document can write exactly that.
+- **Chunks are written to be read in place.** Authors rely on surrounding pages to supply the subject: "the
+  company", "this method", "Table 3", "the previous quarter", "it". Cut out, those references dangle.
+- **Both retrieval legs miss.** "ACME Corp revenue growth Q2 2023" shares no terms with "The company's
+  revenue grew by 3% over the previous quarter", so BM25 scores it near zero; its embedding lands in a
+  generic "revenue growth" region that hundreds of other companies' chunks also occupy. The evidence is in
+  the index and still cannot be retrieved.
+- **It is a recall failure caused by the indexing unit,** worst in corpora of many similar documents:
+  quarterly filings, per-customer contracts, per-service runbooks.
+- **The cheaper fixes fall short.**
+  - **Title and heading-path prefixes** recover a lot and should always be tried first, but fail when the
+    title lacks what the chunk needs (the quarter, the product variant, the entity three paragraphs up).
+  - **Bigger chunks** blur every embedding.
+  - **Parent-document retrieval** gives the generator context but does nothing for matching, because the
+    child is still what gets embedded.
+  - **Document-level summaries** are not specific to each chunk.
+- **What is needed:** a chunk-specific, document-grounded sentence saying what this chunk is about in terms
+  a query would use. An LLM reading the whole document can write exactly that.
 
 ## How it works
 ### The ingestion pipeline
 For each document, for each chunk:
 
-1. Prompt an LLM with the entire document and the chunk, asking for a short context that situates the
-   chunk within the document for the purpose of improving search retrieval, and nothing else. The output
-   is typically a sentence or two (the post suggests on the order of 50–100 tokens).
-2. Prepend the context to the chunk text: `contextualised = context + "\n" + chunk`.
-3. Embed the contextualised chunk for the dense index ("contextual embeddings").
-4. Index the contextualised chunk in BM25 ("contextual BM25").
-5. Store the original chunk (and, separately, the context) for display and citation.
+1. **Generate a context.** Prompt an LLM with the entire document and the chunk, asking for a short
+   context that situates the chunk within the document to improve search retrieval, and nothing else.
+   Typically a sentence or two (the post suggests on the order of 50–100 tokens).
+2. **Prepend:** `contextualised = context + "\n" + chunk`.
+3. **Embed the contextualised chunk** for the dense index ("contextual embeddings").
+4. **Index the contextualised chunk in BM25** ("contextual BM25").
+5. **Store the original chunk** (and, separately, the context) for display and citation.
 
-Each choice has a reason. The whole document is in the prompt because only it can supply the entity,
-date and section the chunk omits. The context is kept short because the chunk's own content must still
-dominate the embedding; a long context makes every chunk of a document look alike. It is prepended to
-both legs because dense and sparse retrieval fail on the same missing terms, and the reported gains were
-larger when both were fixed. The original chunk is kept because the generated sentence is not source
-text and must not be quoted as if it were.
+Why each choice:
+
+| Choice | Because |
+|---|---|
+| Whole document in the prompt | only it can supply the entity, date and section the chunk omits |
+| Context kept short | the chunk's own content must still dominate the embedding; a long context makes every chunk of a document look alike |
+| Prepended to both legs | dense and sparse retrieval fail on the same missing terms, and reported gains were larger when both were fixed |
+| Original chunk kept | the generated sentence is not source text and must not be quoted as if it were |
 
 ### The cost model, and why prompt caching makes it viable
-Naively, contextualising a document with c chunks and d tokens costs about c × d input tokens, since
-each call carries the full document: a 100-chunk document means the document is read 100 times. Prompt
-caching changes this. The document is placed as a fixed prefix, the chunk and instruction vary, and
-after the first call the prefix is served from cache at a much lower rate (on Anthropic's API at the time,
-cache reads were billed at about a tenth of the base input price). The total is still proportional to
-c × d, but with a constant roughly an order of magnitude smaller, so the per-chunk output and the chunk
-itself become a large share of the bill. Caches expire after minutes, so process one document's chunks
-back to back.
+- **Naive cost is about c × d input tokens** for c chunks and d document tokens, since each call carries the
+  full document: a 100-chunk document is read 100 times.
+- **Prompt caching** places the document as a fixed prefix, varies the chunk and instruction, and serves the
+  prefix from cache after the first call at a much lower rate (on Anthropic's API at the time, cache reads
+  were billed at about a tenth of the base input price).
+- **Still proportional to c × d,** but with a constant roughly an order of magnitude smaller, so per-chunk
+  output and the chunk itself become a large share of the bill.
+- **Caches expire after minutes,** so process one document's chunks back to back.
 
-A worked illustration, using Anthropic's ratios at the time (cache write about 1.25× the base input
-price, cache read about 0.1×): a 20,000-token document cut into 50 chunks, with each call's variable
-suffix (chunk plus instruction) about 500 tokens.
+Worked illustration with Anthropic's ratios at the time (cache write about 1.25× base input price, cache
+read about 0.1×): a 20,000-token document, 50 chunks, a variable suffix (chunk plus instruction) of about
+500 tokens per call.
 
 ```
 uncached: 50 × (20,000 + 500)                         ≈ 1,025,000 full-price input tokens
@@ -87,39 +86,49 @@ cached:   1 write × 20,000 × 1.25                     =    25,000
           total                                       ≈   148,000 full-price equivalents (~7× less)
 ```
 
-Output (50 contexts of under 100 tokens) is identical in both cases. Note that the cached reads are still
-the largest term, which is why cost still grows with chunks × document length, and why splitting very
-long documents into sections before contextualising cuts cost as well as fitting the window. Providers
-also set a minimum cacheable prefix length, so very short documents are billed uncached; for them the
-naive cost is small anyway. The post's own estimate was roughly one dollar per million document tokens with caching; treat the exact figure as model- and
-pricing-dependent, but the order of magnitude is what makes "an LLM call per chunk" acceptable.
+- **Output is identical in both cases** (50 contexts of under 100 tokens).
+- **Cached reads are still the largest term,** which is why cost grows with chunks × document length, and
+  why splitting very long documents into sections before contextualising cuts cost as well as fitting the
+  window.
+- **Minimum cacheable prefix.** Providers set one, so very short documents are billed uncached; their naive
+  cost is small anyway.
+- **The post's own estimate** was roughly one dollar per million document tokens with caching. Treat the
+  exact figure as model- and pricing-dependent; the order of magnitude is what makes "an LLM call per
+  chunk" acceptable.
 
 ### What was reported
-The post reported reductions in the top-20 retrieval failure rate on its evaluation set: around 35% with
-contextual embeddings alone, around 49% when contextual BM25 was added, and around 67% when a reranker
-was added on top. These are the authors' numbers on their corpora and embedding models; the shape of
-the result (each layer helps, and they stack) is the transferable lesson, the exact percentages are not.
+Reductions in the top-20 retrieval failure rate on the post's evaluation set:
+
+| Layer | Failure-rate reduction |
+|---|---|
+| Contextual embeddings alone | around 35% |
+| + contextual BM25 | around 49% |
+| + reranker on top | around 67% |
+
+These are the authors' numbers on their corpora and embedding models. The transferable lesson is the
+shape (each layer helps, and they stack), not the exact percentages.
 
 ### The serving path is unchanged
-At query time nothing new happens: hybrid search over the contextualised chunks, rank fusion, reranking,
-top-n to the generator. That is the main attraction compared with query-side techniques: all the cost is
-paid at ingestion, and query latency does not move.
+- **Query time is the same:** hybrid search over the contextualised chunks, rank fusion, reranking, top-n
+  to the generator.
+- **That is the main attraction** versus query-side techniques: all the cost is paid at ingestion, and query
+  latency does not move.
 
 ### Variants and neighbours
-- Structural context (title, heading path, metadata) prepended by rule: zero LLM cost, often enough.
-- Documents longer than the model's context: pass the enclosing section or a window around the chunk
+- **Structural context by rule** (title, heading path, metadata): zero LLM cost, often enough.
+- **Documents longer than the model's context:** pass the enclosing section or a window around the chunk
   instead of the whole document, accepting weaker context.
-- Corpus-specific prompts: for code, ask for file, class and function; for contracts, the parties and
+- **Corpus-specific prompts:** for code, ask for file, class and function; for contracts, the parties and
   the clause.
-- Late chunking (embedding the whole document with a long-context encoder and pooling per chunk) attacks
-  the same problem at the embedding level without an LLM; it is a different trade and worth comparing.
-- Below a certain corpus size the post's own advice applies: if everything fits in the context window,
-  put it in the prompt with caching and skip retrieval.
+- **Late chunking** (embed the whole document with a long-context encoder, pool per chunk) attacks the same
+  problem at the embedding level without an LLM; a different trade, worth comparing.
+- **Small corpora:** the post's own advice applies below a certain size: if everything fits in the context
+  window, put it in the prompt with caching and skip retrieval.
 
-## Example
-A contextualisation step that produces the two index inputs and keeps the original for display. `llm`
-accepts a cached prefix (the document) and a per-call suffix; `embed`, `dense.add` and `bm25.add` are
-stubs for your encoder and indexes.
+## Examples
+### A contextualisation step for both index legs
+`llm` accepts a cached prefix (the document) and a per-call suffix; `embed`, `dense.add` and `bm25.add`
+are stubs for your encoder and indexes.
 
 ```python
 CONTEXT_INSTRUCTION = """Here is the chunk we want to situate within the whole document:
@@ -147,47 +156,89 @@ chunk = "The company's revenue grew by 3% over the previous quarter."
 # (ACME, Q2, 2023, revenue) and the embedding, which the bare chunk could never do.
 ```
 
+### Runnable: ingestion cost calculator
+Pure Python, reproducing the worked illustration and showing how cost grows when documents get longer.
+The 1.25 and 0.1 ratios are the ones quoted above; substitute your provider's current prices.
+
+```python
+def ingest_cost(doc_tokens, n_chunks, suffix_tokens, write=1.25, read=0.1, cached=True):
+    """Input cost in full-price-token equivalents for contextualising one document."""
+    if not cached:
+        return n_chunks * (doc_tokens + suffix_tokens)
+    return doc_tokens * write + (n_chunks - 1) * doc_tokens * read + n_chunks * suffix_tokens
+
+for doc, chunks in ((20_000, 50), (40_000, 100), (80_000, 200)):
+    u = ingest_cost(doc, chunks, 500, cached=False)
+    c = ingest_cost(doc, chunks, 500)
+    print(f"{doc:>6} tokens, {chunks:>3} chunks: uncached {u:>10,.0f}  cached {c:>9,.0f}  ({u / c:.1f}x less)")
+#  20000 tokens,  50 chunks: uncached  1,025,000  cached   148,000  (6.9x less)
+#  40000 tokens, 100 chunks: uncached  4,050,000  cached   496,000  (8.2x less)
+#  80000 tokens, 200 chunks: uncached 16,100,000  cached 1,792,000  (9.0x less)
+```
+
+- **Doubling the document roughly quadruples the cost** (148,000 → 496,000 → 1,792,000), because chunks and
+  document length both double: the "roughly document length squared" growth.
+- **So split long documents into sections** and contextualise each against its section.
+
+## Production patterns
+- **Cache the document block explicitly.** On Anthropic's Messages API, put the document in its own content
+  block marked with `cache_control` of type `"ephemeral"` and the chunk plus instruction after it. Monitor
+  the usage fields `cache_creation_input_tokens` and `cache_read_input_tokens`: reads should dominate after
+  the first call per document.
+- **Warm, then fan out.** Send one chunk's call first so it writes the cache, then run the remaining chunks
+  of that document concurrently, inside the cache lifetime. Monitor the cache-read share per document; a
+  share near zero means the fan-out raced the write.
+- **Contexts as versioned data.** Store each context with the document hash, prompt version and model id,
+  and re-contextualise a document only when its hash or the prompt version changes. Monitor ingestion
+  tokens per day against corpus churn.
+- **Structural baseline in the same eval.** Run title-plus-heading prefixes, contextual embeddings, and
+  contextual embeddings plus contextual BM25 as separate arms on the golden set, adding the reranker as its
+  own step. Track recall@20 or failure rate per arm so each layer's gain is attributable.
+- **Validate generated contexts.** Cheaply check that entities and dates in each context appear somewhere
+  in the source document, and fall back to the structural prefix when they do not. Monitor the fallback
+  rate, which spikes on scanned or messy documents.
+
 ## Trade-offs
-- Retrieval quality rises with zero added query latency, but ingestion now includes an LLM call per
-  chunk; for a corpus that churns daily the recurring cost can outweigh the gain.
-- Because each context depends on the whole document, any edit can change every chunk's context, so
-  re-indexing granularity becomes the document rather than the chunk.
-- The generated context can be wrong (a misread date or entity) and then actively misleads retrieval;
-  documents with clear metadata produce reliable contexts, scanned or messy ones do not.
-- Compared with parent-document retrieval it fixes matching rather than generation context; the two
-  compose, and using only one leaves the other failure mode in place.
+- **Query-free quality gain vs ingestion cost.** Retrieval quality rises with zero added query latency, but
+  ingestion now includes an LLM call per chunk; for a corpus that churns daily the recurring cost can
+  outweigh the gain.
+- **Better keys vs re-index granularity.** Each context depends on the whole document, so any edit can
+  change every chunk's context, and re-indexing granularity becomes the document rather than the chunk.
+- **Disambiguation vs generated errors.** A wrong context (a misread date or entity) actively misleads
+  retrieval; documents with clear metadata produce reliable contexts, scanned or messy ones do not.
+- **Matching vs generation context.** Versus parent-document retrieval it fixes matching rather than
+  generation context; the two compose, and using only one leaves the other failure mode in place.
 
 ## Pitfalls
-- Embedding only the context or only the chunk instead of the concatenation; the symptom is no measurable
-  improvement after a costly ingestion run.
-- Applying contexts to the dense index but not to BM25; the symptom is that exact-term queries naming the
-  entity still miss, and part of the reported gain is absent (a 35% versus 49% failure reduction in the
-  post).
-- Contexts that are too long; the symptom is that every chunk from one document looks alike and retrieval
-  returns clusters of neighbours from the same document instead of the specific passage.
-- Running ingestion without prompt caching; the symptom is an ingestion bill several times to an order
-  of magnitude higher than the cached estimate, growing with chunks × document length, which is roughly
-  document length squared.
-- Firing all of a document's chunk calls in parallel before the first one has written the cache; the
-  symptom is cache-write or cache-miss charges on every call and a bill close to the uncached estimate.
-  Send one call first, then fan out the rest.
-- Documents longer than the model's context being silently truncated; the symptom is contexts for late
+- **Embedding only the context or only the chunk** instead of the concatenation. The symptom is no
+  measurable improvement after a costly ingestion run.
+- **Contexts in the dense index but not BM25.** The symptom is exact-term queries naming the entity still
+  missing, and part of the reported gain absent (a 35% versus 49% failure reduction in the post).
+- **Contexts that are too long.** The symptom is every chunk from one document looking alike, and retrieval
+  returning clusters of neighbours from the same document instead of the specific passage.
+- **Ingesting without prompt caching.** The symptom is a bill several times to an order of magnitude above
+  the cached estimate, growing with chunks × document length, which is roughly document length squared.
+- **Firing all chunk calls in parallel before the first has written the cache.** The symptom is cache-write
+  or cache-miss charges on every call and a bill close to the uncached estimate. Send one call first, then
+  fan out the rest.
+- **Silently truncating documents longer than the model's context.** The symptom is contexts for late
   chunks that refer to the wrong section or entity.
-- Displaying the contextualised text as a quotation; the symptom is "cited" sentences that do not exist in
-  the source document.
-- Shipping contexts and a reranker in the same release without a golden set; the symptom is not knowing
+- **Displaying the contextualised text as a quotation.** The symptom is "cited" sentences that do not exist
+  in the source document.
+- **Shipping contexts and a reranker in one release without a golden set.** The symptom is not knowing
   which change produced the gain or the regression.
 
 ## When to use
-Use it when failure analysis shows chunks that cannot be matched because they lost their subject: many
-similar documents, heavy use of pronouns and references, tables and figures whose rows are meaningless
-without headers. Try structural prefixes first; they are free. Skip it for corpora that fit in the
-context window, for corpora that change faster than you can afford to re-contextualise, and for
-collections of short self-contained records that never lost context in the first place. Measure
-retrieval failure rate or recall@20 on a golden set before and after, with and without contextual BM25,
-and track ingestion cost per million tokens. In interviews it is the answer to "the right chunk is in
-the index but never retrieved", and the strong candidate explains both legs, the caching cost model and
-the re-indexing consequence.
+- **Use when** failure analysis shows chunks that cannot be matched because they lost their subject: many
+  similar documents, heavy pronouns and references, tables and figures whose rows are meaningless without
+  headers.
+- **Try structural prefixes first;** they are free.
+- **Avoid for** corpora that fit in the context window, corpora that change faster than you can afford to
+  re-contextualise, and collections of short self-contained records that never lost context.
+- **Measure:** retrieval failure rate or recall@20 on a golden set before and after, with and without
+  contextual BM25, plus ingestion cost per million tokens.
+- **Interviews:** the answer to "the right chunk is in the index but never retrieved"; the strong candidate
+  explains both legs, the caching cost model and the re-indexing consequence.
 
 ## Role lens
 - **Engineer:** Adds the contextualisation step to the ingestion pipeline with prompt caching, indexes the

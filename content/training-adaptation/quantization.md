@@ -5,7 +5,7 @@ name: Quantization (INT8/INT4, GPTQ, AWQ, GGUF)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - training-adaptation/peft
   - training-adaptation/pruning
@@ -23,120 +23,146 @@ sources:
 ---
 
 ## TL;DR
-Quantization stores weights, and sometimes activations, in fewer bits than the 16-bit training format:
-INT8, INT4 or small floats. It pays off because LLM decoding is limited by bytes read per token, not by
-arithmetic, so fewer bytes per weight means a model that fits cheaper hardware and decodes faster. GPTQ
-and AWQ are calibration-based recipes for choosing 4-bit values that minimise each layer's output error;
-GGUF is the llama.cpp file format for shipping such models to CPUs and laptops.
+Quantization stores weights (sometimes activations) in INT8, INT4 or small floats instead of 16 bits.
+Decode is limited by bytes read, so models fit cheaper hardware and run faster. GPTQ and AWQ choose 4-bit
+values; GGUF ships them to CPUs.
 
 ## Why it exists
-Two numbers drive everything. A 70B-parameter model in bf16 is 140 GB of weights, which does not fit on
-one 80 GB GPU; at 4 bits it is about 35–40 GB and does. A 7B model goes from 14 GB to about 4 GB, which is
-the difference between a data-centre card and a laptop. That is the memory argument.
-
-The speed argument is subtler. During decode the GPU reads every weight once per generated token, and the
-arithmetic per weight is tiny (one multiply-add per token at batch size 1), so time per token is roughly
-bytes of weights divided by memory bandwidth. Halve the bytes and small-batch decoding nearly doubles in
-speed, with no change to the maths. Quantization is a bandwidth optimisation wearing a compression costume.
-
-The naive alternatives both fail. "Train a smaller model instead" loses more quality than quantizing a
-bigger one: at a fixed memory budget, a 4-bit model with roughly four times the parameters generally
-beats the 16-bit model that fills the same bytes, which is the core finding of the k-bit inference
-scaling-law work (Dettmers & Zettlemoyer) and the reason 4-bit became the default for local models. "Just cast to int8 with one scale per tensor" fails because
-of outliers: transformers past a few billion parameters develop a handful of activation channels with
-magnitudes tens of times larger than the rest, and one such value sets the scale for the whole tensor, so
-everything else rounds to zero or one level. Every modern method is a strategy for handling that range
-problem: finer-grained scales, outlier-aware scaling, or error compensation.
+- **Memory.** A 70B-parameter model in bf16 is 140 GB of weights and does not fit one 80 GB GPU; at 4 bits
+  it is about 35–40 GB and does. A 7B model goes from 14 GB to about 4 GB: data-centre card to laptop.
+- **Speed.** During decode the GPU reads every weight once per token, with tiny arithmetic per weight (one
+  multiply-add per token at batch size 1). Time per token ≈ weight bytes ÷ memory bandwidth, so halving
+  the bytes nearly doubles small-batch decode speed. It is a bandwidth optimisation wearing a compression
+  costume.
+- **"Train a smaller model instead" loses more quality.** At a fixed memory budget, a 4-bit model with
+  roughly four times the parameters generally beats the 16-bit model filling the same bytes. That is the
+  core finding of the k-bit inference scaling-law work (Dettmers & Zettlemoyer), and why 4-bit became the
+  default for local models.
+- **"Just cast to int8 with one scale per tensor" fails on outliers.** Transformers past a few billion
+  parameters develop a handful of activation channels tens of times larger than the rest. One such value
+  sets the whole tensor's scale, so everything else rounds to zero or one level.
+- **Every modern method attacks that range problem:** finer-grained scales, outlier-aware scaling, or
+  error compensation.
 
 ## How it works
 ### The arithmetic of a quantizer
-Symmetric *b*-bit quantization maps a real value *x* to an integer *q* with one scale *s*:
+Symmetric *b*-bit quantization maps a real *x* to an integer *q* with one scale *s*:
 
 ```
 s = max|x| / (2^(b−1) − 1)        q = clamp(round(x / s), −2^(b−1), 2^(b−1) − 1)        x̂ = s · q
 ```
 
-INT8 gives 127 levels on each side of zero; INT4 gives only −8…7. The asymmetric (affine) variant adds a
-zero-point *z* so the grid covers [min, max] exactly, which matters for skewed distributions and is the
-usual choice for 4-bit weights. Rounding error is roughly uniform in [−*s*/2, *s*/2] with mean-squared
-error *s*²/12, so error grows with the range the scale has to cover. That single fact explains the
-granularity ladder:
+- **Levels:** INT8 gives 127 levels on each side of zero; INT4 gives only −8…7.
+- **Asymmetric (affine):** adds a zero-point *z* so the grid covers [min, max] exactly. Matters for skewed
+  distributions; the usual choice for 4-bit weights.
+- **Error:** roughly uniform in [−*s*/2, *s*/2] with mean-squared error *s*²/12, so error grows with the
+  range the scale must cover. That one fact explains the granularity ladder.
 
-- **Per-tensor:** one scale. Cheapest, and ruined by a single outlier.
-- **Per-channel:** one scale per output row. Standard for INT8.
-- **Per-group:** one scale (and zero-point) per *g* consecutive weights along the input dimension,
-  typically *g* = 128 or 32. An outlier now only degrades its own group. The price is overhead: INT4 with
-  *g* = 128, an fp16 scale and a 4-bit zero-point costs 4 + 20/128 ≈ 4.16 bits per weight; *g* = 32 costs
-  about 4.6. "4-bit" models are never exactly 4 bits.
+### The granularity ladder
+| Granularity | Scales | Notes |
+|---|---|---|
+| Per-tensor | one | cheapest; ruined by a single outlier |
+| Per-channel | one per output row | standard for INT8 |
+| Per-group | one (plus zero-point) per *g* consecutive input weights, *g* = 128 or 32 | an outlier only degrades its own group |
+
+- **Per-group overhead:** INT4 with *g* = 128, an fp16 scale and a 4-bit zero-point costs 4 + 20/128 ≈
+  4.16 bits per weight; *g* = 32 costs about 4.6.
+- **"4-bit" models are never exactly 4 bits.**
 
 ### Weights only, or weights and activations
-**W4A16 / W8A16** (weight-only) keeps weights in low-bit storage and dequantizes them to fp16/bf16 inside
-the matmul kernel. Memory and bandwidth drop; compute does not, because the multiply still happens in
-16-bit. This helps decode (bandwidth-bound) and does nothing for prefill (compute-bound); at large batch
-sizes the dequantization overhead can make a W4A16 model slower than the fp16 original. GPTQ and AWQ
-live here.
+- **W4A16 / W8A16 (weight-only).**
+  - Low-bit storage, dequantized to fp16/bf16 inside the matmul kernel. GPTQ and AWQ live here.
+  - Memory and bandwidth drop; compute does not, because the multiply still runs in 16-bit.
+  - Helps decode (bandwidth-bound), does nothing for prefill (compute-bound). At large batch sizes the
+    dequantization overhead can make W4A16 slower than the fp16 original.
+- **W8A8 (weights and activations).**
+  - The matmul runs on INT8 (or FP8) tensor cores at roughly twice fp16 throughput.
+  - Activations are harder: outlier channels, and they change with every input.
+  - LLM.int8() pulls the few outlier columns into an fp16 side-matmul. SmoothQuant migrates activation
+    range into the weights with a per-channel scale before quantizing both.
+- **FP8 (E4M3) on GPUs with native support.** A float format has a built-in exponent and copes with
+  dynamic range, so FP8 weights+activations+KV cache became the default "almost free" setting for
+  throughput serving on that hardware.
+- **KV cache.** Quantizing it (8-bit is common) doubles concurrent sequences at long context; see the KV
+  cache lesson for why that is often the binding constraint rather than weights.
 
-**W8A8** quantizes activations too, so the matmul runs on INT8 (or FP8) tensor cores at roughly twice the
-fp16 throughput. Activations are harder than weights because of the outlier channels and because they
-change with every input. LLM.int8() handles this by pulling the few outlier columns out into an fp16
-side-matmul; SmoothQuant migrates activation range into the weights with a per-channel scale before
-quantizing both. On GPUs with native FP8 (E4M3) the problem eases, because a float format has a built-in
-exponent and copes with dynamic range, so FP8 weights+activations+KV cache has become the default
-"almost free" setting for throughput serving on that hardware.
+### PTQ versus QAT
+| | Post-training (PTQ) | Quantization-aware training (QAT) |
+|---|---|---|
+| Input | trained model + calibration set (a few hundred sequences) | a fine-tuning run |
+| Time | minutes to hours | a training run |
+| Mechanism | fit quantized values to calibration data | simulate quantization in forward, straight-through estimator in backward, so the weights learn to live on the grid |
+| More accurate at | the common 4–8 bit settings, cheaply | extreme bit-widths (2–3 bits) or small models |
+| Examples | GPTQ, AWQ | QAT fine-tunes |
 
-The **KV cache** can be quantized too (8-bit is common), which doubles the number of concurrent sequences
-at long context; see the KV cache lesson for why that is often the binding constraint rather than weights.
-
-### Post-training quantization versus quantization-aware training
-PTQ takes a trained model and a small calibration set (a few hundred sequences) and produces a quantized
-model in minutes to hours; GPTQ and AWQ are PTQ. QAT simulates quantization in the forward pass during
-fine-tuning and uses a straight-through estimator for the backward pass, so the weights learn to live on
-the grid; it is more accurate at extreme bit-widths (2–3 bits, or small models) but costs a training run.
 QLoRA sits in between: a frozen 4-bit base with trainable adapters that learn around its rounding error
 (see the PEFT lesson).
 
 ### GPTQ: compensate the error you just made
-Round-to-nearest treats every weight independently. GPTQ instead minimises the layer's reconstruction
-error ‖**WX** − **ŴX**‖² over calibration inputs **X**, using the second-order machinery of Optimal Brain
-Surgeon. The Hessian of that objective is **H** = 2**XXᵀ**, which depends on the inputs, not on **W**.
-GPTQ quantizes a weight matrix one column at a time: round column *j*, compute the error, and update all
-still-unquantized columns by a multiple of the corresponding row of **H⁻¹** so they absorb the error.
-Doing this in a fixed column order with a Cholesky factor of **H⁻¹** and lazy batched updates made it
-numerically stable and fast enough to quantize a 175B model in a few GPU-hours. The result is 4-bit (and
-usable 3-bit) weights with a small perplexity increase. Because it fits **W** to the calibration inputs,
-GPTQ is somewhat sensitive to the calibration data's domain.
+1. **Objective.** Round-to-nearest treats weights independently. GPTQ minimises the layer's reconstruction
+   error ‖**WX** − **ŴX**‖² over calibration inputs **X**, using Optimal Brain Surgeon's second-order
+   machinery.
+2. **Hessian.** **H** = 2**XXᵀ**, which depends on the inputs, not on **W**.
+3. **Column by column.** Round column *j*, compute the error, and update all still-unquantized columns by a
+   multiple of the matching row of **H⁻¹** so they absorb it.
+4. **Made practical.** A fixed column order, a Cholesky factor of **H⁻¹** and lazy batched updates made it
+   stable and fast enough to quantize a 175B model in a few GPU-hours.
+
+- **Result:** 4-bit (and usable 3-bit) weights with a small perplexity increase.
+- **Caveat:** it fits **W** to the calibration inputs, so it is somewhat sensitive to calibration domain.
 
 ### AWQ: protect the weights that matter
-AWQ starts from a measurement: not all weights are equal, and the ones that matter are identified by the
-*activations* flowing through them, not by their own magnitude. A small weight on a channel that always
-carries large activations contributes a lot to the output, so its rounding error hurts. Keeping that
-~1% of channels in fp16 works but produces a mixed-precision layout hardware dislikes. AWQ's trick is
-mathematically free: multiply a salient weight channel by *s* > 1 and divide the matching activation
-channel by *s*; the product is unchanged, but the weight is now larger relative to the rounding step, so
-its relative error falls. The per-channel scales are chosen by a small grid search
-(*s* = mean activation magnitude^α, α ∈ [0, 1]) minimising output error on calibration data. There is
-no gradient and no weight reconstruction, so AWQ runs fast, overfits the calibration set less than GPTQ,
-and transfers well across domains and modalities. Both ship with fast INT4 GPU kernels (Marlin, ExLlama)
-in vLLM, SGLang and TensorRT-LLM.
+- **Saliency comes from activations.** A small weight on a channel that always carries large activations
+  contributes a lot to the output, so its rounding error hurts. A weight's own magnitude is not the signal.
+- **Keeping ~1% of channels in fp16 works** but yields a mixed-precision layout hardware dislikes.
+- **The free trick.** Multiply a salient weight channel by *s* > 1 and divide the matching activation
+  channel by *s*. The product is unchanged, but the weight is larger relative to the rounding step, so its
+  relative error falls.
+- **Choosing scales.** A small grid search (*s* = mean activation magnitude^α, α ∈ [0, 1]) minimising
+  output error on calibration data.
+- **Why it generalises.** No gradient and no weight reconstruction, so AWQ runs fast, overfits calibration
+  less than GPTQ, and transfers well across domains and modalities.
+- **Kernels.** Both ship with fast INT4 GPU kernels (Marlin, ExLlama) in vLLM, SGLang and TensorRT-LLM.
 
 ### GGUF: a container, not a method
-GGUF is the single-file format used by llama.cpp (it replaced the older GGML format in 2023). One file
-holds the tensors, their quantization type per tensor, and all metadata: architecture hyperparameters,
-the tokenizer vocabulary and the chat template, laid out so the file can be memory-mapped and used
-directly. Its quantization types encode a bit-width and a block scheme: `Q8_0` and `Q4_0` use blocks of 32
-with one fp16 scale (about 8.5 and 4.5 bits per weight); the K-quants (`Q4_K_M`, `Q5_K_M`, `Q6_K`) use
-256-weight super-blocks with compact sub-block scales, and the `S`/`M`/`L` suffix is a mixing recipe that
-keeps the most sensitive tensors (attention value/output and parts of the MLP) at higher precision; the
-I-quants (`IQ2_XXS`…`IQ4_XS`) use non-uniform codebooks and an optional importance matrix from
-calibration data to push below 4 bits. GGUF exists because llama.cpp's audience is CPUs, Apple silicon and
-mixed CPU/GPU machines where tensors are offloaded layer by layer, and the block layouts are designed for
-SIMD dequantization there. On a GPU server, GPTQ/AWQ/FP8 through a batching engine will usually
-out-throughput it.
+- **What it is.** The single-file format of llama.cpp (it replaced the older GGML format in 2023). One
+  file holds tensors, per-tensor quantization types and all metadata: architecture hyperparameters,
+  tokenizer vocabulary and chat template, laid out for memory-mapping.
+- **Why it exists.** llama.cpp targets CPUs, Apple silicon and mixed CPU/GPU machines that offload layer
+  by layer; block layouts are designed for SIMD dequantization there.
+- **On a GPU server** GPTQ/AWQ/FP8 through a batching engine usually out-throughputs it.
 
-## Example
-Why the granularity ladder matters, in NumPy. A Gaussian weight matrix gets one outlier input channel, as
-real transformer weights and (more severely) activations do. The relative output error on random
-activations shows per-tensor INT4 collapsing, per-channel barely helping, and per-group scales rescuing it.
+| GGUF type | Scheme | Bits per weight |
+|---|---|---|
+| `Q8_0`, `Q4_0` | blocks of 32, one fp16 scale | about 8.5 and 4.5 |
+| K-quants: `Q4_K_M`, `Q5_K_M`, `Q6_K` | 256-weight super-blocks, compact sub-block scales | varies |
+| `S`/`M`/`L` suffix | mixing recipe: sensitive tensors (attention value/output, parts of MLP) kept higher | varies |
+| I-quants: `IQ2_XXS`…`IQ4_XS` | non-uniform codebooks, optional importance matrix from calibration | below 4 |
+
+## Diagram
+Read it as the decision path from deployment target to format; every branch ends at the same eval gate
+against the bf16 parent.
+
+```mermaid
+flowchart TD
+    M[("bf16 master checkpoint")] --> T["Where does it run?"]
+    T -->|"GPU with native FP8"| F["FP8 weights, activations and KV cache"]
+    T -->|"must fit a smaller or single GPU"| C["Calibrate on in-domain data"]
+    C --> G["GPTQ: compensate rounding error column by column"]
+    C --> A["AWQ: rescale salient channels, then round"]
+    G --> I4["INT4 per-group, about 4.16 bits per weight"]
+    A --> I4
+    T -->|"laptop, CPU or edge"| U["Convert to GGUF, Q4_K_M or Q5_K_M"]
+    F --> E["Task evals vs bf16 parent, tokens per second at real batch"]
+    I4 --> E
+    U --> E
+```
+
+## Examples
+### Why the granularity ladder matters (NumPy)
+A Gaussian weight matrix gets one outlier input channel, as real transformer weights and (more severely)
+activations do. Relative output error on random activations shows per-tensor INT4 collapsing, per-channel
+barely helping, and per-group scales rescuing it.
 
 ```python
 import numpy as np
@@ -172,46 +198,106 @@ for name, W_hat in [("int8 per-tensor", quant_sym(W, 8)),
 # the ladder above: 8 / 4 / 4 / ~4.16 / ~4.6 respectively (this symmetric toy stores no zero-point).
 ```
 
+### Sizing calculator: real bits per weight
+Pure Python. Shows why "4-bit" 70B lands at 35–40 GB, not 35 GB flat.
+
+```python
+def bits_per_weight(bits, group=None, scale_bits=16, zero_bits=0):
+    return bits if group is None else bits + (scale_bits + zero_bits) / group
+
+def weights_gb(params_b, bpw):
+    return params_b * 1e9 * bpw / 8 / 1e9
+
+schemes = {
+    "bf16":              bits_per_weight(16),
+    "int8 per-channel":  bits_per_weight(8),            # per-row scales: negligible overhead
+    "int4 g=128 (+zp)":  bits_per_weight(4, 128, 16, 4),
+    "int4 g=32 (+zp)":   bits_per_weight(4, 32, 16, 4),
+    "Q4_0 (block 32)":   bits_per_weight(4, 32, 16),
+}
+for name, bpw in schemes.items():
+    print(f"{name:18s} {bpw:5.2f} bits/w   7B: {weights_gb(7, bpw):5.1f} GB   70B: {weights_gb(70, bpw):6.1f} GB")
+# bf16               16.00 bits/w   7B:  14.0 GB   70B:  140.0 GB
+# int8 per-channel    8.00 bits/w   7B:   7.0 GB   70B:   70.0 GB
+# int4 g=128 (+zp)    4.16 bits/w   7B:   3.6 GB   70B:   36.4 GB
+# int4 g=32 (+zp)     4.62 bits/w   7B:   4.0 GB   70B:   40.5 GB
+# Q4_0 (block 32)     4.50 bits/w   7B:   3.9 GB   70B:   39.4 GB
+```
+
+### Worked scenario: what INT4 does to decode and prefill
+A 7B model on a GPU with about 2 TB/s of bandwidth (bandwidth floor only; rough orders of magnitude, not a
+benchmark):
+
+| Workload | bf16 (14 GB) | INT4 g=128 (3.6 GB) | Why |
+|---|---|---|---|
+| Decode, batch 1 | ~7 ms/token floor | ~1.8 ms/token floor | bytes read per token fall ~4× |
+| Prefill of a long RAG prompt | compute-bound | about the same, or slower | weight-only keeps 16-bit FLOPs, adds dequant |
+| High-batch serving | baseline | can lose to fp16 or FP8 W8A8 | dequant overhead dominates |
+
+Real decode gains are smaller than the floor suggests, because KV-cache reads and kernel overhead do not
+shrink.
+
+## Production patterns
+- **FP8 first on hardware that supports it.** For throughput serving, enable FP8 weights and KV cache in
+  the engine (in vLLM, `--quantization fp8` and `--kv-cache-dtype fp8`), then run task evals. Monitor
+  eval deltas, time to first token and tokens per second at real batch size.
+- **Serve pre-quantized INT4 checkpoints for single-GPU fits.** Quantize once with AWQ or GPTQ offline on
+  in-domain calibration data, publish the checkpoint, and point the engine at it (vLLM detects the
+  format from the checkpoint config). Confirm a fast kernel (Marlin, ExLlama) is actually selected in the
+  engine logs.
+- **Quantize from the highest-precision source.** Keep the bf16 master in the model registry and derive
+  every format (AWQ, GPTQ, each GGUF type) from it, never from another quantized file, because errors
+  compound.
+- **GGUF build pipeline for edge targets.** Convert with llama.cpp's `convert_hf_to_gguf.py`, then
+  quantize with `llama-quantize` to `Q4_K_M` or `Q5_K_M`; for I-quants, build an importance matrix from
+  in-domain text first. Check that the chat template and end-of-turn token survive by running a scripted
+  conversation.
+- **Eval-delta release gate.** No quantized model ships without task evals versus its full-precision
+  parent, covering maths, code and minority languages if you serve them. Block on regressions above your
+  agreed threshold, not on perplexity alone.
+
 ## Trade-offs
-- Memory and decode speed improve roughly in proportion to bits saved, while quality loss is small at 8-bit
-  and usually modest at 4-bit for models of 7B and up; the loss grows for small models and for
-  precision-sensitive tasks such as maths, code and long multi-step reasoning, where it must be measured.
-- Weight-only INT4 accelerates small-batch decode but not prefill, and at high batch its dequantization
-  overhead can lose to fp16 or FP8 W8A8; the right choice flips with batch size and with whether your
-  workload is prompt-heavy (RAG) or generation-heavy (chat).
-- Smaller groups cut error but add bits per weight and kernel complexity; *g* = 128 is the usual
-  compromise, and *g* = 32 is worth it mainly below 4 bits or on small models.
-- PTQ is cheap and fast but depends on calibration data matching deployment; QAT is more robust at extreme
-  bit-widths but costs a training run and an engineering pipeline most teams do not have.
-- GGUF runs on nearly anything with partial GPU offload and a single portable file, but a batching GPU
-  engine with AWQ/GPTQ/FP8 kernels delivers far higher throughput per dollar for a multi-user service.
+- **Memory and speed vs quality.** Gains are roughly proportional to bits saved. Loss is small at 8-bit
+  and usually modest at 4-bit for 7B and up; it grows for small models and precision-sensitive tasks
+  (maths, code, long multi-step reasoning), where it must be measured.
+- **Weight-only INT4 vs W8A8.** INT4 speeds small-batch decode but not prefill, and at high batch its
+  dequantization overhead can lose to fp16 or FP8 W8A8. The choice flips with batch size and with
+  prompt-heavy (RAG) versus generation-heavy (chat) workloads.
+- **Smaller groups vs overhead.** They cut error but add bits per weight and kernel complexity; *g* = 128
+  is the usual compromise, and *g* = 32 pays off mainly below 4 bits or on small models.
+- **PTQ vs QAT.** PTQ is cheap and fast but depends on calibration data matching deployment. QAT is more
+  robust at extreme bit-widths but costs a training run and a pipeline most teams lack.
+- **GGUF portability vs GPU throughput.** GGUF runs nearly anywhere with partial GPU offload and one
+  portable file; a batching GPU engine with AWQ/GPTQ/FP8 kernels gives far higher throughput per dollar for
+  a multi-user service.
 
 ## Pitfalls
-- Evaluating only perplexity on a generic text set: perplexity can move by 0.1 while instruction
-  following, maths or a minority language regress sharply; the symptom is a clean quantization report and
-  a stream of user complaints. Run your task evals before and after.
-- Calibrating a code or multilingual model on English web text: the symptom is quality that looks fine on
-  general prompts and degrades exactly in the deployment domain; GPTQ is more sensitive than AWQ here.
-- Expecting INT4 to cut time-to-first-token on long-prompt workloads: prefill is compute-bound and
-  weight-only quantization does not reduce FLOPs; the symptom is unchanged or worse TTFT.
-- Sizing hardware at 4.0 bits per weight: scales and zero-points make it 4.2–5.5 depending on scheme, and
-  the KV cache is extra; the symptom is an OOM on a card that "should have fit".
-- Re-quantizing an already quantized checkpoint (GPTQ → GGUF, or a merged QLoRA model) instead of starting
-  from the highest-precision weights: errors compound; the symptom is a model noticeably worse than the
-  same scheme applied to the bf16 original.
-- Losing or mangling tokenizer and chat-template metadata during GGUF conversion: the symptom is a model
-  that rambles, never emits the end-of-turn token or ignores the system prompt despite correct weights.
+- **Evaluating only perplexity on generic text.** Perplexity can move by 0.1 while instruction following,
+  maths or a minority language regress sharply. Symptom: a clean report and a stream of complaints. Run
+  your task evals before and after.
+- **Calibrating a code or multilingual model on English web text.** Quality looks fine on general prompts
+  and degrades exactly in the deployment domain; GPTQ is more sensitive than AWQ here.
+- **Expecting INT4 to cut time-to-first-token on long prompts.** Prefill is compute-bound and weight-only
+  quantization does not reduce FLOPs. Symptom: unchanged or worse TTFT.
+- **Sizing hardware at 4.0 bits per weight.** Scales and zero-points make it 4.2–5.5 depending on scheme,
+  and the KV cache is extra. Symptom: OOM on a card that "should have fit".
+- **Re-quantizing an already quantized checkpoint.** GPTQ → GGUF, or a merged QLoRA model, compounds
+  errors. Symptom: noticeably worse than the same scheme applied to the bf16 original.
+- **Losing tokenizer or chat-template metadata in GGUF conversion.** Symptom: the model rambles, never
+  emits the end-of-turn token, or ignores the system prompt despite correct weights.
 
 ## When to use
-On GPU servers, start with FP8 if the hardware supports it: near-zero quality cost, faster prefill and
-decode. Go to INT4 AWQ or GPTQ when a model must fit a smaller or single GPU, or when decode latency at
-low batch dominates, and verify on your evals. Choose GGUF when the target is a laptop, a CPU box, an
-edge device or a developer's machine, picking `Q4_K_M` or `Q5_K_M` as sensible defaults and moving up when
-quality evals demand it. Use QLoRA, not a serving format, when the goal is fine-tuning on a small GPU.
-Measure three things every time: task evals against the unquantized model, tokens per second at your real
-batch size, and total memory including the KV cache at your context length. In interviews, be able to
-derive bits per weight for a grouped scheme, explain why outliers break per-tensor scaling, and contrast
-how GPTQ and AWQ decide what to protect.
+- **GPU servers:** start with FP8 if the hardware supports it: near-zero quality cost, faster prefill and
+  decode.
+- **INT4 AWQ or GPTQ:** when a model must fit a smaller or single GPU, or decode latency at low batch
+  dominates; verify on your evals.
+- **GGUF:** for a laptop, CPU box, edge device or developer machine; `Q4_K_M` or `Q5_K_M` are sensible
+  defaults, moving up when quality evals demand it.
+- **QLoRA, not a serving format:** when the goal is fine-tuning on a small GPU.
+- **Measure every time:** task evals against the unquantized model, tokens per second at your real batch
+  size, and total memory including the KV cache at your context length.
+- **Interviews:** derive bits per weight for a grouped scheme, explain why outliers break per-tensor
+  scaling, and contrast how GPTQ and AWQ decide what to protect.
 
 ## Role lens
 - **Engineer:** Picks the quantization scheme per deployment target, runs the calibration and the task
@@ -231,6 +317,43 @@ concurrent sequences fit, more with an 8-bit cache. I would use AWQ (or GPTQ wit
 run the task evals against the bf16 model on a second machine, check that the engine has a fast INT4 kernel
 for this architecture, and confirm the workload is decode-heavy, because INT4 does nothing for prefill. If
 quality drops too far, the honest options are two GPUs with FP8 or a smaller model.
+
+## Interview questions
+### Why does weight-only INT4 speed up decode but not prefill?
+- **Decode is bandwidth-bound:** each token reads every weight once with about one multiply-add per
+  weight at batch 1, so time per token ≈ weight bytes ÷ bandwidth and 4× fewer bytes is close to 4× faster.
+- **Prefill is compute-bound:** W4A16 dequantizes to 16-bit inside the kernel, so FLOPs do not fall and
+  time-to-first-token stays the same or gets worse.
+- **To cut compute** you need W8A8 or FP8 on tensor cores that run it at roughly twice fp16 throughput.
+
+### Why does per-tensor INT8 break on large transformers, and how do the main methods fix it?
+- **The cause:** past a few billion parameters a handful of activation channels grow tens of times larger
+  than the rest, and one outlier sets the whole tensor's scale, so other values round to zero or one level.
+- **Finer scales:** per-channel or per-group (*g* = 128 or 32) confine an outlier's damage to its slice.
+- **Outlier handling:** LLM.int8() routes outlier columns to an fp16 side-matmul; SmoothQuant moves
+  activation range into the weights; AWQ scales salient weight channels up before rounding.
+
+### GPTQ or AWQ for a code model when your calibration set is small? Defend the choice.
+- **GPTQ** minimises layer reconstruction error on the calibration inputs with second-order updates, so it
+  is somewhat sensitive to calibration domain and can overfit a small or mismatched set.
+- **AWQ** uses activation statistics only to pick per-channel scales by a small grid search, with no
+  weight reconstruction, so it overfits calibration less and transfers better across domains.
+- **Either way:** calibrate on in-domain code, and decide on task evals, not perplexity.
+
+### How much memory do a 7B model's INT4 weights need with group 128? Show the arithmetic.
+- **Bits per weight:** 4 + (16-bit scale + 4-bit zero-point) / 128 = 4 + 20/128 ≈ 4.16.
+- **Weights:** 7 × 10⁹ × 4.16 / 8 ≈ 3.6 GB, against 14 GB in bf16; at *g* = 32 it is about 4.6 bits and
+  4.0 GB.
+- **Then add** the KV cache at your context length and concurrency, because sizing at a flat 4.0 bits and
+  forgetting the cache is a classic OOM.
+
+### Your quantized model passed a perplexity check, but maths and Spanish users complain. What happened?
+- **Perplexity hides it:** it can move by 0.1 while maths, instruction following or a minority language
+  regress sharply, so the gate measured the wrong thing.
+- **Likely causes:** calibration on English web text instead of in-domain data, or a checkpoint
+  re-quantized from another quantized file, which compounds errors.
+- **Fix:** re-quantize from the bf16 master with in-domain calibration, add maths and per-language task
+  evals to the release gate, and step up to group 32, 8-bit or FP8 if 4-bit still regresses.
 
 ## Quiz
 ### Q: Why does weight-only INT4 quantization speed up decoding but not prefill?

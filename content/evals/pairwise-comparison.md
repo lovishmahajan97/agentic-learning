@@ -5,7 +5,7 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -21,89 +21,99 @@ sources:
 ---
 
 ## TL;DR
-Instead of asking "how good is this answer on a 1–10 scale?", pairwise comparison asks "which of these
-two answers is better?". Relative judgments are more consistent for both humans and LLM judges because
-they need no shared absolute scale. Many verdicts are aggregated into a win rate against a fixed
-baseline, or into a ranking of several systems with a Bradley–Terry model (the method behind Chatbot
-Arena), and the same pairs are the raw material of preference training (RLHF, DPO).
+Pairwise comparison asks "which of these two answers is better?" instead of "rate this 1–10". It needs
+no shared scale, so verdicts are more consistent; they aggregate into a win rate or a Bradley–Terry
+ranking and also feed preference training.
 
 ## Why it exists
-Absolute scores drift. The same annotator gives a 7 on Monday and an 8 on Friday for equivalent
-answers; different annotators carry different internal scales; an LLM judge compresses almost everything
-into 7–9. The differences you actually want to detect between two prompt versions are a few points of
-quality, and that signal drowns in scale noise.
-
-Side-by-side judgment removes the scale. A rater who cannot say whether an answer is a 6 or a 7 can
-usually say which of two answers is better, and will say the same thing tomorrow. This is an old
-observation in psychometrics: comparative judgments are more reliable than absolute ones, which is why
-paired-comparison models from the 1950s are now the backbone of LLM leaderboards. There is a second
-benefit specific to generated text: a judge scoring one answer alone cannot notice what it *omitted*,
-but with a second answer next to it the omission is visible.
-
-The naive alternative, score each answer separately and compare the averages, suffers from both scale
-noise and from any drift between the two scoring sessions. It also answers the wrong question: for a
-release decision you want "is B better than A", which is what a pairwise verdict measures directly.
-
-Pairwise has a real cost, which is why it is not the only method: a win rate says nothing about absolute
-acceptability. Winning 70% of comparisons against a bad baseline does not make a product usable. So
-pairwise is combined with a fixed strong baseline and with absolute gating criteria from a rubric.
+- **Absolute scores drift.** The same annotator gives a 7 on Monday and an 8 on Friday for equivalent
+  answers; different annotators carry different scales; an LLM judge compresses almost everything into
+  7–9. The few points of quality you want to detect drown in scale noise.
+- **Side-by-side judgment removes the scale.** A rater who cannot say whether an answer is a 6 or a 7 can
+  usually say which of two is better, and will say the same tomorrow. Comparative judgments are more
+  reliable than absolute ones, an old psychometrics result; 1950s paired-comparison models now back LLM
+  leaderboards.
+- **Omissions become visible.** A judge scoring one answer alone cannot notice what it *omitted*; with a
+  second answer next to it, the omission shows.
+- **Scoring separately and comparing averages fails.** It suffers from scale noise and from drift between
+  the two scoring sessions, and answers the wrong question: a release decision wants "is B better than
+  A", which a pairwise verdict measures directly.
+- **The real cost: no absolute bar.** Winning 70% of comparisons against a bad baseline does not make a
+  product usable, so pairwise is combined with a fixed strong baseline and absolute rubric gates.
 
 ## How it works
 ### The unit: one comparison
-One prompt, two responses A and B, a verdict in {A, B, tie}. The judge may be a human or an LLM, free or
-rubric-guided. Record the verdict, the order shown and the judge, because order matters: LLM judges show
-position bias, so each pair is judged in both orders (or inconsistent pairs are treated as ties), and
-for human raters the order is randomised.
+- **Inputs:** one prompt, two responses A and B. **Output:** a verdict in {A, B, tie}.
+- **Judge:** a human or an LLM, free or rubric-guided.
+- **Record the verdict, the order shown and the judge**, because order matters: LLM judges show position
+  bias, so each pair is judged in both orders (or inconsistent pairs are treated as ties). For human
+  raters the order is randomised.
 
 ### Aggregation 1: win rate against a baseline
-Fix a baseline, usually the production system or a reference model, and compare each candidate to it.
-Win rate = (wins + 0.5 × ties) / n. The noise is binomial: standard error ≈ √(p(1−p)/n). With n = 200
-and p = 0.6 that is about 0.035, so the 95% interval is roughly ±7 points. To show a 55% win rate is
-distinguishable from 50% you need the interval half-width below 5 points, which works out to several
-hundred comparisons. This is why "B won 57 of 100" is not yet a decision.
+1. **Fix a baseline**, usually the production system or a reference model, and compare each candidate to it.
+2. **Compute** win rate = (wins + 0.5 × ties) / n.
+3. **Attach binomial noise:** standard error ≈ √(p(1−p)/n).
+
+| n | p | Standard error | 95% interval |
+|---|---|---|---|
+| 200 | 0.6 | about 0.035 | roughly ±7 points |
+| 100 | 0.57 | about 0.05 | roughly 47–67%, includes 50% |
+
+- **Resolving 55% from 50%** needs the interval half-width below 5 points, which works out to several
+  hundred comparisons.
+- **So "B won 57 of 100" is not yet a decision.**
 
 ### Aggregation 2: ranking many systems with Bradley–Terry
-With more than two systems you want one consistent ranking from an incomplete, unbalanced set of
-comparisons (not every pair was compared, and not equally often). The Bradley–Terry model gives each
-system a strength β_i and says
+- **The problem:** with more than two systems you want one consistent ranking from an incomplete,
+  unbalanced set of comparisons (not every pair compared, and not equally often).
+- **The model:** each system gets a strength β_i, and
 
 ```
 P(i beats j) = e^{β_i} / (e^{β_i} + e^{β_j}) = sigmoid(β_i − β_j)
 ```
 
-Strengths are fitted by maximum likelihood over all observed comparisons. It is used *because* it turns
-heterogeneous pairwise outcomes into one scale, handles missing pairs naturally, and has a likelihood you
-can bootstrap for confidence intervals. Only differences in β matter, so one system is anchored. Fitting
-is a short fixed-point iteration (Hunter's MM algorithm): with p_i = e^{β_i}, W_i the total wins of i, and
-n_ij the number of games between i and j,
+- **Fit:** maximum likelihood over all observed comparisons.
+- **Why use it:** it turns heterogeneous pairwise outcomes into one scale, handles missing pairs
+  naturally, and has a likelihood you can bootstrap for confidence intervals.
+- **Only differences in β matter**, so one system is anchored.
+- **Fitting is a short fixed-point iteration** (Hunter's MM algorithm). With p_i = e^{β_i}, W_i the total
+  wins of i, and n_ij the number of games between i and j:
 
 ```
 p_i ← W_i / Σ_{j≠i} n_ij / (p_i + p_j)      then renormalise
 ```
 
-**Elo** is the sequential approximation: update two ratings after every game with a step size K. It is
-built for live play where the sequence matters, but on a static dataset its result depends on the order
-comparisons are fed in and it is noisier than the batch fit. Leaderboards such as Chatbot Arena moved
-from Elo-style updates to Bradley–Terry maximum likelihood with bootstrapped intervals for this reason.
+### Bradley–Terry vs Elo
+| | Elo | Bradley–Terry (batch MLE) |
+|---|---|---|
+| How | sequential: update two ratings after every game with a step size K | joint fit over all comparisons |
+| Built for | live play where the sequence matters | static datasets |
+| On a static dataset | result depends on the order comparisons are fed in; noisier | order-independent; bootstrap intervals |
+
+Leaderboards such as Chatbot Arena moved from Elo-style updates to Bradley–Terry maximum likelihood with
+bootstrapped intervals for this reason.
 
 ### Ties, intransitivity and design
-Ties are split as half a win each (or modelled explicitly with a tie parameter). Preferences can be
-intransitive across prompt categories (A beats B on code, B beats C on writing, C beats A on safety);
-Bradley–Terry assumes a single scale, so check per-category win rates before trusting a global rank.
-Comparison budget is quadratic in the number of systems, so compare each new system against a few
-anchors rather than against everything, and spend extra comparisons where the interval is widest.
+- **Ties** are split as half a win each, or modelled explicitly with a tie parameter.
+- **Preferences can be intransitive across prompt categories** (A beats B on code, B beats C on writing,
+  C beats A on safety). Bradley–Terry assumes a single scale, so check per-category win rates before
+  trusting a global rank.
+- **Comparison budget is quadratic** in the number of systems, so compare each new system against a few
+  anchors rather than everything, and spend extra comparisons where the interval is widest.
 
 ### The same pairs train models
-A reward model for RLHF is trained on exactly these (prompt, chosen, rejected) triples with the
-Bradley–Terry likelihood as its loss, and DPO optimises the same preference likelihood directly against
-the policy. The evaluation method and the training signal share a model, which means any bias in your
-pairwise judging (a preference for length, say) is learned by the policy. Debiasing the judge is also
-debiasing the training data.
+- **RLHF reward models** train on exactly these (prompt, chosen, rejected) triples with the Bradley–Terry
+  likelihood as the loss.
+- **DPO** optimises the same preference likelihood directly against the policy.
+- **Consequence:** evaluation and training share a model, so any bias in your pairwise judging (a
+  preference for length, say) is learned by the policy. Debiasing the judge is also debiasing the
+  training data.
 
-## Example
+## Examples
+### Fitting Bradley–Terry strengths for four systems
 Four systems compared on 100 prompts per pair; `wins[i, j]` counts how often system i beat system j,
-with ties pre-split as 0.5. The MM iteration below fits Bradley–Terry strengths; the final line converts
-two strengths into a predicted head-to-head probability.
+with ties pre-split as 0.5. The MM iteration fits strengths; the last line converts two strengths into a
+predicted head-to-head probability.
 
 ```python
 import numpy as np
@@ -135,43 +145,97 @@ print(f"P(ft-model beats prod) = {1 / (1 + np.exp(-(beta[i] - beta[j]))):.2f}")
 # and report the 2.5th and 97.5th percentiles of each beta.
 ```
 
-Running this ranks ft-model first, promptB second, prod third and promptC last, and predicts ft-model
-beating prod about 70% of the time, close to the directly observed 70/100. The value of the fit is not
-that pair, which was observed, but the consistent ranking of all four from unequal evidence and the
-ability to bootstrap intervals on it.
+- **Result:** ft-model first, promptB second, prod third, promptC last; ft-model is predicted to beat
+  prod about 70% of the time, close to the directly observed 70/100.
+- **The value of the fit** is not that pair, which was observed, but the consistent ranking of all four
+  from unequal evidence and the ability to bootstrap intervals on it.
+
+### Win rate with ties, a bootstrap interval and a sample-size check (runnable)
+Pure Python. The candidate is B, the production baseline is A.
+
+```python
+import math, random
+
+def win_rate(verdicts):
+    """verdicts: list of 'B' (candidate won), 'A' (baseline won) or 'tie'."""
+    return sum(1.0 if v == "B" else 0.5 if v == "tie" else 0.0 for v in verdicts) / len(verdicts)
+
+def interval(verdicts, n_boot=5000, seed=0):
+    rng = random.Random(seed)
+    stats = sorted(win_rate(rng.choices(verdicts, k=len(verdicts))) for _ in range(n_boot))
+    return stats[int(0.025 * n_boot)], stats[int(0.975 * n_boot)]
+
+def comparisons_needed(p, half_width, z=1.96):
+    return math.ceil(z**2 * p * (1 - p) / half_width**2)
+
+verdicts = ["B"] * 52 + ["A"] * 38 + ["tie"] * 10       # 57 wins once ties are split
+print(win_rate(verdicts), interval(verdicts))           # 0.57, roughly (0.48, 0.66)
+print(comparisons_needed(0.55, 0.05))                   # 381 to tell 55% from 50%
+print(comparisons_needed(0.60, 0.07))                   # 189: the n = 200, ±7-point case
+print(comparisons_needed(0.60, 0.035))                  # 753: halving the interval costs 4x
+```
+
+| Question | Answer from the code |
+|---|---|
+| Is 57/100 a win? | interval ≈ 48–66% includes 50%: not yet |
+| Comparisons to resolve a five-point difference | ≈ 381 |
+| Cost of halving the interval | about 4× the comparisons, because SE scales with 1/√n |
+
+## Production patterns
+- **Anchor every candidate to production.** Keep a frozen set of prompts with production outputs, and
+  judge each new variant against them in both orders on every pull request. Monitor win rate with its
+  bootstrap interval and the position-consistency rate.
+- **Ship rule = interval plus gates.** Require the lower bound of the win-rate interval to exceed 50% and
+  the candidate to pass rubric gates on its own. Monitor per-category win rates so a global win cannot
+  hide a loss on safety-sensitive prompts.
+- **Adaptive comparison budget.** Run a first round of about 40 comparisons per variant against
+  production, drop clear losers, and spend the rest where intervals overlap. Monitor interval width per
+  surviving variant.
+- **Length-difference guard.** Log the mean length difference between arms next to every win rate, and
+  compute a length-controlled win rate when it is non-trivial. Monitor whether wins concentrate in the
+  longer arm.
+- **Debias before reusing pairs as training data.** Before turning judged pairs into DPO or reward-model
+  data, keep only position-consistent verdicts and check the chosen-vs-rejected length gap. Monitor
+  output length across training rounds against human preference.
 
 ## Trade-offs
-- Pairwise verdicts are more consistent than absolute scores but say nothing about absolute acceptability;
-  for a release gate, pair them with rubric criteria that an answer must pass on its own.
-- Each comparison is cheap, but full coverage of n systems needs n(n−1)/2 pairs; once n grows past a
-  handful, anchor every candidate to a baseline instead of comparing all pairs.
-- Judging both orders doubles LLM-judge cost but is required to cancel position bias; with many human
-  raters, randomising the order across raters is enough.
-- Side-by-side presentation amplifies length and style bias because the longer answer looks more
-  thorough; when variants differ in length, a length-controlled win rate is worth the modelling effort.
-- Graded preferences ("slightly better", "much better") carry more information per comparison but lower
-  agreement; use them only with several raters per item.
+- **Consistency vs absolute bar.** Pairwise verdicts are more consistent than absolute scores but say
+  nothing about absolute acceptability; for a release gate, pair them with rubric criteria that an answer
+  must pass on its own.
+- **Cheap comparisons vs quadratic coverage.** Each comparison is cheap, but full coverage of n systems
+  needs n(n−1)/2 pairs; once n grows past a handful, anchor every candidate to a baseline instead of
+  comparing all pairs.
+- **Both orders vs cost.** Judging both orders doubles LLM-judge cost but is required to cancel position
+  bias; with many human raters, randomising the order across raters is enough.
+- **Side-by-side vs length bias.** Side-by-side presentation amplifies length and style bias because the
+  longer answer looks more thorough; when variants differ in length, a length-controlled win rate is worth
+  the modelling effort.
+- **Graded preferences vs agreement.** "Slightly better" / "much better" carry more information per
+  comparison but lower agreement; use them only with several raters per item.
 
 ## Pitfalls
-- A high win rate against a weak baseline; the symptom is 80% wins and a product nobody can use, because
-  the baseline was never a bar.
-- Dropping ties instead of splitting them; the symptom is a win rate that swings several points depending
-  on tie handling.
-- No confidence interval; the symptom is leaderboard positions reshuffling between runs on the same data.
-- One global win rate over mixed prompt categories; the symptom is a variant that wins overall but loses
-  on the category that matters most, such as safety-sensitive requests.
-- Elo on a static dataset; the symptom is ratings that change when the comparison order is shuffled.
-- Reusing LLM-judged pairs as DPO data without debiasing; the symptom is a model whose outputs get longer
+- **A high win rate against a weak baseline.** Symptom: 80% wins and a product nobody can use, because
+  the baseline was never a bar. Fix: a strong fixed baseline plus rubric gates.
+- **Dropping ties instead of splitting them.** Symptom: a win rate that swings several points depending
+  on tie handling. Fix: count ties as 0.5.
+- **No confidence interval.** Symptom: leaderboard positions reshuffling between runs on the same data.
+  Fix: bootstrap every win rate and strength.
+- **One global win rate over mixed categories.** Symptom: a variant that wins overall but loses on the
+  category that matters most, such as safety-sensitive requests. Fix: per-category win rates.
+- **Elo on a static dataset.** Symptom: ratings that change when the comparison order is shuffled. Fix:
+  batch Bradley–Terry fit.
+- **Reusing LLM-judged pairs as DPO data without debiasing.** Symptom: a model whose outputs get longer
   every training round while human preference stays flat.
 
 ## When to use
-Reach for pairwise when comparing variants of one system (prompt A vs B, a model upgrade, a fine-tune),
-when collecting preference data for training, and whenever humans judge subjective quality where an
-absolute scale would not hold. Do not use it alone for release gating or for tasks with an executable
-check. Measure win rate with a bootstrap interval, position-consistency rate, per-category win rates and
-the length difference between arms. In interviews, expect to explain Bradley–Terry versus Elo, why a
-leaderboard uses the batch fit, and roughly how many comparisons it takes to resolve a five-point
-difference.
+- **Use when** comparing variants of one system (prompt A vs B, a model upgrade, a fine-tune), collecting
+  preference data for training, or whenever humans judge subjective quality where an absolute scale would
+  not hold.
+- **Avoid** using it alone for release gating, or for tasks with an executable check.
+- **Measure** win rate with a bootstrap interval, position-consistency rate, per-category win rates and
+  the length difference between arms.
+- **Interviews:** explain Bradley–Terry versus Elo, why a leaderboard uses the batch fit, and roughly how
+  many comparisons it takes to resolve a five-point difference.
 
 ## Role lens
 - **Engineer:** Builds the comparison harness: randomised order, both orders for an LLM judge, tie

@@ -5,7 +5,7 @@ name: PyTorch (tensors, autograd, nn.Module, DataLoader, device)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: reviewed
+status: crisp
 related:
   - python-for-ai/numpy
   - python-for-ai/hugging-face
@@ -21,57 +21,65 @@ sources:
 ---
 
 ## TL;DR
-PyTorch is NumPy-style arrays (tensors) that can live on a GPU and that record the operations applied
-to them, so `loss.backward()` computes every gradient automatically. `nn.Module` packages parameters and
-forward logic, `DataLoader` feeds batches in parallel, and `device` decides where memory lives. It won
-because the graph is built by running ordinary Python, so you debug models with print statements and
-`pdb` rather than a separate graph compiler.
+PyTorch is GPU-capable NumPy-style tensors that record their operations, so `loss.backward()` computes
+every gradient. `nn.Module` packages parameters, `DataLoader` feeds batches, `device` places memory, and
+the graph is built by running plain Python.
 
 ## Why it exists
-Training a neural network needs three things NumPy does not give you: the derivative of a scalar loss
-with respect to millions or billions of parameters, execution on accelerators whose memory is separate
-from the CPU's, and a way to keep a GPU busy while the next batch is being loaded and decoded.
-
-Deriving gradients by hand is error-prone past a few layers, and finite differences are hopeless: one
-extra forward pass per parameter means a billion forward passes per step for a 1B-parameter model.
-Reverse-mode automatic differentiation computes all of them in a single backward pass whose cost is a
-small constant multiple of the forward pass (commonly quoted as about two to three times), independent of
-the parameter count, but it needs a record of what was computed. Earlier frameworks such as TensorFlow 1.x asked you to
-declare that record as a static graph first and then execute it in a session; this made optimisation easy
-and debugging miserable, because errors surfaced inside a runtime you could not step through, and data-
-dependent control flow (a loop that runs a variable number of times) needed special graph operators.
-
-PyTorch's answer is "define-by-run": the graph is recorded as your Python executes, every iteration,
-so control flow is just Python. For an AI engineer the payoff today is less about writing training loops
-from scratch and more about literacy: every Hugging Face model, every LoRA adapter, every embedding
-model and most local inference stacks are PyTorch modules, and when one OOMs, produces NaNs or runs on
-the CPU by accident, you need to know which of these five pieces is responsible.
+- **NumPy lacks three things training needs.** The derivative of a scalar loss with respect to millions
+  or billions of parameters, execution on accelerators whose memory is separate from the CPU's, and a way
+  to keep a GPU busy while the next batch is loaded and decoded.
+- **Hand-derived and numeric gradients do not scale.** Hand derivation is error-prone past a few layers.
+  Finite differences need one extra forward pass per parameter: a billion forward passes per step for a
+  1B-parameter model.
+- **Reverse-mode autodiff needs a record of the computation.** It computes all gradients in one backward
+  pass costing a small constant multiple of the forward pass (commonly quoted as about two to three
+  times), independent of parameter count.
+- **Static graphs made that record painful.** TensorFlow 1.x had you declare a graph, then run it in a
+  session: easy to optimise, miserable to debug, because errors surfaced inside a runtime you could not
+  step through, and data-dependent loops needed special graph operators.
+- **Define-by-run fixes it, and is now the lingua franca.** The graph is recorded as Python executes,
+  every iteration, so control flow is just Python and you debug with print statements and `pdb`, not a
+  separate graph compiler; that is why it won.
+- **Literacy is the payoff today.** Every Hugging Face model, LoRA adapter, embedding model
+  and most local inference stacks are PyTorch modules; when one OOMs, produces NaNs or runs on the CPU by
+  accident, you need to know which of the five pieces is responsible.
 
 ## How it works
 ### Tensors
-A tensor is a typed, strided n-dimensional array: a pointer to storage plus `shape`, `stride`, `dtype`
-and `device`. Views (`.view`, `.transpose`, slicing) share storage and only change strides, which is why
-they are free, and why `.view` fails on a non-contiguous tensor and you need `.reshape` or
-`.contiguous()`. Broadcasting follows NumPy rules. `dtype` matters more than in NumPy: `float32` is the
-default, `bfloat16` and `float16` halve memory and run on tensor cores, and mixing dtypes in one op
-raises or silently upcasts depending on the op.
+- **What a tensor is.** A typed, strided n-dimensional array: a pointer to storage plus `shape`,
+  `stride`, `dtype` and `device`.
+- **Views are free.** `.view`, `.transpose` and slicing share storage and only change strides. That is
+  also why `.view` fails on a non-contiguous tensor and you need `.reshape` or `.contiguous()`.
+- **Broadcasting** follows NumPy rules.
+- **`dtype` matters more than in NumPy.**
+
+| dtype | Notes |
+|---|---|
+| `float32` | the default |
+| `bfloat16`, `float16` | halve memory and run on tensor cores |
+| mixed in one op | raises or silently upcasts, depending on the op |
 
 ### Autograd
-Any tensor with `requires_grad=True` (all `nn.Parameter`s) makes subsequent ops record a node in a
-directed acyclic graph: each output tensor holds a `grad_fn` pointing to the function that made it and
-to its inputs. `loss.backward()` walks that graph in reverse, applying the chain rule, and *accumulates*
-results into each leaf's `.grad`. Accumulation, not assignment, is a deliberate choice: it lets
-gradient accumulation across micro-batches work for free, and it is why you must call
-`optimizer.zero_grad()` every step. The graph is freed after `backward()` because holding saved
-activations is the main memory cost of training; `torch.no_grad()` (or `torch.inference_mode()`) stops
-recording entirely, which is why inference should run inside it: no activations are saved for a backward
-pass that will never happen.
+1. **Recording.** Any tensor with `requires_grad=True` (all `nn.Parameter`s) makes later ops record a
+   node in a directed acyclic graph. Each output holds a `grad_fn` pointing to the function that made it
+   and to its inputs.
+2. **Backward.** `loss.backward()` walks the graph in reverse, applying the chain rule, and
+   *accumulates* into each leaf's `.grad`.
+3. **Freeing.** The graph is freed after `backward()`, because holding saved activations is the main
+   memory cost of training.
 
-Mechanically, backward never builds a full Jacobian. Starting from d(loss)/d(loss) = 1, each node
-receives the gradient of the loss with respect to its output, multiplies it by its local derivative
-(a vector-Jacobian product) and hands the result to its inputs. That is why the cost is a small multiple
-of the forward pass, and why `backward()` with no argument only works on a scalar: for a vector output
-you must supply the vector to multiply by. Three lines make it concrete:
+Design choices and their reasons:
+- **Accumulate, not assign.** Gradient accumulation across micro-batches works for free; the price is
+  calling `optimizer.zero_grad()` every step.
+- **No full Jacobian.** Starting from d(loss)/d(loss) = 1, each node takes the gradient w.r.t. its output,
+  multiplies by its local derivative (a vector-Jacobian product) and passes it to its inputs. So cost is a
+  small multiple of forward, and `backward()` with no argument only works on a scalar; for a vector
+  output you supply the vector to multiply by.
+- **Stop recording for inference.** `torch.no_grad()` (or `torch.inference_mode()`) records nothing, so
+  no activations are saved for a backward pass that will never happen.
+
+Three lines make accumulation concrete:
 
 ```python
 w = torch.tensor(3.0, requires_grad=True)
@@ -79,35 +87,61 @@ y = 2 * w**2; y.backward(); print(w.grad)   # tensor(12.)  since dy/dw = 4w
 y = 2 * w**2; y.backward(); print(w.grad)   # tensor(24.)  accumulated, not replaced
 ```
 
-Only leaf tensors (ones you created, such as parameters) keep `.grad`; intermediate gradients are freed
-unless you call `retain_grad()`. `.detach()` returns a tensor that shares storage but is cut from the
-graph, which is how you stop gradients flowing into, say, a frozen target. Because backward reuses the
-inputs each op saved, modifying a saved tensor in place before `backward()` would silently corrupt the
-gradient; autograd keeps a version counter per tensor and raises "modified by an inplace operation"
-instead.
+- **Only leaves keep `.grad`.** Tensors you created, such as parameters. Intermediate gradients are freed
+  unless you call `retain_grad()`.
+- **`.detach()` cuts the graph.** It shares storage but stops gradients flowing, for example into a frozen
+  target.
+- **In-place edits are guarded.** Backward reuses inputs each op saved, so modifying one in place before
+  `backward()` would silently corrupt the gradient. Autograd keeps a version counter per tensor and
+  raises "modified by an inplace operation" instead.
 
 ### nn.Module
-A module is a class whose attributes that are `nn.Parameter`s or other modules get registered
-automatically. That registration is what makes `model.parameters()` (for the optimizer),
-`model.to(device)`, `model.state_dict()` (for saving) and `model.train()` / `model.eval()` work across an
-arbitrarily nested tree. `train()`/`eval()` flip behaviour of layers such as dropout and batch norm; they
-do not disable gradients. You write `forward`, and call the module as `model(x)` so hooks run.
+- **Auto-registration.** Attributes that are `nn.Parameter`s or other modules register automatically.
+- **What registration buys.** `model.parameters()` (for the optimizer), `model.to(device)`,
+  `model.state_dict()` (for saving) and `model.train()` / `model.eval()` all work across an arbitrarily
+  nested tree.
+- **`train()`/`eval()` flip layer behaviour** such as dropout and batch norm. They do not disable
+  gradients.
+- **Call it, don't call forward.** You write `forward`, and call the module as `model(x)` so hooks run.
 
 ### DataLoader
-A `Dataset` answers `len()` and `__getitem__(i)`. A `DataLoader` wraps it with batching, shuffling, a
-`collate_fn` that stacks samples (or pads variable-length sequences), and `num_workers` subprocesses that
-prefetch batches so tokenisation or image decoding overlaps GPU compute. Worker processes, not threads,
-are used because of the GIL. `pin_memory=True` puts batches in page-locked host memory so the copy to
-GPU can be asynchronous when you also pass `non_blocking=True` to `.to(device)`.
+| Piece | Job |
+|---|---|
+| `Dataset` | answers `len()` and `__getitem__(i)` |
+| `DataLoader` | batching and shuffling |
+| `collate_fn` | stacks samples, or pads variable-length sequences |
+| `num_workers` | subprocesses that prefetch, so tokenisation or image decoding overlaps GPU compute |
+| `pin_memory=True` | page-locked host memory, so the GPU copy is async with `non_blocking=True` on `.to(device)` |
+
+- **Processes, not threads**, because of the GIL.
 
 ### device
-Tensors live on exactly one device (`cpu`, `cuda:0`, `mps`). Ops require all inputs on the same device;
-moving is explicit (`.to(device)`) because a host-to-GPU copy crosses PCIe and is slow relative to GPU
-compute, and PyTorch refuses to hide that cost. CUDA calls are asynchronous: Python returns before the
-kernel finishes, so naive timing measures launch time unless you call `torch.cuda.synchronize()`.
+- **One device per tensor:** `cpu`, `cuda:0`, `mps`. Ops require all inputs on the same device.
+- **Moves are explicit** (`.to(device)`), because a host-to-GPU copy crosses PCIe and is slow relative to
+  GPU compute, and PyTorch refuses to hide that cost.
+- **CUDA calls are asynchronous.** Python returns before the kernel finishes, so naive timing measures
+  launch time unless you call `torch.cuda.synchronize()`.
 
-## Example
-A complete minimal training loop; every line maps to one of the five pieces.
+## Diagram
+One training step, end to end: follow a batch from the DataLoader onto the device, through the forward
+pass that records the graph, and back through autograd into the optimizer.
+
+```mermaid
+flowchart TD
+    DS["Dataset: len and getitem"] --> DL["DataLoader workers: batch, shuffle, collate"]
+    DL -->|"pinned memory, non_blocking copy"| DEV["Batch on device"]
+    DEV --> F["model(x): forward records grad_fn graph"]
+    F --> L["Scalar loss"]
+    L -->|"loss.backward()"| G["Leaf .grad accumulates, graph freed"]
+    G --> O["optimizer.step()"]
+    O --> Z["optimizer.zero_grad()"]
+    Z -->|"next batch"| DL
+    DEV -.->|"inference_mode: no graph, no saved activations"| P["Predictions to CPU"]
+```
+
+## Examples
+### Minimal training loop
+Every line maps to one of the five pieces.
 
 ```python
 import torch
@@ -144,47 +178,106 @@ for epoch in range(5):
     print(epoch, round(loss.item(), 4), round(acc.item(), 3))
 ```
 
-The model has 16×32+32 + 32×1+1 = 577 parameters; `loss.item()` copies one scalar back to the CPU,
-which forces a sync, so in a real loop you log it every N steps rather than every step.
+- **Parameter count:** 16×32+32 + 32×1+1 = 577.
+- **`loss.item()` forces a sync** because it copies one scalar back to the CPU; in a real loop, log it
+  every N steps rather than every step.
+
+### Leak-free inference handler
+The fix for the Check-yourself bug, reusing `model` and `device` from the loop above on a CUDA GPU: no
+graph, plain Python results, flat memory.
+
+```python
+import torch
+
+model.eval()                                     # dropout off; does NOT stop autograd
+
+@torch.inference_mode()                          # no graph, no saved activations
+def predict(batch):
+    logits = model(batch.to(device, non_blocking=True))
+    return logits.argmax(-1).cpu().tolist()      # plain Python values, nothing keeps a graph alive
+
+before = torch.cuda.memory_allocated()
+for _ in range(100):
+    predict(torch.randn(8, 16))
+print(torch.cuda.memory_allocated() - before)    # should stay ~0 across requests
+```
+
+### Worked scenario: will full fine-tuning of a 1B model fit?
+Plain fp32 training with AdamW, before activations:
+
+| Item | Bytes per parameter | 1B parameters |
+|---|---|---|
+| Weights (fp32) | 4 | 4 GB |
+| Gradients in `.grad` (fp32) | 4 | 4 GB |
+| AdamW state (two moments, fp32) | 8 | 8 GB |
+| **Total before activations** | **16** | **16 GB** |
+
+- Activations for backward come on top and grow with batch size and sequence length; gradient
+  checkpointing trades roughly one extra forward pass for much lower activation memory.
+- Inference alone needs only the weights: 4 GB in fp32, 2 GB in bf16, because no `.grad`, optimizer state
+  or saved activations exist under `inference_mode()`.
+
+## Production patterns
+- **Inference mode everywhere you serve.** Wrap request handlers in `@torch.inference_mode()` plus
+  `model.eval()` at startup, and return `.cpu().tolist()` values. Monitor `torch.cuda.memory_allocated()`
+  per request; it should stay flat.
+- **bf16 autocast for training and serving.** On hardware that supports it, wrap forward in
+  `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`; unlike fp16 it needs no loss scaling. Watch
+  the loss curve and eval metrics against an fp32 baseline run.
+- **Feed the GPU before buying a bigger one.** Raise `num_workers`, set `pin_memory=True` and
+  `persistent_workers=True` on the `DataLoader`, and copy with `non_blocking=True`. Monitor GPU
+  utilisation and samples per second; low utilisation with busy CPUs means the loader is the bottleneck.
+- **Compile hot models.** Apply `torch.compile(model)` once the code is stable, to fuse kernels and cut
+  per-op Python overhead. Track compile time on startup and graph breaks (`TORCH_LOGS="graph_breaks"`).
+- **Track peak memory per job.** Call `torch.cuda.reset_peak_memory_stats()` before a step and log
+  `torch.cuda.max_memory_allocated()` after it, so batch-size and context changes have a measured memory
+  cost. Alert when peak approaches card capacity.
+- **Sync-free logging.** Call `.item()` only every N steps, and time GPU work only after
+  `torch.cuda.synchronize()`, so metrics neither stall the loop nor lie.
 
 ## Trade-offs
-- Eager define-by-run execution makes debugging trivial, but per-op Python overhead hurts small models;
-  `torch.compile` recovers speed by tracing to fused kernels, at the cost of compile time and graph breaks.
-- Explicit device placement makes data movement visible and predictable, but every boundary is a place
-  to forget a `.to(device)`; frameworks like Accelerate hide it once you run multi-GPU.
-- Lower precision (bf16/fp16) halves memory and speeds tensor-core math, but fp16 needs loss scaling to
-  avoid gradient underflow; bf16 does not, so prefer it whenever the hardware supports it.
-- Storing activations for backward is what makes autograd cheap in compute, but it dominates training
-  memory; gradient checkpointing trades roughly one extra forward pass for much lower activation memory.
+- **Eager debuggability vs per-op overhead.** Define-by-run makes debugging trivial, but per-op Python
+  overhead hurts small models. `torch.compile` recovers speed by tracing to fused kernels, at the cost of
+  compile time and graph breaks.
+- **Explicit placement vs forgotten moves.** Device placement makes data movement visible and predictable,
+  but every boundary is a place to forget a `.to(device)`; frameworks like Accelerate hide it once you
+  run multi-GPU.
+- **Lower precision vs numeric care.** bf16/fp16 halve memory and speed tensor-core math, but fp16 needs
+  loss scaling to avoid gradient underflow; bf16 does not, so prefer it whenever hardware supports it.
+- **Cheap backward vs activation memory.** Storing activations makes autograd cheap in compute but
+  dominates training memory; gradient checkpointing trades roughly one extra forward pass for much lower
+  activation memory.
 
 ## Pitfalls
-- Forgetting `optimizer.zero_grad()`: gradients from every step add up, and the symptom is a loss that
-  diverges or oscillates wildly after a few steps.
-- Running inference without `torch.no_grad()` or `inference_mode()`: every forward pass saves activations
-  for a backward that never comes, so peak memory is higher, and if any output is kept (cached, appended
-  to a list) its graph stays alive and memory climbs per request until a CUDA out-of-memory error.
-- Forgetting `model.eval()` before evaluation: dropout stays active, so the same input gives different
-  outputs and validation metrics look noisy and worse than expected.
-- Accumulating `total += loss` instead of `loss.item()`: you keep every step's graph referenced, and the
-  symptom is steadily rising GPU memory across an epoch.
-- Creating tensors inside `forward` with `torch.zeros(n)` after moving the model to GPU: the new tensor
-  lands on the CPU, and the symptom is "Expected all tensors to be on the same device"; pass
-  `device=x.device` or use `torch.zeros_like(x)`.
-- Holding a large dataset as Python lists of strings or dicts with many DataLoader workers: reference
-  counting touches every object, so copy-on-write pages get copied into each worker, and the symptom is
-  host RAM growing per worker until the machine OOMs; store data as NumPy arrays or Arrow instead.
-- Timing GPU code without `torch.cuda.synchronize()`: kernels are asynchronous, so measurements look
-  impossibly fast and then the cost appears at the next `.item()` or `.cpu()` call.
+- **Forgetting `optimizer.zero_grad()`.** Gradients from every step add up. Symptom: loss diverges or
+  oscillates wildly after a few steps.
+- **Inference without `torch.no_grad()` or `inference_mode()`.** Every forward saves activations for a
+  backward that never comes, so peak memory is higher. If any output is kept (cached, appended to a list)
+  its graph stays alive, and memory climbs per request until a CUDA out-of-memory error.
+- **Forgetting `model.eval()` before evaluation.** Dropout stays active, so the same input gives
+  different outputs and validation metrics look noisy and worse than expected.
+- **`total += loss` instead of `loss.item()`.** You keep every step's graph referenced. Symptom: steadily
+  rising GPU memory across an epoch.
+- **`torch.zeros(n)` inside `forward` after moving to GPU.** The new tensor lands on the CPU. Symptom:
+  "Expected all tensors to be on the same device". Fix: pass `device=x.device` or use
+  `torch.zeros_like(x)`.
+- **Python lists of strings or dicts with many DataLoader workers.** Reference counting touches every
+  object, so copy-on-write pages get copied into each worker. Symptom: host RAM grows per worker until the
+  machine OOMs. Fix: store data as NumPy arrays or Arrow.
+- **Timing GPU code without `torch.cuda.synchronize()`.** Kernels are asynchronous, so measurements look
+  impossibly fast, then the cost appears at the next `.item()` or `.cpu()` call.
 
 ## When to use
-Reach for raw PyTorch when you need control a higher-level library hides: a custom loss, a non-standard
-training step, inspecting activations, or debugging why a Hugging Face model misbehaves. For fine-tuning
-standard LLMs, use Transformers, PEFT and TRL on top of it rather than hand-writing loops; for serving
-LLMs at scale, use an inference engine (vLLM, SGLang, TensorRT-LLM) rather than a PyTorch `generate` loop. What
-to measure: GPU utilisation, peak memory (`torch.cuda.max_memory_allocated()`), and samples per second;
-a GPU idling at low utilisation usually means the DataLoader is the bottleneck. In interviews, expect to
-explain why gradients accumulate, what `no_grad` saves, and the difference between `eval()` and
-`no_grad()`.
+- **Use raw PyTorch when** you need control a higher-level library hides: a custom loss, a non-standard
+  training step, inspecting activations, or debugging why a Hugging Face model misbehaves.
+- **Use a library on top when** fine-tuning standard LLMs: Transformers, PEFT and TRL rather than
+  hand-written loops.
+- **Avoid for serving at scale:** use an inference engine (vLLM, SGLang, TensorRT-LLM) rather than a
+  PyTorch `generate` loop.
+- **Measure:** GPU utilisation, peak memory (`torch.cuda.max_memory_allocated()`) and samples per second.
+  A GPU idling at low utilisation usually means the DataLoader is the bottleneck.
+- **Interviews:** explain why gradients accumulate, what `no_grad` saves, and the difference between
+  `eval()` and `no_grad()`.
 
 ## Role lens
 - **Engineer:** Writes and debugs training or inference loops, fixes device mismatches, dtype errors
@@ -203,6 +296,44 @@ output tensor carries a graph with saved activations, and if any output (or a ru
 kept referenced, for example appended to a list or stored in a cache, that memory is never released.
 The fix is to wrap inference in `inference_mode()`, convert results to Python values or detached CPU
 tensors before storing them, and check `torch.cuda.memory_allocated()` stays flat across requests.
+
+## Interview questions
+### What is define-by-run autograd, and why did it win over static graphs?
+- **Definition:** the graph is recorded as Python executes each iteration; every op on a tensor with
+  `requires_grad=True` adds a `grad_fn` node, and `backward()` walks it in reverse once.
+- **Why it won:** control flow is ordinary Python, so you debug with `print` and `pdb` instead of
+  inspecting a separately compiled graph, as TensorFlow 1.x sessions required.
+- **Cost it accepts:** per-op Python overhead, which `torch.compile` later recovers by fusing kernels.
+
+### Training loss diverges after a few steps in a loop a colleague wrote. How do you debug it?
+- **Check gradient zeroing first:** a missing `optimizer.zero_grad()` makes every step's gradients add up,
+  which matches divergence after a few steps.
+- **Then check precision and inputs:** fp16 without loss scaling can underflow gradients; NaN or extreme
+  values in the batch also show up as sudden loss spikes.
+- **Confirm with numbers:** log the gradient norm every N steps (using `.item()` sparingly) and compare
+  against an fp32 baseline run.
+
+### When would you not write a raw PyTorch loop?
+- **Fine-tuning standard LLMs:** Transformers, PEFT and TRL already handle mixed precision, checkpointing
+  and distributed setup, so a hand-written loop is extra code to maintain and debug.
+- **Serving at scale:** an inference engine such as vLLM, SGLang or TensorRT-LLM batches requests and
+  manages the KV cache, which a PyTorch `generate` loop does not.
+- **Still drop to raw PyTorch** for a custom loss, a non-standard training step or inspecting activations.
+
+### How much GPU memory does full fp32 AdamW fine-tuning of a 1B-parameter model need?
+- **16 bytes per parameter before activations:** 4 for weights, 4 for gradients and 8 for the two AdamW
+  moments, so about 16 GB for 1B parameters.
+- **Activations come on top** and grow with batch size and sequence length; gradient checkpointing trades
+  roughly one extra forward pass for much lower activation memory.
+- **Inference needs only weights:** 4 GB in fp32 or 2 GB in bf16, because no `.grad` or optimizer state exists.
+
+### Your GPU shows 30 percent utilisation during training. What do you change?
+- **Suspect the input pipeline:** low GPU utilisation with busy CPU cores means the GPU waits for batches
+  from the `DataLoader`.
+- **Fix it in the loader:** raise `num_workers`, set `pin_memory=True` and `persistent_workers=True`, and
+  copy with `non_blocking=True` so transfers overlap compute.
+- **Remove hidden syncs:** a `.item()` call every step forces the CPU to wait for the GPU; log every N
+  steps instead and measure samples per second before and after.
 
 ## Quiz
 ### Q: Why does PyTorch accumulate gradients into `.grad` instead of overwriting them?

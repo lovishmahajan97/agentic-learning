@@ -5,7 +5,7 @@ name: Embedding models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - model-internals/embeddings
   - rag-retrieval/embedding-dimension-and-normalization
@@ -23,104 +23,119 @@ sources:
 ---
 
 ## TL;DR
-An embedding model is an encoder trained so that texts with similar meaning land close together in a
-fixed-size vector space. It exists because keyword search cannot see that "money back" and "refund"
-mean the same thing, and because scoring every document against the query with a full cross-attention
-model is too slow. A bi-encoder embeds documents once, ahead of time, so retrieval becomes a
-nearest-neighbour lookup. The price is that the model must be chosen, prefixed and versioned
-consistently, or the index is silently wrong.
+An embedding model maps text to a fixed-size vector so similar meanings land close together. Documents
+are embedded once, so retrieval becomes a nearest-neighbour lookup that catches synonyms keyword search
+misses. Model, prefixes and version must stay consistent, or the index silently breaks.
 
 ## Why it exists
-Retrieval is a matching problem: given a query, find the passages that answer it. Lexical search (BM25)
-matches tokens, so it fails whenever the asker and the author chose different words: "cancel my plan"
-against "terminate the subscription", or a German question against English documentation. This
-vocabulary mismatch is the most common reason a keyword system returns nothing useful.
-
-The first fix people try is averaging word vectors (word2vec, GloVe). It captures some synonymy but
-throws away order and context, so "the dog bit the man" equals "the man bit the dog", and frequent,
-meaningless words dominate the average. The second try is a pretrained transformer such as BERT, taking
-the [CLS] output or the mean of the token outputs. That is surprisingly bad for similarity: BERT was
-trained to predict masked tokens, not to make sentence vectors comparable, so its raw outputs sit in a
-narrow cone where everything is cosine-similar to everything. Sentence-BERT showed that fine-tuning
-with a contrastive objective on sentence pairs fixes this, and every modern embedding model descends
-from that recipe.
-
-The remaining question is cost. A cross-encoder that reads the query and a candidate passage together
-is the most accurate matcher available, but scoring a million passages means a million forward passes
-per query. The bi-encoder embedding model is the design that gives up a little accuracy for the ability
-to precompute the document side once and reuse it for every query.
+- **Keyword search misses different wording.** BM25 matches tokens, so it fails on "cancel my plan"
+  against "terminate the subscription", or a German question against English documentation. Vocabulary
+  mismatch is the most common reason a keyword system returns nothing useful.
+- **Averaged word vectors lose order.** word2vec or GloVe averages capture some synonymy, but "the dog
+  bit the man" equals "the man bit the dog", and frequent, meaningless words dominate.
+- **Raw BERT is bad at similarity.** It was trained to predict masked tokens, not to make sentence vectors
+  comparable, so its [CLS] or mean outputs sit in a narrow cone where everything is cosine-similar to
+  everything. Sentence-BERT fixed this with contrastive fine-tuning on sentence pairs; every modern
+  embedding model descends from that recipe.
+- **Cross-encoders are too slow for the first stage.** Reading query and passage together is the most
+  accurate matcher, but a million passages means a million forward passes per query. The bi-encoder
+  gives up a little accuracy to precompute the document side once and reuse it for every query.
 
 ## How it works
 ### Architecture: the bi-encoder
-A text embedding model is a transformer encoder (BERT, RoBERTa or XLM-R style) or, increasingly, a
-decoder-only LLM repurposed as an encoder. The text is tokenized, run through the network, and the
-per-token outputs are pooled into a single vector: mean pooling over tokens, the [CLS] token, or the
-last token for decoder-based models. An optional linear projection and an L2 normalization follow.
-The pooling choice is part of the trained model, not a free option: training taught the network to put
-its summary where the pooling reads it, so mean-pooling a model trained with [CLS] pooling (or the
-reverse) still returns vectors, just worse ones. Loading the model through its own configuration, as
-sentence-transformers does, keeps this right.
-Query and document pass through the same network independently, which is the whole point: a document's
-vector never depends on the query, so it can be computed once, stored, and compared with a dot product.
+1. **Encoder:** a transformer encoder (BERT, RoBERTa or XLM-R style) or, increasingly, a decoder-only
+   LLM repurposed as an encoder.
+2. **Tokenize and run** the text through the network.
+3. **Pool** per-token outputs into one vector: mean pooling, the [CLS] token, or the last token for
+   decoder-based models.
+4. **Optionally** apply a linear projection and L2 normalization.
+
+- **Pooling is part of the trained model, not a free option.** Training taught the network to put its
+  summary where the pooling reads it, so mean-pooling a [CLS]-trained model (or the reverse) returns
+  vectors, just worse ones. Loading through the model's own configuration, as sentence-transformers
+  does, keeps this right.
+- **Query and document pass through the same network independently.** That is the whole point: a
+  document's vector never depends on the query, so it is computed once, stored and compared with a dot
+  product.
 
 ### Training: contrastive learning
-Training data is (query, positive passage) pairs. The loss (InfoNCE and relatives) pulls the positive's
-vector toward the query and pushes negatives away. For a query `q`, its positive `p⁺` and a set of
-candidates `p_j` that includes `p⁺`:
+Training data is (query, positive passage) pairs. The loss (InfoNCE and relatives) pulls the positive
+toward the query and pushes negatives away. For query `q`, positive `p⁺` and candidates `p_j` that
+include `p⁺`:
 
 ```
 L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine similarity, τ = temperature
 ```
 
-This is ordinary softmax cross-entropy in which the "class" to predict is the correct passage among the
-candidates, which is why it trains exactly the operation retrieval performs: rank the right passage
-above the others. The temperature `τ` is small (a few hundredths is common) because cosine lives in
-[−1, 1]; dividing by a small number stretches those differences so the softmax is sharp and the
-gradient concentrates on the negatives that currently score closest to the positive. Negatives are cheap
-because the other passages in the batch serve as in-batch negatives: with a batch of B pairs every query
-gets B − 1 negatives for free, and more negatives make the classification harder and the learned space
-finer, which is why embedding models are trained with very large batches.
-Hard negatives matter more: passages that share topic and vocabulary with the query but do not answer
-it, mined from BM25 or from an earlier version of the model. They teach the model the difference between
-"about the same thing" and "answers the question", which is exactly what retrieval needs; DPR made this
-explicit. Modern recipes such as E5 and BGE first pretrain on hundreds of millions of weakly supervised
-pairs (titles and bodies, questions and accepted answers, near-duplicates) and then fine-tune on curated
-retrieval datasets with hard negatives.
+- **It is softmax cross-entropy over passages.** The "class" is the correct passage among the
+  candidates, so it trains exactly what retrieval does: rank the right passage above the others.
+- **The temperature `τ` is small** (a few hundredths is common), because cosine lives in [−1, 1].
+  Dividing by a small number sharpens the softmax so the gradient concentrates on negatives scoring
+  closest to the positive.
+- **In-batch negatives are free.** With a batch of B pairs, every query gets B − 1 negatives. More
+  negatives make the task harder and the space finer, which is why models train with very large batches.
+- **Hard negatives matter more.** Passages sharing topic and vocabulary with the query but not answering
+  it, mined from BM25 or an earlier model version, teach "about the same thing" versus "answers the
+  question". DPR made this explicit.
+- **Modern recipes (E5, BGE):** pretrain on hundreds of millions of weakly supervised pairs (titles and
+  bodies, questions and accepted answers, near-duplicates), then fine-tune on curated retrieval datasets
+  with hard negatives.
 
 ### Asymmetric models and prefixes
-Queries are short and question-shaped; passages are long and declarative. Many models are trained with a
-marker so they can treat the two sides differently: E5 expects `query: ` and `passage: ` prefixes, and
-BGE and instruction-tuned models accept a task instruction prepended to the query. Omit the prefix and
-the model still returns vectors, just worse ones. There is no error, only a quiet recall drop.
+- **Queries are short and question-shaped; passages are long and declarative.** Many models train with a
+  marker to treat the two sides differently.
+- **E5 expects `query: ` and `passage: ` prefixes**; BGE and instruction-tuned models accept a task
+  instruction prepended to the query.
+- **Omit the prefix and nothing errors.** The model still returns vectors, just worse ones: a quiet
+  recall drop.
 
 ### Capacity limits
-Every model has a maximum input length, typically 512 tokens for BERT-derived models and around 8,000
-for many newer long-context ones. Longer inputs are truncated silently by most local libraries (some
-hosted APIs reject them with an error instead), which is one of the reasons chunking exists. Larger models generally produce better vectors but embed more slowly and emit more dimensions,
-which cost storage and comparison time for every chunk forever; the dimension lesson covers that
-arithmetic.
+- **Maximum input length:** typically 512 tokens for BERT-derived models and around 8,000 for many newer
+  long-context ones.
+- **Longer inputs are truncated silently** by most local libraries (some hosted APIs reject them with an
+  error instead), one reason chunking exists.
+- **Bigger models** generally give better vectors but embed more slowly and emit more dimensions, which
+  cost storage and comparison time for every chunk forever (see the dimension lesson).
 
 ### Where it sits against the alternatives
-Cross-encoders stay more accurate because attention can run across query and passage tokens together.
-The standard pattern is therefore a bi-encoder for first-stage retrieval over millions of chunks and a
-cross-encoder reranker over the top few dozen. Late-interaction models (ColBERT) keep one vector per
-document token and score with a max-similarity sum, a middle ground in both accuracy and storage.
-Sparse retrieval (BM25, learned sparse) remains complementary, which is why hybrid search exists.
+| Approach | How it scores | Role |
+|---|---|---|
+| Bi-encoder | one vector each side, dot product | first-stage retrieval over millions of chunks |
+| Cross-encoder | attention across query and passage tokens together, most accurate | reranker over the top few dozen |
+| Late interaction (ColBERT) | one vector per document token, max-similarity sum | middle ground in accuracy and storage |
+| Sparse (BM25, learned sparse) | token weights | complementary, which is why hybrid search exists |
 
 ### Choosing a model
-The MTEB leaderboard ranks models across retrieval, clustering and classification tasks and is the
-usual starting point, with two caveats: the rank is averaged over tasks that may not resemble yours, and
-popular models are increasingly trained on data close to the benchmark. What decides in practice is
-domain (legal, medical, code and non-English text all reshuffle the ranking), input length, multilingual
-needs, embedding latency and cost, and whether chunk text may leave your environment (hosted API model
-versus self-hosted open weights). Measure recall@k on a few hundred labelled query–passage pairs from
-your own corpus before committing, because changing the model later means re-embedding everything.
+- **Start from MTEB**, which ranks models across retrieval, clustering and classification, with two
+  caveats: the rank averages tasks that may not resemble yours, and popular models are increasingly
+  trained on data close to the benchmark.
+- **What decides in practice:** domain (legal, medical, code and non-English text all reshuffle the
+  ranking), input length, multilingual needs, embedding latency and cost, and whether chunk text may
+  leave your environment (hosted API versus self-hosted open weights).
+- **Measure before committing:** recall@k on a few hundred labelled query–passage pairs from your own
+  corpus, because changing the model later means re-embedding everything.
 
-## Example
-Two queries against three passages with an asymmetric open model. Neither query shares a content word
-with its correct passage ("money back" versus "refunds", "end my membership" versus "cancel a
-subscription"), which is the case BM25 cannot solve. The prefixes are part of the model's contract, and `normalize_embeddings=True` makes
-the matrix product a cosine similarity.
+## Diagram
+The document side runs once at index time; the query side runs per request through the same model,
+prefix rules and pooling, and only then meets the stored vectors.
+
+```mermaid
+flowchart LR
+    DOC["Chunk text"] -->|"prefix passage"| ENC1["Encoder, pinned version"]
+    ENC1 --> POOL1["Pool and L2-normalize"]
+    POOL1 --> IDX[("Vector index, model id stored")]
+    QRY["User query"] -->|"prefix query or instruction"| ENC2["Same encoder, same version"]
+    ENC2 --> POOL2["Pool and L2-normalize"]
+    POOL2 -->|"dot product, nearest neighbours"| IDX
+    IDX -->|"top 50"| CE["Cross-encoder reranker"]
+    CE -->|"top few"| OUT["Results to generator"]
+```
+
+## Examples
+### Synonym matching with an asymmetric model
+Neither query shares a content word with its correct passage ("money back" versus "refunds", "end my
+membership" versus "cancel a subscription"), the case BM25 cannot solve. The prefixes are part of the
+model's contract, and `normalize_embeddings=True` makes the matrix product a cosine similarity.
 
 ```python
 from sentence_transformers import SentenceTransformer
@@ -146,48 +161,91 @@ for q, row in zip(queries, scores):
 # three-passage toy; their cost shows up as lost recall@k over a real corpus, so measure it there.
 ```
 
+### Why the temperature is small: InfoNCE by hand
+One positive at cosine 0.80, one hard negative at 0.75 and two easy negatives. Pure Python.
+
+```python
+import math
+
+def info_nce(s_pos, s_negs, tau):
+    logits = [s_pos / tau] + [s / tau for s in s_negs]
+    m = max(logits)
+    z = sum(math.exp(l - m) for l in logits)
+    probs = [math.exp(l - m) / z for l in logits]
+    return -math.log(probs[0]), probs
+
+s_pos, s_negs = 0.80, [0.75, 0.30, 0.20]       # one hard negative, two easy ones
+for tau in (1.0, 0.05):
+    loss, p = info_nce(s_pos, s_negs, tau)
+    print(f"tau={tau:<4}  loss={loss:.3f}  p(pos)={p[0]:.3f}  p(hard)={p[1]:.3f}  p(easy)={p[2]:.4f}")
+# tau=1.0   loss=1.134  p(pos)=0.322  p(hard)=0.306  p(easy)=0.1952
+# tau=0.05  loss=0.313  p(pos)=0.731  p(hard)=0.269  p(easy)=0.0000
+```
+
+| τ | What the softmax sees | Where the gradient goes |
+|---|---|---|
+| 1.0 | near-uniform; cosine gaps are tiny | spread over all negatives, including easy ones |
+| 0.05 | easy negatives vanish | almost entirely on the hard negative at 0.75 |
+
+## Production patterns
+- **One `embed()` with everything pinned** — wrap the model behind a single function that applies the
+  prefix, normalization and a pinned version (for sentence-transformers, pass `revision=` a commit hash;
+  for APIs, a dated model id). Store the model id with every vector and assert it matches at query time.
+- **Bake-off on your own queries** — before choosing, score two or three candidates on a few hundred
+  labelled pairs from your corpus with recall@k and MRR. Monitor the same numbers on a schedule, since
+  the corpus drifts.
+- **Retrieve wide, rerank narrow** — bi-encoder top 50, then a cross-encoder (for example
+  sentence-transformers `CrossEncoder`) reorders to the final few. Monitor rerank latency p95 and
+  recall@50 of the first stage, which caps what reranking can recover.
+- **Truncation guard at index time** — count tokens with the model's tokenizer against its
+  `max_seq_length` (or the API's documented limit) and re-chunk anything over. Monitor the count of
+  truncated or rejected chunks per ingestion run.
+- **Blue/green model upgrades** — embed the corpus with the new model into a new index, run both on the
+  eval set, then switch reads atomically. Never mix two models in one index; monitor recall on both until
+  the old one is retired.
+
 ## Trade-offs
-- A bi-encoder turns retrieval into a precomputed nearest-neighbour lookup but loses the token-level
-  query–document interaction a cross-encoder has; once you can afford to rerank the top 50, most of
-  that accuracy gap closes.
-- Larger models give better vectors but embed slower and produce bigger vectors; the gain flips to a
-  cost when the corpus is small, the workload is latency-bound, or a reranker already corrects
+- **Precomputed lookup vs token interaction.** A bi-encoder makes retrieval a nearest-neighbour lookup
+  but loses the query–document interaction a cross-encoder has; once you can afford to rerank the top
+  50, most of that gap closes.
+- **Larger models vs speed and size.** Better vectors, but slower embedding and bigger vectors; it flips
+  to a cost when the corpus is small, the workload is latency-bound, or a reranker already corrects
   first-stage mistakes.
-- Hosted API models (OpenAI, Cohere, Voyage, Google) remove serving work and are often strong, but every
-  chunk's text leaves your network and a vendor deprecation forces a full re-embed; self-hosted open
-  models (BGE, E5, GTE, Nomic) reverse both sides of that trade.
-- Multilingual models handle cross-language queries but tend to be a little weaker on English-only
-  tasks than an English-specialised model of the same size, so the corpus decides.
-- Long-context embedding models reduce the need for chunking, but each vector becomes a blurrier average
-  of more content, which lowers precision for specific questions.
+- **Hosted vs self-hosted.** Hosted API models (OpenAI, Cohere, Voyage, Google) remove serving work and
+  are often strong, but every chunk's text leaves your network and a vendor deprecation forces a full
+  re-embed; self-hosted open models (BGE, E5, GTE, Nomic) reverse both sides.
+- **Multilingual vs English-specialised.** Multilingual models handle cross-language queries but tend to
+  be a little weaker on English-only tasks than an English model of the same size; the corpus decides.
+- **Long-context embeddings vs precision.** They reduce the need for chunking, but each vector becomes a
+  blurrier average of more content, lowering precision for specific questions.
 
 ## Pitfalls
-- Embedding the index with one model and queries with another, or with a different version of the
-  "same" model; symptom: every similarity is mediocre and the top results look random. Vectors from two
-  models are not comparable even when their dimensions match.
-- Dropping the `query:`/`passage:` prefix or the instruction on an asymmetric model; symptom: a
-  measurable recall drop with no error anywhere in the logs.
-- Loading an open model with a pooling or normalization setting different from its training (for
-  example a raw `AutoModel` with mean pooling on a [CLS]-pooled model); symptom: recall noticeably
-  below the model card's reported quality with no error raised.
-- Silent truncation of long chunks; symptom: questions about the tail of long documents never retrieve,
-  while the same content pasted as a short chunk works.
-- Choosing by leaderboard rank alone; symptom: the model that scores a point higher on MTEB
-  underperforms the old one on your own labelled queries.
-- Treating cosine scores as absolute confidence and copying a threshold from a blog post; symptom:
-  after a model swap, either nothing or everything passes the threshold. Scores are model-specific.
-- Upgrading the embedding model in place without a plan to re-embed; symptom: old and new vectors mixed
-  in one index, with quality degrading as new content arrives.
+- **Different models (or versions) for index and queries.** Every similarity is mediocre and the top
+  results look random. Vectors from two models are not comparable even when their dimensions match.
+- **Dropping the `query:`/`passage:` prefix or the instruction.** A measurable recall drop on an
+  asymmetric model, with no error anywhere in the logs.
+- **Wrong pooling or normalization on an open model.** For example a raw `AutoModel` with mean pooling on
+  a [CLS]-pooled model: recall noticeably below the model card's reported quality, no error raised.
+- **Silent truncation of long chunks.** Questions about the tail of long documents never retrieve, while
+  the same content pasted as a short chunk works.
+- **Choosing by leaderboard rank alone.** The model a point higher on MTEB underperforms the old one on
+  your own labelled queries.
+- **Treating cosine as absolute confidence.** A threshold copied from a blog post lets nothing or
+  everything through after a model swap. Scores are model-specific.
+- **Upgrading the model in place without a re-embed plan.** Old and new vectors mix in one index, and
+  quality degrades as new content arrives.
 
 ## When to use
-Reach for an embedding model whenever users describe what they want in their own words and the corpus
-says it differently: support search, document question answering, code search, deduplication, clustering
-and recommendations all qualify. Do not expect it to replace lexical search for exact identifiers, part
-numbers, error codes or rare names; pair the two. Measure recall@k and MRR on labelled pairs from your
-data, embedding time per thousand chunks, and vector bytes per chunk. Day to day the work is picking a
-model, pinning its version, applying its prefixes, and re-evaluating whenever the corpus or model
-changes. In interviews, expect to explain bi-encoder versus cross-encoder, contrastive training with hard
-negatives, and why two models can never share one index.
+- **Use when:** users describe what they want in their own words and the corpus says it differently:
+  support search, document QA, code search, deduplication, clustering and recommendations.
+- **Do not expect it to replace lexical search** for exact identifiers, part numbers, error codes or rare
+  names; pair the two.
+- **Measure:** recall@k and MRR on labelled pairs from your data, embedding time per thousand chunks, and
+  vector bytes per chunk.
+- **Day to day:** pick a model, pin its version, apply its prefixes, and re-evaluate whenever the corpus
+  or model changes.
+- **Interviews:** bi-encoder versus cross-encoder, contrastive training with hard negatives, and why two
+  models can never share one index.
 
 ## Role lens
 - **Engineer:** Wraps the model behind one `embed(texts)` function with the prefix, normalization and
@@ -209,6 +267,43 @@ Spanish set. The fix is a multilingual model (multilingual E5, BGE-M3 or a multi
 which means re-embedding the whole corpus, so plan it as a versioned re-index rather than an in-place
 swap. Validate with recall@k in both languages, and keep BM25 in a hybrid setup for product names and
 error codes, which embeddings handle badly in any language.
+
+## Interview questions
+### What is the difference between a bi-encoder and a cross-encoder, and where does each go in a pipeline?
+- **Bi-encoder:** query and document are encoded independently into one vector each, so document
+  vectors are precomputed and retrieval is a nearest-neighbour lookup.
+- **Cross-encoder:** reads query and passage together with full attention, more accurate but one forward
+  pass per pair.
+- **So** the bi-encoder does first-stage retrieval over millions of chunks and the cross-encoder reranks
+  the top few dozen.
+
+### Explain contrastive training with InfoNCE. Why a small temperature and why hard negatives?
+- **InfoNCE** is softmax cross-entropy over candidate passages where the correct class is the positive,
+  so it trains exactly the ranking retrieval needs.
+- **Small τ** (a few hundredths) sharpens the softmax because cosine only spans [−1, 1], concentrating
+  the gradient on negatives scoring near the positive.
+- **Hard negatives** share topic and vocabulary but do not answer, teaching "answers the question" rather
+  than "about the same thing".
+
+### After a deploy, recall dropped sharply with no errors in the logs. What do you check?
+- **Model and version parity:** index and query paths must use the same model id and revision.
+- **Prefixes:** an asymmetric model such as E5 silently degrades without `query: ` and `passage: `.
+- **Pooling and normalization:** loading a raw encoder with the wrong pooling still returns vectors, just
+  worse ones.
+- **Truncation:** count tokens against the model's maximum input length on the new chunks.
+
+### When would you choose a hosted embedding API over a self-hosted open model?
+- **Hosted wins** when the team cannot run GPU serving and the data may leave the network.
+- **Self-hosted wins** when chunk text must stay inside your environment or you need control over
+  version lifetime, because a vendor deprecation forces a full re-embed.
+- **Decide with a bake-off:** recall@k and MRR on a few hundred labelled pairs from your corpus, plus
+  embedding cost and latency.
+
+### How do you upgrade the embedding model in production without breaking retrieval?
+- **Never mix models in one index:** vectors from two models are unrelated even at equal dimension.
+- **Blue/green:** embed the corpus into a new index with the new model, compare both on the eval set,
+  then switch reads atomically.
+- **Budget it:** the re-embed is a full pass over every chunk, so plan time and cost before committing.
 
 ## Quiz
 ### Q: Why are documents embedded independently of the query in a bi-encoder, even though a cross-encoder reading both together is more accurate?

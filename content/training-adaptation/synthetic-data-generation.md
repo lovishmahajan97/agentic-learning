@@ -5,7 +5,7 @@ name: Synthetic data generation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - training-adaptation/data-curation
   - training-adaptation/knowledge-distillation
@@ -23,99 +23,103 @@ sources:
 ---
 
 ## TL;DR
-Synthetic data generation uses a model, a program or a simulator to manufacture training or evaluation
-examples instead of collecting them from people. It exists because the examples you need, rare failure
-cases, verified reasoning traces, formats the public web lacks, are expensive or impossible to gather at
-scale. Its value is decided by verification: generated examples are only as good as the filter that
-chooses which survive, and training repeatedly on unfiltered model output collapses the distribution.
+Synthetic data generation uses a model, program or simulator to manufacture training or eval examples.
+Its value is decided by verification: examples are only as good as the filter choosing survivors, and
+recursive training on unfiltered output collapses the distribution.
 
 ## Why it exists
-Real labelled data has three problems that no budget fully fixes. It is scarce where you need it most:
-the long tail of odd inputs that break a product appears once a month in logs and never in a scraped
-corpus. It is private: a customer's internal forms, ticket formats and tool outputs exist nowhere public,
-and often cannot leave their environment. And it rarely contains what you want the model to *do*: humans
-do not write out step-by-step reasoning, preference comparisons between two drafts, or tool-call
-sequences, so the behaviours modern post-training needs have no natural corpus.
-
-Generation is cheap; a model can produce a hundred thousand examples overnight. The naive version,
-"prompt the big model to write a dataset", fails in three predictable ways. The outputs collapse onto the
-generator's favourite phrasings, names and structures, so the fine-tuned model learns a narrow template
-and fails on real inputs. The generator's mistakes become the student's ground truth. And nothing stops
-the generated set from containing your evaluation questions, which makes your scores meaningless.
-
-Every effective synthetic-data recipe is built around the scarce resource, which is not generation but
-*verification*. Self-Instruct bootstrapped instruction data from 175 human-written seed tasks and filtered for
-novelty; STaR kept only reasoning traces that reached the correct answer; code pipelines keep only
-programs that pass tests; reasoning-model distillates keep only traces a checker accepts. Where
-verification is strong, synthetic data lets a model exceed its own data; where it is absent, synthetic data
-is a slow copy of the generator with the tails cut off.
+- **Real data is scarce where you need it most.** The long tail of odd inputs that break a product
+  appears once a month in logs and never in a scraped corpus.
+- **Real data is private.** A customer's internal forms, ticket formats and tool outputs exist nowhere
+  public, and often cannot leave their environment.
+- **Real data lacks the behaviours you want.** Humans do not write out step-by-step reasoning, preference
+  comparisons between two drafts, or tool-call sequences, so modern post-training has no natural corpus.
+- **Naive generation fails three ways.** Generation is cheap (a hundred thousand examples overnight), but
+  "prompt the big model to write a dataset":
+  - collapses onto the generator's favourite phrasings, names and structures, so the model learns a
+    narrow template and fails on real inputs;
+  - turns the generator's mistakes into the student's ground truth;
+  - can contain your evaluation questions, making scores meaningless.
+- **The scarce resource is verification, not generation.** Self-Instruct bootstrapped from 175
+  human-written seed tasks and filtered for novelty; STaR kept only traces reaching the correct answer;
+  code pipelines keep programs that pass tests; reasoning distillates keep traces a checker accepts. With
+  strong verification a model can exceed its own data; without it, you get a slow copy of the generator
+  with the tails cut off.
 
 ## How it works
 ### The loop
-Seed → specify → generate → verify → deduplicate and balance → train → evaluate on *real* held-out data →
-inspect failures → adjust the specification. The last three steps are the ones teams skip, and they are
-the reason the loop converges rather than drifts.
+```
+seed → specify → generate → verify → deduplicate and balance → train
+     → evaluate on REAL held-out data → inspect failures → adjust the specification
+```
+The last three steps are the ones teams skip, and they are why the loop converges rather than drifts.
 
 ### Sources of diversity
-Mode collapse is the default behaviour of a sampled generator, so diversity has to be engineered in:
-
+Mode collapse is the default behaviour of a sampled generator, so diversity must be engineered in:
 - **Seeds and in-context examples.** Self-Instruct sampled a handful of tasks from a seed pool (human
-  written at first, then including accepted generations) for every prompt and rejected candidates whose
-  ROUGE-L overlap with existing tasks was too high, so each round pushed outward.
-- **Evolution.** Evol-Instruct rewrites existing instructions along explicit axes (add a constraint,
-  deepen, concretise, require more reasoning, or mutate to a different topic) so the difficulty
-  distribution grows rather than regressing to easy prompts.
-- **Personas.** Conditioning the generator on who is asking (a billion-persona pool was built for exactly
-  this) spreads vocabulary, intent and style far more than temperature does.
-- **Grounding in real artefacts.** Generate questions *from* real documents, records or code rather
-  than from nothing. The inputs then follow the real distribution, and in many cases the label comes for
-  free.
-- **Sampling.** Multiple samples per prompt at moderate temperature, then deduplicate by n-gram overlap
-  and by embedding similarity, because duplicates in synthetic sets are far denser than in scraped ones.
+  written at first, then including accepted generations) per prompt, and rejected candidates whose ROUGE-L
+  overlap with existing tasks was too high, so each round pushed outward.
+- **Evolution.** Evol-Instruct rewrites instructions along explicit axes (add a constraint, deepen,
+  concretise, require more reasoning, or mutate to a new topic), so difficulty grows instead of regressing
+  to easy prompts.
+- **Personas.** Conditioning on who is asking (a billion-persona pool was built for exactly this) spreads
+  vocabulary, intent and style far more than temperature does.
+- **Grounding in real artefacts.** Generate questions *from* real documents, records or code. Inputs then
+  follow the real distribution, and often the label comes for free.
+- **Sampling.** Several samples per prompt at moderate temperature, then dedup by n-gram overlap and
+  embedding similarity, because duplicates are far denser in synthetic sets than in scraped ones.
 
 ### Verification, strongest to weakest
-1. **Execution.** Code against unit tests, SQL against a database, maths against a known answer or a
-   symbolic solver. Exact, cheap, and the reason code and maths are where synthetic data has done best.
-2. **Construction.** Decide the label first, then generate the input: sample a structured record and ask
-   the model to write the email that contains it; sample a tool-call sequence and generate the user
-   request it answers. The label is correct by construction. Add a round-trip check (an independent pass
-   must recover the label from the input) to catch generations that quietly dropped a fact.
-3. **Consistency.** Majority vote over several samples (self-consistency), or agreement between two
-   different generators, filters out one-off errors; STaR's trick of regenerating a rationale with the
-   answer as a hint ("rationalisation") recovers training signal from failures.
-4. **LLM-as-judge.** A rubric-driven judge scales to anything, but carries biases (length, position,
-   self-preference) that must be calibrated against human labels before you trust its filter rate.
-5. **Humans.** Domain experts review a stratified sample; they are the gold standard and the bottleneck,
-   so spend them on calibrating the other verifiers, not on everything.
+| # | Verifier | How | Strength | Weakness |
+|---|---|---|---|---|
+| 1 | Execution | code vs unit tests, SQL vs a database, maths vs a known answer or symbolic solver | exact, cheap | only some domains |
+| 2 | Construction | decide the label first, generate the input | correct by construction | needs a structured label |
+| 3 | Consistency | majority vote (self-consistency) or two generators agreeing | filters one-off errors | shared errors survive |
+| 4 | LLM-as-judge | rubric-driven judge | scales to anything | length, position, self-preference bias |
+| 5 | Humans | domain experts on a stratified sample | gold standard | the bottleneck |
+
+- **Execution** is why code and maths are where synthetic data has done best.
+- **Construction:** sample a structured record and have the model write the email containing it; sample
+  a tool-call sequence and generate the request it answers. Add a round-trip check (an independent pass
+  must recover the label) to catch generations that quietly dropped a fact.
+- **Consistency:** STaR's "rationalisation" regenerates a rationale with the answer as a hint, recovering
+  training signal from failures.
+- **LLM judges** must be calibrated against human labels before you trust their filter rate.
+- **Humans:** spend them on calibrating the other verifiers, not on everything.
 
 ### Where it is used
-Instruction tuning (prompt–response pairs), preference data for DPO and RLHF (AI feedback over pairs of
-candidates, with a judge or a rubric), pretraining-scale corpora (synthetic textbooks and rephrased web
-text that proved unusually token-efficient for small models), evaluation and red-team sets (with the
-caveat that a model must not be judged on data its own generator produced), and privacy-preserving
-stand-ins for customer data, where a programmatic generator with synthetic identities lets work proceed
-outside a restricted environment. Distilling a large model's behaviour into a small one is the same
-machinery with a specific aim; see the knowledge distillation lesson.
+- **Instruction tuning:** prompt–response pairs.
+- **Preference data for DPO and RLHF:** AI feedback over pairs of candidates, with a judge or a rubric.
+- **Pretraining-scale corpora:** synthetic textbooks and rephrased web text proved unusually
+  token-efficient for small models.
+- **Evaluation and red-team sets:** with the caveat that a model must not be judged on data its own
+  generator produced.
+- **Privacy-preserving stand-ins:** a programmatic generator with synthetic identities lets work proceed
+  outside a restricted environment.
+- **Distillation:** the same machinery with a specific aim; see the knowledge distillation lesson.
 
 ### Model collapse and how to avoid it
-Training a model on its own (or its predecessor's) unfiltered output, generation after generation,
-shrinks the tails first and then the whole distribution: rare phrasings vanish, variance falls, errors
-compound, and each generation is a blurrier copy. The defences follow from the mechanism. Keep real data
-in the mix, accumulating rather than replacing it. Verify, so errors do not compound. Track diversity
-directly (distinct n-gram ratios, embedding dispersion, length and topic distributions) across dataset
-versions. Prefer a different or stronger generator to the model being trained. And decontaminate the
-synthetic set against every eval, because a generator that has seen the benchmark will reproduce it.
+**Mechanism:** training on its own (or a predecessor's) unfiltered output, generation after generation,
+shrinks the tails first, then the whole distribution. Rare phrasings vanish, variance falls, errors
+compound, and each generation is a blurrier copy. The defences follow from the mechanism:
+- **Keep real data in the mix**, accumulating rather than replacing it.
+- **Verify**, so errors do not compound.
+- **Track diversity directly** across dataset versions: distinct n-gram ratios, embedding dispersion,
+  length and topic distributions.
+- **Prefer a different or stronger generator** to the model being trained.
+- **Decontaminate against every eval**, because a generator that has seen the benchmark will reproduce it.
 
 ### Provenance and permission
-Record the generator model and version, the prompt template, the seed, every verifier's verdict and the
-sampling settings for each example, because you will need to trace a bad behaviour back to the batch that
-taught it. Check the generator's terms: some API providers prohibit using outputs to train models that
-compete with theirs, and some open-weight licences attach conditions to derived models.
+- **Per example, record** the generator model and version, prompt template, seed, every verifier's
+  verdict and the sampling settings, because you will need to trace a bad behaviour to the batch that
+  taught it.
+- **Check the generator's terms.** Some API providers prohibit using outputs to train competing models,
+  and some open-weight licences attach conditions to derived models.
 
-## Example
-Construction-first generation for an extraction task, with a round-trip check. The record is sampled by a
-program, so the label is correct before any model is involved; the model only writes the realistic email.
-`llm` is a stub for whichever provider you use.
+## Examples
+### Construction-first generation with a round-trip check
+An extraction task. A program samples the record, so the label is correct before any model is involved;
+the model only writes the realistic email. `llm` is a stub for whichever provider you use.
 
 ```python
 import json, random
@@ -155,50 +159,116 @@ print(f"kept {len(kept)}/{len(examples)}")
 # and have a human read 50 kept and 50 rejected examples before trusting the pass rate.
 ```
 
+### Execution verifier for generated code
+Pure Python, runnable. Keeps only candidates whose unit tests pass in a separate process with a timeout.
+`subprocess` isolation is not a security sandbox; run untrusted generations in a locked-down container.
+
+```python
+import subprocess, sys, tempfile, os
+
+def passes_tests(candidate_code: str, tests: str, timeout_s: float = 5.0) -> bool:
+    """Run generated code plus its unit tests in a separate process; keep only clean exits."""
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(candidate_code + "\n\n" + tests)
+        path = f.name
+    try:
+        r = subprocess.run([sys.executable, "-I", path], capture_output=True, timeout=timeout_s)
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False                                   # infinite loops count as failures
+    finally:
+        os.unlink(path)
+
+tests = "assert slugify('Hello World') == 'hello-world'\nassert slugify('  A  b ') == 'a-b'"
+good = "def slugify(s):\n    return '-'.join(s.lower().split())"
+bad = "def slugify(s):\n    return s.lower().replace(' ', '-')"
+print(passes_tests(good, tests), passes_tests(bad, tests))   # True False
+```
+
+### A diversity gate: distinct-n across a batch
+Pure Python. A batch that collapsed onto one template scores far lower than a varied one; track this
+number per batch and per dataset version.
+
+```python
+import re
+
+def distinct_n(texts, n=2):
+    """Unique n-grams / total n-grams across a batch: falls as a generator collapses onto templates."""
+    grams = [tuple(t[i:i + n]) for t in (re.findall(r"\w+", x.lower()) for x in texts)
+             for i in range(len(t) - n + 1)]
+    return len(set(grams)) / max(1, len(grams))
+
+collapsed = ["Dear team, I hope this email finds you well. Invoice INV-1001 is due soon."] * 3 + \
+            ["Dear team, I hope this email finds you well. Invoice INV-2002 is due soon."]
+varied = ["hey - acme here, 1001 still unpaid?? due friday",
+          "Per our records, invoice INV-2002 (EUR 310.00) remains outstanding.",
+          "Reminder: Kappa Logistics bill #3003 falls due on 2026-04-12.",
+          "Hi Sam, quick one: can you confirm you got invoice 4004 for the shoot?"]
+print(f"collapsed distinct-2 = {distinct_n(collapsed):.2f}")   # 0.29
+print(f"varied    distinct-2 = {distinct_n(varied):.2f}")      # 1.00
+```
+
+## Production patterns
+- **Construction-first for structured tasks.** For extraction, classification and tool calls, sample
+  the label programmatically and generate only the surface text, with a round-trip extraction at
+  temperature 0. Monitor round-trip pass rate per type, and read rejects to catch a checker that discards
+  hard-but-valid examples.
+- **Per-row provenance in the dataset schema.** Every row carries generator id and version, prompt
+  template version, seed, sampling settings and verifier verdicts, so a bad behaviour traces to one batch
+  and you regenerate that batch, not everything.
+- **Batch gates on verification and diversity.** Reject a batch whose pass rate or distinct-n falls
+  outside the range of previous accepted batches; also track length and topic distributions per version.
+- **Judge calibration before scale.** Before an LLM judge filters a full run, score a few hundred
+  human-labelled items and measure agreement; recalibrate whenever the judge model or rubric changes.
+- **Real data as the anchor, walled-off evals.** Accumulate real curated data across versions and add
+  synthetic data only for gaps found by error analysis. Keep evaluation sets from any generator prompt,
+  and decontaminate synthetic sets against them.
+
 ## Trade-offs
-- Cheap, fast and controllable coverage of rare cases, against a distribution that drifts from real usage;
-  once you have real traffic, curated real data should anchor the set and synthetic data fill the gaps,
-  not the reverse.
-- The student is bounded by the generator on the same task, unless verification adds information from
-  outside the generator (test results, ground truth), in which case self-improvement loops become
-  possible; without such a verifier, expect a slightly worse copy.
-- Executable verifiers are exact and cheap but exist only for some domains; LLM judges cover everything
-  with known biases; humans are accurate and slow, so the practical design calibrates the fast verifiers
-  against a human-labelled sample.
-- Diversity techniques (personas, evolution) widen coverage but produce some unrealistic examples, so they
-  trade a realism check for the breadth they buy.
-- Synthetic stand-ins unblock work on private data, but a generator fine-tuned on that private data can
-  leak it, while a purely programmatic generator is safe and less realistic.
+- **Coverage vs drift.** Cheap, fast, controllable coverage of rare cases, against a distribution that
+  drifts from real usage. Once real traffic exists, curated real data should anchor the set and synthetic
+  data fill gaps, not the reverse.
+- **Bounded by the generator.** The student is bounded by the generator on the same task, unless
+  verification adds outside information (test results, ground truth); then self-improvement loops become
+  possible. Without such a verifier, expect a slightly worse copy.
+- **Verifier choice.** Executable verifiers are exact and cheap but exist only for some domains; LLM judges
+  cover everything with known biases; humans are accurate and slow. Calibrate the fast verifiers against a
+  human-labelled sample.
+- **Breadth vs realism.** Personas and evolution widen coverage but produce some unrealistic examples, so
+  you trade a realism check for the breadth.
+- **Privacy vs realism.** Synthetic stand-ins unblock work on private data, but a generator fine-tuned on
+  that data can leak it; a purely programmatic generator is safe and less realistic.
 
 ## Pitfalls
-- No verification step: the student learns the generator's errors as truth, so the symptom is a fine-tuned
-  model that is confidently wrong in exactly the same places as the generator.
-- Letting a model-based verifier define "correct" without auditing its rejects: a round-trip or judge
-  filter keeps what the checker can already handle, so hard-but-valid examples are discarded and the set
-  drifts toward easy cases; the symptom is a high pass rate with little eval gain on the hardest real
-  inputs. Read the rejects, and rescue valid ones with a stronger checker or a human.
-- Low diversity: the same four names, the same opening sentence, the same structure; the symptom is a low
-  distinct-n-gram ratio in the dataset and a model that handles the template and fails real inputs.
-- Evaluating on data from the same generator and prompt as the training set: the symptom is an eval score
-  that looks excellent and a production rollout that does not.
-- Replacing real data entirely across successive versions: the symptom is shrinking vocabulary and
-  variance from one dataset version to the next, which is collapse in progress.
-- Inheriting the generator's style: overly polite, markdown-heavy, verbose; the symptom is a customer
-  saying the outputs do not sound like their house style even though accuracy is fine.
-- No per-example provenance: when a bad behaviour appears, nobody can say which batch, prompt or generator
-  version taught it, so the fix becomes "regenerate everything".
-- Ignoring the generator's terms of service or licence until launch review: the symptom is a legal block
-  on a model that already works.
+- **No verification step.** The student learns the generator's errors as truth. Symptom: confidently
+  wrong in exactly the generator's places.
+- **Letting a model-based verifier define "correct" without auditing rejects.** A round-trip or judge
+  filter keeps what the checker already handles, discarding hard-but-valid examples and drifting toward
+  easy cases. Symptom: high pass rate, little gain on the hardest real inputs. Read the rejects and rescue
+  valid ones with a stronger checker or a human.
+- **Low diversity.** The same four names, opening sentence and structure. Symptom: a low distinct-n-gram
+  ratio and a model that handles the template but fails real inputs.
+- **Evaluating on data from the same generator and prompt as training.** Symptom: an excellent eval score
+  and a production rollout that does not match.
+- **Replacing real data across versions.** Symptom: vocabulary and variance shrink version to version,
+  which is collapse in progress.
+- **Inheriting the generator's style.** Overly polite, markdown-heavy, verbose. Symptom: the customer says
+  outputs do not sound like their house style despite fine accuracy.
+- **No per-example provenance.** Nobody can say which batch, prompt or generator version taught a bad
+  behaviour, so the fix becomes "regenerate everything".
+- **Ignoring terms of service or licence until launch review.** Symptom: a legal block on a model that
+  already works.
 
 ## When to use
-Reach for synthetic data when real labelled data is scarce, private or missing the rare cases, when you
-need behaviours nobody writes down (reasoning traces, preference pairs, tool-call sequences), when you are
-bootstrapping before there is traffic, and above all when you have a verifier that can tell good examples
-from bad. Lean on real curated data when it is abundant, and use synthetic data to fill specific gaps
-found by error analysis. Measure verification pass rate per batch, diversity metrics across versions,
-the eval delta on *real* held-out data, and agreement between your fast verifiers and a human-labelled
-sample. In day-to-day work this is a generation pipeline with provenance on every row; in interviews,
-expect to be asked how you would prevent collapse and why you would generate the label before the input.
+- **Use when:** real labelled data is scarce, private or missing rare cases; you need behaviours nobody
+  writes down (reasoning traces, preference pairs, tool-call sequences); you are bootstrapping before
+  traffic; and above all when you have a verifier that tells good examples from bad.
+- **Lean on real curated data when:** it is abundant; use synthetic data to fill gaps found by error
+  analysis.
+- **Measure:** verification pass rate per batch, diversity across versions, the eval delta on *real*
+  held-out data, and agreement between fast verifiers and a human-labelled sample.
+- **Day to day:** a generation pipeline with provenance on every row.
+- **Interviews:** how you would prevent collapse, and why you would generate the label before the input.
 
 ## Role lens
 - **Engineer:** Builds the generate–verify–deduplicate pipeline with per-row provenance, calibrates the

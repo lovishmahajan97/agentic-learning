@@ -5,7 +5,7 @@ name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/inverted-indexes
@@ -21,99 +21,98 @@ sources:
 ---
 
 ## TL;DR
-Sparse retrieval represents text as a vocabulary-sized vector that is almost all zeros (which words
-appear, weighted by BM25) and finds matches through an inverted index. Dense retrieval represents text as
-a few hundred learned floats and finds matches by vector similarity. Sparse is exact about terms and blind
-to meaning; dense is fluent about meaning and unreliable about exact terms. Neither dominates, which is
-why production systems usually run both and fuse the results.
+Sparse retrieval (BM25 over an inverted index) is exact about terms and blind to meaning; dense
+retrieval (learned vectors plus similarity search) is fluent about meaning and unreliable on exact
+terms. Neither dominates, so production systems usually run both and fuse.
 
 ## Why it exists
-For decades search meant term matching: a query word either appears in a document or it does not, and
-ranking functions like BM25 weigh those appearances. This works astonishingly well and still sets the
-baseline, but it has a hard ceiling called vocabulary mismatch. A user who types "stop billing me" never
-reaches the page titled "cancel your subscription"; no amount of term weighting bridges words that do
-not overlap. Synonym lists and query expansion patch individual cases without solving the class.
-
-Dense retrieval attacks mismatch directly: train an encoder so that a query and the passage that answers
-it map to nearby vectors regardless of shared words. Contrastive training on question–passage pairs
-gives the model a notion of "aboutness" that survives paraphrase and even crosses languages.
-
-The naive conclusion, "embeddings make keyword search obsolete", fails in practice for two reasons.
-First, dense encoders compress a passage into a fixed vector; rare, high-information tokens like part
-numbers, error codes, clause ids and names are exactly what gets lost, because the model saw them rarely
-during training and its tokenizer splits them into meaningless pieces. Second, dense models are trained
-on particular domains and degrade when the corpus looks different; zero-shot benchmarks across
-heterogeneous domains have repeatedly shown BM25 beating many dense retrievers on out-of-domain data.
-Understanding each family's failure mode is what makes the combination work.
+- **Term matching set the baseline for decades.** A query word appears in a document or not, and ranking
+  functions like BM25 weigh those appearances. It works astonishingly well and is still the baseline.
+- **Its hard ceiling is vocabulary mismatch.** "stop billing me" never reaches "cancel your
+  subscription"; no term weighting bridges words that do not overlap. Synonym lists and query expansion
+  patch cases, not the class.
+- **Dense retrieval attacks mismatch directly.** An encoder trained contrastively on question–passage
+  pairs maps a query near the passage that answers it regardless of shared words, even across languages.
+- **"Embeddings make keywords obsolete" fails, reason 1.** A fixed vector loses rare, high-information
+  tokens (part numbers, error codes, clause ids, names), because the model saw them rarely and its
+  tokenizer splits them into meaningless pieces.
+- **Reason 2: domain shift.** Dense models degrade when the corpus looks unlike their training data;
+  zero-shot benchmarks across heterogeneous domains have repeatedly shown BM25 beating many dense
+  retrievers out of domain. Knowing each family's failure mode is what makes the combination work.
 
 ## How it works
 ### Sparse: a vocabulary-dimensional vector
-Take a vocabulary of V terms (tens of thousands to millions after tokenization and stemming). A document
-becomes a vector in ℝ^V whose entry for term t is a weight such as its BM25 contribution, zero for the
-vast majority of terms. A query becomes the same kind of vector. The score is their dot product, but
-nobody materializes those vectors: because they are sparse, the dot product only touches terms present
-in the query, and an inverted index maps each term to the documents containing it. Scoring a five-term
-query means reading five posting lists, no matter how large the vocabulary. That is why sparse retrieval
-runs comfortably on CPU with millisecond latency over tens of millions of documents.
+1. Take a vocabulary of V terms (tens of thousands to millions after tokenization and stemming).
+2. A document becomes a vector in ℝ^V: entry t is a weight such as its BM25 contribution, zero for the
+   vast majority of terms. A query becomes the same kind of vector.
+3. The score is their dot product, but nobody materializes the vectors: because they are sparse, it only
+   touches terms present in the query.
+4. An inverted index maps each term to the documents containing it, so a five-term query reads five
+   posting lists, no matter how large the vocabulary.
 
-The representation has three properties that follow from its construction. It is exact: a term either
-matches or not, so "ERR-4012" finds "ERR-4012". It is interpretable: you can read off why a document
-scored. And it is static: the weights depend only on counts (tf, df, length), never on word order or
-meaning, so "bank account" and "river bank" share the term "bank".
+That is why sparse retrieval runs comfortably on CPU with millisecond latency over tens of millions of
+documents. Three properties follow:
+- **Exact:** a term matches or not, so "ERR-4012" finds "ERR-4012".
+- **Interpretable:** you can read off why a document scored.
+- **Static:** weights depend only on counts (tf, df, length), never on order or meaning, so "bank
+  account" and "river bank" share the term "bank".
 
 ### Dense: a learned low-dimensional vector
-A bi-encoder (two transformer towers, or one shared tower) maps query and passage independently into
-ℝ^d with d typically a few hundred to a few thousand. Training pulls each query toward its labeled
-positive passage and pushes it away from negatives (in-batch and hard-mined), using cosine or dot
-product as the similarity. After training, the geometry encodes meaning: passages about the same thing
-cluster, and queries land near the passages that answer them even with zero lexical overlap.
+- **Bi-encoder.** Two transformer towers (or one shared tower) map query and passage independently into
+  ℝ^d, d typically a few hundred to a few thousand.
+- **Training.** Each query is pulled toward its labeled positive passage and pushed from negatives
+  (in-batch and hard-mined), with cosine or dot product as the similarity.
+- **Result.** The geometry encodes meaning: same-topic passages cluster, and queries land near their
+  answers even with zero lexical overlap.
 
-The properties invert. Dense is fuzzy: it can match "stop billing me" to "cancel your subscription". It
-is opaque: a score of 0.71 has no term-level explanation. And it is learned, which cuts both ways: it is
-only as good as its training distribution, and every change of model means re-embedding the corpus.
+The properties invert:
+- **Fuzzy:** matches "stop billing me" to "cancel your subscription".
+- **Opaque:** a score of 0.71 has no term-level explanation.
+- **Learned:** only as good as its training distribution, and every model change means re-embedding the
+  corpus.
 
 ### Where each one fails
-Dense failure modes:
-- Exact identifiers and rare terms. The tokenizer splits "PX-200" into subword pieces shared with
-  unrelated strings; the encoder has no stable representation for it, so a query containing it may rank
-  a passage about "PX-210" equally.
-- Domain shift. A model trained on web QA sees medical, legal or internal-jargon text as noise; recall
-  on such corpora can fall below BM25 without fine-tuning.
-- Negation and precise constraints ("flights not via Frankfurt") average out in a single vector.
-- Long passages. One vector per chunk means the embedding is a blend; a passage that answers the
-  question in one sentence among twenty gets diluted.
+| Dense failure mode | Why |
+|---|---|
+| Exact identifiers and rare terms | the tokenizer splits "PX-200" into subword pieces shared with unrelated strings, so a passage about "PX-210" may rank equally |
+| Domain shift | a web-QA model sees medical, legal or internal jargon as noise; recall can fall below BM25 without fine-tuning |
+| Negation and precise constraints | "flights not via Frankfurt" averages out in a single vector |
+| Long passages | one vector per chunk is a blend; one answering sentence among twenty gets diluted |
 
-Sparse failure modes:
-- Vocabulary mismatch, including morphology the stemmer misses, synonyms and cross-language queries.
-- Short, abstract queries ("why is this slow") that share only stopwords with relevant documents.
-- No notion of relevance beyond term statistics: a document that mentions all the query words in
-  passing can outrank the one that actually answers.
+| Sparse failure mode | Why |
+|---|---|
+| Vocabulary mismatch | morphology the stemmer misses, synonyms, cross-language queries |
+| Short, abstract queries | "why is this slow" shares only stopwords with relevant documents |
+| No relevance beyond term statistics | a document mentioning all query words in passing can outrank the one that answers |
 
 ### The same score, different dimensions
-Put the two side by side and the scoring operation is identical: both rank by an inner product between a
-query vector and a document vector. What differs is who defines the dimensions. In sparse retrieval each
-dimension is a vocabulary term fixed in advance by the analyzer, and the weights are count statistics;
-two texts interact only through dimensions they literally share. In dense retrieval the d dimensions are
-latent features the encoder invented during training, and every text has a nonzero value on all of them,
-so any two texts interact. That one difference explains the rest: sparse can be served by reading only
-the posting lists of the query's terms, while dense needs a vector index because every document is a
-candidate; sparse is exact because a term either is a dimension or is not, while dense is fuzzy because
-meaning is smeared across shared dimensions.
+Both rank by an inner product between query and document vectors. What differs is who defines the
+dimensions:
+
+| | Sparse | Dense |
+|---|---|---|
+| Dimensions | vocabulary terms fixed in advance by the analyzer | d latent features invented in training |
+| Weights | count statistics | learned |
+| Nonzeros | only the terms present | every text is nonzero on all of them |
+| Which texts interact | only through dimensions they literally share | any two texts |
+| Serving | read only the query terms' posting lists | vector index, because every document is a candidate |
+| Matching | exact, because a term is a dimension or not | fuzzy, because meaning is smeared across shared dimensions |
 
 ### Learned sparse: a middle ground
-Learned sparse models (SPLADE is the reference) use a transformer to predict a weight for every
-vocabulary term, including terms not present in the text (expansion), with a sparsity penalty so most
-weights stay zero. The output is still a sparse vector served from an inverted index, so it keeps exact
-matching and CPU serving, but the weights carry learned semantics and synonyms. It is a good option when
-you want one index and cannot run a vector database, at the cost of a neural encoder at index and query
-time.
+- **What:** SPLADE (the reference) uses a transformer to predict a weight for every vocabulary term,
+  including terms absent from the text (expansion), with a sparsity penalty so most weights stay zero.
+- **Keeps:** a sparse vector served from an inverted index, so exact matching and CPU serving.
+- **Adds:** learned semantics and synonyms in the weights.
+- **Use when** you want one index and cannot run a vector database, at the cost of a neural encoder at
+  index and query time.
 
 ### Multi-vector dense: another middle ground
-Late-interaction models such as ColBERT keep one dense vector per token rather than one per passage and
-score by matching each query token to its most similar passage token. Because a rare token keeps its own
-vector instead of being averaged into the passage, exact-term behavior improves while paraphrase
-matching survives. The price is an index many times larger than single-vector dense, which is why it
-appears more often as a reranking stage than as first-stage retrieval (see the reranking lesson).
+- **What:** late-interaction models such as ColBERT keep one dense vector per token and match each query
+  token to its most similar passage token.
+- **Why it helps:** a rare token keeps its own vector instead of being averaged away, so exact-term
+  behavior improves while paraphrase matching survives.
+- **Price:** an index many times larger than single-vector dense, which is why it appears more often as a
+  reranking stage than as first-stage retrieval (see the reranking lesson).
 
 ### Operational differences that decide the choice
 | Concern | Sparse (BM25) | Dense (bi-encoder) |
@@ -126,9 +125,27 @@ appears more often as a reranking stage than as first-stage retrieval (see the r
 | Exact tokens | Strong | Weak |
 | Paraphrase | Weak | Strong |
 
-## Example
-Five support passages, two queries. The first query is an exact error code that dense retrieval tends to
-blur; the second is a paraphrase that BM25 cannot bridge. Run both retrievers and compare the top hit.
+## Diagram
+Trace one query down both paths: the sparse arm reads only the query terms' posting lists, the dense arm
+embeds the query and searches a vector index, and the two ranked lists meet at fusion.
+
+```mermaid
+flowchart LR
+    Q["User query"] --> AN["Analyzer: tokenize, lowercase, stem"]
+    Q --> EN["Bi-encoder: embed query"]
+    AN --> PL[("Inverted index: posting lists")]
+    PL -->|"BM25 over query terms only"| S["Sparse ranking: exact terms"]
+    EN --> VX[("Vector index: ANN")]
+    VX -->|"cosine or dot product"| D["Dense ranking: meaning"]
+    S --> F["Fusion, optional reranker"]
+    D --> F
+    F --> K["Top k to the LLM"]
+```
+
+## Examples
+### BM25 vs a bi-encoder on two query types
+Five support passages, two queries: an exact error code that dense retrieval tends to blur, and a
+paraphrase that BM25 cannot bridge.
 
 ```python
 import numpy as np
@@ -157,49 +174,103 @@ for q in queries:
     print("  dense ->", docs[int(np.argmax(dense))][:60], np.round(dense.max(), 2))
 ```
 
-BM25 nails the error-code query, because "e4012", "px" and "200" are exact tokens, while the dense model
-may confuse the PX-200 and PX-210 passages, whose vectors are nearly identical in shape. On the billing
-paraphrase, BM25 scores every document at zero (no shared tokens at all; "billed" is not "billing"
-without a stemmer), so `argmax` just returns the first passage with a score of 0.0, while the dense model ranks the cancellation passage first. The exact margins depend
-on the model, which is itself the point: the behavior is structural, the numbers are not.
+- **Error-code query:** BM25 nails it, because "e4012", "px" and "200" are exact tokens. The dense model
+  may confuse the PX-200 and PX-210 passages, whose vectors are nearly identical in shape.
+- **Billing paraphrase:** BM25 scores every document at zero (no shared tokens; "billed" is not
+  "billing" without a stemmer), so `argmax` just returns the first passage with a score of 0.0. The dense
+  model ranks the cancellation passage first.
+- **Margins depend on the model,** which is the point: the behavior is structural, the numbers are not.
+
+### Per-retriever ablation: which queries does each arm win?
+The decision number is the overlap. Record each retriever's top-k per labeled query, then compare the
+sets of queries each one gets right (toy data; plug in your own runs).
+
+```python
+import re
+# For each labeled query: the gold chunk id and each retriever's top-k ids.
+runs = {
+    "E4012 PX-200":            {"gold": "d1", "bm25": ["d1", "d5"], "dense": ["d2", "d1"]},
+    "PX-210 tray 2 jam":       {"gold": "d2", "bm25": ["d2", "d5"], "dense": ["d1", "d5"]},
+    "how do I stop being billed": {"gold": "d3", "bm25": ["d1", "d2"], "dense": ["d3", "d4"]},
+    "printer will not join wifi": {"gold": "d4", "bm25": ["d4", "d1"], "dense": ["d4", "d3"]},
+}
+ID = re.compile(r"\b(?:[A-Za-z]{1,5}-?\d{2,}|\d{4,})\b")   # crude "identifier-style" detector
+
+def hits(arm, k=1):
+    return {q for q, r in runs.items() if r["gold"] in r[arm][:k]}
+
+for k in (1, 2):
+    b, d = hits("bm25", k), hits("dense", k)
+    n = len(runs)
+    print(f"k={k} recall bm25={len(b)/n:.2f} dense={len(d)/n:.2f} union={len(b | d)/n:.2f}")
+    print("   only bm25 :", sorted(b - d))
+    print("   only dense:", sorted(d - b))
+print("identifier-style:", [q for q in runs if ID.search(q)])
+```
+
+| k | BM25 recall | Dense recall | Union (hybrid ceiling) |
+|---|---|---|---|
+| 1 | 0.75 | 0.50 | 1.00 |
+| 2 | 0.75 | 0.75 | 1.00 |
+
+Each arm wins queries the other loses (BM25 the identifier queries, dense the paraphrase), so a second
+arm is worth its cost here; if one set were a subset of the other, it would not be.
+
+## Production patterns
+- **Run the ablation on every model or analyzer change.** Keep a labeled query set tagged by slice
+  (identifier-style vs natural language) and report recall@k for sparse, dense and their union per slice.
+  Monitor the "only BM25" and "only dense" lists; a shrinking union gain means the second arm is cost
+  without benefit.
+- **Classify query traffic from logs.** Tag queries that look like identifiers (a regex like the one
+  above, tuned to your SKU and ticket formats) and track their share. Use it to weight the sparse arm or
+  route those queries; monitor zero-result and reformulation rate per class.
+- **Make the analyzer preserve identifiers.** Index hyphenated codes both whole and split (in
+  Elasticsearch, a `word_delimiter_graph` filter with `preserve_original` enabled) and use the same
+  analyzer at query time. Monitor exact-identifier queries whose top result does not contain the identifier.
+- **Refresh both indexes from one change stream.** Write each document update to sparse and dense indexes
+  from the same event, carrying a version or timestamp. Monitor the lag between the two; alert when a
+  document is visible in one but not the other beyond your freshness target.
+- **Pin and version the embedding model.** Store the model name with the dense index and re-embed into a
+  new index on any change, switching reads only after the ablation passes. Monitor recall on in-domain
+  jargon slices, where off-the-shelf models fail first.
 
 ## Trade-offs
-- Sparse retrieval is cheap, incremental and exact on identifiers, but it stalls on paraphrase; the
-  balance flips toward dense as soon as your users phrase questions differently from how the documents
-  are written.
-- Dense retrieval generalizes across wording and languages, but costs an embedding pass per chunk and
-  per query and a full re-index on every model change; it flips back toward sparse when the corpus is
-  huge, churns constantly, or the GPU budget is tight.
-- Learned sparse keeps one CPU-served inverted index while adding semantics, at the cost of a neural
-  encoder at index time (and, for most variants, at query time) and some loss versus a strong dense model on pure paraphrase tasks.
-- In-domain fine-tuning of a dense model can overtake BM25 decisively, but needs labeled query–passage
-  pairs; without them an off-the-shelf model on jargon-heavy text may lose to BM25, which needs no labels
-  at all.
+- **Sparse: cheap, incremental, exact on identifiers.** It stalls on paraphrase; the balance flips toward
+  dense as soon as users phrase questions differently from how documents are written.
+- **Dense: generalizes across wording and languages.** It costs an embedding pass per chunk and per query
+  and a full re-index on every model change; it flips back toward sparse when the corpus is huge, churns
+  constantly, or the GPU budget is tight.
+- **Learned sparse: one CPU-served inverted index with semantics.** It costs a neural encoder at index
+  time (and, for most variants, at query time) and some loss versus a strong dense model on pure
+  paraphrase tasks.
+- **In-domain dense fine-tuning: can overtake BM25 decisively.** It needs labeled query–passage pairs;
+  without them an off-the-shelf model on jargon-heavy text may lose to BM25, which needs no labels at all.
 
 ## Pitfalls
-- Shipping dense-only because the demo paraphrases worked; the symptom is support tickets like "I
-  searched the exact ticket number and got unrelated results".
-- Shipping sparse-only with the default analyzer; the symptom is zero-result or wrong-result queries
+- **Shipping dense-only because the demo paraphrases worked.** Symptom: tickets like "I searched the
+  exact ticket number and got unrelated results". Fix: add a sparse arm.
+- **Shipping sparse-only with the default analyzer.** Symptom: zero-result or wrong-result queries
   whenever users use synonyms, plurals the stemmer misses, or another language.
-- Evaluating a dense model on the vendor's benchmark rather than your corpus; the symptom is recall that
-  collapses on internal jargon, acronyms and tables that look nothing like web text.
-- Chunking long documents into large pieces for dense retrieval; the symptom is relevant passages ranked
-  below shorter, vaguely related chunks because the long chunk's vector is an average of many topics.
-- Forgetting that sparse and dense indexes must be refreshed together; the symptom is a document that
-  appears in keyword results but not semantic results (or vice versa) for hours after an update.
+- **Evaluating a dense model on the vendor's benchmark, not your corpus.** Symptom: recall collapses on
+  internal jargon, acronyms and tables that look nothing like web text.
+- **Large chunks for dense retrieval.** Symptom: relevant passages rank below shorter, vaguely related
+  chunks, because the long chunk's vector is an average of many topics.
+- **Refreshing sparse and dense indexes separately.** Symptom: a document appears in keyword results but
+  not semantic results (or vice versa) for hours after an update.
 
 ## When to use
-Start from the queries. If users search by identifiers, codes, names and exact phrases, or the corpus is
-technical and churns fast, sparse is the backbone and dense is an add-on. If users ask natural-language
-questions against prose and wording varies, dense is the backbone and sparse protects the exact-match
-cases. Most real workloads contain both kinds of queries, which is why the practical default is hybrid
-retrieval with fusion, covered in its own lesson. Decide with data: build a labeled query set, measure
-recall@k for each retriever alone and in combination, and look at which queries each one loses. The
-overlap is the decision number: if the queries BM25 wins are a subset of those dense wins, a second
-arm adds cost and nothing else; if each wins queries the other loses, the union of their successes
-bounds what hybrid can reach. In
-interviews, be ready to name the structural failure modes of each family, explain why BM25 remains a
-strong baseline, and say what learned sparse models add.
+Start from the queries.
+- **Sparse as backbone** when users search by identifiers, codes, names and exact phrases, or the corpus
+  is technical and churns fast; dense is an add-on.
+- **Dense as backbone** when users ask natural-language questions against prose and wording varies;
+  sparse protects the exact-match cases.
+- **Default to hybrid** with fusion, because most real workloads contain both kinds of queries (covered in
+  its own lesson).
+- **Decide with data.** Build a labeled query set, measure recall@k for each retriever alone and combined,
+  and look at which queries each loses. If BM25's wins are a subset of dense's, a second arm adds cost and
+  nothing else; if each wins queries the other loses, the union bounds what hybrid can reach.
+- **Interviews:** name each family's structural failure modes, explain why BM25 remains a strong
+  baseline, and say what learned sparse models add.
 
 ## Role lens
 - **Engineer:** Builds both retrievers behind one interface, keeps tokenization consistent between index
@@ -222,6 +293,39 @@ to revert but to run both retrievers and fuse their rankings, possibly with a re
 two indexes refreshed in lockstep so a document is never visible in one and missing from the other. I
 would also check tokenization of identifiers in both systems, since hyphen handling alone can decide
 those queries.
+
+## Interview questions
+### What is the core difference between dense and sparse retrieval?
+- **Both score with an inner product;** what differs is who defines the dimensions. Sparse uses vocabulary
+  terms fixed by the analyzer with count-based weights; dense uses d latent features learned in training.
+- **So sparse is exact and interpretable** but blind to synonyms, while dense matches paraphrases but blurs
+  rare tokens and needs re-embedding on every model change.
+
+### Why does BM25 still beat many dense retrievers out of domain?
+- **Dense models only know their training distribution.** Medical, legal or internal jargon looks like
+  noise to a web-QA encoder, so recall can fall below BM25 without fine-tuning.
+- **BM25 needs no labels or training,** and exact term matching transfers to any corpus; zero-shot
+  benchmarks such as BEIR have repeatedly shown this.
+
+### Users say exact ticket-number searches return unrelated results. Walk through the diagnosis.
+- **Classify the failing queries:** identifier-style queries (codes, SKUs, ticket ids) are the classic
+  dense failure, because the tokenizer splits them into subword pieces shared with unrelated strings.
+- **Measure per slice:** recall@k for dense, BM25 and their union on labeled identifier and
+  natural-language queries.
+- **Fix:** add a sparse arm with an analyzer that keeps codes whole, fuse, and refresh both indexes from
+  one change stream.
+
+### When would you skip the dense arm entirely?
+- **When queries are mostly identifiers, codes and exact phrases**, the corpus churns fast, and there is
+  no GPU or embedding budget, because BM25 updates in seconds on CPU.
+- **Check with the ablation:** if dense's wins on your labeled set are a subset of BM25's, the second arm
+  adds cost and nothing else.
+
+### Where do SPLADE and ColBERT sit between the two families?
+- **SPLADE (learned sparse)** predicts weights for vocabulary terms, including absent ones, and still serves
+  from an inverted index on CPU, at the cost of a neural encoder at index and usually query time.
+- **ColBERT (multi-vector dense)** keeps one vector per token so rare tokens are not averaged away, but its
+  index is many times larger, so it is often used as a reranking stage.
 
 ## Quiz
 ### Q: Why does a dense bi-encoder often fail on queries containing a rare product code such as "PX-200"?

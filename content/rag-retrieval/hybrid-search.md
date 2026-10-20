@@ -5,7 +5,7 @@ name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/dense-vs-sparse-retrieval
   - rag-retrieval/bm25-internals
@@ -21,36 +21,35 @@ sources:
 ---
 
 ## TL;DR
-Hybrid search runs a lexical retriever (BM25) and a dense retriever (embeddings) on the same query and
-merges their results, because the two fail on different queries: BM25 misses paraphrase, dense misses
-exact identifiers and out-of-domain jargon. The hard part is the merge: BM25 and cosine scores live on
-unrelated scales, so you fuse by rank (reciprocal rank fusion) or normalize per query before a weighted
-sum, and verify the gain with recall@k on labeled queries.
+Hybrid search runs BM25 and a dense retriever on the same query and merges results, because they fail on
+different queries. Scores live on unrelated scales, so fuse by rank (RRF) or normalize per query, and
+prove the gain with recall@k.
 
 ## Why it exists
-The dense-vs-sparse lesson ends with the observation that neither retriever dominates. Put illustrative
-numbers on it: for a labeled query set, suppose BM25 alone gets the relevant chunk into the top 10 for
-70% of queries and dense alone for 75%. If their failures were identical, hybrid would be 75%; in
-practice their failures overlap only partly, so the union often lands well above either. The recovered
-queries are the identifier searches dense fumbles and the paraphrases BM25 cannot see. A generation step
-cannot answer from a chunk that was never retrieved, so first-stage recall is the ceiling on everything
-downstream; hybrid raises that ceiling cheaply.
-
-The naive merge, "concatenate both lists and sort by score", fails because the scores are
-incommensurable. A BM25 score is an unbounded sum that grows with query length and term rarity, often
-in the single or double digits for a multi-term query (the exact range depends on corpus and engine); a cosine similarity sits in a narrow model-specific band.
-Sorting them together just returns the BM25 list followed by the dense list. Even normalizing each list
-to [0, 1] per query is fragile: the top BM25 hit for a one-word query may be a weak match normalized to
-1.0. Fusion methods exist to combine evidence from rankers that do not share a scale.
+- **Neither retriever dominates.** BM25 misses paraphrase; dense misses exact identifiers and
+  out-of-domain jargon.
+- **Failures overlap only partly.** Illustrative numbers: BM25 alone gets the relevant chunk into the top
+  10 for 70% of queries, dense for 75%. Identical failures would cap hybrid at 75%; in practice the union
+  often lands well above either, recovering identifier searches and paraphrases.
+- **Recall is the ceiling.** Generation cannot answer from a chunk that was never retrieved, so
+  first-stage recall bounds everything downstream; hybrid raises it cheaply.
+- **Naive merging fails.** "Concatenate and sort by score" mixes an unbounded BM25 sum (often single or
+  double digits for a multi-term query, depending on corpus and engine) with cosine in a narrow
+  model-specific band, so you just get the BM25 list followed by the dense list.
+- **Even per-query [0, 1] normalization is fragile:** a one-word query's top BM25 hit may be a weak match
+  stretched to 1.0. Fusion methods combine evidence from rankers that do not share a scale.
 
 ## How it works
 ### Two retrievers, one query, in parallel
-The query goes to both arms at once. The lexical arm analyzes it into terms and runs BM25 over an
-inverted index; the dense arm embeds it and runs an ANN search. Each returns its top-n candidates with
-scores. n is deliberately larger than the final k (commonly 50 to 200 per arm for a final 5 to 10),
-because fusion needs overlap and depth to work with, and a reranker, if present, wants a wide pool. Any
-metadata filter must be applied identically in both arms; otherwise one arm returns documents the other
-was forbidden to.
+1. Send the query to both arms at once.
+2. **Lexical arm:** analyze into terms, run BM25 over an inverted index.
+3. **Dense arm:** embed the query, run an ANN search.
+4. Each returns its top-n with scores.
+
+- **n > final k** (commonly 50 to 200 per arm for a final 5 to 10), because fusion needs overlap and
+  depth, and a reranker wants a wide pool.
+- **Filters must be identical in both arms;** otherwise one arm returns documents the other was forbidden
+  to.
 
 ### Reciprocal rank fusion
 RRF ignores scores and uses only ranks:
@@ -59,69 +58,77 @@ RRF ignores scores and uses only ranks:
 RRF(d) = Σ_arms 1 / (k + rank_arm(d))        k = 60 in the original paper
 ```
 
-A document found by both arms gets two contributions; one found by only one arm gets one. The constant
-k damps the top: without it, rank 1 would be worth 1.0 and rank 2 only 0.5, which lets a single arm's
-top hit dominate. With k = 60, rank 1 scores 1/61 ≈ 0.0164 and rank 10 scores 1/70 ≈ 0.0143, so a
-document that is rank 10 in both arms (≈ 0.0286) beats one that is rank 1 in a single arm (≈ 0.0164).
-That is the design intent: agreement between retrievers is stronger evidence than a confident vote from
-one. RRF needs no tuning, no normalization and no knowledge of the score scales, which is why most engines
-with hybrid search offer it (Elasticsearch, OpenSearch, Qdrant and Weaviate among them, in recent versions)
-and many RAG frameworks use it by default. Defaults differ and change between releases, so check yours:
-Weaviate, for example, moved its default to a normalized score fusion. Its weakness is that
-it throws away magnitude: a dense hit at cosine 0.92 and the next at 0.55 are treated as adjacent ranks.
-Two refinements are common. Per-arm weights (`w_arm / (k + rank)`) let you trust one arm more without
-touching scores, and k itself is a knob: smaller k makes the curve steeper, so a single arm's top ranks
-count for more; larger k flattens it further toward pure agreement counting.
+- **Agreement adds up.** A document found by both arms gets two contributions; one arm, one.
+- **k damps the top.** Without it rank 1 is worth 1.0 and rank 2 only 0.5, letting one arm's top hit
+  dominate.
+
+| Case (k = 60) | Score |
+|---|---|
+| Rank 1 in one arm | 1/61 ≈ 0.0164 |
+| Rank 10 in one arm | 1/70 ≈ 0.0143 |
+| Rank 10 in both arms | ≈ 0.0286, beats a lone rank 1 |
+
+- **Design intent:** agreement between retrievers is stronger evidence than one confident vote.
+- **Why it is everywhere:** no tuning, no normalization, no knowledge of score scales. Most engines with
+  hybrid search offer it (Elasticsearch, OpenSearch, Qdrant and Weaviate among them, in recent versions)
+  and many RAG frameworks use it by default.
+- **Check your defaults;** they differ and change between releases. Weaviate, for example, moved its
+  default to a normalized score fusion.
+- **Weakness:** it throws away magnitude; a dense hit at cosine 0.92 and the next at 0.55 are just
+  adjacent ranks.
+- **Refinement 1, per-arm weights** (`w_arm / (k + rank)`): trust one arm more without touching scores.
+- **Refinement 2, k as a knob:** smaller k steepens the curve so one arm's top ranks count more; larger k
+  flattens it toward pure agreement counting.
 
 ### Weighted score fusion
-The alternative keeps scores: normalize each arm's scores per query (min–max to [0, 1], or z-scores),
-then combine as `α·dense + (1 − α)·sparse`. This can exploit a decisive dense score or a decisive exact
-match, and α lets you bias toward the arm that wins on your traffic. The price is fragility:
-normalization depends on the candidate pool (a longer list changes the minimum), per-query normalization
-inflates weak top hits, and α must be tuned on labeled data and re-tuned when either model or the corpus
-changes. A concrete case: for a vague query, BM25's top three might score 2.1, 2.0 and 1.9, a near-tie
-among weak matches, while dense returns 0.81, 0.62 and 0.55, a clear winner. Min–max maps the BM25 list
-to 1.0, 0.5, 0.0 and the dense list to 1.0, 0.27, 0.0, so the BM25 arm's essentially arbitrary first
-place now carries exactly the same weight as the dense arm's decisive one, and its second place
-outweighs the dense second by almost 2×, purely as an artifact of stretching a 0.2-wide range to 1. Z-scores soften this but still assume each arm's top-n has a
-comparable spread, which is the thing that varies most from query to query.
+1. Normalize each arm's scores per query (min–max to [0, 1], or z-scores).
+2. Combine as `α·dense + (1 − α)·sparse`.
 
-Some systems go one step further and make the weight query-dependent, leaning lexical when the query
-looks like an identifier (digits, hyphens, quoted strings) and dense when it reads as a question. It
-works when the query classes are cleanly separable in your logs; it is one more component that must be
-evaluated per slice. Engines expose both styles: Weaviate's `alpha`, OpenSearch's normalization processors,
-Elasticsearch's RRF and weighted retrievers.
+- **Gain:** exploits a decisive dense score or a decisive exact match; α biases toward the arm that wins
+  on your traffic.
+- **Fragile, because** normalization depends on the candidate pool (a longer list changes the minimum),
+  per-query normalization inflates weak top hits, and α must be tuned on labeled data and re-tuned when
+  either model or the corpus changes.
+- **Z-scores soften this** but still assume each arm's top-n has a comparable spread, which is what varies
+  most from query to query (see the worked example below).
+
+### Query-dependent weights
+- **Idea:** lean lexical when the query looks like an identifier (digits, hyphens, quoted strings) and
+  dense when it reads as a question.
+- **Works when** query classes are cleanly separable in your logs; it is one more component to evaluate
+  per slice.
+- **Engine knobs:** Weaviate's `alpha`, OpenSearch's normalization processors, Elasticsearch's RRF and
+  weighted retrievers.
 
 ### Where the arms live
-- **One engine, two indexes.** Elasticsearch and OpenSearch hold a BM25 field and a dense vector field in
-  the same document, run both queries and fuse server-side. Postgres with pgvector plus `tsvector` does
-  the same with two indexes and a SQL join plus RRF in the query, with one caveat: Postgres's built-in
-  `ts_rank` is not BM25 (it has no IDF and no saturation in the BM25 sense), so a true BM25 arm needs an
-  extension that implements it. Qdrant stores sparse vectors (BM25-style or learned sparse) beside dense
-  ones, and Weaviate keeps a BM25 inverted index beside its vector index.
-- **Two engines.** A search engine for lexical, a vector database for dense, fused in the application.
-  More moving parts and two consistency boundaries, but each engine is used for what it is best at.
+| Layout | Examples | Trade |
+|---|---|---|
+| One engine, two indexes | Elasticsearch/OpenSearch BM25 field + dense vector field, fused server-side; Postgres pgvector + `tsvector` with a SQL join and RRF; Qdrant sparse vectors (BM25-style or learned) beside dense; Weaviate BM25 inverted index beside its vector index | simpler consistency and latency |
+| Two engines | search engine for lexical, vector database for dense, fused in the application | more moving parts and two consistency boundaries, but each engine does what it is best at |
 
-The consistency issue is identical either way: a document must be written to both arms before it is
-"indexed", and deleted from both, or a query can return a chunk that exists in one and is gone from the
-other.
+- **Postgres caveat:** built-in `ts_rank` is not BM25 (no IDF and no saturation in the BM25 sense), so a
+  true BM25 arm needs an extension that implements it.
+- **Consistency is the same either way:** a document must be written to both arms before it is
+  "indexed", and deleted from both, or a query can return a chunk that exists in one and is gone from
+  the other.
 
 ### After fusion
-Fusion produces a merged candidate list ordered by combined evidence. Most pipelines then pass the top
-20 to 50 to a cross-encoder reranker, which reads query and chunk together and produces the final top k.
-Hybrid is the recall stage; the reranker is the precision stage; fusion is the handshake between them.
+- Fusion yields a merged list ordered by combined evidence.
+- Most pipelines pass the top 20 to 50 to a cross-encoder reranker, which reads query and chunk together
+  and produces the final top k.
+- **Hybrid is the recall stage, the reranker the precision stage, fusion the handshake between them.**
 
 ### Measuring whether it helped
-Hybrid is a hypothesis, not a guarantee. On a labeled set, compute recall@k for BM25 alone, dense alone,
-and the fusion; then look at the queries where fusion beat the best single arm and the ones where it
-lost. A fusion that adds BM25 noise to a strong dense arm can lower precision at small k even while
-raising recall at large k; the reranker usually recovers it, but you need to see it.
+- **Hybrid is a hypothesis, not a guarantee.** On a labeled set compute recall@k for BM25 alone, dense
+  alone and the fusion.
+- **Inspect both directions:** queries where fusion beat the best single arm and ones where it lost.
+- **Watch small k:** adding BM25 noise to a strong dense arm can lower precision at small k while raising
+  recall at large k; the reranker usually recovers it, but you need to see it.
 
-## Example
-Reciprocal rank fusion in a dozen lines, applied to the ranked ids returned by a BM25 arm and a dense
-arm. The numbers show the agreement effect: document 3 is the BM25 arm's top hit but absent from the
-dense top 10, and it falls to fifth behind four documents both arms agreed on, including document 8,
-which was only rank 4 and rank 6.
+## Examples
+### Reciprocal rank fusion in a dozen lines
+Document 3 is the BM25 arm's top hit but absent from the dense top 10; it falls to fifth behind four
+documents both arms agreed on, including document 8, which was only rank 4 and rank 6.
 
 ```python
 from collections import defaultdict
@@ -146,45 +153,104 @@ for doc_id, score in rrf([bm25_top, dense_top])[:5]:
 # 3  0.01639   rank 1, BM25 only
 ```
 
-In Postgres the same shape is two subqueries (one ordered by the `tsvector` rank, one by cosine
-distance), each with a `ROW_NUMBER()` rank, joined on chunk id with a full outer join and ordered by the
-sum of `1.0 / (60 + rank)`.
+### Production snippet: RRF in one Postgres query
+Two subqueries (one ordered by the `tsvector` rank, one by cosine distance), each with a `ROW_NUMBER()`
+rank, joined on chunk id with a full outer join and ordered by the sum of `1.0 / (60 + rank)`. The same
+tenant filter appears in both arms.
+
+```sql
+SET LOCAL hnsw.ef_search = 100;   -- >= the arm depth below, inside a transaction
+
+WITH lexical AS (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank(tsv, q) DESC) AS rank
+  FROM chunks, plainto_tsquery('english', $1) AS q
+  WHERE tenant_id = $3 AND tsv @@ q
+  ORDER BY ts_rank(tsv, q) DESC
+  LIMIT 50
+),
+semantic AS (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> $2) AS rank
+  FROM chunks
+  WHERE tenant_id = $3
+  ORDER BY embedding <=> $2
+  LIMIT 50
+)
+SELECT COALESCE(l.id, s.id) AS id,
+       COALESCE(1.0 / (60 + l.rank), 0) + COALESCE(1.0 / (60 + s.rank), 0) AS rrf
+FROM lexical l FULL OUTER JOIN semantic s ON l.id = s.id
+ORDER BY rrf DESC
+LIMIT 10;
+```
+
+### Worked scenario: how min–max normalization misleads
+A vague query. BM25's top three are a near-tie among weak matches; dense has a clear winner.
+
+| Rank | BM25 raw | BM25 min–max | Dense raw | Dense min–max |
+|---|---|---|---|---|
+| 1 | 2.1 | 1.0 | 0.81 | 1.0 |
+| 2 | 2.0 | 0.5 | 0.62 | 0.27 |
+| 3 | 1.9 | 0.0 | 0.55 | 0.0 |
+
+- The BM25 arm's essentially arbitrary first place now carries exactly the same weight as the dense arm's
+  decisive one.
+- Its second place outweighs the dense second by almost 2×, purely an artifact of stretching a 0.2-wide
+  range to 1.
+- RRF would have treated both arms' rank 2 identically, which is the safer default when spreads vary.
+
+## Production patterns
+- **Start with server-side RRF.** Use your engine's built-in rank fusion (for example Elasticsearch's
+  `rrf` retriever, whose rank constant defaults to 60) before writing custom fusion. Monitor recall@10
+  per arm and fused on a labeled set each release.
+- **One filter object, both arms.** Build tenant, ACL and metadata filters once and pass the same object
+  to the lexical and dense queries; add a test that runs a cross-tenant canary query and fails if any
+  foreign chunk appears. Monitor filter-mismatch test results in CI.
+- **Size arm depth and engine limits together.** Fetch 50 to 200 per arm, and raise engine caps to match,
+  such as pgvector's `hnsw.ef_search` to at least the arm's `LIMIT`. Monitor rows returned per arm versus
+  requested.
+- **Reconcile the two indexes.** Write and delete through one path that updates both arms, and run a
+  periodic job comparing chunk ids (or counts per document) across them. Monitor the diff count and the
+  age of the oldest unreconciled document.
+- **Slice the evaluation.** Tag labeled queries by type (identifier, question, short keyword) and gate
+  releases on per-slice recall, not just the aggregate. Monitor the exact-identifier slice, which hides
+  regressions behind gains elsewhere.
+- **Move to weighted fusion only with labels.** If one arm clearly dominates, tune α (or per-arm RRF
+  weights) on labeled data and record it with the model and corpus versions. Monitor it after every
+  model or corpus change, since α must be re-tuned.
 
 ## Trade-offs
-- Hybrid raises first-stage recall for mixed query traffic, but doubles query-time work (an embedding
-  call plus an ANN search plus a BM25 query) and index storage; if your labeled set shows one arm already
-  at the recall ceiling, the second arm is cost without benefit.
-- RRF is tuning-free and robust to scale differences, but discards score magnitude; when one arm is far
-  stronger on your traffic, weighted score fusion with a tuned α can beat it, at the price of re-tuning
-  on every model or corpus change.
-- Fusing server-side in one engine keeps consistency and latency simple; splitting across a search
-  engine and a vector database lets each scale independently but makes every write a two-phase problem.
-- Deeper candidate lists per arm improve fusion quality and give the reranker more to work with, but
-  latency and reranker cost grow with depth; past the point where recall@depth is flat, extra depth is
-  waste.
+- **Higher first-stage recall for mixed traffic,** at double the query-time work (an embedding call, an
+  ANN search and a BM25 query) and index storage; if one arm is already at the recall ceiling on your
+  labeled set, the second is cost without benefit.
+- **RRF: tuning-free and robust to scale,** but it discards magnitude; when one arm is far stronger on your
+  traffic, weighted fusion with a tuned α can beat it, at the price of re-tuning on every model or corpus
+  change.
+- **One engine vs two.** Server-side fusion in one engine keeps consistency and latency simple; a search
+  engine plus a vector database scale independently but make every write a two-phase problem.
+- **Deeper candidate lists** improve fusion and give the reranker more to work with, but latency and
+  reranker cost grow with depth; once recall@depth is flat, extra depth is waste.
 
 ## Pitfalls
-- Summing raw BM25 and cosine scores; the symptom is results that are simply the BM25 list, because its
-  scores are an order of magnitude larger.
-- Applying a metadata or ACL filter in one arm only; the symptom is a document appearing in results
-  that the user should not see, or a filtered query returning items from the unfiltered arm.
-- Writing to the vector index and the lexical index without a shared commit or reconciliation; the
-  symptom is "I just deleted that document and it still shows up" from one arm, hours after the other
-  dropped it.
-- Treating fused scores as relevance thresholds; RRF values depend on list depth and the number of arms,
-  so a cutoff tuned at depth 50 behaves differently at depth 100.
-- Declaring victory on aggregate recall; the symptom is a regression on a query class (say, exact SKU
-  lookups) hidden by gains elsewhere. Slice the evaluation by query type.
+- **Summing raw BM25 and cosine scores.** Symptom: results are simply the BM25 list, because its scores
+  are an order of magnitude larger. Fix: RRF or per-query normalization.
+- **A metadata or ACL filter in one arm only.** Symptom: a user sees a document they should not, or a
+  filtered query returns items from the unfiltered arm.
+- **No shared commit or reconciliation between indexes.** Symptom: "I just deleted that document and it
+  still shows up" from one arm, hours after the other dropped it.
+- **Fused scores as relevance thresholds.** RRF values depend on list depth and the number of arms, so a
+  cutoff tuned at depth 50 behaves differently at depth 100.
+- **Declaring victory on aggregate recall.** Symptom: a regression on a query class (say, exact SKU
+  lookups) hidden by gains elsewhere. Fix: slice the evaluation by query type.
 
 ## When to use
-Default to hybrid for any corpus that mixes prose with identifiers, names, codes or jargon, which is most
-enterprise content, and for any user base that both searches and asks questions. Skip it when a labeled
-evaluation shows one arm already captures the relevant chunk in nearly every case, or when serving
-constraints rule out one arm (no GPU for embeddings, or no inverted index available). Decide with
-measurements: recall@k per arm and fused, sliced by query type, plus end-to-end answer quality with and
-without the second arm. Start with RRF; move to weighted fusion only when you have the labeled data to
-tune it and a process to re-tune. In interviews, the expected depth is explaining why scores cannot be
-summed, how RRF rewards agreement, and where the reranker sits.
+- **Default to hybrid** for corpora mixing prose with identifiers, names, codes or jargon (most enterprise
+  content) and for users who both search and ask questions.
+- **Skip it when** a labeled evaluation shows one arm already captures the relevant chunk in nearly every
+  case, or serving constraints rule out one arm (no GPU for embeddings, or no inverted index available).
+- **Measure:** recall@k per arm and fused, sliced by query type, plus end-to-end answer quality with and
+  without the second arm.
+- **Start with RRF;** move to weighted fusion only with labeled data to tune it and a process to re-tune.
+- **Interviews:** explain why scores cannot be summed, how RRF rewards agreement, and where the reranker
+  sits.
 
 ## Role lens
 - **Engineer:** Implements both arms behind one retrieval interface, writes the RRF or normalized fusion

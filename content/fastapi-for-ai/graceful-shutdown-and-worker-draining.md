@@ -5,7 +5,7 @@ name: Graceful shutdown & worker draining
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/uvicorn-gunicorn-workers
@@ -22,98 +22,102 @@ sources:
 ---
 
 ## TL;DR
-Graceful shutdown means that when a worker is told to stop (SIGTERM on every deploy, scale-down or node
-drain), it stops receiving new traffic, lets in-flight requests finish, closes its resources, then exits.
-AI services make this hard because a single request can stream tokens for minutes while orchestrators
-give a default 30 seconds, so draining needs an explicit budget, a readiness flip, and a plan for work
-that cannot finish in time.
+On SIGTERM (every deploy, scale-down or drain) a worker stops taking traffic, finishes in-flight requests,
+closes resources and exits. LLM streams can outlast the default 30-second grace, so draining needs a
+budget, a readiness flip and a plan for unfinishable work.
 
 ## Why it exists
-Processes are stopped far more often than they crash: every rolling deploy, autoscaler scale-down, spot
-instance reclaim and node upgrade terminates workers that are busy. If a worker exits immediately, every
-open request dies mid-flight. For a CRUD API that is a few failed 50 ms calls which clients retry. For an
-LLM service it is a user watching an answer stop halfway after 40 seconds, an agent run losing several
-paid tool calls, or a document-ingestion request that already spent money on embeddings and now has to
-start over.
-
-The naive approaches fail in opposite directions. Killing immediately loses work. "Wait for everything to
-finish" with no bound blocks deploys forever when one client holds a stream open, and the orchestrator
-eventually sends SIGKILL anyway, which loses the work *and* skips cleanup. A third trap is ordering: on
-Kubernetes, the pod receiving SIGTERM and the load balancer removing it from its endpoints happen in
-parallel, so a worker that stops accepting connections at once still receives new requests for a short
-window and refuses them. Graceful shutdown is the protocol that sequences these steps deliberately.
+- **Processes are stopped far more often than they crash.** Every rolling deploy, autoscaler scale-down,
+  spot instance reclaim and node upgrade terminates workers that are busy.
+- **Exiting immediately kills open requests.** For a CRUD API that is a few failed 50 ms calls which
+  clients retry. For an LLM service it is an answer stopping halfway after 40 seconds, an agent run losing
+  several paid tool calls, or an ingestion request that already spent money on embeddings starting over.
+- **Unbounded waiting fails the other way.** One client holding a stream open blocks deploys forever, and
+  the orchestrator eventually sends SIGKILL anyway, losing the work *and* skipping cleanup.
+- **Ordering is a trap.** On Kubernetes, SIGTERM and load-balancer endpoint removal happen in parallel, so
+  a worker that stops accepting at once still receives new requests for a short window and refuses them.
+- **Graceful shutdown sequences these steps deliberately.**
 
 ## How it works
 ### The signals
-- **SIGTERM:** "please stop". Uvicorn and Gunicorn treat it as a graceful shutdown.
-- **SIGKILL:** sent by the orchestrator when the grace period expires. It cannot be caught; nothing after
-  it runs, including lifespan shutdown.
-- On Kubernetes, `terminationGracePeriodSeconds` (default 30) is the whole budget from the start of
-  termination to SIGKILL. The clock starts when the `preStop` hook starts (SIGTERM is sent only after the
-  hook returns), so the hook's duration is taken out of the same budget.
+| Signal | Meaning | Catchable |
+|---|---|---|
+| **SIGTERM** | "please stop"; Uvicorn and Gunicorn treat it as a graceful shutdown | yes |
+| **SIGKILL** | sent when the grace period expires; nothing after it runs, including lifespan shutdown | no |
+
+- **`terminationGracePeriodSeconds`** (default 30) is the whole budget from the start of termination to
+  SIGKILL.
+- **The clock starts when the `preStop` hook starts.** SIGTERM is sent only after the hook returns, so the
+  hook's duration comes out of the same budget.
 
 ### The sequence
-1. **Stop new traffic first.** A `preStop` hook (often a short sleep of a few seconds) delays SIGTERM so
-   endpoint controllers and load balancers stop routing to the pod before the process stops listening.
-   Kubernetes removes a terminating pod from Service endpoints on its own, but an external balancer
-   that polls `/readyz` does not know, and the app itself does not learn about SIGTERM until lifespan
-   shutdown, which runs only *after* draining. So the preStop hook can also tell the app it is draining
-   (for example a local `POST /internal/drain` that sets a flag): readiness then fails, and long streams
-   know a cutoff is coming. An in-memory flag is per process: with several workers in one pod, a single
-   request reaches only one of them, so either run one worker per pod or have the hook touch a file
-   (`/tmp/draining`) that every worker's readiness check reads.
+1. **Stop new traffic first.** A `preStop` hook (often a sleep of a few seconds) delays SIGTERM so endpoint
+   controllers and load balancers stop routing to the pod before the process stops listening.
+   - Kubernetes removes a terminating pod from Service endpoints on its own, but an external balancer that
+     polls `/readyz` does not know.
+   - The app does not learn about SIGTERM until lifespan shutdown, which runs only *after* draining.
+   - So the hook can also tell the app it is draining (for example a local `POST /internal/drain` that sets
+     a flag): readiness then fails, and long streams know a cutoff is coming.
+   - An in-memory flag is per process; with several workers in one pod, one request reaches only one of
+     them. Run one worker per pod, or have the hook touch a file (`/tmp/draining`) every worker's readiness
+     check reads.
 2. **Stop accepting, keep serving.** On SIGTERM, Uvicorn closes the listening socket, closes idle
-   keep-alive connections, and waits for in-flight requests to finish. `--timeout-graceful-shutdown`
-   bounds that wait; without it Uvicorn waits indefinitely and leaves the bound to SIGKILL. Under
-   Gunicorn, the master forwards the signal to workers and `--graceful-timeout` bounds their drain.
-3. **Run lifespan shutdown.** After requests drain, the code after `yield` in lifespan runs: close the
-   HTTP client pool, dispose the DB engine, flush telemetry exporters, release GPU memory.
+   keep-alive connections and waits for in-flight requests.
+   - `--timeout-graceful-shutdown` bounds that wait; without it Uvicorn waits indefinitely and leaves the
+     bound to SIGKILL.
+   - Under Gunicorn, the master forwards the signal and `--graceful-timeout` bounds the workers' drain.
+3. **Run lifespan shutdown.** After requests drain, the code after `yield` runs: close the HTTP client
+   pool, dispose the DB engine, flush telemetry exporters, release GPU memory.
 4. **Exit before SIGKILL**, with margin, so step 3 actually happens.
 
 ### The budget
 ```
 terminationGracePeriodSeconds ≥ preStop delay + longest request you intend to finish + cleanup time
 ```
-Set the server's own drain timeout to slightly less than the grace period minus preStop, so the server,
-not SIGKILL, decides what gets cut off and lifespan cleanup still runs.
+- Set the server's drain timeout slightly below the grace period minus preStop, so the server, not
+  SIGKILL, decides what gets cut off and lifespan cleanup still runs.
 
 ### Work that cannot finish
-Some requests should not be waited for: a 10-minute agent run or a stream that the client keeps open.
-Three strategies, in order of robustness:
-- **Move it out of the request.** Long jobs go to a durable queue; the API returns a job id and the
-  client polls or subscribes. The queue survives the worker.
-- **Make it resumable.** Persist progress (tokens generated, steps completed) and let the client reconnect
-  with an id, so a cut stream can continue elsewhere.
-- **End it cleanly.** Once the drain flag is set, a stream that will not finish inside the budget sends
-  a final event that says "reconnect" and closes, so the client retries rather than rendering a truncated
-  answer. This must happen before the server's drain timeout; after that the connection is just closed.
+Some requests should not be waited for: a 10-minute agent run, or a stream the client keeps open. Three
+strategies, in order of robustness:
+1. **Move it out of the request.** Long jobs go to a durable queue; the API returns a job id and the client
+   polls or subscribes. The queue survives the worker.
+2. **Make it resumable.** Persist progress (tokens generated, steps completed) and let the client reconnect
+   with an id, so a cut stream can continue elsewhere.
+3. **End it cleanly.** Once draining, a stream that will not finish inside the budget sends a final
+   "reconnect" event and closes, so the client retries instead of rendering a truncated answer. This must
+   happen before the server's drain timeout; after that the connection is just closed.
 
 ### Draining that is not pod termination
-The same drain happens inside a running pod. Gunicorn's `--max-requests` recycling and a `SIGHUP` reload
-both retire workers: the retiring worker stops accepting and finishes its in-flight requests within
-`--graceful-timeout` while the master starts a replacement, so siblings carry the load. With a single
-worker there are no siblings, so new connections wait in the socket backlog until the replacement has
-finished lifespan startup, which is a latency spike every few thousand requests if the model takes long to
-load. Cloud load balancers also drain on their own timer (an AWS ALB target group's deregistration delay
-defaults to 300 s): it should cover the server's drain timeout, and anything much longer only slows deploys.
+- **Recycling and reloads drain too.** Gunicorn's `--max-requests` recycling and a `SIGHUP` reload retire
+  workers: the retiring worker stops accepting and finishes in-flight requests within `--graceful-timeout`
+  while the master starts a replacement, so siblings carry the load.
+- **A single worker has no siblings.** New connections wait in the socket backlog until the replacement
+  finishes lifespan startup: a latency spike every few thousand requests if the model loads slowly.
+- **Cloud load balancers drain on their own timer.** An AWS ALB target group's deregistration delay
+  defaults to 300 s. It should cover the server's drain timeout; much longer only slows deploys.
 
 ### Containers
-The process must actually receive the signal. A Dockerfile `CMD` in shell form wraps the server in
-`/bin/sh -c`; the shell becomes PID 1 and does not forward SIGTERM to a child, so the server is SIGKILLed
-after the grace period with no drain at all. Some shells exec a single simple command directly, which
-hides the bug until someone adds `&&` or a second command, so do not rely on it. Use the exec form
-(`CMD ["uvicorn", ...]`), `exec` in an entrypoint script, or an init process such as tini.
+- **The process must actually receive the signal.** A Dockerfile `CMD` in shell form wraps the server in
+  `/bin/sh -c`; the shell becomes PID 1 and does not forward SIGTERM, so the server is SIGKILLed after the
+  grace period with no drain at all.
+- **Do not rely on shell luck.** Some shells exec a single simple command directly, hiding the bug until
+  someone adds `&&` or a second command.
+- **Fix:** exec form (`CMD ["uvicorn", ...]`), `exec` in an entrypoint script, or an init process such as
+  tini.
 
-## Example
-A timeline for an SSE chat service whose answers take up to 50 seconds, on a rolling deploy.
+## Examples
+### Worked timeline: SSE chat on a rolling deploy
+Answers take up to 50 seconds. **Defaults first:** grace 30 s, no preStop, Uvicorn waits indefinitely.
 
-Defaults first: grace 30 s, no preStop, Uvicorn waits indefinitely. At t=0 SIGTERM arrives while 12
-streams are open, the longest 10 s into a 50 s answer. Uvicorn stops listening, but the endpoint update
-lags, so a few new requests in the first second get connection refused. At t=30 the kubelet sends
-SIGKILL: streams with more than 30 s remaining are cut mid-sentence, and lifespan shutdown never runs, so
-buffered spans in the telemetry exporter are lost too, which is why the incident is hard to see.
+| t (s) | What happens |
+|---|---|
+| 0 | SIGTERM while 12 streams are open, the longest 10 s into a 50 s answer; Uvicorn stops listening |
+| 0-1 | endpoint update lags, so a few new requests get connection refused |
+| 30 | kubelet sends SIGKILL: streams with more than 30 s left are cut mid-sentence |
+| 30 | lifespan shutdown never runs, so buffered telemetry spans are lost, which is why the incident is hard to see |
 
-Fixed configuration (illustrative values):
+**Fixed configuration** (illustrative values):
 
 ```yaml
 spec:
@@ -128,44 +132,133 @@ spec:
             command: ["sh", "-c", "curl -s -X POST localhost:8000/internal/drain; sleep 5"]
 ```
 
-Now: t=0 preStop sets the drain flag (readiness now returns 503) and the pod is removed from
-endpoints while it still serves. t=5 SIGTERM reaches Uvicorn (exec form, PID 1), which stops accepting
-and drains. Streams that started before t=0 finish by about t=50. A rare outlier still running near its
-deadline sees the flag and sends `event: reconnect` before t=65, when Uvicorn would close it anyway. Lifespan closes clients and flushes telemetry by about t=67, eight seconds before SIGKILL.
+| t (s) | What happens |
+|---|---|
+| 0 | preStop sets the drain flag; readiness now returns 503; pod removed from endpoints while still serving |
+| 5 | SIGTERM reaches Uvicorn (exec form, PID 1), which stops accepting and drains |
+| about 50 | streams that started before t=0 finish |
+| before 65 | a rare outlier near its deadline sees the flag and sends `event: reconnect` (Uvicorn would close it at 65 anyway) |
+| about 67 | lifespan closes clients and flushes telemetry, eight seconds before SIGKILL at 75 |
+
 Answers longer than the budget are the signal to move that workload to a job queue.
 
+### App side: drain flag, readiness and a stream that ends cleanly
+The flag is a file so every worker in the pod sees it. Streams keep going after the flag flips and only
+send `reconnect` once they pass the cutoff, matching the timeline above.
+
+```python
+import asyncio, time
+from contextlib import asynccontextmanager
+from pathlib import Path
+import httpx
+from fastapi import FastAPI, Response
+from fastapi.responses import StreamingResponse
+
+DRAIN_FILE = Path("/tmp/draining")   # shared by every worker in the pod
+CUTOFF_S = 58                        # flag at t=0, Uvicorn closes at 5 + 60: leave margin
+
+def draining() -> bool:
+    return DRAIN_FILE.exists()
+
+def past_cutoff() -> bool:
+    try:
+        return time.time() - DRAIN_FILE.stat().st_mtime > CUTOFF_S
+    except FileNotFoundError:
+        return False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=30)
+    yield                                   # requests are served here
+    await app.state.http.aclose()           # runs only if the server exits before SIGKILL
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/internal/drain", include_in_schema=False)
+async def drain():
+    DRAIN_FILE.touch()
+    return {"draining": True}
+
+@app.get("/readyz")
+async def readyz(response: Response):
+    if draining():
+        response.status_code = 503
+    return {"ready": not draining()}
+
+async def tokens():                         # stand-in for a provider stream
+    for i in range(500):
+        await asyncio.sleep(0.1)
+        yield f"tok{i} "
+
+@app.get("/v1/chat/stream")
+async def chat_stream():
+    async def events():
+        async for tok in tokens():
+            if past_cutoff():
+                yield "event: reconnect\ndata: {}\n\n"
+                return
+            yield f"data: {tok}\n\n"
+        yield "event: done\ndata: {}\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
+## Production patterns
+- **Exec-form entrypoint, always.** Use `CMD ["uvicorn", ...]`, `exec uvicorn ...` in scripts, or tini as
+  PID 1. Monitor: termination duration per pod; shutdowns that take exactly the grace period mean the
+  signal never reached the server.
+- **Budget written down and checked in review.** Keep `terminationGracePeriodSeconds`, the preStop delay
+  and `--timeout-graceful-shutdown` (or Gunicorn's `--graceful-timeout`) next to each other in the
+  manifest and check grace ≥ preStop + drain + cleanup. Monitor: request-duration p99 against the drain
+  timeout, alerting when long requests approach it.
+- **Delay-only preStop without curl.** When the image is slim and only a delay is needed, use the built-in
+  sleep action on recent Kubernetes (`preStop: {sleep: {seconds: 5}}`), or a Python one-liner to call the
+  drain endpoint. Monitor: `FailedPreStopHook` events on pods.
+- **Align the load balancer's drain.** Set the target group deregistration delay (300 s by default on an
+  AWS ALB) just above the server's drain timeout rather than leaving the default. Monitor: deploy duration
+  and 502s at the balancer during rollouts.
+- **Record why each stream ended.** Count stream completions by reason (`done`, `reconnect`, client
+  disconnect, server error) as a metric. Monitor: `reconnect` and errors spiking at deploy time, which
+  says the budget or the workload placement is wrong.
+- **Long agent runs as durable jobs.** Anything that can exceed the budget or performs side effects runs
+  in a queue worker that checkpoints between tool calls. Monitor: jobs retried after worker termination
+  and duplicate side effects.
+
 ## Trade-offs
-- A long grace period lets long streams finish, but it slows rollouts and scale-downs proportionally;
-  past a minute or two, durable jobs or resumable streams are cheaper than waiting.
-- A `preStop` sleep prevents refused connections during endpoint propagation, but it adds its duration
-  to every pod termination and eats into the grace budget.
-- Bounding the server's drain timeout guarantees cleanup runs, but it deliberately cuts the longest
-  requests; flip to an unbounded wait only for workers with no streaming or long requests.
-- Making streams resumable avoids lost work on any shutdown, but it requires persisted generation state
-  and client support, which is only worth building when long generations are core to the product.
+- **Long grace vs rollout speed.** A long grace period lets long streams finish, but it slows rollouts and
+  scale-downs proportionally; past a minute or two, durable jobs or resumable streams are cheaper than
+  waiting.
+- **preStop sleep vs budget.** It prevents refused connections during endpoint propagation, but adds its
+  duration to every pod termination and eats into the grace budget.
+- **Bounded drain vs cut requests.** Bounding the server's drain timeout guarantees cleanup runs, but it
+  deliberately cuts the longest requests; flip to an unbounded wait only for workers with no streaming or
+  long requests.
+- **Resumable streams vs build cost.** They avoid lost work on any shutdown, but require persisted
+  generation state and client support, worth building only when long generations are core to the product.
 
 ## Pitfalls
-- Using shell-form `CMD` in the Dockerfile; the symptom is every shutdown taking exactly the grace period
-  and ending in SIGKILL, with no shutdown log lines from the app.
-- Leaving the server drain unbounded with a grace period shorter than the longest stream; the symptom is
-  lifespan cleanup that never runs, so telemetry from the last seconds is missing.
-- Skipping the preStop delay; the symptom is a burst of connection-refused or 502 errors at the start of
+- **Shell-form `CMD` in the Dockerfile.** Symptom: every shutdown takes exactly the grace period and ends
+  in SIGKILL, with no shutdown log lines from the app.
+- **Unbounded drain, grace shorter than the longest stream.** Symptom: lifespan cleanup never runs, so
+  telemetry from the last seconds is missing.
+- **Skipping the preStop delay.** Symptom: a burst of connection-refused or 502 errors at the start of
   every rolling deploy, even though shutdown itself looks clean.
-- Leaving readiness green during shutdown behind a balancer that polls it; the symptom is new requests
-  landing on a draining worker and failing or being cut a few seconds later.
-- A `preStop` exec hook that calls `curl` in a slim image that has no curl; the symptom is a
-  `FailedPreStopHook` event on the pod and a drain flag that never flips. Use a tool the image has (Python),
-  or the built-in `sleep` preStop action that recent Kubernetes versions provide when only a delay is needed.
-- Treating agent runs as ordinary requests; the symptom is half-completed side effects (tickets created,
+- **Readiness green during shutdown** behind a balancer that polls it. Symptom: new requests land on a
+  draining worker and fail or are cut a few seconds later.
+- **`curl` in a `preStop` exec hook on a slim image with no curl.** Symptom: a `FailedPreStopHook` event and
+  a drain flag that never flips. Fix: use a tool the image has (Python), or the built-in `sleep` preStop
+  action that recent Kubernetes versions provide when only a delay is needed.
+- **Agent runs treated as ordinary requests.** Symptom: half-completed side effects (tickets created,
   emails sent) with no record, because the run was killed between tool calls.
 
 ## When to use
-Every production service needs a deliberate shutdown, because deploys guarantee terminations. Calculate
-the budget from your actual request-duration distribution: if p99 is under a few seconds, defaults plus a
-preStop sleep and exec-form CMD are enough. If you stream LLM output, size the grace period to the longest
-answer you will wait for and bound the server's drain below it. If requests can run for minutes or
-perform side effects, move them to durable workers. Watch for 5xx and truncated streams around deploy
-times; in interviews, walking through the SIGTERM-to-SIGKILL timeline is the expected depth.
+Every production service needs a deliberate shutdown, because deploys guarantee terminations.
+- **Budget from data:** calculate it from your actual request-duration distribution.
+- **p99 under a few seconds:** defaults plus a preStop sleep and exec-form CMD are enough.
+- **Streaming LLM output:** size the grace period to the longest answer you will wait for and bound the
+  server's drain below it.
+- **Minutes-long requests or side effects:** move them to durable workers.
+- **Measure:** 5xx and truncated streams around deploy times.
+- **Interviews:** walking through the SIGTERM-to-SIGKILL timeline is the expected depth.
 
 ## Role lens
 - **Engineer:** Uses exec-form CMD, sets the drain timeout, flips readiness on shutdown, and writes the

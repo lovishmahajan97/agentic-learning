@@ -5,7 +5,7 @@ name: WebSockets
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/server-sent-events
   - fastapi-for-ai/streamingresponse
@@ -22,96 +22,130 @@ sources:
 ---
 
 ## TL;DR
-A WebSocket upgrades one HTTP connection into a persistent, full-duplex channel that carries framed
-text or binary messages in both directions. Reach for it when the client must talk *while* the server
-is streaming: interrupting a generation, two-way voice audio, agent sessions with mid-run approvals.
-The price is state: the connection is pinned to one process, authentication, reconnection and resume
-are hand-rolled, and every load balancer in the path must understand long-lived upgrades. For one-way
-token streaming, SSE is simpler.
+A WebSocket upgrades one HTTP connection into a persistent two-way channel. Use it when the client must
+talk while the server streams (stop buttons, voice, mid-run approvals); you pay in per-connection state,
+hand-rolled auth and resume. One-way streaming: use SSE.
 
 ## Why it exists
-HTTP is request then response. Once the client has sent its body it cannot say anything else on that
-exchange, and the server cannot push anything the client did not ask for. Two AI interactions break
-that model. The first is interruption: a user watching tokens arrive over SSE presses stop, and that
-stop must reach the task producing the tokens. Over HTTP it becomes a second request, which the load
-balancer may route to a different worker process, so now you need shared state (a Redis pub/sub
-channel, a cancel flag in a store) just to deliver one bit to one coroutine. The second is continuous
-two-way media: a voice agent receives audio frames every few tens of milliseconds while sending
-synthesized audio back. A request per frame is absurd in overhead and ordering; long-polling hacks add
-latency and complexity without removing either problem.
-
-The WebSocket protocol (RFC 6455) was designed for exactly this: a single TCP connection, established
-through an HTTP handshake so it passes existing infrastructure, after which both sides send messages
-with a two-to-fourteen-byte frame header and no further HTTP ceremony. Both AI needs map onto it
-directly: the stop message arrives on the same socket the tokens are leaving on, so it lands in the
-same process with no shared state, and audio travels as binary frames without base64. What you accept
-in exchange is that the connection, not the request, is now the unit of state.
+- **HTTP is request then response.** Once the client has sent its body it cannot say anything else on
+  that exchange, and the server cannot push anything the client did not ask for.
+- **Interruption breaks it.** A user watching SSE tokens presses stop; over HTTP that is a second request
+  the load balancer may route to a different worker, so you need shared state (a Redis pub/sub channel,
+  a cancel flag in a store) just to deliver one bit to one coroutine.
+- **Continuous two-way media breaks it.** A voice agent receives audio frames every few tens of
+  milliseconds while sending synthesized audio back. A request per frame is absurd in overhead and
+  ordering; long-polling hacks add latency and complexity without removing either problem.
+- **RFC 6455 was designed for this.** One TCP connection, established through an HTTP handshake so it
+  passes existing infrastructure, then messages in both directions with a two-to-fourteen-byte frame
+  header and no further HTTP ceremony.
+- **Both AI needs map directly.** The stop message arrives on the socket the tokens leave on, so it lands
+  in the same process with no shared state; audio travels as binary frames without base64. The cost: the
+  connection, not the request, is now the unit of state.
 
 ## How it works
 ### The handshake
-The client sends a GET with `Upgrade: websocket`, `Connection: Upgrade` and a random
-`Sec-WebSocket-Key`. The server answers `101 Switching Protocols` with `Sec-WebSocket-Accept`, a hash
-of the key and a fixed GUID that proves it understood the upgrade. From then on the bytes are frames,
-not HTTP. Two consequences follow from the handshake being a plain GET. Browsers cannot attach an
-`Authorization` header to it, because the JavaScript `WebSocket` API has no header option, so auth
-arrives via a cookie, a short-lived token in the query string (which lands in access logs), or a first
-message after connect that the server must receive before doing any work. And CORS does not protect
-it: if browsers are clients and cookies carry auth, check the `Origin` header yourself, otherwise any
-site can open a socket to your API with the user's cookies.
+1. Client sends a GET with `Upgrade: websocket`, `Connection: Upgrade` and a random `Sec-WebSocket-Key`.
+2. Server answers `101 Switching Protocols` with `Sec-WebSocket-Accept`, a hash of the key and a fixed
+   GUID that proves it understood the upgrade.
+3. From then on the bytes are frames, not HTTP.
+
+Because the handshake is a plain GET:
+- **No `Authorization` header from browsers.** The JavaScript `WebSocket` API has no header option, so
+  auth arrives via a cookie, a short-lived token in the query string (which lands in access logs), or a
+  first message after connect that the server must receive before doing any work.
+- **CORS does not protect it.** If browsers are clients and cookies carry auth, check the `Origin` header
+  yourself, otherwise any site can open a socket to your API with the user's cookies.
 
 ### Frames, messages and closes
-Messages are text (must be valid UTF-8) or binary. Control frames carry ping/pong, which servers use to
-detect dead peers, and close, which carries a code: 1000 normal, 1001 going away (server shutting
-down), 1008 policy violation (a common choice for auth failures), 1011 internal error. Uvicorn exposes
-the knobs: `--ws-max-size` caps a message (default 16 MiB), and `--ws-ping-interval` /
-`--ws-ping-timeout` (20 seconds each by default) decide how quickly a silent, dead client is dropped.
-Uvicorn needs the `websockets` or `wsproto` package for WebSocket support, which `uvicorn[standard]`
-installs.
+- **Messages** are text (must be valid UTF-8) or binary.
+- **Control frames** carry ping/pong, which servers use to detect dead peers, and close, which carries a code.
+
+| Close code | Meaning |
+|---|---|
+| 1000 | normal |
+| 1001 | going away (server shutting down) |
+| 1008 | policy violation (a common choice for auth failures) |
+| 1011 | internal error |
+
+| Uvicorn knob | Default | Effect |
+|---|---|---|
+| `--ws-max-size` | 16 MiB | caps a message |
+| `--ws-ping-interval` / `--ws-ping-timeout` | 20 seconds each | how quickly a silent, dead client is dropped |
+| `--ws-max-queue` | 32 | bounded incoming-message queue (see Backpressure) |
+
+Uvicorn needs the `websockets` or `wsproto` package for WebSocket support, which `uvicorn[standard]` installs.
 
 ### ASGI and FastAPI
-A WebSocket arrives as a scope of type `websocket`. The app receives `websocket.connect`, answers with
-`websocket.accept` (or `websocket.close` to refuse, which the server turns into an HTTP 403 before
-upgrade), then exchanges `websocket.receive` and `websocket.send` until `websocket.disconnect`.
-FastAPI wraps this: `@app.websocket("/ws")`, a `WebSocket` parameter, `await websocket.accept()`,
-`receive_text/json/bytes` and `send_text/json/bytes`, and a `WebSocketDisconnect` exception when the
-peer closes. Dependencies, path and query parameters, cookies and headers all work in WebSocket routes.
-`HTTPException` does not fit a connection that is no longer HTTP; raise `WebSocketException(code=...)`
-from a dependency instead, and FastAPI closes with that code. Note where in the lifecycle you are: a
-close *before* `accept()` never reaches the browser as a WebSocket close code, because no WebSocket
-exists yet; the server rejects the upgrade with HTTP 403 and the browser's `close` event reports the
-generic 1006 (abnormal closure). Reject before accept when you want unauthenticated clients to cost
-nothing; accept first and then close with 1008 or a 4000-range application code when the client needs
-to know *why*, for example to refresh its token instead of retrying blindly.
+1. A WebSocket arrives as a scope of type `websocket`.
+2. The app receives `websocket.connect` and answers `websocket.accept`, or `websocket.close` to refuse
+   (the server turns that into an HTTP 403 before upgrade).
+3. Then `websocket.receive` and `websocket.send` until `websocket.disconnect`.
+
+FastAPI wraps this:
+- **Route and calls:** `@app.websocket("/ws")`, a `WebSocket` parameter, `await websocket.accept()`,
+  `receive_text/json/bytes`, `send_text/json/bytes`, and `WebSocketDisconnect` when the peer closes.
+- **Dependencies work**, as do path and query parameters, cookies and headers.
+- **Errors:** `HTTPException` does not fit a connection that is no longer HTTP; raise
+  `WebSocketException(code=...)` from a dependency and FastAPI closes with that code.
+
+### Reject before accept, or close after?
+| Choice | What the browser sees | Use when |
+|---|---|---|
+| Close *before* `accept()` | HTTP 403 on the upgrade; the `close` event reports the generic 1006 (abnormal closure), because no WebSocket exists yet | unauthenticated clients should cost nothing |
+| Accept, then close with 1008 or a 4000-range application code | the real code | the client needs to know *why*, e.g. to refresh its token instead of retrying blindly |
 
 ### Concurrency inside the handler
-A handler is one coroutine. If it awaits `receive_json()` it is not producing tokens, and if it is
-iterating the model stream it is not listening, so a sequential loop can never implement interruption.
-The pattern is two concurrent activities: a reader loop that handles incoming messages, and a
-generation task started with `asyncio.create_task` that the reader can signal (an `asyncio.Event`) or
-cancel. Funnel all outgoing sends through one place, for example the generation task or a single
-sender task fed by a queue, so two tasks never interleave frames.
+- **One coroutine cannot do both.** Awaiting `receive_json()` means not producing tokens; iterating the
+  model stream means not listening. A sequential loop can never implement interruption.
+- **Two activities:** a reader loop for incoming messages, and a generation task from
+  `asyncio.create_task` that the reader can signal (an `asyncio.Event`) or cancel.
+- **One sender.** Funnel all outgoing sends through one place (the generation task, or a single sender
+  task fed by a queue), so two tasks never interleave frames.
 
 ### Scaling and state
-The socket lives in one worker process. Messages from the client reach that process for free, which is
-the point, but anything originating elsewhere (a job finishing on a worker machine, a message from
-another user) must be fanned out to the process holding the socket, usually through Redis pub/sub.
-Load balancers must allow upgrades and keep long idle connections alive; many default to about a
-minute of idle time, so application-level pings matter. Rolling deploys must close sockets deliberately
-(code 1001) and clients must reconnect and resume, which means you design a session id and sequence
-numbers yourself: there is no `Last-Event-ID` equivalent.
+- **The socket lives in one worker process.** Client messages reach it for free, which is the point.
+- **Everything else needs fan-out.** A job finishing on a worker machine or a message from another user
+  must reach the process holding the socket, usually through Redis pub/sub.
+- **Load balancers** must allow upgrades and keep long idle connections; many default to about a minute
+  of idle time, so application-level pings matter.
+- **Rolling deploys** must close sockets deliberately (code 1001), and clients must reconnect and resume.
+  You design the session id and sequence numbers yourself: there is no `Last-Event-ID` equivalent.
 
 ### Backpressure
-With uvicorn's protocol implementations, `await websocket.send_text()` waits when the peer reads
-slowly and the transport's write buffer passes its high-water mark, which throttles the generation
-loop, exactly what you want. Sending with fire-and-forget tasks removes that coupling and lets memory
-grow without bound. On the receive side the `websockets`-based implementation keeps a bounded queue of
-incoming messages (uvicorn's `--ws-max-queue`, default 32) and stops reading from the socket when it
-is full, so TCP pushes back on the sender; check your implementation before relying on it.
+- **Send side:** with uvicorn's implementations, `await websocket.send_text()` waits when the peer reads
+  slowly and the write buffer passes its high-water mark, throttling the generation loop, exactly what
+  you want.
+- **Fire-and-forget sends break this.** Sending from detached tasks removes the coupling and lets memory
+  grow without bound.
+- **Receive side:** the `websockets`-based implementation keeps a bounded incoming queue
+  (`--ws-max-queue`, default 32) and stops reading when it is full, so TCP pushes back on the sender.
+  Check your implementation before relying on it.
 
-## Example
-A chat socket where the server streams tokens from a generation task while the reader loop stays free
-to receive a `stop` message, which interrupts the current answer. Auth is a query token because the
-browser cannot send headers on the upgrade.
+## Diagram
+After the 101 upgrade, a reader loop and a generation task run side by side in one process, so a stop
+message reaches the generator without any shared store.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant R as Reader loop
+    participant G as Generation task
+    B->>R: GET /ws with Upgrade websocket
+    Note over R: auth dependency and Origin check before accept
+    R->>B: 101 Switching Protocols
+    B->>R: prompt message
+    R->>G: asyncio.create_task(generate)
+    G->>B: token frames (single sender)
+    B->>R: stop message
+    R->>G: cancel or set asyncio.Event
+    G->>B: done frame
+    R->>B: close 1000 normal (or 1001 on deploy)
+```
+
+## Examples
+### Interruptible chat socket
+The server streams tokens from a generation task while the reader loop stays free to receive `stop`.
+Auth is a query token because the browser cannot send headers on the upgrade.
 
 ```python
 import asyncio
@@ -153,47 +187,106 @@ async def chat(ws: WebSocket, token: str):           # ?token=... (short-lived);
             task.cancel()                             # client gone: stop paying for tokens
 ```
 
+### Cross-process delivery with Redis pub/sub
+A background worker on another machine finishes a job; the process holding the user's socket must
+forward it. The relay feeds the connection's single outgoing queue instead of calling `send` itself.
+
+```python
+import asyncio
+import redis.asyncio as redis
+
+r = redis.Redis()
+
+async def relay(session_id: str, outbox: asyncio.Queue):
+    """Subscribe to this session's channel and hand messages to the one sender task."""
+    pubsub = r.pubsub()
+    await pubsub.subscribe(f"session:{session_id}")
+    try:
+        async for msg in pubsub.listen():
+            if msg["type"] == "message":            # skip subscribe confirmations
+                await outbox.put(msg["data"])        # the sender task does ws.send_bytes / send_text
+    finally:
+        await pubsub.unsubscribe(f"session:{session_id}")
+
+# In the worker process, wherever the job completes:
+#   await r.publish(f"session:{session_id}", b'{"type": "job_done"}')
+# Pub/sub is fire-and-forget: if no process is subscribed (socket mid-reconnect), the message is lost,
+# so also persist results where the reconnecting client can fetch them.
+```
+
+### Worked scenario: how long until a dead client is noticed?
+Uvicorn defaults, and an illustrative load balancer with a 60 s idle timeout.
+
+| Event | Time | Mechanism |
+|---|---|---|
+| Phone loses signal, no TCP close sent | t = 0 | socket looks open to the server |
+| Next server ping | within 20 s | `--ws-ping-interval` |
+| No pong arrives | up to a further 20 s | `--ws-ping-timeout` |
+| Server closes, handler gets `WebSocketDisconnect` | ≤ ~40 s | `finally` cancels the generation task |
+| Without pings, a silent socket | until the LB's 60 s idle cut, or never | model may stream to nobody the whole time |
+
+Pings every 20 s also keep a healthy-but-quiet socket under that 60 s idle timeout.
+
+## Production patterns
+- **Choose the rejection point deliberately.** Verify the token in a dependency and raise
+  `WebSocketException(code=status.WS_1008_POLICY_VIOLATION)` before `accept()` for unknown clients; for
+  expired tokens, accept and close with a 4000-range code the client maps to "refresh". Monitor 1006
+  versus 4xxx closes and reconnect loops.
+- **Check `Origin` with cookie auth.** Compare `ws.headers.get("origin")` with an allowlist before
+  `accept()`, because CORS does not apply to the upgrade. Monitor rejected origins.
+- **Tune pings below the shortest idle timeout.** Keep `--ws-ping-interval` well under the load balancer
+  idle timeout and size `--ws-ping-timeout` for mobile networks. Monitor open sockets per process and
+  time from last message to disconnect.
+- **Drain sockets on deploy.** On shutdown, close every socket with 1001; clients reconnect with
+  jittered backoff, sending their session id and last sequence number. Bound shutdown with uvicorn's
+  `--timeout-graceful-shutdown`. Monitor reconnect success rate during deploys.
+- **One sender per connection.** Route generation output, pub/sub relays and heartbeats through one
+  `asyncio.Queue` drained by a single task. Monitor queue depth per connection and "Cannot call send"
+  errors.
+- **Lower `--ws-max-size` for text-only routes.** A 16 MiB default is generous for chat JSON; set it to
+  what your largest legitimate message needs. Monitor closes caused by oversize messages.
+
 ## Trade-offs
-- Full-duplex messaging with tiny per-message overhead, but the connection is stateful and pinned to a
-  process, so cross-process delivery needs pub/sub; when traffic is one-way the statelessness of SSE
-  is worth more than the duplex channel.
-- Binary frames carry audio and images without base64's roughly one-third size overhead, but you
-  must define your own message typing and framing on top; for JSON-only, server-to-client protocols
-  that freedom buys nothing over SSE's built-in `event:` and `id:` fields.
-- One long-lived connection avoids a handshake and auth check per message, but thousands of idle
-  sockets each hold memory and a slot in load balancers and worker processes, and shutdowns become a
-  coordination problem instead of waiting for in-flight requests to finish.
-- No built-in reconnection or resume means you design session ids and sequence numbers, which is more
-  work than SSE's `Last-Event-ID` but also lets you resume with arbitrary semantics.
+- **Full duplex vs pinned state.** Tiny per-message overhead, but the connection is stateful and pinned to
+  a process, so cross-process delivery needs pub/sub; when traffic is one-way, SSE's statelessness is
+  worth more than the duplex channel.
+- **Binary frames vs DIY framing.** Audio and images travel without base64's roughly one-third size
+  overhead, but you must define your own message typing and framing; for JSON-only server-to-client
+  protocols that buys nothing over SSE's built-in `event:` and `id:` fields.
+- **One handshake vs idle cost.** One long-lived connection avoids a handshake and auth check per
+  message, but thousands of idle sockets each hold memory and a slot in load balancers and workers, and
+  shutdowns become coordination instead of waiting for in-flight requests.
+- **No built-in resume vs arbitrary resume.** You design session ids and sequence numbers, more work than
+  SSE's `Last-Event-ID`, but you can resume with arbitrary semantics.
 
 ## Pitfalls
-- A sequential handler that awaits `receive` and then generates; the symptom is a stop button that only
-  takes effect after the answer has finished.
-- Putting a long-lived credential in the query string; the symptom is secrets in access logs and proxy
-  logs, which is why upgrade tokens must be short-lived or auth must happen in the first message.
-- An ingress not configured for upgrades or with a short idle timeout; the symptom is 400 or 502 on
-  connect, or every socket dying after exactly the same number of silent seconds.
-- Raising `HTTPException` in a WebSocket route or dependency; the symptom is an unhelpful 500 or an
-  abrupt close instead of a meaningful close code.
-- Expecting the browser to see your auth close code when you reject before `accept()`; the symptom is a
-  client that only ever sees 1006 and retries in a tight loop instead of refreshing its credentials.
-- Sending from several tasks or with fire-and-forget `create_task`; the symptom is messages arriving
-  in an order no single task produced (a `done` before the last token),
-  `RuntimeError: Cannot call "send" once a close message has been sent`, or memory growth with slow
-  clients.
-- Not cancelling the generation task on `WebSocketDisconnect`; the symptom is model spend continuing
-  after users close the tab, visible as a gap between tokens billed and tokens delivered.
-- Skipping the `Origin` check with cookie auth; the symptom is cross-site WebSocket hijacking found by
-  the first security review.
+- **A sequential handler that awaits `receive` then generates.** Symptom: the stop button only takes
+  effect after the answer has finished. Fix: reader loop plus generation task.
+- **A long-lived credential in the query string.** Symptom: secrets in access and proxy logs. Fix:
+  short-lived upgrade tokens, or auth in the first message.
+- **Ingress not configured for upgrades, or a short idle timeout.** Symptom: 400 or 502 on connect, or
+  every socket dying after exactly the same number of silent seconds.
+- **Raising `HTTPException` in a WebSocket route or dependency.** Symptom: an unhelpful 500 or abrupt
+  close instead of a meaningful close code. Fix: `WebSocketException`.
+- **Expecting the browser to see your close code when you reject before `accept()`.** Symptom: the client
+  only ever sees 1006 and retries in a tight loop instead of refreshing credentials.
+- **Sending from several tasks or fire-and-forget `create_task`.** Symptom: messages in an order no single
+  task produced (a `done` before the last token),
+  `RuntimeError: Cannot call "send" once a close message has been sent`, or memory growth with slow clients.
+- **Not cancelling the generation task on `WebSocketDisconnect`.** Symptom: model spend continues after
+  users close the tab, visible as a gap between tokens billed and tokens delivered.
+- **Skipping the `Origin` check with cookie auth.** Symptom: cross-site WebSocket hijacking found by the
+  first security review.
 
 ## When to use
-Choose WebSockets when the client must send during the server's stream: interrupt or steer a running
-generation, voice and other continuous media, interactive agent sessions where a human approves tool
-calls mid-run, and multi-party rooms. Choose SSE when the server talks and the client listens, which
-is most chat products. Measure connection counts per process, message latency in both directions, time
-to detect dead peers, and reconnect success rate during deploys. Interviewers probe whether you know
-why auth is awkward on the handshake, how to make a handler both read and write concurrently, and
-what breaks when you scale from one process to many.
+- **Use when** the client must send during the server's stream: interrupt or steer a running generation,
+  voice and other continuous media, interactive agent sessions where a human approves tool calls mid-run,
+  multi-party rooms.
+- **Avoid when** the server talks and the client listens, which is most chat products; choose SSE.
+- **Measure** connection counts per process, message latency in both directions, time to detect dead
+  peers, and reconnect success rate during deploys.
+- **Interviews:** why auth is awkward on the handshake, how a handler reads and writes concurrently, and
+  what breaks when you scale from one process to many.
 
 ## Role lens
 - **Engineer:** Writes handlers with a reader loop and a cancellable generation task, chooses close
@@ -214,6 +307,42 @@ socket as the tokens, so cancellation is local, but you take on handshake auth, 
 reconnection and resume, ingress configuration and shutdown handling. For a text chat whose only
 client input is stop, I keep SSE and add the Redis-backed cancel, and I move to WebSockets only if the
 product also needs voice or continuous client input.
+
+## Interview questions
+### What does a WebSocket give you that an HTTP response stream does not?
+- **Two-way messages on one connection.** After a GET handshake answered with `101 Switching Protocols`,
+  both sides send frames with a two-to-fourteen-byte header and no further HTTP ceremony.
+- **So client input lands in the same process.** A stop message or an audio frame arrives on the socket
+  the tokens leave on, with no cross-worker shared state.
+
+### How do you authenticate a browser WebSocket, given it cannot send an Authorization header?
+- **Pick a carrier:** a cookie, a short-lived upgrade token in the query string (never a long-lived one,
+  because it lands in access logs), or a first message the server requires before doing any work.
+- **Check `Origin` with cookie auth,** because CORS does not protect the upgrade and any site could open
+  a socket with the user's cookies.
+- **Decide where to reject:** before `accept()` the browser only sees 1006; after `accept()` a 1008 or
+  4000-range code tells the client to refresh its token.
+
+### Users press stop, but the answer keeps streaming to the end. What is wrong with the handler?
+- **It is sequential.** It awaits `receive_json()`, then iterates the model stream, so nothing reads the
+  socket while tokens are produced.
+- **Fix:** a reader loop plus a generation task from `asyncio.create_task`, cancelled or signalled via an
+  `asyncio.Event`, with all sends through one sender so frames never interleave.
+- **Also cancel on `WebSocketDisconnect`,** otherwise model spend continues after the tab closes.
+
+### When would you not use WebSockets for an AI chat?
+- **When the client only listens,** which is most chat products: SSE keeps stateless HTTP, built-in
+  `event:` and `id:` fields and `Last-Event-ID` resume.
+- **When stop is the only client input,** a cancel endpoint plus a Redis flag is less work than handshake
+  auth, origin checks, reconnect, resume and deploy draining.
+
+### What changes when you go from one uvicorn process to many behind a load balancer?
+- **The socket is pinned to one process,** so events produced elsewhere (a worker finishing a job,
+  another user in a room) need fan-out, usually Redis pub/sub.
+- **The ingress must allow upgrades and long idle connections;** many default to about a minute idle, so
+  keep `--ws-ping-interval` (default 20 seconds) below it.
+- **Deploys become coordination:** close with 1001, and clients reconnect with backoff using a session id
+  and sequence number you designed.
 
 ## Quiz
 ### Q: Why can a browser not send an Authorization header on the WebSocket handshake?

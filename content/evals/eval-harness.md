@@ -5,7 +5,7 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - evals/golden-dataset
   - evals/llm-as-a-judge
@@ -21,30 +21,24 @@ sources:
 ---
 
 ## TL;DR
-An eval harness is the code that takes a versioned dataset, runs every item through the system under
-test with pinned configuration, grades the raw outputs, aggregates scores per slice with confidence
-intervals, and writes a report that can be compared with any previous run. It exists because
-evaluation done in notebooks is not repeatable, so Tuesday's number cannot be compared with Friday's;
-the harness is what turns evaluation into an engineering artifact with the status of a test suite.
+An eval harness runs a versioned dataset through the system under test with pinned configuration,
+grades stored outputs, and reports per-slice scores with intervals. It turns notebook evaluation into a
+repeatable artifact with the status of a test suite.
 
 ## Why it exists
-The first eval most teams run is a for-loop in a notebook: iterate over a CSV, call the model, eyeball
-the outputs, maybe count passes. It works once. The second time, the prompt has changed, the
-temperature was different, half the calls hit a rate limit and were silently skipped, the raw outputs
-were overwritten, and nobody can say whether the new 83% is better than the old 80% or just a
-different 80%. The problem is not the loop; it is everything the loop does not record.
-
-Three specific failures force the harness into existence. *Non-reproducibility*: without pinned model
-id, prompt hash, sampling parameters, dataset version and grader version, a score cannot be attributed
-to a change. *Lost evidence*: if only the aggregate is kept, you cannot re-grade when the rubric
-improves, cannot inspect the twelve items that regressed, and cannot show a stakeholder a concrete
-failure. *Operational fragility*: hundreds of LLM calls hit rate limits, timeouts and transient errors;
-a loop that drops them biases the score toward whichever items happened to succeed.
-
-The naive alternative, "just be careful", does not survive a team. Two engineers running the same
-notebook will get numbers that differ for reasons neither can explain. A harness makes carefulness
-structural: the same inputs, the same configuration and the same graders, every time, with everything
-written down.
+- **The notebook loop works once.** Iterate over a CSV, call the model, eyeball outputs, count passes.
+  The second time, the prompt changed, the temperature differed, half the calls hit a rate limit and
+  were silently skipped, and the raw outputs were overwritten. Nobody can say whether the new 83% beats
+  the old 80% or is just a different 80%. The problem is everything the loop does not record.
+- **Non-reproducibility.** Without pinned model id, prompt hash, sampling parameters, dataset version
+  and grader version, a score cannot be attributed to a change.
+- **Lost evidence.** If only the aggregate is kept, you cannot re-grade when the rubric improves,
+  inspect the twelve items that regressed, or show a stakeholder a concrete failure.
+- **Operational fragility.** Hundreds of LLM calls hit rate limits, timeouts and transient errors; a
+  loop that drops them biases the score toward whichever items happened to succeed.
+- **"Just be careful" does not survive a team.** Two engineers running the same notebook get numbers
+  that differ for reasons neither can explain. A harness makes carefulness structural: same inputs,
+  configuration and graders every time, with everything written down.
 
 ## How it works
 ### The components
@@ -52,80 +46,95 @@ written down.
 dataset (versioned) → target adapter → runner → raw outputs (stored) → graders → scores → aggregator → report + gate
 ```
 
-- **Dataset loader.** Reads a specific version of the golden dataset and records its hash, *because*
-  a changed dataset changes the metric.
-- **Target adapter.** Wraps the system under test behind one function, `run(item) -> output`. The
-  harness does not know whether that is a single prompt, a RAG chain or a multi-step agent, *because*
-  the harness should outlive any one architecture.
-- **Runner.** Executes items concurrently with retries, backoff and timeouts; caches results keyed by
-  (configuration hash, item id) so a re-run after a grader change costs nothing; samples each item
-  *k* times when temperature is above zero, *because* a single sample of a stochastic system is a coin
-  flip, not a measurement.
-- **Raw output store.** Every output is written, with the request, latency, token counts and cost,
-  before any grading happens. Running is expensive; grading is cheap and changes often, so the two are
-  separated.
-- **Graders.** Pluggable: deterministic checks (schema, exact, regex, unit tests), LLM judges with their
-  own pinned model and prompt version, and a queue for human review. Grader version is recorded with the
-  score, *because* a grader change can move a score without any change to the system.
-- **Aggregator.** Pass rate per slice with a confidence interval, plus latency percentiles and cost
-  per item. Quality is one of three axes; a harness that reports only accuracy hides the trade-off.
-- **Reporter and gate.** A run manifest (who, when, every pinned value) and a comparison against a
-  baseline run: which items flipped, in which direction, in which slice. A gate turns thresholds into
-  an exit code so CI can block a merge.
+| Component | What it does | Because |
+|---|---|---|
+| **Dataset loader** | Reads a specific version of the golden dataset and records its hash | A changed dataset changes the metric |
+| **Target adapter** | Wraps the system under test behind one function, `run(item) -> output`; it may be a single prompt, a RAG chain or a multi-step agent | The harness should outlive any one architecture |
+| **Runner** | Concurrent execution with retries, backoff and timeouts; caches by (configuration hash, item id) so a re-run after a grader change costs nothing; samples each item *k* times above temperature zero | A single sample of a stochastic system is a coin flip, not a measurement |
+| **Raw output store** | Writes every output with the request, latency, token counts and cost, before any grading | Running is expensive; grading is cheap and changes often, so they are separated |
+| **Graders** | Pluggable: deterministic checks (schema, exact, regex, unit tests), LLM judges with their own pinned model and prompt version, a human-review queue; grader version recorded with the score | A grader change can move a score without any change to the system |
+| **Aggregator** | Pass rate per slice with a confidence interval, plus latency percentiles and cost per item | Quality is one of three axes; accuracy alone hides the trade-off |
+| **Reporter and gate** | Run manifest (who, when, every pinned value) and a comparison with a baseline: which items flipped, which direction, which slice; thresholds become an exit code | CI can block a merge |
 
 ### Design choices and their reasons
-*Pin everything in a manifest.* Model id, prompt text hash, temperature, seed, max tokens, retrieval
-index version, dataset version, grader versions, git SHA. A diff between two manifests should explain
-any diff between two scores.
+- **Pin everything in a manifest.** Model id, prompt text hash, temperature, seed, max tokens,
+  retrieval index version, dataset version, grader versions, git SHA. A diff between two manifests
+  should explain any diff between two scores.
+- **Compare paired, not averaged.** Both runs use the same items, so the harness lists flipped items. A
+  net +15 of 300 with 27 gains and 12 losses says far more than "78% → 83%", and the 12 losses are
+  where the next bug lives.
+- **Fail loudly on dropped items.** An errored item is reported as an error, not excluded, and the
+  summary says how many; a quiet 5% drop rate is a biased score.
+- **Make subsets cheap.** Same code path, different selectors:
 
-*Compare paired, not averaged.* Because both runs use the same items, the harness can list flipped
-items; a net +15 of 300 with 27 gains and 12 losses is far more informative than "78% → 83%", and the
-12 losses are where the next bug lives.
+| Run | Scope | Samples |
+|---|---|---|
+| Pull request | 50 items, minutes | 1 |
+| Nightly | Everything | 1 or more |
+| Release | Everything | *k* = 5 per item |
 
-*Fail loudly on dropped items.* An item that errored is reported as an error, not excluded, and the
-summary says how many; a quiet 5% drop rate is a biased score.
-
-*Make it cheap to run a subset.* A PR run on 50 items in minutes, a nightly run on everything, a
-release run with *k* = 5 samples per item. The same code path, different selectors.
-
-*Do not assume temperature 0 is deterministic.* Hosted models often return different text for the
-same request at temperature 0 (batching and floating-point effects on the server, silent snapshot
-updates), and many APIs treat a seed as best-effort. Measure it: run the baseline twice with no change
-and count the items that flip. That flip count is the harness's noise floor, and any later change that
-flips no more items than that has not been shown to do anything.
-
-*Key the cache on everything that can change the output.* Configuration hash, item id *and* sample
-index, so that *k* samples are *k* distinct cache entries rather than one output read back *k* times.
+- **Do not assume temperature 0 is deterministic.** Hosted models often return different text for the
+  same request at temperature 0 (batching and floating-point effects on the server, silent snapshot
+  updates), and many APIs treat a seed as best-effort.
+- **Measure the noise floor.** Run the baseline twice with no change and count items that flip. A later
+  change that flips no more items than that has not been shown to do anything.
+- **Key the cache on everything that can change the output.** Configuration hash, item id *and* sample
+  index, so *k* samples are *k* distinct cache entries, not one output read back *k* times.
 
 ### Harnesses for agents and multi-step systems
-An agent changes the shape of `run(item)`. Each item needs an environment: a sandboxed filesystem,
-a seeded database, mocked or recorded tools. The environment is created fresh per item and torn down
-afterwards, *because* state left by one item (a file written, a row deleted) silently changes the next
-item's starting point. Grading usually inspects the *final state* rather than the final message (did
-the ticket get the right status, do the repository's tests pass), since many different action
-sequences are correct. The full trajectory (every tool call, argument and result) is stored with the
-output, *because* when an agent fails, the step where it went wrong is the evidence. And every run
-carries budgets, maximum steps, tokens and wall-clock time, so that a looping agent becomes a recorded
-failure instead of a hung CI job.
+An agent changes the shape of `run(item)`:
+- **Environment per item.** A sandboxed filesystem, a seeded database, mocked or recorded tools,
+  created fresh per item and torn down afterwards, *because* state left by one item (a file written, a
+  row deleted) silently changes the next item's starting point.
+- **Grade the final state,** not the final message (did the ticket get the right status, do the
+  repository's tests pass), since many different action sequences are correct.
+- **Store the full trajectory** (every tool call, argument and result) with the output, *because* when
+  an agent fails, the step where it went wrong is the evidence.
+- **Budgets on every run:** maximum steps, tokens and wall-clock time, so a looping agent becomes a
+  recorded failure instead of a hung CI job.
 
 ### Capability harnesses versus application harnesses
-Frameworks such as EleutherAI's lm-evaluation-harness and Inspect standardize prompting and scoring
-for public benchmarks, so that an MMLU number from one lab is comparable with another's. Application
-harnesses (hosted products, open-source libraries or a few hundred lines you own) point at your
-dataset and your graders. The structure is identical; the difference is who owns the dataset and the
-grading rules. The tooling lesson in this module compares the options.
+- **Capability harnesses** such as EleutherAI's lm-evaluation-harness and Inspect standardize prompting
+  and scoring for public benchmarks, so an MMLU number from one lab is comparable with another's.
+- **Application harnesses** (hosted products, open-source libraries or a few hundred lines you own)
+  point at your dataset and your graders.
+- **Same structure;** the difference is who owns the dataset and the grading rules. The tooling lesson
+  in this module compares the options.
 
 ### Integration with the delivery pipeline
-The harness runs in CI like tests: a fast subset on every pull request that touches a prompt, chain or
-retrieval config, a full run nightly or before a release, with results stored so trends are visible.
-Thresholds come from task-specific acceptance criteria. Flaky items (those that flip between samples
-with no change) are tracked separately rather than letting them block merges, and their count is
-itself a quality signal.
+- **Runs in CI like tests:** a fast subset on every pull request that touches a prompt, chain or
+  retrieval config; a full run nightly or before a release; results stored so trends are visible.
+- **Thresholds** come from task-specific acceptance criteria.
+- **Flaky items** (those that flip between samples with no change) are tracked separately rather than
+  blocking merges, and their count is itself a quality signal.
 
-## Example
-A minimal harness in one file: a run manifest, concurrent execution with retries, stored raw outputs,
-pluggable graders, and a per-slice summary with a Wilson confidence interval. `target`
-is any callable, so the same code evaluates a prompt or an agent.
+## Diagram
+One CI run end to end: note that raw outputs are stored before grading, so graders can be re-run without
+calling the system again.
+
+```mermaid
+sequenceDiagram
+    participant CI as CI job
+    participant H as Harness runner
+    participant T as Target adapter
+    participant S as Raw output store
+    participant G as Graders
+    CI->>H: run subset with pinned manifest
+    H->>H: load dataset version and record its hash
+    H->>T: run(item) k times, with retries and timeouts
+    T-->>H: output, latency, tokens, cost or error
+    H->>S: write every output and every error
+    H->>G: grade stored outputs with versioned graders
+    G-->>H: verdicts per item
+    H->>H: per-slice pass rate with interval, paired diff vs baseline
+    H-->>CI: exit code from thresholds and slice floors
+```
+
+## Examples
+### A minimal harness in one file
+A run manifest, concurrent execution with retries, stored raw outputs, pluggable graders, and a
+per-slice summary with a Wilson confidence interval. `target` is any callable, so the same code
+evaluates a prompt or an agent.
 
 ```python
 import hashlib, json, math, time
@@ -183,46 +192,111 @@ def wilson(k, n, z=1.96):          # stays sane at 10/10 or 0/10, where the norm
 # e.g. {'billing': {'n': 60, 'pass': 0.817, 'ci95': (0.701, 0.894), 'errors': 0}, ...}
 ```
 
-The report line for `billing` says what the run can decide: an interval about 19 points wide at
-n = 60, so a 5-point change in that slice needs the paired flipped-item view or more items, not a
-victory lap. The Wilson interval is used instead of p ± 1.96·SE *because* small slices with perfect
-scores are common in a harness, and the normal approximation reports a 10/10 slice as 100% ± 0, which
-is false confidence; Wilson gives roughly 72% to 100% for the same slice.
+- **Reading the `billing` line:** the interval is about 19 points wide at n = 60, so a 5-point change
+  in that slice needs the paired flipped-item view or more items, not a victory lap.
+- **Why Wilson, not p ± 1.96·SE:** small slices with perfect scores are common in a harness. The normal
+  approximation reports a 10/10 slice as 100% ± 0, which is false confidence; Wilson gives roughly 72%
+  to 100% for the same slice.
+
+### A CI gate against a baseline
+Pure Python. It compares graded results from a baseline and a candidate run on the same items, fails on
+errors and slice floors, and reports whether the flip count clears the measured noise floor.
+
+```python
+import sys
+
+def gate(base, cand, noise_floor, slice_floor, max_error_rate=0.0):
+    """base, cand: id -> {"slice": str, "pass": bool | None}; None means the item errored."""
+    problems, notes = [], []
+    errors = sum(r["pass"] is None for r in cand.values())
+    if errors / len(cand) > max_error_rate:
+        problems.append(f"{errors} errored items (reported, not dropped)")
+    both = [i for i in base if base[i]["pass"] is not None and cand[i]["pass"] is not None]
+    gained = sum(1 for i in both if cand[i]["pass"] and not base[i]["pass"])
+    lost = sum(1 for i in both if base[i]["pass"] and not cand[i]["pass"])
+    if gained + lost <= noise_floor:
+        notes.append(f"{gained + lost} flips <= noise floor {noise_floor}: no demonstrated effect")
+    for s, floor in slice_floor.items():
+        rs = [r["pass"] for r in cand.values() if r["slice"] == s and r["pass"] is not None]
+        if rs and sum(rs) / len(rs) < floor:
+            problems.append(f"slice {s}: {sum(rs)}/{len(rs)} below floor {floor}")
+    return problems, notes, (gained, lost)
+
+base = {str(i): {"slice": "billing" if i < 60 else "other", "pass": i % 5 != 0} for i in range(300)}
+cand = {k: dict(v) for k, v in base.items()}
+for i in range(0, 60, 5): cand[str(i)]["pass"] = True        # 12 gains in billing
+for i in [j for j in range(60) if j % 5][:12]: cand[str(i)]["pass"] = False   # 12 losses, also billing
+problems, notes, flips = gate(base, cand, noise_floor=11, slice_floor={"billing": 0.85})
+print(flips, problems, notes)
+sys.exit(1 if problems else 0)
+# (12, 12) ['slice billing: 48/60 below floor 0.85'] []
+```
+
+| Signal (illustrative numbers) | Value | Reading |
+|---|---|---|
+| Baseline vs itself, no change | 11 items flip | This is the noise floor |
+| Candidate vs baseline | 24 flips (12 gained, 12 lost) | Above the floor, but net zero |
+| Billing slice | 48/60 = 0.80 vs floor 0.85 | Gate fails; exit code 1 blocks the merge |
+
+## Production patterns
+- **Tiered runs from one code path.** Use dataset selectors (by tag or slice) so the pull-request job
+  runs a 50-item smoke subset, the nightly job runs everything, and the release job runs *k* = 5
+  samples per item. Monitor wall-clock time and token cost per tier.
+- **Manifest diff in the PR comment.** Post the two manifests side by side with the paired diff, so a
+  reviewer sees which pinned values changed alongside which items flipped. Monitor runs where more than
+  one field changed at once.
+- **Pin snapshots, never aliases.** Resolve any alias such as `latest` to a dated model snapshot before
+  the run and record the resolved id. Monitor score moves on runs with an otherwise empty diff; they
+  signal provider-side changes.
+- **Recalibrate the noise floor.** Re-run the unchanged baseline twice whenever the model snapshot or
+  provider changes, and store the flip count as the gate's threshold. Monitor its trend; a rising floor
+  means more flaky items.
+- **Quarantine flaky items.** Keep items that flip with no change in a tracked list that reports but
+  does not block. Monitor the list's size and review it weekly instead of letting it grow silently.
+- **Hermetic agent environments.** Build each agent item's sandbox from a seed (a container or a fresh
+  temp directory plus a seeded database), enforce step, token and wall-clock budgets, and store the
+  trajectory. Monitor budget-exceeded counts.
 
 ## Trade-offs
-- Storing every raw output makes re-grading free and failures inspectable, but the store grows by
-  items × samples × runs and may contain customer data that needs retention rules.
-- High concurrency makes a 500-item run take minutes instead of an hour, but it can trip provider rate
-  limits and distort the latency numbers you are also trying to measure; use a separate latency run.
-- Caching by configuration hash saves money on repeated runs, but a cache that ignores any pinned value
-  (a changed retrieval index, a new model snapshot behind the same alias) silently returns stale outputs.
-- A hosted eval product gives dashboards, trend history and human-review queues out of the box, but it
-  owns your dataset format and graders; a few hundred lines you own are portable but need maintenance.
+- **Stored outputs vs storage.** Storing every raw output makes re-grading free and failures
+  inspectable, but the store grows by items × samples × runs and may contain customer data that needs
+  retention rules.
+- **Concurrency vs measurement.** High concurrency makes a 500-item run take minutes instead of an hour,
+  but can trip provider rate limits and distort the latency numbers you also measure; use a separate
+  latency run.
+- **Caching vs staleness.** Caching by configuration hash saves money on repeated runs, but a cache that
+  ignores any pinned value (a changed retrieval index, a new model snapshot behind the same alias)
+  silently returns stale outputs.
+- **Hosted product vs owned code.** A hosted eval product gives dashboards, trend history and
+  human-review queues out of the box, but owns your dataset format and graders. A few hundred lines you
+  own are portable but need maintenance.
 
 ## Pitfalls
-- Dropping errored items from the denominator; the symptom is a score that improves on the day the
-  provider has an outage, because the hardest, longest items are the ones that timed out.
-- Changing the grader and the system in the same run; the symptom is a score movement nobody can
-  attribute, visible as two manifest fields differing at once.
-- Running one sample per item at temperature 0.7; the symptom is a score that moves by several points
-  between identical runs on a few-hundred-item set, which the team reads as regressions and improvements.
-- Grading inside the run loop and never storing outputs; the symptom is a rubric fix that forces a
-  full, expensive re-run just to see new scores.
-- Reporting the overall pass rate without intervals or slices; the symptom is a merged prompt change
-  that lifted the average by lowering the one slice a key customer uses.
-- Letting the harness read the model alias (`latest`) instead of a pinned snapshot; the symptom is a
-  score change with an empty diff.
-- Reusing one environment across agent items; the symptom is results that depend on item order, with
-  an item passing alone and failing when run after another that changed shared state.
+- **Dropping errored items from the denominator.** Symptom: the score improves on the day the provider
+  has an outage, because the hardest, longest items are the ones that timed out.
+- **Changing grader and system in the same run.** Symptom: a score movement nobody can attribute,
+  visible as two manifest fields differing at once.
+- **One sample per item at temperature 0.7.** Symptom: the score moves several points between identical
+  runs on a few-hundred-item set, which the team reads as regressions and improvements.
+- **Grading inside the run loop and never storing outputs.** Symptom: a rubric fix forces a full,
+  expensive re-run just to see new scores.
+- **Overall pass rate without intervals or slices.** Symptom: a merged prompt change that lifted the
+  average by lowering the one slice a key customer uses.
+- **Reading the model alias (`latest`) instead of a pinned snapshot.** Symptom: a score change with an
+  empty diff.
+- **Reusing one environment across agent items.** Symptom: results depend on item order; an item passes
+  alone and fails when run after another that changed shared state.
 
 ## When to use
-Build a harness the moment a prompt or chain will be evaluated more than once; that is the second eval
-run, so build it before the first. Use the fast subset on every change that touches model-facing code,
-the full set before releases, and multi-sample runs when the decision is close. Measure pass rate per
-slice with intervals, error rate, latency percentiles and cost per item in the same report. If you
-adopt a framework, keep the target adapter and dataset format yours so you can leave it. In interviews,
-the expected depth is describing the components, explaining why raw outputs are stored before grading,
-why runs are paired, and how the harness plugs into CI with a gate.
+- **Build it before the first eval:** a harness is needed the moment a prompt or chain is evaluated
+  more than once, and that is the second run.
+- **Cadence:** the fast subset on every change touching model-facing code, the full set before
+  releases, multi-sample runs when the decision is close.
+- **Measure in one report:** pass rate per slice with intervals, error rate, latency percentiles and
+  cost per item.
+- **Frameworks:** if you adopt one, keep the target adapter and dataset format yours so you can leave it.
+- **Interviews:** describe the components, why raw outputs are stored before grading, why runs are
+  paired, and how the harness plugs into CI with a gate.
 
 ## Role lens
 - **Engineer:** Owns the harness code, the target adapter and the grader registry, and wires the subset
@@ -243,6 +317,46 @@ Which items flipped, and does any slice regress? A harness answers all of these 
 a paired diff: it pins the dataset hash, model id, prompt hash and grader version, reports error counts
 instead of silently dropping items, stores raw outputs so the flipped items can be read, and gives a
 per-slice interval that says whether six points at that n is signal at all.
+
+## Interview questions
+### What is an eval harness, and what does it give you over a notebook loop?
+- **Definition:** code that runs a versioned dataset through the system under test with pinned
+  configuration, stores raw outputs, grades them and reports per-slice scores with intervals.
+- **Why:** the notebook loop does not record what changed, drops errored items and overwrites outputs,
+  so two runs cannot be compared or attributed to a change.
+- **Its status is a test suite:** same inputs, configuration and graders every time, with a gate CI can
+  enforce.
+
+### Design a harness for a tool-using agent that edits tickets.
+- **Fresh environment per item:** a seeded database and mocked or recorded tools, torn down afterwards,
+  because state left by one item changes the next item's starting point.
+- **Grade the final state,** such as the ticket's status and fields, not the final message, since many
+  action sequences are correct.
+- **Store the full trajectory and enforce budgets** on steps, tokens and wall-clock time, so a looping
+  agent is a recorded failure rather than a hung CI job.
+
+### A nightly score dropped 4 points with an empty diff. How do you debug it?
+- **Check the manifest for aliases:** a model recorded as `latest` may have resolved to a new snapshot;
+  pin dated snapshots so this is attributable.
+- **Compare against the noise floor:** if the baseline flips about as many items against itself, the
+  drop may be sampling noise from temperature or server-side nondeterminism.
+- **Check the error count:** a provider outage that times out hard items should show as errors, not as a
+  quality change.
+
+### Why use a Wilson interval rather than p ± 1.96·SE for per-slice scores?
+- **Small slices hit the edges:** at 10/10 the normal approximation reports 100% ± 0, which is false
+  confidence.
+- **Wilson stays sane** at 0/n and n/n; the same 10/10 slice gives roughly 72% to 100%.
+- **Practical reading:** at n = 60 a Wilson interval is about 19 points wide, so a slice-level change
+  needs the paired view or more items.
+
+### How do you keep harness cost and runtime under control in CI?
+- **Tier the runs:** a 50-item subset on each pull request, everything nightly, *k* = 5 samples per item
+  for releases, all from one code path with dataset selectors.
+- **Cache by configuration hash, item id and sample index,** so re-grading after a rubric change costs
+  nothing, and the cache key includes every value that can change the output.
+- **Trade-off:** high concurrency shortens runs but can trip rate limits and distort latency, so measure
+  latency in a separate run.
 
 ## Quiz
 ### Q: Why does a well-designed harness store raw outputs before any grading happens?

@@ -5,7 +5,7 @@ name: GraphRAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/knowledge-graphs
   - rag-retrieval/multi-hop-retrieval
@@ -22,105 +22,105 @@ sources:
 ---
 
 ## TL;DR
-GraphRAG uses an LLM at index time to extract entities and relationships from every chunk, builds a graph,
-clusters it into a hierarchy of communities, and pre-writes a summary of each community. Queries then
-retrieve over entities and summaries instead of raw chunks. It exists because chunk-level vector search
-cannot answer corpus-wide questions ("what are the main themes?") or join facts spread across documents;
-the price is a large, LLM-heavy indexing cost that must be repaid by those query types.
+GraphRAG uses an LLM at index time to extract an entity graph, cluster it into communities and pre-write
+their summaries, so queries can answer corpus-wide and cross-document questions. The price is a large,
+LLM-heavy indexing bill those queries must repay.
 
 ## Why it exists
-Standard RAG retrieves the top-k chunks most similar to the query. That works when the answer lives in a
-few chunks that resemble the question. Two classes of question break it.
-
-*Global, sensemaking questions:* "What are the recurring complaints across these 5,000 support tickets?" No
-single chunk is similar to that question, and the answer is a property of the whole corpus. Top-k returns a
-handful of arbitrary tickets and the model summarises those, confidently and unrepresentatively. Stuffing
-the whole corpus into a long context fails on size, cost, and the model's uneven use of long inputs.
-
-*Connective questions:* "Which suppliers are linked to the plant that had the recall?" The plant is
-mentioned in one document, its suppliers in another, and the documents share an entity, not vocabulary or
-embedding neighbourhood. Vector search finds one side of the join and misses the other.
-
-The naive fixes, larger k or map-reduce summarisation of every chunk at query time, either dilute context
-or pay the full corpus-reading cost on every query. GraphRAG moves that cost to index time: read everything
-once, extract the structure (who and what is connected to whom), summarise groups of related things ahead
-of time, and let queries reuse that work. The design bet is that structure and pre-summarisation are worth
-paying for up front when many queries need a corpus-level view.
+- **Top-k works only when the answer resembles the question.** Standard RAG retrieves the chunks most
+  similar to the query; that works when the answer lives in a few such chunks. Two question classes break
+  it.
+- **Global, sensemaking questions.** "What are the recurring complaints across these 5,000 support
+  tickets?" No single chunk is similar; the answer is a property of the whole corpus. Top-k returns a
+  handful of arbitrary tickets, summarised confidently and unrepresentatively. Stuffing the whole corpus
+  into a long context fails on size, cost, and the model's uneven use of long inputs.
+- **Connective questions.** "Which suppliers are linked to the plant that had the recall?" The plant is in
+  one document, its suppliers in another; the documents share an entity, not vocabulary or embedding
+  neighbourhood. Vector search finds one side of the join and misses the other.
+- **Naive fixes pay too much.** Larger k dilutes context; map-reduce summarisation of every chunk at query
+  time pays the full corpus-reading cost on every query.
+- **The design bet: move the cost to index time.** Read everything once, extract who and what is connected
+  to whom, summarise related groups ahead of time, and let queries reuse that work. Worth it when many
+  queries need a corpus-level view.
 
 ## How it works
 ### Indexing pipeline
-1. **Chunk** the corpus. Chunk size matters more than in ordinary RAG because each chunk becomes an LLM
+1. **Chunk** the corpus. Size matters more than in ordinary RAG because each chunk becomes an LLM
    extraction call: smaller chunks extract more entities but cost more calls.
 2. **Extract** with an LLM prompt per chunk: entities (name, type, description) and relationships (source,
    target, description, strength), optionally claims. The reference implementation can run extra
    "gleaning" passes asking the model whether it missed anything, *because* single-pass extraction
    under-recalls on dense text.
-3. **Merge and summarise elements.** The same entity appears in many chunks with different descriptions; they
-   are grouped by name and type, and an LLM writes one consolidated description. This is a crude form of
-   entity resolution, and name variants ("IBM" vs "International Business Machines") remain a known weak
+3. **Merge and summarise elements.** The same entity appears in many chunks with different descriptions;
+   they are grouped by name and type, and an LLM writes one consolidated description. This is a crude form
+   of entity resolution; name variants ("IBM" vs "International Business Machines") remain a known weak
    spot.
 4. **Build the graph:** nodes are entities, edges are relationships, weighted by how many times the
    relationship was extracted across chunks (some versions also fold in the LLM's strength score).
-5. **Detect communities** hierarchically with the Leiden algorithm, which partitions the graph into
-   densely connected groups and recursively subdivides them. Leiden is used *because* it guarantees
-   well-connected communities, which the older Louvain method does not.
-6. **Summarise communities.** For each community at each level, an LLM writes a report covering its key
-   entities, relationships and findings. Lower levels are fine-grained; the root level gives a handful of
-   broad themes. These reports are what make global questions answerable cheaply.
+5. **Detect communities** hierarchically with the Leiden algorithm, which partitions the graph into densely
+   connected groups and recursively subdivides them. Leiden is used *because* it guarantees well-connected
+   communities, which the older Louvain method does not.
+6. **Summarise communities.** For each community at each level, an LLM writes a report on its key entities,
+   relationships and findings. Lower levels are fine-grained; the root level gives a handful of broad
+   themes. These reports make global questions answerable cheaply.
 
 ### Query modes
-- **Global search** answers whole-corpus questions by map-reduce over community reports at a chosen level.
-  Map: each report (or batch) produces a partial answer plus a helpfulness score. Reduce: the highest-scoring
-  partial answers are packed into the context and synthesised. Choosing a higher level is cheaper and
-  broader; a lower level is more detailed and costs more calls. The map step reads every report at the
-  chosen level whatever the question, so cost scales with the number of communities, not with relevance;
-  newer versions can first rate reports for relevance and skip whole branches of the hierarchy that do
-  not matter to the query.
-- **Local search** answers questions about specific entities. It finds entities whose descriptions match the
-  query (by embedding), then fans out to their relationships, neighbouring entities, the community reports
-  they belong to and the original source chunks, ranks all of that, and fits it into a context budget. This
-  is where multi-hop connection pays off.
-- Hybrid variants combine the two. Microsoft's DRIFT search, for example, starts from the community
-  reports most relevant to the query to draft a broad answer and follow-up questions, then refines those
-  with local search over entities and source chunks.
+| Mode | For | How |
+|---|---|---|
+| Global search | whole-corpus questions | map-reduce over community reports at a chosen level |
+| Local search | specific entities | embed-match entities, fan out to relationships, neighbours, their community reports and original source chunks; rank and fit to a context budget |
+| Hybrid (e.g. Microsoft's DRIFT search) | broad then specific | start from the most relevant community reports to draft a broad answer and follow-up questions, then refine with local search over entities and source chunks |
+
+**Global search in detail:**
+- **Map:** each report (or batch) produces a partial answer plus a helpfulness score.
+- **Reduce:** the highest-scoring partial answers are packed into the context and synthesised.
+- **Level choice:** higher is cheaper and broader; lower is more detailed and costs more calls.
+- **Cost scales with communities, not relevance:** the map step reads every report at the chosen level
+  whatever the question. Newer versions can first rate reports for relevance and skip whole branches of the
+  hierarchy that do not matter to the query.
+
+**Local search** is where multi-hop connection pays off.
 
 ### Variants that move the cost
-The expensive part is LLM extraction and summarisation of everything at index time, so most variants
-move or shrink it. LazyGraphRAG (Microsoft) builds its graph from cheap NLP noun-phrase co-occurrence
-instead of LLM extraction and defers all LLM summarisation to query time, which makes indexing roughly
-as cheap as vector RAG and pays per query instead; it fits corpora that change often or are queried
-rarely. LightRAG and similar systems keep LLM extraction but skip the community hierarchy, retrieving
-over entity-level and theme-level keys and merging new documents into the graph incrementally rather
-than re-clustering. The choice is the same in every case: pay once at index time when many queries need
-the corpus-level view, pay at query time when they do not.
+The expensive part is LLM extraction and summarisation of everything at index time, so most variants move
+or shrink it.
+
+| Variant | What changes | Fits |
+|---|---|---|
+| LazyGraphRAG (Microsoft) | graph from cheap NLP noun-phrase co-occurrence instead of LLM extraction; all LLM summarisation deferred to query time; indexing roughly as cheap as vector RAG, paid per query instead | corpora that change often or are queried rarely |
+| LightRAG and similar | keep LLM extraction, skip the community hierarchy; retrieve over entity-level and theme-level keys; merge new documents incrementally rather than re-clustering | incremental updates |
+
+The choice is always the same: pay once at index time when many queries need the corpus-level view, pay at
+query time when they do not.
 
 ### Why each piece is there
-Extraction converts unstructured text into joinable keys (entities). Communities give the corpus a
-table of contents that no chunk contains. Pre-written summaries turn an O(corpus) read per query into an
-O(communities) read. And keeping links back to source chunks preserves grounding: a community report is a
-model-written paraphrase, so answers should still cite original text where possible.
+- **Extraction** converts unstructured text into joinable keys (entities).
+- **Communities** give the corpus a table of contents that no chunk contains.
+- **Pre-written summaries** turn an O(corpus) read per query into an O(communities) read.
+- **Links back to source chunks** preserve grounding: a community report is a model-written paraphrase, so
+  answers should still cite original text where possible.
 
-## Example
-An illustrative cost walkthrough (orders of magnitude, not benchmarks) for a corpus of 2,000 internal
-incident reports totalling about 4 million tokens.
+## Examples
+### Worked cost walkthrough: 2,000 incident reports
+Illustrative orders of magnitude, not benchmarks, for a corpus of 2,000 internal incident reports
+totalling about 4 million tokens.
 
-**Indexing.** With 1,200-token chunks there are roughly 3,300 chunks. One extraction call per chunk plus one
-gleaning pass is about 6,600 calls, each reading a chunk plus a long extraction prompt and writing structured
-output: on the order of 15 to 25 million tokens processed. Entity merging and community summarisation add
-thousands more calls. Plain vector RAG over the same corpus costs one embedding pass of 4 million tokens.
-So GraphRAG processes several times more tokens, and every one of them goes through a generative LLM,
-which is typically one to three orders of magnitude more expensive per token than an embedding model
-(output tokens more still). The indexing bill is therefore commonly two or more orders of magnitude larger
-in dollars, with the exact multiple set by the extraction model you choose, and parts of it must be rerun
-as documents change.
+| Stage | GraphRAG | Plain vector RAG |
+|---|---|---|
+| Chunks (1,200 tokens each) | roughly 3,300 | same |
+| Index calls | one extraction call per chunk plus one gleaning pass ≈ 6,600 calls, each reading a chunk plus a long extraction prompt and writing structured output | one embedding pass |
+| Tokens processed | on the order of 15 to 25 million, plus thousands more calls for entity merging and community summarisation | 4 million |
+| Model doing the work | a generative LLM, typically one to three orders of magnitude more expensive per token than an embedding model (output tokens more still) | embedding model |
+| Index bill | commonly two or more orders of magnitude larger in dollars, set by the extraction model you choose; parts rerun as documents change | baseline |
 
-**Global query:** "What are the most common root causes across all incidents?" Vector RAG retrieves 10
-chunks, about 0.3% of the corpus, and reports whatever those happen to say. GraphRAG uses, say, the 40
-level-1 community reports: 40 map calls produce scored partial answers ("deployment config drift, seen in
-communities about service X and Y"), and one reduce call synthesises the top-scoring ones. Fewer than 50
-calls give an answer grounded in a summary of the whole corpus. The index-free way to get the same
-coverage, map-reduce over every chunk at query time, is about 3,300 calls per question; the community
-reports are that reading done once and reused, which is the whole economic argument.
+**Global query:** "What are the most common root causes across all incidents?"
+- Vector RAG retrieves 10 chunks, about 0.3% of the corpus, and reports whatever those happen to say.
+- GraphRAG uses, say, the 40 level-1 community reports: 40 map calls produce scored partial answers
+  ("deployment config drift, seen in communities about service X and Y"), and one reduce call synthesises
+  the top-scoring ones. Fewer than 50 calls give an answer grounded in a summary of the whole corpus.
+- The index-free way to get the same coverage, map-reduce over every chunk at query time, is about 3,300
+  calls per question. Community reports are that reading done once and reused, which is the whole economic
+  argument.
 
 **Local query:** "Which teams were involved in incidents touching the payments database?" Local search
 matches the entity PAYMENTS-DB, follows its edges to incidents and from incidents to TEAM entities, and
@@ -129,41 +129,102 @@ pulls the source chunks for those edges, joining facts that never co-occur in on
 **Decision:** if most traffic is lookup questions ("what is the on-call rotation for X?"), the indexing bill
 buys little; if analysts ask thematic and relational questions daily, it is repaid.
 
+### Runnable estimator for your own corpus
+Prompt and output sizes and the price ratio are placeholders: replace them with your extraction prompt's
+real length and your models' prices.
+
+```python
+def estimate(corpus_tokens, chunk=1_200, prompt=1_500, output=500, gleanings=1,
+             llm_to_embed_price=30, reports=40, queries_per_month=2_000):
+    chunks = corpus_tokens // chunk
+    calls = chunks * (1 + gleanings)
+    llm_tokens = calls * (chunk + prompt + output)        # extraction only; merging/reports add more
+    index_cost_vs_embed = llm_tokens * llm_to_embed_price / corpus_tokens
+    return {"chunks": chunks, "extraction_calls": calls, "llm_tokens_M": round(llm_tokens / 1e6, 1),
+            "index_cost_x_embedding": round(index_cost_vs_embed),
+            "global_query_calls": reports + 1,             # map over reports + one reduce
+            "naive_mapreduce_calls": chunks,               # read every chunk per question instead
+            "calls_saved_per_month": (chunks - reports - 1) * queries_per_month}
+
+print(estimate(4_000_000))
+# {'chunks': 3333, 'extraction_calls': 6666, 'llm_tokens_M': 21.3, 'index_cost_x_embedding': 160,
+#  'global_query_calls': 41, 'naive_mapreduce_calls': 3333, 'calls_saved_per_month': 6584000}
+```
+
+### Production snippet: the reference implementation's CLI flow
+Microsoft's `graphrag` package is driven by a project folder with a settings file and an input directory.
+Check flag names against your installed version.
+
+```bash
+pip install graphrag
+graphrag init --root ./incidents            # writes settings.yaml, .env and default prompts
+# put text files in ./incidents/input, set the model and API key in settings.yaml / .env
+graphrag index --root ./incidents           # extraction, graph, Leiden communities, reports
+graphrag query --root ./incidents --method global --query "Most common root causes?"
+graphrag query --root ./incidents --method local  --query "Teams involved with PAYMENTS-DB?"
+```
+
+## Production patterns
+- **Price a slice before the archive.** Index a representative 1-5% sample, meter LLM tokens per thousand
+  documents, and extrapolate with the estimator above before committing. Monitor tokens and dollars per
+  indexed document per run.
+- **Route by question type.** A cheap classifier (or LLM router) sends thematic and corpus-wide questions
+  to global search, entity-relational ones to local search, and lookups to hybrid retrieval with
+  reranking. Monitor per-route answer quality and the router's confusion on a labelled set.
+- **Tune extraction to the domain.** Set entity types and examples in the extraction prompt (the reference
+  implementation ships an automatic prompt-tuning step) and add an entity-resolution pass for aliases.
+  Monitor duplicate-node rate and entities per chunk on a sample.
+- **Cite chunks, not reports.** Keep source-chunk links on every entity, relationship and report, and make
+  the answer cite those chunks. Monitor the share of claims that resolve to a source span.
+- **Refresh on a schedule that matches churn.** Rebuild community reports on a snapshot cadence (for
+  example weekly) for stable corpora, or switch to a deferred-summarisation variant for fast-changing ones.
+  Monitor report age versus newest-document age.
+- **One graph per permission domain.** Build graphs and reports within a single ACL domain (per site, per
+  space) so no report mixes restricted and public sources. Audit with leakage probes from low-privilege
+  accounts.
+
 ## Trade-offs
-- Corpus-wide and multi-hop answers become possible, but indexing costs far more than embedding; the
-  balance flips toward plain RAG when queries are mostly specific lookups answerable from one chunk.
-- Pre-computed community summaries make global queries cheap, but they are frozen interpretations; when the
-  corpus changes daily, recomputation cost and staleness can outweigh the benefit.
-- LLM extraction needs no hand-built schema, but produces noisy, inconsistent entity types and duplicate
-  nodes; when the domain has a stable ontology, a curated knowledge graph is more precise.
-- Summaries compress well for themes, but add a paraphrase layer between source and answer; for
-  audit-heavy use, require answers to cite underlying chunks rather than community reports.
-- Higher community levels are cheaper and broader per global query, while lower levels give detail at
-  more map calls; the right level depends on whether users want an overview or specifics.
+- **Corpus-wide answers vs indexing cost.** Corpus-wide and multi-hop answers become possible, but indexing
+  costs far more than embedding. The balance flips toward plain RAG when queries are mostly specific
+  lookups answerable from one chunk.
+- **Pre-computed summaries vs staleness.** Community summaries make global queries cheap but are frozen
+  interpretations. When the corpus changes daily, recomputation cost and staleness can outweigh the
+  benefit.
+- **Schema-free extraction vs precision.** LLM extraction needs no hand-built schema but produces noisy,
+  inconsistent entity types and duplicate nodes. When the domain has a stable ontology, a curated knowledge
+  graph is more precise.
+- **Compression vs a paraphrase layer.** Summaries compress well for themes but sit between source and
+  answer. For audit-heavy use, require answers to cite underlying chunks rather than community reports.
+- **Higher vs lower community levels.** Higher levels are cheaper and broader per global query; lower
+  levels give detail at more map calls. The right level depends on whether users want an overview or
+  specifics.
 
 ## Pitfalls
-- Adopting GraphRAG for fact lookup; the symptom is a large indexing bill and answer quality no better than
+- **Adopting GraphRAG for fact lookup.** Symptom: a large indexing bill and answer quality no better than
   hybrid search with reranking on the eval set.
-- Skipping entity resolution, so one real entity becomes several nodes; local search returns partial
+- **Skipping entity resolution.** One real entity becomes several nodes; local search returns partial
   neighbourhoods and communities split along spelling variants.
-- Treating extraction as done once; documents are added and edited, and the graph silently drifts from the
-  source, visible as answers that omit recent incidents.
-- Citing community reports as evidence; reviewers cannot find the claimed statement in any source document
-  because it was synthesised by the indexing model.
-- Evaluating only with a judge on "comprehensiveness"; broad, fluent answers win those comparisons even
+- **Treating extraction as done once.** Documents are added and edited and the graph silently drifts from
+  the source, visible as answers that omit recent incidents.
+- **Citing community reports as evidence.** Reviewers cannot find the claimed statement in any source
+  document, because the indexing model synthesised it.
+- **Evaluating only with a judge on "comprehensiveness".** Broad, fluent answers win those comparisons even
   when specific facts are wrong, so add fact-level checks.
-- Building one graph and one set of community reports over documents with different permissions; the
-  symptom is a theme summary that mentions a restricted project to users who could not open any of its
-  source documents, because a report inherits the content of every chunk it summarises.
+- **One graph over documents with different permissions.** Symptom: a theme summary mentions a restricted
+  project to users who could not open any of its source documents, because a report inherits the content
+  of every chunk it summarises.
 
 ## When to use
-Reach for GraphRAG when a meaningful share of questions is thematic ("what are the main issues"),
-comparative across the corpus, or relational across documents, and the corpus is stable enough that
-indexing cost amortises. Prototype on a representative slice first: measure indexing cost per thousand
-documents, then compare against tuned hybrid retrieval with reranking and query decomposition on a labelled
-question set split by question type. If the gains appear only on global questions, consider routing: send
-those to GraphRAG and the rest to plain RAG. In interviews, explain the indexing-for-query trade and when
-you would not use it.
+- **Use when** a meaningful share of questions is thematic ("what are the main issues"), comparative across
+  the corpus, or relational across documents, and the corpus is stable enough that indexing cost
+  amortises.
+- **Prototype first:** on a representative slice, measure indexing cost per thousand documents, then compare
+  against tuned hybrid retrieval with reranking and query decomposition on a labelled question set split by
+  question type.
+- **Route if gains are narrow:** if they appear only on global questions, send those to GraphRAG and the
+  rest to plain RAG.
+- **Avoid when** traffic is mostly lookups, or the corpus changes faster than you can afford to re-index.
+- **Interviews:** explain the indexing-for-query trade and when you would not use it.
 
 ## Role lens
 - **Engineer:** Tunes chunk size, extraction prompts and entity types, runs incremental re-indexing, and

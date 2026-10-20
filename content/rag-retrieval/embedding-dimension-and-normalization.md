@@ -5,7 +5,7 @@ name: Embedding dimension & normalization
 kind: concept
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/similarity-search
@@ -23,28 +23,24 @@ sources:
 ---
 
 ## TL;DR
-The dimension of an embedding is how many floats each vector holds, and it sets the storage, memory and
-per-comparison cost of the whole index linearly. L2-normalizing vectors to unit length makes cosine
-similarity equal to the dot product and makes Euclidean ranking identical to both, so the metric choice
-stops mattering and scores stop rewarding long, verbose chunks. Matryoshka-trained models let you
-truncate dimensions after the fact; quantization shrinks the bytes per dimension. Both trade a little
-recall for a lot of memory.
+Dimension is how many floats a vector holds; it sets storage and compare cost linearly.
+Normalizing to unit length makes cosine, dot product and Euclidean rank identically and stops long
+chunks winning on norm. Matryoshka truncation and quantization trade a little recall for much memory.
 
 ## Why it exists
-Every stored vector costs `d × bytes_per_float`. At float32 a 1536-dimensional embedding is 6,144 bytes,
-so ten million chunks are about 61 GB of raw vectors before any index overhead, and HNSW indexes want
-those vectors resident in RAM. Query cost scales the same way: every candidate comparison is `d`
-multiply-adds. Dimension is therefore the lever that connects the model choice to the infrastructure
-bill, and until Matryoshka-style training it was fixed the moment a model was chosen.
-
-Normalization solves a different problem. Raw encoder outputs have norms that vary with things you do
-not care about: input length, token frequency, how "sure" the network happens to be. A dot product
-between raw vectors therefore mixes meaning with magnitude, and a long chunk can outscore a short,
-precisely relevant one on sheer norm. Cosine similarity divides the magnitude out. The cheapest way to
-get cosine everywhere is to normalize once at write time and then use the plain dot product, which is
-also the fastest operation an ANN index can run. Skip this step and you get a subtle bug rather than an
-error: the index metric and the ranking you expected disagree, so the "nearest" neighbours are not the
-ones you wanted and thresholds mean nothing.
+- **Every vector costs `d × bytes_per_float`.** At float32 a 1536-dimensional embedding is 6,144 bytes,
+  so ten million chunks are about 61 GB of raw vectors before index overhead, and HNSW wants them
+  resident in RAM.
+- **Query cost scales the same way.** Every candidate comparison is `d` multiply-adds. Dimension links
+  the model choice to the infrastructure bill, and until Matryoshka-style training it was fixed the
+  moment a model was chosen.
+- **Raw norms carry noise.** They vary with input length, token frequency and how "sure" the network
+  happens to be. A raw dot product mixes meaning with magnitude, so a long chunk can outscore a short,
+  precisely relevant one on sheer norm.
+- **Normalize once, then dot product everywhere.** Cosine divides magnitude out; normalizing at write time
+  gets cosine through the plain dot product, the fastest operation an ANN index runs.
+- **Skipping it is a subtle bug, not an error.** The index metric and the ranking you expected disagree,
+  so the "nearest" neighbours are not the ones you wanted and thresholds mean nothing.
 
 ## How it works
 ### Three metrics, one ranking
@@ -55,58 +51,94 @@ When both are unit length, cosine *is* the dot product, and
 ‖a−b‖² = ‖a‖² + ‖b‖² − 2a·b = 2 − 2a·b
 ```
 
-so Euclidean distance is a monotone function of the dot product. All three produce the same order. This
-is why many embedding providers return normalized vectors and why "which metric should I pick" is only a
-real question for unnormalized ones. The practical rule: normalize at write time, store unit vectors,
-and build the index on inner product; that saves a division per comparison, and pgvector's `<#>`
-(negative inner product), `<=>` (cosine distance) and `<->` (L2) then agree on order. The exception
-is a model trained to be scored with an *unnormalized* dot product (the original DPR is one; some
-sentence-transformers checkpoints say so on their model card). There the norm is part of the learned
-score, and normalizing produces a different ranking from the one the model was trained for, so use the
-similarity the model card names rather than normalizing by reflex.
+- **So Euclidean distance is a monotone function of the dot product**, and all three give the same
+  order. That is why many providers return normalized vectors, and why "which metric" is only a real
+  question for unnormalized ones.
+- **Practical rule:** normalize at write time, store unit vectors, and build the index on inner product.
+  It saves a division per comparison, and pgvector's `<#>` (negative inner product), `<=>` (cosine
+  distance) and `<->` (L2) then agree on order.
+- **The exception:** a model trained to be scored with an *unnormalized* dot product (the original DPR
+  is one; some sentence-transformers checkpoints say so on their model card). Its norm is part of the
+  learned score, so normalizing changes the ranking. Use the similarity the model card names.
 
 ### Where the norm comes from and why to discard it
-Encoders are not trained to make norms meaningful. Contextual embeddings are also anisotropic: they
-occupy a narrow cone of the space, so the cosine between two unrelated sentences is well above zero and
-differs by model. The consequence is that absolute similarity values are model-specific; a score of 0.8
-is "related" under one model and "noise floor" under another. Rankings are portable, thresholds are
-not, so any threshold must be calibrated per model on labelled pairs.
+- **Encoders are not trained to make norms meaningful.**
+- **Contextual embeddings are anisotropic:** they occupy a narrow cone, so the cosine between two
+  unrelated sentences is well above zero and differs by model.
+- **So absolute values are model-specific.** A score of 0.8 is "related" under one model and "noise
+  floor" under another. Rankings are portable, thresholds are not; calibrate any threshold per model on
+  labelled pairs.
 
 ### What dimension buys
-Dimensions are capacity: the model needs enough axes to separate the concepts it was trained on.
-Returns diminish quickly, doubling `d` does not double recall, while storage and compare time grow
-linearly and ANN graph memory grows with them. Common sizes: 384 (MiniLM-class), 768 (BERT-base-derived
-models such as E5-base and BGE-base), 1024 (large variants), 1536 and 3072 (OpenAI's text-embedding-3
-small and large).
+- **Dimensions are capacity:** enough axes to separate the concepts the model was trained on.
+- **Returns diminish quickly.** Doubling `d` does not double recall, while storage and compare time grow
+  linearly and ANN graph memory grows with them.
+
+| Size | Typical models |
+|---|---|
+| 384 | MiniLM-class |
+| 768 | BERT-base-derived, such as E5-base and BGE-base |
+| 1024 | large variants |
+| 1536 and 3072 | OpenAI's text-embedding-3 small and large |
 
 ### Matryoshka representation learning
-Standard training spreads information across all dimensions, so truncating a vector discards a random
-slice of its meaning and recall collapses. MRL applies the training loss simultaneously to nested
-prefixes of the vector (the first 64, 128, 256, … dimensions), which pushes the most important
-information to the front. You can then keep the first `k` dimensions, renormalize, and search; keep the
-full vectors on disk to rescore the top candidates. OpenAI's text-embedding-3 models expose this as a
-`dimensions` request parameter and several open models (nomic-embed-text v1.5 among them) support it.
-Renormalization after truncation is mandatory because a prefix of a unit vector is shorter than one.
+- **Standard training spreads information across all dimensions**, so truncating discards a random slice
+  of meaning and recall collapses.
+- **MRL applies the loss to nested prefixes** (the first 64, 128, 256, … dimensions), pushing the most
+  important information to the front.
+
+1. Keep the first `k` dimensions.
+2. Renormalize, which is mandatory because a prefix of a unit vector is shorter than one.
+3. Search, keeping full vectors on disk to rescore the top candidates.
+
+OpenAI's text-embedding-3 models expose this as a `dimensions` request parameter, and several open
+models (nomic-embed-text v1.5 among them) support it.
 
 ### Quantization: fewer bytes per dimension
-Orthogonal to truncation. float32 to float16 halves memory with essentially no recall change; int8
-scalar quantization quarters it; binary quantization (one bit per dimension, scored by Hamming distance)
-gives up to 32× and works surprisingly well on high-dimensional normalized vectors when the top
-candidates are rescored with full-precision vectors. Product quantization (IVF-PQ in FAISS and Milvus)
-compresses further by replacing sub-vectors with codebook ids. Normalization helps scalar quantization
-and PQ, because unit vectors have bounded coordinates and the quantizer's range is predictable; binary
-quantization keeps only the sign, so for it the norm is irrelevant.
+Orthogonal to truncation.
+
+| Scheme | Memory vs float32 | Recall note |
+|---|---|---|
+| float16 | half | essentially no change |
+| int8 scalar | a quarter | small loss |
+| binary (one bit, Hamming distance) | up to 32× smaller | surprisingly good on high-dimensional normalized vectors with full-precision rescoring |
+| product quantization (IVF-PQ in FAISS and Milvus) | further, sub-vectors become codebook ids | needs rescoring for hard queries |
+
+- **Normalization helps scalar quantization and PQ**, because unit vectors have bounded coordinates and
+  the quantizer's range is predictable.
+- **Binary keeps only the sign**, so for it the norm is irrelevant.
 
 ### PCA and friends
-PCA fitted on your own corpus can drop dimensions for any model, Matryoshka-trained or not, but it must
-be fitted on representative data and applied identically to queries; it is a weaker, model-agnostic
+PCA fitted on your own corpus can drop dimensions for any model, Matryoshka-trained or not. It must be
+fitted on representative data and applied identically to queries; it is a weaker, model-agnostic
 version of the same idea.
 
-## Example
-A small numpy walkthrough: a query that is genuinely closest to document 1, and a document 3 that is
-only weakly related but has an eight-times larger norm. Raw dot product ranks document 3 first; cosine,
-and every metric after normalization, rank document 1 first. The last block shows the truncation
-mechanics (truncate, then renormalize) and the storage arithmetic.
+## Diagram
+The write path normalizes once so one inner-product index serves every metric; the branches show the
+memory levers you pull when `vectors × d × bytes` does not fit.
+
+```mermaid
+flowchart TD
+    E["Raw embedding, d floats"] --> MC{"Model card says unnormalized dot product?"}
+    MC -->|"yes"| RAW["Keep raw vectors, use the named similarity"]
+    MC -->|"no"| N["L2-normalize to unit length"]
+    N --> FIT{"vectors x d x bytes fits in RAM?"}
+    FIT -->|"yes"| IP[("Inner-product index on full vectors")]
+    FIT -->|"no, MRL model"| T["Keep first k dims, renormalize"]
+    FIT -->|"no, any model"| QZ["Quantize: float16, int8 or binary"]
+    T --> C[("Compact index for candidates")]
+    QZ --> C
+    C -->|"top 50 to 100"| RS["Rescore with full-precision vectors"]
+    RS --> R["Final top-k"]
+    IP --> R
+```
+
+## Examples
+### Norm bias, the metric identity and truncation in numpy
+A query genuinely closest to document 1, and a document 3 that is only weakly related but has an
+eight-times larger norm. Raw dot product ranks document 3 first; cosine, and every metric after
+normalization, rank document 1 first. The last block shows truncate-then-renormalize and the storage
+arithmetic.
 
 ```python
 import numpy as np
@@ -139,44 +171,98 @@ print("10M x 1536 x 4 bytes =", 10_000_000 * 1536 * 4 / 1e9, "GB")   # 61.44 GB,
 With random vectors the truncation keeps the order only because the signal is spread evenly; for a real
 model the prefix retains the order only if the model was trained Matryoshka-style.
 
+### Worked sizing: ten million chunks at 1536 dimensions
+Raw vector bytes only; HNSW links, payloads and chunk text come on top.
+
+| Configuration | Bytes per vector | 10M vectors |
+|---|---|---|
+| float32, full | 6,144 | 61.44 GB |
+| float16, full | 3,072 | 30.72 GB |
+| int8, full | 1,536 | 15.36 GB |
+| MRL prefix 512, float32 | 2,048 | 20.48 GB |
+| binary, full | 192 | 1.92 GB |
+
+Pick by measuring recall@10 of each row against the float32 baseline, then take the cheapest row that
+meets the target.
+
+### Binary search with full-precision rescoring in pgvector
+Unit vectors in a `vector(1536)` column; a Hamming-distance index over the binary form picks 100
+candidates, and the exact inner product reorders them.
+
+```sql
+CREATE TABLE chunks (id bigserial PRIMARY KEY, body text, embedding vector(1536));
+
+-- unit vectors, so inner product ranks the same as cosine
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops);
+
+-- or a much smaller index over the sign bits
+CREATE INDEX ON chunks USING hnsw ((binary_quantize(embedding)::bit(1536)) bit_hamming_ops);
+
+SELECT id FROM (
+  SELECT id, embedding FROM chunks
+  ORDER BY binary_quantize(embedding)::bit(1536) <~> binary_quantize($1)
+  LIMIT 100
+) c
+ORDER BY c.embedding <#> $1      -- negative inner product: ascending = most similar
+LIMIT 10;
+```
+
+## Production patterns
+- **Normalize inside the shared embed function** — apply L2 normalization (for sentence-transformers,
+  `normalize_embeddings=True`) in the one function both index and query paths call. Add a test that a
+  stored vector has norm 1 within tolerance, and monitor the norm of a sample of query vectors.
+- **Inner-product index on unit vectors** — build the ANN index with the inner-product operator class
+  (pgvector `vector_ip_ops`, or the dot-product metric in your store) once vectors are normalized. Monitor
+  for scores above 1.0, which signal an unnormalized write.
+- **Truncate via the provider, not by hand** — for OpenAI text-embedding-3, request a smaller vector with
+  the `dimensions` parameter; for open MRL models, slice the prefix and renormalize. Record the
+  dimension in index metadata and monitor recall@k against the full-dimension baseline.
+- **Quantize with rescoring** — keep a compact index (binary or int8) for candidate generation and full
+  vectors for reordering the top 50 to 100. Monitor recall@10 versus float32 and the extra rescoring
+  latency.
+- **Mind store dimension limits** — pgvector's HNSW and IVFFlat indexes accept `vector` columns up to
+  2,000 dimensions, and `halfvec` raises that to 4,000, so a 3072-dimension model needs halfvec, a
+  truncated prefix or another store. Check the limit before choosing the model.
+
 ## Trade-offs
-- Fewer dimensions cut memory and compare cost linearly but reduce capacity; the loss is small for an
-  MRL model truncated to a quarter and severe for naive truncation of a standard model.
-- Normalizing and indexing on inner product is the fastest, simplest path, but it throws away the norm;
-  in the rare setup where a model's norm carries a useful signal (some models correlate it with
-  confidence or length) you would keep raw vectors and cosine, at a small cost per comparison.
-- Binary or int8 quantization gives large memory wins with small recall loss when the top candidates are
-  rescored, but adds a second lookup and requires keeping full vectors somewhere; without rescoring,
-  recall on hard queries drops noticeably.
-- A bigger model with more dimensions improves quality until the corpus is small enough that recall is
-  already saturated; past that point the extra dimensions only cost money.
+- **Fewer dimensions vs capacity.** Memory and compare cost fall linearly, but capacity drops; the loss is
+  small for an MRL model truncated to a quarter and severe for naive truncation of a standard model.
+- **Normalize-and-inner-product vs the norm signal.** Fastest and simplest, but it discards the norm; in
+  the rare setup where a model's norm is useful (some models correlate it with confidence or length),
+  keep raw vectors and cosine at a small per-comparison cost.
+- **Quantization memory vs a second lookup.** Binary or int8 gives large memory wins with small recall
+  loss when top candidates are rescored, but needs full vectors somewhere; without rescoring, recall on
+  hard queries drops noticeably.
+- **Bigger model vs saturation.** More dimensions improve quality until the corpus is small enough that
+  recall is already saturated; past that point the extra dimensions only cost money.
 
 ## Pitfalls
-- Building an inner-product index over unnormalized vectors from a cosine-trained model; symptom: long,
-  verbose chunks dominate the top-k regardless of relevance.
-- Normalizing at index time but not at query time; symptom: rankings look fine but scores above 1.0
-  appear and any similarity threshold silently stops working.
-- Truncating a model that was not Matryoshka-trained; symptom: recall collapses far more than the
-  dimension ratio would suggest.
-- Forgetting to renormalize after truncation; symptom: a cosine index returns different scores from a
+- **Inner-product index over unnormalized vectors from a cosine-trained model.** Long, verbose chunks
+  dominate the top-k regardless of relevance.
+- **Normalizing at index time but not at query time.** Rankings look fine, but scores above 1.0 appear
+  and any similarity threshold silently stops working.
+- **Truncating a model that was not Matryoshka-trained.** Recall collapses far more than the dimension
+  ratio would suggest.
+- **Forgetting to renormalize after truncation.** A cosine index returns different scores from a
   dot-product index on the same data, and thresholds drift.
-- Copying a cosine threshold such as 0.75 from another model or a blog post; symptom: after a model swap
-  either nothing or everything passes the filter.
-- Sizing storage from raw vectors alone; symptom: out-of-memory during index build, because HNSW graph
-  links, payloads and copies of the chunk text all add to the vector bytes; graph links alone are small
-  for high-dimensional vectors, but stored chunk text and payload indexes can add a large fraction.
-- Writing vectors of mixed dimensions into one collection; symptom: insert errors where the store
-  enforces the column dimension (pgvector does), or silently wrong scores where it does not.
+- **Copying a cosine threshold such as 0.75.** Taken from another model or a blog post, it lets nothing
+  or everything through after a model swap.
+- **Sizing storage from raw vectors alone.** Out-of-memory during index build, because HNSW links,
+  payloads and copies of chunk text add to the vector bytes. Links alone are small for high-dimensional
+  vectors, but stored text and payload indexes can add a large fraction.
+- **Mixed dimensions in one collection.** Insert errors where the store enforces the column dimension
+  (pgvector does), or silently wrong scores where it does not.
 
 ## When to use
-Use the arithmetic every time you size a vector store: `vectors × d × bytes` tells you whether the index
-fits in RAM, and whether you need truncation, quantization, disk-based indexes or sharding. Always store
-normalized vectors unless the model card specifies an unnormalized dot product, and make the
-normalization part of the shared embed function so index and query paths agree. Consider Matryoshka truncation when the model
-supports it and memory or latency binds; consider binary or int8 quantization with rescoring when the
-corpus is tens of millions of vectors or more. Measure recall@k against the full-precision baseline
-before and after any reduction. In interviews, expect to derive the cosine-equals-dot-product identity
-and to size a 100-million-vector index from scratch.
+- **Size every vector store with it:** `vectors × d × bytes` tells you whether the index fits in RAM, and
+  whether you need truncation, quantization, disk-based indexes or sharding.
+- **Always store normalized vectors** unless the model card specifies an unnormalized dot product, and
+  make normalization part of the shared embed function so index and query paths agree.
+- **Matryoshka truncation:** when the model supports it and memory or latency binds.
+- **Binary or int8 with rescoring:** when the corpus is tens of millions of vectors or more.
+- **Measure:** recall@k against the full-precision baseline before and after any reduction.
+- **Interviews:** derive the cosine-equals-dot-product identity and size a 100-million-vector index from
+  scratch.
 
 ## Role lens
 - **Engineer:** Normalizes inside the embed function, picks the index metric to match, and writes a test
@@ -197,6 +283,39 @@ quantization; or move to a disk-based index and accept higher latency; or shard 
 overhead and payloads must be added on top, so the target is well under 256 GB. The decision is made by
 measuring recall@10 against the full-precision baseline for each variant on labelled queries, then
 picking the cheapest configuration that meets the recall target.
+
+## Interview questions
+### Why do teams normalize embeddings, and when should they not?
+- **Why:** for unit vectors cosine equals the dot product and `‖a−b‖² = 2 − 2a·b`, so all three metrics
+  rank identically and the index can use the cheapest operation, inner product.
+- **It also removes norm bias,** so a long chunk cannot outscore a short relevant one on magnitude alone.
+- **Do not normalize** when the model card says the model was trained for an unnormalized dot product,
+  as the original DPR was, because its norm is part of the learned score.
+
+### Size a 100-million-vector index at 1024 dimensions.
+- **float32:** 100M × 1024 × 4 bytes = 409.6 GB of raw vectors.
+- **int8:** a quarter, 102.4 GB; **binary:** 128 bytes per vector, 12.8 GB.
+- **Then add** ANN graph links, payloads and stored text, and pick the cheapest option whose recall@10
+  with rescoring meets the target.
+
+### Similarity scores above 1.0 started appearing after a release. What is your first hypothesis?
+- **An unnormalized write or query:** cosine and inner product of unit vectors cannot exceed 1, so one
+  path skipped normalization.
+- **Check** the norm of a sample of stored and query vectors, and whether truncation was added without
+  renormalizing.
+- **Fix** by normalizing inside the shared embed function and adding a unit-norm test before writes.
+
+### When does Matryoshka truncation beat quantization, and when would you combine them?
+- **Truncation** fits when the model is MRL-trained, because the leading dimensions hold the most
+  information; on an ordinary model it collapses recall.
+- **Quantization** works for any model and is orthogonal: it shrinks bytes per dimension instead of
+  dimensions.
+- **Combine** them at very large scale, keeping full vectors on disk to rescore the top candidates.
+
+### Why can you not reuse a similarity threshold such as 0.75 across models?
+- **Contextual embeddings are anisotropic,** so unrelated pairs already score well above zero, at a noise
+  floor that differs by model.
+- **Rankings are portable, thresholds are not:** calibrate any cut-off per model on labelled pairs.
 
 ## Quiz
 ### Q: Why does L2-normalizing all vectors make the choice between cosine, dot product and Euclidean distance irrelevant for ranking?

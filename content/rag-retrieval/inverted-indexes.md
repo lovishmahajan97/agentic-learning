@@ -5,7 +5,7 @@ name: Inverted indexes
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -20,115 +20,114 @@ sources:
 ---
 
 ## TL;DR
-An inverted index flips the document→words mapping into words→documents: for every term, a sorted
-posting list of the documents that contain it, with counts and positions. A query then touches only the
-lists for its terms instead of every document, which is what makes lexical search over hundreds of
-millions of documents answerable in milliseconds on CPUs (sharded across machines at the high end). The design choices (sorted ids, compression,
-immutable segments, skip pointers) all exist to make those list scans fast and updates safe.
+An inverted index maps each term to a sorted posting list of the documents containing it, so a query
+reads only its terms' lists. Sorted ids, compression, skips and immutable segments make lexical search
+over hundreds of millions of documents answer in milliseconds.
 
 ## Why it exists
-The forward index is the natural one: document id → the words it contains. Answering "which documents
-mention indemnification" against a forward index means opening every document and scanning it, O(total
-tokens) per query. At a million documents of a thousand tokens each that is a billion token comparisons
-per query, and it gets worse linearly as the corpus grows. Caching does not help, because queries are
-too diverse.
-
-The observation that fixes it is that queries are short and vocabularies, though large, are far smaller
-than the corpus. If for each term you precompute the list of documents containing it, a five-term query
-reads five lists. The cost is proportional to how many documents contain the query terms, not to how
-many documents exist. Rare terms, which carry most of the ranking signal, have short lists, so the
-decisive part of the query is also the cheap part to compute.
-
-Doing this well raises engineering problems that define the structure: posting lists for common terms
-are huge and must be compressed; intersecting lists must not require reading all of both; ranking needs
-per-document statistics stored alongside the ids; documents arrive and change constantly while queries
-are running; and the term dictionary itself must be looked up millions of times a second. Every feature
-of a modern inverted index (Lucene underneath Elasticsearch and OpenSearch, or the engines inside Vespa
-and Tantivy) is an answer to one of these.
+- **The forward index is too slow.** Document id → words means "which documents mention indemnification"
+  opens and scans every document: O(total tokens) per query. A million documents of a thousand tokens each
+  is a billion token comparisons per query, growing linearly with the corpus.
+- **Caching does not help,** because queries are too diverse.
+- **Queries are short; vocabularies are smaller than corpora.** Precompute, per term, the documents that
+  contain it, and a five-term query reads five lists. Cost tracks how many documents contain the query
+  terms, not how many exist.
+- **The decisive part is the cheap part.** Rare terms carry most of the ranking signal and have short
+  lists.
+- **Doing it well defines the structure.** Common-term lists are huge (compress them); intersections must
+  not read all of both lists; ranking needs per-document statistics; documents change while queries run;
+  the dictionary is hit millions of times a second. Every feature of Lucene (under Elasticsearch and
+  OpenSearch) or the engines inside Vespa and Tantivy answers one of these. At the high end it is sharded
+  across machines, still on CPUs.
 
 ## How it works
 ### Analysis defines the terms
-Before indexing, text passes through an analyzer: tokenize, lowercase, maybe strip accents, stem
-("running" → "run"), drop stopwords, split or keep hyphenated tokens. The output tokens are the keys of
-the index. Because a query is analyzed the same way and then looked up by exact key, the analyzer is the
-entire semantic contract: whatever it does not normalize cannot match. This is why the same text in two
-fields with different analyzers behaves like two different indexes, and why a change of analyzer
-requires a full re-index.
+1. Tokenize, lowercase, maybe strip accents.
+2. Stem ("running" → "run"), drop stopwords, split or keep hyphenated tokens.
+3. The output tokens are the index keys.
+
+- **The analyzer is the entire semantic contract.** A query is analyzed the same way and looked up by
+  exact key, so whatever the analyzer does not normalize cannot match.
+- **Consequences:** the same text in two fields with different analyzers behaves like two different
+  indexes, and changing an analyzer requires a full re-index.
 
 ### Dictionary and postings
-The index has two parts.
-
-- The **term dictionary** maps each term to the location of its posting list and to collection
-  statistics such as document frequency. It must support exact lookup and, for prefix and wildcard
-  queries, ordered traversal. Lucene keeps a finite-state transducer (a compressed, trie-like automaton)
-  over term prefixes in memory, which points into on-disk blocks of sorted terms; that is how a dictionary
-  of many millions of terms stays fast without being fully resident.
-- The **posting list** for a term is the sequence of documents containing it, sorted by document id,
-  each entry carrying the term frequency, optionally the positions of each occurrence (for phrase and
-  proximity queries) and payload data. Sorted order is what makes everything else possible.
+- **Term dictionary.** Maps each term to its posting list's location and to collection statistics such as
+  document frequency. It needs exact lookup and, for prefix and wildcard queries, ordered traversal.
+  Lucene keeps a finite-state transducer (a compressed, trie-like automaton) over term prefixes in memory,
+  pointing into on-disk blocks of sorted terms, so many millions of terms stay fast without being fully
+  resident.
+- **Posting list.** The documents containing the term, sorted by document id; each entry carries term
+  frequency, optionally positions (for phrase and proximity queries) and payload data. Sorted order makes
+  everything else possible.
 
 ### Why sorted ids and compression
-Sorted ids let two lists be intersected with a merge: two cursors, advance the smaller, O(|A| + |B|)
-instead of O(|A|·|B|). They also let the list be stored as gaps between consecutive ids rather than
-absolute values; gaps are small numbers, especially for common terms, and variable-byte or bit-packed
-encodings (PForDelta and relatives) store them in a byte or two, often fewer bits, instead of four. A
-list for a term in ten million documents shrinks several-fold and, more importantly, streams through the
-CPU cache. Skip data stored per block of roughly a hundred entries (Lucene encodes postings in blocks of
-128) lets an intersection jump over stretches of one list that
-cannot match the other, so intersecting a rare term with a common one costs about the size of the rare
-list.
+- **Merge intersection.** Two cursors, advance the smaller: O(|A| + |B|) instead of O(|A|·|B|).
+- **Gap encoding.** Store differences between consecutive ids; gaps are small, especially for common
+  terms. Variable-byte or bit-packed encodings (PForDelta and relatives) use a byte or two, often fewer
+  bits, instead of four.
+- **Cache-friendly.** A list for a term in ten million documents shrinks several-fold and, more
+  importantly, streams through the CPU cache.
+- **Skip data.** Stored per block of roughly a hundred entries (Lucene encodes postings in blocks of 128),
+  it lets an intersection jump over stretches that cannot match. Rare AND common costs about the size of
+  the rare list.
 
 ### Query evaluation
-Two strategies exist. Term-at-a-time walks each query term's list fully and accumulates partial scores
-per document; document-at-a-time advances all lists in lockstep and scores each document completely
-before moving on. Document-at-a-time is what Lucene and most production engines mostly use, because it enables early
-termination: with BM25 you can precompute, per term, the maximum score any document can get from it.
-Algorithms like WAND and MaxScore use those upper bounds to skip documents that cannot enter the current
-top k, so a top-10 query over a term in ten million documents reads a small fraction of the list. This is
-why "return the top 10" is far cheaper than "return all matches sorted".
+| Strategy | How | Consequence |
+|---|---|---|
+| Term-at-a-time | walk each term's list fully, accumulate partial scores per document | every list is read to the end |
+| Document-at-a-time | advance all lists in lockstep, score each document completely | what Lucene and most production engines mostly use, because it enables early termination |
 
-MaxScore makes the idea concrete. Take an OR query "iphone15 case" where the rare term's maximum
-possible contribution is 9.0 and the common term's is 1.5. Fill the top-10 heap from the first documents
-seen; suppose its weakest entry, the threshold θ, is now 4.0. A document containing only "case" can
-score at most 1.5 < θ, so it can never enter the results, and "case" becomes a *non-essential* list: the
-engine stops iterating it and only advances the "iphone15" list, probing "case" (via skips) for the
-candidate ids that list produces. The common list's four million postings shrink to a few thousand
-lookups. WAND reaches the same effect by ordering cursors by current document id and summing upper
-bounds until they exceed θ. Block-max variants keep enough per-block data to bound the score within each block of postings
-rather than only per term (Lucene stores these as *impacts*, frequency and length pairs), so even a
-common term can skip blocks whose local maximum is low.
-The pruning is exact, not approximate: the top k is identical to scoring everything, only cheaper, and
-it gets better as θ rises, which is why engines prefer not to compute an exact total hit count.
+- **Upper bounds:** with BM25 you can precompute, per term, the maximum score any document can get from it.
+- **WAND and MaxScore** use those bounds to skip documents that cannot enter the current top k, so a
+  top-10 query over a term in ten million documents reads a small fraction of the list.
+- **That is why** "return the top 10" is far cheaper than "return all matches sorted".
 
-Ranking needs per-document data too: BM25 wants document length, which is stored in a separate per-field
-norms structure, and collection-wide N and average length, which are index statistics. In a sharded
-engine each shard holds its own statistics unless the query coordinator fetches global ones first.
+MaxScore step by step, OR query "iphone15 case" (rare term max 9.0, common term max 1.5):
+1. Fill the top-10 heap from the first documents seen; its weakest entry, the threshold θ, is now 4.0.
+2. A document containing only "case" scores at most 1.5 < θ, so it can never enter the results.
+3. "case" becomes a *non-essential* list: the engine stops iterating it and only advances "iphone15".
+4. It probes "case" (via skips) only for the candidate ids that list produces; four million postings
+   shrink to a few thousand lookups.
+
+- **WAND** reaches the same effect by ordering cursors by current document id and summing upper bounds
+  until they exceed θ.
+- **Block-max variants** bound the score within each block of postings, not only per term (Lucene stores
+  these as *impacts*, frequency and length pairs), so even a common term can skip low-scoring blocks.
+- **The pruning is exact,** not approximate: the top k is identical to scoring everything, only cheaper.
+  It improves as θ rises, which is why engines prefer not to compute an exact total hit count.
+
+Ranking data beyond postings:
+- BM25 needs document length, stored in a separate per-field norms structure, plus collection-wide N and
+  average length as index statistics.
+- In a sharded engine each shard holds its own statistics unless the coordinator fetches global ones first.
 
 ### Segments, immutability and updates
-Mutating a compressed, sorted posting list in place is impractical, so Lucene-style indexes are
-write-once. New documents accumulate in memory and are flushed as a new immutable **segment**, a
-complete mini-index. A query runs against every segment and merges results. Deletes are recorded in a
-per-segment bitset of live documents; the deleted document's postings stay until a background merge
-rewrites the segments without it. Updates are a delete plus a re-add. Two consequences are easy to
-forget: a document is not searchable until its segment is flushed (the refresh interval), and deleted
-documents still affect statistics like document frequency until merged, so scores drift slightly on
-churning indexes.
+- **Write-once,** because mutating a compressed, sorted list in place is impractical.
+- **Segments.** New documents accumulate in memory and flush as a new immutable **segment**, a complete
+  mini-index. Queries run against every segment and merge results.
+- **Deletes** go into a per-segment bitset of live documents; postings stay until a background merge
+  rewrites the segments without them. **Updates** are a delete plus a re-add.
+- **Easy to forget, 1:** a document is not searchable until its segment is flushed (the refresh interval).
+- **Easy to forget, 2:** deleted documents still affect statistics like document frequency until merged,
+  so scores drift slightly on churning indexes.
 
 ### Phrase and positional queries
-Because positions are stored, "fuser overheating" as a phrase is answered by intersecting the two lists
-and then checking, within each shared document, whether some position of the first term is immediately
-followed by a position of the second. Proximity queries relax "immediately" to a window. Storing
-positions substantially enlarges the index, which is why engines let you turn them off per field.
+- **Phrase** "fuser overheating": intersect the two lists, then check within each shared document whether
+  a position of the first term is immediately followed by one of the second.
+- **Proximity** relaxes "immediately" to a window.
+- **Cost:** positions substantially enlarge the index, which is why engines let you turn them off per field.
 
 ### Relationship to filtering and to IVF
-Structured filters (tenant id, date ranges, document type) are themselves posting lists or bitsets
-intersected with the term lists, so lexical search gets filtering almost for free; this is the
-capability vector indexes struggle to match. And an IVF vector index is literally an inverted index whose
-"terms" are cluster ids, which is why the name carries over.
+- **Filters are postings too.** Tenant id, date ranges and document type are posting lists or bitsets
+  intersected with term lists, so lexical search gets filtering almost for free; vector indexes struggle
+  to match this.
+- **IVF is an inverted index** whose "terms" are cluster ids, which is why the name carries over.
 
-## Example
-A tiny index built by hand shows the three operations every engine performs: build postings with
-positions, intersect sorted lists with two cursors, and answer a phrase query from positions.
+## Examples
+### A tiny index by hand
+Build postings with positions, intersect sorted lists with two cursors, and answer a phrase query from
+positions: the three operations every engine performs.
 
 ```python
 import re
@@ -169,45 +168,87 @@ print({t: len(p) for t, p in postings.items() if len(p) > 1})  # df>1: {'hnsw': 
 Real engines add compression, skip pointers and segments on top, but the shape is exactly this: a
 dictionary of terms, sorted lists, and merge-style traversal.
 
+### Worked scenario: "iphone15 case" over ten million items
+| Step | Postings touched | Why |
+|---|---|---|
+| Naive OR, score every match | ~4,008,000 | every document containing either term |
+| AND with skips | ~8,000 plus skip jumps in "case" | driven by the rare list; skip data jumps blocks of 128 in the common list |
+| Top-10 OR with MaxScore, θ = 4.0 | ~8,000 plus up to ~8,000 skip-assisted probes into "case" | "case" alone maxes at 1.5 < θ, so it becomes non-essential |
+| Same, with an exact total hit count | ~4,008,000 | counting every match defeats the pruning |
+
+The ranking is identical in every row; only the work differs.
+
+### Production snippet: index settings that follow from the structure
+```json
+PUT /products
+{
+  "settings": { "index": { "refresh_interval": "1s" } },
+  "mappings": {
+    "properties": {
+      "title":     { "type": "text" },
+      "body":      { "type": "text", "index_options": "freqs" },
+      "tenant_id": { "type": "keyword" },
+      "sku":       { "type": "keyword" }
+    }
+  }
+}
+```
+
+- `body` keeps frequencies for BM25 but drops positions, so no phrase queries on it and a smaller index.
+- `tenant_id` and `sku` are `keyword` fields: one exact term each, ideal for filters.
+
+## Production patterns
+- **Reindex behind an alias after analyzer changes.** Create a new index with the new analyzer, copy data
+  with the `_reindex` API, then switch the read alias atomically. Monitor document counts in old and new
+  indexes before the swap, so no partially re-analyzed index serves traffic.
+- **Wait for refresh in tests, not sleep.** Index test documents with `refresh=wait_for` (or call
+  `_refresh`) so integration tests see their writes deterministically. Monitor flaky-test rate in CI.
+- **Pause refresh during bulk loads.** Set `refresh_interval` to `-1` for a large backfill and restore it
+  afterwards, which avoids many tiny segments. Monitor segment count and merge time after the load.
+- **Watch deleted-document bloat.** On high-churn indexes track the deleted-docs count (the `_cat/indices`
+  API shows it) and run a force merge with `only_expunge_deletes` in a quiet window if merges lag.
+  Monitor index size and p99 latency over weeks.
+- **Keep top-k cheap.** Leave `track_total_hits` at its bounded default rather than demanding exact
+  counts, and avoid leading wildcards on large dictionaries. Monitor p99 latency against posting-list
+  length of the query terms.
+
 ## Trade-offs
-- Precomputing postings makes queries cost proportional to matching documents instead of corpus size,
-  but indexing becomes the expensive, latency-adding step; the balance flips for write-heavy, rarely
-  queried data where a scan is cheaper than maintaining the index.
-- Storing positions enables phrase and proximity queries at a substantial index-size cost; drop them on
-  fields that are only ever filtered or scored as a bag of words.
-- Immutable segments give lock-free reads and crash safety, at the price of refresh latency and
-  background merge I/O; tightening the refresh interval for near-real-time search trades CPU and more
-  small segments for freshness.
-- Heavier analysis (stemming, synonyms, decompounding) raises recall on natural-language queries but
+- **Postings make queries cost matching documents, not corpus size,** but indexing becomes the expensive,
+  latency-adding step; the balance flips for write-heavy, rarely queried data where a scan is cheaper.
+- **Positions enable phrase and proximity queries** at a substantial index-size cost; drop them on fields
+  only ever filtered or scored as a bag of words.
+- **Immutable segments give lock-free reads and crash safety,** at the price of refresh latency and merge
+  I/O; a tighter refresh interval for near-real-time search trades CPU and more small segments for
+  freshness.
+- **Heavier analysis (stemming, synonyms, decompounding)** raises recall on natural-language queries but
   lowers precision on identifiers and names; which side wins depends on the query mix, so measure per
   query type.
 
 ## Pitfalls
-- Re-indexing partially after an analyzer change, so old segments hold tokens produced by the old rules;
-  the symptom is the same query matching a document indexed last month but not its identical twin
-  indexed today.
-- Expecting a freshly written document to be searchable immediately; the symptom is flaky integration
-  tests that pass only with a sleep, caused by the refresh interval and segment flush.
-- Ignoring deleted-document bloat on high-churn indexes; the symptom is index size that never shrinks and
-  slowly rising query latency until a forced merge.
-- Running wildcard or leading-wildcard queries on large term dictionaries; the symptom is a single query
-  that pins a CPU, because it expands to thousands of terms and thousands of posting-list reads.
-- Reading per-shard scores as globally comparable; the symptom is the same document scoring differently
-  after a reshard, because document frequency was computed per shard.
-- Loading learned sparse vectors (SPLADE-style expansions) into an engine tuned for BM25 postings; query
-  latency can be far higher than BM25 on the same index, because expanded queries have many terms with
-  similar weights, which leaves dynamic pruning little to skip. Measure p99 before assuming "it is just
-  an inverted index".
+- **Partial re-index after an analyzer change.** Old segments hold tokens from the old rules. Symptom: a
+  query matches a document indexed last month but not its identical twin indexed today.
+- **Expecting writes to be searchable immediately.** Symptom: flaky integration tests that pass only with
+  a sleep, caused by the refresh interval and segment flush.
+- **Ignoring deleted-document bloat.** Symptom: index size never shrinks and query latency slowly rises
+  until a forced merge.
+- **Wildcard or leading-wildcard queries on large dictionaries.** Symptom: one query pins a CPU, because it
+  expands to thousands of terms and thousands of posting-list reads.
+- **Reading per-shard scores as globally comparable.** Symptom: the same document scores differently after
+  a reshard, because document frequency was computed per shard.
+- **Learned sparse vectors (SPLADE-style) in an engine tuned for BM25.** Expanded queries have many terms
+  with similar weights, leaving dynamic pruning little to skip, so latency can be far higher than BM25 on
+  the same index. Measure p99 before assuming "it is just an inverted index".
 
 ## When to use
-Any time text must be found by the terms it contains: lexical search, BM25, keyword filters, log search,
-and the sparse half of hybrid retrieval. Prefer it over scanning once the corpus is more than a few
-thousand documents or queries are frequent, and over a vector index whenever exact matching, filtering
-and explainability dominate. Know its limits: it cannot match meaning without an analyzer or a learned
-sparse model, and it needs re-indexing when the analyzer changes. Measure index size, refresh latency,
-p99 query latency against posting-list length, and merge I/O. In day-to-day work it surfaces as analyzer
-configuration, mapping decisions and refresh settings; in interviews, expect to explain why posting lists
-are sorted and how a top-k query avoids reading entire lists.
+- **Use whenever** text must be found by the terms it contains: lexical search, BM25, keyword filters, log
+  search, and the sparse half of hybrid retrieval.
+- **Prefer it over scanning** once the corpus is more than a few thousand documents or queries are
+  frequent; **over a vector index** whenever exact matching, filtering and explainability dominate.
+- **Know its limits:** no meaning without an analyzer or a learned sparse model, and a re-index when the
+  analyzer changes.
+- **Measure:** index size, refresh latency, p99 query latency against posting-list length, and merge I/O.
+- **Day to day** it surfaces as analyzer configuration, mapping decisions and refresh settings.
+- **Interviews:** explain why posting lists are sorted and how a top-k query avoids reading entire lists.
 
 ## Role lens
 - **Engineer:** Defines field mappings and analyzers, keeps query-time analysis identical to index-time,

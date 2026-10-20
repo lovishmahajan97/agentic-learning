@@ -5,7 +5,7 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - evals/llm-as-a-judge
   - evals/rubrics
@@ -21,77 +21,85 @@ sources:
 ---
 
 ## TL;DR
-An LLM judge is a measuring instrument with its own systematic errors: it tends to prefer the answer
-shown first, the longer answer, the answer written in its own style, and it bunches scores near the top
-of the scale. Calibration means measuring those errors against human labels *before* trusting the judge;
-bias mitigation is the set of protocol changes (position swapping, length control, rubrics, reference
-answers, judges from a different model family) that shrink them. Skip this and a judge score measures the
-judge, not your system.
+An LLM judge is an instrument with systematic errors: it favours the first answer, the longer one, its
+own style, and bunches scores high. Measure those errors against human labels before trusting it, then
+change the protocol to shrink them.
 
 ## Why it exists
-A judge model is attractive because it is cheap and scales to thousands of outputs. But every instrument
-has two kinds of error. *Variance* is noise: run the judge twice, get slightly different numbers. Variance
-is annoying but you can average it away by repeating. *Bias* is a systematic tilt in one direction, and no
-amount of repetition removes it. If the judge likes long answers and your new prompt makes answers 30%
-longer, the judge reports an improvement that users may never experience, and every repeat of the
-experiment confirms the same wrong conclusion.
-
-The biases are not hypothetical. Zheng et al. documented, for GPT-4-class judges on MT-Bench, three
-recurring ones: **position bias** (the verdict changes when the two candidates are swapped), **verbosity
-bias** (longer answers win even when the extra text adds nothing), and **self-enhancement bias** (a judge
-rates outputs from itself or its own family higher). Wang et al. showed that position bias alone can
-reorder a leaderboard. Later work showed judges can recognise their own generations and favour them.
-Practitioners add a few more: **style bias** (markdown headings and confident tone score higher than
-plain correct prose), **scale compression** (on a 1–10 scale almost everything lands at 7–9, so real
-differences vanish into rounding), **knowledge-gap leniency** (a fluent but wrong proof passes when the
-judge cannot do the math either), and **anchoring** on any hint in the prompt, such as a reference answer
-or a label like "improved version".
-
-The naive fix, "use the strongest model available and trust it", fails on two counts. Stronger judges
-still show these biases, just less; and without a comparison to human labels you cannot tell how much.
-Biases are invisible in an aggregate score, which is why they have to be probed deliberately with
-controlled inputs rather than discovered by accident after a bad release.
+- **Judges are cheap, so they get trusted.** A judge model scales to thousands of outputs, which makes it
+  attractive, but like every instrument it has two kinds of error.
+- **Variance averages away; bias does not.** *Variance* is noise: run twice, get slightly different
+  numbers, so repeat and average. *Bias* is a systematic tilt that no amount of repetition removes.
+- **Bias manufactures wins.** If the judge likes long answers and a new prompt makes answers 30% longer,
+  it reports an improvement users may never feel, and every repeat confirms the same wrong conclusion.
+- **"Use the strongest model and trust it" fails.** Stronger judges still show these biases, just less,
+  and without human labels you cannot tell how much.
+- **Biases are invisible in an aggregate score.** They must be probed deliberately with controlled
+  inputs, not discovered by accident after a bad release. Skip this and a judge score measures the judge,
+  not your system.
 
 ## How it works
+### The known biases
+| Bias | What it looks like | Evidence |
+|---|---|---|
+| **Position** | verdict changes when the two candidates are swapped | Zheng et al. (GPT-4-class judges, MT-Bench); Wang et al. showed it alone can reorder a leaderboard |
+| **Verbosity** | longer answers win even when the extra text adds nothing | Zheng et al. |
+| **Self-enhancement** | a judge rates outputs from itself or its own family higher | Zheng et al.; later work showed judges recognise and favour their own generations |
+| **Style** | markdown headings and confident tone beat plain correct prose | practitioner experience |
+| **Scale compression** | on a 1–10 scale almost everything lands at 7–9, so real differences vanish into rounding | practitioner experience |
+| **Knowledge-gap leniency** | a fluent but wrong proof passes when the judge cannot do the math either | practitioner experience |
+| **Anchoring** | any hint in the prompt (a reference answer, a label like "improved version") pulls the verdict | practitioner experience |
+
 ### Step 1: build a calibration set
-Take a sample of real inputs, on the order of 100–300 items (illustrative), and have humans label them
-with the exact rubric the judge will use. Seed it with the cases that expose bias: correct-but-terse
-answers, wrong-but-eloquent ones, pairs that differ only in formatting, and genuine ties. Measure
-inter-annotator agreement first, because it is the yardstick: a judge cannot be shown to be more
-accurate than the labels it is compared against, and its agreement number only means something next to
-human–human agreement computed the same way.
+1. **Sample real inputs**, on the order of 100–300 items (illustrative).
+2. **Have humans label them with the exact rubric** the judge will use.
+3. **Seed it with bias-exposing cases:** correct-but-terse answers, wrong-but-eloquent ones, pairs that
+   differ only in formatting, and genuine ties.
+4. **Measure inter-annotator agreement first**, because it is the yardstick. A judge cannot be shown to
+   be more accurate than the labels it is compared against, and its agreement only means something next
+   to human–human agreement computed the same way.
 
 ### Step 2: measure agreement, not just scores
-Run the judge on the calibration set and compute agreement with the human majority: accuracy for
-pairwise verdicts, Cohen's kappa for pass/fail, Spearman correlation for ordinal scores. Compare that
-number with human–human agreement on the same items, computed like for like: judge versus each
-annotator next to annotator versus annotator, or judge versus the majority next to each annotator versus
-the majority of the others. Agreement with a majority label is naturally higher than agreement with one
-noisy person, so mixing the two makes a judge look better than it is. A judge within a few points of
-human–human agreement is "another annotator"; one far below is not usable as a gate. Then look at *where* it
-disagrees. Disagreements concentrated on one failure mode (say, numeric claims) tell you the judge
-cannot evaluate that criterion and a human or a programmatic check must.
+- **Pick the right statistic:** accuracy for pairwise verdicts, Cohen's kappa for pass/fail, Spearman
+  correlation for ordinal scores, each against the human majority.
+- **Compare like for like:** judge versus each annotator next to annotator versus annotator, or judge
+  versus the majority next to each annotator versus the majority of the others.
+- **Why it matters:** agreement with a majority label is naturally higher than with one noisy person, so
+  mixing the two makes a judge look better than it is.
+- **Read the result:** within a few points of human–human agreement, the judge is "another annotator";
+  far below, it is not usable as a gate.
+- **Look at *where* it disagrees.** Disagreements concentrated on one failure mode (say, numeric claims)
+  mean the judge cannot evaluate that criterion, so a human or a programmatic check must.
 
 ### Step 2b: split the two error rates and correct the aggregate
-For a pass/fail judge, one agreement number hides which way it errs. Measure the two rates separately
-against human labels: **TPR**, the share of human-pass items the judge passes, and **TNR**, the share of
-human-fail items it fails. Judges are typically lenient, so TPR is high and TNR is the weak side; a judge
-that passes everything scores 90% accuracy on a set where 90% of items pass, which is why accuracy alone
-is not enough. The two rates also bias the headline number in a predictable way, because
+- **One agreement number hides which way a pass/fail judge errs.** Measure **TPR** (share of human-pass
+  items the judge passes) and **TNR** (share of human-fail items it fails) separately.
+- **Judges are typically lenient**, so TPR is high and TNR is the weak side.
+- **Accuracy alone is not enough:** a judge that passes everything scores 90% accuracy on a set where 90%
+  of items pass.
+- **The two rates bias the headline number predictably**, because:
 
 ```
 p_obs = TPR · p + (1 − TNR) · (1 − p)     →     p = (p_obs + TNR − 1) / (TPR + TNR − 1)
 ```
 
-where p is the true (human) pass rate. With TPR = 0.95 and TNR = 0.70, a system that truly passes 80%
-shows 82%, and one that truly passes 70% shows 75.5%: the judge inflates both and shrinks a 10-point gap
-to 6.5, because every difference is scaled by TPR + TNR − 1 = 0.65. Inverting the formula recovers the
-true rate, but only as well as TPR and TNR are known; they are estimated on the human-labeled set, so
-include enough human-fail items to pin TNR down, and bootstrap the correction. As TPR + TNR − 1
-approaches 0 the judge carries no information and the correction explodes, which is the quantitative
-form of "this judge cannot gate". If the judge emits a confidence or a score, check calibration in the
-probabilistic sense too: bucket verdicts by stated confidence and confirm that "90% sure" verdicts agree
-with humans about 90% of the time, so low-confidence items can be routed to people.
+where p is the true (human) pass rate.
+
+| TPR = 0.95, TNR = 0.70 | True pass rate | Judge shows |
+|---|---|---|
+| System A | 80% | 82% |
+| System B | 70% | 75.5% |
+| Gap | 10 points | 6.5 points |
+
+- **The gap shrinks** because every difference is scaled by TPR + TNR − 1 = 0.65.
+- **Inverting the formula recovers the true rate**, but only as well as TPR and TNR are known. They are
+  estimated on the human-labeled set, so include enough human-fail items to pin TNR down, and bootstrap
+  the correction.
+- **As TPR + TNR − 1 approaches 0** the judge carries no information and the correction explodes: the
+  quantitative form of "this judge cannot gate".
+- **Check probabilistic calibration too** if the judge emits a confidence or score: bucket verdicts by
+  stated confidence and confirm "90% sure" verdicts agree with humans about 90% of the time, so
+  low-confidence items can be routed to people.
 
 ### Step 3: probe each bias with controlled perturbations
 - **Position.** Judge every pair in both orders. The inconsistency rate (verdict flips when swapped) is
@@ -106,31 +114,30 @@ with humans about 90% of the time, so low-confidence items can be routed to peop
   and deltas between variants are mostly noise.
 
 ### Step 4: mitigate what you found
-- Position: run both orders and average, or count only consistent verdicts and treat flips as ties.
-  This doubles judge cost, which is why you measure first; if flips are rare for your task, skip it.
-- Length: report a length-controlled win rate (fit a model of preference with the length difference as
-  a covariate and read off the prediction at zero difference, the idea behind length-controlled
-  AlpacaEval), instruct the judge explicitly that length is not a merit, and include few-shot examples
-  where the shorter answer wins.
-- Scale compression: replace 1–10 with rubric-anchored levels or binary per-criterion checks, or switch
-  to pairwise comparison, which needs no absolute scale at all.
-- Knowledge gaps: reference-guided grading. Give the judge a gold answer or test results so it checks
-  consistency instead of solving the problem itself.
-- Self-preference: use a judge from a different family than the system under test, or a small panel of
-  judges from several families with a majority vote.
-- Reasoning: ask for a short analysis before the verdict and a structured final field. This helps on
-  reasoning-heavy comparisons, with the size of the gain model-dependent, so verify it on your set.
-- Drift: pin the judge model version and treat the judge prompt as versioned code. Re-run calibration
-  whenever either changes; vendor model updates silently move the instrument.
+| Bias found | Mitigation | Cost or caveat |
+|---|---|---|
+| Position | run both orders and average, or count only consistent verdicts and treat flips as ties | doubles judge cost, which is why you measure first; if flips are rare for your task, skip it |
+| Length | length-controlled win rate; tell the judge length is not a merit; few-shot examples where the shorter answer wins | needs a fitted model |
+| Scale compression | rubric-anchored levels, binary per-criterion checks, or pairwise comparison (no absolute scale at all) | loses some gradation |
+| Knowledge gaps | reference-guided grading: give a gold answer or test results so it checks consistency instead of solving the problem itself | penalises valid alternatives |
+| Self-preference | a judge from a different family than the system under test, or a small cross-family panel with a majority vote | more calls |
+| Reasoning-heavy comparisons | short analysis before the verdict, then a structured final field | gain is model-dependent, so verify it on your set |
+| Drift | pin the judge model version; treat the judge prompt as versioned code; re-run calibration when either changes | vendor model updates silently move the instrument |
+
+- **Length-controlled win rate, concretely:** fit a model of preference with the length difference as a
+  covariate and read off the prediction at zero difference. This is the idea behind length-controlled
+  AlpacaEval.
 
 ### Step 5: report with uncertainty
-Bootstrap a confidence interval over items for the headline score and always publish the judge's
-agreement with humans next to it. A win rate without an agreement number is an unlabeled gauge.
+- **Bootstrap a confidence interval** over items for the headline score.
+- **Always publish the judge's agreement with humans next to it.** A win rate without an agreement number
+  is an unlabeled gauge.
 
-## Example
-The harness below runs each pair in both orders, measures position inconsistency, agreement with human
-labels on the consistent pairs, and the judge's preference for the longer answer relative to the humans'.
-The `judge` function wraps whatever LLM call you use and returns `"A"` or `"B"`.
+## Examples
+### Both-order calibration harness
+Runs each pair in both orders and measures position inconsistency, agreement with human labels on the
+consistent pairs, and the judge's preference for the longer answer relative to the humans'. The `judge`
+function wraps whatever LLM call you use and returns `"A"` or `"B"`.
 
 ```python
 import statistics as st
@@ -162,51 +169,117 @@ def calibrate(pairs, human):
     print(f"chose longer answer: judge {st.mean(judge_longer):.0%} vs humans {st.mean(human_longer):.0%}")
 ```
 
-Illustrative output on 200 pairs: 46 inconsistent (23%), with the first slot winning 72 of the 92
-verdicts in those pairs (a flipped pair contributes either two first-slot wins or none, so this count is
-always even), which is a clear first-position bias. On the 154 consistent pairs the judge agrees with the
-human majority on 128 (83%), while individual annotators agreed with the majority of the others on 86%,
-so it is close to annotator quality. But it picks the longer answer 68% of the time against the humans' 55%: a verbosity tilt of
-roughly 13 points that will reward any prompt change that makes outputs wordier.
+Illustrative output on 200 pairs:
+
+| Measure | Result | Reading |
+|---|---|---|
+| Position-inconsistent pairs | 46 (23%) | first slot won 72 of the 92 verdicts in those pairs: a clear first-position bias |
+| Agreement on the 154 consistent pairs | 128 (83%) | annotators agreed with the majority of the others on 86%, so close to annotator quality |
+| Chose the longer answer | judge 68% vs humans 55% | a verbosity tilt of roughly 13 points that rewards any change making outputs wordier |
+
+The first-slot count is always even, because a flipped pair contributes either two first-slot wins or none.
+
+### Correcting a lenient judge's pass rate
+Pure Python. Uses the TPR/TNR inversion from Step 2b and bootstraps the calibration set so the corrected
+number carries an interval.
+
+```python
+import random
+
+def corrected(p_obs, tpr, tnr):
+    j = tpr + tnr - 1                     # how much information the judge carries
+    if j <= 0.05:
+        raise ValueError("judge carries ~no information; it cannot gate")
+    return min(1.0, max(0.0, (p_obs + tnr - 1) / j))
+
+def bootstrap(judge, human, p_obs, n=2000, seed=0):
+    """judge, human: parallel 0/1 lists on the human-labeled calibration set."""
+    rng, pairs, out = random.Random(seed), list(zip(judge, human)), []
+    for _ in range(n):
+        s = [rng.choice(pairs) for _ in pairs]
+        pos = [j for j, h in s if h == 1]; neg = [j for j, h in s if h == 0]
+        tpr = sum(pos) / len(pos); tnr = 1 - sum(neg) / len(neg)
+        try: out.append(corrected(p_obs, tpr, tnr))
+        except ValueError: pass
+    out.sort()
+    return out[int(0.025 * len(out))], out[int(0.975 * len(out))]
+
+# Calibration set: 200 human-pass items (judge passes 190), 100 human-fail (judge fails 70)
+human = [1] * 200 + [0] * 100
+judge = [1] * 190 + [0] * 10 + [0] * 70 + [1] * 30
+print(round(corrected(0.82, 0.95, 0.70), 3))   # 0.8: the 82% headline is really ~80%
+print(round(corrected(0.755, 0.95, 0.70), 3))  # 0.7
+print(bootstrap(judge, human, p_obs=0.82))     # roughly (0.75, 0.85) on this set
+```
+
+- **Why 100 human-fail items:** with only 20, the standard error of TNR grows by about √5 ≈ 2.2×
+  (it scales with 1/√n), and the corrected interval widens with it. The 0.05 floor on TPR + TNR − 1 is an illustrative guard, not a
+  standard.
+
+## Production patterns
+- **Calibration job in CI.** When the judge model, judge prompt or task changes, re-run the judge on the
+  versioned human-labeled set and fail the build if kappa or TNR falls below a threshold set relative to
+  human–human agreement. Monitor agreement, TPR and TNR per release.
+- **Pin the judge by dated snapshot.** Call a dated model version rather than a moving alias and store the
+  judge prompt hash with every score. Monitor for step changes in historical trends on days your system
+  did not change.
+- **Swap-and-tie for pairwise gates.** Judge each pair in both orders, count flips as ties, and log the
+  flip rate as its own metric. If it rises above what you measured at calibration, re-calibrate before
+  trusting the win rate.
+- **Cross-family judge panel for model selection.** When the candidates include the judge's own family,
+  use two or three judges from different families and take a majority vote. Monitor how often panel
+  members disagree.
+- **Route low-confidence verdicts to humans.** Use the confidence buckets from Step 2b to send verdicts
+  below a chosen confidence to a review queue. Monitor queue volume and human–judge agreement on the
+  routed items.
+- **Ongoing human spot checks.** Sample a small fixed share of production-judged items each week for
+  human labels, and add them to the calibration set. Monitor agreement over time to catch drift.
 
 ## Trade-offs
-- Position swapping removes the largest pairwise bias but doubles judge cost; skip it only after you have
-  measured a low inconsistency rate on your own calibration set, not because a paper reported one.
-- Reference-guided grading sharply improves accuracy on tasks with a checkable answer, but penalises valid
-  alternatives; it flips to a liability on open-ended tasks with many acceptable answers.
-- A stronger judge agrees more with humans but costs more and is more likely to share a family with the
-  system under test; once the candidate is the judge's sibling, a weaker judge from another family wins.
-- Binary rubric checks cure scale compression but lose gradation; when the differences you care about sit
-  inside a single criterion, a short anchored scale (3 levels) is the better compromise.
-- Human calibration labels are expensive, but they are reusable across judge versions and are the only
-  way to detect drift; a few hundred pairwise labels usually suffice for an accuracy estimate.
+- **Bias removal vs cost.** Position swapping removes the largest pairwise bias but doubles judge cost;
+  skip it only after you have measured a low inconsistency rate on your own calibration set, not because a
+  paper reported one.
+- **Accuracy vs valid alternatives.** Reference-guided grading sharply improves accuracy on tasks with a
+  checkable answer, but penalises valid alternatives; it flips to a liability on open-ended tasks with
+  many acceptable answers.
+- **Strength vs independence.** A stronger judge agrees more with humans but costs more and is more
+  likely to share a family with the system under test; once the candidate is the judge's sibling, a
+  weaker judge from another family wins.
+- **Binary checks vs gradation.** Binary rubric checks cure scale compression but lose gradation; when
+  the differences you care about sit inside a single criterion, a short anchored scale (3 levels) is the
+  better compromise.
+- **Label cost vs drift detection.** Human calibration labels are expensive, but they are reusable across
+  judge versions and are the only way to detect drift; a few hundred pairwise labels usually suffice for
+  an accuracy estimate.
 
 ## Pitfalls
-- Publishing a judge win rate without the judge's agreement with humans; the symptom is a prompt change
-  that "improves" the score while user complaints rise.
-- Generating and judging with the same model family; the symptom is the candidate beating stronger
-  external models suspiciously often, and the ranking changing when the judge family changes.
-- A compressed score distribution; the symptom is every variant scoring 8.2–8.6 with differences inside
-  the bootstrap interval, so the eval cannot distinguish anything.
-- Letting the vendor upgrade the judge model silently; the symptom is a step change in a historical trend
-  chart on the day nothing in your system changed.
-- Reporting only overall accuracy for a pass/fail judge; the symptom is a judge that "agrees 90%" yet
-  catches few of the failures, visible as a low TNR once human-fail items are counted separately.
-- Leaking metadata into the judge prompt (model names, "v2", "improved"); the symptom is verdicts that flip
-  when the labels are swapped while the content stays the same.
-- Judging in one fixed order; the symptom is a leaderboard that reorders when candidate A and B are
-  exchanged.
+- **Publishing a win rate without agreement.** Symptom: a prompt change that "improves" the score while
+  user complaints rise. Fix: report agreement with humans next to every judge score.
+- **Generating and judging with the same family.** Symptom: the candidate beats stronger external models
+  suspiciously often, and the ranking changes when the judge family changes. Fix: cross-family judge.
+- **A compressed score distribution.** Symptom: every variant scores 8.2–8.6 with differences inside the
+  bootstrap interval, so the eval cannot distinguish anything. Fix: anchored levels or pairwise.
+- **Silent vendor upgrades of the judge.** Symptom: a step change in a historical trend chart on the day
+  nothing in your system changed. Fix: pin the version and re-calibrate on change.
+- **Reporting only overall accuracy for pass/fail.** Symptom: a judge that "agrees 90%" yet catches few
+  of the failures, visible as a low TNR once human-fail items are counted separately.
+- **Leaking metadata into the judge prompt** (model names, "v2", "improved"). Symptom: verdicts flip
+  when the labels are swapped while the content stays the same. Fix: strip identifiers.
+- **Judging in one fixed order.** Symptom: a leaderboard that reorders when candidate A and B are
+  exchanged. Fix: both-order judging.
 
 ## When to use
-Calibrate whenever a judge gates a decision: prompt releases, model swaps, fine-tune selection, vendor
-comparisons. Do it once per combination of judge model, judge prompt and task, and again whenever any of
-the three changes. Track three numbers: position inconsistency rate, agreement with humans next to
-human–human agreement (split into TPR and TNR for pass/fail judges), and the judge's length preference
-relative to humans. For tasks with an
-executable check (tests, exact match, schema validation) do not use a judge at all. In day-to-day work
-this is the calibration job in CI that fails when agreement drops; in interviews the question "how do
-you know your judge is right?" expects exactly this: a labeled set, swap-and-average, length control, and
-kappa against the human ceiling.
+- **Use when a judge gates a decision:** prompt releases, model swaps, fine-tune selection, vendor
+  comparisons. Calibrate once per combination of judge model, judge prompt and task, and again whenever
+  any of the three changes.
+- **Measure three numbers:** position inconsistency rate, agreement with humans next to human–human
+  agreement (split into TPR and TNR for pass/fail judges), and the judge's length preference relative to
+  humans.
+- **Avoid when an executable check exists** (tests, exact match, schema validation): do not use a judge
+  at all.
+- **Day to day:** this is the calibration job in CI that fails when agreement drops.
+- **Interviews:** "how do you know your judge is right?" expects exactly this: a labeled set,
+  swap-and-average, length control, and kappa against the human ceiling.
 
 ## Role lens
 - **Engineer:** Implements both-order judging, structured verdict output, a pinned judge version, and a

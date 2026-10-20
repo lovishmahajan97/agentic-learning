@@ -5,7 +5,7 @@ name: Idempotency keys
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/timeouts
   - fastapi-for-ai/redis-caching
@@ -21,38 +21,34 @@ sources:
 ---
 
 ## TL;DR
-Networks fail after the server has done the work but before the client hears back, so clients retry,
-and a retried POST can bill twice, send two emails or run an expensive generation twice. An idempotency
-key is a client-chosen unique ID sent with the request. The server records the first outcome under
-that key and replays it for any retry, which turns at-least-once delivery into an effectively-once
-effect.
+An idempotency key is a client-chosen unique ID sent with a request. The server records the first
+outcome under it and replays it on retries, so a retried POST cannot bill twice or rerun a generation:
+at-least-once delivery becomes effectively-once.
 
 ## Why it exists
-Retries are essential: timeouts, dropped connections and 502s from proxies are routine, and a client
-that never retries is fragile. But a client that sees a timeout can't tell "the request never arrived"
-from "the request succeeded and the response was lost". For GET, PUT or DELETE this doesn't matter,
-because HTTP defines them as idempotent: doing them twice leaves the same state as doing them once.
-POST makes no such promise, and most AI endpoints are POSTs with side effects: create a chat turn and
-charge for its tokens, start a document-ingestion job, run an agent action that sends a message or
-files a ticket.
-
-LLM endpoints make this worse in two ways. Calls are slow and expensive, so timeouts and therefore
-retries are common, and each duplicate costs real money. Outputs are also non-deterministic, so a
-retry doesn't just duplicate the work, it produces a *different* answer. The client may then show one
-answer while your history stores another.
-
-The naive alternatives fail. "Deduplicate on request body" breaks when a user legitimately sends
-"yes" twice, and misses a retry whose body has a new timestamp. "Don't retry POSTs" pushes the failure
-onto the user. "Check whether a record exists first" races: two retries arriving 50 ms apart both see
-nothing and both proceed. What you need is an identity for the *intent*, chosen by the client before
-the first attempt, plus an atomic claim on the server.
+- **Retries are essential but ambiguous.** Timeouts, dropped connections and 502s from proxies are
+  routine, and a client that never retries is fragile. But after a timeout the client can't tell "never
+  arrived" from "succeeded and the response was lost".
+- **POST makes no idempotency promise.** GET, PUT and DELETE are idempotent by HTTP's definition (twice
+  leaves the same state as once). Most AI endpoints are POSTs with side effects: create a chat turn and
+  charge for its tokens, start a document-ingestion job, run an agent action that sends a message or
+  files a ticket.
+- **LLM endpoints make it worse.** Calls are slow and expensive, so timeouts and retries are common and
+  each duplicate costs real money. Outputs are non-deterministic, so a retry produces a *different*
+  answer: the client may show one while your history stores another.
+- **The naive alternatives fail.** "Deduplicate on request body" breaks when a user legitimately sends
+  "yes" twice, and misses a retry whose body has a new timestamp. "Don't retry POSTs" pushes the failure
+  onto the user. "Check whether a record exists first" races: two retries 50 ms apart both see nothing.
+- **What you need:** an identity for the *intent*, chosen by the client before the first attempt, plus
+  an atomic claim on the server.
 
 ## How it works
 ### The contract
-The client generates a high-entropy key (a UUIDv4) once per logical operation and sends it on every
-attempt, typically as an `Idempotency-Key` header. This is the convention used by payment APIs and
-described in an IETF HTTPAPI Internet-Draft. The key identifies the operation, not the attempt, so a
-new user action gets a new key and a retry reuses the old one.
+- **One key per logical operation.** The client generates a high-entropy key (a UUIDv4) once and sends
+  it on every attempt, typically as an `Idempotency-Key` header.
+- **An established convention.** Payment APIs use it, and an IETF HTTPAPI Internet-Draft describes it.
+- **The key names the operation, not the attempt.** A new user action gets a new key; a retry reuses
+  the old one.
 
 ### The server's state machine
 For each key the server stores a record: `{fingerprint, state, status_code, response_body, created_at}`.
@@ -60,46 +56,72 @@ For each key the server stores a record: `{fingerprint, state, status_code, resp
    already exists: Redis `SET key value NX EX ttl`, or a Postgres `INSERT ... ON CONFLICT DO NOTHING`
    on a unique key. Atomic because the check and the claim must be one step, or two concurrent retries
    both win.
-2. **If the claim succeeded**, do the work, then store the status code and response body and mark
-   it `completed`.
-3. **If the key exists and is completed**, compare fingerprints and replay the stored response
-   byte-for-byte without redoing anything. Replaying the stored response, rather than recomputing it,
-   is essential for LLM output, which wouldn't come out the same twice.
-4. **If the key exists and is in progress**, a concurrent retry is racing the original. Return
-   `409 Conflict` (optionally with `Retry-After`) instead of waiting or running it twice.
-5. **If the fingerprint differs**, the client reused a key for a different request, which is a client
-   bug. Reject it (the draft suggests `422`) instead of replaying an unrelated response.
-6. **If the endpoint requires a key and none was sent**, reject with `400` rather than silently
-   running unprotected; the draft suggests this too.
+2. **Claim succeeded:** do the work, then store the status code and response body and mark it `completed`.
+3. **Key exists and is completed:** compare fingerprints and replay the stored response byte-for-byte
+   without redoing anything. Replaying, rather than recomputing, is essential for LLM output, which
+   wouldn't come out the same twice.
+4. **Key exists and is in progress:** a concurrent retry is racing the original. Return `409 Conflict`
+   (optionally with `Retry-After`) instead of waiting or running it twice.
+5. **Fingerprint differs:** the client reused a key for a different request, a client bug. Reject it
+   (the draft suggests `422`) instead of replaying an unrelated response.
+6. **Key required but missing:** reject with `400` rather than silently running unprotected; the draft
+   suggests this too.
 
 ### Design choices and their reasons
 - **Fingerprint** = hash of method, path and canonicalised body. Without it a reused key silently
   returns someone else's result.
 - **Scope keys per caller** (`tenant:user:key`). Otherwise one tenant could collide with, or probe for,
   another's keys.
-- **TTL** a bit longer than the client's maximum retry window. Stripe, for example, keeps keys for
-  at least 24 hours. Shorter saves storage but lets a late retry run twice.
-- **Two TTLs, not one.** The `in_progress` claim is a *lease*: give it a TTL just above the longest the
-  work can take (say a couple of minutes for a generation), and only the completed record gets the long
-  retention TTL. If the claim carried the 24-hour TTL, a worker that crashed or was killed mid-request
-  would leave the key stuck in `in_progress`, and every retry would get 409 for a day.
-- **The lease must outlast the work, and the finisher must still own it.** If a generation runs past
-  its lease, the claim expires, a retry claims the key afresh and runs the work a second time. Bound
-  the work with a request deadline shorter than the lease (see timeouts), or renew the lease while
-  working. Store an owner token in the claim and write the completed record only if the token still
-  matches (a compare-and-set, via a Lua script in Redis or `UPDATE ... WHERE owner = $1` in Postgres),
-  so a stale worker cannot overwrite the record of the attempt that superseded it.
-- **What to store on failure.** Store deterministic outcomes, including 4xx validation errors and
-  successful 2xx results. For 5xx or crashes mid-work, delete the claim (or let it expire) so the
-  retry can run. If the work had partly happened, the work itself must be resumable or transactional.
-- **Commit the effect and the record together** when you can. If both live in Postgres, write the
-  side effect and the idempotency row in one transaction. With an external effect such as an LLM call
-  or an email, you get at-most-once *re-execution* per key, but a crash between the effect and the
-  record write can still duplicate it. Pass the key downstream (many payment and messaging APIs accept
-  one) to close that gap.
+- **Retention TTL** a bit longer than the client's maximum retry window. Stripe, for example, keeps keys
+  for at least 24 hours. Shorter saves storage but lets a late retry run twice.
+- **Two TTLs, not one.** The `in_progress` claim is a *lease*: a TTL just above the longest the work can
+  take (say a couple of minutes for a generation). Only the completed record gets the long retention
+  TTL. With a 24-hour TTL on the claim, a worker killed mid-request leaves the key stuck in
+  `in_progress`, and every retry gets 409 for a day.
+- **The lease must outlast the work.** If a generation runs past its lease, the claim expires and a
+  retry claims the key afresh and runs the work a second time. Bound the work with a request deadline
+  shorter than the lease (see timeouts), or renew the lease while working.
+- **The finisher must still own the lease.** Store an owner token in the claim and write the completed
+  record only if the token still matches (a compare-and-set, via a Lua script in Redis or
+  `UPDATE ... WHERE owner = $1` in Postgres), so a stale worker cannot overwrite the record of the attempt
+  that superseded it.
 
-## Example
-A FastAPI dependency backed by Redis, for an endpoint that runs a billed generation.
+### What to store, and when to commit
+| Outcome | Store it? | Why |
+|---|---|---|
+| 2xx success | yes, replay forever (within TTL) | the work happened |
+| 4xx validation error | yes | deterministic: a retry would fail the same way |
+| 5xx or crash mid-work | no: delete the claim or let it expire | the retry must be able to run |
+
+- **Partial work must be resumable or transactional**, because a deleted claim lets the retry run again.
+- **Commit the effect and the record together** when both live in Postgres: one transaction for the
+  side effect and the idempotency row.
+- **External effects keep a gap.** With an LLM call or an email you get at-most-once *re-execution* per
+  key, but a crash between the effect and the record write can still duplicate it. Pass the key
+  downstream (many payment and messaging APIs accept one) to close that gap.
+
+## Diagram
+The server's decision path for one keyed request: a single atomic claim decides whether this attempt
+does the work, waits, replays or is rejected.
+
+```mermaid
+flowchart TD
+    R["POST with Idempotency-Key"] --> H{"Key present?"}
+    H -->|"no, key required"| E400["400 missing key"]
+    H -->|"yes"| C{"Atomic claim: SET NX or INSERT ON CONFLICT"}
+    C -->|"claimed"| W["Do the work under a lease"]
+    W -->|"2xx or 4xx"| S[("Store status and body as completed")]
+    W -->|"5xx or crash"| D["Delete claim or let lease expire"]
+    C -->|"exists"| F{"Fingerprint matches?"}
+    F -->|"no"| E422["422 key reused for a different request"]
+    F -->|"yes"| ST{"State?"}
+    ST -->|"in_progress"| E409["409 with Retry-After"]
+    ST -->|"completed"| RP["Replay stored response byte for byte"]
+```
+
+## Examples
+### FastAPI dependency backed by Redis
+For an endpoint that runs a billed generation.
 
 ```python
 import hashlib, json
@@ -144,51 +166,118 @@ async def create(payload: dict, claim=Depends(idem)):
     return result
 ```
 
-Scenario: the client posts with key `7f3c...`, the model takes 12 s, and the client's 10 s timeout
-fires. It retries at 11 s with the same key and gets 409. At 13 s it retries again and gets the stored
-201 with the same `gen_123` text. One generation is billed and one answer is shown. (This relies on the
-server finishing the work after the client disconnects, which is FastAPI's default for a non-streaming
-handler. If the pod dies mid-generation instead, the 120 s lease expires and a later retry runs the
-work afresh.) The `tenant` header is a stand-in: in production take the tenant from the authenticated
-principal, or a caller can scope keys into someone else's namespace.
+- **The `tenant` header is a stand-in.** In production take the tenant from the authenticated
+  principal, or a caller can scope keys into someone else's namespace.
+- **No owner token here.** This version omits the compare-and-set; the Postgres example below adds it.
+
+### Worked timeline: a timeout during a 12-second generation
+The client posts with key `7f3c...`, has a 10 s timeout, and the model takes 12 s.
+
+| Time | Event | Server answer |
+|---|---|---|
+| 0 s | first attempt claims the key (`in_progress`, 120 s lease) | work starts |
+| 10 s | client timeout fires and it disconnects | handler keeps running |
+| 11 s | retry with the same key | 409 with `Retry-After: 2` |
+| 12 s | generation finishes; record stored as completed | — |
+| 13 s | retry again | stored 201 with the same `gen_123` text |
+
+- **Result:** one generation billed, one answer shown.
+- **Assumption:** the server finishes the work after the client disconnects, which is FastAPI's default
+  for a non-streaming handler.
+- **If the pod dies mid-generation** instead, the 120 s lease expires and a later retry runs the work afresh.
+
+### Production variant: Postgres claim with lease and owner token
+Durable, and the finish step is a compare-and-set so a stale worker cannot overwrite a newer attempt.
+
+```sql
+CREATE TABLE idempotency (
+  scope_key     text PRIMARY KEY,        -- tenant:user:key
+  fingerprint   text NOT NULL,
+  state         text NOT NULL,           -- in_progress | completed
+  owner         uuid NOT NULL,
+  lease_until   timestamptz NOT NULL,
+  status_code   int,
+  response_body jsonb,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Claim: returns a row only if this attempt now owns the key.
+-- A new key is inserted; an expired in-progress lease with the same fingerprint is taken over.
+INSERT INTO idempotency (scope_key, fingerprint, state, owner, lease_until)
+VALUES ($1, $2, 'in_progress', $3, now() + interval '2 minutes')
+ON CONFLICT (scope_key) DO UPDATE
+  SET owner = EXCLUDED.owner, lease_until = EXCLUDED.lease_until
+  WHERE idempotency.state = 'in_progress'
+    AND idempotency.lease_until < now()
+    AND idempotency.fingerprint = EXCLUDED.fingerprint
+RETURNING owner;
+
+-- Finish: only the current owner may write the result (0 rows updated = superseded).
+UPDATE idempotency
+SET state = 'completed', status_code = $3, response_body = $4
+WHERE scope_key = $1 AND owner = $2 AND state = 'in_progress';
+```
+
+If the claim returns no row, read the existing record and apply steps 3-5 of the state machine.
+
+## Production patterns
+- **Key minted outside the retry loop** — in every client SDK you ship. Generate the UUIDv4 when the
+  user action happens, store it with the pending operation, and reuse it for every attempt (including
+  after an app restart). Monitor distinct keys per logical operation; more than one means a retry path
+  mints new keys.
+- **Lease above the deadline, retention above the retry window** — on every keyed endpoint. Set the lease
+  above the request deadline (for example a 90 s deadline under a 120 s lease) and the retention TTL
+  above the client's retry window. Monitor completions whose start times are one lease apart for the
+  same key.
+- **Replay header and counters** — always. Return `Idempotent-Replayed: true` on replays and count
+  replays, 409s and 422s per endpoint. A high 409 rate means client timeouts are shorter than your
+  latency; any 422 is a client bug worth reporting to that integration.
+- **Key propagation to side-effect APIs** — when the effect leaves your database. Derive a downstream
+  key from yours (for example `f"{scope_key}:charge"`) and pass it to payment or messaging APIs that
+  accept one, such as Stripe's `Idempotency-Key` header. Monitor downstream duplicate-rejection counts.
+- **Postgres when a duplicate costs money** — for billing and agent actions. Keep the idempotency row in
+  the same transaction as the side effect, and purge old rows with a scheduled
+  `DELETE ... WHERE created_at < now() - interval '24 hours'`. Monitor table size and purge lag.
 
 ## Trade-offs
-- Keys make retries safe and cheap, but every mutating request now costs a store round trip and storage
-  for the TTL. That is negligible next to an LLM call but noticeable on a high-volume, cheap endpoint.
-- Returning 409 for in-progress duplicates is simple and avoids holding connections. Making the retry
-  wait for the original's result is friendlier to clients, but it ties up a worker per waiting retry
-  and needs pub/sub or polling.
-- Redis gives fast atomic claims and automatic expiry, but a Redis failover can lose recent keys.
-  Postgres gives durability and lets you commit the record with the side effect, at higher latency.
+- **Safety vs a round trip.** Keys make retries safe and cheap, but every mutating request costs a store
+  round trip and storage for the TTL. Negligible next to an LLM call, noticeable on a high-volume, cheap
+  endpoint.
+- **409 vs waiting for the original.** Returning 409 for in-progress duplicates is simple and avoids
+  holding connections. Making the retry wait is friendlier to clients, but ties up a worker per waiting
+  retry and needs pub/sub or polling.
+- **Redis vs Postgres.** Redis gives fast atomic claims and automatic expiry, but a failover can lose
+  recent keys. Postgres gives durability and commits the record with the side effect, at higher latency.
   The trade flips toward Postgres when a duplicate costs money.
-- Requiring the header on every POST catches client bugs early, but it breaks naive integrations.
-  Optional keys are friendlier but leave unkeyed retries unprotected.
+- **Required vs optional header.** Requiring it on every POST catches client bugs early but breaks naive
+  integrations. Optional keys are friendlier but leave unkeyed retries unprotected.
 
 ## Pitfalls
-- Check-then-insert instead of an atomic claim. The symptom is rare duplicates that only appear under
+- **Check-then-insert instead of an atomic claim.** Symptom: rare duplicates that only appear under
   concurrent retries, often from mobile clients on flaky networks.
-- Generating the key per attempt (inside the retry loop) instead of per operation. The symptom is that
-  the dedupe table fills up but duplicates still happen, because every retry has a fresh key.
-- Not scoping keys by tenant or not fingerprinting the body. The symptom is a client receiving a
-  replayed response that belongs to a different request or a different user.
-- Storing a 500 as the final outcome. The symptom is a request that fails forever with the same
-  replayed error even after the provider has recovered.
-- Giving the in-progress claim the same long TTL as completed records. The symptom is that after a
-  crash or deploy, retries for the interrupted keys return 409 for hours instead of re-running.
-- Making the lease shorter than the slowest request. The symptom is duplicates that appear only for
-  long generations, with two completed attempts per key whose start times are one lease apart.
-- Re-running generation on replay instead of returning the stored body. The symptom is users seeing
-  two different answers for one question and token bills that don't match request counts.
+- **A key per attempt instead of per operation.** Generated inside the retry loop. Symptom: the dedupe
+  table fills up but duplicates still happen, because every retry has a fresh key.
+- **No tenant scope or no body fingerprint.** Symptom: a client receives a replayed response that
+  belongs to a different request or a different user.
+- **Storing a 500 as the final outcome.** Symptom: a request fails forever with the same replayed error
+  even after the provider has recovered.
+- **The in-progress claim gets the long TTL.** Symptom: after a crash or deploy, retries for the
+  interrupted keys return 409 for hours instead of re-running.
+- **A lease shorter than the slowest request.** Symptom: duplicates only for long generations, with two
+  completed attempts per key whose start times are one lease apart.
+- **Re-running generation on replay.** Instead of returning the stored body. Symptom: users see two
+  different answers for one question, and token bills don't match request counts.
 
 ## When to use
-Use idempotency keys on any non-idempotent endpoint where a duplicate is costly or visible: anything
-that charges, creates a resource, kicks off a long job, or lets an agent take an external action. They
-matter most where clients retry automatically (SDKs, queues, mobile apps, webhook senders). You don't
-need them for GET, or for writes that are naturally idempotent (PUT of a full resource, upserts keyed
-by a natural ID). Measure replay and conflict counts: a high 409 rate means client timeouts are
-shorter than your latency. In interviews, the expected answer covers the atomic claim, the
-in-progress state, fingerprinting, TTL, and the honest limit that external side effects need the key
-passed downstream.
+- **Use when** an endpoint is non-idempotent and a duplicate is costly or visible: anything that
+  charges, creates a resource, kicks off a long job, or lets an agent take an external action.
+- **Most important where clients retry automatically:** SDKs, queues, mobile apps, webhook senders.
+- **Skip for** GET, or writes that are naturally idempotent (PUT of a full resource, upserts keyed by a
+  natural ID).
+- **Measure:** replay and conflict counts; a high 409 rate means client timeouts are shorter than your
+  latency.
+- **Interviews:** cover the atomic claim, the in-progress state, fingerprinting, TTL, and the honest
+  limit that external side effects need the key passed downstream.
 
 ## Role lens
 - **Engineer:** Implements the claim-and-replay dependency, decides which outcomes to store, and makes
@@ -209,6 +298,45 @@ retry gets that response replayed exactly. Waiting inside the retry request is p
 a connection and a worker per duplicate, can exceed the client's timeout again, and needs a
 notification mechanism. Under a retry storm it amplifies load. The fingerprint check guards against a
 reused key with a different body.
+
+## Interview questions
+### What is an idempotency key, and why can't you just deduplicate on the request body?
+- **Definition:** a client-chosen unique ID for one logical operation, sent on every attempt, under which
+  the server records and replays the first outcome.
+- **Body dedupe fails both ways:** a user who legitimately sends "yes" twice is wrongly collapsed, and a
+  retry whose body carries a new timestamp is missed.
+- **The key names the intent**, chosen before the first attempt, which is exactly what the server cannot
+  infer from bytes.
+
+### Customers report occasional double charges even though you implemented idempotency keys. How do you investigate?
+- **Count distinct keys per logical operation.** More than one means the client mints a key inside its
+  retry loop, so every attempt looks new.
+- **Check the claim.** A read followed by an insert races; two retries 50 ms apart both see nothing.
+  It must be `SET NX` or a unique-constraint insert.
+- **Check lease versus duration.** Two completed attempts whose start times are one lease apart mean the
+  work outran its lease.
+- **Check the downstream gap.** A crash between the charge and the record write duplicates the charge
+  unless the key is passed to the payment API.
+
+### Redis or Postgres for the idempotency store, and when does the answer flip?
+- **Redis:** fast atomic claims and automatic expiry, but a failover can lose recent keys.
+- **Postgres:** durable, and the record commits in the same transaction as the side effect, at higher
+  latency per request.
+- **Flip to Postgres when a duplicate costs money**, such as billing or agent actions; Redis is fine for
+  deduplicating expensive but harmless generations.
+
+### How do you choose the TTLs for an idempotency record?
+- **Two TTLs.** The `in_progress` claim is a lease just above the longest the work can take (for example
+  120 s over a 90 s request deadline); the completed record gets the long retention TTL.
+- **Retention must exceed the client's retry window.** Stripe, for example, keeps keys for at least 24
+  hours; shorter lets a late retry run twice.
+- **A long TTL on the claim is a bug**: a crashed worker leaves the key returning 409 for a day.
+
+### Why store a 4xx outcome but not a 5xx one?
+- **A 4xx is deterministic**: the same request would fail the same way, so replaying it is correct and
+  saves work.
+- **A 5xx is usually transient**: storing it would make the request fail forever even after the provider
+  recovers, so delete the claim and let the retry run.
 
 ## Quiz
 ### Q: Why must an idempotency claim be an atomic insert rather than "read, and insert if absent"?

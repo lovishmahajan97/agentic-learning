@@ -5,7 +5,7 @@ name: Structured logging
 kind: practice
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/opentelemetry-instrumentation
@@ -21,74 +21,78 @@ sources:
 ---
 
 ## TL;DR
-Structured logging emits each log event as a machine-parseable record (usually one JSON object per line)
-with named fields such as `request_id`, `tenant`, `model`, `prompt_tokens` and `latency_ms`, instead of a
-sentence. In a FastAPI service, a middleware binds request context into `contextvars` so every log line
-from that request carries it automatically, which turns logs into something you can filter, join to
-traces and aggregate into cost and latency per tenant.
+Structured logging emits each event as one JSON object with named fields (`request_id`, `tenant`,
+`model`, `prompt_tokens`, `latency_ms`). Middleware binds request context into `contextvars`, so every
+line carries it, making logs filterable, joinable to traces and summable into per-tenant cost.
 
 ## Why it exists
-A line like `INFO: chat done for acme in 2.3s using gpt-x (812 tokens)` is readable once and useless at
-scale. To answer "which tenant's p95 latency doubled after the prompt change?" or "how many tokens did
-the summariser burn yesterday?", someone must write a regex per message format, and the regex breaks the
-day a developer rewords the sentence. Interleaving makes it worse: an async worker handles hundreds of
-requests concurrently, so lines from different requests alternate, and without a request identifier on
-every line you cannot reconstruct what happened in any single one.
-
-AI services raise the stakes. Each request has fields that matter commercially and operationally: model,
-prompt version, input and output tokens, time to first token, finish reason, retries, cache hits, tool
-calls. These are numbers you will want to sum and group, which is what log platforms do well on fields
-and badly on prose. The naive alternative, passing a `request_id` argument into every function so it can
-be printed, pollutes every signature and still misses library logs. Structured logging plus context
-propagation gets consistent fields onto every line without threading them through the code.
+- **Sentences do not scale.** `INFO: chat done for acme in 2.3s using gpt-x (812 tokens)` is readable once.
+  Answering "which tenant's p95 doubled after the prompt change?" needs a regex per message format, which
+  breaks the day someone rewords the sentence.
+- **Concurrency interleaves lines.** An async worker handles hundreds of requests at once; without a
+  request identifier on every line you cannot reconstruct any single request.
+- **AI requests carry numbers you will sum.** Model, prompt version, input and output tokens, time to
+  first token, finish reason, retries, cache hits, tool calls. Log platforms group fields well and prose
+  badly.
+- **Threading ids by hand fails.** Passing a `request_id` argument into every function pollutes every
+  signature and still misses library logs.
+- **Structured logging plus context propagation** puts consistent fields on every line without threading
+  them through the code.
 
 ## How it works
 ### Events, not sentences
-A log call becomes an event name plus key-value fields: `log.info("llm_call_finished", model=m,
-prompt_tokens=812, completion_tokens=240, latency_ms=2310)`. The message is a stable identifier you can
-count; the variable data lives in fields with stable names and types. A renderer serialises the event to
-JSON at the end of the pipeline, so developers can still get coloured key-value output locally from the
-same calls.
+- **A call is an event name plus fields:** `log.info("llm_call_finished", model=m,
+  prompt_tokens=812, completion_tokens=240, latency_ms=2310)`.
+- **The message is a stable identifier** you can count; variable data lives in fields with stable names and
+  types.
+- **Rendering happens last.** A renderer serialises to JSON at the end of the pipeline, so developers can
+  still get coloured key-value output locally from the same calls.
 
 ### Request context with contextvars
-Python's `contextvars` give each asyncio task its own view of a variable, and a task copies the current
-context when it is created. A middleware at the top of the stack generates or accepts a `request_id`
-(from an incoming `X-Request-ID` header, or the trace id if tracing is on), binds it together with tenant
-and route, and clears any stale values at the start of each request (structlog's recommended pattern). Every log call during that request, in any function or
-library that goes through the same logging pipeline, inherits those fields without receiving them as
-arguments. structlog does this with `bind_contextvars` and the `merge_contextvars` processor.
+1. **Task-local values.** Python's `contextvars` give each asyncio task its own view of a variable, and a
+   task copies the current context when it is created.
+2. **Bind at the top.** A middleware generates or accepts a `request_id` (from an incoming `X-Request-ID`
+   header, or the trace id if tracing is on) and binds it with tenant and route.
+3. **Clear first.** It clears stale values at the start of each request (structlog's recommended pattern).
+4. **Inherit everywhere.** Every log call during that request, in any function or library going through
+   the same pipeline, gets those fields without receiving them as arguments. structlog does this with
+   `bind_contextvars` and the `merge_contextvars` processor.
 
 ### The pipeline
-A typical structlog chain: merge contextvars, add log level, add an ISO timestamp, render exceptions as
-structured fields, then render JSON. Configure the standard library `logging` to use the same pipeline (structlog's `ProcessorFormatter`, with
-`merge_contextvars` in its pre-chain) so third-party loggers (httpx, SQLAlchemy, Uvicorn errors) come out as JSON with the same fields rather
-than as stray plain-text lines.
+```
+merge contextvars → add log level → ISO timestamp → exceptions as structured fields → JSON
+```
+- **Route stdlib `logging` through the same pipeline** (structlog's `ProcessorFormatter`, with
+  `merge_contextvars` in its pre-chain), so third-party loggers (httpx, SQLAlchemy, Uvicorn errors) come out
+  as JSON with the same fields rather than as stray plain-text lines.
 
 ### Where context does not follow
-Context is copied into new asyncio tasks and into `asyncio.to_thread` and Starlette's `run_in_threadpool`,
-so most FastAPI code paths inherit the request's fields. It is *not* copied by `loop.run_in_executor` or a
-raw `ThreadPoolExecutor.submit`, and it obviously does not cross into a job queue worker, so a Celery or
-ARQ job must receive `request_id` in its payload and bind it on arrival. Also remember that stdlib handlers
-write synchronously: at high volume a slow sink stalls the event loop, which is why busy services put a
-`QueueHandler` in front so the actual I/O happens on a listener thread.
+| Path | Context copied? |
+|---|---|
+| new asyncio tasks, `asyncio.to_thread`, Starlette's `run_in_threadpool` | yes |
+| `loop.run_in_executor`, raw `ThreadPoolExecutor.submit` | no |
+| a job queue worker (Celery, ARQ) | no: pass `request_id` in the payload and bind it on arrival |
+
+- **Stdlib handlers write synchronously.** At high volume a slow sink stalls the event loop, which is why
+  busy services put a `QueueHandler` in front so the actual I/O happens on a listener thread.
 
 ### What to log for LLM calls
-One event per model call with: model and provider, prompt template id and version, input and output
-tokens, latency and time to first token, finish reason, retry count, cache hit, and the error class on
-failure. Log the *shape* of content by default, not the content: lengths, hashes, counts of messages and
-tool calls. Prompts and completions routinely contain personal data and secrets pasted by users; if you
-need them for debugging, put them behind an explicit, sampled, access-controlled path with retention
-limits, and redact before writing.
+- **One event per model call** with: model and provider, prompt template id and version, input and output
+  tokens, latency and time to first token, finish reason, retry count, cache hit, and the error class on
+  failure.
+- **Log the *shape* of content by default, not the content:** lengths, hashes, counts of messages and tool
+  calls.
+- **Why:** prompts and completions routinely contain personal data and secrets pasted by users. If you
+  need them for debugging, use an explicit, sampled, access-controlled path with retention limits, and
+  redact before writing.
 
 ### Access logs
-Uvicorn's access logger prints its own plain-text line per request. A common pattern is to disable it
-(`--no-access-log`) and emit one structured `request_finished` event from the middleware instead, with
-status, route template (not the raw path, to avoid high-cardinality ids) and duration.
+- Uvicorn's access logger prints its own plain-text line per request.
+- Common pattern: disable it (`--no-access-log`) and emit one structured `request_finished` event from the
+  middleware, with status, route template (not the raw path, to avoid high-cardinality ids) and duration.
 
-## Example
-structlog configured for JSON, a middleware that binds request context, and one structured event per LLM
-call.
-
+## Examples
+### JSON logs, request context and one event per LLM call
 ```python
 import time, uuid, logging, structlog
 from fastapi import FastAPI, Request
@@ -132,45 +136,109 @@ async def chat(body: dict):
     return {"content": "..."}
 ```
 
-One request yields lines like
-`{"request_id": "9f2c...", "tenant": "acme", "model": "model-a", "prompt_tokens": 812, "event": "llm_call_finished", ...}`.
-A query grouping `llm_call_finished` by `tenant` and summing tokens is now a one-liner in any log platform.
-The `try/finally` matters: without it, a handler that raises skips the `request_finished` line, so the
-requests you most need to see (the 500s) are exactly the ones missing from the logs.
-For a `StreamingResponse`, `request_finished` fires when headers are sent, so log stream completion and
-token counts from inside the generator instead.
+- **One request yields lines like**
+  `{"request_id": "9f2c...", "tenant": "acme", "model": "model-a", "prompt_tokens": 812, "event": "llm_call_finished", ...}`.
+- **Cost per tenant is a one-liner:** group `llm_call_finished` by `tenant` and sum tokens in any log
+  platform.
+- **The `try/finally` matters.** Without it, a handler that raises skips `request_finished`, so the
+  requests you most need (the 500s) are exactly the ones missing from the logs.
+- **Streaming caveat.** For a `StreamingResponse`, `request_finished` fires when headers are sent, so log
+  stream completion and token counts from inside the generator instead.
+
+### One pipeline for stdlib, Uvicorn and a redaction safety net
+Library and Uvicorn error logs go through the same processors, and any field with a sensitive name is
+masked before rendering.
+
+```python
+import logging, os, structlog
+
+SENSITIVE = {"prompt", "messages", "completion", "api_key", "authorization"}
+
+def redact(logger, method_name, event_dict):
+    for key in SENSITIVE & event_dict.keys():
+        event_dict[key] = "[redacted]"
+    return event_dict
+
+shared = [structlog.contextvars.merge_contextvars,
+          structlog.stdlib.add_log_level,
+          structlog.processors.TimeStamper(fmt="iso")]
+
+structlog.configure(processors=shared + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
+                    logger_factory=structlog.stdlib.LoggerFactory())
+
+renderer = (structlog.dev.ConsoleRenderer() if os.getenv("LOG_FORMAT") == "console"
+            else structlog.processors.JSONRenderer())
+formatter = structlog.stdlib.ProcessorFormatter(
+    foreign_pre_chain=shared,                       # for httpx, SQLAlchemy, Uvicorn records
+    processors=[structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                redact, structlog.processors.format_exc_info, renderer])
+
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
+root = logging.getLogger()
+root.handlers, root.level = [handler], logging.INFO
+for name in ("uvicorn", "uvicorn.error"):           # Uvicorn ships its own handlers; reroute them
+    logging.getLogger(name).handlers = []
+    logging.getLogger(name).propagate = True
+```
+
+Run with `--no-access-log` so the middleware's `request_finished` replaces Uvicorn's text access line.
+
+## Production patterns
+- **One schema, one pipeline.** Route structlog and stdlib through `ProcessorFormatter` as above and pick
+  console or JSON rendering from one setting. Monitor: the log shipper's parse-failure count, which should
+  be zero.
+- **Route templates, not raw paths.** Log `request.scope["route"].path` (for example `/v1/docs/{doc_id}`)
+  and keep user or document ids as plain fields, never index keys. Monitor: distinct values of `route` per
+  day; growth means raw paths leaked in.
+- **Redaction as a safety net, metadata as the default.** Log lengths, hashes and counts; add a redaction
+  processor for sensitive field names; send sampled content only to a separate, access-controlled store.
+  Monitor: a scheduled log search for secret-like patterns such as provider key prefixes.
+- **Queue in front of slow sinks.** Put a `logging.handlers.QueueHandler` on the root logger and let a
+  `QueueListener` own the real handler. Set the `ProcessorFormatter` on the `QueueHandler`, so rendering
+  and contextvars merging happen on the request's thread; the listener's handler writes `%(message)s`.
+  Monitor: event-loop lag under log bursts.
+- **`trace_id` on every line.** Add a processor that reads the current span with
+  `trace.get_current_span().get_span_context()` and writes `format(ctx.trace_id, "032x")`. Monitor: the
+  share of request lines carrying a `trace_id`.
+- **Context across the queue.** Put `request_id` and tenant in every job payload and call
+  `bind_contextvars` first thing in the worker. Monitor: worker log lines with no `request_id`.
 
 ## Trade-offs
-- JSON lines are trivially queryable but harder to read raw in a terminal; use a console renderer locally
-  and JSON in deployed environments, driven by one setting.
-- Rich per-request fields make debugging fast, but high-cardinality fields (raw paths, user ids as label
-  keys) inflate cost in some log backends; keep them as fields, not index keys, when the bill flips.
-- Logging prompts and completions makes quality debugging possible, but it creates a copy of sensitive
-  data with weaker controls; default to metadata and opt in to content per tenant with redaction.
-- Logs are cheap per event but expensive in aggregate at token granularity; one event per LLM call is
-  usually right, and per-token logging belongs only in short-lived debugging.
+- **Queryable JSON vs terminal readability.** JSON lines are trivially queryable but harder to read raw;
+  use a console renderer locally and JSON in deployed environments, driven by one setting.
+- **Rich fields vs backend cost.** High-cardinality fields (raw paths, user ids as label keys) inflate cost
+  in some log backends; keep them as fields, not index keys, when the bill flips.
+- **Prompt logging vs data exposure.** Logging prompts and completions makes quality debugging possible,
+  but creates a copy of sensitive data with weaker controls; default to metadata and opt in to content per
+  tenant with redaction.
+- **Granularity vs aggregate cost.** Logs are cheap per event but expensive in aggregate at token
+  granularity; one event per LLM call is usually right, and per-token logging belongs only in short-lived
+  debugging.
 
 ## Pitfalls
-- Formatting values into the message with f-strings; the symptom is thousands of unique "messages" and
-  dashboards that cannot group or count events.
-- Leaving library loggers on the default plain-text handler; the symptom is mixed JSON and text lines that
-  the log shipper fails to parse, often dropping exactly the error lines you need.
-- Forgetting to clear contextvars per request or binding in a long-lived task; the symptom is log lines
-  carrying the previous request's `request_id` or tenant, which misattributes incidents and costs.
-- Logging full prompts by default; the symptom is personal data or API keys showing up in a log search
-  months later, outside any retention or access policy.
-- Offloading work with `run_in_executor` or a background job without carrying context; the symptom is
-  log lines from that work with no `request_id` or tenant, so they cannot be joined to the request.
-- Logging the route's raw path instead of its template; the symptom is per-path aggregations with one row
-  per document id and a log index that grows without bound.
+- **f-strings in the message.** Symptom: thousands of unique "messages" and dashboards that cannot group
+  or count events.
+- **Library loggers on the default plain-text handler.** Symptom: mixed JSON and text lines that the log
+  shipper fails to parse, often dropping exactly the error lines you need.
+- **Not clearing contextvars per request, or binding in a long-lived task.** Symptom: lines carrying the
+  previous request's `request_id` or tenant, which misattributes incidents and costs.
+- **Full prompts logged by default.** Symptom: personal data or API keys showing up in a log search months
+  later, outside any retention or access policy.
+- **Offloading with `run_in_executor` or a background job without carrying context.** Symptom: lines from
+  that work with no `request_id` or tenant, so they cannot be joined to the request.
+- **Raw path instead of route template.** Symptom: per-path aggregations with one row per document id and a
+  log index that grows without bound.
 
 ## When to use
-Use structured logging in any service that runs in more than one process or handles concurrent requests,
-which is every FastAPI deployment. Start with a request-context middleware, one `request_finished` event
-and one `llm_call_finished` event with token and latency fields; those answer most production questions.
-Add `trace_id` to logs once tracing exists, so a log line links to its trace. Use logs for discrete events
-and audit facts, metrics for things you graph continuously, and traces for latency breakdowns across
-services. Interviewers look for request correlation via contextvars and a clear stance on logging prompt content.
+- **Use in any service** that runs in more than one process or handles concurrent requests, which is every
+  FastAPI deployment.
+- **Start with:** a request-context middleware, one `request_finished` event and one `llm_call_finished`
+  event with token and latency fields; those answer most production questions.
+- **Add `trace_id`** to logs once tracing exists, so a log line links to its trace.
+- **Pick the signal:** logs for discrete events and audit facts, metrics for things you graph
+  continuously, traces for latency breakdowns across services.
+- **Interviews:** request correlation via contextvars and a clear stance on logging prompt content.
 
 ## Role lens
 - **Engineer:** Configures structlog and stdlib logging into one JSON pipeline, writes the context

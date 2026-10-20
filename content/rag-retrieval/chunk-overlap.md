@@ -5,7 +5,7 @@ name: Chunk overlap
 kind: concept
 difficulty: intro
 est_minutes: 10
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -20,80 +20,103 @@ sources:
 ---
 
 ## TL;DR
-Overlap makes consecutive chunks share their last and first few tokens, so a sentence or reference
-that straddles a boundary appears whole in at least one chunk instead of being half in each. It is a
-cheap hedge against boundary damage, paid for with a larger index and near-duplicate results that must
-be deduplicated at query time. It does not replace good boundaries; structure-aware splitting and
-parent retrieval fix the root cause that overlap only patches.
+Overlap makes consecutive chunks share a few boundary tokens, so a straddling sentence appears whole in
+at least one chunk. It is a cheap hedge paid for with a larger index and near-duplicate hits, and it
+patches boundaries rather than fixing them.
 
 ## Why it exists
-Any chunker that cuts text into pieces will sometimes cut in the wrong place. A fixed-size splitter
-does it constantly; even a recursive splitter that respects paragraphs will split a long paragraph
-mid-argument. The damage is specific: the sentence "This limit does not apply to enterprise plans" lands
-in chunk 8, while the definition of "this limit" sits at the end of chunk 7. A query about enterprise
-limits matches chunk 8, the generator reads it, and "this limit" is unresolved. Worse, the embedding of
-chunk 8 itself is weaker, because its first sentence is a dangling pronoun with no antecedent.
-
-The naive fix is to make chunks bigger so boundaries are rarer. That trades a boundary problem for a
-dilution problem (see chunking strategies) and does not eliminate boundaries, it only moves them.
-Another naive fix is to return neighbouring chunks at query time, which helps the generator but does
-nothing for the retrieval step, where the damaged chunk still scores low.
-
-Overlap attacks the retrieval step directly. If chunk 8 begins by repeating the last 50 tokens of chunk
-7, the antecedent travels with the pronoun, the chunk's vector is more specific, and whichever chunk
-the retriever picks contains the complete thought. The idea is a sliding window with a stride smaller
-than the window, and every cost it carries follows from that one choice.
+- **Every chunker sometimes cuts in the wrong place.** A fixed-size splitter does it constantly; even a
+  recursive splitter that respects paragraphs splits a long paragraph mid-argument.
+- **The damage is specific.** "This limit does not apply to enterprise plans" lands in chunk 8, while the
+  definition of "this limit" ends chunk 7. A query about enterprise limits matches chunk 8 and the
+  generator cannot resolve "this limit". Chunk 8's embedding is weaker too, because it opens with a
+  dangling pronoun.
+- **Bigger chunks only move the problem.** Rarer boundaries trade a boundary problem for a dilution
+  problem (see chunking strategies), and boundaries still exist.
+- **Returning neighbours at query time helps only the generator.** At the retrieval step the damaged
+  chunk still scores low.
+- **Overlap attacks retrieval directly.** If chunk 8 repeats the last 50 tokens of chunk 7, the
+  antecedent travels with the pronoun and the vector is more specific. It is a sliding window with a
+  stride smaller than the window, and every cost follows from that choice.
 
 ## How it works
 ### The sliding window
-Given a token stream, a chunk size `S` and an overlap `O`, the stride between chunk starts is
-`S − O`. Chunk *i* covers tokens `[i·(S−O), i·(S−O) + S)`. Each token that is not near the document's
-ends therefore appears in `S / (S − O)` chunks on average. With `S = 400` and `O = 100` the stride is
-300 and each token appears in about 1.33 chunks; with `O = 200` the stride is 200 and every token is
-indexed twice. This ratio is the index inflation factor, because the number of chunks for a document of
-`T` tokens is roughly `(T − O) / (S − O)` rather than `T / S`.
+```
+stride            = S − O
+chunk i covers      [i·(S−O), i·(S−O) + S)
+copies per token  ≈ S / (S − O)          (the index inflation factor)
+chunks for T      ≈ (T − O) / (S − O)    instead of T / S
+```
+
+| Chunk size `S = 400` | Stride | Copies per token |
+|---|---|---|
+| overlap `O = 100` | 300 | about 1.33 |
+| `O = 200` | 200 | every token indexed twice |
+
+Tokens near the document's ends appear in fewer chunks, so the ratio is an average.
 
 ### Why the last tokens, not random ones
-Overlap always repeats the *tail* of the previous chunk at the *head* of the next, because the damage
-to repair is local to the boundary: an antecedent is normally within a sentence or two of the pronoun,
-and a table header is immediately above its rows. Repeating anything further back buys nothing.
+- **Overlap repeats the *tail* of the previous chunk at the *head* of the next**, because the damage is
+  local to the boundary.
+- An antecedent is normally within a sentence or two of the pronoun, and a table header sits right above
+  its rows. Repeating anything further back buys nothing.
 
 ### Aligning to boundaries
-Overlap measured in raw tokens can itself cut mid-sentence, giving the next chunk a half-sentence
-preamble. Better splitters snap the overlap to the nearest sentence boundary: "repeat the last one or
-two complete sentences" rather than "repeat the last 64 tokens". Recursive splitters implement this by
-choosing which trailing pieces to carry forward when they start a new chunk. The consequence is that
-overlap there is a *ceiling*, not a guarantee: LangChain's recursive splitter, for example, carries
-forward only whole trailing pieces whose combined length fits within `chunk_overlap`, so if the last
-piece is a 150-token paragraph and the overlap is 100, nothing is carried and that boundary has zero
-overlap.
+- **Raw-token overlap can itself cut mid-sentence**, giving the next chunk a half-sentence preamble.
+- **Better splitters snap to sentences:** "repeat the last one or two complete sentences" rather than
+  "repeat the last 64 tokens". Recursive splitters do this by choosing which trailing pieces to carry
+  forward into the new chunk.
+- **So overlap is a *ceiling*, not a guarantee.** LangChain's recursive splitter carries forward only
+  whole trailing pieces whose combined length fits within `chunk_overlap`. If the last piece is a
+  150-token paragraph and the overlap is 100, nothing is carried and that boundary has zero overlap.
 
 ### Choosing the amount
-Common practice is an overlap of roughly 10–20% of the chunk size (illustrative, not a benchmark).
-Below that, the overlap often fails to carry a whole sentence; above it, index inflation and duplicate
-hits grow faster than retrieval improves. The right value is measured, not chosen: run recall@k on a
-golden set with overlap at 0, 10% and 20% and keep the smallest value that stops boundary failures.
-If zero overlap already works because the splitter respects structure, keep zero.
+- **Common practice:** roughly 10–20% of the chunk size (illustrative, not a benchmark).
+- **Below that,** the overlap often fails to carry a whole sentence.
+- **Above it,** index inflation and duplicate hits grow faster than retrieval improves.
+- **Measure it:** run recall@k on a golden set at 0, 10% and 20%, and keep the smallest value that stops
+  boundary failures. If zero already works because the splitter respects structure, keep zero.
 
 ### Deduplication at query time
-Because adjacent chunks share text, a query that matches the shared region returns both, with nearly
-identical scores. Without handling, the top-5 can contain three copies of the same passage, wasting
-context slots and starving the answer of diversity. The fix is to collapse neighbours: group hits by
-document, merge chunks whose indices are adjacent into one span (keep the max score), and only then
-take the top-k. Merging must use the stored token or character offsets, not plain concatenation:
-two neighbours joined naively repeat the shared `O` tokens in the middle of the merged span. This is
-the first step toward parent-document retrieval, where the index unit and the
-returned unit are deliberately different.
+Adjacent chunks share text, so a query matching the shared region returns both with nearly identical
+scores. Without handling, the top-5 can hold three copies of one passage.
+1. Group hits by document.
+2. Merge chunks whose indices are adjacent into one span, keeping the max score.
+3. Only then take the top-k.
+
+- **Merge by stored offsets, not concatenation**, because two neighbours joined naively repeat the
+  shared `O` tokens in the middle of the merged span.
+- This is the first step toward parent-document retrieval, where the index unit and the returned unit
+  are deliberately different.
 
 ### What overlap does not fix
-Overlap patches *local* boundary damage. It does not restore a heading three pages up, a definition in
-another section, or the document title. Those need structure-aware chunking (carry the heading path),
-contextual retrieval (prepend a generated summary of where the chunk sits), or parent retrieval.
+Overlap patches *local* damage. It cannot restore a heading three pages up, a definition in another
+section, or the document title. Those need:
+- **structure-aware chunking** (carry the heading path);
+- **contextual retrieval** (prepend a generated summary of where the chunk sits);
+- **parent retrieval**.
 
-## Example
-A token-based sliding window with tiktoken, plus the arithmetic that shows index inflation. The window
-returns token ids, decoded for display; production splitters additionally snap the overlap to sentence
-boundaries so a chunk never begins mid-word or mid-sentence.
+## Diagram
+Overlap acts at two points: at index time the window repeats the previous chunk's tail, and at query
+time the retriever must collapse the neighbours that overlap makes rank together.
+
+```mermaid
+flowchart LR
+    T["Token stream, length T"] --> W["Window of S tokens"]
+    W -->|"advance by stride S minus O"| W
+    W --> C["Chunks i and i+1 share O tokens"]
+    C --> I[("Index: about S over S minus O copies per token")]
+    Q["Query"] --> I
+    I -->|"over-fetch 2 to 3 times k"| H["Hits incl. adjacent neighbours"]
+    H --> G["Group by doc, merge adjacent idx by offsets"]
+    G --> K["Top-k distinct spans"]
+    K --> L["Generator prompt"]
+```
+
+## Examples
+### A token sliding window and its inflation
+A token-based sliding window with tiktoken. It returns token ids, decoded for display; production
+splitters also snap the overlap to sentence boundaries so a chunk never begins mid-word or mid-sentence.
 
 ```python
 import tiktoken
@@ -119,47 +142,94 @@ for overlap in (0, 100, 200):
 # approaches S / (S - O), i.e. 1.33x and 2x, as the worked numbers below show.
 ```
 
-Worked numbers: a 100,000-token manual with `S = 400` and `O = 0` yields 250 chunks. With `O = 100`
-the stride is 300, so about `(100,000 − 100) / 300 ≈ 333` chunks, a 33% larger index and embedding
-bill. With `O = 200` the stride is 200 and the count is about 499, double the original. The retrieval
-gain from 100 to 200 is usually small while the cost doubles, which is why moderate overlap is the norm.
+### Worked numbers: a 100,000-token manual
+| Setting | Stride | Chunks | vs no overlap |
+|---|---|---|---|
+| `S = 400`, `O = 0` | 400 | 250 | baseline |
+| `O = 100` | 300 | `(100,000 − 100) / 300 ≈ 333` | 33% larger index and embedding bill |
+| `O = 200` | 200 | about 499 | double the original |
+
+The retrieval gain from 100 to 200 is usually small while the cost doubles, which is why moderate
+overlap is the norm.
+
+### Collapsing adjacent hits by offset
+Store each chunk's start and end offsets at index time, then merge neighbours before taking top-k.
+
+```python
+def collapse(hits, k=5):
+    """Merge hits on adjacent chunks of the same document into one span, keep the max score."""
+    spans = []
+    for h in sorted(hits, key=lambda h: (h["doc"], h["idx"])):
+        last = spans[-1] if spans else None
+        if last and last["doc"] == h["doc"] and h["idx"] == last["last_idx"] + 1:
+            last["end"], last["last_idx"] = h["end"], h["idx"]       # extend by offsets, no repeat
+            last["score"] = max(last["score"], h["score"])
+        else:
+            spans.append({**h, "last_idx": h["idx"]})
+    return sorted(spans, key=lambda s: -s["score"])[:k]
+
+# 400-token chunks, overlap 100, so stride 300: chunk i covers [300*i, 300*i + 400)
+hits = [
+    {"doc": "manual", "idx": 7, "start": 2100, "end": 2500, "score": 0.82},
+    {"doc": "manual", "idx": 8, "start": 2400, "end": 2800, "score": 0.84},
+    {"doc": "manual", "idx": 9, "start": 2700, "end": 3100, "score": 0.79},
+    {"doc": "faq", "idx": 3, "start": 900, "end": 1300, "score": 0.71},
+]
+for s in collapse(hits):
+    print(s["doc"], s["start"], s["end"], s["score"])
+# manual 2100 3100 0.84   <- three overlapping hits become one span; slice text[2100:3100]
+# faq 900 1300 0.71
+```
+
+## Production patterns
+- **Sentence-aligned overlap** — on prose, use a splitter that carries whole sentences, such as
+  LlamaIndex `SentenceSplitter(chunk_size=..., chunk_overlap=...)` or a token-counted LangChain
+  recursive splitter. Monitor the share of chunks that open mid-sentence on a sample.
+- **Store offsets at split time** — set `add_start_index=True` on LangChain text splitters (or record
+  start and end offsets yourself) so merges slice the source instead of concatenating. Monitor merged
+  spans for repeated text.
+- **Over-fetch, collapse, then cut to k** — retrieve two to three times k, merge adjacent chunks per
+  document, then keep the top k spans. Monitor the duplicate rate in the final top-k on the eval set.
+- **Audit real overlap, not config** — on a sample of neighbours, measure the actual shared text and
+  count boundaries with zero overlap. Alert when that count rises after a parser or splitter change.
+- **Budget the inflation factor** — forecast chunk count as `(T − O) / (S − O)` in vector-store sizing
+  and embedding budgets. Monitor actual chunks per corpus token against the forecast.
 
 ## Trade-offs
-- Overlap repairs boundary cuts for free at the splitting step, but every token of overlap is paid
-  again in storage, embedding cost and index size, in proportion to `S / (S − O)`.
-- More overlap raises the chance that a straddling sentence is whole somewhere, yet it also raises the
-  chance that the top-k contains near-duplicates, so dedup logic becomes mandatory rather than optional.
-- Token-measured overlap is simple and deterministic, while sentence-aligned overlap costs a sentence
-  splitter but avoids chunks that open with a fragment; prefer sentence alignment on prose.
-- Zero overlap with a structure-aware splitter is often as good as moderate overlap with a fixed one;
-  if your boundaries already fall on paragraphs, overlap mostly buys inflation.
+- **Free repair vs repeated cost.** Overlap repairs boundary cuts at the splitting step, but every token
+  of overlap is paid again in storage, embedding cost and index size, in proportion to `S / (S − O)`.
+- **Whole sentences vs duplicate hits.** More overlap raises the chance a straddling sentence is whole
+  somewhere, and also the chance the top-k holds near-duplicates, so dedup becomes mandatory.
+- **Token-measured vs sentence-aligned.** Token overlap is simple and deterministic; sentence alignment
+  costs a sentence splitter but avoids chunks that open with a fragment. Prefer it on prose.
+- **Overlap vs good boundaries.** Zero overlap with a structure-aware splitter is often as good as
+  moderate overlap with a fixed one; if boundaries already fall on paragraphs, overlap mostly buys
+  inflation.
 
 ## Pitfalls
-- Returning raw top-k without collapsing adjacent chunks; the symptom is the same passage appearing two
-  or three times in the prompt and the answer missing information that ranked sixth.
-- Setting overlap as a fraction of a tiny chunk, such as 20 tokens on a 128-token chunk; the symptom
-  is overlaps that rarely hold a complete sentence, so boundary failures persist unchanged.
-- Assuming the configured overlap is what the splitter produced; with piece-based recursive splitters
-  the symptom is boundary failures persisting at exactly the boundaries where a long paragraph or
-  sentence ended the previous chunk, because no whole piece fit inside the overlap budget. Inspect
-  actual shared text between neighbours, not the config.
-- Letting overlap exceed half the chunk size; the symptom is an index two or three times larger than
-  the corpus with no measurable recall gain, and slower queries from the extra vectors.
-- Treating overlap as the fix for missing headings or definitions far from the boundary; the symptom
-  is chunks that still lack their subject, which overlap cannot supply because it only repeats
-  neighbouring text.
-- Forecasting chunk count as corpus tokens divided by chunk size, ignoring the stride, so capacity
-  planning and cost forecasts undershoot; the symptom is a vector store filling up well before the
-  projected corpus size.
+- **Returning raw top-k without collapsing neighbours.** The same passage appears two or three times in
+  the prompt, and the answer misses information that ranked sixth.
+- **Overlap as a fraction of a tiny chunk.** 20 tokens on a 128-token chunk rarely holds a complete
+  sentence, so boundary failures persist unchanged.
+- **Trusting the configured overlap.** With piece-based recursive splitters, failures persist exactly
+  where a long paragraph or sentence ended the previous chunk, because no whole piece fit the budget.
+  Inspect actual shared text between neighbours, not the config.
+- **Overlap above half the chunk size.** The index grows two or three times larger than the corpus with
+  no measurable recall gain, and queries slow from the extra vectors.
+- **Expecting overlap to supply far-away context.** Chunks still lack headings or definitions that sit
+  far from the boundary, because overlap only repeats neighbouring text.
+- **Forecasting chunks as tokens ÷ size.** Ignoring the stride makes capacity and cost forecasts
+  undershoot; the vector store fills up well before the projected corpus size.
 
 ## When to use
-Use moderate overlap whenever your splitter can cut inside a sentence or argument, which is any fixed
-size splitter and most recursive splitters on long paragraphs. Skip it when boundaries already follow
-structure (one chunk per section, per function, per FAQ entry) or when you use small-to-big retrieval,
-where the parent supplies the context overlap was trying to preserve. Always pair overlap with query
-time deduplication of adjacent chunks. Measure recall@k at a few overlap settings and watch index size
-and duplicate rate in the top-k. In interviews, the expected depth is the stride arithmetic, the dedup
-requirement, and the honest statement that overlap patches local damage rather than fixing boundaries.
+- **Use when:** your splitter can cut inside a sentence or argument, which is any fixed-size splitter and
+  most recursive splitters on long paragraphs. Use moderate overlap.
+- **Skip when:** boundaries already follow structure (one chunk per section, per function, per FAQ
+  entry), or you use small-to-big retrieval, where the parent supplies the context overlap preserved.
+- **Always:** pair overlap with query-time deduplication of adjacent chunks.
+- **Measure:** recall@k at a few overlap settings, plus index size and duplicate rate in the top-k.
+- **Interviews:** the stride arithmetic, the dedup requirement, and the honest statement that overlap
+  patches local damage rather than fixing boundaries.
 
 ## Role lens
 - **Engineer:** Sets size and overlap in the splitter, writes the adjacent-chunk collapse step in the
@@ -180,6 +250,42 @@ content that was already whole. I would keep overlap moderate, align it to sente
 repeated tail is complete sentences, add adjacent-chunk collapsing in the retriever, and if the real
 problem is missing context, switch to structure-aware chunking with heading paths or small-to-big
 retrieval, then confirm on a golden set with recall@k rather than on the intuition that more is better.
+
+## Interview questions
+### What is chunk overlap and what problem does it actually solve?
+- **Definition:** consecutive chunks share the last few tokens or sentences of the previous chunk, a
+  sliding window whose stride is smaller than the window.
+- **Why:** a sentence or pronoun-antecedent pair that straddles a boundary appears whole in at least one
+  chunk, so that chunk's vector is specific and retrievable.
+- **Limit:** it only repairs local damage; a heading pages earlier needs structure-aware chunking,
+  contextual prefixes or parent retrieval.
+
+### Estimate the index size for a 10-million-token corpus at 512-token chunks with 64 tokens of overlap.
+- **Stride** is 512 − 64 = 448 tokens, so chunks ≈ (10,000,000 − 64) / 448, about 22,300.
+- **Without overlap** it would be 10,000,000 / 512, about 19,500, so overlap adds roughly 14%.
+- **Multiply** by vector size and per-vector index overhead for storage, and by tokens per chunk for the
+  one-time embedding bill.
+
+### Users see the same paragraph three times in the cited sources. What happened and how do you fix it?
+- **Cause:** a query matched the shared region of overlapping neighbours, so adjacent chunks ranked
+  together and filled the top-k.
+- **Fix:** over-fetch, group by document, merge adjacent chunk indices into one span by stored offsets
+  (not concatenation, which repeats the overlap), then cut to k.
+- **Monitor:** the duplicate rate in the final top-k on the eval set.
+
+### When would you set overlap to zero?
+- **Structure-aligned boundaries:** one chunk per section, function or FAQ entry already avoids
+  mid-sentence cuts, so overlap mostly buys inflation.
+- **Small-to-big retrieval:** the returned parent supplies the surrounding context overlap would have
+  preserved.
+- **Verify:** keep zero only if recall@k at 0 matches 10% and 20% on the golden set.
+
+### You configured 100 tokens of overlap but boundary failures persist. Why?
+- **Piece-based splitters treat overlap as a ceiling:** they carry forward only whole trailing pieces that
+  fit within the budget.
+- **So** a boundary after a 150-token paragraph gets zero overlap, exactly where long paragraphs end.
+- **Audit** the real shared text between neighbours on a sample, and switch to sentence-aligned overlap or
+  smaller pieces if many boundaries have none.
 
 ## Quiz
 ### Q: With 400-token chunks and a 100-token overlap, roughly how many chunks does a 100,000-token document produce?

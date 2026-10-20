@@ -5,7 +5,7 @@ name: Package structure & import design
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
   - python-for-ai/protocols-generics-structural-typing
@@ -22,107 +22,140 @@ sources:
 ---
 
 ## TL;DR
-In Python, the import graph is your architecture: whatever imports what decides which code can be
-tested alone, what runs at startup and what breaks when a dependency changes. Use a `src/` layout so
-tests exercise the installed package, keep imports pointing one way (domain ← services ← adapters ←
-entrypoints), keep side effects out of import time, and import heavy SDKs and model libraries lazily or
-only at the edges.
+In Python the import graph is your architecture. Use a `src/` layout, point imports one way
+(domain ← services ← adapters ← entrypoints), keep side effects out of import time, and import heavy SDKs
+and model libraries lazily or only at the edges.
 
 ## Why it exists
-AI codebases usually start as one notebook, then a `utils.py`, then forty modules where everything imports
-everything. Three failures follow. First, **circular imports**: `agent.py` imports `tools.py`, which imports
-`agent.py` for a type, and one day Python raises `ImportError: cannot import name 'Agent' from partially
-initialized module`. Second, **slow, fragile startup**: importing your package pulls in `torch`,
-`transformers` and three vendor SDKs, so a CLI that only lists prompts takes seconds to start, and a
-module-level `client = OpenAI()` fails at import time when `OPENAI_API_KEY` is missing, which also breaks
-test collection. Third, **tests that pass for the wrong reason**: with a flat layout, `pytest` imports the
-package from the working directory rather than from what `pip install` would ship, so a missing file in the
-wheel or a wrong package-data declaration is invisible until production.
-
-The naive fixes make each symptom go away locally and leave the cause. `sys.path.insert(0, "..")` at the
-top of a test or a `PYTHONPATH=.` in someone's shell makes imports resolve on one machine and differently
-in CI, Docker and a teammate's laptop, because the import result now depends on where the process was
-started. Wrapping a failing import in `try/except ImportError` hides a cycle until a different import
-order triggers it. "Just be careful" does not scale because nothing enforces it. Import structure has to
-be designed, given a direction, and checked by a tool, the same way you would design service boundaries.
+- **Notebooks grow into tangles.** One notebook becomes a `utils.py`, then forty modules where everything
+  imports everything. Three failures follow. First, **circular imports**. Second, **slow, fragile
+  startup**: importing your package pulls in everything at once. Third, **tests that pass for the wrong
+  reason**.
+- **Circular imports.** `agent.py` imports `tools.py`, which imports `agent.py` for a type, until Python
+  raises `ImportError: cannot import name 'Agent' from partially initialized module`.
+- **Slow, fragile startup.** Importing the package pulls in `torch`, `transformers` and three vendor SDKs,
+  so a CLI that only lists prompts takes seconds. A module-level `client = OpenAI()` fails at import when
+  `OPENAI_API_KEY` is missing, which also breaks test collection.
+- **Tests pass for the wrong reason.** With a flat layout, `pytest` imports the package from the working
+  directory, not from what `pip install` would ship, so a missing wheel file or wrong package-data
+  declaration stays invisible until production.
+- **Naive fixes hide the cause.** `sys.path.insert(0, "..")` or `PYTHONPATH=.` makes imports depend on
+  where the process started, so they differ in CI, Docker and a teammate's laptop. `try/except ImportError`
+  hides a cycle until another import order triggers it. "Just be careful" does not scale because nothing
+  enforces it: design the structure, give it a direction, check it with a tool.
 
 ## How it works
 ### What an import actually does
-`import pkg.mod` looks in `sys.modules`; if absent, it walks `sys.path` for `pkg`, creates the module object,
-**inserts it into `sys.modules` before executing its body**, then runs the module top to bottom. Two
-consequences drive every rule below. A module's body runs once per process, at first import, so anything at
-top level (network clients, file reads, model loading, `logging.basicConfig`) is an import-time side effect.
-And because the half-built module is already registered, a cycle does not loop forever: the second module
-gets the partially initialized first one, and `from a import X` fails if `X` has not been defined yet.
+1. `import pkg.mod` looks in `sys.modules`.
+2. If absent, it walks `sys.path` for `pkg` and creates the module object.
+3. It **inserts the module into `sys.modules` before executing its body**.
+4. It runs the module top to bottom.
 
-The two import forms bind different things. `import a` binds the module object, so a cycle using it
-survives as long as `a.X` is only looked up later, at call time. `from a import X` copies the current value
-of `a.X` into the importing module's namespace *now*, which is why it fails mid-cycle, and also why
-`mock.patch("a.X")` does not affect a module `b` that already did `from a import X`: `b` holds its own
-reference, so you must patch `b.X`, the name where it is *used*.
+Two consequences drive every rule below:
+- **The body runs once per process, at first import.** Anything at top level (network clients, file
+  reads, model loading, `logging.basicConfig`) is an import-time side effect.
+- **A cycle does not loop forever.** The half-built module is already registered, so the second module
+  gets the partially initialized first one, and `from a import X` fails if `X` is not defined yet.
+
+### `import a` vs `from a import X`
+| Form | Binds | Consequence |
+|---|---|---|
+| `import a` | the module object | a cycle survives if `a.X` is only looked up later, at call time |
+| `from a import X` | a copy of `a.X`'s current value, *now* | fails mid-cycle |
+
+- **Patch where the name is used.** `mock.patch("a.X")` does not affect a module `b` that already did
+  `from a import X`, because `b` holds its own reference; patch `b.X`.
 
 ### Where `sys.path[0]` comes from
-`python path/to/script.py` puts the script's own directory first on `sys.path`; `python -m pkg.mod` puts
-the current directory there and imports `pkg.mod` as part of its package. So running
-`python src/myapp/entrypoints/cli.py` makes `entrypoints/` the top of the search path: sibling files become
-top-level modules, relative imports fail with "attempted relative import with no known parent package", and
-a sibling named like a library shadows it. Run code as `python -m myapp.entrypoints.cli`, or declare a
-console script under `[project.scripts]` in `pyproject.toml`, *because* both resolve imports through the
-installed package rather than through wherever the file happens to sit.
+- **`python path/to/script.py`** puts the script's own directory first on `sys.path`.
+- **`python -m pkg.mod`** puts the current directory there and imports `pkg.mod` as part of its package.
+- **So `python src/myapp/entrypoints/cli.py` breaks things:** `entrypoints/` tops the search path, siblings
+  become top-level modules, relative imports fail with "attempted relative import with no known parent
+  package", and a sibling named like a library shadows it.
+- **Fix:** run `python -m myapp.entrypoints.cli`, or declare a console script under `[project.scripts]` in
+  `pyproject.toml`, *because* both resolve imports through the installed package rather than wherever the
+  file sits.
 
 ### src layout
-Put code in `src/myapp/` with `tests/` beside `src/`, and install it in editable mode (`uv sync`, or
-`pip install -e .`). Because the project root no longer contains an importable `myapp` directory, tests can
-only import the package through the installation, so an undeclared dependency or a module that is not
-actually part of the package shows up instead of being silently picked up from the working directory. One
-caveat: an editable install still points back at `src/`, so files that exist on disk but are missing from the
-wheel (prompt templates, package data) are only caught when CI builds the wheel and runs the tests against a
-non-editable install of it. A flat layout (`myapp/` at the root) is fine for scripts and small tools, but it
-lets the current directory shadow the installed package.
+- **Shape:** code in `src/myapp/`, `tests/` beside `src/`, installed editable (`uv sync`, or
+  `pip install -e .`).
+- **Why it helps:** the project root has no importable `myapp` directory, so tests can only import through
+  the installation. Undeclared dependencies and modules not really in the package show up instead of being
+  silently picked up from the working directory.
+- **Caveat:** an editable install still points back at `src/`. Files on disk but missing from the wheel
+  (prompt templates, package data) are caught only when CI builds the wheel and tests a non-editable
+  install of it.
+- **Flat layout** (`myapp/` at the root) is fine for scripts and small tools, but it lets the current
+  directory shadow the installed package.
 
 ### Layering and direction
-Pick layers and allow imports only downward:
-- `domain/` — pure types and logic (Pydantic models, prompt templates, scoring). Imports nothing from the app.
-- `services/` — orchestration (the RAG pipeline, the agent loop). Depends on domain and on *interfaces*
-  (Protocols) for LLMs, vector stores and tools.
-- `adapters/` — concrete clients (OpenAI, Anthropic, pgvector, Redis). Implement those Protocols.
-- `entrypoints/` — FastAPI app, CLI, workers. The composition root that wires adapters into services.
+Allow imports only downward:
 
-The direction is chosen *because* the parts that change most (vendor SDKs) should be the parts nothing else
-depends on. A tool such as `import-linter` can turn this into a CI check with "layers" and "forbidden"
-contracts, so a stray `from myapp.adapters.openai import ...` inside `domain/` fails the build.
+| Layer | Contains | May import |
+|---|---|---|
+| `domain/` | pure types and logic (Pydantic models, prompt templates, scoring) | nothing from the app |
+| `services/` | orchestration (RAG pipeline, agent loop) | domain + *interfaces* (Protocols) for LLMs, vector stores, tools |
+| `adapters/` | concrete clients (OpenAI, Anthropic, pgvector, Redis) | implement those Protocols |
+| `entrypoints/` | FastAPI app, CLI, workers | the composition root that wires adapters into services |
+
+- **Why this direction:** the parts that change most (vendor SDKs) should be the parts nothing else
+  depends on.
+- **Enforce it:** `import-linter` turns this into a CI check with "layers" and "forbidden" contracts, so a
+  stray `from myapp.adapters.openai import ...` inside `domain/` fails the build.
 
 ### Breaking cycles properly
-A cycle is a design signal: two modules share a concept that belongs in a third. Move the shared types down
-into `domain/`. If the only reason for the import is a type annotation, guard it with
-`if TYPE_CHECKING:` and use string or postponed annotations, because type checkers read it but the runtime
-never executes it. Function-local imports also break cycles, but use them deliberately, not as a habit.
+- **A cycle is a design signal:** two modules share a concept that belongs in a third. Move the shared
+  types down into `domain/`.
+- **Type-only import?** Guard it with `if TYPE_CHECKING:` and use string or postponed annotations,
+  because type checkers read it but the runtime never executes it.
+- **Function-local imports** also break cycles; use them deliberately, not as a habit.
 
 ### Public surface and lazy imports
-`__init__.py` defines what callers see. Re-exporting a small API there (`from .client import Client`, plus
-`__all__`) lets you reorganize internals without breaking users, but re-exporting everything makes
-`import myapp` load everything. For heavy optional dependencies, import inside the function that needs them,
-or use a module-level `__getattr__` (PEP 562) to defer loading until first attribute access.
-`python -X importtime -c "import myapp"` prints per-module import cost, so you can see what to defer.
+- **`__init__.py` defines what callers see.** Re-export a small API (`from .client import Client`, plus
+  `__all__`) to reorganize internals freely. Re-exporting everything makes `import myapp` load everything.
+- **Defer heavy optional dependencies:** import inside the function that needs them, or use a module-level
+  `__getattr__` (PEP 562) to load on first attribute access.
+- **Measure:** `python -X importtime -c "import myapp"` prints per-module import cost, so you see what to
+  defer.
 
 ### Regular vs namespace packages
-A directory with `__init__.py` is a regular package. Since PEP 420, a directory *without* one is still
-importable as a namespace package, which exists so that several separately installed distributions can
-contribute subpackages to one name (`acme.llm` and `acme.rag` shipped independently). Use that on purpose
-only. An accidental namespace package, a forgotten `__init__.py`, usually still imports in development,
-but setuptools' `find_packages()` skips directories without `__init__.py`, so the subpackage can silently
-be left out of the wheel, and some tools resolve module names differently for it. In a single application
-package, give every package directory an `__init__.py`.
+- **Regular package:** a directory with `__init__.py`.
+- **Namespace package (PEP 420):** a directory *without* one is still importable. It exists so several
+  separately installed distributions can contribute subpackages to one name (`acme.llm` and `acme.rag`
+  shipped independently). Use it on purpose only.
+- **Accidental namespace package** (a forgotten `__init__.py`) usually imports in development, but
+  setuptools' `find_packages()` skips it, so the subpackage can silently be left out of the wheel, and some
+  tools resolve its module names differently.
+- **Rule:** in a single application package, give every package directory an `__init__.py`.
 
 ### Absolute vs relative imports
-Absolute imports (`from myapp.domain import Query`) are explicit and survive copying a module elsewhere;
-explicit relative imports (`from .models import Query`) are shorter and survive renaming the top package.
-Either is fine; pick one style and let `ruff` enforce it. Implicit relative imports do not exist in Python 3.
+- **Absolute** (`from myapp.domain import Query`): explicit, survives copying a module elsewhere.
+- **Explicit relative** (`from .models import Query`): shorter, survives renaming the top package.
+- **Either is fine:** pick one and let `ruff` enforce it. Implicit relative imports do not exist in
+  Python 3.
 
-## Example
-A layered layout plus two techniques: a type-only import that removes a runtime cycle between the agent and
-its tool registry, and an embedding adapter that defers the expensive `torch` import until the first call, so
-importing the package (or collecting tests) stays fast and side-effect free.
+## Diagram
+Follow one `import` statement: the module is registered in `sys.modules` before its body runs, which is
+why a cycle hands the second importer a half-built module instead of looping forever.
+
+```mermaid
+flowchart TD
+    I["import pkg.mod"] --> C{"Already in sys.modules?"}
+    C -->|"yes"| U["Return cached module, body not re-run"]
+    C -->|"no"| F["Search sys.path for pkg"]
+    F -->|"not found"| E["ModuleNotFoundError"]
+    F -->|"found"| R["Create module object, insert into sys.modules"]
+    R --> B["Execute module body top to bottom"]
+    B -->|"body imports a module that imports pkg.mod back"| P["Cycle gets the partially initialized module"]
+    P -->|"from pkg.mod import X before X is defined"| X["ImportError: partially initialized module"]
+    B -->|"body finishes"| D["Module fully initialized, names bound"]
+```
+
+## Examples
+### Layered layout with a type-only import and a lazy adapter
+The `TYPE_CHECKING` import removes a runtime cycle between the agent and its tool registry; the embedder
+defers `torch` until the first call, so importing the package (or collecting tests) stays fast and
+side-effect free.
 
 ```python
 # src/myapp/
@@ -160,41 +193,124 @@ class LocalEmbedder:
 # Measure: python -X importtime -c "import myapp.entrypoints.cli" 2> imports.log
 ```
 
+### Reproduce a partial-init cycle and a wrong-place patch
+Standard library only. It writes four tiny modules to a temp directory and shows both failure modes.
+
+```python
+import sys, tempfile, textwrap, pathlib
+from unittest import mock
+
+root = pathlib.Path(tempfile.mkdtemp())
+def write(name, src):
+    (root / name).write_text(textwrap.dedent(src))
+
+write("a.py", """
+    from b import helper          # runs b before X exists
+    X = 1
+""")
+write("b.py", """
+    from a import X               # a is in sys.modules but half-built
+    def helper(): return X
+""")
+write("llm.py", "def call(): return 'real network call'\n")
+write("rag.py", """
+    from llm import call          # copies the reference into rag's namespace
+    def answer(): return call()
+""")
+sys.path.insert(0, str(root))     # demo only: never do this in project code
+
+try:
+    import a
+except ImportError as e:
+    print("cycle:", e)            # cannot import name 'X' from partially initialized module 'a'
+
+import rag
+with mock.patch("llm.call", return_value="fake"):
+    print(rag.answer())           # real network call: patched where defined
+with mock.patch("rag.call", return_value="fake"):
+    print(rag.answer())           # fake: patched where it is looked up
+```
+
+### Layer contract as a CI check
+An `import-linter` contract in `pyproject.toml`; `lint-imports` fails the build when a lower layer imports a
+higher one. Layers are listed from highest to lowest.
+
+```toml
+[tool.importlinter]
+root_package = "myapp"
+
+[[tool.importlinter.contracts]]
+name = "Layered architecture"
+type = "layers"
+layers = [
+    "myapp.entrypoints",
+    "myapp.adapters",
+    "myapp.services",
+    "myapp.domain",
+]
+
+[[tool.importlinter.contracts]]
+name = "Domain never touches vendor SDKs"
+type = "forbidden"
+source_modules = ["myapp.domain", "myapp.services"]
+forbidden_modules = ["openai", "anthropic", "torch"]
+```
+
+## Production patterns
+- **Test the built wheel, not the checkout.** In CI, build the wheel (`uv build` or `python -m build`),
+  install it into a fresh environment without `-e`, and run the test suite against it. Catches missing
+  package data and undeclared dependencies; monitor CI for `ModuleNotFoundError` on this job only.
+- **Import contracts in CI.** Run `lint-imports` with layers and forbidden contracts like the one above on
+  every pull request, so direction is enforced by a tool, not by review. Track contract violations as
+  build failures.
+- **Import-time budget for cold-start paths.** For CLIs, serverless handlers and autoscaled workers,
+  capture `python -X importtime -c "import myapp.entrypoints.cli"` in CI and review the slowest modules;
+  defer them with function-local imports or PEP 562 `__getattr__`. Monitor cold-start latency.
+- **Console scripts, never file paths.** Declare entrypoints under `[project.scripts]` and run workers with
+  `python -m` in Dockerfiles and process managers, so `sys.path` is the same everywhere.
+- **Eager imports at server boot.** For long-running API servers, import adapters during startup (the
+  lifespan or app factory) so a missing optional dependency fails the deploy health check instead of the
+  first user request.
+
 ## Trade-offs
-- Strict layering makes adapters swappable and services testable with fakes, but adds indirection that feels
-  like ceremony in a 500-line prototype; adopt it once a second adapter or a test suite appears.
-- Lazy imports cut startup time and make optional extras optional, but move `ImportError` from startup to
-  first use; for a long-running server, eager import at boot can be safer because it fails fast.
-- A rich `__init__.py` gives users a tidy API, but couples import cost to the whole package; it flips toward
-  minimal `__init__` files once the package contains heavy or optional dependencies.
-- Splitting into many small packages (a monorepo with workspaces) isolates dependencies cleanly, but costs
-  versioning and release overhead that a single package with clear layers usually does not need.
+- **Swappable adapters vs ceremony.** Strict layering makes services testable with fakes, but adds
+  indirection that feels like ceremony in a 500-line prototype; adopt it once a second adapter or a test
+  suite appears.
+- **Fast startup vs late failure.** Lazy imports cut startup time and make optional extras optional, but
+  move `ImportError` from startup to first use; for a long-running server, eager import at boot can be
+  safer because it fails fast.
+- **Tidy API vs import cost.** A rich `__init__.py` gives users a tidy API but couples import cost to the
+  whole package; prefer minimal `__init__` files once the package contains heavy or optional dependencies.
+- **Many packages vs one layered package.** Splitting into many small packages (a monorepo with workspaces)
+  isolates dependencies cleanly, but costs versioning and release overhead that a single package with clear
+  layers usually does not need.
 
 ## Pitfalls
-- Creating clients or loading models at module top level; the symptom is tests failing at collection with a
-  missing API key, or a CLI `--help` that takes several seconds.
-- Fixing a circular import by moving the import inside a function without fixing the shared concept; the
-  symptom is the same cycle reappearing in a new form a few weeks later.
-- Naming a module after a dependency (`openai.py`, `logging.py`, `datasets.py`) inside a directory on
-  `sys.path`; the symptom is `AttributeError: module 'openai' has no attribute 'OpenAI'` because your file
-  shadowed the library.
-- Patching where a name is defined rather than where it is looked up (`patch("myapp.adapters.llm.OpenAI")`
-  when `services/rag.py` did `from myapp.adapters.llm import OpenAI`); the symptom is a test that still
-  makes real network calls even though the patch "is applied".
-- Running modules as files (`python src/myapp/cli.py`) instead of with `-m` or a console script; the
-  symptom is "attempted relative import with no known parent package", or imports that work from one
+- **Clients or models created at module top level.** Symptom: tests fail at collection with a missing API
+  key, or a CLI `--help` takes several seconds. Fix: build them in the composition root.
+- **Moving an import into a function without fixing the shared concept.** Symptom: the same cycle reappears
+  in a new form a few weeks later. Fix: move the shared types into `domain/`.
+- **A module named after a dependency** (`openai.py`, `logging.py`, `datasets.py`) on `sys.path`. Symptom:
+  `AttributeError: module 'openai' has no attribute 'OpenAI'` because your file shadowed the library. Fix:
+  rename it.
+- **Patching where a name is defined, not where it is looked up** (`patch("myapp.adapters.llm.OpenAI")`
+  when `services/rag.py` did `from myapp.adapters.llm import OpenAI`). Symptom: the test still makes real
+  network calls although the patch "is applied". Fix: patch `myapp.services.rag.OpenAI`, or inject.
+- **Running modules as files** (`python src/myapp/cli.py`) instead of with `-m` or a console script.
+  Symptom: "attempted relative import with no known parent package", or imports that work from one
   directory and fail from another.
-- Using a flat layout and never building the wheel in CI; the symptom is `ModuleNotFoundError` or missing
-  prompt templates only after deployment, because package data was never declared.
+- **Flat layout and no wheel build in CI.** Symptom: `ModuleNotFoundError` or missing prompt templates only
+  after deployment, because package data was never declared.
 
 ## When to use
-Apply these rules from the moment code leaves the notebook and gets a `pyproject.toml`. Use a src layout for
-anything that is installed, deployed or shared; keep a flat layout for one-off scripts. Introduce explicit
-layers when you have more than one implementation of an external dependency, or when tests start needing to
-patch module globals to avoid network calls. Measure import time when startup matters (CLIs, serverless cold
-starts, worker autoscaling). In code review, the question to ask is "which way does this import point?"; in
-interviews, explaining why a cycle signals a misplaced concept, and how `sys.modules` makes a cycle fail
-the way it does, shows real understanding.
+- **Use when:** code leaves the notebook and gets a `pyproject.toml`; use a src layout for anything
+  installed, deployed or shared.
+- **Avoid when:** it is a one-off script; keep a flat layout.
+- **Add explicit layers when:** you have more than one implementation of an external dependency, or tests
+  start patching module globals to avoid network calls.
+- **Measure:** import time when startup matters (CLIs, serverless cold starts, worker autoscaling).
+- **Code review / interviews:** ask "which way does this import point?"; explain why a cycle signals a
+  misplaced concept and how `sys.modules` makes a cycle fail the way it does.
 
 ## Role lens
 - **Engineer:** Keeps vendor SDK imports in adapters, guards type-only imports, and runs `-X importtime`
@@ -214,6 +330,41 @@ module, including ones that import `torch` and ones that construct SDK clients a
 or a factory), and inject clients into services. Heavy libraries move behind function-local or PEP 562 lazy
 imports. Then `-X importtime` confirms the cold-start gain, and tests run with fakes because nothing touches
 the network or environment at import time.
+
+## Interview questions
+### What does a src layout buy you over a flat layout, and what does it not catch on its own?
+- **What it buys:** the project root has no importable `myapp` directory, so tests import through the
+  installation and undeclared dependencies or stray modules surface instead of being picked up from the
+  working directory.
+- **What it misses:** an editable install still points back at `src/`, so files missing from the wheel
+  (prompt templates, package data) only show up when CI builds the wheel and tests a non-editable install.
+
+### A teammate hits `ImportError: cannot import name 'Agent' from partially initialized module`. Walk me through the fix.
+- **Explain the cause:** Python inserts a module into `sys.modules` before running its body, so the cyclic
+  import gets a half-built module and `from a import X` fails if `X` is not defined yet.
+- **Find the shared concept:** if both modules need the same types, move them down into `domain/`.
+- **Type-only edge:** guard it with `if TYPE_CHECKING:` plus postponed annotations; avoid
+  `try/except ImportError`, which hides the cycle until another import order triggers it.
+
+### How would you enforce a layered dependency direction across a team of twenty engineers?
+- **Write the rule down as a contract:** `import-linter` with a "layers" contract (entrypoints, adapters,
+  services, domain) and a "forbidden" contract keeping `openai`, `anthropic` and `torch` out of the inner
+  layers.
+- **Run `lint-imports` in CI** on every pull request, so a stray adapter import in `domain/` fails the build
+  rather than relying on reviewers.
+
+### When would you prefer eager imports over lazy ones?
+- **Lazy imports suit cold-start paths:** CLIs, serverless handlers and autoscaled workers, where
+  `python -X importtime` shows `torch` or SDK imports dominating startup.
+- **Eager imports suit long-running servers:** importing adapters in the lifespan or app factory makes a
+  missing optional dependency fail the deploy health check instead of the first user request.
+- **The cost of lazy:** `ImportError` moves from startup to first use.
+
+### Your test patches `myapp.adapters.llm.OpenAI` but still makes real network calls. Why?
+- **Names are looked up where they are used:** `services/rag.py` did `from myapp.adapters.llm import
+  OpenAI`, so it holds its own reference and the patch on the defining module does not touch it.
+- **Fix:** patch `myapp.services.rag.OpenAI`, or better, inject the client so no patching is needed.
+- **Prevent recurrence** by building clients in the composition root rather than at module top level.
 
 ## Quiz
 ### Q: Why does a circular import often fail with "cannot import name X from partially initialized module"?
