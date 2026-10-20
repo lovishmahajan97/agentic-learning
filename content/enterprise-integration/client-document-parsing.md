@@ -127,7 +127,7 @@ import pdfplumber, pytesseract
 def text_is_usable(text: str, min_chars=200, min_alpha=0.6):
     if len(text) < min_chars: return False
     alpha = sum(c.isalpha() or c.isspace() for c in text) / len(text)
-    return alpha >= min_alpha and "�" not in text     # replacement char hints at broken encoding
+    return alpha >= min_alpha and "\ufffd" not in text     # replacement char hints at broken encoding
 
 def parse_pdf(path, lang="eng+deu", ocr_ok=70):
     pages = []

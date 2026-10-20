@@ -186,7 +186,7 @@ for OpenAI models, `AutoTokenizer.from_pretrained(name)(text).input_ids` for ope
 - Asking the model for character-level work (letter counts, exact string reversal, regex-like
   validation); the symptom is confident, inconsistent answers that no prompt reliably fixes.
 - Streaming output by decoding each token id on its own; a multi-byte UTF-8 character (accented
-  letters, CJK, emoji) can span two byte-level tokens, so the symptom is `�` replacement characters in
+  letters, CJK, emoji) can span two byte-level tokens, so the symptom is `U+FFFD` replacement characters in
   streamed text that disappear when the full response is decoded at once. Buffer incomplete bytes.
 - Mismatched chat-template special tokens between training and serving; the symptom is a fine-tuned
   model that ignores its system prompt or never emits a stop token.
