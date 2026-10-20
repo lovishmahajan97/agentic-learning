@@ -5,6 +5,7 @@ name: Idempotency keys
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - fastapi-for-ai/timeouts
   - fastapi-for-ai/redis-caching
@@ -74,8 +75,12 @@ For each key the server stores a record: `{fingerprint, state, status_code, resp
   returns someone else's result.
 - **Scope keys per caller** (`tenant:user:key`). Otherwise one tenant could collide with, or probe for,
   another's keys.
-- **TTL** a bit longer than the client's maximum retry window. Payment APIs keep keys around a day.
-  Shorter saves storage but lets a late retry run twice.
+- **TTL** a bit longer than the client's maximum retry window. Stripe, for example, keeps keys for
+  at least 24 hours. Shorter saves storage but lets a late retry run twice.
+- **Two TTLs, not one.** The `in_progress` claim is a *lease*: give it a TTL just above the longest the
+  work can take (say a couple of minutes for a generation), and only the completed record gets the long
+  retention TTL. If the claim carried the 24-hour TTL, a worker that crashed or was killed mid-request
+  would leave the key stuck in `in_progress`, and every retry would get 409 for a day.
 - **What to store on failure.** Store deterministic outcomes, including 4xx validation errors and
   successful 2xx results. For 5xx or crashes mid-work, delete the claim (or let it expire) so the
   retry can run. If the work had partly happened, the work itself must be resumable or transactional.
@@ -96,14 +101,14 @@ import redis.asyncio as redis
 
 app = FastAPI()
 r = redis.Redis()
-TTL = 24 * 3600
+TTL, LEASE = 24 * 3600, 120     # keep results a day; an in-progress claim expires after 2 min
 
-async def idem(request: Request, tenant: str = Header(...),
+async def idem(request: Request, tenant: str = Header(...),  # really: from the auth principal
                idempotency_key: str = Header(...)):
-    body = await request.body()
-    fp = hashlib.sha256(request.method.encode() + request.url.path.encode() + body).hexdigest()
+    body = await request.body()     # raw bytes; canonicalise JSON if clients re-serialise on retry
+    fp = hashlib.sha256(b"|".join([request.method.encode(), request.url.path.encode(), body])).hexdigest()
     k = f"idem:{tenant}:{idempotency_key}"
-    if await r.set(k, json.dumps({"fp": fp, "state": "in_progress"}), nx=True, ex=TTL):
+    if await r.set(k, json.dumps({"fp": fp, "state": "in_progress"}), nx=True, ex=LEASE):
         return k, fp                                   # we own it: do the work
     rec = json.loads(await r.get(k) or "{}")
     if rec.get("fp") != fp:
@@ -133,7 +138,11 @@ async def create(payload: dict, claim=Depends(idem)):
 
 Scenario: the client posts with key `7f3c...`, the model takes 12 s, and the client's 10 s timeout
 fires. It retries at 11 s with the same key and gets 409. At 13 s it retries again and gets the stored
-201 with the same `gen_123` text. One generation is billed and one answer is shown.
+201 with the same `gen_123` text. One generation is billed and one answer is shown. (This relies on the
+server finishing the work after the client disconnects, which is FastAPI's default for a non-streaming
+handler. If the pod dies mid-generation instead, the 120 s lease expires and a later retry runs the
+work afresh.) The `tenant` header is a stand-in: in production take the tenant from the authenticated
+principal, or a caller can scope keys into someone else's namespace.
 
 ## Trade-offs
 - Keys make retries safe and cheap, but every mutating request now costs a store round trip and storage
@@ -156,6 +165,8 @@ fires. It retries at 11 s with the same key and gets 409. At 13 s it retries aga
   replayed response that belongs to a different request or a different user.
 - Storing a 500 as the final outcome. The symptom is a request that fails forever with the same
   replayed error even after the provider has recovered.
+- Giving the in-progress claim the same long TTL as completed records. The symptom is that after a
+  crash or deploy, retries for the interrupted keys return 409 for hours instead of re-running.
 - Re-running generation on replay instead of returning the stored body. The symptom is users seeing
   two different answers for one question and token bills that don't match request counts.
 

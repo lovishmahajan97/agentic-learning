@@ -5,6 +5,7 @@ name: TCO (total cost of ownership)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - infra-capacity-economics/break-even-analysis
   - infra-capacity-economics/cost-modeling
@@ -46,8 +47,8 @@ of those on one timeline, so the comparison is honest and the assumptions can be
 Options are only comparable if they deliver the same thing: the same task, at the same quality bar on your
 evals, at the same latency and availability target. If the cheaper option scores lower, either add the
 cost of closing the gap (fine-tuning, a reranker, human review) or express both in cost per successful
-task. The horizon is usually three years: long enough that one-off build costs amortize, and roughly the
-term of a hardware depreciation schedule or a committed-use contract. For a hosted-API product, a horizon
+task. The horizon is usually three years: long enough that one-off build costs amortize, and the common
+longest committed-use term (hardware is often depreciated over three to five or more years). For a hosted-API product, a horizon
 longer than the model generation you are building on is fiction, so keep it short and model the migration.
 
 ### 2. Enumerate costs in four buckets
@@ -113,12 +114,12 @@ for label, users in (("growth", [500, 1000, 1500]), ("flat", [500, 500, 500])):
     b, s = build_on_api(users), buy_saas(users)
     print(f"{label}: build {tco(b):.0f} (NPV {tco(b, RATE):.0f})  buy {tco(s):.0f} (NPV {tco(s, RATE):.0f})")
 # growth: build 1232 (NPV 1051)  buy 1393 (NPV 1131)
-# flat:   build 1052 (NPV 911)   buy 789 (NPV 662)
+# flat: build 1052 (NPV 911)  buy 789 (NPV 662)
 ```
 
 Three readings. First, in the build option tokens are a minority of cost even in year three ($180k of
-$394k); the 0.75 FTE of upkeep is the biggest recurring line, so negotiating a cheaper token price would
-barely move the answer. Second, the decision flips on adoption: per-seat pricing scales with users while
+$394k), and over the three years the 0.75 FTE of upkeep ($450k) outweighs tokens ($360k). A 20% token
+discount would save about $72k; trimming upkeep by a quarter of an FTE would save $150k. Second, the decision flips on adoption: per-seat pricing scales with users while
 the build is mostly fixed, so build wins if usage triples and buy wins clearly if it stays flat. That makes
 adoption the assumption to test before committing. Third, discounting halves build's advantage in the
 growth case ($161k undiscounted, $80k NPV) because the subscription's large payments come late. A strong

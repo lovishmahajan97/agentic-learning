@@ -4,8 +4,8 @@ module: evals
 name: Eval harness
 kind: pattern
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/llm-as-a-judge
@@ -88,6 +88,26 @@ summary says how many; a quiet 5% drop rate is a biased score.
 *Make it cheap to run a subset.* A PR run on 50 items in minutes, a nightly run on everything, a
 release run with *k* = 5 samples per item. The same code path, different selectors.
 
+*Do not assume temperature 0 is deterministic.* Hosted models often return different text for the
+same request at temperature 0 (batching and floating-point effects on the server, silent snapshot
+updates), and many APIs treat a seed as best-effort. Measure it: run the baseline twice with no change
+and count the items that flip. That flip count is the harness's noise floor, and any later change that
+flips no more items than that has not been shown to do anything.
+
+*Key the cache on everything that can change the output.* Configuration hash, item id *and* sample
+index, so that *k* samples are *k* distinct cache entries rather than one output read back *k* times.
+
+### Harnesses for agents and multi-step systems
+An agent changes the shape of `run(item)`. Each item needs an environment: a sandboxed filesystem,
+a seeded database, mocked or recorded tools. The environment is created fresh per item and torn down
+afterwards, *because* state left by one item (a file written, a row deleted) silently changes the next
+item's starting point. Grading usually inspects the *final state* rather than the final message (did
+the ticket get the right status, do the repository's tests pass), since many different action
+sequences are correct. The full trajectory (every tool call, argument and result) is stored with the
+output, *because* when an agent fails, the step where it went wrong is the evidence. And every run
+carries budgets, maximum steps, tokens and wall-clock time, so that a looping agent becomes a recorded
+failure instead of a hung CI job.
+
 ### Capability harnesses versus application harnesses
 Frameworks such as EleutherAI's lm-evaluation-harness and Inspect standardize prompting and scoring
 for public benchmarks, so that an MMLU number from one lab is comparable with another's. Application
@@ -104,7 +124,7 @@ itself a quality signal.
 
 ## Example
 A minimal harness in one file: a run manifest, concurrent execution with retries, stored raw outputs,
-pluggable graders, and a per-slice summary with a normal-approximation confidence interval. `target`
+pluggable graders, and a per-slice summary with a Wilson confidence interval. `target`
 is any callable, so the same code evaluates a prompt or an agent.
 
 ```python
@@ -150,15 +170,24 @@ def summarize(results):
     report = {}
     for s, rs in sorted(by_slice.items()):
         graded = [r for r in rs if r["pass"] is not None]
-        n, p = len(graded), sum(r["pass"] for r in graded) / max(1, len(graded))
-        ci = 1.96 * math.sqrt(p * (1 - p) / n) if n else float("nan")
-        report[s] = {"n": n, "pass": round(p, 3), "ci95": round(ci, 3), "errors": len(rs) - n}
+        n, k = len(graded), sum(r["pass"] for r in graded)
+        report[s] = {"n": n, "pass": round(k / n, 3) if n else None,
+                     "ci95": wilson(k, n), "errors": len(rs) - n}
     return report
-# e.g. {'billing': {'n': 60, 'pass': 0.817, 'ci95': 0.098, 'errors': 0}, ...}
+
+def wilson(k, n, z=1.96):          # stays sane at 10/10 or 0/10, where the normal approximation gives ±0
+    if n == 0: return None
+    p, d = k / n, 1 + z * z / n
+    c, h = (p + z * z / (2 * n)) / d, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (round(c - h, 3), round(c + h, 3))
+# e.g. {'billing': {'n': 60, 'pass': 0.817, 'ci95': (0.701, 0.894), 'errors': 0}, ...}
 ```
 
-The report line for `billing` says what the run can decide: ±10 points at n = 60, so a 5-point change
-in that slice needs the paired flipped-item view or more items, not a victory lap.
+The report line for `billing` says what the run can decide: an interval about 19 points wide at
+n = 60, so a 5-point change in that slice needs the paired flipped-item view or more items, not a
+victory lap. The Wilson interval is used instead of p ± 1.96·SE *because* small slices with perfect
+scores are common in a harness, and the normal approximation reports a 10/10 slice as 100% ± 0, which
+is false confidence; Wilson gives roughly 72% to 100% for the same slice.
 
 ## Trade-offs
 - Storing every raw output makes re-grading free and failures inspectable, but the store grows by
@@ -183,6 +212,8 @@ in that slice needs the paired flipped-item view or more items, not a victory la
   that lifted the average by lowering the one slice a key customer uses.
 - Letting the harness read the model alias (`latest`) instead of a pinned snapshot; the symptom is a
   score change with an empty diff.
+- Reusing one environment across agent items; the symptom is results that depend on item order, with
+  an item passing alone and failing when run after another that changed shared state.
 
 ## When to use
 Build a harness the moment a prompt or chain will be evaluated more than once; that is the second eval

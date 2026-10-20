@@ -5,7 +5,7 @@ name: AI control plane vs data plane
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - system-design/ai-gateway
   - llmops-platform/model-registry
@@ -88,6 +88,13 @@ design needs a break-glass path: an operator-supplied local override snapshot th
 with a logged, time-limited exception. This is the same trade the meshes make: availability of
 serving over freshness of configuration.
 
+Fail static is not unconditional. Most configuration (aliases, rollout percentages, prompts) is safe
+to serve stale for hours. A few entries are security decisions whose staleness is itself a breach: a
+revoked API key, an offboarded tenant, a newly blocked model or region. Give the snapshot a
+**staleness budget**, alert when a replica's config age exceeds it, and decide per entry type what
+happens past it: keep serving (most of the snapshot), or deny (revocations, which should also travel
+on a separate, faster push channel so they do not wait for the next full snapshot).
+
 ### Telemetry flows up
 The data plane emits spans, usage and cost tagged with tenant, bundle, model and snapshot version.
 The control plane consumes the aggregates: budgets are enforced against them, canary analysis reads
@@ -110,7 +117,7 @@ Signature verification is left out for brevity. `call_model` and `emit_span`
 are the application's existing functions.
 
 ```python
-import hashlib, json, threading, time, urllib.request
+import hashlib, json, os, threading, time, urllib.request
 
 LOCAL = "/var/lib/gateway/last_snapshot.json"
 CONF = json.load(open(LOCAL))      # last-known-good from disk, so a cold start survives an outage
@@ -124,7 +131,9 @@ def refresh(url="http://control-plane/config/current", every=30):
                 snap = json.load(r)
             if snap["version"] > CONF["version"]:        # monotonic: a stale node never wins
                 CONF = snap                               # whole-snapshot atomic swap
-                json.dump(snap, open(LOCAL, "w"))         # persist for the next cold start
+                with open(LOCAL + ".tmp", "w") as f:      # write-then-rename: a crash mid-write
+                    json.dump(snap, f)                    # must not corrupt last-known-good
+                os.replace(LOCAL + ".tmp", LOCAL)
         except Exception as e:
             print(f"control plane unreachable ({e}); still serving config v{CONF['version']}")
         time.sleep(every)
@@ -136,8 +145,8 @@ def bucket(key):                                           # stable across repli
 
 def resolve(c, use_case, tenant):
     r = c["rollouts"].get(use_case)      # {"stable": "support@41", "candidate": "support@42", "percent": 5}
-    if r and bucket(f"{use_case}:{tenant}") < r["percent"]:
-        return r["candidate"]               # sticky per tenant: percent counts tenants, not requests
+    if r and bucket(f"{r['candidate']}:{tenant}") < r["percent"]:  # salted by candidate: each
+        return r["candidate"]               # rollout picks different tenants; percent counts tenants
     return r["stable"] if r else c["aliases"][use_case]
 
 def handle(tenant, use_case, messages):
@@ -177,12 +186,16 @@ def handle(tenant, use_case, messages):
   seconds after each change, when a new prompt ran against the old model or tool set.
 - Bucketing the canary per request instead of per tenant or user; the symptom is a user flipping
   between bundle versions mid-conversation and support tickets nobody can reproduce.
+- Bucketing per tenant and reading the percentage as a traffic share; the symptom is a "5%" canary
+  carrying a third of all requests because one very large tenant hashed into the canary bucket.
 - Using Python's built-in `hash()` for buckets; the symptom is "sticky" assignments that differ per
   replica, because string hashing is randomised per process.
 - Omitting the snapshot version from telemetry; the symptom is a canary analysis that cannot tell
   which traffic ran under which rollout percentage, and a rollback whose effect cannot be dated.
 - No break-glass path; the symptom is a bad bundle live during a control-plane outage with every
   engineer able to see the problem and nobody able to change the alias.
+- Treating key revocation as ordinary snapshot config; the symptom is a revoked key that keeps working
+  on some replicas for as long as they cannot fetch a fresh snapshot.
 
 ## When to use
 The split is worth making explicit as soon as configuration changes more often than code deploys, or

@@ -5,6 +5,7 @@ name: GIL (Global Interpreter Lock)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
   - python-for-ai/race-conditions-and-synchronization-primitives
@@ -72,9 +73,11 @@ the race depends on the Python version and timing, which makes it more dangerous
 ### Ways around it, and its future
 Processes (`multiprocessing`, `ProcessPoolExecutor`) each have their own interpreter and GIL. PEP 684
 (Python 3.12) gave each sub-interpreter its own GIL, enabling parallelism within one process with
-isolated state. PEP 703 introduced an optional free-threaded CPython build with no GIL, using biased
-reference counting and other techniques; extensions must be built and marked compatible with it, and
-it has some single-threaded overhead. Its support status changes by release, so check the docs for
+isolated state; in 3.12 this was reachable only through the C API, and a Python-level
+`concurrent.interpreters` module followed in 3.14 (PEP 734). PEP 703 introduced an optional
+free-threaded CPython build with no GIL, using biased reference counting and other techniques
+(experimental in 3.13, officially supported but still a separate build in 3.14); extensions must be
+built and marked compatible with it, and it has some single-threaded overhead. Its support status changes by release, so check the docs for
 your version and your dependencies before planning around it.
 
 ## Example
@@ -156,8 +159,9 @@ not make code thread-safe.
 **A:** The cleaning function is pure-Python CPU work, so in standard CPython the GIL lets only one thread
 execute bytecode at a time; more threads only add switching overhead, which is why 32 threads barely beat
 one. The fix is a `ProcessPoolExecutor` with roughly one worker per core, sending documents in chunks so
-pickling is amortised, or vectorising the cleaning with regex-heavy native code, Polars or a compiled
-library. I would time a small sample sequentially and with processes to confirm the gain before running
+pickling is amortised, or moving the hot loop into native code: Polars string expressions or a compiled
+library. Fewer, larger `re` calls also cut per-document interpreter overhead, but the `re` module holds the
+GIL, so regex work still does not parallelise across threads. I would time a small sample sequentially and with processes to confirm the gain before running
 the full million. Threads would be right only if the work were I/O or GIL-releasing native code.
 
 ## Quiz

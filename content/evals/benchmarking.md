@@ -4,8 +4,8 @@ module: evals
 name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - evals/model-evaluation
   - evals/dataset-contamination
@@ -70,7 +70,14 @@ MMLU-Pro raise the option count and the reasoning load to restore headroom.
 164 hand-written Python problems, each a function signature with a docstring; the model completes the
 body and hidden unit tests decide pass or fail. The metric is pass@k: the probability that at least one
 of *k* samples passes, estimated without bias from *n* ≥ *k* samples by
-`pass@k = 1 − C(n−c, k) / C(n, k)` where *c* samples passed. Its design point was to grade code by
+`pass@k = 1 − C(n−c, k) / C(n, k)` where *c* samples passed. Read the formula as counting: of all
+ways to choose *k* of the *n* samples, C(n−c, k) contain only failures, so the fraction of size-*k*
+subsets with at least one pass is the estimate. The obvious plug-in, 1 − (1 − c/n)^k, is biased low,
+*because* that function is concave in the pass probability, so averaging it over noisy per-problem
+estimates understates the true value; drawing many samples and counting subsets avoids this. pass@k
+also rewards diversity: a model that solves a problem 1 time in 10 scores 0.1 at pass@1 but 0.5 at
+pass@5 on that problem, which is why pass@k suits settings with a verifier that can pick the
+passing sample and misleads when a user gets one shot. Its design point was to grade code by
 *executing* it rather than by text similarity to a reference, which is why it displaced BLEU-style
 code metrics. Weaknesses: tiny (one problem is 0.6 points), Python only, saturated at the top, heavily
 contaminated because solutions are all over GitHub, and its original tests are sparse enough that
@@ -103,7 +110,16 @@ temperature and number of samples averaged, subset (Diamond, Verified, Lite), sc
 date, and whether the score is self-reported. Then apply statistics: a score is a proportion with
 standard error √(p(1−p)/n). On GPQA Diamond at p = 0.6 that is ±3.5 points standard error, so two
 models four points apart are not distinguishable at 95% confidence; on MMLU's ~14k items the same
-calculation gives ±0.4. Finally ask about contamination: the dataset-contamination lesson covers how
+calculation gives ±0.4. Two refinements matter in practice. Models evaluated on the *same* items can
+be compared paired (count the items where exactly one model is right), which is tighter than the
+independent intervals suggest, *because* item difficulty is shared; but this needs per-item results,
+which published tables do not give you. And for sampled or reasoning models, a single run adds
+sampling noise on top of item noise, so careful reports average several runs per item; a score from
+one run on a 198-item set can move by several points on a re-run with nothing changed.
+
+Saturation has a precise meaning here. A benchmark's effective ceiling is below 100% whenever some
+items are mislabeled or ambiguous, so as top scores approach that ceiling, the remaining differences
+reflect which models happen to agree with the label errors rather than capability. Finally ask about contamination: the dataset-contamination lesson covers how
 to detect it.
 
 ### From benchmark to decision

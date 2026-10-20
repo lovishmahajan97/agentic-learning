@@ -5,6 +5,7 @@ name: logging / structlog
 kind: tool
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - observability/logging
   - fastapi-for-ai/structured-logging
@@ -110,9 +111,11 @@ def handle_request(user_id: str, prompt: str) -> None:
              tokens_in=812, tokens_out=164, latency_ms=round((time.perf_counter() - t0) * 1000))
 
 handle_request("u_42", "Summarize this contract ...")
-# {"request_id": "…", "user_id": "u_42", "model": "gpt-4o-mini", "prompt_version": "summarize-v3",
-#  "prompt_sha": "…", "tokens_in": 812, "tokens_out": 164, "latency_ms": 0, "event": "llm_call",
+# {"model": "gpt-4o-mini", "prompt_version": "summarize-v3", "prompt_sha": "…", "tokens_in": 812,
+#  "tokens_out": 164, "latency_ms": 0, "event": "llm_call", "request_id": "…", "user_id": "u_42",
 #  "level": "info", "timestamp": "2026-…Z"}
+# (keys follow processor order: call kwargs, then contextvars, level, timestamp; pass
+#  JSONRenderer(sort_keys=True) if your pipeline wants a stable alphabetical order)
 ```
 
 ## Trade-offs

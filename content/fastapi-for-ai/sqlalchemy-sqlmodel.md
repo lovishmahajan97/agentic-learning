@@ -5,6 +5,7 @@ name: SQLAlchemy / SQLModel
 kind: tool
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - fastapi-for-ai/async-database-access-and-connection-pooling
   - fastapi-for-ai/alembic-migrations
@@ -51,7 +52,14 @@ statements with bound parameters. The ORM sits on top: a `DeclarativeBase` subcl
 `id: Mapped[int] = mapped_column(primary_key=True)` style attributes, and a `Session` that holds an
 identity map (one Python object per row per session) and a unit of work. `session.add()` registers an
 object, `flush()` emits SQL in dependency order, `commit()` flushes, commits and by default *expires*
-every loaded instance so the next attribute access reloads from the database. That default,
+every loaded instance so the next attribute access reloads from the database. Two consequences of the
+unit of work surprise people. Autoflush: before a query runs, pending changes are flushed so the query
+sees them, which means a `select()` can raise an `IntegrityError` that really belongs to an earlier
+`add()`. And the identity map means one session holds one object per primary key: `session.get()` for a
+row already loaded skips the database entirely, and even a fresh `select()` that does hit the database
+hands back the existing object without overwriting its loaded attributes (unless you ask for
+`populate_existing`), so a long-lived session serves stale data while a short per-request session
+does not. That expiry default,
 `expire_on_commit=True`, is the trap in async code: the reload is implicit IO and raises
 `MissingGreenlet`, so async sessions are created with `expire_on_commit=False`.
 
@@ -64,9 +72,10 @@ calls and metadata; the `pgvector` package adds a `Vector(dim)` column type for 
 
 ### What SQLModel adds
 `class Message(SQLModel, table=True)` declares fields with ordinary type annotations; each field is a
-Pydantic field *and* a column. `Field(primary_key=True, index=True, foreign_key="conversation.id",
-sa_column=Column(JSON))` reaches SQLAlchemy column options, and `Relationship(back_populates=...)`
-maps relationships. A `SQLModel` subclass *without* `table=True` is a pure Pydantic schema, so the
+Pydantic field *and* a column. `Field(primary_key=True, index=True, foreign_key="conversation.id")`
+covers the common column options, `Field(sa_column=Column(JSON))` hands over a full SQLAlchemy column
+for anything else (it cannot be combined with `primary_key`, `index` or `foreign_key`, which then go
+on the `Column` itself), and `Relationship(back_populates=...)` maps relationships. A `SQLModel` subclass *without* `table=True` is a pure Pydantic schema, so the
 idiom is a shared base with the common fields, a table model that adds `id` and timestamps, and
 `Create`/`Read` schemas that add or omit fields for the API. `sqlmodel.Session` and the async session
 in `sqlmodel.ext.asyncio.session` are SQLAlchemy sessions with a `session.exec(select(...))` method
@@ -138,15 +147,17 @@ def list_messages(conv_id: int, session: Session = Depends(get_session)):
 
 ## Trade-offs
 - The ORM's identity map and unit of work remove whole classes of bugs, but they add per-object
-  overhead; for bulk ingestion of chunks the flip point is a few thousand rows, where Core inserts or
-  driver-level copy are an order of magnitude faster.
+  overhead; once ingestion reaches thousands of chunks per batch, Core `insert()` with a list of dicts
+  (or the 2.0 ORM bulk form `session.execute(insert(Chunk), rows)`) and driver-level `COPY` are
+  typically several times faster than adding objects one by one; measure on your own data.
 - SQLModel's single class per entity removes duplication, but couples the API contract to the table;
   the moment a client must not see a column or a response needs a computed shape, you are back to
   separate schemas and have lost the benefit.
 - Lazy loading makes simple code simple, but each relationship access is a query; explicit
   `selectinload` is more typing and is the only way the query count stays flat as data grows.
 - Typed 2.0-style models give IDE and type-checker support, but mixing them with legacy `Query` code
-  in one codebase produces confusing deprecation warnings and inconsistent typing.
+  (still supported, labelled legacy rather than deprecated) leaves two query idioms with different
+  return shapes and weaker typing on the legacy half; migrate module by module.
 
 ## Pitfalls
 - `expire_on_commit` left at its default in async sessions; the symptom is `MissingGreenlet` on the
@@ -187,9 +198,10 @@ serialiser touches `conversation.messages` for each one, which lazily issues one
 conversation. In development there are five conversations; in production there are five hundred, so
 the endpoint runs five hundred and one queries. Confirm by logging SQL or counting statements in a
 test. Fix it by adding `options(selectinload(Conversation.messages))` to the select, which loads all
-messages in one extra `IN` query, or `joinedload` if the result set is small. In async code this is
-also the only correct option, because the lazy load would raise `MissingGreenlet`. Add `raiseload` in
-tests so the regression cannot return.
+messages in one extra `IN` query, or `joinedload` if the result set is small. In async code eager
+loading is also effectively required, because the implicit lazy load raises `MissingGreenlet` (the
+explicit `await conv.awaitable_attrs.messages` from `AsyncAttrs` avoids the error but is still one
+query per conversation). Add `raiseload` in tests so the regression cannot return.
 
 ## Quiz
 ### Q: What is the one thing SQLModel adds on top of SQLAlchemy?

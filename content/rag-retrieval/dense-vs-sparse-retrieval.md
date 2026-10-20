@@ -4,8 +4,8 @@ module: rag-retrieval
 name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/inverted-indexes
@@ -89,6 +89,17 @@ Sparse failure modes:
 - No notion of relevance beyond term statistics: a document that mentions all the query words in
   passing can outrank the one that actually answers.
 
+### The same score, different dimensions
+Put the two side by side and the scoring operation is identical: both rank by an inner product between a
+query vector and a document vector. What differs is who defines the dimensions. In sparse retrieval each
+dimension is a vocabulary term fixed in advance by the analyzer, and the weights are count statistics;
+two texts interact only through dimensions they literally share. In dense retrieval the d dimensions are
+latent features the encoder invented during training, and every text has a nonzero value on all of them,
+so any two texts interact. That one difference explains the rest: sparse can be served by reading only
+the posting lists of the query's terms, while dense needs a vector index because every document is a
+candidate; sparse is exact because a term either is a dimension or is not, while dense is fuzzy because
+meaning is smeared across shared dimensions.
+
 ### Learned sparse: a middle ground
 Learned sparse models (SPLADE is the reference) use a transformer to predict a weight for every
 vocabulary term, including terms not present in the text (expansion), with a sparsity penalty so most
@@ -96,6 +107,13 @@ weights stay zero. The output is still a sparse vector served from an inverted i
 matching and CPU serving, but the weights carry learned semantics and synonyms. It is a good option when
 you want one index and cannot run a vector database, at the cost of a neural encoder at index and query
 time.
+
+### Multi-vector dense: another middle ground
+Late-interaction models such as ColBERT keep one dense vector per token rather than one per passage and
+score by matching each query token to its most similar passage token. Because a rare token keeps its own
+vector instead of being averaged into the passage, exact-term behavior improves while paraphrase
+matching survives. The price is an index many times larger than single-vector dense, which is why it
+appears more often as a reranking stage than as first-stage retrieval (see the reranking lesson).
 
 ### Operational differences that decide the choice
 | Concern | Sparse (BM25) | Dense (bi-encoder) |
@@ -176,7 +194,10 @@ technical and churns fast, sparse is the backbone and dense is an add-on. If use
 questions against prose and wording varies, dense is the backbone and sparse protects the exact-match
 cases. Most real workloads contain both kinds of queries, which is why the practical default is hybrid
 retrieval with fusion, covered in its own lesson. Decide with data: build a labeled query set, measure
-recall@k for each retriever alone and in combination, and look at which queries each one loses. In
+recall@k for each retriever alone and in combination, and look at which queries each one loses. The
+overlap is the decision number: if the queries BM25 wins are a subset of those dense wins, a second
+arm adds cost and nothing else; if each wins queries the other loses, the union of their successes
+bounds what hybrid can reach. In
 interviews, be ready to name the structural failure modes of each family, explain why BM25 remains a
 strong baseline, and say what learned sparse models add.
 

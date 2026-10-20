@@ -5,6 +5,7 @@ name: AI roadmap
 kind: practice
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - scoping/ai-use-case-discovery
   - scoping/roi-model
@@ -43,13 +44,22 @@ cannot clear the accuracy bar, and the credibility loss poisons the next proposa
 ### 1. Build the candidate list from workflows, not technology
 Each candidate is a specific workflow step with an owner, a volume, a current cost or cycle time, and a
 user who would act on the output ("triage inbound claims emails into twelve queues", not "use GenAI in
-claims"). Framing it this way *because* value, baseline and adoption can only be measured on a workflow.
+claims"). Frame it this way *because* value, baseline and adoption can only be measured on a workflow.
 Use-case discovery (see the scoping module) is where this list comes from; the roadmap is what you do
 with it.
 
 ### 2. Score on value and on feasibility separately
-Value: volume × value per unit (time saved, revenue, risk reduced), and whether the gain is captured or
-just "freed capacity" nobody redeploys. Feasibility has several independent axes, scored separately
+Value is a small formula, not an adjective:
+
+```
+annual value ≈ volume × value per unit × capture rate × automation share − (run cost + review cost)
+```
+
+Capture rate is the part people skip: hours "freed" are worth nothing unless someone redeploys them or a
+cost line actually moves. Automation share is how much of the volume the system can handle at an
+acceptable error rate, which you do not know until the feasibility eval, so early value scores are
+ranges. Run cost is inference at production volume, not pilot volume; a use case that is valuable at
+$0.02 per item can be uneconomic at $0.50. Feasibility has several independent axes, scored separately
 *because* a single gut-feel number hides which one will kill the project:
 - **Data readiness:** does the input data exist, can you legally use it, can you get access this quarter?
 - **Evaluability:** can you build a labelled set and define "correct"? If experts disagree on the answer,
@@ -66,21 +76,34 @@ higher-value but riskier projects then start with those assets in place. This is
 idea is not always first: if it needs four foundations nobody has built, it goes second or third, behind
 a project that builds two of them.
 
-### 4. Attach a gate to every stage
+### 4. Decide build, buy or wait for each item
+For each candidate ask whether a vendor product already does it acceptably (buy), whether it needs your
+data and workflow integration (build), or whether the blocker is raw model capability that the market is
+improving quickly (wait). "Wait" is a legitimate roadmap state *because* building elaborate workarounds
+for a capability gap is often wasted when the next model release closes it; but a waiting item needs a
+trigger, such as "re-run the feasibility eval whenever a new model in our approved set ships", or it is
+just a polite way of dropping it.
+
+### 5. Attach a gate to every stage
 Each use case moves through discovery → feasibility eval → pilot → production → scale, and each
 transition has a pre-agreed criterion and a kill condition. Example: "proceed to pilot if the offline eval
 on 300 labelled cases meets the agreed accuracy bar at the agreed cost per item; stop if after two
 iterations it is still far below." Gates make cancelling cheap and normal, *because* the decision rule
-was set before anyone was invested in the answer.
+was set before anyone was invested in the answer. The economics favour this: a feasibility eval costs
+weeks and a production build costs months, so the early gate is buying information cheaply before the
+expensive commitment. Gates also change what they measure as the item matures: the feasibility gate
+checks offline accuracy and cost per item; the pilot gate checks whether users actually act on the output
+and whether the workflow metric moved; the production gate checks cost at full volume, latency, monitoring
+and an owner on call.
 
-### 5. Plan in horizons and re-plan on a cadence
+### 6. Plan in horizons and re-plan on a cadence
 Near term (this quarter): committed scope and dates. Mid term: ranked candidates with the foundations they
 need. Long term: themes and bets, explicitly unscheduled. Review quarterly, and re-score whenever the
 model landscape moves: a capability jump can promote a parked use case; a price drop can flip one from
 uneconomic to obvious. Commit to *capabilities required* ("extract fields from scanned forms at this
 accuracy"), not to a named model, so the roadmap survives model churn.
 
-### 6. Make the portfolio visible
+### 7. Make the portfolio visible
 Keep it as a living artefact: each row has owner, stage, gate criterion, latest eval result, cost per
 item, and next decision date. This is also what governance needs for the AI inventory.
 
@@ -120,9 +143,13 @@ for step, (name, score, builds) in enumerate(plan, 1):
 
 The highest-value item, automated claim decisions, comes last: its weakest axis (error tolerance 1) caps
 its feasibility, and by the time it starts every foundation it needs already exists. Contract Q&A
-overtakes reply drafting because, once the gateway and harness exist, it only needs one new foundation
-and carries more value. Using `min` rather
-than an average is deliberate: excellent data does not rescue a use case nobody can evaluate.
+beats reply drafting for second place because, once the gateway and harness exist, each needs exactly one
+new foundation (doc ingestion vs. review UI), so the tie-break is the base score: 12 against 9. Using `min` rather
+than an average is deliberate: excellent data does not rescue a use case nobody can evaluate. The
+penalty of 2 points per new foundation is a judgement call, so check the plan is not an artefact of it:
+here any weight from 1 to 4 gives the same order, which is what makes the sequence defensible in the
+meeting. If a small change of weight reshuffles the plan, the scores are too close to decide on and the
+honest move is a quick feasibility eval on the tied items.
 
 ## Trade-offs
 - Starting with modest, feasible use cases builds foundations and credibility, but delays the headline
@@ -143,13 +170,18 @@ than an average is deliberate: excellent data does not rescue a use case nobody 
   the next roadmap gets less funding.
 - Pinning the plan to one model's capabilities; when a new release changes what is easy, the team keeps
   building workarounds that the new model makes unnecessary.
-- Skipping baseline measurement before deployment, so no one can prove the improvement afterwards.
+- Skipping baseline measurement before deployment; the symptom is a launch review where the system
+  looks good but nobody can say by how much it beats the old process, so the next item gets no funding.
+- Treating a pilot pass as production readiness; costs and error rates jump at full volume or on input
+  types the hand-picked pilot users never sent, and the item slides back to "almost done".
 
 ## When to use
 Write a roadmap as soon as there are more candidate use cases than people to build them, which is almost
 immediately. Keep it short-horizon and evidence-driven: the quarter's commitments in detail, the rest as
 ranked hypotheses. Measure each item with its gate metric (offline eval score, cost per item, adoption in
-pilot) and review quarterly or when the model market moves. Do not produce a three-year plan of dated AI
+pilot) and review quarterly or when the model market moves. Measure the portfolio too: time from idea to
+feasibility verdict, the share of items with a gate decision in the last quarter, and the kill rate. A
+kill rate of zero is not a sign of good ideas; it means the gates are not being applied. Do not produce a three-year plan of dated AI
 features; it will be wrong within months and will make every later change look like failure. In
 interviews, a strong answer separates value from feasibility, names evaluability and data access as the
 real constraints, and explains how sequencing builds reusable capability.

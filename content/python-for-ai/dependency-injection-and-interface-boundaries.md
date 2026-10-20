@@ -5,6 +5,7 @@ name: Dependency injection & interface boundaries
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - python-for-ai/protocols-generics-structural-typing
   - python-for-ai/test-doubles-mocks-fixtures
@@ -66,7 +67,10 @@ finish reason). This matters more than it looks: if `openai.types.chat.ChatCompl
 through your services, the vendor is still a dependency of everything that touches them, and a
 provider switch becomes a rewrite. The boundary is only as strong as the types that cross it. The
 adapter is the one file per vendor that imports the SDK, handles its exception types, and maps its
-status codes into your error hierarchy.
+status codes into your error hierarchy: `openai.RateLimitError` becomes your `ProviderRateLimited`, so
+the retry policy upstream is written once against your exception and works for every vendor. This is
+the dependency inversion principle in practice: the high-level policy and the low-level SDK both
+depend on an abstraction that the high-level side owns.
 
 ### Move 3: inject at construction, wire at the root
 Constructor injection, `Summarizer(completer)`, is the default in Python *because* it makes the
@@ -75,6 +79,23 @@ composition root (`main()`, an app factory, a FastAPI lifespan) is the single pl
 settings, instantiates real clients and connects them. Tests build the same graph with fakes. Because
 everything else receives its collaborators, nothing else reads environment variables or creates
 network clients, which is what removes import-time side effects.
+
+### Not every dependency needs a class
+When the dependency is a single operation, inject a callable instead of a Protocol:
+`def __init__(self, now: Callable[[], datetime] = datetime.now)` or
+`embed: Callable[[list[str]], list[list[float]]]`. This is still dependency injection, *because* the
+caller decides what runs; it is just the smallest possible interface. Promote it to a Protocol when a
+second method appears or when the call needs named, typed options. One trap: a default argument is
+evaluated once, when the `def` runs at import time, so `completer: Completer = OpenAICompleter(OpenAI())`
+quietly reintroduces an import-time client. Defaults are safe only for cheap, side-effect-free values
+such as `datetime.now` itself.
+
+### Sync or async is part of the contract
+`def complete(...)` and `async def complete(...)` are different interfaces: a caller of the first gets
+a `Completion`, a caller of the second gets a coroutine. Decide at the port, *because* an async service
+calling a sync adapter blocks the event loop on every network call, and a sync service handed an async
+adapter receives an un-awaited coroutine that mypy will flag but the runtime will not. If both are
+needed, define two ports (`Completer`, `AsyncCompleter`) rather than one that tries to be both.
 
 ### Why Python rarely needs a container
 Java-style containers reflect on constructors to auto-wire graphs. Python has first-class functions,
@@ -184,6 +205,9 @@ def test_summarizer_passes_document_through():
   write a fake for it, so tests mock the port's internals instead.
 - Fakes that are too clever (parsing the prompt and generating plausible answers); the symptom is
   green tests for behaviour the real provider does not exhibit.
+- An async service whose port is sync (or an adapter that wraps an async SDK in `asyncio.run`); the
+  symptom is request latency that grows with concurrency because each LLM call blocks the event loop,
+  or `RuntimeError: asyncio.run() cannot be called from a running event loop`.
 - Threading individual config values (`api_key`, `model`, `temperature`) through five layers; the
   symptom is signatures that change whenever a setting is added. Inject the configured adapter instead.
 
@@ -225,8 +249,9 @@ fakes cannot drift from reality.
 - [ ] Abstract base classes cannot have more than one concrete implementation
 - [ ] Protocols are faster because they skip method resolution
 > A class satisfies a Protocol by having the right methods, checked statically by mypy, so adapters
-> stay decoupled from your code. Protocols are not enforced at runtime, and ABCs support many
-> implementations; the difference is nominal versus structural typing.
+> stay decoupled from your code. Protocols are not enforced at runtime (`@runtime_checkable` only
+> checks that method names exist, not signatures), and ABCs support many implementations; the
+> difference is nominal versus structural typing.
 
 ### Q: Which of these should NOT get its own interface boundary in a typical RAG service?
 - [ ] The vector store client used for retrieval

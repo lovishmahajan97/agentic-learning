@@ -5,7 +5,7 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - evals/llm-as-a-judge
   - evals/rubrics
@@ -71,6 +71,27 @@ noisy person, so mixing the two makes a judge look better than it is. A judge wi
 human–human agreement is "another annotator"; one far below is not usable as a gate. Then look at *where* it
 disagrees. Disagreements concentrated on one failure mode (say, numeric claims) tell you the judge
 cannot evaluate that criterion and a human or a programmatic check must.
+
+### Step 2b: split the two error rates and correct the aggregate
+For a pass/fail judge, one agreement number hides which way it errs. Measure the two rates separately
+against human labels: **TPR**, the share of human-pass items the judge passes, and **TNR**, the share of
+human-fail items it fails. Judges are typically lenient, so TPR is high and TNR is the weak side; a judge
+that passes everything scores 90% accuracy on a set where 90% of items pass, which is why accuracy alone
+is not enough. The two rates also bias the headline number in a predictable way, because
+
+```
+p_obs = TPR · p + (1 − TNR) · (1 − p)     →     p = (p_obs + TNR − 1) / (TPR + TNR − 1)
+```
+
+where p is the true (human) pass rate. With TPR = 0.95 and TNR = 0.70, a system that truly passes 80%
+shows 82%, and one that truly passes 70% shows 75.5%: the judge inflates both and shrinks a 10-point gap
+to 6.5, because every difference is scaled by TPR + TNR − 1 = 0.65. Inverting the formula recovers the
+true rate, but only as well as TPR and TNR are known; they are estimated on the human-labeled set, so
+include enough human-fail items to pin TNR down, and bootstrap the correction. As TPR + TNR − 1
+approaches 0 the judge carries no information and the correction explodes, which is the quantitative
+form of "this judge cannot gate". If the judge emits a confidence or a score, check calibration in the
+probabilistic sense too: bucket verdicts by stated confidence and confirm that "90% sure" verdicts agree
+with humans about 90% of the time, so low-confidence items can be routed to people.
 
 ### Step 3: probe each bias with controlled perturbations
 - **Position.** Judge every pair in both orders. The inconsistency rate (verdict flips when swapped) is
@@ -169,6 +190,8 @@ roughly 13 points that will reward any prompt change that makes outputs wordier.
   the bootstrap interval, so the eval cannot distinguish anything.
 - Letting the vendor upgrade the judge model silently; the symptom is a step change in a historical trend
   chart on the day nothing in your system changed.
+- Reporting only overall accuracy for a pass/fail judge; the symptom is a judge that "agrees 90%" yet
+  catches few of the failures, visible as a low TNR once human-fail items are counted separately.
 - Leaking metadata into the judge prompt (model names, "v2", "improved"); the symptom is verdicts that flip
   when the labels are swapped while the content stays the same.
 - Judging in one fixed order; the symptom is a leaderboard that reorders when candidate A and B are
@@ -178,7 +201,8 @@ roughly 13 points that will reward any prompt change that makes outputs wordier.
 Calibrate whenever a judge gates a decision: prompt releases, model swaps, fine-tune selection, vendor
 comparisons. Do it once per combination of judge model, judge prompt and task, and again whenever any of
 the three changes. Track three numbers: position inconsistency rate, agreement with humans next to
-human–human agreement, and the judge's length preference relative to humans. For tasks with an
+human–human agreement (split into TPR and TNR for pass/fail judges), and the judge's length preference
+relative to humans. For tasks with an
 executable check (tests, exact match, schema validation) do not use a judge at all. In day-to-day work
 this is the calibration job in CI that fails when agreement drops; in interviews the question "how do
 you know your judge is right?" expects exactly this: a labeled set, swap-and-average, length control, and

@@ -5,6 +5,7 @@ name: ETL / ELT for RAG
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - data-architecture/ingestion-pipelines
   - data-architecture/document-processing-pipelines
@@ -152,8 +153,11 @@ still hits the embedding cache, and `reconcile_index` removes the v3 chunks per 
   applied selectively.
 
 ## Pitfalls
-- Deriving chunk ids from `(doc_id, position)` only; the symptom after a chunker change is old and new
-  chunks of the same document both ranking in the top-k, often with overlapping text.
+- Deriving chunk ids from `(doc_id, position)` only and skipping orphan reconciliation; the symptom after
+  a chunker change is old and new chunks of the same document both ranking in the top-k, often with
+  overlapping text, because a new chunker that emits fewer chunks overwrites positions 0..n−1 and leaves
+  the old tail live. Even with reconciliation, position-only ids overwrite in place, so a half-finished
+  re-run leaves an index of mixed chunker versions with no way to tell which rows are which.
 - Mixing vectors from two embedding models in one index; the symptom is retrieval quality dropping right
   after a model "upgrade", because similarity scores from different models are not comparable.
 - Embedding before near-duplicate removal; the symptom is the top-k filled with copies of the same
@@ -219,8 +223,8 @@ users do, and the vector index is treated as a projection that can always be reb
 ### Q: After switching chunkers, users see overlapping passages from the same document twice in the top-k. What is the likely cause?
 - [ ] The embedding model was changed at the same time
 - [ ] The reranker was not retrained on the new chunk sizes
-- [x] Chunk ids did not encode the chunker version, so new chunks were added without the old ones being identified and deleted
+- [x] Old chunks were never reconciled away: ids lacked the chunker version and no step deleted ids absent from the new chunk set
 - [ ] The new chunker produces chunks that are too small for the index
-> When ids depend only on document and position, a new chunker writes new rows while the old rows stay
-> live or are partially overwritten. Encoding the chunker version in the id makes old chunks discoverable
-> as orphans so reconciliation can remove them.
+> When ids depend only on document and position, a new chunker overwrites some old rows and leaves others
+> (the tail beyond its own chunk count) live. Versioned ids plus a reconciliation step that deletes every
+> indexed id for the document not in the current chunk set make the old chunks discoverable and removable.

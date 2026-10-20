@@ -5,6 +5,7 @@ name: Workflow analysis
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - scoping/customer-discovery
   - scoping/problem-decomposition
@@ -71,9 +72,11 @@ escalations and "request more information" steps. Design for the variants that c
 decide explicitly which rare variants stay manual.
 
 ### 6. Locate the constraint
-Using the measurements, find the step that limits throughput or dominates elapsed time. By Little's law
-(items in progress = throughput × time in system), a growing queue before one step means that step's
-capacity is below the arrival rate. That is where improvement changes the outcome.
+Using the measurements, find the step that limits throughput or dominates elapsed time. A queue that
+keeps growing before one step means items arrive faster than that step completes them: its capacity is
+below the arrival rate. Little's law (average items in progress = throughput × average time in system,
+for a stable system) then explains why that hurts: with throughput capped by the constraint, every extra
+item queued adds directly to time in system. That is where improvement changes the outcome.
 
 ### 7. Identify AI insertion points
 Now ask which steps AI could help at, and how: removing a step, shortening touch time, preventing a
@@ -197,10 +200,11 @@ the copilot is right, and I would baseline review time and error rate first.
 > Logs are excellent for statistics on recorded steps, but spreadsheets, chat questions and mental checks
 > leave no trace. Observation explains what the log measures and reveals what it cannot see.
 
-### Q: A queue in front of the approval step grows every week. By Little's law, what does that indicate?
+### Q: A queue in front of the approval step grows every week. What does that indicate?
 - [ ] The approval step has too much documentation
 - [ ] Items arriving at approval are of lower quality than before
 - [x] Approval capacity is below the arrival rate, so it is the constraint limiting throughput
 - [ ] The upstream steps are working too slowly
-> Little's law ties items in progress to throughput and time in system. A steadily growing queue means
-> work arrives faster than the step completes it, making that step the place where improvement pays off.
+> A queue only grows when work arrives faster than the step completes it, so approval capacity is the
+> constraint. Slow upstream steps would shrink this queue, not grow it; and by Little's law, the growing
+> backlog at a capped throughput translates directly into longer time in system.

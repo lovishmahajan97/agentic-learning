@@ -5,6 +5,7 @@ name: Health / readiness endpoints
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
@@ -115,8 +116,12 @@ def load_embedding_model():
 
 Probe configuration to match: `startupProbe` on `/livez` with `periodSeconds: 5, failureThreshold: 30`
 (150 s for model load), `livenessProbe` on `/livez` with defaults, `readinessProbe` on `/readyz` with
-`periodSeconds: 5`. Note the model is loaded inside lifespan, so Uvicorn does not serve any route,
-including `/livez`, until it finishes; that is why the startup probe must cover the whole load.
+`periodSeconds: 5`. Note the model is loaded inside lifespan, and Uvicorn runs lifespan startup before it
+even binds the port, so every probe gets connection refused until the load finishes; that is why the
+startup probe must cover the whole load. (The `model` check in `/readyz` matters if you later switch to
+loading in a background task after startup.) The `draining` flag lives in one process's memory: with
+several workers per pod, a preStop `POST` reaches only one of them, so use one worker per pod or a shared
+signal such as a file.
 
 ## Trade-offs
 - Checking dependencies in readiness removes instances that genuinely cannot serve, but it couples all
@@ -137,6 +142,9 @@ including `/livez`, until it finishes; that is why the startup probe must cover 
   upstream incidents, with restart counts climbing on every replica at once.
 - Running synchronous inference on the event loop; the symptom is liveness timeouts and restarts under
   load only, because probes queue behind the blocking work, killing pods that were merely busy.
+- Setting a drain flag in process memory while running several Uvicorn or Gunicorn workers per pod; the
+  symptom is readiness that keeps returning 200 on most probes during shutdown, because only the worker
+  that received the drain call flipped.
 - Health routes going through auth, rate-limit or logging middleware; the symptom is probes failing with
   401 or 429, or logs dominated by probe requests every few seconds.
 

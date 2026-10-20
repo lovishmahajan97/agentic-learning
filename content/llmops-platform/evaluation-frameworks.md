@@ -5,7 +5,7 @@ name: Evaluation frameworks
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - evals/eval-harness
   - evals/tooling
@@ -111,13 +111,18 @@ open-source store rather than inventing a results format.
 
 ## Example
 A minimal framework skeleton showing the five interfaces as code. The point is the shape: scorers carry a
-version, the target is the production entrypoint, raw output is stored before any scoring, and the run id
-is a hash of the manifest so two runs with identical pins collide on purpose.
+version, the target is the production entrypoint, and raw output is stored before any scoring under a
+*generation id* that hashes only what determines the outputs (dataset version and bundle). The run id
+adds the scorer versions on top. So an interrupted run resumes without paying again for finished items,
+and swapping `judge@rubric-v3` for `judge@rubric-v4` on a 1,000-item set yields a new run id but reuses
+all 1,000 stored outputs: 1,000 judge calls, zero target calls. A changed prompt changes the bundle, hence
+the generation id, hence fresh outputs. Repeats for a noise-floor measurement need a repeat index in the
+generation id; otherwise every "repeat" replays the same stored sample and the measured noise is zero.
 
 ```python
 from dataclasses import dataclass, asdict
 from typing import Any, Callable
-import hashlib, json, time
+import hashlib, json, pathlib, time
 
 @dataclass
 class Item:                      # one row of a content-hashed dataset version
@@ -144,20 +149,22 @@ def rubric_judge(judge: Target, rubric_version: str) -> Scorer:   # model-graded
     return Scorer("judge", rubric_version, fn)
 
 def run(dataset_version: str, items: list[Item], target: Target, scorers: list[Scorer], bundle: dict) -> dict:
-    manifest = {"dataset": dataset_version, "bundle": bundle,
-                "scorers": [f"{s.name}@{s.version}" for s in scorers]}
-    run_id = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:12]
-    rows, raw = [], open(f"{run_id}.raw.jsonl", "a")   # raw outputs survive a scorer crash or a re-score
-    for it in items:
-        out = target(it.input)
-        raw.write(json.dumps({"id": it.id, "output": out}) + "\n"); raw.flush()   # persisted before scoring
-        scores = []
-        for s in scorers:
-            value, rationale = s.fn(it, out)            # one call per scorer: a judge call costs money
-            scores.append({"scorer": f"{s.name}@{s.version}", "value": value, "rationale": rationale})
-        rows.append({"item": asdict(it), "output": out, "scores": scores})
-    raw.close()
-    return {"run_id": run_id, "manifest": manifest, "started": time.time(), "rows": rows}
+    h = lambda o: hashlib.sha256(json.dumps(o, sort_keys=True).encode()).hexdigest()[:12]
+    gen_id = h({"dataset": dataset_version, "bundle": bundle})          # what determines the outputs
+    run_id = h({"gen": gen_id, "scorers": [f"{s.name}@{s.version}" for s in scorers]})
+    path = pathlib.Path(f"outputs/{gen_id}.jsonl"); path.parent.mkdir(exist_ok=True)
+    done = {r["id"]: r["output"] for r in map(json.loads, path.open())} if path.exists() else {}
+    rows = []
+    with path.open("a") as raw:
+        for it in items:
+            if it.id not in done:                       # a new judge reuses these: re-scoring costs judge calls only
+                done[it.id] = target(it.input)
+                raw.write(json.dumps({"id": it.id, "output": done[it.id]}) + "\n"); raw.flush()
+            out = done[it.id]                           # persisted before any scorer runs
+            scores = [dict(zip(("value", "rationale"), s.fn(it, out)), scorer=f"{s.name}@{s.version}")
+                      for s in scorers]                 # one call per scorer: a judge call costs money
+            rows.append({"item": asdict(it), "output": out, "scores": scores})
+    return {"run_id": run_id, "gen_id": gen_id, "started": time.time(), "rows": rows}
 ```
 
 ## Trade-offs

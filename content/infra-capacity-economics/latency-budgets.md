@@ -5,6 +5,7 @@ name: Latency budgets
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - reliability/slas-slos
   - observability/latency-percentiles
@@ -72,8 +73,8 @@ not the same time, and a downstream service should stop working once the caller 
 ### 5. Degrade instead of failing
 Classify steps as required or optional. When the remaining budget is short, skip the optional ones
 (query rewrite, reranking, a second retrieval hop) rather than squeezing them into a timeout they will
-miss. Retry only when the remaining budget exceeds the attempt's p95; otherwise a retry is guaranteed to
-time out and only adds load. Hedged requests (send a second copy after the p95 delay and take the first
+miss. Retry only when the remaining budget exceeds the attempt's p95; otherwise the retry has a large
+chance of timing out and adds load exactly when the system is struggling. Hedged requests (send a second copy after the p95 delay and take the first
 response) cut tails for idempotent reads at a modest extra cost.
 
 ### 6. Verify end to end
@@ -109,8 +110,8 @@ async def stage(fn, budget, dl, keep=0.0, optional=False, fallback=None):
 
 PREFILL_P95 = 0.8                           # measured queue + prefill at peak
 
-async def first_token(query, rewrite, retrieve, rerank, generate):
-    dl = Deadline(2.0 - 0.13)               # SLO minus edge + gateway already spent
+async def first_token(query, remaining_s, rewrite, retrieve, rerank, generate):
+    dl = Deadline(remaining_s)              # from the propagated deadline header, not a fresh 2.0 s
     q = await stage(lambda: rewrite(query), 0.30, dl, keep=0.15 + PREFILL_P95,
                     optional=True, fallback=query)
     docs = await stage(lambda: retrieve(q), 0.15, dl, keep=PREFILL_P95)
@@ -119,8 +120,12 @@ async def first_token(query, rewrite, retrieve, rerank, generate):
     return await stage(lambda: generate(q, docs), dl.remaining(), dl)
 ```
 
-If the gateway queue ate 400 ms, the rewrite is skipped automatically and retrieval still runs with
-generation's share protected.
+`remaining_s` comes from the deadline set at the edge, so upstream delay is already subtracted. On a
+normal request about 1.87 s is left (2.0 s minus 130 ms of edge and gateway) and the rewrite runs. If the
+gateway queue ate an extra 700 ms, only 1.17 s is left; the rewrite needs its 0.30 s plus the 0.95 s kept
+for retrieval and generation, so it is skipped automatically, and generation's 0.8 s share stays
+protected. Creating `Deadline(2.0)` inside this function instead would silently ignore that upstream
+delay, which is exactly the bug deadline propagation exists to prevent.
 
 ## Trade-offs
 - Tight per-step allocations make regressions visible early, but over-precise budgets create churn;
@@ -192,5 +197,5 @@ jitter.
 - [ ] Call the model anyway with a 300 ms timeout
 - [x] Take the degraded path: skip or shortcut steps, fall back, or fail fast with a clear response
 - [ ] Extend the deadline because the model step is required
-> A 300 ms timeout on a 700 ms p95 call almost always fails while still consuming GPU time. Degrading
+> A 300 ms timeout on a 700 ms p95 call fails a large share of the time while still consuming GPU time. Degrading
 > or failing fast keeps the SLO honest and avoids wasted work.

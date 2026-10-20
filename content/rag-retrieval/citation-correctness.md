@@ -5,6 +5,7 @@ name: Citation correctness
 kind: metric
 difficulty: advanced
 est_minutes: 14
+status: reviewed
 related:
   - rag-retrieval/citations-grounding
   - evals/faithfulness-groundedness
@@ -76,7 +77,10 @@ the definition popularised by the ALCE benchmark; variants exist, so state which
   with the passage and claim only, never the full answer, so it cannot be swayed by fluency. More capable,
   but it has biases and must be calibrated against human labels.
 - **Humans:** the reference. Label a few hundred claim-citation pairs, then measure the automated judge's
-  agreement with them before trusting its numbers.
+  agreement with them before trusting its numbers. Report agreement per label, not only overall: the
+  costly judge error is calling a partial or unsupported pair "full", so the precision of the judge's
+  "full" verdict matters more than its accuracy on easy cases, and judges tend to err in the lenient
+  direction.
 
 ### Partial support
 Real claims are often partly supported: the passage gives the 30-day window but not the "annual plans
@@ -88,6 +92,13 @@ Low recall with high retrieval recall means a generation problem: the evidence w
 model drifted or cited the wrong chunk. Low recall with low retrieval recall means the model is answering
 without evidence, so fix retrieval or enforce abstention. Low precision means citation spraying; tighten
 the instruction or the schema to one or two citations per claim.
+
+One extra judge call per unsupported claim sharpens the diagnosis: check the claim against *all*
+retrieved passages, not just the cited ones. Supported by an uncited passage means misattribution: the
+answer is grounded but points at the wrong chunk, which a post-hoc re-citation pass can repair.
+Supported by nothing in context means the claim came from parametric knowledge or invention, which only
+abstention or better retrieval fixes. The two failures look identical in citation recall and need
+opposite remedies.
 
 ## Example
 A worked scoring of one answer to "What are the rules for refunding annual plans?" with sources S1 to S4.
@@ -137,7 +148,9 @@ where the generator drifts.
 Track citation correctness whenever your product shows citations to users or relies on them for audit.
 Run it offline on a golden set for every prompt, model or retrieval change, and online on a sampled slice
 of production traffic. Report recall, precision and contradiction rate separately, alongside retrieval
-recall so you can tell generation failures from retrieval failures. If you show no citations, measure
+recall so you can tell generation failures from retrieval failures. Put an interval on every number
+before acting on a change: claims within one answer are correlated, so bootstrap over questions rather
+than claims, and expect a two-point movement on a few hundred questions to be within noise. If you show no citations, measure
 faithfulness instead. In interviews, the expected depth is to distinguish citation correctness from
 faithfulness and answer correctness, and to explain how you would validate the judge itself.
 

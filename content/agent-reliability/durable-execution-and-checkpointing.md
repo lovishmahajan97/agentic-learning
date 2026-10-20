@@ -5,7 +5,7 @@ name: Durable execution & checkpointing
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
   - agent-reliability/state-and-checkpoint-stores
@@ -57,7 +57,9 @@ is forgotten, or a new prompt version runs against old context.
 ### Two architectures
 **Snapshot checkpointing.** After each step, write the full state keyed by (run id, step). Resume
 means load the latest snapshot and continue the loop. It is simple and framework-agnostic, and it is
-what LangGraph's checkpointers do after each super-step, keyed by a thread id. The cost is writing a
+what LangGraph's checkpointers do after each super-step, keyed by a thread id; LangGraph also stores
+the pending writes of nodes that finished inside a super-step that failed, so on resume those nodes
+are not run again, which is the same intent-and-result idea applied to graph nodes. The cost is writing a
 growing state on every step, mitigated by storing the transcript as append-only events and
 snapshotting only the small non-transcript part.
 
@@ -93,7 +95,33 @@ effectively once.
 3. Validate the transcript: every tool call has a result; synthesize an error result for any that
    cannot be re-executed, because model APIs reject histories with unmatched calls.
 4. Re-execute pending intents with their recorded keys.
-5. Continue the loop, bumping the attempt counter on the run record.
+5. Continue the loop under the *same* run id, incrementing a resume counter (or lease epoch) on the
+   run record. A crash-resume is not a new attempt: a new attempt would mint a new run id and with
+   it new idempotency keys, which is exactly what must not happen to a half-finished step.
+
+What is *not* protected: a model call that completed but whose response was not yet saved is simply
+made again on resume. That costs tokens and may produce a different decision, but it is safe,
+because no side effect has happened until the intents are recorded and executed. This is why the
+save sits between "model decided" and "tools run", not after the tools.
+
+### Durable waits
+Agents wait: for a human approval, a CI pipeline, a rate-limit window, a scheduled follow-up the next
+morning. Holding a worker (and its memory, connections and lease) for hours of waiting wastes
+capacity and bets the run on that process surviving. A durable runtime instead *parks* the run: it
+records "waiting for signal `approval:42`" or "timer due at 09:00" and releases the worker. When the
+signal arrives or the timer fires, any worker claims the run and continues from the checkpoint.
+Temporal exposes this as durable timers and signals; in a snapshot design it is a status
+(`awaiting_approval`) plus a wake-up row a scheduler polls. Either way, waiting costs storage, not a
+process.
+
+### Timeouts and retries per step
+Each model call and tool call is the unit of retry, with its own timeout and retry policy, because a
+retry of the whole run would repeat completed work. Separate the timeouts: one per attempt of the
+call, and one for the call overall, including retries. For long tools, a heartbeat (the tool reports
+"still working" every few seconds) lets the runtime detect a dead worker in seconds instead of
+waiting out a timeout sized for the slowest legitimate case; Temporal activities support exactly
+this. Retries apply automatically only to calls classified as idempotent or keyed; for the rest,
+an ambiguous failure becomes a reconciliation step rather than a blind retry.
 
 ### Versioning
 A checkpoint written by last week's code must load in this week's. Store a schema version in each
@@ -103,20 +131,24 @@ drained before deploy.
 
 ### Checkpoint frequency
 Per step is the natural unit: the step is the boundary between "model decided" and "world changed".
-Checkpointing less often widens the window of lost work; more often, inside a step, is rarely useful.
+Checkpointing less often widens the window of lost work. Inside a step, the only extra writes worth
+making are one per completed tool result, so a step with several parallel calls does not re-run the
+finished ones on resume; anything finer (saving partial model output) buys little, because a model
+call can be repeated safely: it costs tokens but has no side effects.
 The write sits on the critical path of every step, so store latency matters; that is the topic of the
 state and checkpoint stores lesson.
 
 ## Example
-The loop records tool-call intents with deterministic keys *before* executing them; on restart, any
-pending intents are re-executed with the same keys so idempotent tools return the original result
-instead of acting twice.
+The loop saves the model's decision and the tool-call intents, with deterministic keys, *before*
+executing anything, and saves each result as it lands. On restart, only intents without a result are
+re-executed, with the same keys, so idempotent tools return the original result instead of acting
+twice.
 
 ```python
-def key_for(run_id, step, idx):                 # deterministic -> identical on retry
+def key_for(run_id, step, idx):                 # deterministic -> identical on resume
     return f"{run_id}:{step}:{idx}"
 
-def resume_or_start(store, run_id, initial_messages):
+def load_or_start(store, run_id, initial_messages):
     cp = store.load_latest(run_id)              # None on first start
     if cp is None:
         cp = {"step": 0, "messages": initial_messages, "pending": [], "status": "running"}
@@ -124,16 +156,18 @@ def resume_or_start(store, run_id, initial_messages):
     return cp
 
 def run(store, run_id, model, tools, initial_messages):
-    cp = resume_or_start(store, run_id, initial_messages)
+    cp = load_or_start(store, run_id, initial_messages)    # caller holds the run's lease
     while True:
-        if cp["pending"]:                       # died mid-step: finish the intents first
-            for call in cp["pending"]:
-                res = tools[call["name"]](**call["args"], idempotency_key=call["key"])
-                cp["messages"].append({"role": "tool", "tool_call_id": call["id"],
-                                       "content": res})
+        for call in cp["pending"]:              # empty unless we died mid-step
+            if "result" not in call:            # completed calls are not re-run
+                call["result"] = tools[call["name"]](**call["args"], idempotency_key=call["key"])
+                store.save(run_id, cp)          # record each result as soon as it exists
+        if cp["pending"]:
+            cp["messages"] += [{"role": "tool", "tool_call_id": c["id"], "content": c["result"]}
+                               for c in cp["pending"]]
             cp["pending"] = []
             store.save(run_id, cp)
-        resp = model(cp["messages"])
+        resp = model(cp["messages"])            # lost on a crash before the next save: re-asked
         cp["messages"].append(resp.message)
         if not resp.tool_calls:
             cp["status"] = "done"
@@ -145,6 +179,15 @@ def run(store, run_id, model, tools, initial_messages):
         cp["step"] += 1
         store.save(run_id, cp)                  # intent recorded BEFORE execution
 ```
+
+Kill the worker at each boundary and see what the resume does. Killed during the model call: no
+intents exist, so the call is simply made again. Killed in the fourth step of run `run_9` (step
+index 3), whose model response asked for three parallel calls, after call 0 finished and was
+recorded and while call 1 was executing: the resume skips call 0, re-runs call 1 with the same key
+`run_9:3:1` so the downstream API returns the first execution's result, then runs call 2 for the
+first time. Killed after all three results were recorded but before the messages were updated: the
+resume re-runs nothing and only finishes the bookkeeping. At no boundary does a side effect happen
+twice, provided the tools honour the key.
 
 ## Trade-offs
 - Snapshot checkpointing is simple and framework-agnostic, but write size grows with the transcript;
@@ -170,6 +213,10 @@ def run(store, run_id, model, tools, initial_messages):
   symptom is resumed runs failing with malformed-history errors or behaving differently from fresh ones.
 - Storing the entire transcript in every snapshot; the symptom is checkpoint storage growing
   quadratically and store latency climbing as runs lengthen.
+- Waiting for a human approval inside a live worker; the symptom is runs lost whenever a deploy
+  happens during business hours, and worker pools sized for idle waiting rather than work.
+- Treating a crash-resume as a new attempt with a fresh run id; the symptom is the same as random
+  keys: duplicates after restarts, because every derived idempotency key changed.
 
 ## When to use
 Reach for checkpointing as soon as a run can outlive a single request, touches external systems, or

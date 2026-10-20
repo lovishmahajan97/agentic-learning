@@ -5,7 +5,7 @@ name: Open-weight vs proprietary
 kind: decision
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - system-design/self-host-vs-api
   - system-design/build-vs-buy
@@ -21,10 +21,11 @@ sources:
 
 ## TL;DR
 Open-weight models publish their parameters so you can download, run, inspect, modify and fine-tune
-them under a licence; proprietary models are reachable only through a provider's API. The choice
-decides who controls the model's lifecycle, where data goes, what you can change, and how cost scales.
-It is a control-and-licensing axis, not a deployment one: open weights can be rented through an API
-and proprietary models can run in private endpoints, so decide it separately from self-host versus API.
+them under a licence; proprietary weights stay with the provider, who exposes them as a service. The
+choice decides who controls the model's lifecycle, where data goes, what you can change, and how cost
+scales. It is a control-and-licensing axis, not a deployment one: open weights can be rented through
+an API and proprietary models can be reached over private networking, so decide it separately from
+self-host versus API.
 
 ## Why it exists
 At any given moment the proprietary frontier usually leads on raw capability, and an API is the
@@ -55,10 +56,14 @@ at scale or restrict using outputs to train competitors. The licence has to be r
    proprietary model is a versioned API with deprecations typically announced months ahead. This
    matters *because* an LLM system's behaviour is tuned to a specific model; when the model changes,
    the prompts, evals and downstream parsers were all written against something that no longer exists.
-2. **Data governance.** Open weights in your own environment mean data physically never leaves.
+2. **Data governance.** Open weights on hosts you control mean data physically never leaves.
    Proprietary access relies on data-processing agreements, zero-retention options and regional
-   endpoints; a private endpoint inside your cloud tenant is the middle ground. Which suffices depends
-   on whether the constraint is legal (a contract can satisfy it) or architectural (it cannot).
+   endpoints. The middle ground is a proprietary model offered as a managed service by the cloud
+   provider you already use, reached over private networking in your region: traffic never crosses
+   the public internet and the processor is one you have already contracted, but inference still runs
+   on the provider's infrastructure, not on hosts you operate. Which option suffices depends on whether
+   the constraint is legal (a contract and a network path can satisfy it) or architectural (only
+   hardware you control can).
 3. **Customisation depth.** Open weights allow full fine-tuning, parameter-efficient adapters,
    quantization, distillation, raw logit access, custom constrained decoding, speculative decoding
    with your own draft model, and tokenizer work. Proprietary models offer prompting, structured
@@ -89,8 +94,11 @@ at scale or restrict using outputs to train competitors. The licence has to be r
 Four combinations exist and all are used. Open weights self-hosted: maximum control and isolation,
 maximum operations. Open weights through a hosting API: portability and lower price without hardware,
 but the host's lifecycle and shared infrastructure. Proprietary through the public API: frontier
-capability, least effort, least control. Proprietary in a private endpoint within your cloud tenant:
-frontier capability with contractual and network isolation, at a premium. Choosing "open" does not
+capability, least effort, least control. Proprietary through your cloud provider's managed service
+with a private endpoint: frontier-class capability with contractual and network isolation, often at a
+premium and with model availability that lags the provider's own API. A fifth, rarer arrangement is a
+vendor licensing proprietary weights for deployment inside the customer's environment under contract,
+which gives physical isolation without the right to modify or redistribute. Choosing "open" does not
 force you to run GPUs, and choosing "proprietary" does not force data onto the public internet.
 
 ### How the decision runs
@@ -130,9 +138,12 @@ enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="
 with torch.no_grad():
     next_logits = model(**enc).logits[0, -1]        # full-vocabulary distribution for the next token
 probs = torch.softmax(next_logits[label_ids], dim=-1)   # renormalise over the allowed labels only
+mass = torch.softmax(next_logits.float(), dim=-1)[label_ids].sum().item()
 for label, p in zip(labels, probs.tolist()):
     print(f"{label:9s} {p:.3f}")
-# No decoding loop, no parsing of free text, and the probabilities double as a confidence signal.
+print(f"mass on allowed labels: {mass:.3f}")   # low mass: the model wanted to say something else
+# No decoding loop and no parsing of free text. The renormalised probabilities are a confidence signal
+# to calibrate on held-out data (not a calibrated probability as-is); low mass flags odd inputs.
 ```
 
 The same classification through a proprietary API would need a generated answer parsed from text,
@@ -190,10 +201,12 @@ axis from deployment, naming the licence question, and making the lifecycle argu
 ## Check yourself
 **Q:** A healthcare customer insists on open-weight models "so that no data leaves". Their platform
 team is three engineers and expected volume is low. What do you advise, and how do you reason about it?
-**A:** Separate the two axes first. The actual requirement is data isolation, and it can be met by
-self-hosted open weights or by a proprietary model in a private endpoint inside their own cloud tenant
-with contractual zero retention and regional guarantees. Which one depends on whether their constraint
-is legal, where a contract satisfies the regulator, or physical, where the network boundary must. With
+**A:** Separate the two axes first. The actual requirement is data isolation, and depending on what
+"leaves" means it can be met by self-hosted open weights, or by a proprietary model through their
+existing cloud provider's managed service over a private endpoint in-region, with contractual zero
+retention. Which one depends on whether their constraint is legal, where a contract with an existing
+processor and a private network path satisfy the regulator, or physical, where only hosts they operate
+will do. I would get that definition in writing before choosing. With
 three engineers and low volume, a self-hosted GPU fleet is an operations burden with poor utilisation
 economics, so if the constraint is legal, the private endpoint or a hosted open model in-region is
 likely cheaper and safer. If the environment is genuinely air-gapped, open weights are the only
@@ -221,11 +234,12 @@ gateway so the decision stays reversible.
 > and SLAs are things proprietary APIs commonly offer, and latency depends on serving, not on whether
 > the weights are open.
 
-### Q: A customer requires that data never leave their cloud tenant. Which option is not automatically excluded?
-- [ ] A proprietary model through its public API with a zero-retention agreement
+### Q: A customer's rule is that data must stay in-region, never cross the public internet, and go to no processor other than their existing cloud provider. Which option is not automatically excluded?
+- [ ] A proprietary model through its vendor's public API with a zero-retention agreement
 - [ ] An open-weight model served by a third-party hosting provider's multi-tenant API
-- [x] A proprietary model deployed as a private endpoint inside the customer's own tenant
+- [x] A proprietary model offered as a managed service by their existing cloud provider, reached through a private endpoint in-region
 - [ ] None of these; only self-hosted open weights can satisfy the requirement
-> Zero retention and hosted open weights both send data outside the tenant, so they fail the stated
-> rule. A private endpoint keeps the request inside the customer's network boundary, which shows the
-> isolation requirement is separate from the open-versus-proprietary choice.
+> The public API and the third-party host both add a new processor and a public network path, so they
+> fail the stated rule. The cloud provider's managed service over private networking satisfies it,
+> which shows the isolation requirement is separate from the open-versus-proprietary choice. A rule
+> demanding hosts the customer operates would exclude it too.

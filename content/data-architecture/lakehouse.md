@@ -5,6 +5,7 @@ name: Lakehouse
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - data-architecture/etl-elt-for-rag
   - data-architecture/training-data-pipelines
@@ -61,12 +62,18 @@ all three, a write is: add new data files, then atomically publish a new log ent
 that references them. Because publishing is a single atomic operation, readers either see the old version
 or the new one, never a mix, and concurrent writers use optimistic concurrency: each validates that no
 conflicting commit landed since it started, and retries if one did. This is how ACID is achieved without a
-database server sitting in front of the files.
+database server sitting in front of the files. The atomic publish still needs one primitive from somewhere:
+a put-if-absent write in the object store (which S3 lacked until it added conditional writes, so Delta on S3
+long relied on a single writer or an external lock table), or an atomic pointer swap in the catalog, which
+is how Iceberg commits.
 
 The same log gives you:
 
 - **Snapshot isolation and time travel.** A reader pins a version; a training job can record the
-  snapshot id it read, and reading it again a year later returns identical rows.
+  snapshot id it read, and reading it again later returns identical rows, as long as that snapshot has not
+  been expired and its files vacuumed. Default retention windows are days to weeks (Delta's default vacuum
+  threshold is 7 days), so a snapshot needed for a year must be explicitly retained (an Iceberg tag, a
+  longer retention setting on that table) or materialized as its own dataset.
 - **Schema enforcement and evolution.** The current schema is in the metadata; writes with a mismatched
   schema are rejected, and adding a column is a metadata change rather than a rewrite.
 - **Deletes and updates.** Copy-on-write rewrites the affected files and commits the replacement;
@@ -114,7 +121,7 @@ batch = pa.table({
     "doc_version":["9f3a", "9f3a"],
     "text":       ["Refund window is 30 days.", "Returns need a receipt."],
     "model_id":   ["emb-v2", "emb-v2"],
-    "embedding":  [[0.01, 0.42, -0.13], [0.33, 0.05, 0.27]],   # real width: 1024+ floats
+    "embedding":  [[0.01, 0.42, -0.13], [0.33, 0.05, 0.27]],   # real width: hundreds to ~3,000 floats
 })
 write_deltalake(path, batch, mode="append", partition_by=["model_id"])
 
@@ -136,7 +143,9 @@ dt.vacuum(retention_hours=168, dry_run=False)
 ```
 
 Every training or evaluation run that reads this table records `eval_version`; a later audit re-reads the
-same rows even after the table has moved on.
+same rows even after the table has moved on, provided the retention policy keeps that version. Note that
+`vacuum(retention_hours=168)` deletes files that only versions older than seven days still reference, so
+time travel to those versions stops working: retention and reproducibility are one decision, not two.
 
 ## Trade-offs
 - Open files and a shared catalog let any engine read the data without copies, but you now operate
@@ -145,8 +154,10 @@ same rows even after the table has moved on.
   lookups or request-path serving; the moment a query needs sub-100 ms, the data needs a derived store.
 - Copy-on-write keeps reads simple and fast, while merge-on-read makes frequent small updates and deletes
   cheap; the choice flips toward merge-on-read when CDC-style streams feed the table continuously.
-- Time travel gives reproducibility and audit for free, but every retained snapshot pins files on disk,
-  and a deletion is not a deletion until snapshot expiry runs, which matters for retention commitments.
+- Time travel gives reproducibility and audit cheaply, but every retained snapshot pins files on disk,
+  and a deletion is not a deletion until snapshot expiry runs; long-lived reproducibility and prompt
+  physical deletion pull in opposite directions, so training snapshots that must outlive retention are
+  usually materialized separately with deletion handled explicitly.
 - Choosing Delta, Iceberg or Hudi is mostly an ecosystem decision (Databricks, Spark and Trino, or a
   streaming-first stack); the formats converge on features, so engine support and catalog integration
   should decide.

@@ -5,6 +5,7 @@ name: asyncio vs threads vs multiprocessing
 kind: decision
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - python-for-ai/asyncio
   - python-for-ai/gil
@@ -67,7 +68,8 @@ CPU-bound Python scales across cores. The price: arguments and results are pickl
 clients cannot be sent), each worker pays startup and import cost, and memory is multiplied by the
 number of workers. The start method matters. `fork` copies the parent quickly but is unsafe if the
 parent has threads or CUDA state; `spawn`, the default on macOS and Windows, starts clean but
-re-imports your modules, so worker entry points must be importable and guarded by
+re-imports your modules (since 3.14 the Linux default is `forkserver`, which has the same import
+requirements), so worker entry points must be importable and guarded by
 `if __name__ == "__main__":`.
 
 ### Bridges between them
@@ -91,8 +93,8 @@ chunks via an API (about 0.4 s, network). On an 8-core machine:
   ~1,000 s floor, plus contention.
 - **Async I/O plus a process pool of 8 for parsing:** parse time becomes roughly 1,000 s ÷ 8 ≈ 125 s if
   it scales cleanly. With downloads and embeddings bounded by a semaphore and overlapped, the job is
-  near the parse floor, a couple of minutes, provided pickling the extracted text back is cheap
-  relative to 0.5 s of work.
+  near the parse floor, a couple of minutes, provided pickling the PDF bytes in and the extracted text
+  back is cheap relative to 0.5 s of work.
 
 ```python
 import asyncio
@@ -123,8 +125,9 @@ async def handle(pdf_key, pool, sem):                   # pool: ProcessPoolExecu
   wall time barely changes.
 - Passing large objects (documents, NumPy arrays, model weights) to a process pool per task; profiling
   shows most time in pickling and worker memory spikes.
-- Using `fork` after loading CUDA or starting threads in the parent; the symptom is workers that hang
-  or crash intermittently with no clear traceback.
+- Using `fork` after starting threads or initialising CUDA in the parent; the symptom is workers that
+  deadlock intermittently on a lock some parent thread held at fork time, or PyTorch's "Cannot
+  re-initialize CUDA in forked subprocess" error.
 - Loading a local model at import time in a module that `spawn` re-imports; each worker loads its
   own copy and the machine runs out of memory.
 

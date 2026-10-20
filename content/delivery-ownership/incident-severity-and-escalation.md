@@ -5,6 +5,7 @@ name: Incident severity & escalation
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - delivery-ownership/production-debugging
   - delivery-ownership/root-cause-analysis-and-postmortems
@@ -65,7 +66,19 @@ justify the top severity even if it touched one user, because the harm is not pr
 ### Declare early, adjust freely
 Teams are told to declare at the higher plausible severity and downgrade as facts arrive, *because*
 under-declaring delays response while over-declaring costs only some attention. Severity is not a verdict
-on anyone; it is a routing decision and should change as the picture changes.
+on anyone; it is a routing decision and should change as the picture changes. The asymmetry applies to a
+human declaring a suspected incident, not to automated alert thresholds: a page that fires on noise has a
+real cost, because people learn to ignore it, so alerts should be tuned for precision while declaration
+stays biased high.
+
+### Severity is not priority
+Severity measures impact; priority is the order in which work gets done, and it also weighs urgency
+(is the harm growing or stable?) and available effort. A SEV3 with a workaround can still be top of the
+queue because the workaround expires tomorrow. Customer contracts usually define their own ticket
+priorities (P1 to P4 or similar) with response targets, so the policy must map them explicitly to
+internal severities; otherwise a customer's P1 lands as an internal SEV3 and the SLA clock runs out
+while both sides think the other is on it. A related line to draw: a defect becomes an *incident* when it
+needs a coordinated response now, not when it is merely a bug in the backlog.
 
 ### Severity drives the response
 Each level maps to: who is paged, a target time to acknowledge and to mitigate, whether an incident
@@ -91,8 +104,8 @@ Policy excerpt: SEV2 = a key customer or more than 5% of requests degraded with 
 on-call, acknowledge within 15 minutes, updates every 30 minutes, escalate to engineering manager if not
 mitigated in 60 minutes. Any confirmed cross-tenant data exposure = SEV1.
 
-- **09:10** Alert: 4% of responses fail JSON schema validation after a provider model alias moved to a
-  newer snapshot. Failures fall back to a generic answer. On-call declares SEV3: workaround exists, small share.
+- **09:10** Alert: 4% of responses fail JSON schema validation (later traced to a provider model alias
+  moving to a newer snapshot). Failures fall back to a generic answer. On-call declares SEV3: workaround exists, small share.
 - **09:25** Scoping shows all failures are from one enterprise tenant whose prompts use a tool schema the
   new snapshot handles differently; for them, 60% of requests fail. That tenant is a named account with an
   SLA. Upgraded to SEV2; incident commander assigned; account team informed.
@@ -128,6 +141,8 @@ changed.
   for an hour exactly when the incident is worst.
 - Escalating to a model provider without request IDs, timestamps and a minimal reproduction; the symptom
   is a support ticket that sits unanswered while you wait.
+- Severity inflation, where everything urgent-sounding is declared SEV1 and never downgraded; the
+  symptom is SEV1 pages that no longer mobilise anyone and a postmortem backlog nobody can clear.
 
 ## When to use
 Every team running a production service needs a written severity scale and escalation policy before the

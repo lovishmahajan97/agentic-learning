@@ -5,7 +5,7 @@ name: Object model and mutability
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/dataclasses
   - python-for-ai/memory-and-performance-profiling
@@ -55,6 +55,27 @@ that binding is O(1) regardless of what is bound. `==` asks whether two objects 
 `is` asks whether they are the same object. Use `is` only for singletons like `None`: CPython caches
 small integers and interns some strings, so `is` on numbers or text gives answers that depend on
 implementation details.
+
+### Everything is an object, including functions and classes
+Functions, classes and modules are ordinary objects too, which is what turns several "language
+quirks" into one rule. A function object stores its default values in `f.__defaults__`, built when
+`def` executes; a class object stores its body's assignments in its own `__dict__`. Neither is
+re-created per call or per instance, so anything mutable stored there is shared by construction.
+
+### Attribute lookup: where `obj.x` comes from
+Reading `obj.x` follows a fixed search order: first data descriptors on the type (a `property`,
+a slot), then the instance's own `__dict__`, then the class and its bases in MRO order (where plain
+functions become bound methods). *Writing* `obj.x = v` is different: unless a descriptor
+intercepts it, it always stores into the instance `__dict__`. That asymmetry is the whole mechanism
+behind the class-attribute bug. With `class Agent: history = []`, `self.history.append(m)` *reads*
+`history`, finds the class's single list, and mutates it for every agent; `self.history = [m]`
+would instead have created a private instance attribute that shadows the class one. Same-looking
+code, opposite sharing.
+
+### Operators are method calls on the type
+`a + b` calls `type(a).__add__(a, b)`, `a[i] = v` calls `__setitem__`, and `a += b` calls
+`__iadd__` if the type defines it, otherwise falls back to `a = a + b`. Which one you get is a
+property of the type, not the syntax, and the next section is that rule applied.
 
 ### Mutable versus immutable
 Immutable objects (`int`, `float`, `str`, `bytes`, `tuple`, `frozenset`, `bool`, `None`) cannot
@@ -170,6 +191,9 @@ print(grid, [[0] * 2 for _ in range(2)])        # [[9, 0], [9, 0]] [[0, 0], [0, 
   the symptom is retrieval scores that drift between runs.
 - GPU memory that does not come back after `del`; another reference (a list, an exception traceback,
   a notebook `Out[]` entry) is still holding the tensor.
+- `t[0] += [x]` where `t` is a tuple holding a list; the list's `__iadd__` mutates it in place,
+  then the store back into the tuple raises `TypeError`, so the symptom is an exception *and* a
+  changed list, which looks impossible until you split `+=` into its two steps.
 - Using `is` to compare strings or integers; it works in tests because of interning and fails on
   values built at runtime.
 

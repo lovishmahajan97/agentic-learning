@@ -5,6 +5,7 @@ name: Capacity planning (tokens/sec, requests/sec, concurrent sessions)
 kind: practice
 difficulty: core
 est_minutes: 18
+status: fact-checked
 related:
   - infra-capacity-economics/queueing-theory
   - infra-capacity-economics/latency-budgets
@@ -32,8 +33,9 @@ A classic web service has fairly uniform requests: if one pod handles 500 RPS at
 pods handle about 5,000. Teams carry that habit into LLM serving and it breaks in three ways.
 
 First, cost per request is wildly uneven. A 200-token classification and a 30,000-token document
-summary are both "one request", yet the second does a hundred times the prefill work and holds GPU
-memory for far longer. An RPS figure says nothing about which mix you will get.
+summary are both "one request", yet the second processes 150 times the input tokens (and more than
+that in attention work, which grows faster than linearly with context) and holds GPU memory for far
+longer. An RPS figure says nothing about which mix you will get.
 
 Second, a request occupies a GPU for seconds, not milliseconds. Generation produces output tokens one at
 a time, so a 500-token answer at 30 ms per token holds a batch slot and its KV cache for 15 seconds.
@@ -82,9 +84,9 @@ or the latency knee, is the replica's capacity, and you should know which one it
 differ (more memory or GQA/quantized cache vs. more replicas).
 
 ### 4. Size, then add headroom
-Replicas = peak in-flight sequences ÷ per-replica capacity, rounded up, then divided by a target
-utilization below 100% *because* queueing delay grows sharply as utilization approaches one, and
-increased again for N+1 failure tolerance, rolling deploys and autoscaler lag (GPU nodes and model
+Replicas = peak in-flight sequences ÷ (per-replica capacity × target utilization), rounded up. The
+target utilization sits below 100% *because* queueing delay grows sharply as utilization approaches
+one, and the count is increased again for N+1 failure tolerance, rolling deploys and autoscaler lag (GPU nodes and model
 loading can take minutes). For a managed API, the same numbers become requests-per-minute and
 tokens-per-minute quotas per region and per model; check whether your provider counts the requested
 `max_tokens` against the token quota at admission time, because some do, which makes generous

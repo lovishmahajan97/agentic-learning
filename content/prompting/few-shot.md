@@ -5,7 +5,7 @@ name: Few-shot prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - prompting/zero-shot
   - prompting/prompt-engineering
@@ -57,12 +57,25 @@ rather than a law. The practical reading is the same either way: examples are a 
 specification first and a source of knowledge a distant second. They do not teach the model facts it
 lacks.
 
+A partial mechanistic account exists. Interpretability work on transformers identified "induction
+heads", attention circuits that find an earlier occurrence of the current token pattern and copy what
+followed it, and linked their formation in training to the onset of in-context learning. That fits the
+observed behaviour: a demonstrated format is copied with high fidelity, surface details leak from
+examples into answers, and the example nearest the query has outsized pull. It is an account of
+the copying, not a full theory of how models infer a task from examples.
+
 ### How many, and which
 Returns diminish quickly; a few to around ten examples is a typical working range (illustrative, not a
 rule), and cost grows linearly with each one. What matters more than count is coverage: every label
 represented, and the examples drawn from the boundary cases where the zero-shot prompt was inconsistent,
 not from the easy middle. An example of an obviously-billing ticket teaches nothing the label definition
 did not.
+
+Long context windows have moved the ceiling. Work on many-shot in-context learning in 2024 reported
+that on some tasks accuracy kept rising with hundreds of demonstrations, which blurs the line with
+fine-tuning: the examples act like a training set read on every call. Whether it pays is arithmetic you
+can do. Three hundred 60-token examples are 18,000 input tokens per request; with a static, cached block
+that is mostly cache reads, and without caching it is a per-call bill that a fine-tune would remove.
 
 ### Static versus dynamic selection
 Static examples are hand-picked and fixed, so they form a stable prefix that caches. Dynamic selection
@@ -129,15 +142,23 @@ def classify(ticket, k=4):
     messages.append({"role": "user", "content": f"<ticket>{ticket}</ticket>"})
     r = client.messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, messages=messages)
     text = next((b.text for b in r.content if b.type == "text"), "")  # thinking counts toward max_tokens
+    shown = [POOL[i][1] for i in nearest]                         # labels the model was shown
     try:
-        return json.loads(text)["label"]
+        return json.loads(text)["label"], shown
     except (json.JSONDecodeError, KeyError, TypeError):
-        return "FORMAT_ERROR"
+        return "FORMAT_ERROR", shown
 
-print(classify("My invoice total is wrong and the PDF download is broken"))
-# Inspect the neighbours' labels before trusting a result: if all k share one label,
-# majority-label bias is in play and k or the pool balance needs adjusting.
+label, shown = classify("My invoice total is wrong and the PDF download is broken")
+print(label, "<- neighbours:", shown)
 ```
+
+What to look for in the output. This ticket straddles two labels, so its nearest neighbours are likely a
+mix of billing and bug examples, and the label in the last slot, nearest the query, tends to have the
+most pull. If you log `shown` across a few hundred requests and the prediction agrees with the neighbour
+majority far more often than with the gold label, the model is copying the neighbourhood rather than
+reading the ticket; the fixes are a larger, balanced pool, a smaller *k*, or a decision rule for
+two-issue tickets ("label the issue the customer asks to have fixed first") stated in the system prompt
+and demonstrated by one example that obeys it.
 
 ## Trade-offs
 - Specification by demonstration against tokens on every call; the balance flips toward fine-tuning once

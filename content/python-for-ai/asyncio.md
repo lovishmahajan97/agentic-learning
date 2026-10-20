@@ -5,6 +5,7 @@ name: asyncio
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/async-await
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -30,7 +31,8 @@ may block, or everything stalls.
 Take a chat backend that calls a model with a 3-second median response and streams it back. A
 synchronous handler holds its thread for those 3 seconds doing nothing but waiting on a socket. Serving
 1,000 concurrent chats that way needs 1,000 threads: each costs a kernel object, a reserved stack
-(illustratively, hundreds of KB to a few MB of address space), and scheduler time, and under the GIL
+(the platform default ranges from 512 KB on macOS to 8 MB on typical Linux, mostly virtual address space
+rather than resident memory), and scheduler time, and under the GIL
 they cannot even run Python in parallel. Most of that machinery exists only to wait.
 
 The naive fix, a bigger thread pool, moves the ceiling but not the shape of the cost. The sharper
@@ -88,9 +90,9 @@ I/O, does not yield at all; `await asyncio.sleep(0)` is the explicit "let others
 `asyncio.run(main())` creates a fresh loop, runs `main` as a task, then cancels any tasks still
 pending, finalizes async generators, and closes the loop. It cannot be called from inside a running
 loop (Jupyter already runs one; use `await main()` there). Debug mode (`PYTHONASYNCIODEBUG=1` or
-`asyncio.run(..., debug=True)`) logs coroutines that were never awaited and callbacks that hog the
-loop longer than `loop.slow_callback_duration` (100 ms by default), which is the first tool for finding
-accidental blocking.
+`asyncio.run(..., debug=True)`) adds the creation traceback to "coroutine was never awaited" warnings
+and logs callbacks that hog the loop longer than `loop.slow_callback_duration` (100 ms by default),
+which is the first tool for finding accidental blocking.
 
 ## Example
 Twenty chat completions fanned out concurrently, sharing one HTTP connection pool, with a blocking
@@ -127,7 +129,9 @@ asyncio.run(main([f"Summarise item {i} in one line." for i in range(20)]))
 
 Sequentially the twenty calls would take roughly twenty times one call's latency; with `gather` they
 take about the slowest single call plus a little scheduling overhead, because all twenty sockets are
-waited on in one selector call.
+waited on in one selector call. That holds only if the server actually processes twenty requests at
+once: a local server configured for a few parallel requests queues the rest, and the client-side
+concurrency then buys nothing beyond that limit.
 
 ## Trade-offs
 - Thousands of concurrent waits cost kilobytes each instead of a thread apiece, but the moment the work
@@ -138,8 +142,9 @@ waited on in one selector call.
 - Cooperative scheduling has no preemption overhead and needs no locks for most state, but one
   misbehaving task (a tight loop, a sync HTTP call) degrades every request on the loop, where a thread
   pool would only lose one worker.
-- Tracebacks and profilers see a flat sequence of task steps rather than a call stack, which is harder
-  to read than threaded code until you learn asyncio debug mode and named tasks.
+- A traceback shows the await chain inside one task but not which task spawned it, and profilers see
+  interleaved task steps under the loop's own frames, which is harder to read than threaded code until
+  you learn asyncio debug mode and named tasks.
 
 ## Pitfalls
 - Calling a blocking function inside a coroutine (`time.sleep`, the sync OpenAI client,

@@ -5,7 +5,7 @@ name: Memory retrieval / update / deletion policies
 kind: practice
 difficulty: advanced
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-memory
   - agents/context-compaction-summarization
@@ -54,7 +54,15 @@ ask about, which is why they matter beyond quality.
    similarity to the current query), recency (exponential decay since last access) and importance (a
    score assigned at write time, for example by asking the model to rate significance 1–10). The blend
    exists *because* each term alone fails: relevance alone surfaces old look-alikes, recency alone
-   surfaces trivia, importance alone ignores the question.
+   surfaces trivia, importance alone ignores the question. A worked case with equal weights and a
+   daily recency decay of 0.99: for the query "where should I ship this?", "user lives in Munich"
+   (relevance 0.82, last accessed 200 days ago, importance 0.6) scores 0.82 + 0.99²⁰⁰ + 0.6 ≈ 0.82 +
+   0.13 + 0.6 = 1.55, while "user lives in Berlin" (relevance 0.80, 3 days, 0.6) scores 0.80 + 0.97 +
+   0.6 = 2.37. Recency breaks a near-tie that relevance alone would have got wrong, but it is a
+   backstop: the update policy should already have marked Munich inactive.
+   Retrieval also writes: each hit resets `last_accessed`, so memories that keep proving useful stay
+   fresh. The side effect is a rich-get-richer loop where an often-retrieved entry is never allowed to
+   decay, which is one reason consolidation re-checks old, frequently used facts.
 3. **Budget.** Take top-k within a token budget, deduplicate near-identical entries, and prefer the
    newest of a superseded chain. Reserve budget by kind so one noisy episode cannot crowd out facts.
 4. **Present.** Inject as a labelled block with timestamps and source ("from user, 2026-09-12"), and
@@ -87,12 +95,19 @@ fact, and recompute importance. Every mutation is logged.
   *because* unbounded stores degrade retrieval and cost.
 - **User control.** Users must be able to see, correct and delete what the agent remembers; the policy
   is not complete without the UI or API that exposes it.
+- **Retraction versus "forget this".** Two user statements look alike and need different handling.
+  "I no longer work at Acme" is new information: supersede the old fact (inactive, with history).
+  "Forget that I told you about my diagnosis" is a deletion request: the fact and its history must be
+  hard-deleted from every copy, *because* keeping an inactive row is exactly the retention the user
+  just refused. Item-level tombstones then store a keyed hash of the normalised fact, never its text,
+  so re-extraction can be blocked without retaining what was erased.
 - **Erasure on request and offboarding.** Right-to-erasure obligations (for example GDPR Article 17,
   which has its own exceptions such as legal retention duties) require deleting a person's data
   everywhere it is held: the raw store, the vector index, caches, compaction
   summaries that embed the fact, derived consolidations, and logs, with backups rolling off on a
   documented schedule. Keep a tombstone so re-extraction from an old transcript cannot resurrect the
-  memory, and verify with a post-deletion retrieval test.
+  memory, replay tombstones after any backup restore (the most common resurrection path), and verify
+  with a post-deletion count across every store.
 - **Index consistency.** Deleting from the raw store but not the index yields retrievals that point at
   nothing or, worse, still carry the text in the index payload; treat the raw record as the source of
   truth and the index as a derived view rebuilt from it.
@@ -140,8 +155,9 @@ def erase_user(user_id):
     vector_index.delete(ids)                             # derived index, same ids
     summary_store.delete(user_id=user_id)                # compaction summaries that embed facts
     tombstones.add(user_id, ids, at=time.time())         # block re-extraction from old transcripts
-    if store.search(user_id=user_id, query="anything", k=1):            # verify, then log
-        raise RuntimeError(f"erasure incomplete for {user_id}")
+    left = store.count(user_id=user_id, include_inactive=True) + vector_index.count(user_id=user_id)
+    if left:                                             # verify by count, not by similarity search
+        raise RuntimeError(f"erasure incomplete for {user_id}: {left} records remain")
     audit("user_erased", user_id, len(ids))
 ```
 
@@ -149,7 +165,9 @@ The decisions that matter are the trusted-source gate, superseding rather than o
 on `active` at retrieval time, and erasing the index and summaries along with the raw records. Two
 details are deliberate: the model picks the target by *index*, because asking it to echo the existing
 text verbatim fails on any paraphrase; and the tombstone is checked on the write path, since a tombstone
-nobody reads blocks nothing. The tombstone records the user id and time, not the erased content.
+nobody reads blocks nothing. The tombstone records the user id and time, not the erased content. And
+verification counts records rather than running a similarity search, *because* a search with a
+filter or a score threshold can return nothing while rows still exist.
 
 ## Trade-offs
 - Blending recency and importance into retrieval keeps results fresh and relevant, but each weight is
@@ -179,6 +197,8 @@ nobody reads blocks nothing. The tombstone records the user id and time, not the
   user's detail resurfacing from a session summary months later.
 - No audit log of memory writes; the symptom is being unable to explain why the agent believes
   something, which is exactly what a customer will ask.
+- Handling "forget this" as a soft supersede; the symptom is a user's export or a data-subject request
+  still showing the fact they asked the agent to forget, marked inactive.
 
 ## When to use
 These policies apply the moment memories persist across sessions for more than a handful of users.

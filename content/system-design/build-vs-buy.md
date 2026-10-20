@@ -90,9 +90,9 @@ TCO_buy   = licence over 3 years (at projected seats or usage) + integration
             + P(switch) × exit cost
 ```
 
-  Writing it out exposes the terms people drop: maintenance and opportunity cost on the build side,
-  integration and exit on the buy side, and the fact that the licence term grows with adoption while
-  most of the build side is fixed. That asymmetry is why the answer often flips with scale.
+Writing it out exposes the terms people drop: maintenance and opportunity cost on the build side,
+integration and exit on the buy side, and the fact that the licence term grows with adoption while
+most of the build side is fixed. That asymmetry is why the answer often flips with scale.
 
 ### Patterns that come out of the questions
 - **Buy then build.** Adopt a vendor to learn the real requirements, then replace the differentiating

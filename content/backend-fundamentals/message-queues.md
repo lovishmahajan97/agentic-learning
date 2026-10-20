@@ -5,7 +5,7 @@ name: Message queues (Kafka, SQS, RabbitMQ)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/redis
@@ -58,7 +58,21 @@ consumer. This ack-after-work protocol is what makes delivery **at-least-once**:
 the work and dies before the ack causes a duplicate. Acknowledging *before* the work gives
 **at-most-once**: no duplicates, but a crash loses the message. "Exactly-once" across arbitrary side
 effects is not achievable; what systems offer is at-least-once delivery plus **idempotent** consumers
-(deduplicate by message id or business key), which is effectively-once from the outside.
+(deduplicate by message id or business key), which is effectively-once from the outside. Kafka's
+"exactly-once semantics" is real but narrower than the name: idempotent producers plus transactions make
+a read-from-Kafka, write-to-Kafka pipeline commit its outputs and its consumer offsets atomically, so
+nothing inside Kafka is duplicated. The guarantee ends at Kafka's edge; a consumer that calls an email
+API or writes to a database is back to at-least-once plus idempotency.
+
+### Publishing reliably
+The producer side has its own failure, the **dual write**. A handler that commits an order to the database
+and then publishes `order.created` can crash between the two: the order exists and no event ever does.
+Publishing first is worse: consumers act on an order the database then rolls back. Retrying the publish
+does not help when the process is gone. The standard fix is the **transactional outbox**: write the event
+into an `outbox` table in the same database transaction as the business change, and let a separate relay
+(a poller, or change-data capture reading the database log) publish outbox rows and mark them sent. The
+relay can itself crash after publishing and before marking, so it too is at-least-once, and consumers
+still deduplicate.
 
 ### Ordering, partitions and parallelism
 A single queue consumed by one worker is ordered; the moment you add workers, messages complete out of
@@ -72,7 +86,13 @@ one consumer or any failure.
 
 ### Backpressure and retries
 A queue only levels load if someone watches the **lag** (messages waiting, or the age of the oldest
-message); an unbounded backlog is a silent outage. Consumers limit in-flight messages (RabbitMQ
+message); an unbounded backlog is a silent outage. The arithmetic is simple and worth doing: if producers
+add λ messages per second and consumers finish μ, the backlog grows at λ − μ while λ > μ and drains at
+μ − λ afterwards. A burst that leaves 120,000 messages waiting, with consumers at 500/s against a steady
+400/s arrival, drains in 120,000 ÷ 100 = 1,200 s, twenty minutes during which every new message waits
+behind it. Doubling consumers to 1,000/s cuts that to 200 s, which is why consumer autoscaling keys off
+lag or oldest-message age rather than CPU. If λ exceeds the maximum μ for long, the queue is not levelling
+load, it is accumulating debt, and the producer must be slowed or work shed. Consumers limit in-flight messages (RabbitMQ
 `prefetch`, SQS `MaxNumberOfMessages`, Kafka `max.poll.records`). Failed messages are retried with
 backoff, and after N attempts go to a **dead-letter queue** (DLQ) so one poison message cannot block the
 rest. A message whose payload is large (a PDF, a transcript) should not travel through the broker:
@@ -190,6 +210,9 @@ loop would poll, process, then commit the offset; with RabbitMQ it would set `ba
   a user asking why their document never got indexed.
 - Choosing Kafka for a few messages per second of job traffic; the symptom is a team spending its time on
   partition rebalances and consumer-group tuning instead of the product.
+- Committing to the database and then publishing the event as a second step; the symptom is rows that
+  exist with no downstream effect (never indexed, never notified) after a deploy or crash, with no error
+  anywhere because the publish was simply never attempted.
 - Assuming order on SQS standard queues or across Kafka partitions; the symptom is "updated" events
   processed before "created" events and intermittent not-found errors.
 - Sending multi-megabyte payloads through the broker; the symptom is size errors, slow brokers and a

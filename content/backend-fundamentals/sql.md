@@ -5,7 +5,7 @@ name: SQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
@@ -80,8 +80,22 @@ indexed column appears bare on one side of a comparison: `created_at >= $1` can 
 `date(created_at) = $1` cannot, because the index stores `created_at`, not its date. `LIKE 'abc%'` can use
 a B-tree, but in PostgreSQL only if the index uses the `C` collation or the `text_pattern_ops` operator
 class (a default index under a locale such as `en_US.UTF-8` is not used for `LIKE`); `LIKE '%abc%'` cannot
-use a B-tree at all and needs a trigram (`pg_trgm`) index. The planner is only as good as its statistics, so a table that grew 100×
-since the last `ANALYZE` gets bad plans.
+use a B-tree at all and needs a trigram (`pg_trgm`) index. When an index holds every column the query
+reads (for example via `INCLUDE (input_tokens)`), PostgreSQL can answer from the index alone with an
+**index-only scan**, skipping the table, but only for pages the visibility map marks all-visible, which is
+one more reason vacuum health shows up in query latency. The planner is only as good as its statistics, so a
+table that grew 100× since the last `ANALYZE` (autovacuum usually re-analyzes, but can lag after a bulk
+load) gets bad plans.
+
+### NULL is not a value
+SQL uses three-valued logic: a comparison with NULL is neither true nor false but *unknown*, and `WHERE`
+keeps only rows where the predicate is true. So `WHERE model <> 'gpt-x'` silently drops every row whose
+`model` is NULL, `x = NULL` never matches (use `IS NULL` or `IS DISTINCT FROM`), and
+`NOT IN (subquery)` returns nothing at all once the subquery yields a single NULL, because
+`a NOT IN (b, NULL)` expands to `a <> b AND a <> NULL`, which can never be true. Arithmetic propagates it:
+`input_tokens + output_tokens` is NULL if either side is, and `SUM` skips NULLs, so a row with a missing
+count vanishes from a spend total rather than raising an error. `COUNT(*)` counts rows; `COUNT(col)` counts
+non-NULL values; the difference is a common source of reports that disagree.
 
 ### Parameters, not string formatting
 Queries take parameters (`$1`, `%s`, `?` depending on the driver) that are sent separately from the SQL
@@ -116,8 +130,8 @@ last_message_at, id)`, so the cursor seeks straight to the page.
 --    Day boundaries follow the session TimeZone setting.
 SELECT tenant_id,
        date_trunc('day', created_at) AS day,
-       SUM(input_tokens + output_tokens)                                 AS tokens,
-       SUM(SUM(input_tokens + output_tokens))
+       SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))        AS tokens,
+       SUM(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)))   -- window over groups
          OVER (PARTITION BY tenant_id ORDER BY date_trunc('day', created_at)) AS running_tokens
 FROM   messages
 WHERE  created_at >= now() - interval '7 days'      -- sargable: bare column vs constant
@@ -133,7 +147,7 @@ JOIN   LATERAL (
          SELECT content, created_at, id
          FROM   messages
          WHERE  conversation_id = c.id
-         ORDER  BY created_at DESC
+         ORDER  BY created_at DESC, id DESC           -- id breaks timestamp ties
          LIMIT  1                                     -- hits (conversation_id, created_at)
        ) m ON true
 WHERE  c.tenant_id = $1 AND c.user_id = $2 AND c.deleted_at IS NULL
@@ -145,6 +159,9 @@ LIMIT  20;
 Run each with `EXPLAIN (ANALYZE, BUFFERS)` and check two things: that the scan on `messages` is an index
 scan rather than a sequential scan, and that the estimated row count is within an order of magnitude of
 the actual one. A large mismatch means stale statistics or a predicate the planner cannot estimate.
+The `id` tie-breaker in both the `ORDER BY` and the cursor matters: two messages with the same
+`created_at` would otherwise have no defined order, and a page boundary falling between them could skip
+or repeat a row. The `COALESCE` calls stop a single row with a NULL count from dropping out of the total.
 
 ## Trade-offs
 - Declarative queries let the planner adapt to data growth, but you give up control of the algorithm; when

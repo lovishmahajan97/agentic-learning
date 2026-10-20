@@ -5,6 +5,7 @@ name: polars
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/pandas
   - python-for-ai/pyarrow
@@ -106,7 +107,7 @@ daily.write_parquet("daily_usage.parquet")
 ```
 
 Suppose the trace files hold 40 columns, including large prompt and completion text fields, and only
-the last two weeks are needed. The plan reads 7 numeric or short columns and skips row groups whose `ts`
+rows from 1 October onward are needed. The plan reads 7 numeric or short columns and skips row groups whose `ts`
 statistics fall before October, so the bytes read can be a small fraction of the dataset. The
 equivalent eager pandas code would load all 40 columns, text included, before filtering.
 
@@ -152,8 +153,9 @@ and peak memory on your real data before migrating a pipeline.
 ## Check yourself
 **Q:** A pandas job reads 30 GB of Parquet traces, filters to one customer, and sums tokens per day. It
 OOMs on a 64 GB machine. Why might a Polars lazy rewrite succeed, and what would you verify?
-**A:** pandas reads every column of every file into memory before filtering, and intermediates add more,
-so 30 GB on disk can exceed 64 GB in RAM. A lazy Polars plan built with `scan_parquet` pushes the
+**A:** As written, pandas reads every column of every file into memory before filtering (its
+`read_parquet` accepts `columns=` and `filters=`, but the naive job uses neither), and decompression,
+Python string objects and intermediates add more, so 30 GB on disk can exceed 64 GB in RAM. A lazy Polars plan built with `scan_parquet` pushes the
 customer filter and the column selection into the scan, so only the few needed columns are read and
 row groups for other customers can be skipped using Parquet statistics. The aggregation then runs in
 parallel. I would verify with `explain()` that the filter and projection are in the scan, measure peak

@@ -5,7 +5,7 @@ name: CI/CD
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/kubernetes
@@ -70,6 +70,16 @@ quality drift ships unnoticed and is discovered by users.
    (deployment), progressively: a canary takes a slice of traffic while error rate, latency and online
    quality metrics are compared against the baseline, then full rollout or automatic rollback.
 
+The three common production strategies differ in what they cost and what they can detect. A **rolling**
+update replaces replicas a few at a time: no extra capacity beyond the surge, but old and new versions
+serve side by side and a bad version reaches every user before anyone compares metrics. **Blue-green**
+stands up a full second environment and switches traffic at once: rollback is an instant switch back,
+paid for with double capacity during the release, and it detects nothing that only shows under real
+load until all users are on it. A **canary** sends a small share of traffic to the new version and
+promotes only if its metrics hold: the only strategy that limits the blast radius of a bad release, but
+it needs enough traffic for the comparison to be statistically meaningful and metrics that actually
+reflect quality, which for LLM features means online evaluation signals, not just HTTP 5xx.
+
 With GitOps, the pipeline's last step is a commit of the new digest to a configuration repository, and
 a controller (Argo CD, Flux) reconciles the cluster to it. The config repo becomes the audit log of
 what ran when, and rollback is `git revert`.
@@ -89,6 +99,11 @@ what ran when, and rollback is `git revert`.
   role credential, instead of a stored long-lived key; secrets are masked in logs and never exposed to
   jobs triggered by untrusted pull requests.
 - **Environment protection.** Production deploys require a reviewer, a branch rule, or both.
+- **Backward-compatible changes across a deploy.** During any rolling or canary release, old and new
+  versions run at once against the same database, queue and caches, and a rollback puts the old version
+  back on data the new one wrote. Schema changes therefore follow expand-contract: add the new column or
+  table first (old code ignores it), deploy code that writes both and reads the new one, backfill, and
+  only in a later release drop the old shape. Message and API formats follow the same rule.
 
 ### What changes for AI systems
 - **Non-determinism.** Model outputs vary between runs, so unit tests mock or record the client and
@@ -189,6 +204,9 @@ jobs:
   a build script or log line.
 - A commit stage that grows past half an hour; the symptom is rising pull-request size and lead time,
   because developers batch changes to avoid waiting.
+- Shipping a destructive migration (rename or drop a column) in the same release as the code that needs
+  it; the symptom is errors from the still-running old replicas during rollout, and a rollback that
+  fails because the old code cannot read the new schema.
 
 ## When to use
 Set up a pipeline on day one for any codebase with more than one contributor or more than one deploy;

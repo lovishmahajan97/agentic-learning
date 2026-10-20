@@ -5,6 +5,7 @@ name: pytest
 kind: tool
 difficulty: intro
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/pytest-asyncio
   - python-for-ai/test-doubles-mocks-fixtures
@@ -86,7 +87,8 @@ parametrized over `["memory", "pgvector"]` runs the whole store suite against bo
 `@pytest.mark.skip`, `skipif`, and `xfail(strict=True)` document known gaps; custom markers such as
 `integration` or `e2e` are registered in configuration and selected with `-m "not e2e"`. The
 `--strict-markers` option turns a typo in a marker name into an error, because an unregistered marker
-is otherwise silently ignored and the test runs in the wrong lane. `-k` selects by substring or
+otherwise produces only a `PytestUnknownMarkWarning` that is easy to miss in the summary, and the
+misspelled test is not matched by `-m` so it runs in the wrong lane. `-k` selects by substring or
 boolean expression over test names, `-x` stops at the first failure, `--lf` reruns only the last
 failures, `--durations=10` lists the slowest tests.
 
@@ -94,8 +96,8 @@ failures, `--durations=10` lists the slowest tests.
 Settings live under `[tool.pytest.ini_options]` in `pyproject.toml`: `testpaths`, `addopts`,
 `markers`, `filterwarnings`. Plugins are ordinary packages that implement `pytest_*` hook functions
 and register an entry point; `conftest.py` can implement the same hooks locally. The ones an AI
-engineer meets weekly: `pytest-asyncio` (coroutine tests), `pytest-xdist` (`-n auto` runs files across
-CPU cores), `pytest-cov` (coverage), `pytest-timeout` (kill hung tests), `pytest-mock` (the `mocker`
+engineer meets weekly: `pytest-asyncio` (coroutine tests), `pytest-xdist` (`-n auto` distributes tests
+across one worker process per CPU core), `pytest-cov` (coverage), `pytest-timeout` (kill hung tests), `pytest-mock` (the `mocker`
 fixture), and Hypothesis, which registers its own settings and database handling.
 
 ## Example
@@ -128,8 +130,9 @@ def test_every_chunk_respects_limit(chunker):
     assert all(chunker.count_tokens(c) <= 50 for c in chunks)
 
 def test_overlap_is_shared_tokens(chunker):
-    first, second = chunker.split("word " * 120)[:2]
-    assert first.split()[-5:] == second.split()[:5]
+    text = " ".join(f"w{i}" for i in range(120))   # distinct tokens, so overlap is observable
+    first, second = chunker.split(text)[:2]
+    assert first.split()[-5:] == second.split()[:5] == ["w45", "w46", "w47", "w48", "w49"]
 
 @pytest.mark.parametrize("bad", [None, 42, b"bytes"])
 def test_rejects_non_text(chunker, bad):
@@ -139,8 +142,10 @@ def test_rejects_non_text(chunker, bad):
 
 Run `pytest -q tests/test_chunking.py` and a wrong overlap implementation fails as
 `test_chunk_count[overlapping]` with `assert 4 == 3` followed by `where 4 = len([...])`, which tells
-you the case and the value without a debugger. `pytest -k overlap` runs just the two tests whose
-names contain the word.
+you the case and the value without a debugger. The overlap test uses distinct tokens on purpose: with
+`"word " * 120` every window looks identical and the assertion would pass even with zero overlap.
+`pytest -k overlap` runs just the two test ids that contain the word: `test_chunk_count[overlapping]`
+and `test_overlap_is_shared_tokens`.
 
 ## Trade-offs
 - Fixture injection by name is concise, but the implicit wiring through `conftest.py` hides where a
@@ -159,7 +164,8 @@ names contain the word.
 - Running tests in the wrong lane because a marker was misspelled; the symptom is an `e2e` test
   hitting a real API on every pull request. `--strict-markers` turns this into a collection error.
 - Tests that pass in isolation and fail together, usually a shared fixture mutated by an earlier test;
-  `pytest-randomly` or `-p no:cacheprovider` plus running the pair alone exposes the order dependence.
+  `pytest-randomly` shuffles the order and prints its seed, `--randomly-seed=<n>` replays that order,
+  and running the suspected pair alone confirms the dependence.
 - Asserting on floating-point results with `==`; embedding similarities and loss values differ in the
   last bits across BLAS builds. The fix is `pytest.approx(expected, rel=1e-6)`.
 - Catching too broadly with `pytest.raises(Exception)`, so a `TypeError` from a typo passes as the

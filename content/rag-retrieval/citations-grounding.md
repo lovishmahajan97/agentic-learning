@@ -5,6 +5,7 @@ name: Citations / grounding
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - rag-retrieval/citation-correctness
   - rag-retrieval/lost-in-the-middle
@@ -53,20 +54,30 @@ IDs matter because the model must reproduce them exactly; long UUIDs get mangled
 from the short ID to the real document, version and character range, because the citation shown to the
 user must resolve to the exact text the model saw, not to the current version of the file.
 
-### 2. Instruct the citation contract
+### 2. Choose the citation granularity
+Citations can point at a document, a chunk, a sentence or a character span. Coarser pointers are
+easier for the model to produce and nearly always "correct", which is exactly why they are weak: a
+40-page PDF supports almost any claim about its topic, so the user still has to hunt and a verifier
+cannot check anything. Finer pointers make verification and the UI highlight precise, but the model must
+locate the exact supporting text, and chunk boundaries can split it. The usual operating point is
+chunk-level IDs plus a short verbatim quote, which gives span precision without asking the model to
+emit character offsets it cannot count reliably; the server resolves the quote to offsets afterwards.
+
+### 3. Instruct the citation contract
 The instruction is specific: cite after every sentence that states a fact, cite only IDs that appear
 above, prefer quoting the supporting phrase, and if the sources do not contain the answer, say so instead
 of answering. The abstention clause is the grounding mechanism; without a legitimate "I don't know" path,
 the model will reach for parametric knowledge and attach the nearest-looking citation to it.
 
-### 3. Constrain the output shape
+### 4. Constrain the output shape
 Free-text `[S2]` markers are easy to read but hard to verify. A sturdier pattern is structured output: a
 list of claims, each with `source_ids` and a short verbatim `quote`. Because the quote must appear in the
 cited chunk, a string check in code catches fabricated or misattributed citations cheaply. Some provider
-APIs offer native citation modes in which you pass documents and the response returns the cited spans
-with character locations; these remove the parsing burden but tie you to that provider's format.
+APIs offer native citation modes in which you pass documents and the response returns the cited text
+with its location (character ranges for plain text, page numbers for PDFs, the exact shape varying by
+vendor); these remove the parsing burden but tie you to that provider's format.
 
-### 4. Generation-time vs post-hoc attribution
+### 5. Generation-time vs post-hoc attribution
 Two families exist. *Generation-time* citation asks the model to cite while writing, which is cheap and
 usually accurate when retrieval is good. *Post-hoc* attribution generates the answer first, then for each
 sentence searches the sources for a supporting span (with an embedding search plus an entailment check)
@@ -74,7 +85,7 @@ and attaches or flags it. Post-hoc is slower but works with any model and can fi
 the generator never cited. Mature systems often do generation-time citation and then a post-hoc
 verification pass.
 
-### 5. Verify and act
+### 6. Verify and act
 After generation, code checks: every cited ID exists in this request's source set; every quote is a
 substring (after whitespace normalisation) of its cited chunk; every factual sentence has at least one
 citation. Failures trigger a repair retry, removal of the unsupported sentence, or a visible "unverified"
@@ -109,28 +120,32 @@ def verify(raw, chunks):
     out = json.loads(raw)
     ids = {f"S{i+1}": c for i, c in enumerate(chunks)}
     problems = []
+    if out.get("answerable") and not out["claims"]:
+        problems.append((None, "marked answerable but made no claims"))
     for n, cl in enumerate(out["claims"]):
-        if not cl["source_ids"]:
+        if not cl.get("source_ids"):
             problems.append((n, "uncited claim"))
             continue
         bad = [s for s in cl["source_ids"] if s not in ids]
         if bad:
             problems.append((n, f"unknown source {bad}"))
             continue
-        if not any(norm(cl["quote"]) in norm(ids[s]["text"]) for s in cl["source_ids"]):
-            problems.append((n, "quote not found in cited sources"))
+        quote = norm(cl.get("quote") or "")          # an empty quote would match any chunk
+        if not quote or not any(quote in norm(ids[s]["text"]) for s in cl["source_ids"]):
+            problems.append((n, "quote missing or not found in cited sources"))
     return out, problems   # caller repairs, drops, or flags the claims listed in problems
 ```
 
 Suppose three chunks are retrieved for "What is the refund window for annual plans?" and the model returns
 two claims: one cites S2 with the quote "Annual plans may be refunded within 30 days", which appears in S2
 and passes; the other says partial refunds are prorated and cites S3 with a quote that appears nowhere.
-The verifier flags claim 1, and the product either regenerates or drops it and shows only the supported
+The verifier flags the second claim (index 1 in `problems`), and the product either regenerates or drops it and shows only the supported
 sentence. No model call was needed to catch the fabricated quote.
 
 ## Trade-offs
-- Mandatory per-claim citations raise trust and auditability but make answers terser and slightly longer
-  to generate; for casual or creative use the friction is not worth it.
+- Mandatory per-claim citations raise trust and auditability, but they make prose choppier, add output
+  tokens and push the model toward claims it can quote; for casual or creative use the friction is not
+  worth it, and it flips back the moment an answer can be acted on or disputed.
 - Strict abstention lowers hallucination rate but increases "I can't find that" responses; if retrieval
   recall is weak, users experience it as a broken product, so fix recall first.
 - Verbatim-quote requirements make verification a cheap string check, but paraphrase-heavy answers (summaries
@@ -151,6 +166,8 @@ sentence. No model call was needed to catch the fabricated quote.
   "citation rate" while human reviewers still find many unsupported sentences.
 - Letting long, numerous chunks bury the evidence mid-context; citation accuracy drops as top-k grows even
   though retrieval recall goes up.
+- Citing whole documents rather than chunks or spans; the symptom is a near-perfect automated citation
+  score alongside users who say the cited PDF is 40 pages and they could not find the sentence.
 
 ## When to use
 Use explicit citations whenever an answer could be acted on, disputed or audited: internal knowledge

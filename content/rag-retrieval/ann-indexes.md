@@ -4,8 +4,8 @@ module: rag-retrieval
 name: ANN indexes (HNSW, IVF)
 kind: concept
 difficulty: core
-est_minutes: 17
-status: fact-checked
+est_minutes: 19
+status: reviewed
 related:
   - rag-retrieval/similarity-search
   - rag-retrieval/vector-databases
@@ -52,8 +52,9 @@ HNSW keeps every vector as a node in a graph whose edges connect near neighbors.
 is greedy: start at some node, look at its neighbors, move to whichever is closest to the query, repeat
 until no neighbor improves. The graph is built so that this walk converges, using two ideas.
 
-1. **Hierarchy.** Each node is assigned a random maximum layer with exponentially decaying probability,
-   so layer 0 holds everything and higher layers hold a sparse sample. A search starts at the top layer,
+1. **Hierarchy.** Each node is assigned a random maximum layer `l = ⌊−ln(U) · mL⌋` with U uniform in
+   (0, 1) and the paper's suggested `mL = 1/ln(M)`, so each layer holds roughly 1/M of the layer below:
+   layer 0 holds everything, higher layers a sparse sample, and the number of layers grows like log N. A search starts at the top layer,
    where edges are long and a few hops cross the whole space, and descends one layer at a time, using
    the best node found so far as the entry point to the next. This is the skip-list trick, and it is
    what makes search cost grow roughly logarithmically with N instead of linearly.
@@ -62,6 +63,26 @@ until no neighbor improves. The graph is built so that this walk converges, usin
    computations and higher recall; `ef` must be at least k. There are two settings: `efConstruction`,
    used while inserting (affects graph quality), and `efSearch`, used at query time (the live
    recall–latency knob).
+
+The layer-0 search is short enough to state exactly, and the stopping rule is what makes `ef` matter:
+
+```
+search_layer(q, entry, ef):
+  C = min-heap of candidates by distance to q, starting with entry
+  W = max-heap of the best ef results found so far, starting with entry
+  while C not empty:
+    c = pop closest from C
+    if dist(c, q) > dist(furthest in W, q): break   # nothing left can improve W
+    for n in neighbors(c) not yet visited:
+      if |W| < ef or dist(n, q) < dist(furthest in W, q):
+        push n to C and W; if |W| > ef: drop furthest from W
+  return W                                          # caller takes its k closest
+```
+
+The upper layers run the same routine with ef = 1 (pure greedy descent). Cost per query is roughly the
+number of nodes expanded times their degree, so it rises with both `ef` and `M`. A small `W` stops the
+walk as soon as the local neighborhood looks exhausted, which is exactly when a true neighbor one hop
+beyond a mediocre node gets missed.
 
 The other build parameter is `M`, the number of links each node keeps per layer (layer 0 commonly allows
 2M). When a new node is inserted, the index runs a search to find its nearest `efConstruction`
@@ -82,7 +103,9 @@ but keyed by cluster. At query time it computes the distance from the query to a
 nlist is thousands, not millions), picks the `nprobe` closest, and scans only those lists exhaustively.
 
 The approximation is in the boundary: a true neighbor sitting just across a cell edge is missed unless
-`nprobe` reaches its cell. Raising `nprobe` raises recall and scan cost roughly linearly. A common rule
+`nprobe` reaches its cell. Scan cost grows roughly linearly with `nprobe` (each probe adds about N/nlist
+vectors), while recall rises quickly at first and then saturates, so the useful setting is usually a
+small fraction of `nlist`. A common rule
 of thumb puts `nlist` on the order of √N up to a few multiples of it, with at least tens of training
 vectors per centroid so k-means has something to fit. Because the centroids are fixed at training time,
 an IVF index degrades when the data distribution drifts (new product lines, new languages) and needs
@@ -91,9 +114,13 @@ re-training, whereas HNSW adapts incrementally.
 ### Product quantization: trading bytes for bits
 IVF is usually paired with product quantization (IVF-PQ). PQ splits each d-dimensional vector into `m`
 sub-vectors and replaces each with the id of its nearest centroid from a 256-entry codebook, so a
-768-dim fp32 vector (3,072 bytes) becomes `m` bytes: 96 bytes at m = 96, a 32× compression. Distances
-are computed asymmetrically: the query stays exact, and per-subspace lookup tables turn each candidate's
-distance into `m` table reads. This is what makes billion-scale search fit in memory or on GPU, at a
+768-dim fp32 vector (3,072 bytes) becomes `m` bytes: 96 bytes at m = 96, a 32× compression. The codebooks
+are learned by running k-means separately in each subspace. Distances are computed asymmetrically: the
+query stays exact, and before scanning, the engine precomputes an m × 256 table of distances from each
+query sub-vector to each sub-centroid; a candidate's approximate distance is then the sum of `m` table
+reads, no multiplications. Inside IVF, PQ usually encodes the residual (vector minus its cell centroid)
+rather than the raw vector, because residuals are smaller and spread more evenly, so the same 8 bits per
+subspace capture them more precisely. This is what makes billion-scale search fit in memory or on GPU, at a
 recall cost you recover partly by re-ranking the top few hundred PQ candidates with their exact vectors.
 
 ### Choosing between them
@@ -102,6 +129,14 @@ recall cost you recover partly by re-ranking the top few hundred PQ candidates w
 - IVF-Flat: faster to build and simpler, needs training and periodic re-training; at equal recall it
   usually computes more distances per query than HNSW, because whole cells are scanned.
 - IVF-PQ: smallest footprint by far, GPU-friendly; lowest raw recall, so pair it with exact re-ranking.
+
+In pgvector these are concrete settings. HNSW takes `m` and `ef_construction` at build time (defaults 16
+and 64) and `hnsw.ef_search` per session (default 40); because `ef_search` bounds the candidate list,
+a plain HNSW scan returns at most that many rows, so `LIMIT 100` with the default can quietly yield 40
+(raise `ef_search`, or use the iterative index scans added in pgvector 0.8).
+IVFFlat takes `lists` at build time (the docs suggest rows/1000 up to a million rows and √rows beyond)
+and `ivfflat.probes` per session (start near √lists), and should be built after representative data is
+loaded, since the centroids come from the rows present at build time.
 
 ### Filters interact badly with both
 A metadata filter that keeps 1% of vectors breaks the assumptions: HNSW's greedy walk cannot reach the
@@ -189,8 +224,11 @@ which on a modern CPU is typically up to a low number of millions of vectors; it
 recall loss and is the reference you will need anyway. Move to HNSW when latency forces it and the data
 fits in RAM; it is what pgvector, Lucene, Qdrant, Weaviate and most managed services offer first. Move to
 IVF-PQ when the vector set outgrows memory or must run on GPU at very high throughput. Whatever you
-choose, instrument recall@k against the exact index on a labeled sample and expose the search knob as a
-configuration value, because the right operating point changes with traffic and content. Interviewers
+choose, keep two measurements apart. ANN recall@k is overlap with the exact index's top k on a sample of
+real queries; it needs no relevance labels, only a brute-force run, and it isolates what the index loses.
+Retrieval quality (did the relevant chunk come back) needs labels and mostly reflects the embedding
+model; an index at 0.99 ANN recall cannot rescue a model that ranks the wrong chunk first. Expose the
+search knob as a configuration value, because the right operating point changes with traffic and content. Interviewers
 ask you to explain the greedy walk, why ef and nprobe exist, and what happens under a restrictive filter.
 
 ## Role lens
@@ -212,8 +250,10 @@ codes), use IVF-PQ, which fits easily at tens of bytes per vector, or shard acro
 inserts favor HNSW's incremental build over IVF's trained centroids, so a quantized HNSW with periodic
 rebuilds, or IVF-PQ with scheduled re-training, are the realistic choices. In every case I would re-rank
 the top few hundred candidates with exact vectors fetched from disk, and measure recall@10 against a
-brute-force scan on a labeled query set while sweeping ef or nprobe to find the cheapest point that keeps
-downstream answer quality flat.
+brute-force scan on a sample of real queries while sweeping ef or nprobe, then confirm on labeled
+queries that the chosen point keeps downstream answer quality flat. I would also note that
+quantization error and graph approximation compound, so the sweep must be run on the final quantized
+configuration, not on a full-precision prototype.
 
 ## Quiz
 ### Q: In HNSW, what does raising `efSearch` do, and why does it help recall?

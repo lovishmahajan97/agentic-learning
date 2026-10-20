@@ -5,7 +5,7 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/parent-document-retrieval
@@ -73,7 +73,25 @@ after the first call the prefix is served from cache at a much lower rate (on An
 cache reads were billed at about a tenth of the base input price). The total is still proportional to
 c × d, but with a constant roughly an order of magnitude smaller, so the per-chunk output and the chunk
 itself become a large share of the bill. Caches expire after minutes, so process one document's chunks
-back to back. The post's own estimate was roughly one dollar per million document tokens with caching; treat the exact figure as model- and
+back to back.
+
+A worked illustration, using Anthropic's ratios at the time (cache write about 1.25× the base input
+price, cache read about 0.1×): a 20,000-token document cut into 50 chunks, with each call's variable
+suffix (chunk plus instruction) about 500 tokens.
+
+```
+uncached: 50 × (20,000 + 500)                         ≈ 1,025,000 full-price input tokens
+cached:   1 write × 20,000 × 1.25                     =    25,000
+          49 reads × 20,000 × 0.1                     =    98,000
+          50 suffixes × 500 × 1.0                     =    25,000
+          total                                       ≈   148,000 full-price equivalents (~7× less)
+```
+
+Output (50 contexts of under 100 tokens) is identical in both cases. Note that the cached reads are still
+the largest term, which is why cost still grows with chunks × document length, and why splitting very
+long documents into sections before contextualising cuts cost as well as fitting the window. Providers
+also set a minimum cacheable prefix length, so very short documents are billed uncached; for them the
+naive cost is small anyway. The post's own estimate was roughly one dollar per million document tokens with caching; treat the exact figure as model- and
 pricing-dependent, but the order of magnitude is what makes "an LLM call per chunk" acceptable.
 
 ### What was reported
@@ -150,6 +168,9 @@ chunk = "The company's revenue grew by 3% over the previous quarter."
 - Running ingestion without prompt caching; the symptom is an ingestion bill several times to an order
   of magnitude higher than the cached estimate, growing with chunks × document length, which is roughly
   document length squared.
+- Firing all of a document's chunk calls in parallel before the first one has written the cache; the
+  symptom is cache-write or cache-miss charges on every call and a bill close to the uncached estimate.
+  Send one call first, then fan out the rest.
 - Documents longer than the model's context being silently truncated; the symptom is contexts for late
   chunks that refer to the wrong section or entity.
 - Displaying the contextualised text as a quotation; the symptom is "cited" sentences that do not exist in

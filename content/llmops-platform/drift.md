@@ -5,7 +5,7 @@ name: Drift
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/model-monitoring
   - llmops-platform/golden-dataset-strategy
@@ -71,6 +71,10 @@ which factor moved:
   every request without labels, which makes it the cheapest early-warning signal, but ambiguous: it
   happens under any of the three above and also when the system itself changes.
 
+For a generative system Y is free text, so read it as "the correct behaviour": label shift then means,
+for example, that the share of requests whose right response is "escalate to a human" or "refuse" has
+moved, which matters because prompts and thresholds were tuned for the old mix.
+
 Drift also has a shape (the Gama et al. taxonomy): **sudden** (a release, a provider update),
 **gradual** (new segment ramping up), **incremental** (slow vocabulary change) and **recurring**
 (seasonality: tax season, Black Friday). The shape decides the detector: a sudden shift needs a short
@@ -118,7 +122,12 @@ same period last cycle) and a **current window**, per feature and per slice:
    confident "current" examples show *what* moved, which a single divergence number never does.
 3. Control for noise. Require minimum window sizes, compare like with like (same weekday, same
    season), and slice by tenant and intent, because a global PSI of 0.03 can hide one tenant at 0.6.
-4. Separate "moved" from "broke". A detected shift raises priority for the slow signals: route more of
+4. Separate "the world moved" from "the system moved". Re-run a **frozen probe set** (a fixed slice of
+   the golden set with known-good outputs) on a schedule and whenever an alert fires. It is a control:
+   its inputs never change, so if its scores move, a component changed (model, prompt, embedder, judge);
+   if it is stable while production metrics move, the world changed. This one check halves most drift
+   investigations.
+5. Separate "moved" from "broke". A detected shift raises priority for the slow signals: route more of
    that slice to judging and human review, and check whether error rate on it changed. Input drift
    with stable outcomes is information, not an incident. Concept drift can only be confirmed by
    labels, so the detector's job is to decide where to spend them.
@@ -228,7 +237,9 @@ Input-length and field-mix PSIs are below 0.05, and no deploy happened. Walk thr
 the cause and what you would do for each possibility.
 **A:** First confirm the drop is real: on a review sample of a few hundred cases, seven points is
 well outside sampling noise, but on fifty it may not be. Stable input statistics then rule out the
-obvious covariate shift, so look at the components and at concept drift. Check the model id reported in responses and the bundle hash per request: if the
+obvious covariate shift, so look at the components and at concept drift. The fastest split is to
+re-run the frozen probe set: if it also dropped, the system changed even though nobody deployed; if it
+held, the world changed. Check the model id reported in responses and the bundle hash per request: if the
 provider alias moved, every tenant's proxies will have stepped at one timestamp, and the fix is to pin
 the previous snapshot, evaluate the new one and canary it. Check the judge or review process: if the
 reviewers' guidelines changed, the "drop" is a measurement change. Then test for concept drift: pull

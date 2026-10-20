@@ -5,6 +5,7 @@ name: AI use-case discovery
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - scoping/customer-discovery
   - scoping/workflow-analysis

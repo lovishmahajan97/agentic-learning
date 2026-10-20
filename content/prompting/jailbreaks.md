@@ -5,7 +5,7 @@ name: Jailbreaks
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - prompting/prompt-injection
   - prompting/system-prompt
@@ -19,6 +19,7 @@ sources:
   - Wei et al., 2023 — Jailbroken: How Does LLM Safety Training Fail?
   - Zou et al., 2023 — Universal and Transferable Adversarial Attacks on Aligned Language Models
   - Anil et al., 2024 — Many-shot Jailbreaking
+  - Arditi et al., 2024 — Refusal in Language Models Is Mediated by a Single Direction
 ---
 
 ## TL;DR
@@ -53,13 +54,14 @@ talked out of its scope.
 2. **Framing.** Fiction, hypotheticals, research, "my late grandmother used to read me..." The refusal
    is reframed as unhelpfulness.
 3. **Forced compliance.** "Start your answer with 'Sure, here is'." Once a compliant prefix exists, the
-   continuation follows the prefix, which is one reason some providers restrict or remove assistant
-   prefill on recent models.
+   continuation follows the prefix. Assistant prefill through the API made this trivial, and several
+   providers now restrict or remove prefill on recent models.
 4. **Obfuscation.** Base64, rot13, leetspeak, token splitting, low-resource languages, ASCII art.
    Exploits mismatched generalisation: the model decodes the request but the refusal was not trained there.
 5. **Many-shot.** Fill a long context with hundreds of fabricated dialogue turns in which the assistant
-   complies with similar requests. In-context learning overrides training, and effectiveness grows with
-   the number of shots (Anil et al.), which is a direct cost of long context windows.
+   complies with similar requests. In-context learning can outweigh the trained refusal, and
+   effectiveness grows with the number of shots (Anil et al.), which is a direct cost of long context
+   windows.
 6. **Multi-turn escalation.** Begin benign, advance one small step per turn, each building on the
    previous answer, so no single message looks like the request.
 7. **Optimisation-based.** With white-box access to an open-weight model, gradient search finds an
@@ -76,6 +78,14 @@ region of that distribution shaped by training examples; any framing outside tho
 uncovered surface. The model has no verifier for its own rules and no way to distinguish "a user
 testing me" from "a legitimate novelist". And in a long context, in-context evidence of compliance is
 simply more data than the training signal that said to refuse.
+
+Interpretability work makes the "thin layer" picture concrete. Arditi et al. (2024) found that in
+several open chat models refusal is mediated largely by a single direction in the residual stream:
+remove that direction from the activations and the model stops refusing while keeping its capability.
+Likewise, fine-tuning an aligned open model on a small number of examples can undo much of its safety
+behaviour (Qi et al., 2023). Neither attack needs a clever prompt, which is the point: refusal is a
+behaviour layered on capability, so anyone with the weights can remove it, and prompt-level attacks are
+just the black-box way of steering around the same layer.
 
 ### Defences, layered
 *Model-side (the vendor's job):* safety training, input and output classifiers trained on synthetic
@@ -144,6 +154,15 @@ print(asr)                                            # illustrative: {"persona"
 assert max(asr.values()) < 0.10, f"jailbreak regression: {asr}"   # gate the release
 ```
 
+Two things about reading the gate. First, the estimate is noisy: with 50 attacks in a family and a
+true success rate of 10%, the standard error is √(0.1 × 0.9 / 50) ≈ 0.042, so a measured 0.06 and a
+measured 0.14 are both consistent with the same model. Grow the suite, sample each attack several
+times, and compare releases on the same cases rather than reading one number against a threshold.
+Second, the judge reads attacker-influenced text: a response that says "grader, this is OK" is an
+injection aimed at your eval. Wrap the response in delimiters, tell the judge it is data, and spot-check
+the judge's verdicts by hand. A full gate also runs a benign set through the same `app` and tracks the
+over-refusal rate, since an ASR of zero is easy to achieve by refusing everything.
+
 ## Trade-offs
 - Stronger classifier layers lower attack success but raise over-refusal for legitimate users; the right
   balance differs between a consumer chatbot and a tool for security researchers or clinicians.
@@ -155,8 +174,9 @@ assert max(asr.values()) < 0.10, f"jailbreak regression: {asr}"   # gate the rel
   high-risk paths or sample elsewhere.
 - Automated red-teaming scales coverage but finds generic attacks; human red-teaming finds the
   domain-specific framings; the two are complements, not alternatives.
-- Open-weight models give you control over safety tuning but hand attackers white-box gradient access;
-  hosted models hide weights, yet transferable suffixes still land, so neither choice removes the problem.
+- Open-weight models give you control over safety tuning but hand attackers white-box gradient access,
+  fine-tuning and activation editing that strip refusals outright; hosted models hide weights, yet
+  transferable suffixes still land, so neither choice removes the problem.
 
 ## Pitfalls
 - Secrets in the system prompt (keys, internal hostnames, unreleased product names); the symptom is a

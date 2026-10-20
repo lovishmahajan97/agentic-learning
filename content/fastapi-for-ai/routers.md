@@ -5,6 +5,7 @@ name: Routers (APIRouter)
 kind: pattern
 difficulty: intro
 est_minutes: 11
+status: fact-checked
 related:
   - fastapi-for-ai/dependency-injection
   - fastapi-for-ai/middleware-ordering
@@ -35,8 +36,8 @@ The naive fixes fail in specific ways. Repeating `"/v1/admin"` and `Depends(requ
 decorator works until someone adds one admin route and forgets the dependency, which is an
 authorization hole that no test catches because nothing is broken from the happy path. Splitting into
 separate FastAPI apps per feature and mounting them gives isolation, but each mounted app has its own
-OpenAPI document, its own exception handlers and its own middleware stack, so clients and generated
-SDKs see several APIs instead of one. Routers are the middle ground: modular declaration, shared
+OpenAPI document, its own exception handlers and its own additional middleware stack, so clients and
+generated SDKs see several APIs instead of one. Routers are the middle ground: modular declaration, shared
 cross-cutting settings applied once per group, and a single merged application at runtime.
 
 ## How it works
@@ -67,7 +68,9 @@ replacing the chat one.
 Middleware and exception handlers belong to the app (Starlette applies them to the whole ASGI stack),
 so there is no `router.add_middleware`. If you need per-group behaviour that must wrap the request,
 such as timing or a request-size check, express it as a router dependency, or mount a separate
-sub-application with `app.mount` and accept that it has its own docs and handlers.
+sub-application with `app.mount` and accept that it has its own docs and handlers. Note the direction of
+isolation: the parent app's middleware still wraps a mounted sub-app (it sits outside the routing step),
+while the sub-app's own middleware applies only to requests under its mount path.
 
 ### Matching order
 The app's route table is checked in insertion order and the first path that matches wins. Path
@@ -181,13 +184,13 @@ middleware, accepting separate OpenAPI docs. Given the privacy stakes, I would m
 separate internal service, so the public stack cannot accidentally inherit body logging.
 
 ## Quiz
-### Q: Why does `GET /v1/models/latest` return 422 in a service that defines both routes?
+### Q: Why does `GET /v1/models/latest` return 422 in a service that defines both `/v1/models/latest` and `/v1/models/{model_id}` with `model_id: int`?
 - [ ] `latest` is a reserved word in FastAPI path parameters
 - [x] `/v1/models/{model_id}` was registered first and matched before the literal route was tried
 - [ ] The router prefix was applied twice so the literal route lives elsewhere
 - [ ] Routers sort routes alphabetically, putting `{model_id}` ahead of `latest`
 > Routes are matched in insertion order and path matching precedes validation, so the parameterised route
-> captures `latest` and then fails type validation. Registering the literal path first fixes it.
+> captures `latest` and then fails integer validation. Registering the literal path first fixes it.
 
 ### Q: You need every admin endpoint to require an admin token. What is the most robust approach?
 - [ ] Add `Depends(require_admin)` to each admin route decorator
@@ -203,4 +206,5 @@ separate internal service, so the public stack cannot accidentally inherit body 
 - [x] The mounted app has its own middleware, exception handlers and OpenAPI document
 - [ ] Mounted apps share the parent's dependencies automatically
 > Mounting attaches a separate ASGI application in-process, so it is isolated: its own docs, handlers and
-> middleware. That is the point when you need isolation, and the cost when you wanted one merged API.
+> middleware (the parent's middleware still wraps it). That is the point when you need isolation, and the
+> cost when you wanted one merged API. There is no HTTP proxying, and dependencies are not inherited.

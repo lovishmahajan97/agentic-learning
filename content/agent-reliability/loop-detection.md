@@ -5,7 +5,7 @@ name: Loop detection
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/max-step-budgets
@@ -85,6 +85,24 @@ Information is the cheapest intervention, so the rungs are ordered by cost and s
    a human.
 Each rung has its own threshold, for example inform at three, block at four, abort at six.
 
+### Loops above the tool stream
+Not every loop is one tool called twice. Two agents can hand a task back and forth (a router sends
+it to the billing agent, which decides it is a support question and sends it back); a
+critique-and-revise loop can fail to converge, each revision trading one flagged issue for another;
+a planner can regenerate essentially the same plan after every failure; a sub-agent can delegate to a
+copy of itself. The same three signals apply one level up. Hash handoffs as (from, to, task) and
+count repeats; treat a revision whose critique score did not improve as a no-progress step; and cap
+delegation depth. These loops are usually invisible to a per-agent guard, because each agent sees
+only its own short, healthy-looking history, so the detector has to live where the whole run is
+visible: the orchestrator.
+
+### Why deterministic settings make it worse
+A loop is the model making the same choice from nearly the same context. Greedy or low-temperature
+decoding makes "nearly the same context in, same action out" more likely, which is why agents run at
+temperature 0 for reproducibility tend to repeat exactly rather than drift. That is an argument for
+detection, not for raising temperature: changing the context (the inform message) changes the
+choice for a reason, while sampling noise changes it at random.
+
 ### Where it lives
 In the harness, between the model's response and tool dispatch, so it sees every action regardless of
 which model is used. Log every detection with its evidence (hashes, window contents, counts): this is
@@ -92,53 +110,65 @@ also the best data for improving tools and prompts, because it shows which error
 help the model change course.
 
 ## Example
-The guard hashes canonical (tool, args) pairs, tracks exact repeats, detects short cycles over a
-sliding window, and counts identical (action, result) pairs as no-progress; for tools marked
-pollable only repeats with an unchanged result count. The loop calls `before` ahead of dispatch and
-`after` once the tool returns, and acts on the returned rung.
+The guard escalates on *stale* repeats: calls with identical canonical (tool, args) whose result
+matched an earlier result for the same call. Calls whose results keep changing (re-running tests
+after each edit) never escalate by count; the cycle check catches them only if the actions
+themselves start repeating, such as two edits undoing each other. Pollable tools get the same ladder
+with thresholds scaled up, as a stand-in for a time budget. A refused call counts as stale, because
+blocking made no progress either, so a model that keeps insisting climbs to abort.
 
 ```python
 import hashlib, json
 from collections import Counter, deque
 
-def canon(*parts):
+def canon(*parts):     # strip volatile fields (timestamps, request ids) from results first
     raw = json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha1(raw.encode()).hexdigest()
 
 class LoopGuard:
-    def __init__(self, inform=3, block=4, abort=6, window=12, max_period=4, pollable=()):
-        self.calls, self.same, self.seen = Counter(), Counter(), set()
-        self.seq, self.pollable = deque(maxlen=window), set(pollable)
-        self.inform, self.block, self.abort, self.max_period = inform, block, abort, max_period
+    def __init__(self, inform=1, block=2, abort=4, window=12, max_period=4,
+                 pollable=(), poll_factor=10):
+        self.calls, self.stale, self.seen = Counter(), Counter(), set()
+        self.seq, self.max_period = deque(maxlen=window), max_period
+        self.pollable, self.poll_factor = set(pollable), poll_factor
+        self.inform, self.block, self.abort = inform, block, abort
 
     def _cycle(self):
         s = list(self.seq)
-        for p in range(2, self.max_period + 1):     # pure repeats (A A A) are counted below
+        for p in range(2, self.max_period + 1):  # period 1 is the stale count's job
             if len(s) >= 2 * p and s[-p:] == s[-2 * p:-p] and len(set(s[-p:])) > 1:
                 return p
         return 0
 
-    def before(self, name, args):              # call before dispatching the tool
+    def before(self, name, args):                # call before dispatching the tool
         h = canon(name, args)
         self.seq.append(h); self.calls[h] += 1
-        n, same, p = self.calls[h], self.same[h], self._cycle()
-        k = same + 1 if name in self.pollable else n   # polling counts only unchanged results
-        if k >= self.abort:
-            return "abort", f"{name}: {n} identical calls, {same} with identical results"
-        if k >= self.block and same >= 2:
-            return "block", f"refused: identical to {n - 1} earlier calls whose result did not change"
-        if k >= self.inform:
-            return "inform", f"you have called {name} with these exact arguments {n} times"
-        if p:
+        n, st = self.calls[h], self.stale[h]
+        f = self.poll_factor if name in self.pollable else 1
+        if st >= self.abort * f:
+            return "abort", f"{name}: {n} identical calls, result unchanged {st} times"
+        if st >= self.block * f:
+            self.stale[h] += 1                   # a refused call is no progress either
+            return "block", f"refused: identical to {n - 1} earlier calls; result never changed"
+        if st >= self.inform * f:
+            return "inform", f"call {n} of {name} with these exact args; last result was identical"
+        if p := self._cycle():
             return "inform", f"your last {2 * p} actions repeat with period {p}; change approach"
         return "ok", ""
 
-    def after(self, name, args, result):       # call after the tool returns
-        key = canon(name, args, str(result))   # full result: test summaries sit at the end
-        if key in self.seen:
-            self.same[canon(name, args)] += 1
-        self.seen.add(key)
+    def after(self, name, args, result):         # call after the tool returns
+        if (k := canon(name, args, str(result))) in self.seen:
+            self.stale[canon(name, args)] += 1
+        self.seen.add(k)
 ```
+
+Trace a failing `run_tests` that prints the same 40-line failure each time. Call 1 runs; call 2
+runs and its result matches call 1 (stale = 1). Call 3 runs with an inform message attached. Call 4
+is refused (stale was 2), as is call 5, and call 6 aborts the run as `stuck`: inform at three,
+block at four, abort at six. Now trace a healthy edit-test cycle: every `run_tests` output differs
+because the failing count drops, so stale stays at 0 and nothing fires. A deploy poller declared
+pollable that returns "building" over and over is informed on call 12 (ten results that repeated an
+earlier one) and refused from call 22, by which point a wall-clock budget should normally have taken over.
 
 ## Trade-offs
 - Exact-match detection is cheap with near-zero false positives, but misses loops with trivially
@@ -163,6 +193,10 @@ class LoopGuard:
   Include the exact call, the count and the fact that the result was identical.
 - Hashing arguments without canonicalization; the symptom is obvious repeats with reordered JSON keys
   that are never counted.
+- Escalating on raw call counts instead of unchanged results; the symptom is healthy edit-test
+  cycles aborted as "stuck" on the sixth test run while every run was making progress.
+- Running the detector per agent in a multi-agent system; the symptom is a task bouncing between two
+  agents for the whole budget while each agent's guard reports nothing.
 
 ## When to use
 Any agent that calls tools more than a few times per run, and especially anything that runs

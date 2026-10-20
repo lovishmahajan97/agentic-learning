@@ -5,6 +5,7 @@ name: uv / poetry / pip
 kind: tool
 difficulty: intro
 est_minutes: 13
+status: fact-checked
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -31,7 +32,9 @@ A Python project needs four things: a list of what it depends on, an exact resol
 satisfies all constraints, an isolated environment holding those versions, and a way to build and publish
 itself. pip historically did only the install step. It has a real resolver (it backtracks to satisfy
 constraints), but out of the box it does not record the result in a lockfile, does not create environments,
-and does not distinguish "what I asked for" from "what I ended up with".
+and does not distinguish "what I asked for" from "what I ended up with". (A standard lockfile format,
+`pylock.toml`, was only accepted as PEP 751 in 2025, and pip's `pip lock` command that writes it is still
+marked experimental; most teams therefore still get locking from pip-tools, Poetry or uv.)
 
 The naive workflow, `pip install` things into a venv and `pip freeze > requirements.txt`, mixes those
 concerns. The freeze captures whatever happens to be installed, including leftovers from experiments, for
@@ -72,8 +75,9 @@ uv, from Astral, is written in Rust and covers the whole toolchain:
 - **Indexes:** per-package index pinning (`[tool.uv.sources]`) handles the classic AI pain of installing
   `torch` from a CUDA-specific index while everything else comes from PyPI.
 
-uv is fast *because* of a parallel resolver and downloader, a global cache that hard-links or copies files
-into environments instead of re-downloading them, and reading wheel metadata without fetching whole wheels
+uv is fast *because* of a parallel resolver and downloader, a global cache whose files are cloned
+(copy-on-write, the default on macOS), hard-linked (the default on Linux) or copied into environments instead
+of being re-downloaded and re-unpacked, and reading wheel metadata without fetching whole wheels
 where indexes allow. The practical effect is that recreating an environment becomes cheap enough to do on
 every CI run and in every Docker build.
 
@@ -111,7 +115,8 @@ install only from the lock.
 
 ## Pitfalls
 - Installing into the system or base conda interpreter instead of a project environment; the symptom is a
-  package upgrade for one project breaking another, or permission errors on `pip install`.
+  package upgrade for one project breaking another, permission errors on `pip install`, or (on distro and
+  Homebrew Pythons that adopt PEP 668) pip refusing with `externally-managed-environment`.
 - Committing `pyproject.toml` but not the lockfile for an application; the symptom is CI and production
   resolving newer transitive versions than developers tested.
 - Mixing tools in one project (running `pip install` inside a uv- or Poetry-managed venv); the symptom is an

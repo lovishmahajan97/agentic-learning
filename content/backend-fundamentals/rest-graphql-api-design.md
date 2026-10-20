@@ -5,7 +5,7 @@ name: REST / GraphQL API design
 kind: decision
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/api-versioning-and-backward-compatibility
   - backend-fundamentals/pagination-rate-limits-api-quotas
@@ -64,6 +64,23 @@ success, `400`/`422` for invalid input, `401`/`403` for identity and permission,
 conflicts, `429` for rate limits, `5xx` for your faults. Use one error envelope everywhere; Problem
 Details (RFC 9457) gives a standard JSON shape with `type`, `title`, `status` and `detail`.
 
+Idempotency is about server state, not identical responses: a second `DELETE` of the same job may
+return `204` or `404` and both are idempotent, because the resource ends up gone either way. Pick one
+and document it, since clients write retry logic against it.
+
+Concurrent writers are HTTP's other built-in mechanism. A `GET` returns an `ETag` (a version tag for
+the representation); a client that wants to update sends `If-Match: <etag>` with its `PUT` or `PATCH`,
+and the server answers `412 Precondition Failed` if someone else changed the resource in between.
+That is optimistic concurrency without a custom `version` field, and it is what stops two editors (or
+two agents) from silently overwriting each other's changes to the same prompt template or config.
+The same tag sent as `If-None-Match` on a `GET` lets the server answer `304 Not Modified` with no
+body, which is how polling stays cheap.
+
+Fielding's original definition also requires hypermedia (responses carrying links that tell the
+client what it can do next, often called HATEOAS). Most production "REST" APIs skip it; the useful
+remnants are the `Location` header, `next` links in paginated responses and job resources that link
+to their result.
+
 Long-running AI work maps cleanly: `POST /summaries` returns `202` with a `Location` to a job resource
 that clients `GET` until it is `succeeded`, or the response itself streams as `text/event-stream`.
 Both keep proxies and timeouts happy *because* no single request has to live as long as the job.
@@ -81,6 +98,12 @@ with a 200 status, so clients must inspect the body; the GraphQL-over-HTTP spec 
 clients author queries, the server must enforce depth and cost limits, *because* an unbounded nested
 query is a denial-of-service vector. The spec does not fix a transport for subscriptions; most
 servers use WebSockets (the `graphql-ws` protocol), and SSE is a common alternative.
+
+GraphQL also changes how the contract evolves. There are no URL versions: you add fields freely
+(clients only receive what they ask for, so additions never break anyone), mark old fields
+`@deprecated(reason: ...)`, and remove them once field-level usage telemetry shows zero queries
+selecting them. That telemetry is something REST cannot give you per field without extra work, and it
+is one of GraphQL's quieter advantages for a fast-moving product schema.
 
 ### The decision
 Ask who the clients are and how many shapes they need. One product UI with screens assembled from a
@@ -156,6 +179,8 @@ type Subscription { summaryUpdated(id: ID!): Summary! }
   database logs (the N+1 pattern).
 - Holding a request open for a multi-minute AI job; the symptom is intermittent 504s from a proxy
   whose idle timeout you never configured, and clients retrying work that already ran.
+- Read-modify-write updates without `ETag`/`If-Match` or a version field; the symptom is "my change
+  disappeared" reports when two users or two agents edit the same resource within seconds.
 - Leaving GraphQL query depth and cost unlimited; the symptom is one client's nested query pinning
   the database while everything else times out.
 

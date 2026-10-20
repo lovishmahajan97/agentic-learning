@@ -5,6 +5,7 @@ name: Hugging Face (transformers, datasets, tokenizers, accelerate, PEFT, TRL)
 kind: tool
 difficulty: core
 est_minutes: 22
+status: fact-checked
 related:
   - python-for-ai/pytorch
   - python-for-ai/safetensors
@@ -53,8 +54,9 @@ tested place.
 picks the matching PyTorch class, and loads the weights (preferably `.safetensors`) into it. Task heads
 are separate classes (`...ForSequenceClassification`, `...ForCausalLM`) because the same backbone feeds
 different output layers. `device_map="auto"` (via Accelerate) spreads layers across available GPUs and
-CPU when a model does not fit on one device, and `torch_dtype` selects precision at load time so you
-never materialise an fp32 copy. `generate()` implements the decoding loop with the KV cache, sampling
+CPU when a model does not fit on one device, and `dtype` (called `torch_dtype` in older releases, still
+accepted as a deprecated alias) selects precision at load time, for example `torch.bfloat16` or `"auto"` to
+use the dtype stored in the checkpoint, so you do not materialise an fp32 copy first. `generate()` implements the decoding loop with the KV cache, sampling
 and stopping criteria. `pipeline()` wraps tokenise-model-decode for quick experiments.
 
 ### tokenizers
@@ -127,14 +129,16 @@ Parameter arithmetic for one 4096×4096 projection with r=16: full update is 16.
 trains 16×(4096+4096) = 131,072, under 1% of that matrix.
 
 ## Trade-offs
-- `from_pretrained` by name gives instant access to thousands of models, but it fetches remote code and
-  weights at runtime; pin a revision hash and mirror artifacts once you leave experimentation.
+- `from_pretrained` by name gives instant access to thousands of models, but it fetches weights at
+  runtime (and, with `trust_remote_code=True`, Python code too) from whatever the repository's branch
+  currently holds; pin a revision hash and mirror artifacts once you leave experimentation.
 - Trainer classes remove boilerplate and encode correct defaults, but they hide the loop; when you need
   a custom loss or schedule, subclassing can become harder than writing the PyTorch loop directly.
 - LoRA cuts memory and storage dramatically and allows many adapters per base, but it can underfit tasks
   that need broad behaviour change, where full fine-tuning (if affordable) does better.
 - `transformers.generate` is fine for experiments and batch jobs, but production serving with many
-  concurrent users is better handled by vLLM, SGLang or TGI, which add continuous batching and paging.
+  concurrent users is better handled by an inference engine such as vLLM or SGLang, which add continuous batching and a
+  paged KV cache.
 - `device_map="auto"` makes a too-large model run, but layers offloaded to CPU make generation
   dramatically slower; it trades failure for latency, which is only acceptable offline.
 

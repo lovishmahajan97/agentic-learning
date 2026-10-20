@@ -5,7 +5,7 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/tool-schemas-and-argument-validation
@@ -64,6 +64,19 @@ accept only `auto` and `none`, so there the instruction has to go in the prompt.
 model- and mode-dependent and always check that a `tool_use` block actually came back. With `strict: true` on the declaration (and
 `additionalProperties: false` in the schema) the API guarantees the arguments validate against the
 schema, which removes a class of parsing failures but says nothing about whether the values make sense.
+
+### Under the hood
+Nothing about tool calling is outside next-token prediction. The provider serializes your declarations
+into the prompt in a format the model was fine-tuned on, and the model emits the call as ordinary tokens
+wrapped in special delimiter tokens; the API recognises the delimiters, stops generation, parses the
+arguments into JSON and hands you a `tool_use` block. Two consequences follow. First, without `strict`,
+argument validity is a *trained tendency*, not a guarantee: the model usually produces schema-shaped JSON
+*because* it was trained on millions of such calls, but it can still omit a required field or invent an
+enum value, so your handler must validate. Second, `strict` mode works by constrained decoding: the
+schema is compiled into a grammar and, at each step, tokens that would break it are masked out before
+sampling. That is why it can *guarantee* shape, why it supports only a subset of JSON Schema (the grammar
+has to be compilable), and why it cannot help with meaning; a grammar can force `"date"` to be a string
+matching a pattern, not to be the date the user meant.
 
 ### Your side
 For each `tool_use` block you execute the matching function with `input` as its arguments and send back

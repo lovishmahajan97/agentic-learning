@@ -5,7 +5,7 @@ name: Data labeling
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/data-curation
   - training-adaptation/supervised-fine-tuning
@@ -74,7 +74,10 @@ guidelines).
    kappa extends this to many raters; Krippendorff's alpha also handles missing labels and ordinal
    scales. The Landis–Koch bands are the common reading: below 0 poor, 0–0.20 slight, 0.21–0.40 fair,
    0.41–0.60 moderate, 0.61–0.80 substantial, above 0.80 almost perfect. The bands are a convention, not
-   a test; set the acceptable bar by the stakes of the task.
+   a test; set the acceptable bar by the stakes of the task. Two cautions: kappa from a 150-item pilot
+   is itself noisy (bootstrap the items for an interval before declaring victory), and a single overall
+   kappa hides where the disagreement lives, so also read the rater-by-rater confusion matrix to see
+   which pairs of classes the guideline fails to separate.
 4. **Adjudicate and rewrite.** Every disagreement is a guideline gap or an annotator error. Fix the
    guideline, re-brief, re-pilot until agreement is acceptable.
 5. **Produce with QA.** Single-label most items, but keep 5–10% overlap to track agreement, seed gold
@@ -91,6 +94,16 @@ that data is partly trained on its own output. Keep the overlap and gold subsets
 so you can measure the acceptance bias. Active learning chooses which items to label next, those where
 the current model is uncertain or annotators disagreed, because labels on items the model already
 handles add little.
+
+### Finding label errors after the fact
+Agreement measures noise on the overlap; it does not tell you *which* single-labeled items are wrong.
+Once a first model exists, use it as a detector: train with k-fold cross-validation so every item gets a
+prediction from a model that never saw it, then rank items where the out-of-fold model confidently
+disagrees with the given label. Confident learning formalises this by estimating, per class, the
+threshold above which a disagreement is likely a label error. Review the top of that list by hand rather
+than auto-relabeling, because the model's confident disagreements also include the genuinely hard cases
+it gets wrong. An LLM used as a labeler belongs in the same framework: treat it as one more rater, compute
+its agreement with adjudicated human labels on the pilot, and only then decide where to trust it.
 
 ### Why agreement rather than accuracy
 There is no external truth to score the labels against; the labels are the truth you are constructing.
@@ -163,6 +176,10 @@ with open("tickets_sft.jsonl", "w") as f:
   items drifting over time and a model that learns a blend of two definitions.
 - Sampling items uniformly from production so rare classes get a handful of examples; the symptom is
   high overall accuracy with near-zero recall on the class you built the model for.
+- Reading a low kappa on a heavily skewed task as "the raters are careless"; with a 97% majority class,
+  kappa can be low even at very high raw agreement, and the symptom is a confusion matrix showing that
+  all the disagreement sits on the rare class, which is a guideline problem for that class, not a
+  workforce problem.
 - Rubric scores without anchor examples per level; the symptom is one annotator's "4" being another's
   "2", hidden because most items cluster in the middle.
 - Sending raw customer text to a vendor without PII redaction and a data-processing agreement; the

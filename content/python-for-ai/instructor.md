@@ -5,6 +5,7 @@ name: Instructor
 kind: tool
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - python-for-ai/pydantic
   - python-for-ai/outlines
@@ -54,9 +55,9 @@ validation layer.
 
 ### Schema in, object out
 1. **Schema generation.** Pydantic's `model_json_schema()` turns your `BaseModel` into JSON Schema,
-   including field descriptions, enums from `Literal` or `Enum`, and nested models. Field docstrings and
-   `Field(description=...)` become prompt text the model actually reads, which is why good descriptions
-   measurably matter.
+   including field descriptions, enums from `Literal` or `Enum`, and nested models. The class docstring
+   and each `Field(description=...)` land in the schema, so they become prompt text the model actually
+   reads, which is why good descriptions matter (measure it on your own eval set).
 2. **Mode selection.** The `mode` decides how the schema reaches the model. `Mode.TOOLS` (the usual
    default for OpenAI) sends it as a single tool definition and forces that tool to be called; there are
    provider-specific tool modes for Anthropic and others; `Mode.JSON` uses the provider's JSON mode; and
@@ -68,8 +69,33 @@ validation layer.
    `ValidationError` text to the conversation as a new message and calls again. The error message is
    the correction signal: a validator that raises `ValueError("end_date is before start_date")` tells
    the model precisely what to fix. Retries are driven by Tenacity, so `max_retries` accepts an integer
-   or a full Tenacity retry policy. After the last attempt it raises an `InstructorRetryException` that
-   carries the attempts made.
+   or a full Tenacity retry policy. An integer is turned into a stop-after-N-*attempts* rule, so it counts
+   total calls including the first, not extra reasks on top of it (check this against the version you
+   pin). After the last attempt it raises an `InstructorRetryException` that carries the number of
+   attempts and the last completion.
+
+### What a reask actually sends
+In tool mode the retry request is the original messages, plus an assistant message containing the
+failed tool call, plus a message carrying the `ValidationError` text and an instruction to fix it. Every
+retry therefore re-sends the whole prompt *and* grows it, so retry *k* costs more input tokens than the
+first call. This matters for long documents: reasking over a 20k-token contract repeats the 20k tokens
+each time.
+
+The expected cost follows from the first-pass failure rate. If each attempt failed independently with
+probability *p* and you allow *N* attempts, expected calls are 1 + p + p² + … + p^(N−1) and the residual
+failure rate is p^N; at p = 0.1 and N = 3 that is about 1.11 calls and 0.1% residual failures. Real
+failures are *not* independent: an input that defeats the model once tends to defeat it again with the
+same error, so the residual rate is far higher than p^N and most of the retry spend lands on a small set
+of hard inputs. Measure retry success rate per attempt number; if the second attempt rarely fixes what
+the first broke, lower `max_retries` and route failures to review or a stronger model instead.
+
+### Giving validators something to check against
+Validators can only enforce rules about the data they can see. To check that an extracted quote really
+appears in the source, pass the source at call time as a context dict (`context=` in recent versions,
+`validation_context=` in older ones); it reaches validators through Pydantic's `ValidationInfo.context`.
+This turns "the quote must be verbatim" from a prompt instruction into an enforced rule that triggers a
+reask. Equally, make fields the source may not contain `Optional`: a required field forces the model to
+produce *something*, and that something is a plausible invention.
 
 ### Beyond a single object
 `create_partial` streams a model whose fields fill in as tokens arrive, useful for UIs that render a
@@ -110,16 +136,19 @@ client = instructor.from_openai(OpenAI())
 meeting, raw = client.chat.completions.create_with_completion(
     model="gpt-4o-mini",                 # any tool-calling model
     response_model=Meeting,
-    max_retries=2,                       # up to 2 corrective reasks after the first try
+    max_retries=3,                       # at most 3 calls: the first try plus up to 2 reasks
     messages=[{"role": "user", "content":
         "Offsite with Acme from 3 to 5 March 2025. Invite ana@acme.com and raj@us.io."}],
 )
 print(meeting.model_dump())
-print(raw.usage.total_tokens)            # bill every attempt, not only the last
+print(raw.usage.total_tokens)            # recent versions sum usage across all attempts here
 ```
 
 If the first reply sets `end` before `start`, the validator's message goes back to the model and the
-second call usually fixes it; if both retries fail, the exception tells you which validation kept failing.
+second call usually fixes it; if all three attempts fail, the exception tells you which validation kept
+failing. Recent Instructor versions accumulate token usage from every attempt into the returned
+completion's `usage` for the major providers; confirm that for your version and provider before you
+build cost reporting on it.
 
 ## Trade-offs
 - One `response_model` argument replaces schema, parsing and retry glue, but you inherit a dependency
@@ -136,10 +165,14 @@ second call usually fixes it; if both retries fail, the exception tells you whic
   the symptom is a cost spike traced to a handful of requests with repeated identical errors.
 - Validators that raise vague messages like "invalid"; the model cannot act on them, and the symptom is
   retries that return the same wrong value each time.
-- Counting tokens only from the final response; usage from failed attempts is invisible unless you log
-  each attempt, so cost dashboards under-report against the provider invoice.
+- Building cost reporting on per-call logs or a provider adapter that does not accumulate usage across
+  retries; failed attempts then vanish from your numbers, and the symptom is cost dashboards that
+  under-report against the provider invoice. Verify with a forced validation failure, or log each attempt
+  through Instructor's hooks.
 - Placing the answer field before a reasoning field in the model; field order is generation order, so
   the answer is committed before the reasoning exists and accuracy drops on harder cases.
+- Making every field required when the source often omits some; the model must fill them, and the
+  symptom is plausible but absent values (a made-up phone number, a guessed date) that pass validation.
 - Treating a validated object as true; validation proves the shape and your rules, not that the
   extracted facts are in the source, which shows up as confident, well-typed hallucinations in evals.
 
@@ -149,7 +182,7 @@ schema can say, especially across more than one provider. If your only need is v
 shape from one provider, the SDK's native structured output (for example OpenAI's `parse` helper) may
 be enough without another dependency. If you self-host and need hard guarantees or very low latency,
 prefer constrained decoding. Measure first-pass validation rate, retries per request and cost per
-successful extraction; a falling first-pass rate is an early signal of prompt or model drift. In
+successful extraction, plus the fix rate of each retry attempt; a falling first-pass rate is an early signal of prompt or model drift. In
 interviews, expect to explain why validation-plus-reask and constrained decoding solve different halves
 of the structured-output problem.
 

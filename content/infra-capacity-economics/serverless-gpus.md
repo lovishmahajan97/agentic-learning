@@ -5,6 +5,7 @@ name: Serverless GPUs
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - infra-capacity-economics/keda-autoscaling
   - infra-capacity-economics/break-even-analysis
@@ -85,7 +86,8 @@ below.
 ### Billing shape
 You pay per second of container lifetime (not per request), often for CPU and memory as well, at a
 GPU rate above on-demand hourly pricing: the premium funds the idle pool and the fast storage.
-Cold-start seconds are billed. Egress, storage volumes and request overhead may be separate lines.
+Cold-start seconds are usually billed, and so is the idle tail of every scale-down window: each
+container that scales to zero was first paid for while it sat idle for the full window. Egress, storage volumes and request overhead may be separate lines.
 
 ### What it is not
 Serverless GPUs are *your container on their pooled GPUs*. Per-token model APIs are a different
@@ -102,17 +104,20 @@ premium. Measured cold start after tuning: 45 seconds. Scale-down window: 5 minu
 
 *Workload A, internal document tool:* 1,000 requests per day at ~3 GPU-seconds each is 3,000 busy
 seconds a day, ~25 hours a month, $40. Requests cluster in working hours with gaps, producing about
-40 cold starts a day: 40 × 45 s = 30 minutes a day, ~15 hours a month, $24. Idle time inside the
-5-minute windows adds perhaps as much again. Serverless total: roughly $90 against $584 dedicated,
-a six-fold saving, and the 45-second cold start is tolerable for a tool that already takes seconds.
+40 cold starts a day: 40 × 45 s = 30 minutes a day, ~15 hours a month, $24. The line people forget
+is the idle tail: 40 cold starts means 40 scale-downs, each preceded by a billed 5-minute idle window,
+so 200 minutes a day, ~100 hours a month, $160. Serverless total: roughly $225 against $584
+dedicated, about 2.6× cheaper, and the 45-second cold start is tolerable for a tool that already takes
+seconds. The idle tail is the biggest line, so the scale-down window is a cost knob: at 2 minutes it
+falls to ~$64 (if the number of cold starts does not rise much), at 10 minutes it doubles to ~$320.
 
 *Workload B, steady product traffic at 40% busy:* 292 busy hours × $1.60 = $467, cold starts
 negligible because containers stay warm. Serverless still wins by 20%. The break-even is where the
 rates cross: 0.80 ÷ 1.60 = 50% utilisation, minus whatever cold starts and idle windows add. At 60%
 busy, serverless costs $700 against $584 and dedicated wins.
 
-*Workload B with a latency SLO:* p95 response under 2 seconds. Even a 3% cold-start rate puts
-45-second responses inside the p95, which fails the SLO. Keeping one container always warm costs
+*Workload B with a latency SLO:* p95 response under 2 seconds. Any cold-start rate above 5% puts
+45-second responses at the p95, and even 1% puts them at the p99, which most teams also track. Keeping one container always warm costs
 730 × $1.60 = $1,168, double the dedicated card. The right design is a dedicated card (or
 Kubernetes replica) for the base load and serverless only for bursts above it, where the cold start
 affects a small tail of requests during ramps. The arithmetic, not the branding, picks the layout.

@@ -5,6 +5,7 @@ name: Cancellation on client disconnect
 kind: pattern
 difficulty: advanced
 est_minutes: 15
+status: fact-checked
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/streamingresponse
@@ -119,7 +120,8 @@ async def answer_question(q: str) -> str:
     try:
         return await llm_complete(q)               # httpx call, closed on cancellation
     finally:
-        await asyncio.shield(record_usage(q))      # billing record must survive cancellation
+        # billing record must survive cancellation, but bounded so it cannot hang shutdown
+        await asyncio.shield(asyncio.wait_for(record_usage(q), timeout=2.0))
 
 @app.post("/answer")
 async def answer(body: dict, request: Request):

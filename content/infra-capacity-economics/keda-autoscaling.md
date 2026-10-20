@@ -5,6 +5,7 @@ name: KEDA autoscaling
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - infra-capacity-economics/serverless-gpus
   - infra-capacity-economics/inference-clusters
@@ -65,8 +66,9 @@ KEDA does not replace the HPA; it drives it. The split is the most important thi
    metric and generates an HPA pointing at it. The HPA then applies its usual rule: for an `AverageValue`
    target (the default for most scalers), `desired = ceil(total_metric / threshold)`, clamped to
    `[minReplicaCount, maxReplicaCount]`, with a default tolerance of about 10% to avoid flapping.
-   Scale-down is damped by the HPA `behavior` stabilisation window (default 300 s); scale-up is not
-   damped by default. You tune both through `advanced.horizontalPodAutoscalerConfig.behavior`.
+   Scale-down is damped by the HPA `behavior` stabilisation window (default 300 s); scale-up has no
+   stabilisation window by default but is rate-limited by the default policy to the larger of +4 pods
+   or +100% every 15 seconds. You tune both through `advanced.horizontalPodAutoscalerConfig.behavior`.
 
 With several triggers, the HPA computes a replica count per metric and takes the maximum, so you can
 combine "queue depth" with a `cron` trigger that pre-warms capacity before the morning peak.
@@ -127,7 +129,8 @@ spec:
 ```
 
 Walkthrough: at 09:00 traffic reaches 70 concurrent requests. The HPA computes ceil(70 / 12) = 6 replicas
-and adds them at once (no scale-up damping). If only two GPU nodes are free, four pods go Pending until
+and gets there within one or two 15-second policy periods (no stabilisation window; the default scale-up
+policy allows +4 pods or +100% per period, and the `scaleUp` block above keeps those default policies). If only two GPU nodes are free, four pods go Pending until
 new nodes join, which is why a cron trigger setting 4 replicas at 08:45 is often cheaper than SLO
 misses. At 18:00 load falls to 10; the HPA removes at most one pod every two minutes after a ten-minute
 window, so a brief lull does not throw away warm replicas that cost minutes to rebuild. Note the vLLM
@@ -175,10 +178,11 @@ metric and where the 0↔1 and 1↔N loops split.
 
 ## Check yourself
 **Q:** A team autoscales its vLLM pods with an HPA on GPU utilisation targeting 70%. The deployment
-sits at its maximum replica count even overnight with a trickle of traffic, and the GPU bill is huge.
+sits at its maximum replica count even overnight, when traffic is a fraction of the daytime peak, and
+the GPU bill is huge.
 Explain what is happening and design a better setup.
 **A:** GPU "utilisation" reports the fraction of time any kernel is running, so it reads near 100% as
-soon as a few requests are decoding on each replica and says nothing about how many more could fit. The
+soon as one or two requests are decoding on each replica and says nothing about how many more could fit. The
 HPA sees every replica above target, scales up, and never finds a reason to scale down; the signal
 carries no proportional information, so capacity is set by the cap rather than by demand. Better: a
 KEDA ScaledObject on running plus waiting requests summed across

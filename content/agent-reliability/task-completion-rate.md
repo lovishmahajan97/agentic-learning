@@ -5,7 +5,7 @@ name: Task completion rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/agent-trajectory-evaluation
   - agent-reliability/tool-call-success-rate
@@ -78,12 +78,17 @@ rate*). The unassisted rate is the autonomy number; the assisted rate is the con
 support organisation cares about; mixing them hides both.
 
 ### Attempts versus tasks
-Per-attempt completion is the probability one run succeeds. For agents with retries or a human picking the
-best of several, pass@k applies. For unattended agents the relevant number is pass^k, the probability that
-every one of k attempts succeeds, because each user gets one attempt and consistency is what they
-experience. With per-attempt rate p and independence, pass^k ≈ p^k; the unbiased estimate from n trials
-with c successes is C(c, k) / C(n, k), averaged over tasks. An agent at 90% per attempt is at about 73%
-for pass^3 and 59% for pass^5.
+Per-attempt completion is the probability one run succeeds, and it is the expected fraction of
+single-shot users who get their task done. For agents with retries or a human picking the best of
+several, pass@k applies. For unattended agents add pass^k, the probability that every one of k attempts
+at the same task succeeds. It measures consistency rather than average success, and that matters
+*because* an unattended agent meets the same task again and again: an operator can hand a task class
+over without review only if it works every time, and two agents at the same per-attempt rate can differ
+completely here. One that always solves 85% of task types and always fails the rest lets you route the
+rest to humans; one that solves every task 85% of the time leaves nothing safe to automate. With
+per-attempt rate p and independence, pass^k ≈ p^k; the unbiased estimate from n trials with c successes
+is C(c, k) / C(n, k), averaged over tasks. An agent at 90% per attempt on every task is at about 73% for
+pass^3 and 59% for pass^5.
 
 ### Statistics
 Completion rates come from small samples. With n tasks and c successes, use a Wilson interval rather than
@@ -93,8 +98,13 @@ is not. Track it as a time series per release and gate releases on a stated bar 
 
 ### Offline and online
 Offline, the rate comes from a task suite with known success predicates, run N times. Online, it comes
-from production runs with verified outcomes where possible and sampled human review where not. The two
-should be reported side by side; a large gap between them is the most useful signal that the suite is not
+from production runs with verified outcomes where possible and sampled human review where not. Where
+neither exists, behavioural proxies stand in: the user repeating the same request within a short window,
+a ticket reopened, an escalation to a human, an undo of the agent's change. Proxies are biased in known
+directions (silent users count as successes), so calibrate each against reviewed samples before trusting
+it. Also note which runs *can* be verified: if only the easy task types have an inspectable end state,
+the verified online rate describes the easy types, not the product. Offline and online rates should be
+reported side by side; a large gap between them is the most useful signal that the suite is not
 representative.
 
 ## Example
@@ -164,6 +174,8 @@ print(f"pass^1 {pass_hat_k(trials, 1):.1%}  pass^3 {pass_hat_k(trials, 3):.1%}")
   humans who were quietly fixing tasks go on holiday.
 - An offline suite that never gets compared to online outcomes; the symptom is a suite at 95% and
   customers at 70%.
+- Treating "no complaint" as success online; the symptom is a high proxy completion rate that drops
+  sharply the first time someone hand-reviews a random sample of sessions.
 
 ## When to use
 Make completion rate the headline metric of any agent from the first prototype, and define its unit,
@@ -192,9 +204,9 @@ fixed the result, the other only unassisted ones. One may use the agent's self-r
 end state. One may measure per attempt, the other pass^k over repeated attempts. They may also use
 different task grains, for example sessions versus subtasks, or different task mixes. For a customer I
 would present the unassisted, verified, per-attempt rate with a Wilson interval and the denominator policy
-stated, segmented by task type, and beside it the pass^k figure for the unattended case, because that is
-the experience their users will actually have. The assisted rate goes in as a secondary line for their
-support organisation.
+stated, segmented by task type, and beside it per-task pass^k for the unattended case, because it tells
+them which task types work every time and can be automated without review. The assisted rate goes in as
+a secondary line for their support organisation.
 
 ## Quiz
 ### Q: Why is the agent's own "task complete" message a poor basis for completion rate?
@@ -208,10 +220,10 @@ support organisation.
 ### Q: An agent succeeds on 90% of attempts. Roughly what is its pass^3, and why does it matter?
 - [ ] 90%, because pass^k equals the per-attempt rate
 - [ ] About 99.9%, because three attempts give more chances to succeed
-- [x] About 73%, because all three attempts must succeed and unattended users each get one attempt
+- [x] About 73%, because all three attempts must succeed, which measures whether the task works every time it recurs
 - [ ] About 30%, because pass^k divides the rate by k
-> Under independence pass^k ≈ p^k, so 0.9³ ≈ 0.73; it measures consistency, which is what a user who gets
-> a single run experiences. The 99.9% figure, 1 − 0.1³, would be pass@3.
+> Under independence pass^k ≈ p^k, so 0.9³ ≈ 0.73; it measures consistency, which decides whether a task
+> class can run unattended as it recurs across users. The 99.9% figure, 1 − 0.1³, would be pass@3.
 
 ### Q: Which denominator policy best isolates agent quality while staying honest?
 - [ ] Count every session, including out-of-scope requests, as a task

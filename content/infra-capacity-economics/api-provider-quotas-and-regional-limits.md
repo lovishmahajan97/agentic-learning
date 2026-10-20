@@ -5,6 +5,7 @@ name: API provider quotas & regional limits
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - infra-capacity-economics/cloud-ai-architecture
   - infra-capacity-economics/capacity-planning
@@ -41,10 +42,13 @@ real and predictable.
 From the application side, the naive model is "the API is infinite, just call it; retry on error".
 It fails in three ways. First, a 429 under sustained demand is not transient: retries add load to a
 limiter that is already rejecting you, so the retry storm raises latency for every request without
-increasing throughput. Second, the limit is measured in tokens, not requests, and most providers
-reserve output tokens from `max_tokens` at admission, so a request with `max_tokens=4096` that
-produces 50 tokens still consumed 4,096 from the minute's budget; a team that never set
-`max_tokens` deliberately can find its effective capacity is a fraction of what the quota implies.
+increasing throughput. Second, the limit is measured in tokens, not requests, and several major
+providers (OpenAI, Azure OpenAI and Bedrock among them) document that they count `max_tokens`
+against the token budget at admission, so a request with `max_tokens=4096` that produces 50 tokens
+still holds 4,096 tokens of budget when it is admitted (some providers credit the unused part back
+when the response completes, others do not); a team that never set `max_tokens` deliberately can
+find its effective capacity is a fraction of what the quota implies. The exact rule differs per
+provider and has changed over time, so read the current docs for the one you use.
 Third, quotas are regional, and the model the product depends on may not be available, or may have
 a lower quota, in the only region the data-residency rule allows. A launch has been delayed by a
 quota ticket more often than by a model's quality. Treating quota as a planned resource like GPU
@@ -68,10 +72,11 @@ memory, with measurement, headroom and a growth process, is what this topic is a
 ### How counting works
 Providers implement limits as token buckets or sliding windows: the budget refills continuously, a
 request is admitted if the bucket holds enough, otherwise it is rejected with 429 and usually a
-`Retry-After` (or `retry-after-ms`) header saying when to try again. The token cost is estimated at
-admission from the prompt length plus `max_tokens` (or a default when absent), *because* the
-provider must reserve capacity before it knows the real output length; several providers then
-adjust the accounting when the response completes. Response headers report the remaining budget,
+`Retry-After` (or `retry-after-ms`) header saying when to try again. On providers that reserve output,
+the token cost is estimated at admission from the prompt length plus `max_tokens` (or a default
+when absent), *because* the provider must reserve capacity before it knows the real output length;
+some then adjust the accounting when the response completes, and others count only actual output
+against an output-token limit. Response headers report the remaining budget,
 for example OpenAI's `x-ratelimit-remaining-tokens` family and Anthropic's
 `anthropic-ratelimit-tokens-remaining` family, which a gateway can read to slow down before the
 first 429 rather than after it.
@@ -126,6 +131,8 @@ class TokenBucket:
             now = time.time(); self.tokens = min(self.cap, self.tokens + (now - self.t) * self.cap / 60); self.t = now
             if self.tokens >= n: self.tokens -= n; return True
             return False
+    def give(self, n: int):                      # refund a reservation that was never sent
+        with self.lock: self.tokens = min(self.cap, self.tokens + n)
 
 class Deployment:
     def __init__(self, name, tpm, rpm):
@@ -133,16 +140,19 @@ class Deployment:
 
 pool = [Deployment("eu-west-a", tpm=300_000, rpm=1_800), Deployment("eu-west-b", tpm=150_000, rpm=900)]
 
-def estimate(prompt_tokens: int, max_tokens: int) -> int:
-    return prompt_tokens + max_tokens          # providers reserve max_tokens at admission
+def pick(need: int):
+    for d in random.sample(pool, len(pool)):   # random order spreads load; budget only the one used
+        if d.open_until > time.time() or not d.rpm.take(1): continue
+        if d.tpm.take(need): return d
+        d.rpm.give(1)                          # token budget short: return the request slot
+    return None
 
 def call(send, prompt_tokens, max_tokens, attempts=4):
-    need = estimate(prompt_tokens, max_tokens)
+    need = prompt_tokens + max_tokens          # count max_tokens, as the provider does at admission
     for attempt in range(attempts):
-        cands = [d for d in pool if d.open_until < time.time() and d.rpm.take(1) and d.tpm.take(need)]
-        if not cands:
+        d = pick(need)
+        if d is None:
             time.sleep(min(2 ** attempt, 8) * random.uniform(0.5, 1.5)); continue   # wait in our queue
-        d = random.choice(cands)
         status, headers, body = send(d.name)
         if status == 200: return body
         if status == 429:                      # our estimate drifted or the pool is busy: back off
@@ -154,8 +164,12 @@ def call(send, prompt_tokens, max_tokens, attempts=4):
     raise RuntimeError("quota exhausted: shed or defer this request")
 ```
 
-The limiter admits only when both the request budget and the token budget have room, which is the
-condition the provider will check; running it at 85% of quota keeps a margin for estimation drift.
+The limiter admits only when both the request budget and the token budget of the chosen deployment
+have room, which is the condition the provider will check, and it debits only the deployment the
+request is actually sent to (debiting every candidate would silently burn the others' budgets).
+Running it at 85% of quota keeps a margin for estimation drift. A production version would also
+refund the unused part of `max_tokens` when the response reports its real usage, if the provider
+does the same.
 
 ## Trade-offs
 - Self-limiting below quota prevents 429 storms and lets you prioritise, but it leaves a slice of
@@ -230,10 +244,10 @@ and reserved capacity in-region.
 ### Q: Why does an overly large `max_tokens` reduce effective throughput on a tokens-per-minute quota?
 - [ ] Larger outputs always take longer to generate
 - [ ] The provider charges for `max_tokens` whether used or not
-- [x] Most providers reserve `max_tokens` against the budget at admission, so unused reservation still counts for that minute
+- [x] Providers that reserve output count `max_tokens` against the budget at admission, so unused reservation still counts for that minute
 - [ ] Requests with large `max_tokens` are routed to a slower pool
-> Billing is on actual tokens, but the rate limiter must reserve before it knows the output length,
-> so it uses `max_tokens`. Setting it from real output-length percentiles recovers the wasted
+> Billing is on actual tokens, but a limiter that reserves before it knows the output length uses
+> `max_tokens` (OpenAI, Azure OpenAI and Bedrock document this; check your provider). Setting it from real output-length percentiles recovers the wasted
 > budget.
 
 ### Q: A residency-bound workload exceeds the quota available in its region. Which option is valid?

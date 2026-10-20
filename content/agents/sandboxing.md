@@ -5,7 +5,7 @@ name: Sandboxing
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agents/computer-use
   - agents/approval-gates-for-consequential-actions
@@ -55,7 +55,10 @@ Decide what you are protecting: the host machine, your data stores, your credent
 the same infrastructure, the outside world (sending spam, attacking third parties), and the integrity
 of the agent's own task (an injected instruction that quietly changes the output). Each maps to a
 different control; a sandbox that stops host compromise but allows free egress still leaks every secret
-the agent can read.
+the agent can read. The last one, task integrity, is the one a sandbox cannot address at all: code that
+runs perfectly inside the box can still produce a subtly wrong output or a malicious diff. That threat
+is handled outside the box, by reviewing what leaves it (the pull request, the report) and by approval
+gates on consequential actions.
 
 ### Isolation tiers
 From weakest to strongest, with cost rising with strength:
@@ -63,6 +66,8 @@ From weakest to strongest, with cost rising with strength:
   escaped, fine for nothing adversarial.
 - **Container** (Linux namespaces and cgroups): isolates the filesystem view, process tree and
   resources, but shares the host kernel, so a kernel exploit escapes it. Starts in well under a second.
+  Hardening narrows the kernel surface without removing it: a seccomp profile filters syscalls, dropped
+  capabilities and a non-root (ideally rootless) runtime limit what an escape is worth.
 - **User-space kernel** (gVisor): intercepts syscalls in a sandboxed kernel implementation so most of
   the host kernel's attack surface is hidden; some syscall compatibility and performance cost.
 - **MicroVM** (Firecracker and similar): a separate guest kernel with a minimal device model, boot
@@ -85,6 +90,16 @@ integrating against) through a proxy that logs. This is the control that matters
 because an injected instruction's usual payload is "send what you can read to this address". Be honest
 about residual channels: an allowed registry or code host can still carry data out (an issue comment, a
 package upload), and DNS is a covert channel; allowlists shrink the surface, they do not close it.
+Two specific destinations deserve an explicit block. On cloud VMs, the instance metadata endpoint
+(the link-local address 169.254.169.254 on the major clouds) hands out the host's own cloud credentials
+to any process that can reach it, so a sandbox with egress to it inherits the host's IAM role. And
+internal address ranges should be denied even when the internet is allowed, because "call the internal
+admin API" is as natural an injected instruction as "send data out", and a sandbox on your network is
+already past the perimeter.
+
+Allowing a package registry also means running other people's install scripts: `pip install` of a
+typosquatted package executes its code. Inside a sandbox that is acceptable, which is much of the
+point; a proxying mirror with an allowlist or pinned hashes narrows it further.
 
 ### Credentials
 Secrets never enter the sandbox. If the agent must call an authenticated API, it calls a broker outside
@@ -167,6 +182,8 @@ def run_in_sandbox(code: str, workdir: pathlib.Path, timeout_s: int = 60) -> dic
   kernel CVE becoming a cross-tenant breach.
 - No process, disk or output limits; the symptom is a model-written loop that fills the disk, forks
   until the host stalls, or dumps 50 MB into the context window.
+- Leaving the cloud metadata endpoint or internal ranges reachable from a sandbox that has some egress;
+  the symptom is cloud API calls in the audit log made with the host's role, from inside a "sandboxed" run.
 - Persisting a writable volume across sessions for convenience; the symptom is a planted file from one
   run altering the next run's behaviour.
 
@@ -201,7 +218,8 @@ a cross-tenant risk. Ephemeral root with only the checked-out repository mounted
 directory, no cloud credential files, so a wrong `rm` or an injected script finds nothing to steal.
 Default-deny egress with a logging proxy allowlisting the package registry and the git host, which
 blocks the standard injection payload of exfiltrating what the agent can read, while accepting that the
-git host is a residual channel. No long-lived tokens inside: pull-request creation goes through a broker
+git host is a residual channel; the cloud metadata endpoint and internal ranges are explicitly denied so
+the sandbox cannot borrow the host's cloud role or reach internal services. No long-lived tokens inside: pull-request creation goes through a broker
 outside the box holding a per-run, repository-scoped, expiring token. CPU, memory, pids, disk and
 timeout limits sized from measured test-suite profiles, with output caps so logs cannot flood the
 context. Destroy on completion; the pull request is the only persistent output, and a human reviews it.

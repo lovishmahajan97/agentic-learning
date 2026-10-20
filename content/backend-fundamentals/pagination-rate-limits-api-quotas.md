@@ -5,7 +5,7 @@ name: Pagination, rate limits & API quotas
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/rest-graphql-api-design
   - backend-fundamentals/api-and-sdk-integration
@@ -67,7 +67,9 @@ unique; without it, rows sharing a timestamp at a page boundary get skipped or r
 **Cursor** pagination wraps the keyset values in an opaque token (base64 JSON, optionally HMAC-signed)
 and returns `{"data": [...], "next_cursor": "...", "has_more": true}`. The token is opaque *because* it
 is part of your contract: if clients can read it they will build it, and you can never change the sort
-or the key again. Fetch `limit + 1` rows to compute `has_more` without a count. Enforce a default and a
+or the key again. Bind the cursor to the query that produced it (include the sort and a hash of the
+filters, or sign it) so a client that reuses a cursor with different filters gets a clear 400 rather
+than a silently wrong page. Fetch `limit + 1` rows to compute `has_more` without a count. Enforce a default and a
 maximum page size on the server; clients will ask for 10,000. Omit or estimate totals, because
 `COUNT(*)` over a large table is a full scan on every page. As a consumer, loop until `has_more` is
 false and treat an invalid cursor as "start over". An agent tool that returns a list needs the same
@@ -86,6 +88,16 @@ context window.
 - **Sliding window log:** keep every request timestamp in a sorted set and count those inside the
   trailing window; exact, but memory grows with traffic. **Sliding window counter:** weight the
   previous window's count by its overlap with the trailing window; approximate, cheap, usually enough.
+- **Concurrency limit:** cap requests *in flight* rather than requests per second. Rate limits alone
+  do not bound concurrency when requests are long: by Little's law, in-flight = arrival rate ×
+  duration, so 10 requests per second of 30-second streaming completions means about 300 open
+  streams, each holding a connection and a slot on the model server. LLM gateways therefore usually
+  enforce both a rate and a max-in-flight per tenant.
+
+A worked trace makes the token bucket concrete. Take *b* = 10 and *r* = 2 per second. An idle client
+fires 15 requests at t = 0: the first 10 drain the bucket and pass, the next 5 are rejected (or wait).
+At t = 1 s the bucket holds 2 tokens, so 2 more pass. Over any interval of length *T* the bucket admits
+at most `b + r·T` requests, which is the whole contract: burst *b*, long-run rate *r*.
 
 Distributed counters must be atomic: `INCR` followed by `EXPIRE` as two commands leaves a key without
 a TTL if the process dies in between, so use a Lua script or `SET NX EX` plus `INCR`. Placement is a
@@ -202,6 +214,8 @@ tpm_bucket = TokenBucket(rate_per_sec=200_000 / 60, capacity=200_000)   # illust
   request limit because each request carries a 40k-token prompt.
 - Charging quota only after the response arrives; the symptom is tenants exceeding their cap by one
   burst's worth of concurrent requests, and failed streaming calls that are never accounted for.
+- Rate-limiting long streaming requests without a concurrency cap; the symptom is the model server
+  or connection pool saturating while every tenant is under its requests-per-minute limit.
 - Exposing a readable cursor; the symptom is integrations breaking after a release that changed the
   sort order, because clients had been hand-building cursors.
 

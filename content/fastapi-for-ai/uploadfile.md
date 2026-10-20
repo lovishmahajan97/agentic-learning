@@ -5,6 +5,7 @@ name: UploadFile
 kind: tool
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - fastapi-for-ai/request-size-limits-and-upload-security
   - fastapi-for-ai/backgroundtasks
@@ -36,8 +37,8 @@ into one `bytes` object. For a 2 KB avatar that is fine. For a 300 MB audio file
 concurrent request held in worker memory, and that memory isn't released until the handler ends. Ten
 simultaneous uploads can OOM-kill a pod. Reading `request.stream()` yourself avoids the memory cost but
 means writing your own multipart parser. `UploadFile` sits in between: Starlette's multipart parser
-streams each file part into a `SpooledTemporaryFile`, which stays in memory below a threshold and rolls
-over to a temporary file on disk above it. You get a file-like object with metadata, bounded memory,
+streams each file part into a `SpooledTemporaryFile`, which stays in memory below a threshold (1 MiB
+in current Starlette) and rolls over to a temporary file on disk above it. You get a file-like object with metadata, bounded memory,
 and no parser to write.
 
 ## How it works
@@ -65,15 +66,19 @@ upload itself, so caps belong in middleware or at the proxy. Second, temp files 
 temp directory, which on many platforms is small or memory-backed, so large uploads can fill it.
 
 ### Lifetime
-FastAPI closes request upload files once the request is finished. Handing the `UploadFile` object to
-`BackgroundTasks` or a thread that outlives the request is a classic bug, because the file may
-already be closed when the task reads it. Read the bytes, or copy to durable storage, inside the
-handler, and pass a path or object key onward.
+An `UploadFile` is request-scoped: FastAPI closes it, and the temp file is deleted, when the request's
+lifecycle ends. Exactly when has changed between releases. Some FastAPI versions close upload files as
+soon as the endpoint returns, *before* `BackgroundTasks` run, so a task that reads the object hits
+"I/O operation on closed file". Current versions close them only after the response and its
+background tasks finish. Don't depend on either: a thread or task that outlives the request, a job
+queue, or a worker in another process can never use the object safely. Read the bytes, or copy to
+durable storage, inside the handler, and pass a path or object key onward.
 
 ### JSON plus files
 A request is either JSON or multipart, not both. To send metadata alongside a file, use `Form()`
 fields, or one form field containing a JSON string that you validate with a Pydantic model's
-`model_validate_json`.
+`model_validate_json`. Since FastAPI 0.113 you can also bind a Pydantic model to the form fields
+themselves (`meta: Annotated[Meta, Form()]`), which suits flat options.
 
 ### Alternatives
 `bytes = File()` is fine for small, bounded files. Streaming the raw body via `request.stream()` (for
@@ -118,7 +123,7 @@ async def transcribe(audio: UploadFile, meta: str = Form("{}")):
 ```
 
 A client sends it with `curl -F "audio=@call.m4a;type=audio/mp4" -F 'meta={"language":"de"}'`. A
-150 MB recording is spooled to temp disk by the parser, then copied in 150 one-MiB reads, so the
+150 MiB recording is spooled to temp disk by the parser, then copied in 150 one-MiB reads, so the
 handler's memory stays around a megabyte. The SHA-256 lets you deduplicate repeat uploads. The real
 file write uses a sync `open`, which in production should be async object-storage I/O or run in a
 thread.
@@ -139,8 +144,9 @@ thread.
 ## Pitfalls
 - Using `bytes = File()` for large media. The symptom is worker memory climbing with concurrent uploads
   until pods are OOM-killed under modest load.
-- Passing the `UploadFile` to a background task. The symptom is intermittent "I/O operation on closed
-  file" errors that appear only in the background job.
+- Passing the `UploadFile` to a background task or another thread. The symptom is "I/O operation on
+  closed file" errors that appear only in the background job, or code that works until a FastAPI
+  upgrade changes when upload files are closed, or until the work moves to a queue.
 - Writing to disk at `audio.filename`. The symptom is files landing outside the intended directory or
   overwriting each other, which is a path-traversal vulnerability.
 - Calling `audio.file.read()` (sync) on a large spooled file inside an `async def` handler. The symptom
@@ -187,13 +193,13 @@ on a properly sized volume.
 > UploadFile wraps a SpooledTemporaryFile that rolls over to disk, so memory stays small. bytes = File()
 > materialises the whole part in RAM. Neither validates type or streams to the handler early.
 
-### Q: Why might reading an `UploadFile` inside a `BackgroundTasks` function fail?
-- [ ] Background tasks cannot perform I/O
-- [ ] UploadFile objects cannot be pickled to the task queue
-- [x] The request's upload files are closed when the request finishes, which can happen before the task reads them
+### Q: Why should a handler persist an upload and pass a storage key to follow-up work, rather than pass the `UploadFile` object?
+- [ ] Background tasks cannot perform file I/O
+- [ ] An `UploadFile` is always empty once the handler has returned
+- [x] The object wraps a request-scoped temp file that FastAPI closes and deletes when the request lifecycle ends, sometimes before BackgroundTasks run
 - [ ] Background tasks run before the multipart body is parsed
-> The file belongs to the request's lifetime. Read the content or persist it to storage inside the
-> handler and pass a path or key, so the task does not depend on a closed temporary file.
+> The temp file belongs to the request. Depending on the FastAPI version it may already be closed when a
+> background task runs, and it can never reach a queue worker or survive a crash. A path or object key can.
 
 ### Q: A client needs to send a PDF together with structured options. What is the correct FastAPI approach?
 - [ ] Declare a Pydantic model body and an UploadFile in the same handler as JSON

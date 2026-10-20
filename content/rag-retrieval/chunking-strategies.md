@@ -5,7 +5,7 @@ name: Chunking strategies (fixed, recursive, semantic)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/chunk-overlap
   - rag-retrieval/retrieval-granularity
@@ -80,8 +80,13 @@ Split the text into sentences and embed each one. Compute the cosine similarity 
 sentences (or between each sentence and a small window of its neighbours). Mark a breakpoint wherever
 similarity drops below a threshold, which can be absolute, a percentile of all drops, or a number of
 standard deviations below the mean. Sentences between breakpoints form a chunk, with a size cap and a
-fallback split for runs that grow too long. Because boundaries follow topic shifts rather than
-formatting, the result is topically coherent chunks even in unstructured prose such as meeting
+fallback split for runs that grow too long. An illustrative run over six transcript
+sentences: consecutive similarities of 0.81, 0.78, 0.34, 0.80, 0.76. The drop to 0.34 between sentences
+3 and 4 is far below the others, so a percentile rule (break on the largest few percent of distances,
+where distance = 1 − similarity) places one boundary there and yields two chunks of three sentences.
+The rule is relative on purpose: absolute cosine levels differ by embedding model, so a fixed
+threshold such as 0.5 that works under one model splits everywhere or nowhere under another. Because
+boundaries follow topic shifts rather than formatting, the result is topically coherent chunks even in unstructured prose such as meeting
 transcripts or long narrative. The costs are real: one embedding call per sentence before you have
 even embedded the chunks, a threshold that must be tuned per corpus, highly variable chunk sizes, and
 little gain over recursive splitting on text that already has paragraphs and headings.
@@ -159,6 +164,8 @@ for c in recursive_split(doc, max_len=200):
   after every "improvement" and an argument nobody can settle.
 - Leaving tiny trailing chunks (a 12-token final paragraph) in the index; the symptom is short,
   near-empty chunks crowding the top-k for generic queries because their vectors are unspecific.
+- Running semantic chunking with an absolute similarity threshold copied from another setup; the
+  symptom is either one giant chunk per document or one chunk per sentence after an embedding-model swap.
 - Running semantic chunking over short, single-topic documents; the symptom is one chunk per document,
   and the whole exercise collapses back into whole-document embedding with extra cost.
 

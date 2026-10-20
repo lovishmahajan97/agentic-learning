@@ -5,6 +5,7 @@ name: FinOps
 kind: practice
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - observability/token-cost-tracking
   - infra-capacity-economics/cost-allocation-by-tenant-and-feature
@@ -55,13 +56,28 @@ every call passes through: an AI gateway or an SDK wrapper. Each call records th
 cached token counts, latency, tenant, feature, environment, prompt version and a request id that joins to
 your traces. Cost is computed at record time from a versioned price table and stored alongside the price
 used, *because* prices change and a cost history that silently re-prices itself is useless for trend
-analysis. Events flow to the warehouse where every other business metric lives.
+analysis. Token counts come from the provider's response usage fields, not from your own tokenizer
+estimate, *because* tokenizers differ between models and estimates drift. Events flow to the warehouse
+where every other business metric lives, and once a month the metered total is reconciled against the
+invoice; the gap is a data-quality KPI, and a growing one means a call path is bypassing the gateway or a
+price in the table is stale. Normalizing cloud and AI billing into one schema is what the FinOps
+Foundation's FOCUS specification is for, which matters once GPU, API and SaaS spend must be read together.
 
 The gateway is the structural fix for the root cause of unattributable spend: one shared API key per
 company. Per-team or per-feature keys plus mandatory tags make unallocated spend visible as a bucket to be
 driven toward zero. Start with *showback*, showing each team its own spend, and move to *chargeback*,
 actually debiting internal budgets, only once allocation is trusted; chargeback on shaky numbers produces
 arguments about the numbers instead of decisions about the spend.
+
+### Shared costs: allocate them by a driver, not evenly
+Not every dollar has a natural tag. A self-hosted GPU pool serves many features; an embedding index, an
+eval suite and the platform team serve everyone; a one-year reservation is paid upfront. Allocate each by
+the driver that causes it: GPU pool cost by GPU-seconds or tokens served per feature (decode tokens weigh
+more than prefill tokens for the reason above), reservations amortized monthly over the term rather than
+booked in the month they were paid, platform cost by a stated proxy such as share of requests. Splitting
+evenly is the tempting shortcut and it is wrong *because* it subsidizes the heavy users with the light
+ones, which hides exactly the unprofitable tenant the exercise was meant to find. Whatever the rule, write
+it down; disputes about allocation are disputes about the rule, and a written rule ends them.
 
 ### Unit economics: telling growth from waste
 Total spend is the wrong headline. The question is whether cost per unit of value moved: cost per
@@ -71,15 +87,20 @@ distinguishes them, and only the unit view lets product price the feature.
 
 ### Optimize: usage levers and rate levers are different jobs
 *Usage optimization* means consuming fewer units: prompt trimming, prompt and response caching, routing
-cheap models first, output caps, batch endpoints for offline work, step and token budgets on agents,
+cheap models first, output caps, step and token budgets on agents,
 retiring idle GPU replicas. *Rate optimization* means paying less per unit: committed-use and provisioned
-throughput discounts, reserved GPUs, negotiated enterprise pricing, batch pricing tiers. They are kept
+throughput discounts, reserved GPUs, negotiated enterprise pricing, and moving offline work to
+discounted batch endpoints, which bill the same tokens at a lower price. They are kept
 separate because they belong to different people (engineering versus procurement), move on different
 timescales, and mixing them hides which one is actually working.
 
 ### Operate: budgets, anomalies, forecasts, owners
 Each feature and team gets a budget with an alert on *forecast* (month-to-date burn rate projected to
-month end), not just on the threshold, because by the time a threshold fires the money is spent. Daily
+month end), not just on the threshold, because by the time a threshold fires the money is spent. Project
+from the *recent* daily rate (say, the trailing three days) as well as the month-to-date average, because
+a step change on day eight is diluted by seven normal days in the average and shows up in full in the
+recent rate. Maturity is gradual, and the FinOps Foundation describes it as crawl, walk, run: a daily
+report first, then budgets and showback, then forecasts, anomaly detection and chargeback. Daily
 anomaly detection runs per dimension: a feature whose tokens per task tripled overnight is a bug, not a
 trend. A named owner reviews each cost centre weekly. Guardrails live in the gateway: per-key spend
 limits, model allowlists, default output caps. New features carry a cost estimate through design review,
@@ -100,7 +121,7 @@ in a real system they are loaded from the provider's current price list and vers
 import time, uuid
 from collections import defaultdict
 
-PRICES = {  # USD per 1M tokens, illustrative; load and version from the provider's price page
+PRICES = {  # USD per 1M tokens, illustrative; "in" = uncached input tokens
     "large-model": {"in": 3.00, "out": 15.00, "cached_in": 0.30},
     "small-model": {"in": 0.15, "out": 0.60,  "cached_in": 0.015},
 }
@@ -141,7 +162,11 @@ The point of the output is the first line. On day ten the search feature has spe
 $300 budget, so a threshold alert would stay silent for two more weeks; the burn-rate forecast flags it
 today. Because every event carries `prompt_version` and token counts, the next query, tokens per call by
 prompt version, shows that `v12` doubled input tokens, and the fix is a prompt rollback rather than a
-budget increase.
+budget increase. The simulation runs the whole month-to-date at the new rate; in real traffic, if `v12`
+shipped on day eight, the month-to-date average would mix in seven cheaper days, so the burn-rate forecast
+would understate the overrun and a trailing-days forecast would show it in full. Note too where the money
+is: each search call costs about $0.00046, and 372 of its 462 micro-dollars are input tokens, so context
+size, not output length, is the lever for that feature.
 
 ## Trade-offs
 - A gateway chokepoint gives complete attribution and enforcement, but it is one more hop of latency and a
@@ -166,6 +191,8 @@ budget increase.
   invoice by a wide margin and loses everyone's trust.
 - Ignoring non-production spend; the symptom is production explaining half the bill while evals, load tests
   and developer experiments own the rest with no owner.
+- Splitting a shared GPU pool or platform cost evenly across teams; the symptom is a margin report where
+  every tenant looks equally profitable and the heavy tenant's growth never shows up as a cost.
 - Agents without step and token budgets; the symptom is a single stuck loop becoming the largest line item
   of the day.
 
@@ -196,8 +223,8 @@ and compute tokens per task and cost per successful task before and after the ju
 possible. If volume grew and unit cost is flat, the increase is growth, and the right response is to show
 margin per task and leave the feature alone. If tokens per task jumped in one feature, it is a regression,
 typically a retrieval change, a prompt edit or an agent loop retrying, and fixing it recovers most of the
-delta without touching anything else. If the model or price mix changed, the lever is rate: routing,
-committed-use pricing or a tier change. Then install the guardrails that were missing: per-feature budgets
+delta without touching anything else. If the model or price mix changed, the levers are routing traffic
+back to cheaper models (usage) and committed-use pricing or a tier change (rate). Then install the guardrails that were missing: per-feature budgets
 with burn-rate forecasts, daily anomaly alerts on tokens per task, per-key limits and a cost estimate in
 design review, so the next jump is caught in a day rather than on the invoice.
 
@@ -214,11 +241,11 @@ design review, so the next jump is caught in a day rather than on the invoice.
 ### Q: Which of these is a usage-optimization lever rather than a rate-optimization lever?
 - [ ] Signing a committed-use discount with the provider
 - [ ] Negotiating enterprise pricing for the large model
-- [x] Enabling prompt caching so repeated prefixes consume fewer billable input tokens
+- [x] Trimming the prompt and capping output length so each task consumes fewer tokens
 - [ ] Reserving GPU instances for a one-year term
-> Rate levers change the price paid per unit and belong to procurement. Caching reduces the number of
-> billable units consumed, which is an engineering change to usage; keeping the two apart shows which
-> lever is working.
+> Rate levers change the price paid per unit and belong to procurement. Trimming and capping reduce the
+> number of billable units consumed, which is an engineering change to usage; keeping the two apart shows
+> which lever is working.
 
 ### Q: Total spend doubled this month while cost per successful task stayed flat. What is the FinOps reading?
 - [ ] Waste doubled and spend should be cut immediately

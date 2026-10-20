@@ -5,6 +5,7 @@ name: GPU sizing (VRAM math)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -80,14 +81,14 @@ Now the fits, taking a 0.9 utilisation budget and ~1 GB overhead per card:
   conversations.
 - 8B bf16 on an 80 GB H100: 72 − 16 − 1 = 55 GB ≈ 420k tokens ≈ a hundred 4k conversations, at which
   point memory bandwidth rather than memory capacity becomes the limit.
-- 70B bf16 on two 80 GB H100s: 144 − 141 − 2 ≈ 1 GB for KV ≈ 3k tokens *total*. It "fits" but can
+- 70B bf16 on two 80 GB H100s: 144 − 141.2 − 2 ≈ 0.8 GB for KV ≈ 2.4k tokens *total*. It "fits" but can
   barely serve one request; this is the case the formula catches and intuition misses.
 - 70B in fp8 on the same two cards: 144 − 71 − 2 = 71 GB ≈ 220k tokens, a comfortable server.
 - 70B in int4 (~39 GB) on one 80 GB card: 72 − 39 − 1 = 32 GB ≈ 100k tokens, with a quality cost that
   must be evaluated, not assumed.
 
 A long-context request is the other surprise: one 128k-token prompt on the 8B model is 128k × 128 KB
-= 16 GB of cache, as much as the weights, and a single such request can evict everything else.
+= 16 GiB (about 17 GB) of cache, as much as the weights, and a single such request can evict everything else.
 
 ### The training budget
 Full fine-tuning with mixed precision and Adam keeps, per parameter: 2 bytes of bf16 weights, 2 bytes
@@ -100,7 +101,8 @@ layer boundaries. LoRA changes the equation *because* the base weights are froze
 per parameter with no gradient or optimizer state, and only the adapter (typically well under 1% of
 parameters) carries the 16-byte burden, so the 8B model fine-tunes in roughly 16 GB plus activations.
 QLoRA stores the frozen base in 4-bit, about 4.5 GB for 8B, which is what makes 24 GB cards viable.
-Eight-bit optimizer implementations cut Adam's 8 bytes to 2 when the master copy is also dropped.
+Eight-bit optimizers (for example bitsandbytes' 8-bit Adam) store each Adam moment in one byte with
+block-wise scales, cutting the optimizer term from 8 bytes per parameter to about 2.
 
 ### Multi-GPU arithmetic
 Tensor parallelism divides both weights and KV cache by the TP degree, while each card keeps its own
@@ -136,7 +138,7 @@ def plan(name, params_b, n_layers, n_kv_heads, head_dim, vram_gb, n_gpus=1,
 
 plan("8B bf16 / L4 24GB",       8.0, 32, 8, 128, 24)             # ~35k tok, ~9 seqs
 plan("8B bf16 / H100 80GB",     8.0, 32, 8, 128, 80)             # ~420k tok, ~100 seqs
-plan("70B bf16 / 2xH100",      70.6, 80, 8, 128, 80, n_gpus=2)   # ~2k tok: unusable
+plan("70B bf16 / 2xH100",      70.6, 80, 8, 128, 80, n_gpus=2)   # ~2.4k tok: unusable
 plan("70B fp8 / 2xH100",       70.6, 80, 8, 128, 80, n_gpus=2, bytes_w=1)     # ~220k tok
 plan("70B int4 / 1xH100",      70.6, 80, 8, 128, 80, bytes_w=0.55)            # ~100k tok
 ```
@@ -211,7 +213,7 @@ contexts will be bandwidth-bound on one card, so latency targets need checking t
 - [x] After weights and overhead only about a gigabyte remains for KV cache, so the server can hold only a few thousand tokens
 - [ ] bf16 is not supported across tensor-parallel ranks
 > The usable budget is about 144 GB at 0.9 utilisation; weights take 141 GB and overhead about 2 GB,
-> leaving roughly 3k tokens of cache at 320 KB per token. The model technically loads but cannot serve
+> leaving under a gigabyte, roughly 2.4k tokens of cache at 320 KB per token. The model technically loads but cannot serve
 > real traffic, which is why fp8 or four cards are the usual choices.
 
 ### Q: Which single change most increases the number of concurrent 4k-token requests an 8B bf16 model can hold on a 24 GB card?

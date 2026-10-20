@@ -5,6 +5,7 @@ name: Ingestion pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - data-architecture/etl-elt-for-rag
   - data-architecture/document-processing-pipelines
@@ -55,7 +56,8 @@ four answers, in rising order of fidelity and cost.
    updates and deletes. Cost is O(corpus) per run for the listing (not for the content, if the source gives
    a cheap version or ETag), so it is fine for a few hundred thousand items and wrong for a billion rows.
 2. **Cursor / watermark.** Query `WHERE updated_at > :last_seen` or use a provider's change token
-   (Microsoft Graph delta queries, Google Drive's changes feed). Cheap and incremental, but a plain
+   (Microsoft Graph delta queries, Google Drive's changes feed). Cheap and incremental. Provider change
+   tokens usually do report deletions (Graph delta marks removed items, for example), but a plain
    timestamp cursor misses hard deletes and can miss rows written with a timestamp earlier than the
    watermark by clock skew or long transactions. The fix is to read with `>=` and a small overlap window
    and dedupe by id, and to pair it with a periodic snapshot diff that reconciles deletes.
@@ -81,7 +83,9 @@ be replayed from them without touching the source again.
 ### Make every stage idempotent
 The natural key of an item is `(source, source_id)`. Content hashing on top of it lets the pipeline skip
 items whose bytes have not changed even when the source claims an update (many SaaS APIs bump
-`updated_at` on permission changes or views). Downstream writes are upserts keyed by that identity, and
+`updated_at` on permission changes or views). Skipping re-parsing and re-embedding is right in that case,
+but the ACL must still be compared and propagated, because a permission change with identical bytes is
+exactly the update retrieval filtering depends on. Downstream writes are upserts keyed by that identity, and
 deletes are written as tombstone rows carrying the same key, so a replay of any window produces the same
 end state. The watermark is committed *after* the batch's writes are durable; committing it first is the
 classic bug that turns a crash into a silent gap.
@@ -105,33 +109,38 @@ id changed). These three numbers answer "is the index fresh?" without reading th
 
 ## Example
 An incremental connector loop for a cursor-based source. It reads with an overlap window, dedupes by id,
-skips unchanged content by hash, writes tombstones for deletes reported by the source, and commits the
-watermark only after the batch is durable.
+skips re-embedding unchanged content by hash while still propagating ACL changes, writes tombstones for
+deletes reported by the source, and commits the watermark only after the batch is durable.
 
 ```python
 import hashlib, datetime as dt
 
 OVERLAP = dt.timedelta(minutes=5)          # tolerate clock skew / late commits at the source
+EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
 
 def sync_once(source, landing, state):
-    since = state.get("watermark", dt.datetime.min) - OVERLAP
-    seen, newest = set(), since
-    for item in source.list_changes(since=since):          # yields {id, updated_at, deleted, fetch}
+    wm = state.get("watermark")                              # tz-aware datetime, or None on first run
+    since = wm - OVERLAP if wm else EPOCH
+    seen, newest = set(), wm or EPOCH
+    for item in source.list_changes(since=since):          # yields {id, updated_at, deleted, acl, fetch}
         if item["id"] in seen:
-            continue                                         # overlap window re-delivered it
+            continue                                         # same id twice in one listing (paged API)
         seen.add(item["id"])
+        newest = max(newest, item["updated_at"])
         key = (source.name, item["id"])
         if item["deleted"]:
-            landing.write_tombstone(key, at=item["updated_at"])
-        else:
-            raw = item["fetch"]()                            # bytes; respects source rate limits
-            digest = hashlib.sha256(raw).hexdigest()
-            if landing.latest_hash(key) == digest:
-                continue                                     # metadata-only change: skip downstream work
-            landing.write_version(key, raw, hash=digest, acl=item.get("acl"),
-                                  fetched_at=dt.datetime.utcnow())
-            landing.emit_event("document.changed", key=key, hash=digest)
-        newest = max(newest, item["updated_at"])
+            landing.write_tombstone(key, at=item["updated_at"])   # idempotent if re-delivered
+            continue
+        raw = item["fetch"]()                                # bytes; respects source rate limits
+        digest = hashlib.sha256(raw).hexdigest()
+        if landing.latest_hash(key) == digest:               # overlap re-delivery or metadata-only bump
+            if landing.latest_acl(key) != item.get("acl"):
+                landing.update_acl(key, item.get("acl"))     # permissions changed: no re-embed needed
+                landing.emit_event("document.acl_changed", key=key)
+            continue
+        landing.write_version(key, raw, hash=digest, acl=item.get("acl"),
+                              fetched_at=dt.datetime.now(dt.timezone.utc))
+        landing.emit_event("document.changed", key=key, hash=digest)
     landing.flush()                                          # make writes durable first ...
     state["watermark"] = newest                              # ... then advance the cursor
     return len(seen)
@@ -162,7 +171,8 @@ the standard pairing for sources that only expose `updated_at`.
 - Dropping source ACLs during ingestion "to simplify"; the symptom is a user retrieving a document they
   could not open in the source system, which is a security incident, not a bug.
 - Re-fetching on every `updated_at` bump without a content hash; the symptom is a large embedding bill
-  for a corpus that barely changes, because the SaaS source bumps timestamps on permission edits.
+  for a corpus that barely changes, because the SaaS source bumps timestamps on permission edits. The
+  opposite error, skipping hash-identical items entirely, silently drops those permission edits.
 - No dead-letter path; the symptom is a whole nightly run that fails repeatedly on the same oversized or
   malformed file while thousands of healthy documents go stale.
 

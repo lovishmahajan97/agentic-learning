@@ -5,7 +5,7 @@ name: Protocols, generics and structural typing
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/type-hints
   - python-for-ai/dependency-injection-and-interface-boundaries
@@ -80,6 +80,21 @@ Compare this with an abstract base class (`abc.ABC` plus `@abstractmethod`): the
 enforces at instantiation time (a subclass missing a method cannot be constructed), and can carry
 shared default implementations. Protocols enforce only statically and carry no behaviour. Use the
 ABC when you own every implementation; use the Protocol when implementations come from outside.
+
+### What a protocol member actually promises
+A bare attribute declaration (`dim: int`) promises a *readable and writable* attribute, because a
+consumer typed against the protocol is allowed to assign `e.dim = 768`. So a class exposing `dim`
+as a read-only `@property` does not satisfy it, and for the same reason as `list` invariance (next
+section), a settable attribute must match its type exactly, not just a subtype. If consumers only
+read it, declare it in the protocol as `@property def dim(self) -> int: ...`, which accepts plain
+attributes, properties and subtypes alike. Ask for the least you need, here as everywhere.
+
+A protocol can also be generic, which is where the two halves of this lesson meet:
+`class Store[T](Protocol): def get(self, key: str) -> T | None: ...` (or `Protocol[T]` on older
+versions) lets a Redis-backed `Store[Session]` and an in-memory `Store[Session]` stand in for each
+other while the checker still knows what `get` returns. And when the interface is a single call
+with keyword arguments or overloads that `Callable[...]` cannot express (a streaming callback taking
+`token: str, *, final: bool`), a *callback protocol* with only `__call__` defined types it exactly.
 
 ### Generics: type variables
 A `TypeVar` is a placeholder the checker binds per use. `def first[T](xs: Sequence[T]) -> T` (PEP
@@ -196,8 +211,11 @@ because `self.vecs` is annotated; an unannotated `[]` would leak `Any` and hide 
 - Relying on `isinstance(x, SomeProtocol)` to confirm a vendor object is safe to call; the check
   passes with the wrong signature and the failure appears later as a `TypeError` inside the call.
 - Using a bare `TypeVar` in a signature where it appears only once (`def f(x: T) -> None`); it
-  it relates nothing to anything (pyright warns about exactly this), usually a sign `object` was
+  relates nothing to anything (pyright warns about exactly this), usually a sign `object` was
   intended.
+- Declaring a protocol attribute as `dim: int` when every implementation exposes a read-only
+  property; the symptom is "protocol member dim is not settable" errors on classes that look
+  correct. Declare it as a `@property` in the protocol.
 - Writing a decorator typed `Callable[..., Any]` and wondering why mypy never catches wrong
   arguments to decorated LLM-call functions; the signature was erased.
 

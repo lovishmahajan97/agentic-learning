@@ -5,6 +5,7 @@ name: response_model
 kind: concept
 difficulty: core
 est_minutes: 11
+status: reviewed
 related:
   - fastapi-for-ai/pydantic-request-response-models
   - python-for-ai/pydantic
@@ -51,8 +52,9 @@ so reliably.
 ### Declaring it
 Either `@app.get("/x", response_model=Item)` or a return annotation `async def f() -> Item:`; recent
 FastAPI versions treat the annotation as the response model, and the explicit parameter wins when both
-are present. `response_model=None` turns the machinery off, which you need when the annotation is a
-`Response` subclass or a type the validator cannot build a field for.
+are present. `response_model=None` turns the machinery off, which you need when the annotation is a type the
+validator cannot build a field for, such as `Response | dict`. A plain `Response` subclass
+annotation (`-> StreamingResponse`) is detected and skipped automatically.
 
 ### What happens to the return value
 1. The handler returns something: a model instance, a dict, an ORM object, a list.
@@ -68,8 +70,9 @@ are present. `response_model=None` turns the machinery off, which you need when 
    true (the default), and `response_model_include`, `response_model_exclude`,
    `response_model_exclude_unset`, `response_model_exclude_defaults` and `response_model_exclude_none`
    control which fields appear.
-5. The result goes through the route's `response_class` (`JSONResponse` by default; `ORJSONResponse`
-   for speed) to bytes.
+5. The result goes through the route's `response_class` (`JSONResponse` by default) to bytes. The
+   serialisation fast path has changed across FastAPI releases (`ORJSONResponse` was the classic speed
+   option), so check your version's docs before optimising it.
 
 ### The filtering semantics that matter
 - Undeclared fields on the returned object are dropped. This is the allow-list behaviour and the
@@ -89,16 +92,20 @@ contract tests work from the same source as the server. Other status codes are d
 `responses={404: {"model": ErrorOut}}`.
 
 ### Cost
-Validating and re-serialising the output is extra CPU on the event loop, proportional to payload size.
+Validating and re-serialising the output is extra CPU proportional to payload size, spent on the event
+loop for `async def` routes (FastAPI moves it to the thread pool for `def` routes).
 For chat responses it is negligible. For an endpoint returning thousands of embedding vectors it is
 measurable, and returning a pre-built `ORJSONResponse`, giving up validation on that route, is a
 legitimate choice once you have measured it.
 
 ## Example
-An internal model with fields that must never leave the process, a public model, and a handler that
-returns the internal object unchanged. The declaration does the filtering; `finish_reason` is omitted
-when `None` because of `response_model_exclude_none`. Returning an internal object with `text=None`
-would raise `ResponseValidationError` and produce a 500 rather than a malformed success.
+A public model, an internal subclass that adds fields which must never leave the process, and a
+handler that returns the internal object unchanged. Subclassing keeps the type checker happy (a
+`CompletionInternal` *is* a `CompletionOut`), and FastAPI still filters: it does not trust
+`isinstance`, it dumps the returned object and re-validates the data through the declared model, so
+only `CompletionOut`'s four fields survive. `finish_reason` is omitted when `None` because of
+`response_model_exclude_none`. Returning a dict without `text` would raise `ResponseValidationError`
+and produce a 500 rather than a malformed success.
 
 ```python
 from typing import Annotated, Optional
@@ -107,19 +114,15 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-class CompletionInternal(BaseModel):          # what the service works with
-    id: str
-    text: str
-    model: str
-    finish_reason: Optional[str] = None
-    cost_usd: float                           # never public
-    provider_raw: dict                        # never public
-
 class CompletionOut(BaseModel):               # what clients receive
     id: str
     text: str
     model: str
     finish_reason: Optional[str] = None
+
+class CompletionInternal(CompletionOut):      # what the service works with
+    cost_usd: float                           # never public
+    provider_raw: dict                        # never public
 
 def run_model(prompt: str) -> CompletionInternal:
     return CompletionInternal(id="cmpl_1", text=prompt[::-1], model="demo-1", cost_usd=0.0003,
@@ -130,6 +133,7 @@ async def complete(prompt: Annotated[str, Body(embed=True)]) -> CompletionOut:
     internal = run_model(prompt)
     return internal        # superset is fine: cost_usd and provider_raw are dropped on the way out
 
+# POST /complete {"prompt": "abc"} -> {"id": "cmpl_1", "text": "cba", "model": "demo-1"}
 # GET /openapi.json shows CompletionOut as the 200 schema; cost_usd and provider_raw do not appear.
 ```
 
@@ -140,7 +144,7 @@ async def complete(prompt: Annotated[str, Body(embed=True)]) -> CompletionOut:
 - Validation surfaces shape bugs as 500s instead of malformed success responses, which is right for
   correctness, but means a benign internal change can take a route down until the model is updated.
 - Declaring the model in the return annotation keeps code and contract together, yet an annotation
-  that is not a valid Pydantic type (a `Response` subclass, an awkward union) needs
+  that is not a valid Pydantic type (for example a union of `Response` and `dict`) needs
   `response_model=None` or an explicit model.
 - Re-serialising through the model costs CPU per byte of output; negligible for chat, measurable for
   bulk embeddings, where a raw `ORJSONResponse` trades the guarantee for speed.
@@ -155,6 +159,10 @@ async def complete(prompt: Annotated[str, Body(embed=True)]) -> CompletionOut:
   that only make sense in output, and output exposes fields that only make sense in input.
 - Treating a `ResponseValidationError` 500 as a library bug and disabling response validation; symptom:
   a handler branch returns the wrong shape and ships for months.
+- Putting `extra="forbid"` on response models (often via a shared base class copied from request
+  models); the superset a handler returns is now a validation failure instead of being filtered.
+  Symptom: routes that return ORM rows or internal objects start failing with 500s and
+  `extra_forbidden` in the `ResponseValidationError`. Forbid extras on input, ignore them on output.
 - Annotating a handler `-> dict` or `-> Any`; symptom: the contract silently loosens and filtering
   stops, without anyone having touched `response_model=`.
 

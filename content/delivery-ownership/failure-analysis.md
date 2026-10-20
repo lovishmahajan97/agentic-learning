@@ -5,6 +5,7 @@ name: Failure analysis
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - delivery-ownership/production-debugging
   - delivery-ownership/root-cause-analysis-and-postmortems
@@ -52,14 +53,22 @@ rather than the cases someone forwarded. A sample of a few hundred is usually en
 failure modes, because you are estimating proportions, not finding every bug. Also pull some
 *successes*: they calibrate whether a "failure pattern" is really specific to failures.
 
+Separately, label a small random sample of *all* traffic, flagged or not. Failure signals miss the
+confident wrong answer that nobody thumbs down, so this sample is the only way to estimate the silent
+failure rate, and it lets you turn "38% of flagged failures" into an absolute rate per conversation,
+which is what a fix's benefit is actually measured in.
+
 ### 3. Open coding, then a taxonomy
 Read each case end to end (the trace, not just the final answer) and write a short free-text note on the
 *first* thing that went wrong. Anchoring on the first error matters because later errors are often
 consequences of it: a wrong retrieval causes a wrong citation causes a wrong answer, and you want to count
-one failure, not three. After a pass, cluster the notes into categories ("retrieved outdated policy",
+one failure, not three. Keep reading until new cases stop producing new kinds of note (saturation);
+that, not a fixed quota, tells you the taxonomy is complete enough to rank. After a pass, cluster the notes into categories ("retrieved outdated policy",
 "tool called with wrong date format", "ignored instruction to ask for order ID"). Each category is tagged
-with the pipeline stage where it originated. This is the same discipline the evals module calls error
-analysis; here it is applied to live production traffic.
+with the pipeline stage where it originated. Have a second person code a few dozen of the same cases:
+if the two of you disagree often, the category definitions are ambiguous and the counts that follow
+are noise. This is the same discipline the evals module calls error analysis; here it is applied to live
+production traffic.
 
 ### 4. Count and weight
 Compute each category's share, with uncertainty: a proportion *p* from *n* samples has standard error
@@ -68,7 +77,15 @@ common one that adds an extra sentence. A simple score is frequency × severity 
 or revenue exposed).
 
 ### 5. Attribute and choose fixes
-For the top categories, ask what the cheapest effective intervention is at the stage that originated it:
+For each top category, estimate the most a fix could buy before choosing one:
+
+```
+expected reduction in failure rate ≈ overall failure rate × category share × fix efficacy
+```
+
+The category share is a hard ceiling: a perfect fix for a 12% category removes at most 12% of failures,
+however impressive the intervention. Weighting that by severity and dividing by the fix's cost gives the ranking.
+Then ask what the cheapest effective intervention is at the stage that originated it:
 index freshness for stale retrieval, a schema or validator for malformed tool arguments, a prompt rule or
 few-shot example for ignored instructions, a guardrail for unsafe content. Fixing at the originating stage
 beats patching downstream symptoms.
@@ -98,10 +115,19 @@ had a failure signal and code the first error in each:
 
 The top share has standard error √(0.38 × 0.62 / 200) ≈ 0.034, so a 95% interval of roughly 31%–45%:
 wide, but clearly the largest bucket. Only 12% of failures are genuine model reasoning errors, so a
-bigger model would address at most about an eighth of the problem while increasing cost on every call.
+bigger model directly targets about an eighth of the problem while increasing cost on every call. It may
+help somewhat with tool arguments and escalation judgement, but it cannot fix stale retrieval or provider
+timeouts, which together are 46% of failures.
 Re-indexing on document change plus filtering superseded policies attacks 38%; validating the order-ID
 format before the tool call attacks another 22%. The escalation category is lower in frequency but higher
 in severity (a customer given a wrong commitment), so it goes second in priority despite its share.
+
+To put the options in the same unit, suppose (illustratively) that 8% of conversations fail. A
+freshness fix that removes 80% of stale-retrieval failures cuts the overall rate by about
+0.08 × 0.38 × 0.8 ≈ 2.4 percentage points. A larger model that fixed half of the reasoning errors would
+cut it by 0.08 × 0.12 × 0.5 ≈ 0.5 points, plus whatever spillover it has on tool arguments, at a higher
+price on every request. The efficacy figures are guesses, which is fine: the point is that the
+category share bounds each option, and the next sample tells you whether the guess held.
 
 ## Trade-offs
 - Manual reading of traces finds categories nobody anticipated, but costs expert hours; it flips toward
@@ -124,6 +150,8 @@ in severity (a customer given a wrong commitment), so it goes second in priority
   bucket and categories that never change week to week.
 - Ranking by frequency alone; the symptom is the team polishing tone while a rare data-exposure or
   wrong-commitment failure keeps recurring.
+- Sampling only flagged conversations; the symptom is a reported failure rate that looks stable while
+  customers, on manual review, turn out to be receiving confidently wrong answers nobody flagged.
 
 ## When to use
 Run a failure-analysis pass when an aggregate quality metric moves, before choosing between expensive
@@ -145,10 +173,11 @@ dropped, what do you do?" with "sample failures, categorise by stage, rank by im
 **Q:** Leadership wants to fine-tune a model because "accuracy is 78%". How do you decide whether
 fine-tuning is the right investment?
 **A:** I would sample a few hundred failing cases at random, read the full traces and code the first error
-with its originating stage. Fine-tuning only addresses failures where the model had the right context and
-still answered wrongly, or where style or format is the issue. If most failures originate in retrieval,
-tool arguments or missing escalation rules, fine-tuning cannot fix them and the money is better spent at
-those stages. I would show the category shares with confidence intervals, weight them by severity, and
+with its originating stage. Fine-tuning mainly addresses failures where the model had the right context and
+still answered wrongly, or where learned behaviour is the issue (output format, tool-argument conventions,
+when to escalate). If most failures originate in retrieval, data freshness or infrastructure, fine-tuning
+cannot fix them, and even model-behaviour failures are often cheaper to fix with validators or prompt rules,
+so the money is better spent at those stages. I would show the category shares with confidence intervals, weight them by severity, and
 estimate the ceiling each intervention could reach before committing.
 
 ## Quiz
@@ -171,7 +200,8 @@ estimate the ceiling each intervention could reach before committing.
 ### Q: In a sample of 200 failures, 12% are model reasoning errors with correct context. What does that imply about switching to a stronger model?
 - [ ] It will fix most failures because stronger models also retrieve better
 - [ ] It is pointless because 12% is within the margin of error
-- [x] It can address at most roughly that share, so other stages likely offer larger gains
+- [x] It directly targets roughly that share and cannot fix retrieval or infra failures, so other stages likely offer larger gains
 - [ ] It should be done first because model errors are the hardest to fix otherwise
-> A stronger model improves generation, not stale indexes or malformed tool arguments; its ceiling is about
-> the share of failures that originate in the model, so larger categories elsewhere usually deserve priority.
+> A stronger model improves generation, not stale indexes or provider timeouts; its main lever is the share
+> of failures that originate in the model (plus some spillover into tool arguments and instruction following),
+> so larger categories elsewhere usually deserve priority.

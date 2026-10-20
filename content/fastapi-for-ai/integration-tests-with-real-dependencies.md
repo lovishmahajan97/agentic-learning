@@ -5,6 +5,7 @@ name: Integration tests with real dependencies
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - fastapi-for-ai/testclient-plus-pytest-asyncio
   - python-for-ai/integration-and-end-to-end-testing
@@ -54,7 +55,14 @@ drift is one of the bugs you are trying to catch. Two common ways:
   environment variables, which suits CI systems that already manage services.
 
 Scope the container to the test session, *because* starting Postgres takes seconds and doing it per
-test makes the suite unusably slow.
+test makes the suite unusably slow. A running container is not yet a ready database: Testcontainers
+waits on a readiness check (a log line or an open port) before handing back the URL, and with Compose
+you need a healthcheck and `depends_on` a healthy service, *because* otherwise the first tests fail
+with connection refused on a cold CI runner and pass on a warm laptop. Testcontainers also starts a
+small reaper container that removes your containers if the test process is killed, so aborted runs
+do not leak databases. Under `pytest-xdist` each worker is a separate process with its own session
+fixtures, so either accept one container set per worker or share one container and give each worker
+its own database.
 
 ### Bring the schema up the real way
 Run your migrations (for example `alembic upgrade head`) against the fresh database rather than
@@ -64,8 +72,10 @@ never applies it will not notice a broken or missing migration.
 ### Isolate each test
 Every test must start from a known state. Options, in order of speed:
 1. **Transaction rollback.** Open a connection, begin a transaction, bind the app's session to it,
-   run the test, roll back. Nothing persists. It does not work for code that commits on separate
-   connections or relies on committed data being visible to other connections.
+   run the test, roll back. Nothing persists. If the code under test calls `session.commit()` on that
+   bound session, SQLAlchemy 2.0's `join_transaction_mode="create_savepoint"` turns those commits into
+   savepoint releases so the outer rollback still wins. It does not work for code that commits on
+   separate connections or relies on committed data being visible to other connections.
 2. **Truncate after each test.** Slower, but works when the app commits or uses several connections.
 3. **Per-test database or schema.** Strongest isolation; use when tests run in parallel workers.
 For Redis, use a dedicated logical database or a per-test key prefix and `FLUSHDB` between tests.
@@ -83,51 +93,63 @@ layer), or run a self-hosted small model in a container when you need a live end
 separately scheduled contract suite that hits the real provider to catch API and schema drift.
 
 ## Example
-Session-scoped Postgres and Redis containers with Testcontainers, migrations applied once, and a
-rollback per test. Assumes the app reads its URLs from settings exposed through a `get_settings`
-dependency.
+A session-scoped pgvector Postgres container, migrations applied once, and a per-test session bound
+to an outer transaction that is always rolled back, injected into a sync app through its
+`get_session` dependency.
 
 ```python
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
 from testcontainers.postgres import PostgresContainer
-from testcontainers.redis import RedisContainer
 from alembic import command
 from alembic.config import Config
+from app.main import app, get_session                     # the app's real session dependency
 
 @pytest.fixture(scope="session")
-def pg_url():
+def engine():
     with PostgresContainer("pgvector/pgvector:pg16") as pg:   # match prod image and major version
         url = make_url(pg.get_connection_url()).set(drivername="postgresql+psycopg")
         cfg = Config("alembic.ini")
         cfg.set_main_option("sqlalchemy.url", url.render_as_string(hide_password=False))
-        command.upgrade(cfg, "head")                             # schema via real migrations
-        yield url
-
-@pytest.fixture(scope="session")
-def redis_url():
-    with RedisContainer("redis:7") as rc:
-        yield f"redis://{rc.get_container_host_ip()}:{rc.get_exposed_port(6379)}/0"
+        command.upgrade(cfg, "head")                         # schema via real migrations
+        eng = create_engine(url)
+        yield eng
+        eng.dispose()
 
 @pytest.fixture
-def db_conn(pg_url):
-    engine = create_engine(pg_url)
+def session(engine):
     with engine.connect() as conn:
-        tx = conn.begin()
-        yield conn            # bind the app's session to this connection
-        tx.rollback()         # every test starts from the migrated, empty schema
+        outer = conn.begin()                                 # never committed
+        s = Session(bind=conn, join_transaction_mode="create_savepoint")
+        app.dependency_overrides[get_session] = lambda: s    # app's commits become savepoints
+        yield s
+        app.dependency_overrides.clear()
+        s.close()
+        outer.rollback()                                     # next test sees an empty schema
 
-def test_vector_dimension_matches_model(db_conn):
-    dim = db_conn.execute(text(
-        "SELECT atttypmod FROM pg_attribute WHERE attrelid = 'chunks'::regclass "
-        "AND attname = 'embedding'")).scalar_one()
-    assert dim == 1024        # fails the build if the migration and embedding model disagree
+def test_create_doc_commits_inside_rollback(session):
+    with TestClient(app) as client:
+        r = client.post("/docs", json={"title": "Refund policy"})  # handler calls commit()
+    assert r.status_code == 201
+    assert session.execute(text("SELECT count(*) FROM docs")).scalar_one() == 1
+
+def test_vector_dimension_matches_model(session):
+    dim = session.execute(text("SELECT atttypmod FROM pg_attribute WHERE "
+        "attrelid = 'chunks'::regclass AND attname = 'embedding'")).scalar_one()
+    assert dim == 1024      # fails the build if the migration and embedding model disagree
 ```
 
-The vector test is the kind of assertion a fake can never make: it reads the schema that the real
-migration produced. Endpoint tests then use `TestClient` with settings overridden to `pg_url` and
-`redis_url`.
+Trace the first test: the endpoint's `commit()` releases a savepoint, so the row is visible to the
+test's assertion on the same connection, then `outer.rollback()` discards it, so the next test starts
+from the migrated, empty schema without truncating anything. The second test is the kind of assertion
+a fake can never make: it reads the schema the real migration produced (for pgvector, `atttypmod`
+holds the declared dimension). A Redis container fixture has the same shape; point the app at it by
+overriding settings, and flush its database between tests. For an async app, use the same structure
+with `AsyncEngine`, `AsyncConnection` and `AsyncSession`, driven through `ASGITransport` so the app
+and the fixtures share one event loop.
 
 ## Trade-offs
 - Real dependencies catch dialect, migration and semantic bugs that fakes cannot, at the cost of
@@ -141,7 +163,8 @@ migration produced. Endpoint tests then use `TestClient` with settings overridde
 
 ## Pitfalls
 - Testing against SQLite while production runs Postgres; the suite passes and production fails on
-  JSONB operators, `ON CONFLICT`, locking or pgvector, which SQLite lacks.
+  JSONB operators, row locking (`SELECT ... FOR UPDATE`), Postgres-specific `ON CONFLICT` behaviour or
+  pgvector, which SQLite either lacks or implements differently.
 - Creating tables with `create_all()` instead of running migrations; a missing or broken migration
   ships, and the symptom is the first deploy failing on `alembic upgrade`.
 - No per-test isolation; tests pass alone and fail together, or depend on execution order.
@@ -171,8 +194,8 @@ Postgres test double and how you isolate tests is the expected depth.
 enqueues a background job and lets a worker read the row fails in the test: the worker sees nothing.
 Why, and what do you change?
 **A:** With rollback isolation the endpoint's write lives inside an uncommitted transaction on the
-test's connection. The worker uses its own connection, and under Postgres's read-committed isolation
-it cannot see uncommitted data from another transaction, so the row looks absent. This is exactly the
+test's connection. The worker uses its own connection, and Postgres never shows one transaction's
+uncommitted writes to another (there are no dirty reads at any isolation level), so the row looks absent. This is exactly the
 case rollback cannot cover. For this test, let the code commit and isolate by truncating tables
 afterward or using a per-test database, and run the worker against the same real database. Keep
 rollback for the many tests that stay on one connection, because it is much faster.
@@ -198,6 +221,7 @@ rollback for the many tests that stay on one connection, because it is much fast
 - [ ] Tests that only read data
 - [ ] Tests that insert rows through the ORM
 - [ ] Tests that run vector similarity queries
-- [x] Tests where the code under test commits or reads on separate connections
-> Rollback works because everything happens in one uncommitted transaction on one connection. Commits
-> or other connections escape that boundary, so truncation or per-test databases are needed instead.
+- [x] Tests where the code under test commits on, or reads from, separate connections
+> Rollback works because everything happens in one uncommitted transaction on one connection. Commits on
+> the bound session can be absorbed with savepoints, but other connections escape that boundary and never
+> see the uncommitted rows, so truncation or per-test databases are needed instead.

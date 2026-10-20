@@ -5,7 +5,7 @@ name: Reflection / self-critique
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/planning
@@ -59,6 +59,18 @@ into the next attempt as text. That is the mechanism to copy: feedback that is g
 4. **Revise** by generating again with the lesson in context, and stop when the evaluator passes, the
    attempt stops changing, or the iteration budget runs out.
 
+### Three named variants, and what each feeds back
+- **Self-Refine** keeps one model in one task: generate, have the same model write feedback on its own
+  output, refine the output in place, repeat. No external signal enters, so its reported gains are on
+  tasks where a second look at the visible output suffices (style, readability, constraint coverage),
+  not on facts the model did not know.
+- **Reflexion** works *across attempts*: an evaluator (tests, an environment's success signal) scores a
+  whole trial, the model writes a verbal lesson, and the next trial starts fresh with the lessons
+  prepended. It regenerates rather than edits, which helps when the first attempt's approach was wrong.
+- **CRITIC** makes the critique itself use tools: to check a claim, the critic searches or runs code,
+  then revises using what it found. The new information arrives during critique rather than from a
+  pre-built test suite.
+
 ### Why a separate critic context helps
 When the generator critiques its own output inside the same conversation, its context is saturated
 with the reasoning that produced the answer, and attention to that reasoning makes it likely to confirm
@@ -81,6 +93,12 @@ Each iteration costs a generate call plus an evaluate call, and revisions are no
 can be worse than attempt 2. Keep the best-scoring attempt, cap iterations (two or three is typical for
 writing, more for code with tests), and stop early when the critic passes or the diff between attempts
 is trivial. Log every attempt and critique, since this trace is what you will use to tune the rubric.
+
+Gate the loop on the evaluator, so you pay for revision only on failures. With a cheap deterministic
+check, expected model calls per task are roughly 1 + (1 − p₁)·(reflect + regenerate), where p₁ is the
+one-shot pass rate: at p₁ = 0.9 the loop costs about 20% extra on average and only touches the 10% that
+failed. An LLM critic, by contrast, runs on *every* task, so it adds at least one call even when the
+first attempt was already right; that is the case where reflection is most often not worth it.
 
 ### Where reflection sits in an agent
 Inside a step (revise a tool call after an error), at the end of a task (review the deliverable before
@@ -150,6 +168,8 @@ it ranks an attempt that does not even import below one that fails a single test
   never satisfy, such as a test that is itself wrong.
 - Keeping only the last attempt; the symptom is returning attempt 4 when attempt 2 passed more tests.
 - Vague critic output ("could be improved"); the symptom is revisions that change style, not substance.
+- Letting the generator see and optimise against the exact tests; the symptom is code that special-cases
+  test inputs, passing the visible suite and failing held-out cases or production inputs.
 
 ## When to use
 Use reflection when a cheap, trustworthy evaluator exists (tests, validators, reconciliations), when

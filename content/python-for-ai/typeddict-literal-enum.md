@@ -5,7 +5,7 @@ name: TypedDict, Literal and Enum
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
@@ -43,10 +43,11 @@ strings", the checker cannot flag a typo, cannot tell you a `match` statement is
 and cannot stop a new team member inventing a fourth role. `Literal` names the set with no runtime
 object at all, which is the right cost when the strings only travel over the wire.
 
-Sometimes the vocabulary needs behaviour: map each finish reason to an action, iterate every role
-to render a UI, attach a retry policy to each error class. Literals do not exist at runtime, so
-there is nothing to iterate or hang a method on. `Enum` makes each member a singleton object with a
-name, a value, and whatever methods you add, at the cost of a conversion step at the JSON boundary.
+Sometimes the vocabulary needs behaviour: map each finish reason to an action, attach a retry
+policy to each error class, refer to the set from twenty modules. A Literal's values are plain
+strings at runtime, so there is nothing to hang a method on, and the mapping ends up in a separate
+dict that can drift from the type. `Enum` makes each member a singleton object with a name, a value,
+and whatever methods you add, at the cost of a conversion step at the JSON boundary.
 
 ## How it works
 ### TypedDict: a dict with a declared shape
@@ -73,8 +74,12 @@ valid identifiers (`"content-type"`) use the functional form `TypedDict("Headers
 `if role == "user":` the type of `role` is `Literal["user"]`. The payoff is exhaustiveness: in a
 `match` over a Literal (or an Enum), a final `case _: assert_never(x)` makes the checker report an
 error if any member is unhandled, which is how you learn at check time, not in production, that a
-new role was added and one handler forgot it. There is no runtime trace of a Literal; `role` is just
-a `str`. That is why Literal is the right tool for values that are only compared and serialized.
+new role was added and one handler forgot it. At runtime the *values* carry no trace: `role` is just
+a `str`, so nothing stops `"robot"` arriving from JSON unless something validates it. The alias
+itself does survive as an object, and `typing.get_args(Role)` returns `("system", "user",
+"assistant")`; that is how Pydantic turns a Literal into a schema `enum`, and how you can iterate
+the set when you must, though the checker sees that tuple only as `tuple[Any, ...]`. That is why
+Literal is the right tool for values that are only compared and serialized.
 
 ### Enum: a finite set of runtime objects
 `class Reason(Enum): STOP = "stop"` creates singleton members. Each has `.name` (`"STOP"`) and
@@ -154,8 +159,9 @@ Remove the `CONTENT_FILTER` case and mypy or pyright reports that `assert_never`
 ## Trade-offs
 - TypedDict costs nothing at runtime and keeps data SDK-ready, but gives no validation or methods;
   once the same shape is consumed in several modules, a Pydantic model's validation pays for itself.
-- Literal gives exhaustiveness checks for free, but there is no runtime object to iterate or attach
-  behaviour to; the moment you write `for role in ...` or want a method, switch to an Enum.
+- Literal gives exhaustiveness checks for free, but its values are bare strings with no behaviour,
+  and iterating means `get_args` on the alias; once you want methods, per-member data or the set
+  referenced from many modules, switch to an Enum.
 - Enum members have identity and can carry methods, but a plain Enum needs `.value` at every JSON
   boundary and compares unequal to raw strings; `StrEnum` removes that cost for string vocabularies.
 - `NotRequired` keys model optional payload fields precisely, but every `.get()` returns `T | None`
@@ -172,6 +178,11 @@ Remove the `CONTENT_FILTER` case and mypy or pyright reports that `assert_never`
 - Assigning `json.loads(...)` output straight to a `TypedDict`-typed variable; because the result is
   `Any`, the checker accepts it silently and trusts a shape nobody verified, and the `KeyError`
   appears later. Validate with `TypeAdapter(ChatMessage).validate_python(...)` at the boundary.
+- Using the pre-3.11 idiom `class Reason(str, Enum)` and interpolating members into prompts or log
+  lines; on 3.11+ `f"{Reason.STOP}"` renders `Reason.STOP`, not `stop`, so a prompt says "finish
+  reason Reason.STOP". `StrEnum` formats as its value; or interpolate `.value` explicitly.
+- Passing a `TypedDict` to a helper typed `dict[str, Any]`; the checker rejects it, because that
+  helper could insert arbitrary keys. Type read-only helpers as `Mapping[str, object]`.
 - Giving two Enum members the same value; the second silently becomes an alias and disappears from
   iteration, which looks like a "missing" member in a dropdown or a prompt listing valid options.
 - Adding a new Literal or Enum member without an `assert_never` guard in handlers; nothing warns, and
@@ -200,8 +211,9 @@ and what `StrEnum` changes about equality and JSON.
 **Q:** An agent's `finish_reason` field is a plain `str`. You want the checker to catch unhandled
 values when a provider adds a new one, you need to serialize it to JSON in logs, and one module
 needs to map each value to a retry policy. Which of TypedDict, Literal or Enum do you pick and why?
-**A:** A `StrEnum`. Literal would give exhaustiveness checking but has no runtime object to attach
-the retry-policy mapping to, so that logic would live in a separate dict that can drift. A plain
+**A:** A `StrEnum`. Literal would give exhaustiveness checking, but its members are bare strings,
+so the retry-policy mapping would live in a separate dict keyed by those strings that can drift
+from the type (a checker will not tell you the dict lacks a new key). A plain
 Enum carries the mapping as a method or property but fails `json.dumps` and compares unequal to the
 wire string, costing a conversion at every boundary. `StrEnum` members are strings, so they
 serialize and compare transparently, you can still `match` over them with `assert_never` for

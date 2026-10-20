@@ -4,8 +4,8 @@ module: system-design
 name: Tenant isolation
 kind: pattern
 difficulty: advanced
-est_minutes: 17
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - system-design/multi-tenancy
   - safety-security/cross-tenant-data-leakage
@@ -77,13 +77,24 @@ with transaction-mode connection pooling a session-level setting leaks to whiche
 connection next. Bridge and silo models get the same property structurally: a schema or database per
 tenant, with per-tenant database credentials so a connection can only ever reach one tenant.
 
+Be precise about what RLS defends against. It catches the *forgotten* filter, because the tenant is set
+once, right after authentication, and every later query in the transaction inherits it. It does not stop
+a *compromised* application: SQL injection, or any code path that can issue `SET LOCAL`, can name another
+tenant, because the setting is just a string the database trusts. That threat is what per-tenant
+credentials (bridge or silo) address, and it is why RLS is one layer rather than the whole answer. Index
+for it as well: the policy adds `tenant_id = …` to every query, so composite indexes should lead with
+`tenant_id`, or large tables degrade into scans that the policy then filters.
+
 ### Layer 2: retrieval and caches are partitioned, not post-filtered
 Vector search is where AI products most often leak. The tenant key must be a **hard pre-filter** or a
 **separate namespace**, never a re-ranking step applied after top-k, because a post-filter on a
 cross-tenant top-k can return fewer results than requested, which tempts someone to widen the search,
 and because the unfiltered candidates have already crossed the boundary in memory and logs. With
-pgvector the row policy from Layer 1 applies before ranking; with a dedicated vector database use a
-collection or namespace per tenant for larger tenants and mandatory metadata filtering for pooled ones,
+pgvector the row policy from Layer 1 runs inside the database, so no other tenant's row ever reaches the
+application; with an approximate index (HNSW, IVFFlat) the engine still filters the index's candidate
+list, so isolation holds but small tenants can get fewer than k rows. Iterative index scans (pgvector 0.8
+and later) mitigate that recall loss, and a partition or partial index per large tenant is the structural
+fix. With a dedicated vector database use a collection or namespace per tenant for larger tenants and mandatory metadata filtering for pooled ones,
 and make the filter non-optional in the retrieval client's signature. Semantic caches, prompt caches and
 agent memory stores must include the tenant in the key for the same reason: a cache hit is a read.
 
@@ -147,6 +158,8 @@ FROM   documents
 ORDER  BY embedding <=> $1      -- cosine distance to the query embedding
 LIMIT  8;                        -- policy filters the scan, so the 8 rows are within-tenant
 COMMIT;
+-- Same SELECT with no SET LOCAL: the predicate is NULL, so 0 rows come back (fails closed).
+-- INSERT naming another tenant_id: ERROR: new row violates row-level security policy for table "documents"
 ```
 
 ## Trade-offs
@@ -173,6 +186,12 @@ COMMIT;
   token appearing in a trace, an eval sample or a model response.
 - Trusting the vector database's metadata filter without making it mandatory in the client; the symptom
   is one new call site that omits the filter and passes review because the code "looks like the others".
+- Reading through views or `SECURITY DEFINER` functions owned by a superuser or a `BYPASSRLS` role; the
+  symptom is a reporting view that returns every tenant's rows although the base table has a policy,
+  because a view checks policies as its owner unless it is created with `security_invoker` (PostgreSQL 15+).
+- Assuming RLS hides everything; unique and foreign-key checks bypass row security, so "this email is
+  already registered" on a globally unique column tells tenant A that a value exists in tenant B. The
+  symptom is an enumeration finding in a pen test; scope unique constraints to `(tenant_id, …)`.
 - Logging full prompts to a shared log store without tenant tags and access control; the symptom is
   support engineers reading tenant data they are not cleared for, which is itself a reportable breach.
 

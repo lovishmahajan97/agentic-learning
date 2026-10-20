@@ -5,7 +5,7 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -66,6 +66,24 @@ Some failures must not be averaged away: a fabricated citation, a leaked secret,
 Mark those criteria as gates: failing any gate makes the overall result a fail regardless of the rest.
 This exists because an arithmetic mean over criteria is exactly the mechanism by which a 4-out-of-5
 answer with a made-up policy number ships.
+
+### Applicability and the denominator
+Many criteria apply only to some items: "escalates when the request is out of scope" means nothing for an
+in-scope question, and "cites the refund clause" means nothing for a password reset. Give such criteria
+an explicit **N/A** outcome with its own trigger condition, and exclude N/A from the denominator. Scoring
+them as automatic passes inflates the score with free points (an answer that passes 2 of 3 real checks
+plus 3 inapplicable ones reports 5/6 instead of 2/3) and hides the criterion's true pass rate, which
+should be computed only over the items where it applied. Scoring them as fails does the opposite. Ask the
+judge, or the item's metadata, to decide applicability first, because "did it escalate?" is ambiguous
+when escalation was never warranted.
+
+### Weighting
+Weighted sums look principled but hide trade-offs: with weights 0.5 on correctness and 0.1 on tone, a
+regression in tone is invisible in the headline, and arguments about weights are really arguments about
+priorities that should be explicit. The usual pattern is gates for what must never happen, an unweighted
+fraction of the remaining checks for the trend line, and per-criterion pass rates for decisions. Reach
+for weights only when a single scalar must rank many variants, and report the per-criterion numbers
+next to it.
 
 ### Binary beats Likert
 Prefer yes/no checks per criterion over 1–5 scales. A five-level scale has four boundaries to disagree
@@ -137,7 +155,7 @@ def grade(item, response, llm):
     gates_failed = [n for n, r in results.items() if RUBRIC[n]["gate"] and not r]
     if gates_failed:
         return 0.0, results, gates_failed          # a gate failure zeroes the score
-    return sum(results.values()) / len(results), results, []
+    return sum(results.values()) / len(results), results, []   # skipped criteria never enter the denominator
 
 # A response citing "DOC-9" when the context only holds DOC-1..DOC-4 returns (0.0, {...}, ['no_fabricated_citation'])
 # even if it answers the question, is otherwise grounded and states the 30-day window.
@@ -168,6 +186,8 @@ change" is actionable and "average score dropped 0.04" is not.
   release threshold.
 - Editing the rubric in the middle of an experiment; the symptom is an "improvement" that disappears when
   both arms are regraded with the same version.
+- Scoring inapplicable criteria as passes; the symptom is a criterion such as "escalates when out of
+  scope" reporting a 97% pass rate although the system mishandles most of the few out-of-scope items.
 - Twelve criteria in one judge call; the symptom is later criteria agreeing with humans far less than the
   same criteria graded in isolation.
 - Treating the rubric as finished; the symptom is a green eval dashboard while production complaints

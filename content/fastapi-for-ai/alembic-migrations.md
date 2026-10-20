@@ -5,6 +5,7 @@ name: Alembic migrations
 kind: tool
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
   - fastapi-for-ai/async-database-access-and-connection-pooling
@@ -55,8 +56,9 @@ numbers *because* two developers on separate branches would otherwise both creat
 The database stores its position in a table named `alembic_version` holding the current revision ID.
 `alembic upgrade head` walks the graph from that ID to the newest revision, running each `upgrade()`
 in order, and updates the row. `alembic downgrade -1` runs the latest `downgrade()`. `alembic current`
-and `alembic history` show where you are. On PostgreSQL, DDL is transactional, so by default a failed
-migration rolls back cleanly instead of leaving a half-altered table; on MySQL most DDL commits
+and `alembic history` show where you are. On PostgreSQL, DDL is transactional and Alembic by default runs the whole
+`upgrade` invocation in one transaction (`transaction_per_migration=True` in `env.py` makes it one per
+revision), so a failed migration rolls back cleanly instead of leaving a half-altered table; on MySQL most DDL commits
 implicitly, so a failure midway can leave you between two revisions.
 
 ### env.py: the bridge to your app
@@ -81,7 +83,8 @@ deterministic names that a later migration can drop by name.
 `op.execute()` runs raw SQL for things autogenerate never produces: `CREATE EXTENSION IF NOT EXISTS
 vector`, a backfill `UPDATE`, or `SET lock_timeout`. Some PostgreSQL statements refuse to run inside a
 transaction block, notably `CREATE INDEX CONCURRENTLY`, so Alembic provides
-`op.get_context().autocommit_block()` for them. SQLite cannot alter most columns in place; Alembic's
+`op.get_context().autocommit_block()` for them. A concurrent build that fails or hits the lock
+timeout is not rolled back: it leaves an `INVALID` index behind, which must be dropped before retrying. SQLite cannot alter most columns in place; Alembic's
 `op.batch_alter_table` works around this by copying the table. `alembic upgrade head --sql` (offline
 mode) renders the SQL without connecting, for DBAs who must review or run it themselves.
 
@@ -111,7 +114,8 @@ down_revision = "3d5f0e8a1b22"
 def upgrade() -> None:
     # Fail fast instead of queueing behind a long query and blocking every reader.
     op.execute("SET lock_timeout = '5s'")
-    # Nullable, no default: a catalog-only change in PostgreSQL, no table rewrite.
+    # Nullable, no default: a catalog-only change in PostgreSQL, no table rewrite
+    # (since PostgreSQL 11 a constant default is catalog-only too; a volatile one rewrites the table).
     op.add_column("chunks", sa.Column("embedding_model", sa.Text(), nullable=True))
     # CREATE INDEX CONCURRENTLY is rejected inside a transaction block.
     with op.get_context().autocommit_block():
@@ -136,8 +140,11 @@ def downgrade() -> None:
 The deploy then runs in three releases. Release 1 applies this migration as a pre-deploy job, then
 ships code that writes `embedding_model` for new chunks. A background job backfills old rows in
 batches of a few thousand, committing per batch so no single transaction holds locks for minutes.
-Release 2, once the backfill reports zero NULLs, adds `NOT NULL` (on a large table, via a `CHECK ...
-NOT VALID` constraint validated separately, to avoid a long scan under a strong lock). Release 3, the
+Release 2, once the backfill reports zero NULLs, adds `NOT NULL`. A plain `SET NOT NULL` scans the whole
+table under an `ACCESS EXCLUSIVE` lock, so on a large table add `CHECK (embedding_model IS NOT NULL)
+NOT VALID` (instant), then `VALIDATE CONSTRAINT` (scans, but under a lock that lets reads and writes
+continue), then `SET NOT NULL`, which PostgreSQL 12 and later can apply without re-scanning because the
+validated check already proves it, and finally drop the redundant check. Release 3, the
 contract step, drops whatever the old column was, after no running code reads it.
 
 ## Trade-offs
@@ -219,6 +226,6 @@ pre-deploy job with a lock timeout, and each step is compatible with the code st
 - [ ] It makes the index build faster by disabling write-ahead logging
 - [ ] It lets `downgrade()` drop the index automatically
 - [x] PostgreSQL rejects `CREATE INDEX CONCURRENTLY` inside a transaction block, and Alembic normally runs migrations in one
-> Concurrent builds avoid blocking writes but cannot run in a transaction, while Alembic wraps each
-> migration in one by default on PostgreSQL. The autocommit block commits first and runs that
-> statement outside a transaction; it does not change logging or speed.
+> Concurrent builds avoid blocking writes but cannot run in a transaction, while Alembic runs
+> migrations inside one by default on PostgreSQL. The autocommit block commits what came before and
+> runs that statement outside a transaction; it does not change logging or speed.

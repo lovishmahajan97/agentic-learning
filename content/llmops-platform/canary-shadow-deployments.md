@@ -5,7 +5,7 @@ name: Canary / shadow deployments
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/rollback
   - llmops-platform/evaluation-gates-for-production-releases
@@ -70,6 +70,12 @@ different and is it cheaper or slower", not "do users prefer it". The mirrored s
 inference cost on that slice, so most teams shadow 5–20% of traffic (illustrative) or shadow 100% for a
 short window.
 
+One more trap is specific to LLMs: the incumbent disagrees *with itself*. At non-zero temperature, and
+often even at temperature zero on hosted APIs, running the same request twice yields different text. So
+"B's answer differs from A's on 30% of requests" is meaningless until you know A-vs-A differs on, say,
+25%. Mirror a small slice to a second copy of the *incumbent* as well, and read the candidate's
+disagreement rate as the excess over that self-disagreement floor, broken down by intent.
+
 ### Canary (partial live exposure)
 1. The router assigns each request to a bucket by hashing a stable key, usually user or session id, and
    routes buckets below the canary percentage to the candidate. Hashing *because* a conversation must not
@@ -85,13 +91,31 @@ short window.
    requires that the success metrics are not worse, not merely that nothing exploded.
 
 ### What the numbers can and cannot tell you
-Detecting a shift in a rate of δ needs sample size roughly proportional to 1/δ². A 1% canary on a
-service doing 20,000 requests a day gives 200 canary requests a day; that is enough to notice a
-schema-failure rate jumping from 0.5% to 5%, and nowhere near enough to notice a judge score moving
-from 4.1 to 4.0. So the early steps are for catastrophic signals, and the later, larger steps are where
-quality comparisons become meaningful. Treat the canary as a controlled experiment only when the two
+Detecting a shift of size δ in a metric with standard deviation σ needs, per arm, roughly
+
+```
+n ≈ 16 · σ² / δ²        (rule of thumb: two-sided α = 0.05, 80% power)
+σ² = p(1 − p) for a rate p
+```
+
+so halving the effect you want to see quadruples the traffic you need. A 1% canary on a service doing
+20,000 requests a day gives 200 canary requests a day. A schema-failure rate jumping from 0.5% to 5%
+(σ² ≈ 0.027 at the midpoint, δ = 0.045) needs about 16 × 0.027 / 0.002 ≈ 210 samples: about a day, and
+in practice faster because the incumbent's baseline is known precisely. A judge score moving from 4.1 to
+4.0 with σ ≈ 0.8 needs about 16 × 0.64 / 0.01 ≈ 1,000 samples per arm: a week at 1%, an afternoon at 25%.
+So the early steps are for catastrophic signals, and the later, larger steps are where quality
+comparisons become meaningful. Treat the canary as a controlled experiment only when the two
 arms are assigned randomly and compared on the same window; comparing this week's canary to last
 week's baseline confounds the version with time.
+
+### Canary vs A/B test vs blue-green
+These are often conflated. A **canary** is a safety mechanism: the question is "is anything broken?",
+the decision is asymmetric (roll back on harm, promote on *no harm*), and it ends at 100%. An **A/B
+test** is a decision mechanism: the question is "which is better on the success metric?", it holds a
+fixed split until the pre-registered sample is reached, and either arm may win. A large canary step can
+double as an A/B test only if you pre-commit to the metric and sample size. **Blue-green** keeps two full
+environments and flips all traffic at once; it gives instant rollback but no gradual exposure, so it
+suits infrastructure changes better than behaviour changes.
 
 ### Where it lives
 Routing, hashing, mirroring and the rollout percentage belong in the AI gateway or control plane as
@@ -164,6 +188,8 @@ async def handle(req: dict, user_id: str, trace_id: str) -> dict:
   version.
 - Canarying only internal users; the symptom is a clean canary followed by a wave of complaints from
   the customer segment that writes in a different language or uploads different documents.
+- Reading the shadow disagreement rate without an incumbent-vs-incumbent baseline; the symptom is a
+  "40% disagreement" alarm that turns out to be ordinary sampling variation in both versions.
 
 ## When to use
 Shadow first when the change is large or structurally different: a new model family, a new provider, a

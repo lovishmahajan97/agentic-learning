@@ -5,6 +5,7 @@ name: Pilot → production plan
 kind: practice
 difficulty: advanced
 est_minutes: 14
+status: fact-checked
 related:
   - scoping/rapid-prototyping-poc
   - scoping/productionization
@@ -100,8 +101,12 @@ A support-ticket drafting assistant for an insurer's customer service team. All 
   prompt logging (legal, 4 weeks), monitoring dashboards and alerts (platform team), runbook and on-call
   rota (support engineering), training for 400 agents (enablement), cost centre for inference (finance).
 - **Week 6 result:** handle time 9.1 minutes vs. 10.8 in the comparison teams (−16%); audit pass rate
-  91%; CSAT 4.2. Go decision. Rollout to 25%, then 100% over six weeks, with rollback if audit pass rate
-  drops below 90% for two consecutive weeks. Hypercare for the first four weeks after full rollout.
+  91%; CSAT 4.2. Go decision. Rollout to 25%, then 100% over six weeks, with rollback if the audit pass
+  rate pooled over two consecutive weeks (400 tickets) drops below 88%. The rollback line sits below the
+  90% exit bar on purpose: with a true rate of 91% and ±4-point weekly noise, a 90% trigger on a single
+  week's sample would fire spuriously roughly a third of the time, while 88% on 400 pooled tickets is a
+  false alarm only a few percent of the time yet still catches a real drop to the mid-80s. Hypercare for
+  the first four weeks after full rollout.
 
 Because the gap list ran in parallel, production started two weeks after the decision instead of months.
 

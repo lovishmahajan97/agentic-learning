@@ -5,7 +5,7 @@ name: Embedding dimension & normalization
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/similarity-search
@@ -59,7 +59,11 @@ so Euclidean distance is a monotone function of the dot product. All three produ
 is why many embedding providers return normalized vectors and why "which metric should I pick" is only a
 real question for unnormalized ones. The practical rule: normalize at write time, store unit vectors,
 and build the index on inner product; that saves a division per comparison, and pgvector's `<#>`
-(negative inner product), `<=>` (cosine distance) and `<->` (L2) then agree on order.
+(negative inner product), `<=>` (cosine distance) and `<->` (L2) then agree on order. The exception
+is a model trained to be scored with an *unnormalized* dot product (the original DPR is one; some
+sentence-transformers checkpoints say so on their model card). There the norm is part of the learned
+score, and normalizing produces a different ranking from the one the model was trained for, so use the
+similarity the model card names rather than normalizing by reflex.
 
 ### Where the norm comes from and why to discard it
 Encoders are not trained to make norms meaningful. Contextual embeddings are also anisotropic: they
@@ -148,8 +152,8 @@ model the prefix retains the order only if the model was trained Matryoshka-styl
   already saturated; past that point the extra dimensions only cost money.
 
 ## Pitfalls
-- Building an inner-product index over unnormalized vectors; symptom: long, verbose chunks dominate the
-  top-k regardless of relevance.
+- Building an inner-product index over unnormalized vectors from a cosine-trained model; symptom: long,
+  verbose chunks dominate the top-k regardless of relevance.
 - Normalizing at index time but not at query time; symptom: rankings look fine but scores above 1.0
   appear and any similarity threshold silently stops working.
 - Truncating a model that was not Matryoshka-trained; symptom: recall collapses far more than the
@@ -167,8 +171,8 @@ model the prefix retains the order only if the model was trained Matryoshka-styl
 ## When to use
 Use the arithmetic every time you size a vector store: `vectors × d × bytes` tells you whether the index
 fits in RAM, and whether you need truncation, quantization, disk-based indexes or sharding. Always store
-normalized vectors unless you have a specific reason not to, and make the normalization part of the
-shared embed function so index and query paths agree. Consider Matryoshka truncation when the model
+normalized vectors unless the model card specifies an unnormalized dot product, and make the
+normalization part of the shared embed function so index and query paths agree. Consider Matryoshka truncation when the model
 supports it and memory or latency binds; consider binary or int8 quantization with rescoring when the
 corpus is tens of millions of vectors or more. Measure recall@k against the full-precision baseline
 before and after any reduction. In interviews, expect to derive the cosine-equals-dot-product identity

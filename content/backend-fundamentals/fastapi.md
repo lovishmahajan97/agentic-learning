@@ -5,7 +5,7 @@ name: FastAPI
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/async-endpoints
@@ -64,6 +64,20 @@ plain `def` handler is run in a bounded worker threadpool so that it cannot bloc
 is deliberate: use `async def` when everything you call is async (httpx, async DB drivers, provider
 SDKs' async clients); use `def` when you must call a blocking library. The failure mode is the
 mix: a sync SDK call inside `async def` blocks the loop and every other request on that worker waits.
+The same rule applies to dependencies: a plain `def` dependency is also run in the threadpool.
+
+The capacity arithmetic differs between the two. A `def` handler's concurrency per worker is capped by
+the threadpool (AnyIO's default limiter is 40 tokens), so if each call holds a thread for 5 seconds,
+one worker serves at most 40 / 5 = 8 requests per second before requests queue for a thread. An
+`async def` handler that awaits the same 5-second call is capped by memory and the upstream's limits
+instead, which is why the async path is the default for model-calling endpoints.
+
+### Workers and processes
+One uvicorn process is one event loop on one core. Production runs several worker processes per
+machine (uvicorn `--workers`, gunicorn with uvicorn workers, or one process per container behind the
+orchestrator) *because* JSON parsing, validation and serialisation still use CPU, and a single loop
+cannot use a second core. Workers share nothing, so in-memory caches, rate-limit counters and
+"which streams are open" state belong in Redis or the database, not in a module-level dict.
 
 ### Pydantic as the contract
 Declaring `body: ChatRequest` validates and parses the JSON body; `response_model=Answer` filters the
@@ -80,6 +94,13 @@ model client) instead of recreating them per request.
 `StreamingResponse` takes an async generator and writes each yielded chunk as it arrives. With
 `text/event-stream` framing you get server-sent events, the standard way to stream tokens to browsers
 and SDKs. Because each `yield` happens between awaits, a slow stream does not block other requests.
+
+### Background tasks are not a job queue
+`BackgroundTasks` runs a function after the response is sent, in the same process. That suits a
+few hundred milliseconds of follow-up (write an audit row, emit a metric). It is the wrong home for a
+two-minute summarisation *because* the work dies with the process on a deploy or crash, nothing
+retries it, and it competes with live requests for the same loop or threadpool. Long or must-complete
+work goes to a durable queue and a separate worker, with a `202` and a job resource on the API side.
 
 ### Compared with the alternatives
 Flask is simpler and sync-first, fine for small internal tools but a poor fit for long-lived streaming
@@ -145,13 +166,19 @@ async def chat(body: ChatRequest, client: httpx.AsyncClient = Depends(http)):
   (a cost figure, a secret flag) appearing in client responses.
 - Doing CPU-heavy work (tokenizing megabytes, re-ranking in pure Python) inside the handler; the
   symptom is event-loop stalls visible as every endpoint slowing together.
+- Running long jobs through `BackgroundTasks`; the symptom is work that silently vanishes on every
+  deploy or pod restart, with no error logged because the request already returned 200.
+- Keeping state in module-level variables; the symptom is behaviour that changes with which worker
+  served the request (a rate limit that allows N times the configured rate with N workers).
 
 ## When to use
 Reach for FastAPI when building the HTTP layer of a Python AI service: model gateways, RAG endpoints,
 agent runners, anything that awaits a model and benefits from streaming and typed contracts. Prefer
 Django when the application is mostly conventional CRUD with an ORM and admin, and Flask only for
-tiny sync tools. Measure event-loop blocking (a handler that should take 50 ms taking seconds under
-load) and connection reuse. In day-to-day work the skill is keeping the request path fully async,
+tiny sync tools. Measure event-loop lag (schedule a no-op every 100 ms and record how late it fires),
+the health check's latency under load (it should stay flat; if it tracks the model endpoint's
+latency, something is blocking the loop), threadpool saturation for `def` handlers, and upstream
+connection reuse. In day-to-day work the skill is keeping the request path fully async,
 designing Pydantic models that double as structured-output schemas, and wiring shared clients
 through dependencies; interviews probe whether you know why `def` and `async def` handlers behave
 differently. The `fastapi-for-ai` module covers each mechanism in depth.
@@ -163,7 +190,7 @@ differently. The `fastapi-for-ai` module covers each mechanism in depth.
   limits per process, and treats the OpenAPI schema as the published contract for other teams.
 - **FDE:** Stands up a FastAPI service inside a customer's network, exposes `/docs` so their
   integrators can self-serve, and explains why blocking code in their middleware (a sync auth lookup)
-stalls every async handler behind it.
+  stalls every async handler behind it.
 
 ## Check yourself
 **Q:** A FastAPI service has one `async def` endpoint that calls a provider through a synchronous SDK.
@@ -175,8 +202,10 @@ requests queue behind each other. Fix one: switch to the SDK's async client (or 
 yields to the loop; this is the right long-term fix but requires the whole path to be async. Fix two:
 change the handler to plain `def` so FastAPI runs it in the threadpool; this unblocks the loop
 immediately but caps concurrency at the threadpool size (AnyIO's default limiter is 40 threads,
-tunable) and adds thread overhead. Either way, add a
-metric for event-loop lag so a regression is visible.
+tunable) and adds thread overhead; at 5 seconds per call, 40 threads is only 8 requests per second per
+worker. A middle path is to keep the handler async and wrap just the sync call in
+`await asyncio.to_thread(...)`, with the same thread cap. Either way, add a metric for event-loop lag
+so a regression is visible, and treat a slow health check as the first sign of a blocked loop.
 
 ## Quiz
 ### Q: Why does FastAPI run a plain `def` handler in a threadpool but an `async def` handler on the loop?

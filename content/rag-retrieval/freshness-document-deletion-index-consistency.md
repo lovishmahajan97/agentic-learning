@@ -5,6 +5,7 @@ name: Freshness, document deletion and index consistency
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - rag-retrieval/embedding-pipelines
   - rag-retrieval/metadata-filtering
@@ -73,9 +74,11 @@ record the new version as current, then delete chunks whose `doc_id` matches and
 The order matters because at no point is the document absent, and the old version is removed by filter
 rather than by assumed chunk count. Overwriting by `doc_id:chunk_index` is the classic bug: a document
 that shrinks from nine chunks to seven leaves chunks seven and eight of the old text in the index
-indefinitely. The brief window in which both versions are searchable is usually milliseconds; if even that
-is unacceptable, group results by `doc_id` after retrieval and keep the newest `indexed_at`, a cheap
-belt-and-braces filter that also hides reconciliation lag.
+indefinitely. The window in which both versions are searchable is normally short (the gap between two writes, plus
+any engine refresh delay), but a crash between steps 1 and 3 can stretch it until reconciliation runs. If
+that is unacceptable, filter after retrieval: for each `doc_id`, drop chunks whose `version` is not the
+newest one seen (or not the manifest's current version), a cheap belt-and-braces check that also hides
+reconciliation lag.
 
 ### Deleting: tombstone, fan-out, verify
 A delete is a fan-out, not a single call. Targets include the vector index, the keyword (BM25) index of a
@@ -89,6 +92,15 @@ segment, and some engines acknowledge a write before it is searchable. Also note
 stores only delete by id or id prefix rather than by metadata filter, which is one more reason the ids
 must be deterministic.
 
+### Guarding the delete path
+`deleted = manifest − listing` is only as trustworthy as the listing. A source API that times out, pages
+incorrectly or returns an empty result under a revoked token makes *every* document look deleted, and a
+naive reconciler will dutifully wipe the index. Treat the listing as suspect: require that it completed
+(every page fetched, no error), and refuse to apply a deletion set larger than a threshold fraction of the
+corpus (for example a few percent) without a human or a second listing confirming it. Deletes should
+be the most cautious write in the pipeline, because they are the only one that cannot be repaired by
+re-running it.
+
 ### Consistency inside the index
 Two further consistency rules. First, one index, one embedding model: vectors from two models live in
 different spaces, so a partial re-embed after a model change silently breaks similarity for the
@@ -97,8 +109,24 @@ diffs the source manifest against what the index actually contains and repairs o
 because incremental pipelines drift: a webhook is missed, a batch fails halfway, a delete fan-out hits a
 timeout on one of six targets.
 
+### Superseded is not the same as deleted
+Version ids handle a document that is edited in place. They do nothing for the common enterprise case where
+the replacement is a *different* document: "Travel Policy 2025.pdf" uploaded next to "Travel Policy
+2024.pdf", both live, both relevant, near-identical text. Retrieval will happily return either, and
+similarity cannot break the tie because the content barely differs. The fixes are metadata, not
+embeddings: capture `effective_from` / `superseded_by` (or a `status: current | archived` field) at
+ingestion, filter archived documents out by default, and keep them reachable when the question is
+explicitly historical ("what was the policy last year?"). A softer alternative is a recency prior,
+`score = similarity × exp(−age / τ)`, which prefers newer text without hiding older text; it is right for
+news-like corpora and wrong for reference material, where a ten-year-old standard can still be the
+authoritative one. Recency must use the source's `modified_at` or `effective_from`, never `indexed_at`.
+
 ### Measuring freshness
-Staleness lag: insert a canary document with a unique token, poll retrieval until it appears, record the
+Freshness lag decomposes into three terms, and each has a different owner:
+`lag = detection delay (webhook latency or poll interval) + processing (parse, chunk, embed, write)
++ engine visibility (refresh interval, segment flush, replica sync)`. A five-minute poll with a
+thirty-second pipeline gives a worst case near five and a half minutes; shortening the poll is pointless if
+a batch embedding queue holds work for an hour. Staleness lag in practice: insert a canary document with a unique token, poll retrieval until it appears, record the
 delay; do the same for a canary delete. Orphan count from reconciliation. Deleted-document leak probes on a
 schedule. Re-embedding cost per day as a proxy for how well change detection is working.
 
@@ -113,8 +141,9 @@ import hashlib, time
 def chunk_ids(doc_id, version, n):
     return [f"{doc_id}:{version}:{i}" for i in range(n)]
 
-def index_document(store, bm25, embed, split, doc_id, text, manifest):
+def index_document(store, bm25, embed, split, doc_id, text, manifest, tombstones):
     version = hashlib.sha256(text.encode()).hexdigest()[:16]
+    tombstones.discard(doc_id)                              # a re-created document must become visible
     if manifest.get(doc_id) == version:
         return "unchanged"                                  # content hash: no embedding call needed
     chunks = split(text)
@@ -130,16 +159,21 @@ def index_document(store, bm25, embed, split, doc_id, text, manifest):
         bm25.delete(filter={"doc_id": doc_id, "version": old})
     return "updated"
 
-def delete_document(store, bm25, caches, doc_id, manifest):
-    manifest.pop(doc_id, None)                              # tombstone: query path hides it immediately
+def delete_document(store, bm25, caches, doc_id, manifest, tombstones):
+    tombstones.add(doc_id)                                  # query path filters these ids out immediately
     for target in (store, bm25):
         target.delete(filter={"doc_id": doc_id})            # every version, every chunk
     for c in caches:                                        # answer cache, parent store, chunk contexts
         c.invalidate(doc_id=doc_id)
+    manifest.pop(doc_id, None)                              # only after every target succeeded: a crash
+                                                            # above leaves it for reconcile to retry
 
-def reconcile(source_listing, manifest, store, bm25, caches):
-    for doc_id in set(manifest) - set(source_listing):      # gone at the source: only the manifest sees it
-        delete_document(store, bm25, caches, doc_id, manifest)
+def reconcile(source_listing, manifest, tombstones, store, bm25, caches, max_frac=0.05):
+    gone = set(manifest) - set(source_listing)              # gone at the source: only the manifest sees it
+    if len(gone) > max_frac * max(len(manifest), 1):        # a failed or truncated listing looks like
+        raise RuntimeError(f"refusing to delete {len(gone)} docs")  # mass deletion: stop and alert
+    for doc_id in gone:
+        delete_document(store, bm25, caches, doc_id, manifest, tombstones)
     return [d for d in source_listing if d not in manifest]  # never indexed: feed back to index_document
 ```
 
@@ -170,6 +204,11 @@ def reconcile(source_listing, manifest, store, bm25, caches):
   older documents and a bimodal distribution of similarity scores.
 - Running a pull-based crawler without a manifest; the symptom is an index that only ever grows, with
   retired documents accumulating until someone notices a stale citation.
+- Trusting a source listing that failed silently; the symptom is the index's document count dropping by
+  most of the corpus right after a connector outage or token expiry, followed by "I could not find
+  anything" answers across every topic.
+- Treating a replacement document as unrelated to the one it supersedes; the symptom is answers that
+  alternate between the old and new policy depending on phrasing, with both cited as current.
 - Confusing chunk-level `indexed_at` with document-level `modified_at` in recency filters; the symptom is a
   re-indexed old document being treated as "new" by date-sorted retrieval.
 

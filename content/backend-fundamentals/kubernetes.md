@@ -5,7 +5,7 @@ name: Kubernetes
 kind: tool
 difficulty: core
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/ci-cd
@@ -59,12 +59,32 @@ networking. When you `kubectl apply` a manifest, nothing executes a command: you
 in the API server, and the controllers converge toward it, repeatedly. That is why a deleted Pod comes
 back and why a `docker run` on a node is invisible to the cluster.
 
+Every controller is the same loop, run on every change event and on a periodic resync:
+
+```
+loop:
+    desired = read spec from API server        # e.g. replicas: 3, image: v2
+    actual  = observe status                   # e.g. 2 Pods running v1, 1 Pending
+    diff    = desired - actual
+    act on diff (create, delete, update)       # one step toward desired, not a script to the end
+    write status back
+```
+
+The loop is *level-triggered*, acting on the current difference rather than on the event that caused
+it, *because* events are lost when components restart; a controller that wakes after a crash simply
+recomputes the diff. It also means you never get a "done" signal from `apply`; you watch status
+(`kubectl rollout status`) to learn when reality has caught up.
+
 ### The objects you actually use
 - **Pod**: one or more containers sharing a network namespace and volumes; the unit of scheduling;
   ephemeral, and almost never created directly in production (a controller owns it).
 - **Deployment → ReplicaSet → Pods**: a replica count, a Pod template and a rollout strategy. Changing
   the image creates a new ReplicaSet and scales it up while the old one scales down, bounded by
-  `maxSurge` and `maxUnavailable`; a bad rollout rolls back to the previous ReplicaSet.
+  `maxSurge` and `maxUnavailable`. Old ReplicaSets are kept at zero replicas, which is what makes
+  `kubectl rollout undo` fast. Kubernetes does not roll back on its own: a rollout whose new Pods never
+  become ready simply stalls (with `maxUnavailable: 0`, harmlessly) and is marked failed after
+  `progressDeadlineSeconds`; reverting is a human, pipeline or progressive-delivery tool (Argo Rollouts,
+  Flagger) decision.
 - **Service**: a stable virtual IP and DNS name that load-balances to Pods matching a label selector,
   with membership gated by readiness. An Ingress or Gateway brings HTTP in from outside.
 - **ConfigMap** and **Secret**: configuration injected as environment variables or mounted files.
@@ -81,6 +101,14 @@ integers, request equal to limit, no overcommit, because a GPU cannot be time-sh
 way CPU can. GPU node pools are usually tainted so that only Pods with a matching toleration land on
 them, keeping CPU-only work off expensive hardware. Fractional sharing needs MIG partitions or
 time-slicing configured on the node.
+
+Requests and limits together also set a Pod's quality-of-service class, which decides who dies first
+when a node runs short of memory. **Guaranteed**: every container has CPU and memory requests equal to
+limits. **BestEffort**: no requests or limits at all. **Burstable**: anything in between. Under memory
+pressure the kubelet evicts BestEffort Pods first, then Burstable Pods using more than they requested,
+and Guaranteed Pods last, *because* a Pod that reserved exactly what it uses has made no claim on
+anyone else's memory. The trade is that Guaranteed requires a CPU limit, which reintroduces
+throttling; the example below is Burstable on purpose.
 
 ### Probes: the contract that makes rollouts safe
 - **Startup probe**: for slow starts such as loading model weights; while it has not passed, the other
@@ -136,7 +164,7 @@ spec:
       - name: api
         image: registry.example.com/llm-api@sha256:3f9c...   # immutable digest, not :latest
         ports: [{containerPort: 8000}]
-        envFrom: [{secretRef: {name: llm-api-secrets}}]
+        envFrom: [{secretRef: {name: llm-api-secrets}}]   # frozen at start; mount as files for hot rotation
         resources:
           requests: {cpu: "2", memory: 8Gi, nvidia.com/gpu: 1}
           limits:   {memory: 8Gi, nvidia.com/gpu: 1}          # no CPU limit: avoids throttling
@@ -200,7 +228,10 @@ spec:
 Reach for Kubernetes when you run several services, need GPU scheduling, run batch jobs beside serving,
 share infrastructure across teams, or deploy into enterprises that already run it, which is most of
 them. Avoid it for a single container with modest load, where a managed serverless container platform
-costs less to operate. Measure time-to-ready for a new Pod, rollout duration, restart counts, Pending
+(Cloud Run, AWS App Runner) or a simpler orchestrator (ECS, Nomad) costs less to operate; those
+give you scheduling and restarts but a smaller object model, less portability and, for serverless,
+limited GPU and long-request support. Even on a managed control plane (EKS, GKE, AKS) you still own
+node pools, upgrades, add-ons and every manifest, which is where most of the operating cost lives. Measure time-to-ready for a new Pod, rollout duration, restart counts, Pending
 Pods, and GPU allocation versus actual utilization. Day to day you live in `kubectl get`, `describe`,
 `logs` and `exec`, read events, write Deployments, Jobs and autoscalers, and package them with Helm or
 Kustomize. In interviews, explain reconciliation, how a Deployment rolls out, the three probes,

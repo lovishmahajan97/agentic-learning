@@ -4,8 +4,8 @@ module: evals
 name: Model evaluation
 kind: concept
 difficulty: intro
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -96,14 +96,28 @@ A pass rate is an estimate from a sample. For a proportion *p* measured on *n* i
 error is √(p(1−p)/n): at p = 0.8 and n = 100 that is 0.04, so the 95% interval is roughly ±8 points.
 Two prompts scoring 81% and 84% on 100 items are indistinguishable. Three practices follow. Compare
 versions on the *same* items and count which items flipped (a paired comparison has far less noise
-than two independent averages). Run each item more than once when sampling temperature is above zero.
-And grow the dataset where the decision is tight rather than everywhere.
+than two independent averages, *because* item difficulty is shared by both versions and cancels; only
+the items that changed verdict carry information about the difference). Run each item more than once
+when sampling temperature is above zero, *because* there are two sources of variance, which items you
+happened to pick and which sample each item happened to draw, and the second does not shrink by adding
+items. And grow the dataset where the decision is tight rather than everywhere.
+
+### Quality is a vector, not a scalar
+A release decision weighs several axes at once: task correctness, safety and policy compliance,
+format validity (does the downstream parser accept it), latency and cost per request. They do not
+average: a 2-point quality gain that doubles p95 latency, or a cheaper model that is equal on average
+but fails a hard safety check, is a different decision from "the score went up". Report each axis
+separately, decide in advance which are hard constraints and which are traded, and compute them in the
+same run so they describe the same outputs.
 
 ### The loop
 Evaluation is not a phase; it is a loop. Look at real failures (error analysis), turn each failure
 class into a criterion and a few dataset items, add the grader to the harness, gate releases on the
-result, monitor production, and feed new failures back in. The remaining lessons in this module are
-the pieces of that loop.
+result, monitor production, and feed new failures back in. One property of the loop is easy to miss:
+any set you tune against stops being an unbiased estimate of quality (Goodhart's law applied to
+prompts), which is why the dataset keeps a held-out split that is only read when deciding to ship, and
+why online signals remain the final check. The remaining lessons in this module are the pieces of that
+loop.
 
 ## Example
 A worked scenario (numbers illustrative). A team runs a RAG support assistant and wants to swap the
@@ -148,6 +162,8 @@ evaluation buys: a specific, attributable, slice-level reason rather than an ove
   scored as failures because they are phrased differently from the reference.
 - Trusting an LLM judge that was never checked against human labels; the symptom is a high eval
   score alongside user complaints that the judge is blind to.
+- Iterating prompts against the same items used to decide the release; the symptom is a dev-set
+  score that keeps climbing while the held-out split and production metrics stay flat.
 
 ## When to use
 Evaluation is the default, not the exception: any change to a prompt, model, retrieval setting or

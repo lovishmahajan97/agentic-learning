@@ -5,7 +5,7 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agents/mcp-authentication-authorization-transport-security
   - agents/a2a-protocol
@@ -83,6 +83,35 @@ which uses HTTP POST with optional server-sent events for streaming and replaced
 HTTP-plus-SSE transport. Remote servers authenticate with OAuth 2.1 under the specification's
 authorization section; a separate lesson covers that in depth.
 
+### One call on the wire
+The handshake is where versioning lives. The client sends `initialize` with the revision it speaks
+and what it supports; the server answers with the revision it will use and its own capabilities:
+
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18",
+  "capabilities": {"elicitation": {}}, "clientInfo": {"name": "ops-agent", "version": "1.4.0"}}}
+{"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18",
+  "capabilities": {"tools": {"listChanged": true}, "resources": {}}, "serverInfo": {"name": "fs", "version": "0.6.2"}}}
+```
+
+Each side then uses only features both declared, *because* hosts and servers upgrade on different
+schedules and a capability that was never negotiated is simply not used rather than failing at runtime.
+A tool call afterwards is one request and one response, correlated by `id`:
+
+```json
+{"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+  "params": {"name": "read_text_file", "arguments": {"path": "/data/reports/q3.md"}}}
+{"jsonrpc": "2.0", "id": 7, "result": {"content": [{"type": "text", "text": "Q3 churn rose to ..."}],
+  "isError": false}}
+```
+
+Two failure channels exist and the host must map both. A tool that ran and failed (file missing, upstream
+down) returns a normal `result` with `isError: true`, which is meant to reach the model as an error
+result it can recover from. A protocol failure (unknown method, malformed request, a server that crashed)
+comes back as a JSON-RPC `error` object or a dead connection, which the model never sees unless the host
+converts it into an `is_error` tool result itself. A host that handles only the first channel crashes
+its loop on the second.
+
 ### Plugging into the agent loop
 The host lists tools from each connected server, converts them to the model provider's format (name,
 description, `input_schema`), usually prefixes names with the server name to avoid collisions, and
@@ -113,7 +142,8 @@ privilege. And every call is an extra hop with its own latency and failure modes
 ## Example
 A Python host that connects to a local reference filesystem server over stdio, converts its tools to
 the provider format with a namespace prefix, and runs the standard agent loop, routing each
-`tool_use` back to `session.call_tool`. The `mcp` package is the official Python SDK.
+`tool_use` back to `session.call_tool`. The `mcp` package is the official Python SDK. For brevity it
+keeps only text content blocks; a production host would also forward images and `structuredContent`.
 
 ```python
 import asyncio, anthropic
@@ -142,7 +172,12 @@ async def main(question: str):
                 for b in resp.content:
                     if b.type != "tool_use":
                         continue
-                    r = await session.call_tool(b.name.removeprefix("fs__"), arguments=b.input)
+                    try:                                                 # protocol errors raise
+                        r = await session.call_tool(b.name.removeprefix("fs__"), arguments=b.input)
+                    except Exception as e:                               # map channel 2 to an error result
+                        results.append({"type": "tool_result", "tool_use_id": b.id,
+                                        "content": f"server error: {e}", "is_error": True})
+                        continue
                     text = "\n".join(c.text for c in r.content if getattr(c, "type", "") == "text")
                     if len(text) > 8000:                                 # cap, and say so
                         text = text[:8000] + "\n[truncated: narrow the request]"
@@ -173,6 +208,8 @@ print(asyncio.run(main("Which reports under /data/reports mention Q3 churn, and 
   credentials or files it never needed, discovered during a security review.
 - Ignoring `isError` and mapping every result to a successful `tool_result`; the symptom is the model
   narrating error text as if it were data.
+- A stdio server that prints logs or a startup banner to stdout; stdout *is* the protocol channel, so
+  the symptom is JSON parse errors or a handshake that hangs, fixed by logging to stderr.
 - Building against the deprecated HTTP-plus-SSE transport; the symptom is new remote servers that will
   not connect.
 - Assuming two servers cannot both have a tool named `search`; the symptom is calls routed to the wrong

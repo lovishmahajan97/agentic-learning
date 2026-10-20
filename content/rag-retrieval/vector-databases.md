@@ -5,7 +5,7 @@ name: Vector databases (pgvector, Qdrant, Pinecone, Weaviate, Milvus, Chroma)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/ann-indexes
   - rag-retrieval/similarity-search
@@ -73,7 +73,11 @@ filtered query returns nothing".
   (cosine distance) and `<#>` (negative inner product), and `ivfflat` and `hnsw` index types; without an
   index it does an exact scan. Its strength is everything Postgres already gives you: transactions, joins
   against your real tables, row-level security, one backup and a team that already runs it. Its limits
-  are single-node scaling, index build time and memory, and the filtered-recall behaviour above.
+  are single-node scaling, index build time and memory, and the filtered-recall behaviour above. Two
+  sharp edges: HNSW and IVFFlat indexes on the `vector` type accept at most 2,000 dimensions, so a
+  3,072-dimensional model must be stored as `halfvec` (indexable up to 4,000) or truncated; and there is
+  no built-in BM25, so hybrid search means fusing results with Postgres full-text search (whose
+  `ts_rank` is a different scoring function) or adding another extension.
 - **Qdrant** is an open-source engine written in Rust: HNSW with payload-aware filtering built into the
   traversal, scalar, binary and product quantization, named and sparse vectors per point for hybrid
   search, REST and gRPC APIs, sharding and replication in distributed mode, and a managed cloud.
@@ -96,6 +100,16 @@ filtered query returns nothing".
 
 Adjacent options: FAISS and hnswlib (libraries, not databases), Elasticsearch and OpenSearch kNN (if you
 already run them for lexical search), Redis, LanceDB and Vespa.
+
+### When a write becomes searchable
+The systems also differ on read-your-writes. In pgvector a row is visible to queries the moment its
+transaction commits, like any other row. Dedicated engines acknowledge a write before, or separately
+from, making it searchable: Qdrant's upsert takes a `wait` flag that decides whether the call returns
+only after the change is applied; Milvus exposes consistency levels (Strong, Bounded, Session,
+Eventually) per collection or query; Pinecone documents its indexes as eventually consistent, with a
+short delay before new records appear. This matters for pipelines that upsert and then immediately
+verify counts or run a test query, and for user flows such as "upload a document, then ask about it",
+where the first question can miss the document the user just added.
 
 ### What "scale" means here
 Memory is the first wall: vectors plus the HNSW graph must be in RAM for low latency. As an illustrative
@@ -129,6 +143,8 @@ CREATE INDEX chunks_tenant_idx ON chunks (tenant_id);
 
 -- Query time: wider graph search for better recall (default 40).
 SET hnsw.ef_search = 100;
+-- pgvector 0.8.0+: keep scanning the graph until LIMIT rows survive the WHERE clause.
+SET hnsw.iterative_scan = relaxed_order;
 
 SELECT id, doc_id, 1 - (embedding <=> $1::vector) AS cosine_similarity
 FROM chunks
@@ -164,6 +180,9 @@ sequential scan.
 - A filtered query returns fewer than k results or none while the unfiltered one works; cause:
   post-filtering inside the index scan. Fix with a higher `ef_search`, iterative scans, a store with
   filterable HNSW, or partitioning by the filter key.
+- Declaring a `vector(3072)` column and then creating an HNSW index on it; symptom: the index build
+  fails on pgvector's 2,000-dimension limit. Use `halfvec(3072)` with `halfvec_cosine_ops`, or a
+  truncated Matryoshka dimension, decided before the schema ships.
 - Building the HNSW index before the bulk load; symptom: the load takes hours because every insert
   updates the graph. Load first, index after.
 - Measuring recall only at the default query-time parameters; symptom: great benchmark numbers and

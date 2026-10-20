@@ -5,7 +5,7 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - evals/eval-harness
   - evals/llm-as-a-judge
@@ -132,7 +132,18 @@ two sources of truth for golden items is the most common way these stacks rot.
 ### What is under every prebuilt metric
 A prompt, a model and a parsing step. Read the prompt before trusting the number, pin the judge model,
 and calibrate against a few dozen human-labelled items from your own domain before the metric gates
-anything.
+anything. Faithfulness-style metrics are typically a ratio, supported statements ÷ extracted
+statements, so the score inherits two judge decisions per item: how the answer was split into
+statements and whether each was judged supported. A terse answer with one supported claim scores 1.0;
+a thorough answer with nine supported claims and one unsupported aside scores 0.9, so the metric
+mildly rewards saying less.
+
+The same anatomy sets the bill. A judge metric costs one or more model calls per row, so a run costs
+roughly rows × judge metrics × calls per metric × samples per row. An illustrative 500-row set with
+three judge metrics at about two calls each and three samples per row is around 9,000 judge calls per
+run, which is why the cost pyramid (deterministic checks per commit, judges per PR or nightly) is a
+budgeting decision, not a style preference. Library caching only helps when the target's output is
+unchanged, which is rarely true for the run that tests a change.
 
 ## Example
 The same support assistant tested two ways: a DeepEval test that pairs a prebuilt faithfulness metric
@@ -177,6 +188,17 @@ tests:
       - { type: python, value: "'billing' in output.lower() or 'contact' in output.lower()" }
 ```
 
+What the numbers mean underneath. Promptfoo expands the YAML into a matrix: 2 prompts × 2 providers ×
+2 tests = 8 cells, each graded by its two assertions, and the view shows prompt v7 and v8 side by side
+per provider, which is the comparison you wanted. On the DeepEval side, suppose the SCIM answer makes
+four claims: SCIM lives under Settings → Security, it needs the Enterprise plan, you generate a token,
+and you paste the token into the identity provider. The retrieved article supports three; nothing in
+it mentions a plan requirement. Faithfulness is 3/4 = 0.75, below the 0.9 threshold, so the test fails
+and the metric's `reason` names the unsupported claim. Now the trap: if retrieval had returned the SSO
+article instead and the bot faithfully described SSO setup, faithfulness would be 1.0 and the test
+would pass. The Promptfoo `contains: SCIM` and the rubric assertion are what catch that case, which is
+the general lesson: pair every context-relative metric with a check against the task itself.
+
 ## Trade-offs
 - Prebuilt metrics give faithfulness and relevance on day one without labels, but each is a judge whose
   prompt and model you do not control; once a metric gates a release you must calibrate it against
@@ -187,7 +209,9 @@ tests:
 - Config-driven Promptfoo makes prompt×model comparison trivial, but agents and multi-step pipelines
   must be wrapped as a custom provider, where a code-first `Eval` or pytest style is more natural.
 - Pytest-style pass/fail slots into CI and feels familiar but hides distributions; score tables show
-  distributions but need a separate gating rule before they stop anything.
+  distributions but need a separate gating rule before they stop anything. Per-case thresholds suit a
+  small suite of must-pass behaviours; once the suite is large and noisy, gate on aggregate drops and
+  regressed-item counts instead.
 - Combining several tools covers each one's gaps but multiplies copies of the dataset and metric
   definitions; keep one canonical store and import into the rest.
 

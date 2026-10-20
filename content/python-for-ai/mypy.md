@@ -5,6 +5,7 @@ name: mypy
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/type-hints
   - python-for-ai/protocols-generics-structural-typing
@@ -87,10 +88,11 @@ ignore_missing_imports = true
 mypy caches results in `.mypy_cache` and rechecks only what changed; `dmypy` keeps a daemon running for
 faster editor-style feedback. The main alternative is pyright (the engine behind Pylance), which is
 faster and infers more aggressively, so the two disagree at the edges; newer Rust-based checkers such as
-Astral's ty and Meta's Pyrefly are still maturing. Pick one checker as the CI gate.
+Astral's ty and Meta's Pyrefly are much faster but younger, so check their current maturity and
+typing-spec conformance before making one a gate. Pick one checker as the CI gate.
 
 ## Example
-Three bugs a test suite can easily miss, each reported by mypy with its error code. The comments show
+Bugs a test suite can easily miss, each reported by mypy with its error code, plus one it misses. The comments show
 mypy's messages (paths and line numbers omitted).
 
 ```python
@@ -125,12 +127,15 @@ def route(call: ToolCall) -> str:
     else:
         assert_never(name)   # adding "run_sql" to the Literal makes this line an error
 
-def helper(resp):            # unannotated: body not checked unless check_untyped_defs is on
-    return resp.choises[0]   # typo goes unreported by default
+def helper(resp):                  # unannotated: mypy skips this body by default
+    return first_text(resp) + 1    # str + int: reported only with check_untyped_defs (or strict)
+    # resp.choises would pass even then: an unannotated parameter is Any until you annotate it
 ```
 
 The fixes are one line each (`os.environ["MODEL"]` or a default, an `is None` branch, the correct key),
-and the last function shows why `strict` matters: unannotated code is invisible to the checker.
+and the last function shows why `strict` matters: unannotated bodies are skipped by default, and even
+`check_untyped_defs` cannot see through parameters that are implicitly `Any`. Strict mode's
+`disallow_untyped_defs` forces the annotation that makes the checker useful there.
 
 ## Trade-offs
 - Strict mode catches the most bugs, but costs annotation effort and fights dynamic code; it flips from
@@ -147,8 +152,9 @@ and the last function shows why `strict` matters: unannotated code is invisible 
   reason, which `warn_unused_ignores` and error-code-specific ignores make visible.
 - Typing provider responses or tool arguments as `dict[str, Any]`; the symptom is mypy passing code that
   reads misspelled keys, because `Any` turns off every check downstream of it.
-- Leaving functions unannotated and assuming they are checked; the symptom is obvious attribute typos in
-  those functions that mypy never reports until `check_untyped_defs` or strict mode is switched on.
+- Leaving functions unannotated and assuming they are checked; the symptom is obvious misuse of typed
+  values in those bodies that mypy never reports until `check_untyped_defs` is on, and attribute typos
+  on their implicitly `Any` parameters that stay invisible until the parameters are annotated.
 - Running mypy only in editors, not in CI; the symptom is a main branch with hundreds of errors that
   nobody can turn on as a gate without a week of cleanup.
 - Ignoring missing stubs globally rather than per module; the symptom is a typo in an import or a

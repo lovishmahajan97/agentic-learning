@@ -5,7 +5,7 @@ name: Overfitting
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/train-val-test-split
   - training-adaptation/epochs
@@ -57,7 +57,9 @@ rate and less diverse data all widen it. Noise in the labels sets a floor on ach
 that goes below the noise floor on training data has memorised the noise.
 
 ### How it looks in LLM fine-tuning
-- Held-out loss turns up after one or two passes while training loss keeps dropping.
+- Held-out loss turns up after one or two passes while training loss keeps dropping, often with a
+  staircase in training loss: an abrupt drop at each epoch boundary, because the model is now predicting
+  rows it has already seen.
 - The model reproduces training completions verbatim, including names, numbers and boilerplate, and can
   be prompted to regurgitate training records, which is a privacy incident as well as a modelling failure.
 - Outputs converge on one style or length regardless of the prompt, because the fine-tuning set had one.
@@ -79,6 +81,15 @@ that goes below the noise floor on training data has memorised the noise.
    stops the model from driving probabilities to exactly one, and mixing general-purpose data into the
    fine-tuning set dilutes the shortcuts specific to your rows. Details in
    `ml-fundamentals/dropout-regularization`.
+
+### Diagnosing with a learning curve
+When the gap is large, the cheapest way to decide whether more data would help is to retrain on 25%, 50%
+and 100% of the training set and plot the best validation score against data size. If validation keeps
+improving steeply as data grows and the train-validation gap narrows, the model is variance-limited and
+more (diverse) data is the lever worth paying for. If validation has flattened and training and
+validation scores are close, more of the same data will not help; the limit is label noise, task
+definition or model capacity. This is the bias-variance decomposition turned into an experiment, and it
+replaces an argument about whether to label another 5,000 rows with a chart.
 
 ### What overfitting is not
 - **Underfitting:** both losses high and close together; the model lacks capacity or steps.
@@ -170,7 +181,9 @@ how to detect and bound it. Always train with a held-out set that respects the u
 evaluate at least once per epoch, save a checkpoint at each evaluation and keep the best one. Start with
 few epochs and a low learning rate and lengthen only if validation is still improving. Reach for more or
 cleaner data before reaching for regularisation knobs, and for a smaller trainable footprint when data is
-scarce. Day to day, the gap between training and validation curves is the first chart to inspect in any
+scarce; a learning curve over data fractions tells you whether more data will actually pay. Measure the
+train-validation gap at the chosen checkpoint, the task metric on held-out data, and a verbatim-overlap
+check between generations and training targets. Day to day, the gap between training and validation curves is the first chart to inspect in any
 run review. In interviews, be ready to explain the gap, the levers, and why the classic U-curve is only
 a guide for modern networks.
 

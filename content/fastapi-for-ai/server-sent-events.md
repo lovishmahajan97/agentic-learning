@@ -5,6 +5,7 @@ name: Server-Sent Events
 kind: concept
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - fastapi-for-ai/streamingresponse
   - fastapi-for-ai/websockets
@@ -72,12 +73,15 @@ behind nginx add `X-Accel-Buffering: no`.
 ### The client side
 `EventSource` is built into browsers: it opens a GET, parses events, fires listeners by `event:` name,
 reconnects automatically when the connection drops and sends the `Last-Event-ID` header on reconnect.
-Its limits decide how chat UIs are built: it can only GET, cannot set an `Authorization` header or a
+Reconnection is driven by the browser: after a drop it waits the `retry:` interval (a few seconds by
+default, browser-dependent) and reissues the GET; a server that wants a stream to end for good must
+respond to that reconnect with HTTP 204, or the client must call `close()`, otherwise a finished run is
+re-requested forever. Its limits decide how chat UIs are built: it can only GET, cannot set an `Authorization` header or a
 body, and sends credentials only via cookies. A chat prompt is a POST with a JSON body and a bearer
 token, so production frontends use `fetch()` and parse the stream themselves (a `ReadableStream`, a
 `TextDecoder` and a line splitter, or a small library), which means they also own reconnection logic.
-Server-side consumers use `httpx` with `stream=True` and `aiter_lines()`; vendor SDKs parse the
-vendor's own SSE for you.
+Server-side consumers use `httpx`'s `client.stream("POST", ...)` context manager with `aiter_lines()`
+(`stream=True` is the `requests` spelling, not httpx's); vendor SDKs parse the vendor's own SSE for you.
 
 ### The server side in FastAPI
 The minimum is a `StreamingResponse` whose generator yields correctly formatted strings with
@@ -107,7 +111,9 @@ id before continuing live. For agent runs that cost real money per attempt this 
 mobile connection from "re-run the whole thing" into "catch up".
 
 ### Event vocabularies
-OpenAI's API streams JSON chunks in `data:` lines and ends with a literal `data: [DONE]`; Anthropic's
+Vocabularies differ by vendor and by API generation, so check the current docs. OpenAI's Chat
+Completions API streams untyped JSON chunks in `data:` lines and ends with a literal `data: [DONE]`,
+while its newer Responses API uses named events such as `response.output_text.delta`; Anthropic's
 Messages API streams typed events such as `message_start`, `content_block_delta` and `message_stop`.
 Your own API should define its own small vocabulary (`token`, `tool_call`, `usage`, `done`, `error`)
 and translate, so that swapping the model provider never changes the frontend.
@@ -115,7 +121,10 @@ and translate, so that swapping the model provider never changes the frontend.
 ## Example
 A FastAPI SSE endpoint built directly on `StreamingResponse`. The model stream runs in its own task
 feeding a queue, so the consumer can wait with a timeout and emit a keepalive comment during silent
-phases without cancelling the producer. Each event carries an id so a client can resume.
+phases without cancelling the producer. Each event carries a monotonic id; this endpoint does not
+replay, but those ids are exactly what a resume endpoint (see Resumability) would key its buffer on.
+With tokens 0.3 s apart nothing is silent for 15 s, so here the ping only fires if the model stalls,
+for instance during a long tool call.
 
 ```python
 import asyncio, json
@@ -178,14 +187,19 @@ async def chat(body: Ask):
   and bearer tokens at the cost of owning reconnection and the parser yourself.
 
 ## Pitfalls
-- Forgetting the terminating blank line or using a single newline between fields; the symptom is a
-  client that receives nothing until the stream closes, then everything as one malformed event.
+- Forgetting the blank line that ends each event (a single newline only separates fields); the
+  symptom is a client that receives nothing, because a conforming parser discards an undispatched
+  event at end of stream, or a hand-rolled parser that glues everything into one malformed event.
 - Putting raw text with embedded newlines into one `data:` line; the symptom is events split at the
   wrong place, which JSON-encoding the payload (newlines become `\n`) avoids entirely.
 - No keepalive during long tool calls; the symptom is streams that die at a fixed wall-clock interval,
   often exactly the load balancer's idle timeout, only when the agent is "thinking".
 - A buffering proxy or compression middleware on the route; the symptom is all events arriving in a
   burst at the end, with the server logs showing they were produced on time.
+- Ending a run by simply closing the response while the client uses `EventSource`; the symptom is a
+  fresh GET, and possibly a fresh billed generation, every few seconds after each answer finishes,
+  because the browser treats a closed stream as a dropped one; send a `done` event the client acts on
+  by calling `close()`, and answer reconnects for finished runs with 204.
 - Leaking the vendor's event schema straight to the browser; the symptom is a model-provider switch
   that breaks the frontend parser.
 - Replaying a run from `Last-Event-ID` without re-checking that the caller owns that run; the symptom

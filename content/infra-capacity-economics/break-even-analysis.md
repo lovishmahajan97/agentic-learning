@@ -5,6 +5,7 @@ name: Break-even analysis (hosted API vs self-hosting)
 kind: decision
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - system-design/self-host-vs-api
   - system-design/open-weight-vs-proprietary
@@ -65,7 +66,11 @@ N(V)      = ceil(peak_rate / T_slo)
 `T_slo` is the sustained tokens per second one replica delivers *at your latency target*, measured on your
 sequence lengths, not the throughput at maximum batch. The distinction matters because continuous batching
 trades per-request latency for aggregate throughput: the batch size that maximizes tokens per second gives a
-p95 nobody would ship. The peak-to-average ratio comes from your traffic logs; headroom covers failover and
+p95 nobody would ship. Measure it for your request *shape* (typical input and output lengths), not as a
+generic tokens-per-second figure, *because* a prompt token is processed in parallel during prefill and
+costs far less GPU time than an output token generated one at a time in decode. An API's price ratio
+between input and output tokens is not your GPU's cost ratio, so blend both sides on the same mix. The
+peak-to-average ratio comes from your traffic logs; headroom covers failover and
 the fact that a replica at 100% load is already past its latency target.
 
 The achieved utilization is `u = avg_rate / (N · T_slo)`, roughly `1 / (peak_to_average · (1 + headroom))`
@@ -83,6 +88,12 @@ achieve, there is no break-even at any volume: fixed costs only widen the gap. I
 continuous approximation of the crossover is `V* ≈ F / (p − c_self)`, and the step function makes the real
 crossover slightly later. The sign test is what an API price cut attacks: halve `p` and a workload that was
 comfortably past break-even can be on the wrong side of it permanently.
+
+### Payback on the switch
+Moving is itself a one-off cost `M`: building the serving path, evaluating and possibly fine-tuning the
+open-weight model, load testing, migrating traffic. Even past break-even, the switch pays back only after
+`M / (Cost_api − Cost_self)` months. Put that next to the reservation term and the expected life of the
+model choice: a 14-month payback on a decision you expect to revisit within a year is a loss.
 
 ### What goes into G and F
 `G` is the accelerator plus its share of the node (CPU, memory, local disk, network), ingress and load
@@ -111,6 +122,15 @@ Regulated data that cannot leave a region or a building; rate limits and quotas 
 your peak; latency control through co-location; a specific open-weight or custom fine-tuned model the
 vendor does not serve; deprecation and lock-in risk. Any one of these can settle the question regardless
 of cost, but run the arithmetic anyway so the premium being paid for the constraint is known and owned.
+
+### Separate the model choice from the operating model
+"Hosted API versus self-hosting" silently bundles two decisions: which model (proprietary or open-weight)
+and who operates it. They can be unbundled. Several providers serve open-weight models per token, and some
+vendors sell dedicated or provisioned capacity for a fixed fee. A per-token open-weight endpoint gives you
+the open model's price and portability with no `F` for serving; provisioned capacity gives you fixed cost
+and guaranteed throughput without running the stack. Price these as separate rows, *because* the
+self-hosting case often rests on the model being cheaper, not on operating it yourself, and a managed
+endpoint captures that saving without the fixed costs.
 
 ### The usual answer is hybrid
 Self-host the predictable base load, where utilization is high and fixed cost amortizes well, and send
@@ -150,10 +170,13 @@ for label, price, p2a in (("interactive", 2.00, 2.5), ("flat batch", 2.00, 1.2),
 # API cut:      100,000M api=$100,000 self=$190,000 (58) -> api wins at every volume shown
 ```
 
-Read the three blocks together. With bursty interactive traffic, self-hosting does not win until somewhere
-past 50 billion tokens a month, an API bill around $100,000. Make the load flat and the same GPUs serve
-roughly twice the tokens, so the crossover drops below 20 billion. Halve the API price and the sign test
-fails: the self-hosted cost per token is now above the API price, and no volume rescues it. The GPU price
+Read the three blocks together, starting with the sign test. One replica serves
+2,000 × 2,592,000 ≈ 5.2 billion tokens a month at full load, so `c_self` = $3,000 / 5,184M ≈ $0.58 per
+million at u = 1. Interactive traffic gives u ≈ 1 / (2.5 × 1.2) = 1/3, so `c_self` ≈ $1.74, below the $2
+price but only just: `V* ≈ 16,000 / (2.00 − 1.74)` ≈ 62 billion tokens a month. That matches the table:
+self-hosting does not win until somewhere past 50 billion tokens a month, an API bill around $100,000. Make the load flat (u ≈ 0.69, `c_self` ≈ $0.83) and the same GPUs serve
+roughly twice the tokens, so the crossover drops to about 14 billion. Halve the API price and the sign test
+fails: $1.74 is above $1.00, and no volume rescues it. The GPU price
 never changed across the three runs; utilization and the competitor's price did all the work.
 
 ## Trade-offs
@@ -179,6 +202,9 @@ never changed across the three runs; utilization and the competitor's price did 
   per million tokens and looks wrong after the next provider price cut.
 - Ignoring the input/output mix; the symptom is decode-heavy traffic achieving far less than the measured
   throughput, because decode is bandwidth-bound while the benchmark was prefill-heavy.
+- Framing it as "frontier API versus our own GPUs" and skipping managed open-weight endpoints; the symptom
+  is a self-hosting project whose whole saving came from the cheaper model, which a per-token endpoint
+  would have delivered without the platform team.
 - Arguing cost when the real driver is residency or quotas; the symptom is weeks of spreadsheet debate
   while the compliance blocker that actually decides the question goes unaddressed.
 
@@ -218,14 +244,15 @@ and throughput at SLO first, and to consider a hybrid that self-hosts the flat b
 to the API.
 
 ## Quiz
-### Q: Which single parameter most changes the self-hosted cost per token?
+### Q: For a chosen model and serving stack, which parameter most changes the self-hosted cost per token?
 - [ ] The GPU's hourly list price
 - [x] The utilization actually achieved after provisioning for peak with headroom
-- [ ] The model's parameter count
-- [ ] The number of transformer layers in the model
+- [ ] The maximum-batch throughput in the vendor's published benchmark
+- [ ] The network egress price of the cloud region
 > Effective cost per token is the replica cost divided by the tokens it actually serves. Provisioning for
-> a bursty peak leaves most of the capacity idle most of the time, which multiplies the cost per token far
-> more than any plausible difference in GPU price.
+> a bursty peak can leave two-thirds or more of the capacity idle, which typically moves the cost per token
+> more than price differences between comparable GPU offers; a vendor benchmark changes no real cost, and
+> egress is small for text tokens.
 
 ### Q: At realistic utilization the self-hosted effective cost per token comes out above the API's price per token. What does that imply?
 - [ ] Break-even will be reached at a high enough volume

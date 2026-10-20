@@ -5,6 +5,7 @@ name: Uvicorn / Gunicorn workers
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/lifespan
@@ -32,8 +33,9 @@ and run the asyncio event loop. Uvicorn does that. A single Uvicorn process hand
 concurrent connections well as long as handlers mostly await I/O, which is exactly the shape of an LLM
 gateway: a request waits seconds for a provider while using almost no CPU.
 
-Two limits push you beyond one process. First, CPython's global interpreter lock means one process
-executes Python bytecode on one core at a time, so CPU work (tokenizing, JSON-heavy post-processing,
+Two limits push you beyond one process. First, on the standard CPython build the global interpreter lock
+means one process executes Python bytecode on one core at a time (the experimental free-threaded builds
+from Python 3.13 relax this, but most AI library stacks still assume the GIL), so CPU work (tokenizing, JSON-heavy post-processing,
 local embedding inference, PDF parsing) saturates one core and stalls the event loop for everyone.
 Second, a single process is a single point of failure: if it crashes, segfaults in a native library or
 leaks memory until it is killed, the service is down. Running N worker processes addresses both, but
@@ -45,8 +47,9 @@ orchestrator instead.
 ### Uvicorn alone
 `uvicorn app.main:app --host 0.0.0.0 --port 8000` runs one process with one event loop. With
 `--workers N`, Uvicorn starts a small supervisor that spawns N child processes sharing the listening
-socket; the kernel spreads incoming connections across them. Each child runs lifespan startup
-independently, so every worker builds its own HTTP client pool, DB engine and model.
+socket; the kernel spreads incoming connections across them (not perfectly evenly). Recent Uvicorn
+versions (0.30 onward) also restart children that die. Each child runs lifespan startup independently, so
+every worker builds its own HTTP client pool, DB engine and model.
 
 ### Gunicorn with Uvicorn workers
 `gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4 --bind 0.0.0.0:8000` makes Gunicorn the
@@ -64,8 +67,9 @@ replaces any that exit. It adds operational controls Uvicorn alone is thinner on
   copy-on-write. CPython reference counting writes to objects it touches, so sharing erodes over time, and
   CUDA must not be initialised before a fork, so preloading a GPU model is a trap.
 
-Recent Uvicorn releases moved the Gunicorn worker class into a separate `uvicorn-worker` package; check
-which import path your pinned version expects.
+Since Uvicorn 0.30 the built-in `uvicorn.workers` module is deprecated in favour of the separate
+`uvicorn-worker` package (`-k uvicorn_worker.UvicornWorker`); the old path still works in many versions but
+warns, so check which import path your pinned versions expect.
 
 ### Sizing
 Gunicorn's classic `2 × cores + 1` guidance is for synchronous workers that block on I/O. An async worker
@@ -93,8 +97,9 @@ about 1.1 GiB of reranker weights and tokenizer, 0.5 GiB of Python, libraries an
 - CPU-only reasoning says 4 workers. Memory says 4 × 1.6 = 6.4 GiB, leaving 1.6 GiB for request buffers
   and spikes in tensor allocation during reranking. That fits, so 4 workers it is.
 - If the team upgrades to a reranker whose workers measure 2.6 GiB each, 4 workers need 10.4 GiB: the pod
-  is OOM-killed under load. Options: 2 workers per pod and double the replicas (same total CPU, more
-  memory overall), or move the reranker into a dedicated model server so the API workers shrink to
+  is OOM-killed under load. Options: resize pods to 2 vCPU and about 6 GiB with 2 workers each and
+  double the replicas (2 × 2.6 = 5.2 GiB per pod; same total CPU and worker count, more memory overall
+  because headroom is now reserved per smaller pod), or move the reranker into a dedicated model server so the API workers shrink to
   ~0.5 GiB each and the reranker loads once.
 - A configuration that sends the reranker to a GPU node should run one worker per GPU, or better, put the
   model behind an inference server and keep FastAPI as a thin async I/O layer.
@@ -106,8 +111,11 @@ gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4 --bind 0.0.0.0:8000 
   --timeout 120 --graceful-timeout 60 --max-requests 5000 --max-requests-jitter 500
 ```
 
-`--timeout 120` is raised because a rerank batch can legitimately hold the loop briefly; a better fix is
-moving that CPU work off the loop with `run_in_threadpool` or a process pool, then lowering the timeout.
+`--timeout 120` is raised because a large rerank batch run synchronously can block the loop long enough to
+miss the default 30 s heartbeat. That is a workaround, not a fix: while the loop is blocked, every other
+request on that worker stalls too. The real fix is moving the CPU work off the loop (`run_in_threadpool`
+works for libraries such as PyTorch that release the GIL during heavy ops; pure-Python work needs a process
+pool), then lowering the timeout back.
 
 ## Trade-offs
 - More workers use more cores and survive single-process crashes, but every worker duplicates the model

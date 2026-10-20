@@ -5,6 +5,7 @@ name: StreamingResponse
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - fastapi-for-ai/server-sent-events
   - fastapi-for-ai/websockets
@@ -36,7 +37,9 @@ until then the client sees nothing. Three things go wrong at once. The user expe
 because people judge responsiveness by the first visible change. Infrastructure timeouts trip:
 reverse proxies and load balancers commonly ship with request or idle timeouts in the tens of seconds,
 so long answers die with a 502 or 504 even though the model was still working. And memory scales with
-concurrency, because every in-flight request keeps its whole output alive until the end.
+concurrency, because every in-flight request keeps its whole output alive until the end; for a few KB
+of chat text that is negligible, but for a row-by-row CSV export or a proxied file it is the difference
+between constant memory and holding hundreds of megabytes per request.
 
 The naive fixes fail. Raising every timeout keeps the connection open but does nothing for first-token
 latency and still ties up a connection per request. Polling a job endpoint adds a round trip per poll
@@ -57,15 +60,27 @@ are bypassed: what you yield is what goes on the wire.
 A normal response sends one `http.response.start` message (status, headers) followed by a single
 `http.response.body` with `more_body: False`. A streaming response sends the start message, then one
 `http.response.body` with `more_body: True` per chunk, then an empty body with `more_body: False` to
-close. No `Content-Length` is known up front, so over HTTP/1.1 the server (uvicorn) uses
+close:
+
+```
+send {"type": "http.response.start", "status": 200, "headers": [...]}   # status frozen here
+send {"type": "http.response.body", "body": b'{"delta":"Str"}\n', "more_body": True}
+send {"type": "http.response.body", "body": b'{"delta":"eam"}\n', "more_body": True}
+...                                                                     # one per yield
+send {"type": "http.response.body", "body": b"", "more_body": False}     # end of response
+```
+
+No `Content-Length` is known up front, so over HTTP/1.1 the server (uvicorn) uses
 `Transfer-Encoding: chunked`; behind a proxy that terminates HTTP/2 the chunks simply become DATA
 frames. This is why you must not set `Content-Length` yourself unless you really know it.
 
 ### Sync versus async iterators
 If `content` is a plain generator, Starlette drives it with `iterate_in_threadpool`: each `next()` is
 run on a worker thread so it cannot block the event loop. That is safe but costs a thread hop per
-chunk and occupies a slot in the shared thread pool (anyio's default limiter is 40 threads) for the
-life of the stream. An `async def` generator is awaited directly on the loop, which is what you want
+chunk, and each `next()` holds a slot in the shared thread pool (anyio's default limiter is 40 tokens)
+while it runs. For a blocking source that spends most of its time waiting for the next token, that
+means a slot is held for most of the stream's life, so a few dozen slow streams can starve every other
+sync endpoint and dependency. An `async def` generator is awaited directly on the loop, which is what you want
 when the source is an async SDK stream or an `httpx` streaming response. Mixing the two, for example
 calling a blocking SDK inside an async generator, blocks every other request for the duration of
 each call.
@@ -114,6 +129,7 @@ instead of a truncated body.
 
 ```python
 import asyncio, json
+from contextlib import aclosing                           # Python 3.10+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -136,10 +152,12 @@ async def answer(body: Ask, request: Request):
 
     async def ndjson():
         try:
-            async for piece in model_stream(body.prompt):
-                if await request.is_disconnected():
-                    break                                 # stop paying for tokens nobody will read
-                yield json.dumps({"delta": piece}) + "\n"
+            # aclosing() closes the upstream stream deterministically when we stop early
+            async with aclosing(model_stream(body.prompt)) as stream:
+                async for piece in stream:
+                    if await request.is_disconnected():
+                        return                            # stop paying for tokens nobody will read
+                    yield json.dumps({"delta": piece}) + "\n"
             yield json.dumps({"done": True}) + "\n"
         except Exception as exc:                          # headers are gone: signal the error in-band
             yield json.dumps({"error": type(exc).__name__}) + "\n"
@@ -156,8 +174,8 @@ async def answer(body: Ask, request: Request):
   and the connection stays open for the whole generation, so capacity must be sized by concurrent
   streams rather than by requests per second.
 - You stop buffering whole bodies in memory, but you lose `Content-Length`, so clients cannot show a
-  percentage and HTTP caches will not store the response; for small, cacheable payloads a plain
-  `JSONResponse` is the better choice.
+  percentage or detect truncation by length, and CDNs either buffer or skip such responses; for small,
+  cacheable payloads a plain `JSONResponse` is the better choice.
 - In-band error chunks let the client keep partial output, but every consumer must now parse a protocol
   instead of checking a status code; when the consumers are third-party integrators expecting REST
   semantics, offer a non-streaming variant as well.
@@ -218,7 +236,7 @@ not accidentally setting `Content-Length`, and add periodic keepalive chunks for
 ### Q: What is the main reason to prefer an async generator over a sync generator as the content?
 - [ ] Sync generators cannot yield bytes
 - [ ] Async generators automatically set Content-Length
-- [x] Each item from a sync generator is pulled on a thread-pool thread, costing a hop per chunk and a pool slot for the stream's lifetime
+- [x] Each item from a sync generator is pulled on a thread-pool thread, costing a hop per chunk and a limited pool slot while each pull waits
 - [ ] Sync generators bypass disconnect detection entirely
 > Starlette wraps sync iterators with `iterate_in_threadpool` to keep the loop unblocked. That is
 > correct but expensive for thousands of small chunks and it consumes a limited thread pool.

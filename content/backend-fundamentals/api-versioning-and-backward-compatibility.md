@@ -5,7 +5,7 @@ name: API versioning & backward compatibility
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/rest-graphql-api-design
   - fastapi-for-ai/openapi-contract-testing
@@ -89,9 +89,28 @@ guide on old-version responses, and mark the route deprecated in OpenAPI. RFC 97
 version per client so you know who is left. Run brownouts (short planned outages of the old version)
 before removal. Remove on the announced date.
 
+### Catching breaks before they ship
+Review by eye misses breaks, so make them mechanical. Two complementary checks run in CI. A schema
+diff compares the OpenAPI document generated from the branch against the one published from `main`
+and fails on any change in the breaking list (removed field, narrowed type, new required input); it
+catches what the provider changed. Consumer-driven contract tests (the Pact style) go the other way:
+each client publishes the requests it sends and the fields it reads, and the provider's build replays
+them; this catches the Hyrum's-law dependencies the schema never promised, such as a client relying
+on list order.
+
+### SDKs and client libraries
+A published SDK has its own compatibility surface on top of the wire API: method names, exception
+classes, default timeouts and retries. Version it with semantic versioning, so a breaking change to any
+of those is a major bump even when the HTTP API did not change, and decouple the SDK version from the
+API version it speaks (pinning the API version inside the SDK release is common) so upgrading the
+library is not silently also an API migration.
+
 ### Data and schema changes: expand and contract
-Rename a column or field in three steps: add the new one, write both and read either, migrate
-consumers, then remove the old. The same pattern applies to message schemas and tool arguments.
+Rename a column or field in three phases. Expand: add the new field and populate both, so old and
+new readers both work. Migrate: move every consumer to the new field, verified by telemetry rather
+than by asking. Contract: stop writing the old field, then remove it. The order matters *because* at
+every point in time each deployed producer and consumer, old or new, still sees a field it
+understands, which is what lets the two sides deploy independently. The same pattern applies to message schemas and tool arguments.
 
 ### AI-specific contracts
 Model providers retire model versions; pin exact snapshot names and track deprecation notices. A

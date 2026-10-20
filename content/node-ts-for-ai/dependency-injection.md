@@ -5,6 +5,7 @@ name: Dependency injection
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - node-ts-for-ai/vitest-jest-and-integration-testing
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
@@ -36,7 +37,7 @@ The problems appear in a predictable order. Tests: every unit test of the handle
 real API (slow, paid, flaky, needs secrets in CI) or reaches for module mocking (`vi.mock('./clients')`),
 which couples tests to file paths and silently diverges from the real wiring. Per-tenant variation: an
 enterprise customer wants their traffic routed to an Azure endpoint with their own key; a module-level
-singleton has exactly one key. Provider fallback and A/B tests: "use Anthropic when OpenAI returns 529"
+singleton has exactly one key. Provider fallback and A/B tests: "use Anthropic when OpenAI keeps returning 429 or 5xx"
 cannot be expressed when the dependency is a fixed import. Lifecycle: the singleton is created at import
 time, before config is validated and before the process knows whether it is a web server, a worker or a
 one-off script, so startup order becomes accidental.
@@ -71,6 +72,10 @@ in Node is to create a `RequestContext` in middleware and pass it down, or to us
 for ambient values such as the trace id. `AsyncLocalStorage` is complementary, not a replacement: it is
 good for cross-cutting context you would otherwise thread through every signature, and bad for real
 dependencies, *because* hidden ambient dependencies recreate the testability problem DI solves.
+Containers differ on scope mismatches: NestJS "bubbles" request scope up the chain, so a provider that
+injects a request-scoped one silently becomes request-scoped itself (correct, but now rebuilt on every
+request), whereas a hand-wired root or a container without that rule lets a singleton capture the
+first request's object and keep it.
 
 ### Containers and decorators
 Frameworks automate the composition root. NestJS uses class decorators (`@Injectable()`) and constructor
@@ -117,7 +122,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const openai = new OpenAI();                                  // reads OPENAI_API_KEY here, nowhere else
 const llm: LLM = {
   async complete({ system, user, maxTokens }) {
-    const res = await openai.chat.completions.create({ model: process.env.MODEL ?? "gpt-4o-mini", max_tokens: maxTokens,
+    const res = await openai.chat.completions.create({ model: process.env.MODEL ?? "gpt-4o-mini", max_completion_tokens: maxTokens,
       messages: [{ role: "system", content: system }, { role: "user", content: user }] });
     return { text: res.choices[0].message.content ?? "", inputTokens: res.usage?.prompt_tokens ?? 0, outputTokens: res.usage?.completion_tokens ?? 0 };
   },
@@ -146,7 +151,7 @@ const svc = createChatService({
 - Service locator in disguise: passing one giant `container` object and calling `container.get('llm')` inside business logic; the symptom is that a signature no longer tells you what a function touches, and every test must build the whole container.
 - Mixing scopes: injecting a request-scoped object (tenant config, trace span) into a singleton; the symptom is one tenant's model or API key leaking into another tenant's request under concurrency.
 - Mocking by file path (`vi.mock('../clients')`) instead of injecting: the symptom is tests that break when files move, and mocks that stay green after the real wiring changed.
-- Circular dependencies between services, which containers resolve lazily and hand-wiring cannot; the symptom is `undefined` at runtime or a NestJS circular-dependency boot error, and the fix is usually splitting an interface.
+- Circular dependencies between services, which some containers can paper over with lazy proxies (NestJS `forwardRef`) and hand-wiring cannot construct at all; the symptom is `undefined` at runtime or a NestJS circular-dependency boot error, and the fix is usually splitting an interface.
 
 ## When to use
 Reach for explicit injection in any service that talks to an LLM, a database or a queue, which is nearly
@@ -166,11 +171,12 @@ interface erasure affects containers, and where request scope lives.
 ## Check yourself
 **Q:** Your service imports a single OpenAI client at module scope. A customer now requires their
 requests to go to an Azure OpenAI deployment with their own key, and the team wants automatic fallback
-to Anthropic on 529 errors. How would you restructure, and where does each decision live?
+to Anthropic when OpenAI is rate-limiting or failing (429s and 5xx after retries). How would you restructure, and where does each decision live?
 **A:** Introduce a narrow `LLM` interface covering only the operations the service uses, and make the
 service take it as a constructor or factory argument. At the composition root build concrete adapters:
 one wrapping the OpenAI SDK, one for Azure with the customer's endpoint and key, one for Anthropic.
-Compose them: a `FallbackLLM` that tries the primary and, on a 529 or 5xx, calls the secondary, and a
+Compose them: a `FallbackLLM` that tries the primary and, on a 429 or 5xx that survives the SDK's own
+retries, calls the secondary, and a
 router that picks a per-tenant adapter from config at request time. The business logic never changes;
 tests inject a fake `LLM` and a fixed clock. Credentials stay in the root, tenant routing is
 request-scoped, and the fallback policy is a decorator around the interface, which keeps retry and
@@ -196,4 +202,4 @@ circuit-breaker logic out of the handler.
 - [ ] Slower startup because the singleton is now rebuilt per request
 - [x] Under concurrent traffic, one tenant's model routing or API key is used for another tenant's request
 - [ ] The container refuses to start and logs a circular-dependency error
-> A singleton is constructed once and shared, so it captures whichever request-scoped object it was first given; later requests from other tenants reuse that state, a correctness and security failure that only appears under concurrency.
+> A singleton is constructed once and shared, so it captures whichever request-scoped object it was first given; later requests from other tenants reuse that state, a correctness and security failure that only appears under concurrency. (NestJS avoids this by making the consumer request-scoped too, which trades the leak for per-request construction.)

@@ -5,7 +5,7 @@ name: Vercel AI SDK
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/openai-anthropic-node-sdks
   - node-ts-for-ai/streams-and-backpressure
@@ -83,8 +83,29 @@ unified call; they simply do nothing on a provider that lacks them.
   than a mis-typed value.
 - `embed` and `embedMany` do the same unification for embedding models.
 
+### One request through the tool loop
+With `tools` that have `execute` and `stopWhen: stepCountIs(4)`, a single `streamText` call runs:
+1. **Step 1.** The SDK maps `system`, `messages` and the tool schemas to the provider's request and
+   streams the reply. The model emits a tool call; the SDK accumulates its argument fragments and
+   validates the parsed input against the tool's Zod schema.
+2. **Execute.** `execute` runs with the typed input. The SDK appends two messages to the step's
+   history: the assistant message holding the tool call and a tool message holding the result.
+   (In v5 a failed execution is recorded as a tool-error part rather than thrown, so the model can
+   read it; check how your version treats errors.)
+3. **Check the stop condition.** The loop continues only if the last step ended in tool calls and
+   `stopWhen` is not yet satisfied. Otherwise the finish part is emitted.
+4. **Step 2.** A *new* provider request is sent containing the original prompt plus the appended
+   messages. The model now writes the answer.
+
+Two consequences follow from step 4. Each step is a separate billed request that resends the whole
+history, so input tokens grow with every round, which is *why* `totalUsage` (summed over steps)
+can be several times the first request's input and why a step limit is a cost control, not only a
+loop guard. And the result exposes `steps`, each with its own text, tool calls, results and usage,
+which is what you log to see where a slow or expensive answer spent its rounds.
+
 ### The UI half and its protocol
-`useChat` on the client keeps the message list, sends it to your route on submit, and appends parts as
+`useChat` (from `@ai-sdk/react` in v5; Vue and Svelte packages exist too) on the client keeps the
+message list, sends it to your route on submit, and appends parts as
 they stream: text, tool invocations with their state, and custom data. The server route returns the
 result's response helper, which encodes the unified stream parts into the SDK's UI message stream
 (in v5, JSON parts sent as server-sent events and marked by a protocol-version header; v4 used a
@@ -155,6 +176,16 @@ export async function classify(text: string) {
 }
 ```
 
+Walk the chat route for "Where is ord_42?". Step 1 sends the system prompt, one user message and
+the `lookupOrder` schema; the model replies with a tool call `{ orderId: "ord_42" }`, the regex
+passes, and `execute` reads the database. Step 2 resends everything plus the call and its result,
+and the model writes the answer. `steps.length` is 2, the browser saw a tool card move from
+"input available" to "output available" before any answer text, and `totalUsage.inputTokens` counts
+the system prompt twice, because it was sent twice. Had the model asked for `"42"`, the Zod regex
+would have rejected the input before `execute` ran. Swapping `anthropic(...)` for `openai(...)`
+changes the bytes on the wire (a `tool_calls` entry with string arguments instead of a `tool_use`
+block) and nothing in this file.
+
 ## Trade-offs
 - One call shape across providers makes comparisons and fallbacks cheap, but the newest
   provider-specific feature usually arrives behind `providerOptions` or not at all for a while;
@@ -166,7 +197,8 @@ export async function classify(text: string) {
   server package versions and of a wire format you do not own; a plain text stream is simpler when
   the client is not yours.
 - Middleware centralises logging, caching and guardrails, but a stack of middlewares is a second place
-  behaviour hides; keep it short and visible.
+  behaviour hides; it pays while every call site needs the same policy, and stops paying once
+  middlewares need per-route exceptions, at which point explicit calls are clearer.
 - Major versions have renamed core options, which is cheap to follow in a small codebase and painful in
   a large one; pin the version and schedule upgrades rather than floating.
 

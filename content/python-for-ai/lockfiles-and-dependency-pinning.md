@@ -5,6 +5,7 @@ name: Lockfiles & dependency pinning
 kind: practice
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - python-for-ai/uv-poetry-pip
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -99,9 +100,10 @@ and the cause was visible as a two-line lock diff rather than reconstructed from
 ## Trade-offs
 - Exact locks make builds reproducible and incidents bisectable, but you stop receiving fixes automatically;
   that is only safe when an automated upgrade process actually runs and its PRs get merged.
-- Hash checking defends against tampered or substituted artifacts, but breaks when a package must be built
-  from source differently per platform or when an internal mirror re-packages files; in those cases verify at
-  the mirror instead.
+- Hash checking defends against tampered or substituted artifacts, but breaks when the lock lacks a hash for
+  the wheel another platform needs, when an internal mirror rebuilds or re-packages files (new bytes, new
+  hash), or for direct URL and VCS dependencies pip cannot hash-check; in those cases verify at the mirror or
+  pin by commit instead.
 - A universal lock serves every developer OS and CI image from one file, but may fail to resolve packages
   that only exist for some platforms; a Linux-only lock is simpler when deployment is the only target.
 - Tight upper bounds in a library protect users from untested majors, but cause unresolvable conflicts in

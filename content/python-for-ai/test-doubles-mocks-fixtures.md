@@ -5,6 +5,7 @@ name: Test doubles, mocks and fixtures
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/pytest
   - python-for-ai/pytest-asyncio
@@ -68,11 +69,13 @@ arguments, a charge was not made twice).
 - `Mock` / `MagicMock` create attributes on access and record every call in `call_args_list`.
   `MagicMock` also supports dunder methods (`len`, iteration, context managers). `AsyncMock` returns
   awaitables, for async clients.
-- `return_value` and `side_effect` script behaviour; `side_effect` can be a list (one result per call)
-  or an exception class, which is how you simulate "timeout, then success".
-- **Spec it.** `create_autospec(RealClass, instance=True)` or `Mock(spec_set=RealClass)` makes the
-  double reject attributes and call signatures the real class lacks, because an unspecced mock will
-  happily accept `client.compelte(...)` and the typo ships.
+- `return_value` and `side_effect` script behaviour; `side_effect` can be an exception (raised on every
+  call), a callable, or an iterable consumed one item per call in which any exception item is raised.
+  `side_effect=[TimeoutError(), "ok"]` is how you simulate "timeout, then success".
+- **Spec it.** `Mock(spec_set=RealClass)` rejects attributes the real class lacks (and assignment of
+  new ones); `create_autospec(RealClass, instance=True)` goes further and also checks call signatures
+  of the methods. Either matters because an unspecced mock will happily accept `client.compelte(...)`
+  and the typo ships.
 - `patch("pkg.module.name")` replaces a name *where it is looked up*, not where it is defined. If
   `app/summarize.py` does `from app.llm import call_llm`, you patch `app.summarize.call_llm`;
   patching `app.llm.call_llm` changes nothing the code under test sees.

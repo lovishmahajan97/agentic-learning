@@ -5,6 +5,7 @@ name: Training data pipelines
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - training-adaptation/data-curation
   - training-adaptation/synthetic-data-generation
@@ -25,8 +26,8 @@ sources:
 A training data pipeline turns raw sources into versioned, deduplicated, decontaminated, token-ready
 shards with full provenance. Its architecture matters because what you *remove* (duplicates, eval
 leakage, junk, PII) shapes the model at least as much as what you add, because every run must be
-reproducible from a dataset hash, and because tokenization and shuffling done at training time starve the
-GPUs. This lesson covers the pipeline; the curation, labeling and synthetic-data lessons in Training &
+reproducible from a dataset hash, and because tokenizing, packing and globally shuffling raw text at
+training time can starve the GPUs. This lesson covers the pipeline; the curation, labeling and synthetic-data lessons in Training &
 adaptation cover what makes an individual example good.
 
 ## Why it exists
@@ -35,8 +36,9 @@ invisible in the loss curve and expensive to discover afterwards.
 
 Duplicates are the first problem. Web and enterprise corpora contain the same page, template or ticket
 thousands of times. A model trained on them sees those sequences many more times than the rest of the
-data, memorizes them, and spends capacity on boilerplate; the deduplication literature showed that near
-duplicate removal both reduces memorized output and improves held-out perplexity at the same compute.
+data, memorizes them, and spends capacity on boilerplate; Lee et al. found that near-duplicate removal
+made models emit memorized training text roughly ten times less often and reach the same or better
+accuracy in fewer training steps.
 Contamination is the second: if the eval set's questions leaked into training through a scraped forum or
 an internal doc, the benchmark score is a measure of memorization, and the regression you see at
 deployment has no explanation in your dashboards. Third, formatting noise: SFT examples assembled by hand
@@ -44,8 +46,9 @@ with inconsistent chat templates, stray system prompts or missing end-of-turn to
 noise, and the symptom is a fine-tuned model that stops at the wrong place or emits template fragments.
 Fourth, reproducibility: without a dataset version and a deterministic shuffle, a loss divergence cannot
 be reproduced, a resumed run does not match the original, and a regression cannot be attributed to a data
-change. Fifth, throughput: tokenizing and shuffling inside the dataloader is CPU-bound work that leaves
-the accelerators idle in a sawtooth pattern.
+change. Fifth, throughput: tokenizing, packing and globally shuffling raw text inside the dataloader is
+CPU- and I/O-bound work that can leave the accelerators idle in a sawtooth pattern, most visibly for
+smaller models whose per-GPU token consumption is high.
 
 The pipeline exists to make these properties structural rather than hoped for: filter, deduplicate,
 decontaminate, format, tokenize, pack and shard offline, and record what came from where.
@@ -109,15 +112,18 @@ IGNORE, SEQ_LEN, SHARD_ROWS = -100, 4096, 2048
 def render(tok, messages):
     prompt = tok.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
     full   = tok.apply_chat_template(messages, tokenize=False)
-    p_ids, f_ids = tok(prompt)["input_ids"], tok(full)["input_ids"]
+    enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]   # template already has BOS
+    p_ids, f_ids = enc(prompt), enc(full)
     assert f_ids[:len(p_ids)] == p_ids, "template must be prefix-stable"
-    labels = [IGNORE] * len(p_ids) + f_ids[len(p_ids):]      # loss only on the assistant turn
+    labels = [IGNORE] * len(p_ids) + f_ids[len(p_ids):]      # loss only on the final assistant turn
     return f_ids, labels
 
 def pack(examples, tok):
     ids, labels, doc_ids = [], [], []
     for n, msgs in enumerate(examples):
         i, l = render(tok, msgs)
+        if len(i) + 1 > SEQ_LEN:
+            continue                                            # too long: drop (or truncate) and count it
         if len(ids) + len(i) + 1 > SEQ_LEN:
             yield ids, labels, doc_ids; ids, labels, doc_ids = [], [], []
         ids += i + [tok.eos_token_id]; labels += l + [tok.eos_token_id]; doc_ids += [n] * (len(i) + 1)
@@ -126,13 +132,18 @@ def pack(examples, tok):
 
 def write_shards(packed, path):
     manifest, rows = [], []
-    for k, (ids, labels, doc_ids) in enumerate(packed):
+    def flush():
+        blob = json.dumps(rows).encode(); name = f"{path}/shard-{len(manifest):05d}.json"
+        with open(name, "wb") as f: f.write(blob)
+        manifest.append({"shard": name, "rows": len(rows), "sha256": hashlib.sha256(blob).hexdigest()})
+    for ids, labels, doc_ids in packed:
         rows.append({"input_ids": ids, "labels": labels, "doc_ids": doc_ids})  # doc_ids -> attention mask
         if len(rows) == SHARD_ROWS:
-            blob = json.dumps(rows).encode(); name = f"{path}/shard-{k // SHARD_ROWS:05d}.json"
-            open(name, "wb").write(blob); manifest.append({"shard": name, "sha256": hashlib.sha256(blob).hexdigest()})
-            rows = []
-    json.dump(manifest, open(f"{path}/manifest.json", "w"))    # the dataset version is this file's hash
+            flush(); rows = []
+    if rows:
+        flush()                                                 # keep the final partial shard
+    with open(f"{path}/manifest.json", "w") as f:
+        json.dump(manifest, f)                                  # the dataset version is this file's hash
 ```
 
 The `doc_ids` column lets a trainer that supports it block attention across packed documents; the manifest
@@ -155,8 +166,8 @@ of shard hashes is what the training config references so the run is reproducibl
   written eval set of the same difficulty.
 - Rendering SFT examples with a template that differs from serving; the symptom is the fine-tuned model
   emitting role tags or failing to stop at the end of its turn.
-- Shuffling or tokenizing inside the dataloader at scale; the symptom is GPU utilization oscillating
-  between near zero and full while CPUs are saturated.
+- Tokenizing, packing or globally shuffling raw text inside the dataloader at scale; the symptom is GPU
+  utilization oscillating between near zero and full while CPUs are saturated.
 - Non-deterministic shuffling without a seeded, offset-addressable order; the symptom is a resumed run
   whose loss curve does not continue the original, and a divergence nobody can reproduce.
 - Running near-dup detection before cheap filters; the symptom is MinHash jobs that take days on data
@@ -221,6 +232,7 @@ the dedup cluster sizes as well.
 - [ ] The trainer cannot apply chat templates at runtime
 - [x] Tokenization and packing are CPU-bound; done at training time they bottleneck the loader and leave accelerators idle, and done offline they are also reproducible
 - [ ] Packing is only possible when all examples are known in advance
-> Accelerators consume tokens faster than a few CPU workers can tokenize and shuffle them, producing a
-> sawtooth utilization pattern. Precomputed shards make the loader a simple reader and make the exact
+> When accelerators consume tokens faster than the loader's CPU workers can tokenize and pack them, the
+> result is a sawtooth utilization pattern; whether that happens depends on model size and worker count,
+> but the reproducibility benefit holds regardless. Precomputed shards make the loader a simple reader and make the exact
 > sequence of training tokens part of the versioned dataset.

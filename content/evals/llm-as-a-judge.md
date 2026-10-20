@@ -4,8 +4,8 @@ module: evals
 name: LLM-as-a-judge
 kind: pattern
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - evals/judge-calibration-and-bias
   - evals/rubrics
@@ -59,6 +59,11 @@ calibrated".
 - **Pairwise.** The judge sees outputs A and B and states a preference. Appropriate for relative
   comparisons (prompt v1 versus v2, model X versus Y), and mandatory to run in both orders *because*
   of position bias; a preference that flips when the order flips is a tie.
+- **Probability-weighted scoring.** Instead of taking the judge's single sampled score, read the
+  probabilities it assigns to each score token and report the expected value, as G-Eval does after a
+  chain-of-thought step that writes out the evaluation steps. This turns a coarse 1–5 scale into a
+  continuous score that ties less often, *because* a judge torn between 3 and 4 reports 3.5 instead of
+  whichever token it sampled. It needs log-probabilities from the judge API.
 - **Reference-free quality checks** such as faithfulness: the judge checks each claim in an answer
   against retrieved context. Here the "reference" is the context, and the rubric is "supported, not
   supported, contradicted".
@@ -90,7 +95,19 @@ both passes and failures represented). Run the judge, then compute agreement, Co
 corrected for chance), and per-class recall. For a judge used as a gate, recall on *failures* is the
 number that matters, *because* a judge that passes 95% of items while missing a quarter of real
 failures is a leaky gate. Iterate the judge prompt on a dev split and confirm on a held-out split, the
-same discipline as any model. Re-calibrate when the generator, the task or the judge model changes,
+same discipline as any model.
+
+Calibration also tells you how wrong the judge's headline number is. A judge with recall *r_pass* on
+human passes and *r_fail* on human failures reports a pass rate that is biased toward whichever error
+it makes more often. If you trust those two rates, the true pass rate can be estimated from the
+observed one as `true ≈ (observed + r_fail − 1) / (r_pass + r_fail − 1)` (the Rogan–Gladen correction
+from diagnostic testing). The correction is only as good as the calibration set, and it fails when the
+generator changes and its errors stop resembling the ones the judge was calibrated on, but it makes
+the point concrete: an uncorrected judge score is an estimate of the judge, not of the system.
+
+When one judge is not reliable enough, use several: different model families, or the same judge with
+the candidate order swapped, combined by majority vote. Disagreement between them is a useful flag
+for items to route to a human. Re-calibrate when the generator, the task or the judge model changes,
 and keep sampling live outputs for human spot checks so drift is caught.
 
 ### Cost and placement
@@ -140,10 +157,13 @@ def calibrate(items, human: dict[str, bool]) -> dict:
 #   135 true passes, 15 fails marked pass, 5 passes marked fail, 45 fails marked fail
 #   agreement = 180/200 = 0.90, chance agreement = 0.75*0.70 + 0.25*0.30 = 0.60, kappa = 0.75
 #   fail_recall = 45/60 = 0.75  -> the judge misses one real failure in four: not yet a release gate.
+#   observed pass rate 0.75 vs true 0.70; correction: (0.75 + 0.75 - 1) / (135/140 + 0.75 - 1) ≈ 0.70
 ```
 
 The 90% agreement looks fine; the 75% recall on failures is the number that says the judge is not yet
-good enough to gate a release, and the 15 missed failures are where to look to improve the rubric.
+good enough to gate a release, and the 15 missed failures are where to look to improve the rubric. The
+judge also overstates quality by 5 points, which matters when comparing two systems: if version B's
+errors are the kind this judge misses more often, B can look better than A while being worse.
 
 ## Trade-offs
 - A judge grades hundreds of outputs in minutes for a few dollars, but every verdict carries the

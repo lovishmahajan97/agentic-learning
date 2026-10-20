@@ -5,7 +5,7 @@ name: Docker
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/kubernetes
   - backend-fundamentals/ci-cd
@@ -111,6 +111,18 @@ time when autoscaling.
 `docker compose` runs several containers (API, Redis, Postgres, a vector database) on one network with
 named volumes from a single file: the local development stack that mirrors production topology.
 
+### What "Docker" actually is, and the alternatives
+"Docker" names a stack, and the pieces are separable *because* they were standardised by the Open
+Container Initiative. The `docker` CLI talks to the `dockerd` daemon; builds go through BuildKit; the
+daemon hands containers to containerd, which uses runc to set up the namespaces and cgroups. The image
+format and the runtime contract are OCI specifications, so an image built by Docker runs under any
+OCI runtime. Kubernetes nodes run containerd or CRI-O directly through the Container Runtime Interface
+and have not used Docker as the runtime since dockershim was removed (v1.24); Docker-built images run
+there unchanged, but `docker ps` on a node shows nothing. Podman offers a largely compatible CLI
+without a central root daemon and is common where rootless operation is required; Buildah and kaniko
+build images without a daemon, which suits CI runners that must not expose a privileged Docker socket.
+The choice rarely changes the Dockerfile; it changes who needs root on the build machine.
+
 ## Example
 A multi-stage Dockerfile for a FastAPI inference service using `uv`. Dependencies are installed from
 the lockfile in their own layer before the source is copied, the runtime stage contains only the
@@ -182,6 +194,9 @@ docker history llm-api:$(git rev-parse --short HEAD)   # where did the bytes go?
   for CUDA runtime version" error on one node pool and not another.
 - A memory limit below real peak usage; the symptom is silent restarts with exit code 137 and no
   Python traceback, typically during model load or a large batch.
+- Mounting `/var/run/docker.sock` into a CI or agent container "so it can build"; the symptom is that
+  anything running in that container can start a privileged container and own the host. Use a
+  rootless or daemonless builder instead.
 
 ## When to use
 Containerize anything you deploy more than once or onto more than one machine: inference APIs,

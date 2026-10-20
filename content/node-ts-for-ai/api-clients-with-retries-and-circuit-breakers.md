@@ -5,6 +5,7 @@ name: API clients with retries & circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - serving-inference/retry-strategies
   - reliability/circuit-breakers
@@ -32,10 +33,10 @@ timeouts, idempotency, breakers and bulkheads.
 ## Why it exists
 A naive client does `await fetch(url)` and throws on error. In production that produces three distinct
 failures. First, latency with no bound: a provider that accepts the TCP connection and then stalls
-leaves your handler waiting until the socket gives up, which for Node's built-in `fetch` is measured in
-minutes by default; a few hundred of those and every worker slot, pooled DB connection and queue lock is
+leaves your handler waiting until the socket gives up, which for Node's built-in `fetch` (undici, with
+300-second header and body timeouts) is measured in minutes by default; a few hundred of those and every worker slot, pooled DB connection and queue lock is
 held by a request going nowhere. Second, transient errors surface as user-facing failures: a 429 from a shared
-quota or a 529 `overloaded_error` from Anthropic is usually gone in a second, so not retrying throws
+quota or a 529 `overloaded_error` from Anthropic often clears within seconds, so not retrying throws
 away a request that would have succeeded. Third, the opposite naive fix, "retry everything, immediately,
 five times", is worse: during a provider incident a thousand clients retrying in lockstep multiply the
 load five-fold at exactly the wrong moment, synchronised by the same schedule, and non-idempotent calls
@@ -77,12 +78,15 @@ ambiguity to the caller.
 
 ### The vendor SDKs
 The Anthropic TypeScript SDK retries connection errors, 408, 409, 429 and 5xx with backoff, honours
-`Retry-After`, and exposes `maxRetries` (default 2) and `timeout` (default 10 minutes, in milliseconds).
-A timed-out attempt is itself retried, so wall-clock time can reach `timeout × (maxRetries + 1)`, which
-is the number to put in your deadline arithmetic. The OpenAI Node SDK follows the same design with the
-same defaults. Errors come back as typed classes (`Anthropic.RateLimitError`,
-`Anthropic.APIConnectionError`, `Anthropic.APIError` with `.status` and `.type` such as
-`overloaded_error`), so classification is an `instanceof` chain, not string matching. The right move is
+`Retry-After`, and exposes `maxRetries` (default 2) and `timeout` (default 10 minutes, in milliseconds;
+for non-streaming calls with a large `max_tokens` the SDK raises the default, up to 60 minutes). A
+timed-out attempt is itself retried, so wall-clock time can reach roughly `timeout × (maxRetries + 1)`
+plus backoff, which is the number to put in your deadline arithmetic. The OpenAI Node SDK follows the same design with the
+same defaults. Errors come back as typed classes (`Anthropic.RateLimitError` for 429,
+`Anthropic.InternalServerError` for 5xx including 529, `Anthropic.APIConnectionError`, all subclasses
+of `Anthropic.APIError` with `.status`, `.headers`, the parsed body on `.error` and `.type` such as
+`overloaded_error`), so classification is an `instanceof` chain plus a status check, not string
+matching. The right move is
 to configure those options rather than wrap the SDK in a second retry loop, *because* nested retries
 multiply: 3 × 3 = 9 attempts against a provider that is already overloaded.
 
@@ -107,28 +111,35 @@ consume every worker slot. For LLM providers this doubles as a way to stay under
 quotas, and backed by Redis it works across replicas.
 
 ## Example
-A minimal `fetchWithRetry` with per-attempt timeout, error classification, full-jitter backoff and
-`Retry-After`, plus a small count-based circuit breaker around it. Production code uses the SDK's
-built-in retries and `opossum` or `cockatiel`, but the mechanics are these. Note that after the last
-retryable status the response is returned, so callers still check `res.ok`.
+A minimal `fetchWithRetry` with per-attempt timeout (combined with the caller's own signal),
+error classification that retries timeouts only for idempotent requests, full-jitter backoff and
+`Retry-After`, plus a small consecutive-failure circuit breaker that lets exactly one probe through when
+half-open. Production code uses the SDK's built-in retries and `opossum` or `cockatiel`, but the
+mechanics are these. After the last retryable status the response is returned, not thrown, so the
+breaker's wrapped function must turn 5xx and 429 into failures itself, as the usage line shows.
 
 ```ts
 const RETRYABLE = new Set([408, 429, 500, 502, 503, 504, 529]);
+const TRANSIENT_CODES = ["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT"];
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const jitter = (n: number, base: number, cap: number) => Math.random() * Math.min(cap, base * 2 ** n);
 
 export async function fetchWithRetry(url: string, init: RequestInit,
                                      o = { attempts: 4, baseMs: 500, capMs: 8_000, attemptTimeoutMs: 20_000 }) {
+  const idempotent = ["GET", "HEAD", "PUT", "DELETE"].includes(init.method ?? "GET")
+    || new Headers(init.headers).has("idempotency-key");
   for (let n = 0; ; n++) {
+    const timeout = AbortSignal.timeout(o.attemptTimeoutMs);
     try {
-      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(o.attemptTimeoutMs) });
+      const res = await fetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
       if (!RETRYABLE.has(res.status) || n + 1 >= o.attempts) return res;     // success, non-retryable, or out of attempts
-      const retryAfter = Number(res.headers.get("retry-after"));             // seconds, when the server sends one
+      await res.body?.cancel();                                               // free the socket before retrying
+      const retryAfter = Number(res.headers.get("retry-after"));             // seconds form; an HTTP date falls back to jitter
       await sleep(retryAfter > 0 ? retryAfter * 1000 : jitter(n, o.baseMs, o.capMs));
     } catch (err: any) {
       const code = err?.cause?.code;                                          // undici wraps socket errors in err.cause
-      const transient = err?.name === "TimeoutError" || ["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED"].includes(code);
-      if (!transient || n + 1 >= o.attempts) throw err;
+      const transient = (err?.name === "TimeoutError" && idempotent) || TRANSIENT_CODES.includes(code);
+      if (!transient || n + 1 >= o.attempts) throw err;                       // caller aborts (AbortError) are never retried
       await sleep(jitter(n, o.baseMs, o.capMs));
     }
   }
@@ -138,9 +149,9 @@ export class CircuitBreaker {
   private failures = 0; private openedAt = 0; private state: "closed" | "open" | "half" = "closed";
   constructor(private threshold = 5, private resetMs = 30_000) {}
   async call<T>(fn: () => Promise<T>, fallback: () => T): Promise<T> {
-    if (this.state === "open") {
-      if (Date.now() - this.openedAt < this.resetMs) return fallback();         // fail fast, no network
-      this.state = "half";                                                      // let one probe through
+    if (this.state !== "closed") {
+      if (this.state === "half" || Date.now() - this.openedAt < this.resetMs) return fallback();  // fail fast; one probe at a time
+      this.state = "half";                                                      // this caller is the probe
     }
     try {
       const out = await fn();
@@ -151,8 +162,8 @@ export class CircuitBreaker {
     }
   }
 }
-// const breaker = new CircuitBreaker();
-// await breaker.call(() => fetchWithRetry(url, init), () => cachedOrDegradedAnswer());
+// await breaker.call(async () => { const r = await fetchWithRetry(url, init);
+//   if (r.status >= 500 || r.status === 429) throw new Error(`upstream ${r.status}`); return r; }, () => degraded());
 ```
 
 ## Trade-offs
@@ -189,10 +200,13 @@ breakers trip on rate, and say which layer should own retries.
 **Q:** During a provider incident your service's p99 latency went from 3 s to 90 s and your bill
 tripled for the hour, even though the provider was mostly returning errors. Explain the mechanics and
 the fix.
-**A:** Each request waited the full default timeout on a provider that accepted connections but failed
-slowly, then the SDK retried twice, then the handler's own loop retried three times, and the queue above
-re-enqueued failures: a single user action became over a dozen slow attempts, which explains both the
-latency and the cost, since some attempts were billed before erroring. The fix is layered: a
+**A:** Each attempt hung for tens of seconds on a provider that accepted connections but failed slowly
+(the SDK's 10-minute default timeout never fired, so nothing cut the wait short), then the SDK retried
+twice, then the handler's own loop retried three times, and the queue above re-enqueued failures: a
+single user action became a dozen or more slow attempts (3 SDK attempts × 4 handler attempts before the
+queue even acts), which explains the latency. The cost comes from the attempts that did complete
+server-side, and are billed, after your client had already timed out or given up, plus work the queue
+re-ran after it had in fact succeeded. The fix is layered: a
 per-attempt timeout sized for the call, a single owner of retries (the SDK with `maxRetries` set and
 nothing above it), full-jitter backoff honouring `Retry-After`, a total deadline per request, and a
 circuit breaker per provider that opens on a high failure rate and fails fast with a fallback or a clear
@@ -218,4 +232,4 @@ error. Idempotency keys make any remaining retries safe to repeat.
 - [ ] A connection reset before any response bytes arrived
 - [x] 400 Bad Request caused by an over-long prompt
 - [ ] 429 Too Many Requests from a shared rate limit
-> A 400 means the request itself is invalid and will fail identically on every attempt; retrying only adds load and latency, whereas 503, 429 and connection resets are transient by definition.
+> A 400 means the request itself is invalid and will fail identically on every attempt; retrying only adds load and latency, whereas 503, 429 and a reset before any response bytes are transient signals that a later attempt can succeed.

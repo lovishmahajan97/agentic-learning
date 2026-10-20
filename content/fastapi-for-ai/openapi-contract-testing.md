@@ -5,6 +5,7 @@ name: OpenAPI contract testing
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - fastapi-for-ai/openapi-docs
   - fastapi-for-ai/testclient-plus-pytest-asyncio
@@ -134,8 +135,8 @@ alongside the new name with a deprecation, or cut a new version.
   and flaky contract tests that fail differently on every run.
 - Accepting a red snapshot test by regenerating the file without reading the diff; the symptom is a
   breaking change that reaches clients with a green, "reviewed" pipeline behind it.
-- Ignoring undocumented status codes the fuzzer reports, such as 422s on streaming endpoints or 500s on
-  empty lists; the symptom is client SDKs that throw on responses their types say cannot happen.
+- Ignoring undocumented status codes the fuzzer reports, such as 401s or 403s raised by an auth
+  dependency (FastAPI documents its own 422 automatically, but not these) or 500s on empty lists; the symptom is client SDKs that throw on responses their types say cannot happen.
 
 ## When to use
 Add the snapshot test as soon as any client you do not deploy with (a front end in another repo, a

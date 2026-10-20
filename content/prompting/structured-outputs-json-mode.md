@@ -5,7 +5,7 @@ name: Structured outputs / JSON mode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - prompting/function-tool-calling
   - prompting/prompt-templates
@@ -47,7 +47,8 @@ to the grammar of JSON; structured outputs apply it to your specific schema.
 ## How it works
 ### Three levels of guarantee
 1. **Prompting** ("return JSON with these keys"): no guarantee, only a strong tendency.
-2. **JSON mode**: the output is guaranteed to parse as JSON. Keys, types and required fields are not
+2. **JSON mode** (the name comes from OpenAI's `response_format` option; other providers offer
+   equivalents): the output is guaranteed to parse as JSON. Keys, types and required fields are not
    enforced, so `{"result": "I could not find the invoice"}` is a valid answer to a request for
    `{"invoice_id", "total"}`.
 3. **Schema-constrained output** (structured outputs, strict mode): the output is guaranteed to validate
@@ -63,6 +64,16 @@ set to negative infinity before sampling. The model still chooses among the allo
 its own probabilities, so it decides the *content*, while the mask decides the *form*. Compilation is
 paid once per new schema and cached by the provider, so the first request with a schema is slower than
 the rest. The serving module covers the implementation inside open-source engines.
+
+A concrete step: the schema says `severity` is one of `low`, `medium`, `high`, and the output so far
+is `{"evidence": ["..."], "severity": "`. The automaton now allows only tokens that begin one of those
+three strings (`low`, `med`, `high`, `h`, ...). If the model's top choice was `crit` (for "critical"),
+that token is masked, the remaining probability is renormalised over the allowed tokens, and the model
+emits whichever allowed value it found most plausible. That is the key consequence: **the mask can
+force an answer but cannot make the model abstain unless the schema has a way to say so**. If the
+document contains no total and `total` is a required number, the model must still write some number.
+Nullable fields and explicit `unknown` or `other` enum values are the escape hatches that keep a
+forced format from turning into forced fabrication.
 
 ### Why masking beats rejection sampling
 Generate-validate-retry spends a full generation on each failure and offers no bound on attempts.
@@ -129,7 +140,7 @@ def triage(ticket: str) -> Triage:
         model="claude-opus-5-5", max_tokens=4096,   # thinking tokens also count against this cap
         system="Classify support tickets. Quote evidence before deciding.",
         messages=[{"role": "user", "content": ticket}],
-        output_format=Triage,          # schema compiled server-side; decoding is constrained to it
+        output_format=Triage,          # SDK helper; sent as output_config.format, compiled server-side
     )
     if r.stop_reason != "end_turn":    # max_tokens => truncated JSON; refusal => may not match schema
         raise RuntimeError(f"unusable output: {r.stop_reason}")
@@ -168,6 +179,9 @@ print(triage("Checkout returns 500 for every EU customer since 09:00 UTC. We are
   out-of-range values that passed server-side and were never checked client-side.
 - Treating "valid" as "correct" and dropping the eval; the symptom is silent mislabeling discovered by a
   downstream team weeks later.
+- No escape value in a required enum or number field; the symptom is confident labels or figures
+  on inputs that do not contain the information, visible when you feed the golden set blank or
+  off-topic documents.
 - Enums with overlapping or too many categories; the symptom is near-identical tickets receiving different
   labels, visible as low agreement on paraphrased test cases.
 - Prompt text that contradicts the schema (asking for markdown while forcing JSON); the symptom is fences

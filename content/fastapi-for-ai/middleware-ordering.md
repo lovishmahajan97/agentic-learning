@@ -5,6 +5,7 @@ name: Middleware ordering
 kind: concept
 difficulty: core
 est_minutes: 13
+status: reviewed
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/cors
@@ -54,6 +55,19 @@ list is the outermost user layer. Because the stack is built lazily and then fro
 after the app has started raises an error in current Starlette; configure everything before the first
 request.
 
+### Tracing one request through the onion
+With a `middleware=` list of `[RequestID, CORS, Auth]`, a `POST /chat` with a bad key runs:
+
+```
+in : ServerError -> RequestID (sets id) -> CORS -> Auth (rejects: sends 401 itself)
+out: Auth's 401 -> CORS (adds Allow-Origin) -> RequestID (adds x-request-id) -> ServerError -> wire
+     ExceptionMiddleware, Router and the endpoint never run
+```
+
+A good request goes all the way in to the endpoint and back out through the same layers in reverse.
+Each layer runs code at two moments, before and after it calls the inner app, so "first in" is always
+"last out".
+
 ### Two ways to add, two orderings
 - `app.add_middleware(M)` inserts `M` at index 0 of `user_middleware`. Each call pushes the new layer to
   the *outside*. Reading a file with three `add_middleware` calls, the bottom one is the outermost; the
@@ -66,7 +80,8 @@ request.
 `ServerErrorMiddleware` is always the outermost layer. It catches any exception that escaped everything
 else, returns a 500 (or the handler you registered for `500` / `Exception`), then re-raises so the
 server logs it. *Because* it is outside your middleware, a 500 it generates never passes back through
-`CORSMiddleware`: a browser sees a CORS failure, not a 500. `ExceptionMiddleware` is always the
+`CORSMiddleware`: a browser sees a CORS failure, not a 500. Note that a handler registered for
+`Exception` or status `500` is installed *on* `ServerErrorMiddleware`, so it is outside CORS too. `ExceptionMiddleware` is always the
 innermost layer, directly around the router. It converts `HTTPException` and anything with a registered
 handler into a normal response. *Because* it is inside your middleware, your layers see a 404 or a 422
 as an ordinary response with a status code, not as an exception. Only unhandled exceptions travel
@@ -133,7 +148,8 @@ class Timing(BaseHTTPMiddleware):
 
 app = FastAPI(middleware=[                         # list order: first is outermost
     Middleware(RequestID),
-    Middleware(CORSMiddleware, allow_origins=["https://app.example.com"], allow_headers=["*"]),
+    Middleware(CORSMiddleware, allow_origins=["https://app.example.com"],
+               allow_methods=["POST"], allow_headers=["*"]),   # default allow_methods is GET only
     Middleware(Timing),
 ])
 
@@ -163,10 +179,19 @@ async def chat(request: Request, body: dict):
 - Measuring or logging after `await call_next(request)` without `try/finally`; symptom: requests that end
   in unhandled exceptions vanish from timing logs and metrics, so error latency is invisible.
 - Expecting CORS headers on 500 responses; `ServerErrorMiddleware` is outside everything, so its
-  response skips `CORSMiddleware`. Symptom: the front end cannot read the error body of crashes; the fix
-  is an exception handler that runs inside the stack.
-- Reading the body in a `BaseHTTPMiddleware` for logging and then expecting the endpoint to read it too;
-  symptom: endpoints hang or receive an empty body only when request logging is enabled.
+  response skips `CORSMiddleware`, and so does an `@app.exception_handler(Exception)` handler, which
+  Starlette attaches to that same layer. Symptom: the front end cannot read the error body of crashes;
+  the fix is a small middleware placed inside CORS that catches exceptions and returns the 500 itself,
+  or handlers for specific exception classes, which `ExceptionMiddleware` runs inside the stack.
+- Draining the request body in a pure ASGI middleware for logging without replaying the `http.request`
+  events to the inner app (older Starlette had the same problem inside `BaseHTTPMiddleware`; current
+  releases replay the body); symptom: endpoints hang or receive an empty body only when request logging
+  is enabled.
+- Raising `HTTPException(401)` from inside a middleware instead of returning a response; middleware
+  sits *outside* `ExceptionMiddleware`, so no handler converts it and it reaches
+  `ServerErrorMiddleware`. Symptom: bad keys produce 500s with a traceback rather than 401s. Return a
+  `JSONResponse(status_code=401, ...)` from middleware, or do auth in a dependency, where
+  `HTTPException` works.
 - Assuming the file order of `add_middleware` calls is execution order; symptom: a request-ID middleware
   "added first" produces IDs that the auth middleware's log lines never contain.
 
@@ -200,8 +225,9 @@ fail the same way because CORS never gets to answer them. The logger misses 500s
 exception propagates through `call_next` as an exception, skipping the code after it. Fix: add
 middleware in reverse of the desired outer-to-inner order (or use the `middleware=` list): logging
 outermost, CORS next, API-key inside CORS; and wrap `call_next` in `try/finally` so exceptions are
-timed. Note that 500s produced by `ServerErrorMiddleware` still lack CORS headers unless you register
-an exception handler that runs inside the stack.
+timed. Note that 500s produced by `ServerErrorMiddleware` still lack CORS headers, even with an
+`Exception` handler registered, because that handler runs on `ServerErrorMiddleware`; catch exceptions
+in a layer inside CORS if the browser must read crash responses.
 
 ## Quiz
 ### Q: With three `app.add_middleware()` calls A, B, C in that order, which runs first on an incoming request?

@@ -5,7 +5,7 @@ name: Zero-shot prompting
 kind: pattern
 difficulty: intro
 est_minutes: 10
-status: fact-checked
+status: reviewed
 related:
   - prompting/few-shot
   - prompting/chain-of-thought
@@ -70,6 +70,14 @@ Each clause narrows the distribution and removes a specific class of error:
 With no demonstrations the model reads each label as a word. "positive" and "negative" carry their own
 meaning; "P1" or "tier_b" do not. Internal codes need definitions or the model will map them by surface
 similarity. The same applies to quantities: "short" is a prior, "under 50 words" is a spec.
+
+### Closing the output space, and leaving an exit
+A format clause in words lowers the rate of malformed output; a structured-output mode with an enum of
+labels makes membership in the set a guarantee, because decoding cannot emit anything else. That fixes
+the *form* of the answer and nothing about its correctness, and it has a side effect worth knowing:
+with no permitted way to say "none of these", every off-topic or ambiguous input is forced into some
+label. Include an explicit escape label (`other`, `unclear`) with a definition, and track how often it is
+used; a rising rate is an early signal that traffic has drifted away from what the description covers.
 
 ### Zero-shot reasoning
 Appending a reasoning trigger such as "think step by step before answering" makes the model emit
@@ -156,6 +164,8 @@ for ticket, expected in EVAL:
   is a sample from a distribution.
 - Compensating for ambiguity with ever more rules; the symptom is a forty-rule instruction where three
   demonstrations would have settled the boundary, and rules that now contradict each other.
+- Closing the label set with no escape label; the symptom is off-topic or garbled inputs confidently
+  filed under whichever real label is nearest, inflating that label's counts downstream.
 - Using a base, non-instruction-tuned model zero-shot; the symptom is the model continuing or
   paraphrasing your instruction instead of executing it.
 

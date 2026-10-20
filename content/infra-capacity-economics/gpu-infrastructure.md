@@ -5,6 +5,7 @@ name: GPU infrastructure
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - infra-capacity-economics/gpu-sizing
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -77,8 +78,10 @@ The kernel-mode NVIDIA driver is installed once per node and is the only piece t
 Everything else — CUDA runtime, cuBLAS, cuDNN, NCCL, the PyTorch build — ships inside the container
 and must be a version the node's driver supports. Drivers are backward compatible with older CUDA
 runtimes, not forward compatible, so "CUDA driver version is insufficient for CUDA runtime version"
-means the image is newer than the node. Pin both, and upgrade drivers fleet-wide *before* bumping base
-images.
+means the image is newer than the node. Two escape hatches exist but neither is a plan: CUDA minor-version
+compatibility lets, say, a 12.x runtime run on an older 12.x driver with some features (PTX JIT) missing,
+and the `cuda-compat` forward-compatibility package works only on data-centre GPUs. Pin both, and upgrade
+drivers fleet-wide *before* bumping base images.
 
 ### 4. Container runtime: how does a container see the device?
 Containers do not include the driver. The NVIDIA Container Toolkit hooks the container runtime so
@@ -88,14 +91,19 @@ libraries are mounted in at start. This is why a GPU image is portable across dr
 
 ### 5. Scheduling: which workload gets which card?
 On Kubernetes a device plugin advertises GPUs as an extended resource, `nvidia.com/gpu`, in integer
-units. Extended resources cannot be overcommitted and requests must equal limits, *because* there is
-no kernel mechanism to time-share or throttle a GPU the way CFS shares CPU. The NVIDIA GPU Operator
+units. Extended resources cannot be overcommitted and requests must equal limits. The reason is that
+the kubelet treats an extended resource as an opaque count it cannot enforce: there is no cgroup-style
+controller that gives a container a guaranteed fraction of a GPU or caps its device memory, the way CFS
+quotas and memory cgroups do for CPU and RAM. (The GPU itself does time-slice between processes by
+default; what is missing is enforced shares and isolation.) The NVIDIA GPU Operator
 packages driver, toolkit, device plugin, feature discovery (node labels such as the card model) and the
 DCGM metrics exporter as one install. Taints keep ordinary pods off expensive nodes; labels let a pod
 target the right tier. Sharing one card between small workloads has three mechanisms with different
 isolation: MIG hardware-partitions an A100 or H100 into up to seven instances with separate memory;
 time-slicing lets the plugin advertise N virtual GPUs that share memory with no isolation; MPS lets
-processes run kernels concurrently on one card. Only MIG protects one tenant from another's OOM.
+processes run kernels concurrently on one card and, on Volta and later, can set an opt-in per-client
+memory cap, but clients still share one fault domain. Only MIG gives hardware-enforced memory and fault
+isolation, so only MIG reliably protects one tenant from another's OOM.
 
 ### 6. Procurement: who pays, and how?
 The same card arrives as on-demand instances, reserved or committed-use discounts, spot/preemptible
@@ -111,9 +119,11 @@ often means one kernel at a time on an otherwise idle chip, which the utilizatio
 
 ## Example
 A minimal Kubernetes Deployment that asks for one GPU on a node labelled with a card model, tolerates
-the GPU taint, and fails fast if the driver and runtime disagree. The init container runs `nvidia-smi`,
-which only succeeds if the toolkit mounted the driver libraries, so a mis-provisioned node fails the
-pod before the server tries to load 16 GB of weights.
+the GPU taint, and fails fast on a mis-provisioned node. The init container runs `nvidia-smi`, which
+only succeeds if the toolkit mounted the driver libraries; because official `nvidia/cuda` images also set
+`NVIDIA_REQUIRE_CUDA`, the toolkit refuses to start the container on a driver too old for that CUDA
+version. Use the same CUDA version as the server image, and a bad node fails the pod before the server
+tries to load 16 GB of weights.
 
 ```yaml
 apiVersion: apps/v1
@@ -134,7 +144,7 @@ spec:
         effect: NoSchedule
       initContainers:
       - name: gpu-check
-        image: nvidia/cuda:12.4.1-base-ubuntu22.04
+        image: nvidia/cuda:12.4.1-base-ubuntu22.04   # same CUDA version as the server image
         command: ["nvidia-smi"]                   # fails the pod if the device is not visible
         resources: { limits: { nvidia.com/gpu: 1 } }
       containers:
@@ -206,12 +216,13 @@ also matters: if half the fleet is unusable, the autoscaler should be told, not 
 ## Quiz
 ### Q: Why can `nvidia.com/gpu` not be overcommitted on Kubernetes the way CPU can?
 - [ ] GPUs are too expensive for the scheduler to risk contention
-- [x] There is no kernel mechanism to time-share or throttle a GPU, so the device plugin hands out whole devices
+- [x] There is no cgroup-style mechanism to enforce a fractional share or memory cap on a GPU, so whole devices are handed out
 - [ ] The NVIDIA driver forbids more than one process per card
 - [ ] Extended resources are only counted at node level, not pod level
-> CPU is overcommittable because the kernel's scheduler can slice time between processes. A GPU has no
-> such host-side control, so Kubernetes exposes it as an integer extended resource with requests equal
-> to limits. Multiple processes per card are possible (MPS, time-slicing) but without memory isolation.
+> CPU is overcommittable because CFS quotas and cgroups can enforce each container's share. A GPU has no
+> such host-side enforcement, so Kubernetes exposes it as an opaque integer extended resource with
+> requests equal to limits. Multiple processes per card are possible (MPS, time-slicing) but without
+> enforced shares or hard memory isolation; the driver does not forbid them.
 
 ### Q: Which sharing mechanism protects one tenant from another tenant's out-of-memory error on the same card?
 - [ ] Time-slicing configured in the device plugin
@@ -219,8 +230,8 @@ also matters: if half the fleet is unusable, the autoscaler should be told, not 
 - [x] MIG hardware partitions
 - [ ] Setting memory requests equal to limits on both pods
 > MIG partitions an A100 or H100 into instances with their own memory and compute slices. Time-slicing
-> and MPS share one memory space, so a leak in one process can starve the other. Pod memory limits
-> govern host RAM, not device memory.
+> shares one memory pool with no limits; MPS shares the pool and the fault domain (its per-client memory
+> cap is opt-in), so one process can starve or crash another. Pod memory limits govern host RAM only.
 
 ### Q: A GPU container image contains the CUDA runtime but no driver. Where does the driver come from at run time?
 - [ ] It is downloaded from the registry as a hidden image layer

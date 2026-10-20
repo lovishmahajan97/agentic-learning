@@ -5,7 +5,7 @@ name: Prompt caching
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - prompting/system-prompt
   - prompting/prompt-templates
@@ -70,8 +70,11 @@ without markers; the prefix rule is the same, only the control differs.
 Entries expire after a short time-to-live (five minutes by default on Anthropic's API, with a one-hour
 option at a higher write price) and a read refreshes the timer, so requests that share a prefix and
 arrive more often than the TTL keep the entry warm indefinitely. Entries are scoped to the model and
-are not shared between customers. The timer starts when the writing request starts, so a long generation
-eats into the window.
+are not shared between customers (organization-scoped on hosted APIs; check your provider's exact
+isolation rule before relying on it for tenant separation). Eviction is best-effort: a correctly laid-out
+prefix can still miss occasionally, so cost models should use the measured hit ratio, not an assumed 100%.
+The lifetime is measured from the start of the request that writes or reads the entry, so a long
+generation eats into the window: what matters is the start-to-start gap between requests.
 
 ### Economics
 A cache write costs more than ordinary input (about 1.25× for the five-minute TTL and 2× for the
@@ -101,6 +104,14 @@ before the breakpoint.
 An entry becomes readable only once the first response has started. N identical requests fired in
 parallel all miss and all pay the write premium. For fan-out, send one request, wait for its first token,
 then send the rest.
+
+### What it does not change
+Prompt caching is semantically transparent: the reused K and V are the ones the model would have
+computed anyway, so the output distribution is the same as an uncached call. That is the difference
+from *response* caching (or a "semantic cache"), which returns a stored answer for a similar question
+and can be wrong when the question differs in a detail. It also only touches prefill. Output tokens
+are billed and decoded exactly as before, so an output-heavy workload (short prompt, long answer)
+saves little, and time-to-first-token improves while time per output token does not.
 
 ### Self-hosted equivalents
 vLLM's automatic prefix caching and SGLang's RadixAttention do the same thing inside the serving engine,

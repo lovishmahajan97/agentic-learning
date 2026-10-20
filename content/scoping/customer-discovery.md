@@ -5,6 +5,7 @@ name: Customer discovery
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - scoping/ai-use-case-discovery
   - scoping/workflow-analysis

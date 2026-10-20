@@ -5,6 +5,7 @@ name: python-dotenv
 kind: tool
 difficulty: intro
 est_minutes: 9
+status: fact-checked
 related:
   - python-for-ai/pydantic-settings
   - backend-fundamentals/secrets-management

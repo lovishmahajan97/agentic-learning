@@ -5,6 +5,7 @@ name: Data retention & deletion architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - data-architecture/data-lineage
   - rag-retrieval/freshness-document-deletion-index-consistency
@@ -37,8 +38,9 @@ is written to the application database; copied into a prompt; sent to a model ve
 recorded by the observability stack as a trace with full prompt and completion; embedded and stored as a
 memory vector for future personalization; cached as a semantic-cache entry keyed on its embedding;
 sampled into a weekly eval set; exported into a fine-tuning dataset; and, after the fine-tune, partially
-encoded in model weights. Nine copies, in nine systems, owned by four teams, two of them outside the
-company.
+encoded in model weights. Setting aside the transient prompt, that is eight persisted copies in eight
+systems, typically owned by several different teams, with at least one (the vendor's logs) outside the
+company, and two if the observability stack is a hosted service.
 
 The naive alternative, "delete from the primary database and let the rest expire", fails because several
 of those copies have no expiry (the vector index, the fine-tuning dataset, the weights) and because the
@@ -84,8 +86,8 @@ Partial completion must be visible, not silently treated as done.
 
 ### Store-specific mechanics
 - **Vector indexes:** deletion must be keyed by metadata (`subject_id`, `document_id`), so those fields
-  must exist on every vector. Many ANN implementations implement deletion as a tombstone until
-  compaction or rebuild, which means the vector may remain on disk after it stops being returned; treat
+  must exist on every vector. Many ANN implementations implement deletion as a soft-delete marker until
+  compaction, segment merge or rebuild, which means the vector may remain on disk after it stops being returned; treat
   the index as a derived store that can be rebuilt from the source of truth, and schedule rebuilds.
 - **Caches:** semantic and exact-match response caches hold prompts and completions; key them so that
   entries carrying a subject's data can be found, or give them a TTL short enough that deletion
@@ -93,10 +95,13 @@ Partial completion must be visible, not silently treated as done.
 - **Traces and logs:** either redact PII before the trace is written, so the trace store holds nothing
   deletable, or keep traces keyed by subject with a retention short enough to expire within the deadline.
   Redaction at write time is the more robust choice.
-- **Backups and immutable stores:** you cannot delete one row from a backup. Crypto-shredding solves
-  this: encrypt each subject's (or tenant's) data under its own key, and delete the key. The ciphertext
-  remains but is unrecoverable, which satisfies the regulatory intent and is the standard pattern for
-  backups and append-only logs.
+- **Backups and immutable stores:** you cannot delete one row from a backup. Two patterns are common.
+  The simpler is a short backup rotation plus a deletion log: backups age out within a defined window,
+  and any restore replays the recorded deletions before the data goes live again. The stronger is
+  crypto-shredding: encrypt each subject's (or tenant's) data under its own key, and delete the key. The
+  ciphertext remains but is unrecoverable, which is widely treated as meeting the intent of erasure for
+  backups and append-only logs; regulators have not uniformly codified that view, so confirm the
+  approach with your privacy counsel.
 - **Training datasets:** rows must carry subject or tenant identifiers so they can be removed, and the
   dataset's snapshot digest changes, which flows into provenance.
 - **Model weights:** data that has been trained into a model cannot be deleted from it; machine
@@ -172,7 +177,9 @@ from a forward lineage traversal rather than a per-store scan.
 - Short TTLs on traces and caches make deletion deadlines trivial to meet but shrink the window for
   debugging and evaluation; the balance shifts toward longer retention once PII is redacted at write time.
 - Crypto-shredding handles backups and immutable logs cleanly, but per-subject keys add a key-management
-  system and a lookup on every read; per-tenant keys are the usual compromise below enterprise scale.
+  system and a lookup on every read; per-tenant keys are far cheaper and cover offboarding, but cannot
+  shred one person inside a tenant, so per-subject erasure then falls back to backup expiry plus replay
+  of the deletion log on restore.
 - Keeping personal data out of fine-tuning avoids the unlearning problem entirely, but some use cases
   need it; then retraining on a schedule is the cost of being able to honour deletions.
 - Partitioning every store by tenant makes offboarding a partition drop, but multiplies collections and
@@ -246,11 +253,11 @@ the job's receipt plus the provenance manifest of the replacement model showing 
 - [x] Data is encrypted per subject or tenant, and deleting the key makes the remaining ciphertext unrecoverable
 - [ ] It moves the subject's rows to a separate archive with shorter retention
 > Immutable stores cannot have individual rows removed. Encrypting under a per-subject key and destroying
-> the key achieves the regulatory intent without modifying the store, which is why it is the standard
-> pattern for backups.
+> the key leaves only unreadable ciphertext without modifying the store, which is why it is the common
+> pattern for backups. Compression or a separate archive still leaves the data readable.
 
-### Q: What is the purpose of a tombstone in a deletion architecture?
-- [ ] To mark the vector as deleted in the ANN index until compaction
+### Q: In the propagated deletion job, what is the tombstone written in the final step for?
+- [ ] To mark the subject's rows as pending so a nightly job can remove them later
 - [x] To prevent re-ingestion from resurrecting deleted data and to record that deletion occurred
 - [ ] To hold the subject's data for the appeal period before final deletion
 - [ ] To signal the model vendor to purge their logs

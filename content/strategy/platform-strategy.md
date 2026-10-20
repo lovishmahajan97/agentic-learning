@@ -5,6 +5,7 @@ name: Platform strategy
 kind: decision
 difficulty: advanced
 est_minutes: 16
+status: reviewed
 related:
   - llmops-platform/centralized-vs-federated-ai-platform
   - llmops-platform/ai-control-plane-vs-data-plane
@@ -60,7 +61,24 @@ designed from imagination.
   data sent to an unapproved region, uncapped spend, no audit trail)? Those belong in the shared layer
   even with low demand, *because* the cost of inconsistency is organisational.
 
-### 3. Draw a thin mandatory core and an optional paved road
+### 3. Check the economics before you centralise
+The three questions combine into a rough break-even. With *n* teams each spending *c_team* to build and
+run their own version, and a platform costing *C_platform* to build and run plus *c_adopt* per team to
+integrate and adapt:
+
+```
+centralise when  n × c_team  >  C_platform + n × c_adopt + coordination cost
+                 (+ the expected cost of an inconsistency incident, for high-externality items)
+```
+
+Variance is what makes this fail: when teams' needs differ, *c_adopt* rises toward *c_team* (every team
+still does most of the work, now fighting an abstraction), and the inequality never holds however large
+*n* gets. Externalities enter as the last term, which is why a gateway or audit log can justify itself at
+*n* = 2 while a shared chunking library cannot at *n* = 6. The same arithmetic covers sourcing: if a
+commercial or open-source gateway gives you most of *C_platform* for less, the platform team's job is to
+operate and integrate it, not to write one.
+
+### 4. Draw a thin mandatory core and an optional paved road
 The core is what every AI workload must go through: identity, approved model access through a gateway,
 budgets and rate limits, logging to a common trace store, data-classification rules. It is mandatory
 *because* its value comes from being universal (one inventory, one place to swap a model). The paved road
@@ -68,26 +86,33 @@ is everything else the platform offers as defaults (an eval harness, an ingestio
 optional, but easier than building your own. Teams that leave the paved road accept owning what they
 build.
 
-### 4. Treat the platform as a product
+### 5. Treat the platform as a product
 It has users (internal teams), a roadmap driven by their needs, documentation, SLOs and adoption metrics:
 number of teams onboarded, time from idea to first production call, share of spend flowing through the
 gateway. A platform team measured on features shipped rather than on consumer outcomes drifts toward the
 over-built monolith described above.
 
-### 5. Choose a funding model
+### 6. Choose a funding model
 Central funding makes adoption easy but hides cost. Showback (reporting each team's usage) creates
 awareness without friction. Chargeback (billing teams) aligns incentives but can push teams to route
 around the platform to save money. Many organisations start with central funding plus showback and move
 to chargeback for variable costs such as tokens once usage is significant.
 
-### 6. Keep seams so decisions are reversible
+### 7. Keep seams so decisions are reversible
 Expose the platform through stable internal interfaces (an OpenAI-compatible endpoint, a trace schema,
 an eval-result format) rather than leaking a vendor's SDK into every service, *because* the model and
 tooling market changes quickly and you will swap components under the interface.
 
+### 8. Engineer the core as shared infrastructure
+A mandatory gateway is on every AI request path, so its failure is everyone's outage. Run it with the
+availability target of the most demanding consumer, keep it stateless and horizontally scaled, and decide
+up front what happens when it is down (fail closed for high-risk traffic, fail open to a direct route only
+where policy allows), *because* the centralisation that gives you one place to swap a model also gives you
+one place to break all of them.
+
 ## Example
 A worked scenario. An insurer has six product teams using LLMs. The platform lead tabulates the
-capabilities (counts are from the inventory; costs are illustrative):
+capabilities (team counts come from the inventory; the scenario is illustrative):
 
 | Capability | Teams needing it | Variance | Externality | Decision |
 |---|---|---|---|---|
@@ -104,7 +129,8 @@ breakdown, and security found two teams sending claim documents to a model regio
 not allow. The first platform release is deliberately small: a gateway in front of approved models, with
 per-team budgets, common logging and redaction. Migration is cheap for teams because the gateway speaks
 the same API shape they already call. Within a quarter, all spend is attributable per feature, one team's
-model deprecation is handled by changing a routing rule, and the eval harness is offered next because
+model deprecation is handled by changing a routing rule once that team's evals pass on the
+replacement model, and the eval harness is offered next because
 five teams asked for it. Agent frameworks stay team-owned: only two teams use them and their needs
 differ, so a shared abstraction now would freeze the wrong design.
 
@@ -129,13 +155,18 @@ differ, so a shared abstraction now would freeze the wrong design.
   consumer request ages in the backlog.
 - Leaking one vendor's SDK through the platform interface; the first provider migration turns into a
   change in every consuming service.
-- No exit path for teams off the paved road, so exceptions accumulate as unreviewed shadow stacks.
+- No exit path for teams off the paved road; exceptions accumulate as unreviewed shadow stacks that show
+  up as provider invoices finance cannot map to any registered workload.
+- Running the gateway like an internal tool rather than tier-one infrastructure; the symptom is a single
+  gateway incident that takes down every AI feature at once, followed by teams asking for bypass routes.
 
 ## When to use
 Make platform decisions explicitly once two or three teams are building on models, or earlier if a
 compliance or spend externality already exists. Start with the thin core: gateway, identity, budgets,
 logging. Add paved-road components when demand is proven and variance is low. Measure adoption, time to
-first production call, share of traffic through the core, and consumer satisfaction. Do not build a
+first production call, share of traffic and spend through the core, lead time on the platform's top
+consumer requests, and the number of approved exceptions (a rising count means the paved road no longer
+fits). Do not build a
 platform as the first AI project; build it out of the first projects' shared parts. In interviews, show
 you can name what to centralise and why, and when you would deliberately leave duplication in place.
 

@@ -5,7 +5,7 @@ name: State machines
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -78,6 +78,13 @@ unless `tests_passed`", "cannot enter APPLY more than three times", "cannot ente
 way around. They are also where approval gates attach: a consequential transition's guard is "an
 approval exists for these exact arguments".
 
+### Guard facts must be invalidated
+A guard is only as good as the freshness of the fact it reads. `tests_passed = True` describes the code
+*as it was when the tests ran*; any later edit makes it stale. So the harness must clear facts when an
+action invalidates them (an edit resets `tests_passed`, a changed plan resets `approved_by`), because
+otherwise the sequence test, pass, edit, finish satisfies the guard while violating the invariant it
+was written for.
+
 ### Persistence and resumption
 After every transition the harness persists `(run_id, state, data, step)`. On restart it reloads and
 re-enters the state, with the data it had. This is what makes a run resumable without re-reading the
@@ -97,6 +104,14 @@ is the graph state, with checkpointers for persistence and interrupts for human 
 is about fifty lines; frameworks add persistence, streaming, visualization and time travel. Either way
 the design work, choosing states and guards, is yours.
 
+### Checking the machine
+Because the machine is data (an enum, a table, a tool map), its properties can be tested without a
+model. Enumerate every (state, event) pair and assert the expected next state; check that every
+non-terminal state can reach a terminal one (a graph search over the table), that no event leads into
+DEPLOY or DONE without a guard, and that the consequential tools appear only in the states meant to hold
+them. These are cheap unit tests, and they are the reason to prefer an explicit table over transitions
+scattered through `if` statements: a free loop has no structure you can check this way.
+
 ### Choosing the states
 A state is a phase in which the allowed actions differ, or a point at which you would want to resume.
 It is not "one state per prompt". Four to eight top-level states is typical; if you need thirty, you
@@ -104,9 +119,13 @@ are describing a workflow and should write it as code with no model choosing tra
 
 ## Example
 A bug-fix agent as a small machine. The model only sees the tools of its current state, the transition
-table decides what each tool call means, and two guards enforce the invariants: no finishing without
-passing tests, and no more than three apply attempts. Legality is checked *before* the tool executes, so
-a rejected call has no side effect, and repeated rejections end the run in FAILED rather than looping.
+table decides what each tool call means, and guards enforce the invariants: no finishing without
+passing tests, and a bounded number of apply attempts. PROPOSE has no model tools at all: its event
+comes from outside (a reviewer approving or rejecting the plan), because a plan the model approves
+itself is not reviewed. Legality is checked *before* the tool executes, so a rejected call has no side
+effect; an edit clears `tests_passed` so a stale pass cannot satisfy the guard; and both the third retry
+and repeated illegal calls end the run in FAILED rather than looping. The rejection count is
+checkpointed with the state so a crash cannot reset the budget.
 
 ```python
 from enum import Enum
@@ -122,11 +141,9 @@ class Data(BaseModel):
     attempts: int = 0
 
 TOOLS = {S.INVESTIGATE: ["read_file", "grep", "submit_plan"],
-         S.PROPOSE: ["approve_plan", "revise_plan"],
-         S.APPLY: ["edit_file", "run_tests"],
-         S.VERIFY: ["read_file", "finish", "retry"]}
-TABLE = {(S.INVESTIGATE, "submit_plan"): S.PROPOSE, (S.PROPOSE, "approve_plan"): S.APPLY,
-         (S.PROPOSE, "revise_plan"): S.INVESTIGATE, (S.APPLY, "run_tests"): S.VERIFY,
+         S.APPLY: ["edit_file", "run_tests"], S.VERIFY: ["read_file", "finish", "retry"]}
+TABLE = {(S.INVESTIGATE, "submit_plan"): S.PROPOSE, (S.PROPOSE, "approve"): S.APPLY,
+         (S.PROPOSE, "reject"): S.INVESTIGATE, (S.APPLY, "run_tests"): S.VERIFY,
          (S.VERIFY, "retry"): S.APPLY, (S.VERIFY, "finish"): S.DONE}
 
 def check(state: S, event: str, d: Data) -> None:      # runs BEFORE any side effect
@@ -135,31 +152,29 @@ def check(state: S, event: str, d: Data) -> None:      # runs BEFORE any side ef
     if TABLE.get((state, event)) is S.DONE and not d.tests_passed:   # guard lives in code
         raise ValueError("cannot finish: tests have not passed")
 
-def next_state(state: S, event: str, d: Data) -> S:
-    if (state, event) == (S.VERIFY, "retry"):
-        d.attempts += 1
-        if d.attempts >= 3:
-            return S.FAILED                          # bounded retry ends in a terminal state
-    return TABLE.get((state, event), state)          # tools that do not change phase self-loop
-
-def run(model, execute, store, run_id, max_rejections=5):
-    state, d, step = store.load(run_id) or (S.INVESTIGATE, Data(), 0)   # resume where we left off
-    rejections, feedback = 0, None
+def run(model, reviewer, execute, store, run_id, max_rejections=5):
+    state, d, step, rejections = store.load(run_id) or (S.INVESTIGATE, Data(), 0, 0)
+    feedback = None
     while state not in (S.DONE, S.FAILED):
-        call = model.next_action(state, d, tools=TOOLS[state], feedback=feedback)
-        try:
-            check(state, call.name, d)
-        except ValueError as e:                      # reject, tell the model why, re-prompt
-            rejections, feedback = rejections + 1, str(e)
-            state = S.FAILED if rejections >= max_rejections else state
-            store.save(run_id, state, d, step)
-            continue
-        feedback = None
-        result = execute(call, idempotency_key=f"{run_id}:{step}")   # same key if re-run after a crash
-        if call.name == "run_tests": d.tests_passed = result.ok
-        if call.name == "submit_plan": d.plan = call.args["plan"]
-        state, step = next_state(state, call.name, d), step + 1
-        store.save(run_id, state, d, step)           # checkpoint after every transition
+        if state is S.PROPOSE:                       # external event: a reviewer decides, not the model
+            state = TABLE[(state, reviewer(d.plan))]   # "approve" or "reject"
+        else:
+            call = model.next_action(state, d, tools=TOOLS[state], feedback=feedback)
+            try:
+                check(state, call.name, d); feedback = None
+            except ValueError as e:                  # reject, tell the model why, re-prompt
+                rejections, feedback = rejections + 1, str(e)
+                state = S.FAILED if rejections >= max_rejections else state
+                store.save(run_id, state, d, step, rejections); continue
+            result = execute(call, idempotency_key=f"{run_id}:{step}")   # same key if re-run after a crash
+            if call.name == "edit_file": d.tests_passed = False          # an edit makes the old result stale
+            if call.name == "run_tests": d.tests_passed = result.ok
+            if call.name == "submit_plan": d.plan = call.args["plan"]
+            d.attempts += call.name == "retry"
+            state = (S.FAILED if d.attempts >= 3       # bounded retry ends in a terminal state
+                     else TABLE.get((state, call.name), state))   # non-phase tools self-loop
+        step += 1
+        store.save(run_id, state, d, step, rejections)     # checkpoint after every transition
     return state
 ```
 
@@ -187,6 +202,10 @@ def run(model, execute, store, run_id, max_rejections=5):
   APPLY for hours and only stops at the global token budget.
 - Checking guards in the prompt ("only finish when tests pass") rather than in code; the symptom is a
   successful-looking run whose tests never ran.
+- Setting a guard fact once and never clearing it; the symptom is a run that passed tests, made one
+  more edit, and finished green with untested code.
+- Letting the model fire the transition that is meant to be someone else's decision (`approve_plan` as
+  a model tool); the symptom is a review state that every run passes through in one step.
 - Changing the data schema without migrating persisted runs; the symptom is validation errors on
   resume, a week after the deploy.
 

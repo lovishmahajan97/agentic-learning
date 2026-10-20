@@ -5,6 +5,7 @@ name: Hybrid / on-prem
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - infra-capacity-economics/cloud-ai-architecture
   - infra-capacity-economics/gpu-infrastructure
@@ -90,14 +91,18 @@ side must pass its eval on both.
 
 ### Bursting and backflow
 Cloud burst works like an overflow queue: when the on-prem pool's queue wait exceeds a threshold,
-eligible requests (eligibility is the classification again) go to the cloud. Running it in the other
-direction, cloud by default with on-prem absorbing what it can, keeps the owned GPUs busy and is
-often the better default for workloads allowed on both sides, since the fixed cost is sunk and the
-cloud cost is marginal.
+eligible requests (eligibility is the classification again) go to the cloud. For workloads allowed
+on both sides, on-prem first with cloud overflow is the right default, because the owned cost is
+already sunk while every cloud token is a marginal cost. Backflow is the reverse movement: deferrable
+eligible work (batch jobs, re-indexing, evaluation runs) is pulled back onto owned GPUs whenever they
+would otherwise idle, for example overnight, so the fixed pool stays busy instead of the cloud bill
+growing.
 
 ### Operating the owned side
-A fixed pool is only cheaper when busy, so on-prem capacity should be sized for the steady base of
-eligible work, not for peak; peak goes to the cloud. The owned side needs a hardware lifecycle
+A fixed pool is only cheaper when busy, so on-prem capacity should not be sized for the peak of all
+traffic. The sizing has two parts: restricted work has nowhere else to go, so its *peak* (plus a
+spare for a node failure) must fit on-prem; burst-eligible work is sized only at its steady base,
+filling the gaps the restricted peak leaves, and its peaks go to the cloud. The owned side needs a hardware lifecycle
 (procurement lead time, spares, replacement cadence, typically a three-to-five-year amortisation
 for the TCO model), a serving-stack lifecycle (engine upgrades, CVE patching, driver and CUDA
 compatibility), monitoring unified with the cloud side, and a model lifecycle (which open-weight
@@ -116,6 +121,7 @@ A gateway routing policy that enforces classification, routes for capability and
 eligible traffic. Thresholds and model names are placeholders.
 
 ```python
+from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
@@ -170,8 +176,9 @@ has; that refusal is the signal to procure a better on-prem model, not a bug to 
   the provider's pricing and lock-in inside your building.
 
 ## Pitfalls
-- Sizing on-prem for peak instead of base load; the symptom is a GPU fleet averaging well under a
-  quarter utilization while the finance model assumed near-full.
+- Sizing on-prem for the peak of all traffic, including work that could burst to the cloud; the
+  symptom is a GPU fleet averaging well under a quarter utilization while the finance model assumed
+  near-full.
 - Classification by prompt inspection instead of by source; the symptom is a restricted document
   found in cloud logs because a detector missed it.
 - One prompt tuned on the cloud model and reused on the on-prem model; the symptom is a quality
@@ -191,7 +198,8 @@ every hosted path and open-weight models meet the quality bar. Measure owned-poo
 burst volume and its cost, per-route quality on shared evals, and the number of policy refusals,
 which tells you where the on-prem model is falling short. In day-to-day work this shows up as the
 gateway's policy table and the quarterly review of what each side costs; in interviews, expect to
-defend why classification is enforced at the gateway and why on-prem is sized for base load.
+defend why classification is enforced at the gateway and why on-prem is sized for the restricted
+peak plus the base of eligible work rather than for total peak.
 
 ## Role lens
 - **Engineer:** Builds the gateway policy and burst logic, runs OpenAI-compatible engines on the
@@ -212,7 +220,9 @@ model is evaluated on clinical tasks before launch. The staff assistant needs fr
 touches internal but not restricted data, so it goes to a cloud platform in an approved region
 over a private endpoint. The research batch is public data: it runs on the owned pool overnight
 when the restricted workload is quiet, bursting to the cloud batch API if it cannot finish by
-morning. Size the owned pool for the restricted base load plus the overnight batch, not for peak.
+morning. Size the owned pool for the restricted workload's peak (it cannot burst) with one GPU
+or node of spare, and let the overnight batch fill the idle hours, not for the combined peak of all
+three workloads.
 Measure owned-pool utilization (target high, since cost per token depends on it), queue wait and
 burst volume, per-route eval scores, and policy refusals, which show where the on-prem model is
 insufficient.
@@ -229,12 +239,13 @@ insufficient.
 
 ### Q: Which sizing rule keeps owned GPUs economical in a hybrid design?
 - [ ] Size on-prem for peak so the cloud is never needed
-- [x] Size on-prem for the steady base of eligible work and send peaks to the cloud
-- [ ] Size on-prem for the restricted workload only and send everything else to the cloud
+- [x] Fit the restricted workload's peak, add the steady base of cloud-eligible work, and send eligible peaks to the cloud
+- [ ] Size on-prem for the restricted workload's average load and send everything else to the cloud
 - [ ] Size on-prem to match the cloud quota in the approved region
-> Owned cost per token falls with utilization, so the pool must be busy; sizing for base load keeps
-> it full while elastic cloud capacity absorbs the peaks that would otherwise sit idle on owned
-> hardware.
+> Owned cost per token falls with utilization, so the pool must be busy, but restricted work cannot
+> burst, so its peak sets a floor. Filling the remaining capacity with the base of eligible work
+> keeps the pool full, while elastic cloud capacity absorbs eligible peaks that would otherwise sit
+> idle on owned hardware; sizing restricted work at its average would drop requests at its peak.
 
 ### Q: A restricted-data workload needs a capability only the hosted frontier model has. What should the gateway do?
 - [ ] Route to the cloud once with logging so the exception is auditable

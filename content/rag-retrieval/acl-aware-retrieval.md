@@ -5,6 +5,7 @@ name: ACL-aware retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 16
+status: reviewed
 related:
   - rag-retrieval/metadata-filtering
   - safety-security/cross-tenant-data-leakage
@@ -87,8 +88,9 @@ The practical design is a hybrid: early-bound predicate for retrieval, then a la
 final top-k when the data warrants it. The check is cheap because k is small (5 to 10 documents) and many
 sources accept batched permission queries. Alongside it, subscribe to the source's change feed (webhooks,
 delta queries) to update ACL payloads without re-embedding, and run a periodic full re-sync to catch
-missed events. Because groups are expanded at query time, group-membership changes are already
-immediate; the lag only applies to direct shares and new restrictions.
+missed events. Because groups are expanded at query time, group-membership changes take effect within the
+principal-cache TTL (plus any propagation delay in the identity provider itself); the sync lag only
+applies to direct shares and new restrictions.
 
 ### 5. Revocation and deletion
 A document that becomes restricted or is deleted must disappear from results for everyone immediately:
@@ -108,6 +110,17 @@ cached by a semantic cache keyed on the query alone, summaries an agent stores i
 LLM-generated documents written back into the index all carry content and must be scoped by the same
 principals. A semantic cache must key on (principal-set hash, query) or cache only public results.
 Responses for "not found" and "forbidden" should be indistinguishable.
+
+### 8. Derived content inherits the most restrictive ACL
+Anything the pipeline writes *from* several documents (a parent-section summary, a contextual-retrieval
+prefix, a GraphRAG community report, a knowledge-graph entity description, an agent's memory note) may
+only be shown to someone who could read every input, because a summary of a board deck and a public FAQ
+leaks the board deck. The tempting shortcut, intersecting the two `allowed` lists, is wrong when they
+hold groups: `[group:finance] ∩ [group:legal]` is empty as strings, yet a user in both groups may read
+both sources. Store the derived chunk's ACL as a conjunction instead (the list of source ACLs, each of
+which the user's principals must match, enforced with nested filters or a late-bound check) or, more simply, only build derived artifacts within one permission domain, for
+example per site or per space. Either way the derived item must be rebuilt or tombstoned when any source
+ACL tightens.
 
 ## Example
 Ingestion stores effective principals on each chunk; query time expands the user's groups, builds the
@@ -130,24 +143,27 @@ def principals_for(user, directory):
     return [f"user:{user.email}", f"domain:{user.domain}", "public", *[f"group:{g}" for g in groups]]
 
 def retrieve(user, query_vec, directory, source, k=8):
-    who = principals_for(user, directory)
-    if not who:                                                   # fail closed, never open
+    try:
+        who = principals_for(user, directory)
+    except Exception:                                             # directory down: fail closed, never open
         return []
     flt = models.Filter(
         must=[models.FieldCondition(key="allowed", match=models.MatchAny(any=who))],
         must_not=[models.FieldCondition(key="denied", match=models.MatchAny(any=who))],
     )
-    hits = client.query_points("docs", query=query_vec, query_filter=flt, limit=k).points
+    # Fetch a little extra: the late-bound check below may drop a few stale grants.
+    hits = client.query_points("docs", query=query_vec, query_filter=flt, limit=2 * k).points
     # Late binding on the few survivors closes the window between ACL syncs for direct shares.
     doc_ids = {h.payload["doc_id"] for h in hits}
     readable = source.can_read(user.id, doc_ids)                  # one batched permission check
-    return [h for h in hits if h.payload["doc_id"] in readable]
+    return [h for h in hits if h.payload["doc_id"] in readable][:k]
 ```
 
 Worked numbers: with 2 million chunks and a user in 60 groups, the predicate is a 63-value `match_any`
 against a keyword index, which is a bitmap union and costs about the same as any other payload filter.
-If the nightly ACL sync is the only refresh, a direct share revoked at 10:00 stays visible for up to 16
-hours without the late-binding check; with it, the window closes at the next query.
+If a nightly ACL sync at 02:00 is the only refresh, a direct share revoked at 10:00 stays visible for 16
+hours (up to 24 hours for a revocation made just after the sync) without the late-binding check; with it,
+the window closes at the next query.
 
 ## Trade-offs
 - Early binding is fast and scales to millions of chunks, but freshness is bounded by ACL sync lag; it
@@ -183,6 +199,11 @@ hours without the late-binding check; with it, the window closes at the next que
   surfacing hours later, found during an audit.
 - Treating "not in the index" and "not permitted" differently in the response; the symptom is users
   discovering the existence of documents by probing.
+- Taking group memberships from the sign-in token's group claim; identity providers cap or omit that
+  claim for users in many groups (Entra ID switches to an "overage" indicator), so the symptom is
+  heavily grouped users, often managers and admins, suddenly seeing far less than they should.
+- Summaries, contextual prefixes or graph reports built across documents with different ACLs; the
+  symptom is a restricted fact surfacing in a chunk whose own `allowed` list looks harmless.
 
 ## When to use
 Any RAG system over data with per-user permissions needs this, which in practice means almost every
@@ -211,8 +232,9 @@ document is shared with a 2,000-member group; a user is removed from that group 
 re-sync runs nightly at 02:00. Design retrieval so the user cannot see the document at 10:05, and state
 what it costs.
 **A:** Store `group:<id>` on the chunks rather than the 2,000 members, and expand the user's groups at
-query time from the Workspace directory with a cache TTL of a few minutes. At 10:05 the user's principal
-set no longer contains the group, so the predicate excludes the document with no re-index at all. Direct
+query time from the Workspace directory with a cache TTL shorter than the five-minute window (or
+invalidate the cache on directory change events). At 10:05 the user's principal set no longer contains
+the group, so the predicate excludes the document with no re-index at all. Direct
 per-user shares stay early-bound and would be stale until 02:00, so cover them two ways: subscribe to
 Drive change notifications and patch the `allowed` payload on permission changes, and run a late-binding
 permission check on the final top-k before answering. Costs: one cached directory call per user per TTL,

@@ -5,6 +5,7 @@ name: Graceful shutdown
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
   - deployment/health-checks
@@ -24,13 +25,15 @@ sources:
 Processes are killed constantly: deploys, autoscaling, node drains, out-of-memory kills. Graceful
 shutdown is the sequence a Node service runs on SIGTERM so nothing in flight is lost: stop advertising
 readiness, stop accepting new requests and jobs, let in-flight work finish within a deadline shorter
-than the orchestrator's grace period, flush telemetry, close pools, then exit. Without it, every deploy
+than the orchestrator's grace period, close queues and pools, flush telemetry, then exit. Without it, every deploy
 truncates streamed LLM responses, re-runs queue jobs and leaks half-done writes.
 
 ## Why it exists
 Kubernetes replaces a pod by sending SIGTERM and, after `terminationGracePeriodSeconds` (30 s by
 default), SIGKILL. `docker stop` does the same with a 10 s default. In a Node process with no handler,
-SIGTERM terminates immediately: an SSE stream halfway through a 2,000-token answer closes without a
+SIGTERM either terminates it immediately or, when Node is PID 1 in the container, is ignored outright
+(the kernel drops signals that PID 1 has no handler for), so the pod sits until SIGKILL. Either way
+nothing drains: an SSE stream halfway through a 2,000-token answer closes without a
 final event, a BullMQ worker mid-way through a 500-chunk embedding loses its place and the job stalls
 and re-runs, a Postgres transaction is rolled back by the server when the socket drops, and the last
 batch of OpenTelemetry spans, which are precisely the ones covering the deploy, is never exported.
@@ -50,7 +53,9 @@ of that against a deadline.
 1. The pod is marked terminating; endpoint removal propagates to kube-proxy and ingress controllers
    with a delay.
 2. The container's `preStop` hook runs, if any; a common one is `sleep 5` to let endpoint removal
-   propagate before the signal arrives.
+   propagate before the signal arrives (the exec form needs a `sleep` binary in the image; recent
+   Kubernetes versions also offer a built-in `sleep` preStop action). The hook's time counts against
+   the grace period.
 3. SIGTERM is sent to PID 1 of the container.
 4. After the grace period, SIGKILL.
 
@@ -73,19 +78,23 @@ wins and the work is lost anyway.
    finish them if they will end within the deadline, otherwise send a final event that tells the client
    to resume or retry, and abort the upstream model call with an `AbortController` so you stop paying
    for tokens nobody will receive.
-4. **Close resources in reverse dependency order.** Telemetry first (`sdk.shutdown()` flushes the batch
-   span processor), then queue and Redis clients (`queue.close()`, `redis.quit()`, which waits for
-   pending replies, unlike `disconnect()`), then `pool.end()` so no query is cut mid-flight.
+4. **Close resources in reverse dependency order.** Queue and Redis clients (`queue.close()`,
+   `redis.quit()`, which waits for pending replies, unlike `disconnect()`), then `pool.end()`, which
+   must come after every worker and request that might still query. Telemetry goes last
+   (`sdk.shutdown()` flushes the batch span processor): the exporter depends on none of the other
+   resources, and flushing last also exports the spans and errors of the close steps themselves. Give
+   the flush its own short timeout.
 5. **Exit explicitly.** Once a SIGTERM listener is registered, Node no longer exits on the signal by
    default, so call `process.exit(0)` at the end (or set `process.exitCode` and let the loop drain).
-   Wrap the sequence in a deadline timer (`setTimeout(..., 25_000).unref()`) that exits non-zero if
+   Wrap the sequence in a deadline timer (`setTimeout(..., 20_000).unref()` for a 30 s grace period with a 5 s `preStop`) that exits non-zero if
    draining hangs, *because* a hung shutdown wastes the whole grace period and still ends in SIGKILL.
 6. **Second signal means force.** A second SIGTERM or SIGINT during draining should exit immediately;
    operators expect it.
 
 ### Crashes
-`uncaughtException` and `unhandledRejection` leave the process in an unknown state. Log, flush
-telemetry if you can within a second, and exit non-zero; do not try to keep serving. The orchestrator
+`uncaughtException` and `unhandledRejection` leave the process in an unknown state. Log, then either
+flush telemetry and exit non-zero within a second or two, or run the normal drain under a short
+deadline (as the example does); either way stop accepting work and exit non-zero, never keep serving. The orchestrator
 starts a fresh instance, and the queue's stall detection re-runs the job, which is why jobs must be
 idempotent in the first place.
 
@@ -95,9 +104,10 @@ and the last trace before shutdown is present in the backend.
 
 ## Example
 A shutdown orchestrator for an API process that also runs a BullMQ worker. Readiness fails first, HTTP
-intake and the worker close in parallel, then telemetry, Redis and Postgres close in order. The deadline
-timer is `unref()`'d so it cannot keep an otherwise-finished process alive, and a second signal forces
-exit.
+intake and the worker close in parallel, then Redis and Postgres close, and telemetry is flushed last
+under its own 3-second cap. The 20-second deadline leaves margin under a 30-second grace period minus a
+5-second `preStop` sleep; the timer is `unref()`'d so it cannot keep an otherwise-finished process
+alive, and a second signal forces exit.
 
 ```ts
 import http from "node:http";
@@ -114,23 +124,24 @@ const server = http.createServer((req, res) => {
   handle(req, res);                                 // normal routing
 });
 server.keepAliveTimeout = 5_000;
-const worker = new Worker("embed", processEmbed, { connection: redis.duplicate(), concurrency: 4 });
+const workerConn = redis.duplicate({ maxRetriesPerRequest: null });   // BullMQ workers require null
+const worker = new Worker("embed", processEmbed, { connection: workerConn, concurrency: 4 });
 server.listen(8080);
 
 let shuttingDown = false;
 async function shutdown(signal: string, code = 0) {
   if (shuttingDown) { console.warn("second signal, forcing exit"); process.exit(1); }
   shuttingDown = true; ready = false;               // 1. fail readiness first
-  const deadline = setTimeout(() => { console.error("drain timeout"); process.exit(1); }, 25_000).unref();
+  const deadline = setTimeout(() => { console.error("drain timeout"); process.exit(1); }, 20_000).unref();
   console.log(`${signal}: draining`);
   try {
     await Promise.all([
       new Promise<void>((resolve) => server.close(() => resolve())),  // 2. stop intake (closes idle keep-alive on Node 19+)
       worker.close(),                                                   //    stop taking jobs, wait for active ones
     ]);
-    await sdk.shutdown();                                               // 3. flush spans before the transports go
-    await redis.quit();                                                 //    waits for pending replies
-    await pool.end();                                                   //    no query is cut mid-flight
+    await Promise.all([redis.quit(), workerConn.quit()]);              // 3. waits for pending replies
+    await pool.end();                                                   //    only after nothing can still query
+    await Promise.race([sdk.shutdown(), new Promise((r) => setTimeout(r, 3_000))]);  // 4. flush spans last, capped
     clearTimeout(deadline);
     process.exit(code);
   } catch (err) {
@@ -182,9 +193,10 @@ either wait for probes to notice or add a short `preStop` sleep, and keep the li
 The stalled jobs come from the worker never being closed: `server.close` only drains HTTP, so
 `process.exit` killed active jobs whose locks then expired and were re-run by the stall checker. The
 full sequence is: readiness to 503, `server.close()` (closing idle keep-alive connections) in parallel
-with `await worker.close()`, flush OpenTelemetry, `redis.quit()`, `pool.end()`, then `process.exit(0)`,
+with `await worker.close()`, `redis.quit()`, `pool.end()`, flush OpenTelemetry, then `process.exit(0)`,
 all under a deadline below the grace period, with a non-zero exit if the deadline fires. Verify the
-container runs Node as PID 1 so the signal arrives at all.
+signal reaches Node at all: exec-form `CMD` so Node (or a forwarding init such as `tini`) is PID 1,
+not a shell.
 
 ## Quiz
 ### Q: Why should readiness be failed before calling `server.close()` rather than relying on `close()` alone?
@@ -201,9 +213,9 @@ container runs Node as PID 1 so the signal arrives at all.
 - [ ] Subsequent SIGTERMs are ignored
 > Installing a signal listener replaces the default behaviour; if the handler drains but never calls `process.exit` and some handle keeps the loop alive, the process lingers until SIGKILL.
 
-### Q: What is the right order for closing resources after intake has stopped and in-flight work has drained?
-- [ ] Postgres pool, then Redis, then telemetry, then exit
-- [x] Flush telemetry, then close queue and Redis clients, then end the Postgres pool, then exit
-- [ ] Exit immediately; the orchestrator closes sockets
-- [ ] Close the Postgres pool first so no new writes can start
-> Spans describing the drain must be flushed before their exporters lose connectivity, and the pool must outlive any job that may still write; ending the pool early produces errors in the final jobs of each deploy.
+### Q: After readiness has been flipped to 503, which shutdown order is right?
+- [ ] End the Postgres pool so no new writes can start, then close the worker, then flush telemetry, then exit
+- [x] Close the HTTP server and the worker, then Redis and the Postgres pool, then flush telemetry, then exit
+- [ ] Flush telemetry, then exit and let the orchestrator close the remaining sockets
+- [ ] Close the worker, then exit, because the stall checker will finish any remaining jobs
+> The pool must outlive every request and job that may still query, so it closes only after the server and worker have drained; ending it first produces "pool after end" errors in the last jobs. Telemetry goes last, under a short cap, so the close steps' own spans are exported before exit.

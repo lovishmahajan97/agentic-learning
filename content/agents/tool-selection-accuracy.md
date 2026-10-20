@@ -5,7 +5,7 @@ name: Tool selection accuracy
 kind: metric
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - agents/tool-calling
   - agents/tool-schemas-and-argument-validation
@@ -64,7 +64,10 @@ the expected key arguments. Include `none` cases in roughly their real proportio
 measured, and deliberately include near-miss pairs that separate similar tools. A set in the low
 hundreds of cases is enough to see large regressions but not small ones: with 200 cases the standard
 error on a 90% score is about 2 points (sqrt(0.9 × 0.1 / 200) ≈ 0.021), so only shifts of roughly five
-points or more are distinguishable from noise. Label it as a golden set, keep it out of any
+points or more are distinguishable from noise. Comparing two configurations on the *same* cases is
+more sensitive than that, because most cases agree; count only the discordant cases (passed before and
+failed after, or the reverse), and a 14-to-3 split is a real change where two headline numbers a few
+points apart might not be. Label it as a golden set, keep it out of any
 few-shot examples embedded in tool descriptions, and version it with the tool definitions. For
 mid-trajectory decisions, snapshot the conversation up to the decision point as the case input.
 
@@ -134,6 +137,16 @@ print(f"recall {d('both', 'needed'):.0%}  precision {d('both', 'called'):.0%}  "
       f"name {d('name_ok', 'both'):.0%}  args {d('args_ok', 'name_ok'):.0%}")
 print("confusions (expected -> chosen):", dict(confusion))
 ```
+
+Reading the output on a realistic set (illustrative numbers). 200 cases: 160 need a tool, 40 are `none`.
+The model calls on 150: 140 of the needed cases and 10 of the `none` cases. Should-call recall is
+140/160 = 87.5% and precision 140/150 = 93%. Of the 140, 133 picked the right name (95%), and 120 of
+those had the right key arguments (90%). Step-level accuracy is the fully correct cases, 120 tool cases
+plus 30 correctly unanswered `none` cases, so 150/200 = 75%. That 75% alone suggests "the model is
+mediocre"; the decomposition says something sharper. The biggest loss is the 20 missed calls, and if
+the confusion map shows 15 of them as `(get_order, None)` on "when will it arrive" phrasings, the fix is
+one trigger condition in one description, not a model change. The 13 argument misses are a separate,
+smaller problem with a separate fix (parameter descriptions), and the 7 name errors point at one pair.
 
 ## Trade-offs
 - A first-turn eval is cheap and isolates the decision, but it misses selections made deep in a long

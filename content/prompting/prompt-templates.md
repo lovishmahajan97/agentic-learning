@@ -5,7 +5,7 @@ name: Prompt templates
 kind: practice
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - prompting/prompt-engineering
   - prompting/system-prompt
@@ -61,7 +61,15 @@ A rendered prompt has three zones, in this order because prompt caches match a b
 The static zone: role, rules, format, fixed examples, tool descriptions. The dynamic zone: retrieved
 context, per-tenant settings, the user's input, each inside its own delimiter tags. The ask: a short
 restatement of the task at the end, where recency helps. Anything that varies per request belongs after
-the last static byte.
+the last static byte, and if the cache boundary is marked explicitly, it goes on that byte.
+
+"Static" is a matter of cardinality, not of whether a value is a variable. Every distinct rendering of
+the static zone is its own cache entry, so the number of entries is the product of the distinct values
+of every variable in it. Two audiences and a per-tenant glossary across 50 tenants is at most 100
+prefixes, each warm if its tenant has steady traffic. Put a free-form per-request number such as a
+word limit there and the count multiplies by every value seen, entries go cold before reuse, and the hit
+rate falls with no single line looking wrong. Rule of thumb: tenant- or product-level settings may live
+in the static zone; anything chosen per request goes in the dynamic zone.
 
 ### Rendering rules, and why
 - Insert variables as data, never as template source. A template engine substitutes a variable's value
@@ -112,9 +120,9 @@ import hashlib, anthropic
 from jinja2 import Environment, StrictUndefined
 from pydantic import BaseModel, Field
 
-class SummarizeVars(BaseModel):
+class SummarizeVars(BaseModel):          # static-zone fields: per-tenant settings, low cardinality
     audience: str = Field(pattern="^(exec|engineer)$")
-    max_words: int = Field(ge=20, le=400)
+    max_words: int = Field(ge=20, le=400)   # fixed per tenant here; if callers choose it per request, move it
     glossary: list[str] = []
     document: str
 
@@ -168,6 +176,9 @@ def test_user_text_is_data_not_template():              # tests/test_templates.p
   about "None" or ignoring a section that was supposed to be there.
 - A timestamp or request ID in the static zone; the symptom is a cache-read token count of zero on every
   call.
+- A high-cardinality variable (a per-request limit, a user's locale string) rendered into the static
+  zone; the symptom is a hit rate that decays as traffic diversifies, with cache writes far
+  outnumbering reads.
 - Whitespace or line-ending drift between environments; the symptom is a cache hit rate that differs
   between staging and production for the same template.
 - Truncating the dynamic zone by characters; the symptom is cut-off sentences and context overflows that

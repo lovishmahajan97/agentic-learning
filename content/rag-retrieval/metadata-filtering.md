@@ -5,6 +5,7 @@ name: Metadata filtering
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - rag-retrieval/ann-indexes
   - rag-retrieval/vector-databases
@@ -81,6 +82,20 @@ linearly with collection size.
    scans that keep walking until enough rows pass, and partial indexes (`CREATE INDEX ... WHERE
    tenant_id = ...`) remain the pre-filter option.
 
+### Why filtered traversal loses recall, and how engines repair it
+HNSW finds neighbours by greedy hops along graph edges, and each node keeps only a few dozen edges
+(the `M` parameter). Those edges were chosen for geometric closeness, not for sharing a tenant or a
+year. If only 1% of nodes pass, a passing node's neighbours mostly fail, so the walk either spends its
+`ef` budget expanding failing nodes or stalls in a region with no passing nodes at all, and it returns
+fewer or worse results than exist. Raising `ef_search` buys some recall back at linear cost; it does not
+fix the topology. Engines fix it in three ways. They estimate the predicate's cardinality from the
+payload index *before* searching, because that estimate is what decides brute force versus traversal.
+Some add extra edges at build time among nodes that share an indexed payload value (Qdrant does this for
+indexed keyword fields), so the subgraph of each value stays navigable. Others widen the neighbourhood
+during a filtered walk, for example by also considering neighbours-of-neighbours when direct neighbours
+fail (the ACORN approach, which Weaviate adopted as a filter strategy). Each fix costs memory, build time
+or per-hop work, which is why none of them is free and the selectivity measurement below still matters.
+
 ### The decision rule is selectivity
 Let *s* be the fraction of the corpus that passes. When *s* is tiny, pre-filter and brute-force: exact,
 cheap, and the ANN index is irrelevant. When *s* is large (most rows pass), filtered traversal costs
@@ -146,7 +161,9 @@ for kf in (10, 100, 1_000, 10_000):
 The pre-filtered search touched ~2,000 rows and was exact. Post-filtering needed to over-fetch 5% of
 the whole corpus to match it, and at k′ = 10 (what a naive `top_k=10` call does) it returned nothing.
 The expected survivor count k′·s predicts these numbers: 0.1, 1, 10 and 100 for the four over-fetch
-sizes, with the last two capped at k.
+sizes, the last capped at k. Note the second failure at k′ = 1,000: all nine survivors were correct, but
+the tenant's tenth-nearest row ranked outside the unfiltered top-1,000, so no amount of post-processing of
+that candidate set could have found it. Over-fetching fixes the count before it fixes correctness.
 
 ## Trade-offs
 - Pre-filtering is exact with respect to the predicate, but its cost scales with the allowed set; once

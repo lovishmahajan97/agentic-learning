@@ -4,7 +4,7 @@ module: system-design
 name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
-est_minutes: 14
+est_minutes: 16
 status: reviewed
 related:
   - python-for-ai/litellm

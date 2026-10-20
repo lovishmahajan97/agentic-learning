@@ -5,6 +5,7 @@ name: Anthropic SDK
 kind: tool
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/litellm
@@ -43,7 +44,8 @@ The SDK exists to make the API's real shape the path of least resistance: typed 
 typed content-block classes you branch on with `.type`, streaming helpers that accumulate the final
 message for you, an exception hierarchy that separates retryable from fatal failures, and helpers for
 token counting, batches and the tool-use loop. It also provides client classes for Claude on Amazon
-Bedrock and Google Vertex AI, so the same calling code works across those platforms.
+Bedrock, Google Vertex AI and Microsoft Foundry, so the same calling code works across those platforms
+(feature availability still differs per platform).
 
 ## How it works
 ### Client
@@ -59,11 +61,13 @@ timeouts are retried too, so worst-case wall-clock time is the timeout times the
   and keeping it separate makes it a stable, cacheable prefix.
 - **`max_tokens` is required** so every call has an explicit output ceiling; hitting it ends the
   response with `stop_reason == "max_tokens"`, which your code must treat as truncation.
-- **`messages` alternate user and assistant turns**, and each message's `content` may be a string or a
-  list of blocks (text, image, document, tool_result).
+- **`messages` is a sequence of user and assistant turns** (consecutive turns with the same role are
+  merged), and each message's `content` may be a string or a list of blocks (text, image, document,
+  tool_result).
 
 ### Content blocks and stop reasons
-`response.content` is a list. Branch on `block.type`: `"text"`, `"thinking"` (reasoning, when enabled),
+`response.content` is a list. Branch on `block.type`: `"text"`, `"thinking"` (reasoning; opt-in on older models, on by default on
+recent ones, and its visible text may be summarised or empty depending on the display setting),
 `"tool_use"` (with `id`, `name`, `input` already parsed as a dict). `stop_reason` tells you what to do
 next: `end_turn` (done), `tool_use` (run tools and continue), `max_tokens` (truncated), `stop_sequence`,
 `pause_turn` (a long server-side tool turn to resume) and `refusal` (declined; check it before reading
@@ -102,7 +106,7 @@ import os, anthropic
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
 client = anthropic.Anthropic(max_retries=3)
 SYSTEM = [{"type": "text", "text": "You are an order-support agent. Use tools for facts.",
-           "cache_control": {"type": "ephemeral"}}]          # stable prefix, cached
+           "cache_control": {"type": "ephemeral"}}]  # caches only above the model's minimum prefix length
 TOOLS = [{"name": "get_order", "description": "Look up an order by id.",
           "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}},
                            "required": ["order_id"]}}]
@@ -112,7 +116,7 @@ def get_order(order_id: str) -> str:
 
 messages = [{"role": "user", "content": "Where is order A-1042?"}]
 while True:
-    resp = client.messages.create(model=MODEL, max_tokens=2048, system=SYSTEM,
+    resp = client.messages.create(model=MODEL, max_tokens=8192, system=SYSTEM,   # thinking counts too
                                   tools=TOOLS, messages=messages)
     print(resp._request_id, resp.usage.input_tokens, resp.usage.cache_read_input_tokens)
     if resp.stop_reason != "tool_use":
@@ -130,7 +134,10 @@ if resp.stop_reason == "refusal" or resp.stop_reason == "max_tokens":
 print("".join(b.text for b in resp.content if b.type == "text"))
 ```
 
-A production loop also caps iterations, validates `block.input` before running a tool, and catches
+This toy system prompt is far shorter than the minimum cacheable prefix (model-dependent, from a few
+hundred to a few thousand tokens), so here `cache_read_input_tokens` stays at zero; with a realistic
+multi-thousand-token system prompt and tool list it rises from the second call. A production loop also
+caps iterations, validates `block.input` before running a tool, and catches
 `anthropic.RateLimitError`, `anthropic.APIStatusError` and `anthropic.APIConnectionError` separately.
 
 ## Trade-offs

@@ -5,6 +5,7 @@ name: tenacity
 kind: tool
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - serving-inference/retry-strategies
   - reliability/circuit-breakers
@@ -47,7 +48,12 @@ A retry policy in tenacity is built from four composable pieces passed to `@retr
 ### stop: when to give up
 `stop_after_attempt(5)`, `stop_after_delay(30)` (seconds since the first attempt), combined with `|`
 ("whichever comes first"). A time-based stop matters *because* the caller has its own deadline; attempt
-counts alone do not bound latency. **The default is never stop**, so a bare `@retry` loops forever.
+counts alone do not bound latency. Note that stop conditions are evaluated only after an attempt fails, so
+`stop_after_delay` is a soft budget: an attempt that starts at 29 s still runs to completion (or to its own
+timeout), and the true worst case is roughly the delay plus one wait plus one attempt timeout. Recent releases
+add `stop_before_delay`, which also refuses an attempt that would begin past the budget; either way, keep the
+per-attempt timeout small relative to the budget. **The default is never stop**, so a bare `@retry` loops
+forever.
 
 ### wait: how long between attempts
 `wait_fixed`, `wait_random`, `wait_exponential(multiplier=, min=, max=)`, and jittered variants such as
@@ -82,9 +88,11 @@ Anthropic) already retry some errors internally through a `max_retries` setting,
 before adding your own layer.
 
 ## Example
-A policy for a chat-completion call: retry only transient errors, exponential backoff with jitter, a hard
-30-second budget, a log line per retry, and the original exception re-raised at the end. The SDK's own
-retries are switched off so attempts do not multiply.
+A policy for a chat-completion call: retry only transient errors, exponential backoff with jitter, a
+30-second retry budget, a log line per retry, and the original exception re-raised at the end. The SDK's own
+retries are switched off so attempts do not multiply. Because the budget is checked between attempts, the
+worst case here is about 30 s + one wait (up to 20 s) + one 20 s attempt timeout, roughly 70 s; if a caller
+needs a strict ceiling, shrink the per-attempt timeout and wait cap or enforce an outer deadline.
 
 ```python
 import logging

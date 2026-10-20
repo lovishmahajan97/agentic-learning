@@ -5,6 +5,7 @@ name: Redis caching
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - backend-fundamentals/redis
   - serving-inference/caching
@@ -58,6 +59,17 @@ solve is correctness; that is entirely about the key.
    prompt or model changes invalidates everything at once without a scan, *because* old keys simply stop
    being read and age out under TTL.
 
+### Is it worth it? The arithmetic
+With hit rate *h*, a Redis round trip of *t_r* and a model call of *t_m*, mean latency is roughly
+`h·t_r + (1 − h)·(t_r + t_m + t_r)`: a miss pays the failed `GET`, the call and the `SET` (the `SET`
+can be fired without awaiting it). Because *t_r* is around a millisecond on a local network and *t_m*
+is hundreds of milliseconds or more, the cache pays for itself on latency at almost any hit rate;
+the saving in spend is simply *h* × calls × price per call. The real cost is memory:
+`entries × (key + value + per-key overhead)`. Value encoding dominates that. A 1,536-dimension
+float32 embedding is 6,144 bytes as raw bytes, but several times larger as a JSON list of Python
+floats, so a cache sized for one encoding overflows with the other. Measure *h* per namespace before
+growing memory: a namespace with a 2% hit rate is mostly paying to store keys nobody reads.
+
 ### What is safe to cache
 Deterministic or near-deterministic work is the sweet spot: embeddings (same model and text give the
 same vector), classification and extraction at temperature 0, retrieval results for a fixed index
@@ -75,9 +87,18 @@ a sync call inside `async def` blocks the event loop for every request on that w
 ### Stampede protection
 When a hot key expires, every concurrent request misses at once and all of them call the model: a
 cache stampede that can multiply provider spend and trip rate limits. Defences, cheapest first: add
-random jitter to TTLs so keys do not expire together; let one request recompute while others wait,
-using a short lock taken with `SET lock:key token NX PX 30000` (`NX` makes the take atomic, the expiry
-means a crashed holder cannot block forever); or serve the stale value while one request refreshes.
+random jitter to TTLs so keys do not expire together; collapse concurrent misses inside one worker
+with an in-process "single-flight" map of key → pending future, which removes most duplicates for
+free; then, across workers, let one request recompute while others wait, using a short lock taken
+with `SET lock:key token NX PX 30000`; or serve the stale value while one request refreshes.
+
+The lock needs three details to be correct. `NX` makes the take atomic, *because* check-then-set in
+two commands lets two workers both see "no lock". The expiry means a crashed holder cannot block
+forever. And release must delete the lock only if it still holds *your* random token (a small Lua
+script doing compare-and-delete), *because* a holder slower than the lock's expiry would otherwise
+delete the next holder's lock and re-open the stampede. Losers poll `GET` for the value with a short
+sleep up to a deadline, then fall through and call the model themselves: a lock that makes waiters
+fail when the holder dies trades a cost problem for an availability one.
 
 ### Memory and eviction
 Set `maxmemory` and an eviction policy. For a pure cache, `allkeys-lru` (or `allkeys-lfu`) lets
@@ -130,13 +151,14 @@ async def embed_cached(r: redis.Redis, model: str, text: str, tenant: str) -> li
         pass
     return vec
 
-@app.post("/embed")
+@app.post("/embed")   # in production take tenant from auth, never from the request body
 async def embed(body: dict, r: redis.Redis = Depends(get_redis)):
     return {"vector": await embed_cached(r, "text-embedding-x", body["text"], body["tenant"])}
 ```
 
 Re-indexing 100,000 chunks where 90% are unchanged now pays for roughly 10,000 embedding calls instead
-of 100,000; the exact saving depends on how much content really changes between runs.
+of 100,000, provided the unchanged chunks' entries are still within their seven-day TTL and have not
+been evicted; the exact saving depends on how much content really changes and how often you re-index.
 
 ## Trade-offs
 - A shared cache raises hit rate across all workers and survives deploys, but adds a network hop and a
@@ -161,6 +183,8 @@ of 100,000; the exact saving depends on how much content really changes between 
   `noeviction`, writes start failing with errors the app treats as outages.
 - Caching error responses or truncated generations; the symptom is a transient provider failure being
   replayed to every user for the full TTL.
+- Releasing a stampede lock with a plain `DEL`; under slow model calls the symptom is bursts of
+  duplicate provider calls for the same key despite the lock, because holders delete each other's locks.
 
 ## When to use
 Reach for Redis caching when the same expensive, deterministic-enough call repeats across users or

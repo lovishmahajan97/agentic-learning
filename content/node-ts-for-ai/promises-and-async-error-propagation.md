@@ -5,7 +5,7 @@ name: Promises & async error propagation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/abortcontroller-and-cancellation
@@ -78,6 +78,37 @@ decides what to do. Lint for it (`@typescript-eslint/no-floating-promises`). Ins
 `process.on('unhandledRejection')` handler that only logs turns a crash into silent data loss; it is
 acceptable as a last-resort reporter, not as a strategy.
 
+### The handler-attachment window
+"Unhandled" is judged per promise at the moment it rejects, not at the end of the function. That
+makes a tempting concurrency pattern dangerous:
+
+```
+const a = callModel(p1);   // both start now: good
+const b = callTool(t1);
+const x = await a;         // while suspended here, b rejects -> nobody is listening yet
+const y = await b;         // too late: the process may already have crashed
+```
+
+If `b` rejects while the function is still suspended on `a`, `b` has no handler, the
+`'unhandledRejection'` check fires, and in the default mode the process exits; attaching a handler
+later only triggers the `'rejectionHandled'` event. `await Promise.all([a, b])` (or `allSettled`)
+attaches handlers to both immediately, which is the reason to use a combinator for concurrent work
+rather than staggered awaits.
+
+### Where propagation stops
+`await` carries errors only along promise edges. Four places break the chain:
+
+- **Callbacks scheduled from async code.** A `throw` inside `setTimeout(() => ...)`, an event-emitter
+  listener or a stream `'data'` handler is not inside your `try`; the enclosing async function has
+  already moved on. It becomes an uncaught exception. Wrap the callback-based API in a promise (or use
+  `events.once`, `timers/promises`, `stream/promises`) so the error re-enters the chain.
+- **Emitter `'error'` events.** An `EventEmitter` that emits `'error'` with no listener throws. Streams
+  and SDK clients that expose events need a listener, or use a promise-returning wrapper.
+- **Non-async functions that return promises.** `function call() { validate(x); return fetch(...) }`
+  throws *synchronously* if `validate` fails, so `call().catch(...)` never sees it. Marking the
+  function `async` converts that throw into a rejection, making error handling uniform.
+- **Floating promises**, covered above: no edge means no propagation.
+
 ### Combinators and their error semantics
 - `Promise.all(ps)` — fulfils with an array when all fulfil; rejects with the **first** rejection. The
   remaining promises are not cancelled; they run to completion unobserved. Use it when any failure makes
@@ -125,7 +156,7 @@ async function callProvider(name: string, prompt: string, signal: AbortSignal): 
     }
     return await res.text();                 // `return await` so the try block sees a rejection
   } catch (e: unknown) {
-    if (e instanceof ProviderError) throw e; // already classified
+    if (e instanceof ProviderError || signal.aborted) throw e; // classified, or a cancellation: not retryable
     throw new ProviderError(`${name} transport failure`, 0, true, { cause: e });
   }
 }
@@ -158,7 +189,8 @@ void (async () => { /* audit sink */ })().catch((e) => console.error("audit sink
 - Crashing on unhandled rejections loses in-flight requests but surfaces bugs immediately; swallowing
   them keeps the process up while silently losing work, which is worse in anything that bills tokens.
 - Prefer `await` over `.then` chains for readable stack traces, accepting that sequential awaits can
-  serialize work you meant to run concurrently; start promises first, await them after.
+  serialize work you meant to run concurrently; for concurrency, start the promises and await them
+  through one combinator, not one by one, so every rejection has a handler from the start.
 
 ## Pitfalls
 - Forgetting `await` on a call whose result you do not use (logging, metrics, cache writes); the symptom
@@ -169,6 +201,10 @@ void (async () => { /* audit sink */ })().catch((e) => console.error("audit sink
   "never runs" while the error surfaces in the caller.
 - Awaiting sequentially what could run concurrently (`const a = await x(); const b = await y();`); the
   symptom is latency equal to the sum of calls instead of the max.
+- "Fixing" that by starting both and awaiting them one after another; the symptom is an intermittent
+  crash on unhandled rejection that only happens when the second call fails while the first is slow.
+- Throwing inside a `setTimeout` or event-listener callback and expecting the surrounding `try` to
+  catch it; the symptom is an `uncaughtException` crash whose stack has no request-handler frames.
 - Rethrowing as a fresh `new Error(msg)` without `cause`; the symptom is logs saying "model call failed"
   with no status code, no request id and no stack from the real failure.
 - Treating `Promise.all` rejection as "the batch failed" and retrying everything; the symptom is

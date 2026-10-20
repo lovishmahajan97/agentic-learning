@@ -5,6 +5,7 @@ name: Quality–latency–cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - system-design/model-routing-cascading
   - system-design/model-selection
@@ -57,12 +58,37 @@ Nothing below works without numbers for each axis on the *same* set of requests.
   misses and the downstream cost of failures. Per-request cost is what the provider bills; per-successful
   task is what the business pays.
 
+### Where latency and cost actually come from
+Before pulling levers, decompose each axis, *because* the decomposition tells you which lever can move it:
+
+```
+cost_per_call ≈ n_in_uncached·p_in + n_in_cached·p_cached + n_out·p_out
+TTFT          ≈ network + queueing + prefill(n_in)
+end_to_end    ≈ TTFT + n_out · TPOT          (TPOT = time per output token)
+```
+
+Prefill processes the whole prompt in parallel, so input tokens are cheap in time; decode emits output
+tokens one at a time, so `n_out · TPOT` usually dominates end-to-end latency. Output tokens are also
+typically priced several times higher than input tokens. With an illustrative TPOT of 20 ms, a
+300-token answer spends about 6 s in decode alone, whatever the prompt length; cutting the answer to
+100 tokens saves about 4 s, while halving a 2,000-token prompt saves a fraction of a second of prefill.
+This is why output caps and terse formats are often the strongest latency lever, and why prompt trimming
+mainly buys cost and TTFT. Agents and chains multiply all of it by the number of sequential calls.
+
+### Cost per success, and when quality *is* cost
+If each attempt succeeds with probability *q* and a verifier lets you retry until success, expected
+attempts are `1/q`, so `cost_per_success = (c_call + c_verify) / q`. If failures instead go to a human,
+`cost_per_task = c_call + (1 − q) · c_human`. Illustratively, a $0.001 model at 86% with a $2 human
+escalation costs 0.001 + 0.14 × 2 ≈ $0.28 per task; a $0.018 model at 94% costs 0.018 + 0.06 × 2 ≈ $0.14.
+When failure is expensive, the quality axis collapses into the cost axis and the "expensive" model is the
+cheap one. When failure is cheap (a user rephrases), the axes stay separate and the frontier below matters.
+
 ### Know which axis each lever moves
 | Lever | Quality | Latency | Cost | Note |
 |---|---|---|---|---|
 | Bigger model tier | up | up | up | coarsest lever; quality gain saturates per task |
 | Shorter prompt / less context | risk | down (prefill) | down | every token is paid on every call |
-| Capped or terser output | neutral if instructed | down (decode) | down | decode is sequential, so output length dominates total time |
+| Capped or terser output | neutral if instructed | down (decode) | down | decode is sequential, so output length often dominates total time |
 | Reasoning / thinking budget | up on hard tasks | up a lot | up a lot | wasted on easy tasks; gate by difficulty |
 | Prompt caching (shared prefix) | none | down (TTFT) | down (input) | removes work instead of trading it |
 | Response / semantic cache | none on hits | near zero on hits | near zero on hits | only for repeat queries; staleness risk |
@@ -81,7 +107,15 @@ constraints, only the second group can help; more tuning of the first group cann
 Run every candidate configuration against the same eval set and a replay of real traffic, and record the
 triple (quality, p95 latency, cost per successful task). Configuration A is *dominated* if some B is at
 least as good on all three and strictly better on one; discard the dominated ones. What remains is the
-Pareto frontier. The point of the exercise is that it turns a three-way argument into a short list and makes
+Pareto frontier.
+
+Respect measurement noise when declaring dominance. A pass rate on *n* items has a standard error of about
+`√(q(1−q)/n)`; at q = 0.92 and n = 200 that is roughly 2 points, so 0.92 and 0.93 are a statistical tie.
+Treat configurations within the noise band as equal on quality (compare them on the same items with a
+paired test, or grow the eval) and let latency and cost decide. Latency percentiles need the same care:
+a p95 from a few hundred requests is itself noisy.
+
+The point of the exercise is that it turns a three-way argument into a short list and makes
 the exchange rate visible: "moving from B to C buys two points of quality for $0.003 per task and 450 ms
 of p95". People can argue about whether that trade is worth it; they can no longer argue about facts.
 
@@ -125,9 +159,11 @@ configs = [
     Config("medium, trimmed prompt", 0.90, 1700, 0.0045),
 ]
 
-def dominated(c, others):
-    return any(o is not c and o.quality >= c.quality and o.p95_ms <= c.p95_ms
-               and o.cost_per_task <= c.cost_per_task for o in others)
+def dominated(c, others):  # B dominates A: no worse on all three, strictly better on one
+    return any(o.quality >= c.quality and o.p95_ms <= c.p95_ms
+               and o.cost_per_task <= c.cost_per_task
+               and (o.quality > c.quality or o.p95_ms < c.p95_ms
+                    or o.cost_per_task < c.cost_per_task) for o in others)
 
 frontier = [c for c in configs if not dominated(c, configs)]
 feasible = [c for c in frontier if c.quality >= 0.90 and c.p95_ms <= 2000]
@@ -147,7 +183,9 @@ faster, cheaper), and the medium model is dominated by the fine-tuned small one.
 (quality ≥ 0.90, p95 ≤ 2 s) only the fine-tuned small model and the cascade survive, and the fine-tuned
 model wins on cost. Note what the table does not show: the one-off cost of producing the fine-tuned model,
 which must be amortized over expected volume before the choice is final, and the fact that the cascade's
-p95 is driven by the escalated minority, so its p50 is close to the small model's.
+p95 is driven by the escalated minority, so its p50 is close to the small model's. And the quality gap
+between the fine-tuned model (0.92) and the cascade (0.93) is inside the noise of a few-hundred-item eval,
+which is exactly why cost, not quality, should break the tie here.
 
 ## Trade-offs
 - A cascade cuts average cost but raises tail latency and adds a confidence gate to maintain; with
@@ -174,6 +212,8 @@ p95 is driven by the escalated minority, so its p50 is close to the small model'
   retries, judge calls and human review make the total higher.
 - Evaluating on a handful of hand-picked prompts; the symptom is a configuration that shines in the demo
   and degrades on the real traffic distribution.
+- Reading a one- or two-point eval difference as a real win; the symptom is the "winning" configuration
+  swapping places with the runner-up every time the eval is re-run or re-sampled.
 - Leaving output length unconstrained; the symptom is cost and decode latency creeping up after a prompt
   or model change made the model chattier.
 - Treating the frontier as static; the symptom is a once-optimal setup that became dominated after a

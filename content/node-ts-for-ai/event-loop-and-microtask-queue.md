@@ -5,7 +5,7 @@ name: Event loop & microtask queue
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
   - node-ts-for-ai/worker-threads-for-cpu-bound-tasks
@@ -28,8 +28,9 @@ cheaply, and also why one 200 ms synchronous computation stalls every one of the
 ## Why it exists
 A service that calls LLM APIs spends almost all of its wall-clock time waiting: a request to a model
 might take 2–30 seconds, during which the CPU does nothing useful for that request. The thread-per-
-request model (one OS thread blocked per outstanding call) burns a stack and a kernel thread for every
-idle wait, and context-switching among thousands of them is where throughput goes to die. Node took the
+request model (one OS thread blocked per outstanding call) spends a stack and a kernel thread on every
+idle wait; that works at hundreds of concurrent calls, but memory and scheduling overhead grow with the
+number of *waiting* requests rather than with the work actually being done. Node took the
 opposite bet: one JavaScript thread, non-blocking I/O everywhere, and a loop that runs the callback for
 whichever operation just completed. A pending HTTP response costs a few kilobytes of heap, not a thread.
 
@@ -60,13 +61,16 @@ each:
    *minimum* delay, not a schedule; it runs when the loop gets here.
 2. **pending callbacks** — deferred I/O callbacks from the previous iteration (some system errors).
    libuv then runs internal idle/prepare hooks; nothing in user code schedules there.
-3. **poll** — the heart of the loop: block waiting for I/O (with a timeout derived from the nearest
-   timer), then run the callbacks for completed I/O: socket data, HTTP responses, file reads.
+3. **poll** — the heart of the loop: run the callbacks for completed I/O (socket data, HTTP responses,
+   file reads), then, if there is nothing else to do, block in the OS waiting for more. The block has a
+   timeout derived from the nearest timer, and it does not block at all if `setImmediate` callbacks are
+   queued. This is where an idle Node process spends its time: asleep in `epoll_wait`, using no CPU.
 4. **check** — `setImmediate` callbacks. It exists so that code can say "run right after the I/O I just
    handled" without competing with timers.
 5. **close callbacks** — `'close'` events for destroyed sockets and handles.
 
-Between every single callback, Node drains the two microtask queues (next section). The loop exits when
+Between every single callback, Node drains the two microtask queues (next section); since Node 11 this
+happens after each individual timer or immediate, not once per phase as in older versions. The loop exits when
 there are no pending timers, handles or requests, which is why a script "just ends" when its work is done.
 
 ### Microtasks: `process.nextTick` and promise jobs
@@ -100,9 +104,21 @@ across 100k embeddings in plain JS, synchronous `zlib`/`crypto` calls, or a tigh
 prompt from a large document. While that runs, every open SSE stream in the process freezes, because
 the `write()` calls that would flush their next tokens are callbacks waiting for the loop. Event-loop
 lag is therefore the first metric to watch: `perf_hooks.monitorEventLoopDelay()` samples how late the
-loop is, and p99 lag above tens of milliseconds means some handler is doing CPU work inline. The
-remedies, in order: make it async in chunks (`await setImmediate`-style yielding), move it to a worker
-thread, or move it out of the process.
+loop is, and p99 lag above tens of milliseconds means some handler is doing CPU work inline. Its
+companion, `performance.eventLoopUtilization()`, reports the fraction of time the loop was busy rather
+than idle in the poll phase. Read them together: utilization near 1 with lag that rises smoothly means
+the process is saturated by many short callbacks (scale out), while lag spikes at moderate utilization
+mean a few long callbacks (find and offload them). The remedies, in order: make it async in chunks
+(`await setImmediate`-style yielding), move it to a worker thread, or move it out of the process.
+
+### Why chunk size is a latency budget
+Yielding does not make work faster; it bounds how long anyone else waits. If one slice of work takes
+*s* ms of synchronous time, every other callback can be delayed by up to *s* ms per slice, and the
+yielding request itself takes longer in total because other callbacks run between its slices. So pick
+the slice from the latency you can tolerate: if other streams must never stall more than ~10 ms, a
+slice must be measured to run under 10 ms on the production CPU. Note the yield must be a *macrotask*
+(`setImmediate`): `await Promise.resolve()` or `await` on any already-resolved value only re-enters the
+microtask queue, which is drained before the poll phase, so it yields to nothing that matters.
 
 ## Example
 The ordering rules and a lag monitor in one script. Run it as CommonJS (for example compile with `tsc`
@@ -132,6 +148,8 @@ setInterval(() => {
 
 // A CPU-heavy scoring loop made cooperative: yield to I/O every 500 vectors so
 // streaming responses to other clients keep flowing while this request computes.
+// At 1536 dims, 500 vectors is ~768k multiply-adds per slice: measure it, it is
+// the worst-case stall every other client sees. 100k vectors = 200 slices.
 async function topK(query: Float32Array, vectors: Float32Array[], k: number) {
   const scores: Array<[number, number]> = [];
   for (let i = 0; i < vectors.length; i++) {
@@ -171,6 +189,8 @@ void topK;
   small stall multiplies across every in-flight request.
 - Not watching event-loop lag at all; the symptom is latency incidents with no CPU, memory or upstream
   signal to explain them, because the delay is inside the process.
+- "Yielding" with `await Promise.resolve()` or `await null` inside a hot loop; the symptom is that loop
+  lag is unchanged, because microtasks are drained before the loop ever reaches poll.
 
 ## When to use
 You do not opt into the event loop; you design around it. Reach for plain async I/O for everything that

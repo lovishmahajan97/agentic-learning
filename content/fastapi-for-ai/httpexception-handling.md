@@ -5,6 +5,7 @@ name: HTTPException handling
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/pydantic-request-response-models
@@ -114,8 +115,8 @@ class UpstreamBusy(AppError):    status, code, retry_after = 503, "model_busy", 
 class UpstreamTimeout(AppError): status, code = 504, "model_timeout"
 class ContextTooLong(AppError):  status, code = 422, "context_too_long"
 
-def problem(req: Request, status: int, code: str, detail, headers=None):
-    rid = req.headers.get("x-request-id", str(uuid.uuid4()))
+def problem(req: Request, status: int, code: str, detail, headers=None, rid=None):
+    rid = rid or req.headers.get("x-request-id") or str(uuid.uuid4())  # usually set by middleware
     body = {"type": f"https://docs.acme.ai/errors/{code}", "title": code, "status": status,
             "detail": detail, "request_id": rid}
     return JSONResponse(body, status, headers=headers, media_type="application/problem+json")
@@ -135,12 +136,16 @@ async def invalid(req: Request, e: RequestValidationError):
 
 @app.exception_handler(Exception)                   # runs in ServerErrorMiddleware
 async def unhandled(req: Request, e: Exception):
-    log.exception("unhandled error")                 # full detail goes to logs only
-    return problem(req, 500, "internal", "unexpected error; quote request_id to support")
+    rid = req.headers.get("x-request-id") or str(uuid.uuid4())
+    log.exception("unhandled error request_id=%s", rid)   # full detail goes to logs only
+    return problem(req, 500, "internal", "unexpected error; quote request_id to support", rid=rid)
 ```
 
 A provider 429 inside `generate()` is caught in the client wrapper and re-raised as
-`UpstreamBusy("model capacity exhausted")`. The caller receives a 503 Problem Details body with
+`UpstreamBusy("model capacity exhausted")`. Note that the 500 handler logs the same `request_id` it
+returns; an ID minted fresh in the response but absent from the log line would send support looking
+for a trace that doesn't exist. In a real service a middleware assigns the ID once per request and
+every log line carries it. The caller receives a 503 Problem Details body with
 `Retry-After: 10` and a `request_id`. The SDK backs off for ten seconds instead of hammering, and
 support can find the trace from the ID. Nothing from the provider's raw error reaches the client.
 

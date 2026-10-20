@@ -5,7 +5,7 @@ name: A/B testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - evals/offline-vs-online-evaluation
   - evals/pairwise-comparison
@@ -17,6 +17,7 @@ related:
   - enterprise-integration/tenant-specific-configuration-and-feature-flags
 sources:
   - Kohavi, Tang and Xu, 2020 — Trustworthy Online Controlled Experiments
+  - Deng, Xu, Kohavi and Walker, 2013 — Improving the Sensitivity of Online Controlled Experiments by Utilizing Pre-Experiment Data
 ---
 
 ## TL;DR
@@ -62,7 +63,13 @@ Assign at the user level for anything conversational: `bucket = hash(user_id + e
 notices the inconsistency. Session-level assignment is for anonymous traffic; request-level only for
 stateless one-shot tasks. The unit of *analysis* must match the unit of *randomisation*: randomising by
 user and then counting requests as independent samples underestimates variance, because one user's
-requests are correlated, and produces false positives. The salt is per experiment so that assignments are
+requests are correlated, and produces false positives. If the metric is per request (latency, thumbs per answer) while assignment is
+per user, aggregate to one value per user, or compute the ratio's variance with the delta method or
+cluster-robust standard errors, which account for the correlation. When users interact (teammates
+sharing one assistant workspace, agents acting on a shared ticket queue), a treated user's experience
+leaks into control users' outcomes; randomise by the enclosing cluster (team, tenant) instead, and
+accept that the effective sample size is closer to the number of clusters than the number of users.
+The salt is per experiment so that assignments are
 independent across experiments, instead of the same users always landing in treatment together.
 
 ### Sample size before, not after
@@ -73,6 +80,17 @@ to 63%: 16 × 0.24 / 0.0009 ≈ 4,270 users per arm (the exact two-proportion fo
 about 4,130). To detect a 1-point lift instead, it is nine times that. This is why low-traffic
 enterprise deployments often cannot A/B on outcomes at all and fall back to pairwise judging on shadow
 traffic or to longer-running tests with larger expected effects.
+
+### Variance reduction
+The other lever on sample size is the variance term. CUPED (Deng et al., described in Kohavi et al.)
+adjusts each user's outcome using the same metric measured before the experiment, *because* most of
+the variation between users (heavy versus light users, easy versus hard ticket mixes) existed before
+the change and is unrelated to it. If the pre-period covariate has correlation ρ with the outcome,
+variance falls by a factor of (1 − ρ²), so ρ = 0.5 cuts the required sample by a quarter and ρ = 0.7
+by about half. Any covariate fixed before assignment works, but the same metric's pre-period value is
+usually the strongest; for new users with no history, weaker covariates such as customer tier or
+signup channel recover less. A covariate measured after assignment must never be used, because the
+treatment may have moved it.
 
 ### Running it
 Start with a small ramp (1%, then 10%) guarded by the canary metrics, then move to the planned split,
@@ -163,6 +181,8 @@ print(sample_ratio_mismatch(4100, 4350))               # planned 50/50; investig
   through when the provider updates one of the models.
 - Declaring the primary metric after seeing the data; the symptom is every experiment "winning" on a
   different metric.
+- Randomising by user when users in a team share work; the symptom is a treatment effect that shrinks
+  or vanishes at full rollout, because control users were already benefiting from treated colleagues.
 - Stopping after three days; the symptom is a weekday-only population and a novelty effect reported as
   a durable lift.
 

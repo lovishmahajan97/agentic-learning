@@ -5,6 +5,7 @@ name: ROI model
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - scoping/success-metrics-kpis
   - scoping/baseline-measurement-before-deployment
@@ -89,10 +90,11 @@ cost per ticket from a token measurement on real traffic.
 BASE = dict(tickets=40_000, min_saved=4.0, cost_per_min=0.80, capture=0.6,
             adoption_ramp=[0.2, 0.35, 0.5, 0.6, 0.7], adoption_steady=0.7,
             ai_cost_per_ticket=0.04, review_min=0.0, platform=6_000, upkeep=10_000,
-            build=180_000)
+            build=180_000)                  # review_min=0: min_saved is measured net of review
 
 def monthly(p, month):
-    a = p["adoption_ramp"][month] if month < len(p["adoption_ramp"]) else p["adoption_steady"]
+    ramp = p["adoption_ramp"][month] if month < len(p["adoption_ramp"]) else 1.0
+    a = min(ramp, p["adoption_steady"])          # the plateau caps the ramp
     benefit = p["tickets"] * a * (p["min_saved"] - p["review_min"]) * p["cost_per_min"] * p["capture"]
     run = p["tickets"] * p["ai_cost_per_ticket"] + p["platform"] + p["upkeep"]  # drafts for every ticket
     return benefit, run
@@ -112,7 +114,7 @@ def evaluate(p, months=24, rate=0.10):
 print("base", evaluate(BASE))                      # ROI ~ +100%, payback month 8, NPV ~ 517k
 for k, v in [("capture", 0.3), ("adoption_steady", 0.4), ("min_saved", 2.5), ("upkeep", 20_000)]:
     print(k, v, evaluate({**BASE, k: v}))
-# capture 0.3 -> ROI ~ 0, no payback in 24 months; adoption 0.4 -> +27%, month 12
+# capture 0.3 -> ROI ~ 0, no payback in 24 months; adoption 0.4 -> +19%, month 16
 # min_saved 2.5 -> +25%, month 15;               upkeep 20k -> +43%, month 11
 
 lo, hi = 0.0, 10.0                                 # break-even on minutes saved
@@ -123,7 +125,7 @@ print(f"break-even minutes saved: {hi:.2f}")       # ~2.0
 ```
 
 The base case looks strong. The sensitivity run shows that halving the capture rate wipes out the
-return entirely, while doubling engineering upkeep only dents it. So the most valuable scoping
+return entirely, while doubling engineering upkeep roughly halves it but leaves it clearly positive. So the most valuable scoping
 conversation is with finance about what happens to freed time, not with engineering about tokens.
 The pilot must also measure minutes saved precisely, because the case survives anything above about
 2 minutes.

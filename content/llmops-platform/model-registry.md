@@ -5,7 +5,7 @@ name: Model registry
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/experiment-tracking
   - llmops-platform/prompt-registry
@@ -90,6 +90,13 @@ replicas against the new alias target, which is what a canary needs. For embeddi
 mechanism prevents the classic bug of querying an index built with embedder v2 using embedder v3: the
 index build records the embedder version and the query path refuses a mismatch.
 
+Rollback is a pointer move in the registry, but in serving it is a new rollout, so its real duration is
+the time to start replicas on the previous version: download, verify and load. For an API model that is
+seconds; for tens of gigabytes of self-hosted weights it can be many minutes, which is why teams keep the
+previous champion's artifact cached on serving nodes (or keep a few previous-version replicas warm)
+until the new champion has survived its canary window. Measure rollback time end to end; the alias move
+is the fast part.
+
 ### Hugging Face Hub as a registry
 For open weights the Hub is a git-backed registry: each repository has a commit history, a model card in
 the README, and `from_pretrained(..., revision="<commit sha>")` pins an exact version. Pinning to a
@@ -134,7 +141,8 @@ client.set_registered_model_alias(NAME, "champion", mv.version)
 # 4. The serving process resolves the alias once at startup and records what it got
 resolved = client.get_model_version_by_alias(NAME, "champion")
 print("serving", NAME, "version", resolved.version, "from", resolved.source)   # log into every trace
-model = mlflow.pyfunc.load_model(f"models:/{NAME}@champion")
+model = mlflow.pyfunc.load_model(f"models:/{NAME}/{resolved.version}")   # load the version just resolved, not the
+                                                                          # alias again: it may move in between
 ```
 
 ## Trade-offs
@@ -159,6 +167,8 @@ model = mlflow.pyfunc.load_model(f"models:/{NAME}@champion")
   quality collapsing after a "routine" model upgrade while every service reports healthy.
 - Attaching eval results to the alias rather than the version; the symptom is a rolled-back champion
   that inherits the evidence of the version that replaced it.
+- Resolving the alias and then loading by alias again in a second call; the symptom is a replica whose
+  logged version differs from the weights it actually loaded, because a promotion landed between the calls.
 - Mirroring nothing from the Hub and pinning only to a repository name; the symptom is a broken deploy
   the day the upstream author force-pushes, gates the repository or changes the license.
 

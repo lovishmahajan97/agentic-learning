@@ -5,7 +5,7 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/recall-vs-precision-trade-off
   - rag-retrieval/reranking

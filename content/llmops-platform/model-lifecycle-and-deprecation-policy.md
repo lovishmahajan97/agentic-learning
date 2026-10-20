@@ -5,7 +5,7 @@ name: Model lifecycle & deprecation policy
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/model-registry
   - llmops-platform/ci-cd-for-prompts-and-models
@@ -99,7 +99,11 @@ it is a silent model change in production.
 5. **Migrate with evaluation.** Each consumer evaluates the successor against its own golden set,
    fixes prompts where behaviour changed, and promotes through the normal canary path. The
    scheduled model-upgrade job from the CI/CD lesson is the mechanism; the policy is what makes it
-   mandatory rather than optional.
+   mandatory rather than optional. "Same quality on the golden set" is not the whole check, because a
+   successor usually changes more than answers: its tokenizer (so token counts, cost and effective
+   context length move), latency profile, rate limits and quota, refusal behaviour, structured-output
+   and tool-calling support, and default parameters. The migration checklist covers each, *because*
+   the regressions that slip through are typically a cost or a 429 surprise, not a quality drop.
 6. **Brownout.** In the last weeks, the deprecated version is made unavailable for short, announced
    windows. Consumers who ignored every notice discover the dependency during a planned ten-minute
    window instead of at sunset. Brownouts exist *because* an error in a test window costs less than
@@ -107,7 +111,11 @@ it is a silent model change in production.
 7. **Retire and archive.** Serving stops; requests return a specific error naming the successor.
    Weights, config and evaluation evidence stay archived for the retention period the policy sets,
    *because* audits, incident investigations and reproducibility all need to re-run the model that
-   was in production on a given date. Deletion is its own dated, recorded event.
+   was in production on a given date. Deletion is its own dated, recorded event. For a *provider*
+   model there are no weights to keep: once the vendor retires the snapshot, its behaviour can never
+   be re-run. What you can archive is the bundle (prompts, parameters, tool schemas), the evaluation
+   evidence and logged inputs and outputs on a representative sample, which is why the policy should
+   capture that record *before* the sunset, while the model still answers.
 
 ### Compatibility promises
 The policy states what a consumer may assume across versions: which fields of the response are
@@ -194,6 +202,8 @@ check on pinned model ids.
   incident post-mortem that needs to reproduce last quarter's behaviour and cannot.
 - Treating an embedding model like a chat model in the lifecycle; the symptom is a successor promoted
   without re-indexing, and retrieval quality collapsing on the promotion day.
+- Validating the successor on quality alone; the symptom is a migration that passes every eval and
+  then blows the monthly cost forecast or hits 429s, because tokenization, pricing or quota differ.
 
 ## When to use
 A written lifecycle and deprecation policy is worth having as soon as more than one team depends on a
@@ -245,7 +255,7 @@ cannot migrate in time, the fallback is a short, dated exception, not an unrevie
 > Freezing new pins, enforced in CI, bounds the migration; stopping traffic is what brownouts do later,
 > briefly and by announcement, to find consumers the inventory missed.
 
-### Q: Why keep a retired model's weights and evaluation evidence after it stops serving?
+### Q: Why keep a retired self-hosted model's weights and evaluation evidence after it stops serving?
 - [ ] So it can be promoted back if the successor fails
 - [ ] Because providers require it for billing reconciliation
 - [x] Audits and incident investigations may need to reproduce the behaviour that was in production on a given date

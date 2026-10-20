@@ -5,6 +5,7 @@ name: pyarrow
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/pandas
   - python-for-ai/polars
@@ -112,8 +113,10 @@ print(t.num_rows, vecs.shape, vecs.dtype)                           # 3333 (3333
 ```
 
 The read skips the `chunk` column entirely. It cannot skip row groups here, because every row group
-contains all three tenants; had the data been sorted or partitioned by tenant, the min/max statistics
-would let the reader skip two-thirds of the row groups.
+contains all three tenants. Had the table been sorted by tenant before writing, `t1` would occupy rows
+3,334 to 6,666 (0-based), which fall in the 2nd, 3rd and 4th row groups, so min/max statistics would let the reader skip
+the other 2 of 5. Partitioning by tenant (`tenant=t1/` directories) would go further and skip the
+two-thirds of the data belonging to other tenants without even opening those files.
 
 ## Trade-offs
 - Parquet's compression and column pruning make selective reads cheap, but files are immutable and

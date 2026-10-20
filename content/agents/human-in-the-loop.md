@@ -5,7 +5,7 @@ name: Human-in-the-loop
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agents/approval-gates-for-consequential-actions
   - agents/state-machines
@@ -17,6 +17,7 @@ related:
   - evals/offline-vs-online-evaluation
 sources:
   - Parasuraman and Riley, 1997 — Humans and Automation: Use, Misuse, Disuse, Abuse
+  - Bainbridge, 1983 — Ironies of Automation
   - Anthropic, 2024 — Building effective agents
 ---
 
@@ -61,7 +62,24 @@ also closes a loop the agent cannot close alone: each human decision is a labell
 - **After the loop (auditing).** A sample of completed runs is reviewed and labelled. Cheapest, catches
   drift and systematic error, catches no individual mistake in time.
 Mature systems use all three, assigned by action class: block on refunds over a threshold, supervise
-bulk edits, audit summaries.
+bulk edits, audit summaries. On-the-loop supervision has its own trap, described long ago for
+industrial automation: the more reliable the system, the less the supervisor practises the task and the
+less context they hold, so when they must intervene they do it late and with poor situational awareness.
+Supervision works when the stream highlights the few actions worth a look, not when it asks a person to
+watch everything.
+
+### The economics of a review
+Whether a class deserves blocking review is a comparison you can write down. Per item, review is worth
+it when
+
+    p_error × catch_rate × harm  >  review_cost + delay_cost
+
+where `p_error` is the agent's error rate on that class (measured, from logged decisions), `catch_rate`
+is the fraction of errors reviewers actually catch (measured with canaries), `harm` is the cost of an
+uncaught error, and the right side is the reviewer's time plus what the wait costs the customer. The
+formula explains the patterns that follow: irreversible or large `harm` justifies review even at a tiny
+error rate; a rubber-stamping reviewer has a `catch_rate` near zero, so their review is pure cost; and
+as the agent improves, `p_error` falls until a class crosses the line and should move to auditing.
 
 ### Triggers: when the harness involves a person
 1. **Stakes and reversibility.** Irreversible, external or costly actions are gated regardless of
@@ -109,7 +127,10 @@ random audit (70 a day). Refunds above $50 (600 a day) stay blocking. Reviewer l
 (600 + 70) × 45 s ≈ 8.4 hours a day, a two-thirds reduction. Residual risk on the automated class is
 1,400 × 0.8% ≈ 11 wrong decisions a day (treating every week-one disagreement as an agent error), each
 bounded at $50, so at most about $560 a day of exposure,
-which the business compares against the 16 reviewer-hours saved. The audit sample is the safety net: if
+which the business compares against the 16 reviewer-hours saved. Per item the formula above gives the
+same answer: 0.008 × an assumed 0.9 catch rate × at most $50 is at most $0.36 of harm prevented, against 45 seconds
+of reviewer time, which at an illustrative $40 an hour is $0.50; the review costs more than it saves.
+Above $50 the harm term grows with the amount and the error rate is 6%, so review stays. The audit sample is the safety net: if
 agreement on the audited cases falls below a set threshold, the harness automatically returns the class
 to blocking review. At 99.2% agreement, 70 audits a day yield well under one disagreement a day on
 average, so the threshold has to be judged over a rolling window of several hundred audits (or the
@@ -139,6 +160,8 @@ drops, what reviewers see is redesigned before autonomy is widened further.
 - Not recording the reviewer's reason; the symptom is a year of decisions that cannot be turned into a
   single eval case.
 - Rubber stamping; the symptom is 99.9% approval, three-second decisions, and canaries sailing through.
+- Asking a person to supervise a long, uneventful stream of actions; the symptom is an intervention
+  that arrives minutes after the bad action, from someone who has to scroll back to understand it.
 - Routing approvals to whoever is online rather than whoever owns the system; the symptom is approvals
   from people who could not have known the action was wrong.
 
@@ -147,7 +170,8 @@ Put a person in the loop wherever an action is consequential, regulated, novel o
 nowhere else: every unnecessary review is attention taken from a necessary one. Start new deployments
 with full review, not because the model is bad but because the logged decisions are how you learn where
 it is good; widen autonomy per action class as agreement data accumulates. Measure agreement rate,
-decision time, approval rate, canary catch rate and queue depth. Day to day this is the difference
+decision time, approval rate, canary catch rate and queue depth, and use the first and fourth to fill in
+the review-economics inequality per action class. Day to day this is the difference
 between an agent the business trusts and one it turns off after the first incident; in interviews,
 expect to be asked how you would avoid rubber stamping and how you would decide what to automate first.
 

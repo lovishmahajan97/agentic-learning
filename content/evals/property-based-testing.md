@@ -5,7 +5,7 @@ name: Property-based testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/property-based-testing
   - evals/metamorphic-testing
@@ -82,11 +82,22 @@ The property must not re-implement the function, or a bug in the logic appears i
   generated metadata and queries.
 - Cost and budget accounting: non-negative, additive across turns.
 
+### Stateful properties for components with memory
+Some of the riskiest AI plumbing is not a pure function: a conversation-history trimmer, a response
+cache, a tool-call budget tracker, an agent's scratchpad. Their bugs appear only after a particular
+*sequence* of operations, so a single generated input never reaches them. Hypothesis's stateful testing
+(`RuleBasedStateMachine` with `@rule` and `@invariant` methods) generates random sequences of
+operations (add a user turn, add a 3,000-token tool result, trim, summarise) and checks invariants after
+every step: the system prompt is still first, the total stays under the token budget, the latest user
+turn is never dropped, a cache hit returns what was stored under that exact key. Shrinking works on the
+sequence too, so a failure found after 40 random operations is reported as the shortest sequence that
+still breaks, often three or four steps, which reads like a bug report.
+
 ### Properties on model outputs
 The same shape applies to the model itself: generate inputs, call the model, assert a property (schema
 valid, no echo of a planted secret, reply language matches the input, length within bounds). It works,
 with three adjustments *because* each example costs a network call and the model is nondeterministic:
-cap `max_examples` low and disable the per-example deadline; cache responses keyed by model, parameters
+cap `max_examples` low and disable the per-example deadline (200 ms by default, far below a model call); cache responses keyed by model, parameters
 and prompt so re-runs are free; and treat failures as a measured rate reported by the eval harness
 rather than a hard assertion that blocks every PR. Record-and-replay turns these into fast tests of the
 parser around the model rather than of the model.

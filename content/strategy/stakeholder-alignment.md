@@ -5,6 +5,7 @@ name: Stakeholder alignment
 kind: practice
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - adoption/stakeholder-management
   - adoption/exec-communication
@@ -55,20 +56,30 @@ in a negotiation over an outcome.
 ### 3. Measure the baseline
 Measure the current process on the same metrics: human error rate, cycle time, cost per item. This
 replaces "AI must never be wrong" with "AI plus review must beat today's process by an agreed margin",
-which is a standard a system can actually meet.
+which is a standard a system can actually meet. Measure it on the *same items* the AI will handle,
+*because* a system that automates only its confident cases is taking the easier slice of the work: humans
+are usually more accurate on that slice than their overall rate suggests, so comparing the AI's error on
+its slice with the humans' error on everything flatters the AI. Historical decisions on the labelled eval
+set usually give you this for free.
 
 ### 4. Agree the operating point with evidence
 Run an offline eval on representative data and show the trade-off curve: as the confidence threshold for
 automation rises, fewer items are automated and fewer are wrong. Stakeholders then choose a point on a
 real curve instead of arguing in the abstract. This is the AI-specific heart of alignment.
 
-### 5. Write it down in one page
+### 5. Pre-wire before the decision meeting
+Walk each veto holder through the evidence one-to-one before the group meeting, *because* an objection
+raised privately can be met with a design change, while one raised for the first time in front of peers
+tends to harden into a position. The group meeting should then ratify a choice everyone has already seen,
+with any remaining disagreement named and escalated to the agreed decision owner rather than re-argued.
+
+### 6. Write it down in one page
 Goal, primary metric with baseline and target, hard constraints, the operating point and why, failure
 handling (fallback to humans, escalation path, rollback trigger), decision rights (who approves launch,
 who can pause it; a RACI or DACI model works), and review cadence. A written artefact matters *because*
 memories of verbal agreements diverge within weeks.
 
-### 6. Re-align at each gate
+### 7. Re-align at each gate
 Present results against the one-pager at each roadmap gate. If results move the trade-off (accuracy is
 lower than hoped, costs are higher), re-open the decision explicitly rather than drifting.
 
@@ -78,7 +89,7 @@ illustrative.
 
 - **Operations VP:** wants at least 50% of claims routed automatically.
 - **Compliance:** red line, wrong-queue errors on auto-routed claims must be no worse than today's manual
-  error rate, measured at 4%.
+  error rate, which is 4% across all claims.
 - **Finance:** cost per claim below today's $3.10.
 
 The team runs the classifier on 1,000 labelled historical claims and tabulates by confidence threshold:
@@ -90,10 +101,16 @@ The team runs the classifier on 1,000 labelled historical claims and tabulates b
 | 0.95 | 38% | 1.1% | $2.30 |
 
 At 0.70, ops gets its volume but the compliance red line is breached. At 0.95, compliance is comfortable
-but ops is well short of 50%. At 0.85 all three are satisfied: 61% automated, 3.2% error (below the 4%
-baseline), and cost well under $3.10. The one-pager records 0.85 as the operating point, a rollback
-trigger if the production error rate on a weekly audited sample exceeds 4%, compliance as the owner of
-that trigger, and a review after a month of production data. The argument that would have happened at
+but ops is well short of 50%. At 0.85 all three look satisfied: 61% automated, 3.2% error, cost well under
+$3.10. Two checks make the margin thinner than it looks. First, the fair baseline: the labelled claims
+carry their original human routing, and on the same 610 claims the model would automate, humans erred
+3.5% of the time, not 4% (on the 390 harder claims they erred about 4.8%; 0.61 × 3.5% + 0.39 × 4.8% ≈ 4.0%).
+So the model is roughly at parity on its slice, and the whole process improves only from about 4.0% to
+0.61 × 3.2% + 0.39 × 4.8% ≈ 3.8%. Second, noise: 3.2% of 610 is roughly 20 errors, and its 95% interval
+runs to about 4.6%. Compliance agrees parity is acceptable, since the red line was "no worse". The
+one-pager therefore records 0.85 as a provisional operating point, a rollback trigger if the production error rate
+over a rolling audited sample (large enough, a few hundred claims or more, that noise alone does not trip
+it) exceeds 4%, compliance as the owner of that trigger, and a review after a month of production data. The argument that would have happened at
 launch happened in a one-hour meeting with a table on the screen.
 
 ## Trade-offs
@@ -115,6 +132,9 @@ launch happened in a one-hour meeting with a table on the screen.
   project stalls on anecdotes.
 - Treating frontline users as recipients rather than stakeholders; adoption stays low while every
   dashboard looks green, a silent veto.
+- Comparing the AI's error on the cases it chose to automate with the humans' error on all cases; the
+  launch clears the bar, and a later audit shows the automated slice is worse than humans were on those
+  same, easier claims.
 - Decision rights left implicit; when production metrics wobble, two executives give contradictory
   instructions and the team freezes.
 

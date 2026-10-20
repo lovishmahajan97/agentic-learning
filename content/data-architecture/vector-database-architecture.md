@@ -5,6 +5,7 @@ name: Vector database architecture
 kind: concept
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - rag-retrieval/vector-databases
   - rag-retrieval/ann-indexes
@@ -31,8 +32,8 @@ vendor comparison in the RAG module becomes a checklist.
 
 ## Why it exists
 Exact nearest-neighbour search is a dot product per stored vector. For a million 1,536-dimensional
-float32 vectors that is about 6 GB of reads per query, which on one machine is hundreds of milliseconds
-and scales linearly with the corpus. Approximate indexes such as HNSW cut that to a few thousand distance
+float32 vectors that is about 6 GB of reads per query, which at the tens of GB/s of memory bandwidth a
+server offers is on the order of 100 ms or more per query, and it scales linearly with the corpus. Approximate indexes such as HNSW cut that to a few thousand distance
 computations by navigating a graph, which is why ANN indexes exist and the rag-retrieval module explains
 them. But an index alone is a library call, not a database. Production retrieval also needs to add and
 delete vectors while serving queries, attach and filter on metadata (tenant, date, ACL), survive a process
@@ -91,7 +92,7 @@ subtle part.
 - **Filter-aware traversal:** check the filter at each hop and keep exploring through disallowed nodes
   without returning them, with extra graph links built per indexed payload field so the subgraph stays
   connected (Qdrant's approach), or a flat-search cutoff below which the engine abandons the graph
-  (Weaviate's approach). pgvector historically returned fewer than k rows under a selective `WHERE`
+  (Weaviate's `flatSearchCutoff`; newer Weaviate releases also offer an ACORN-style filtered traversal). pgvector historically returned fewer than k rows under a selective `WHERE`
   because the index scan ran first; newer releases added iterative index scans that keep walking until
   enough rows pass.
 
@@ -130,7 +131,7 @@ from qdrant_client.models import (Distance, VectorParams, HnswConfigDiff, PointS
 client = QdrantClient(":memory:")                 # swap for QdrantClient(url="http://localhost:6333")
 client.create_collection(
     collection_name="chunks",
-    vectors_config=VectorParams(size=4, distance=Distance.COSINE),   # real width: 768-3072
+    vectors_config=VectorParams(size=4, distance=Distance.COSINE),   # real width: 384-3072
     hnsw_config=HnswConfigDiff(m=16, ef_construct=128),              # graph degree, build beam
 )
 client.create_payload_index("chunks", field_name="tenant", field_schema="keyword")
@@ -138,7 +139,7 @@ client.create_payload_index("chunks", field_name="tenant", field_schema="keyword
 client.upsert("chunks", points=[
     PointStruct(id=1, vector=[0.10, 0.90, 0.00, 0.20], payload={"tenant": "acme",   "doc_id": "d-1"}),
     PointStruct(id=2, vector=[0.80, 0.10, 0.10, 0.00], payload={"tenant": "acme",   "doc_id": "d-2"}),
-    PointStruct(id=3, vector=[0.10, 0.90, 0.10, 0.10], payload={"tenant": "globex", "doc_id": "d-3"}),
+    PointStruct(id=3, vector=[0.10, 0.90, 0.00, 0.10], payload={"tenant": "globex", "doc_id": "d-3"}),
 ])
 
 hits = client.query_points(
@@ -153,9 +154,13 @@ print([(h.id, round(h.score, 3), h.payload["doc_id"]) for h in hits])   # point 
 client.delete("chunks", points_selector=PointIdsList(points=[2]))        # tombstone; freed at compaction
 ```
 
-Point 3 is the nearest vector overall but belongs to another tenant; with the payload index the engine
-restricts the search to `acme` points rather than retrieving top-k and discarding. The delete returns
-immediately because it only marks the point; the memory comes back when the segment is optimized.
+Point 3 is identical to the query, so it is the nearest vector overall, but it belongs to another tenant;
+on a Qdrant server the payload index lets the planner restrict the search to `acme` points rather than
+retrieving top-k and discarding. The delete returns quickly because it only marks the point; the memory
+comes back when the segment is optimized. Two caveats about running this snippet: the `:memory:` local
+mode is a brute-force reimplementation that ignores HNSW and payload-index settings, and even a real
+server brute-forces a segment this small (below its indexing threshold), so the code shows the API shape,
+not the index behaviour, which only appears at realistic collection sizes.
 
 ## Trade-offs
 - HNSW gives high recall at low latency but costs RAM for links plus vectors and a slow build; IVF or
@@ -212,8 +217,10 @@ and a security audit asks how cross-tenant leakage is prevented. Explain the mec
 symptom and propose an architecture.
 **A:** Small tenants get few results because the engine is post-filtering: it retrieves top-k′ by
 similarity over all tenants and then applies the filter, and a tenant owning 0.1 % of points rarely
-survives. Large tenants are slow because for them the filter is unselective and the engine may be
-pre-filtering through a huge bitmap or brute-forcing. Leakage prevention currently rests on application
+survives. Large tenants are slow for different reasons: any workaround for the small ones (a larger k′ or
+`ef` applied to every query) makes each query walk much more of the shared graph, the big tenants'
+points are spread over every shard so each query pays scatter-gather, and if the engine does build
+per-filter candidate sets, materializing a bitmap covering a large fraction of the collection is costly. Leakage prevention currently rests on application
 code remembering the filter. The fix is a tenant-aware index: a payload index on `tenant_id` so the engine
 can build per-tenant graph structure or route queries to a per-tenant subgraph, so small tenants are
 searched as small graphs and large tenants as their own full graphs. For the handful of very large
@@ -243,8 +250,9 @@ caller's request, and test filtered recall at both the smallest and largest tena
 ### Q: With a filter that matches 0.5 % of a collection, which filtering strategy is likely to return correct top-k results?
 - [ ] Retrieve the top-k by similarity, then discard points failing the filter
 - [x] Compute the matching ids first and search only within them, falling back to brute force over that small set
-- [ ] Increase `ef` until enough filtered results appear
+- [ ] Keep post-filtering but double the candidate count k′ before discarding non-matching points
 - [ ] Disable the HNSW index and rely on the payload index alone
 > With 0.5 % selectivity, a top-100 similarity result contains about half a matching point on average,
-> so post-filtering returns almost nothing. Pre-filtering yields a small candidate set that is cheap to
-> scan exactly, which is why engines switch strategy based on estimated selectivity.
+> and doubling k′ to 200 still yields about one, so post-filtering returns almost nothing. Pre-filtering
+> yields a small candidate set that is cheap to scan exactly, which is why engines switch strategy based on
+> estimated selectivity.

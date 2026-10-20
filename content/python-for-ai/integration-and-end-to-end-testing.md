@@ -5,6 +5,7 @@ name: Integration and end-to-end testing
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/pytest
   - python-for-ai/test-doubles-mocks-fixtures
@@ -62,7 +63,7 @@ for a multi-service stack. Container startup is the expensive part, so scope the
 and make each test isolated within it.
 
 ### Isolation inside a shared dependency
-Options, in rough order of strength: wrap each test in a transaction and roll back (fast, but breaks if
+Options, each with its own failure mode: wrap each test in a transaction and roll back (fast, but breaks if
 the code commits or uses several connections); give each test a unique namespace, such as a tenant ID,
 schema or collection name (works across connections and services); or truncate tables between tests
 (simple, slower). Never rely on test order.
@@ -99,7 +100,7 @@ pytestmark = pytest.mark.integration      # run with: pytest -m integration
 
 @pytest.fixture(scope="session")
 def retriever():
-    with PostgresContainer("pgvector/pgvector:pg16", driver=None) as pg:   # pinned image
+    with PostgresContainer("pgvector/pgvector:0.8.0-pg16", driver=None) as pg:  # pin both versions
         r = PgRetriever(pg.get_connection_url(), embedder=HashEmbedder(dim=8))
         r.migrate()                       # the real migrations: extension, table, HNSW index
         yield r
@@ -126,7 +127,12 @@ def test_filtered_search_returns_all_matches(retriever, tenant):
 
 The last test is the one doubles cannot write: with a shared approximate index and a selective tenant
 filter, a naive query can return fewer than *k* rows, which is a property of the real engine and its
-settings, not of your Python.
+settings, not of your Python. pgvector's HNSW scan gathers a bounded candidate list (`hnsw.ef_search`,
+40 by default) and the `WHERE` filter is applied afterwards; version 0.8.0 added iterative index scans
+to keep searching when too few rows survive. To make the test meaningful, seed enough rows for other
+tenants that the planner actually uses the index; on a near-empty table Postgres may choose an exact
+sequential scan and the test passes for the wrong reason. Note the image tag pins pgvector as well as
+Postgres: a bare `pg16` tag moves when pgvector releases.
 
 ## Trade-offs
 - Real dependencies catch dialect, index and migration bugs that fakes hide, but add container startup

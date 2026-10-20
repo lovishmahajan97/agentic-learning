@@ -5,6 +5,7 @@ name: Retrieval failure diagnosis
 kind: practice
 difficulty: advanced
 est_minutes: 16
+status: reviewed
 related:
   - evals/retrieval-evaluation
   - evals/error-analysis
@@ -27,7 +28,7 @@ one changes nothing.
 A RAG pipeline is a chain of lossy steps, and the only thing the user sees is the end of it. "The bot
 said our refund window is 14 days, it is 30" could mean the policy PDF was never synced, the OCR turned
 "30" into "3O", the number landed in a chunk with no mention of refunds, an ACL filter excluded the
-document, the embedding ranked a blog post above it, the reranker cut it at position 6 of 5, or it was in
+document, the embedding ranked a blog post above it, the reranker ranked it 6th when only the top 5 are kept, or it was in
 the prompt and the model still preferred an older FAQ. These have nothing in common except the symptom.
 
 The naive response is to change something global: swap the embedding model, raise top-k, rewrite the
@@ -46,6 +47,12 @@ Collect failing queries from evals, thumbs-down feedback or support escalations.
 answers it. Without a gold target you can only guess, so this labelling is the expensive but
 non-negotiable part. A few dozen labelled failures usually reveal the dominant cause.
 
+Label gold as *document plus answer span* (the sentence or cell that settles the question), not as a chunk
+ID, because chunk IDs are an artifact of the current chunker and change the moment you re-chunk; map the
+span to whichever chunks contain it at diagnosis time. Some questions need several pieces of evidence (a
+limit in one section, the exception in another, or two documents to compare). Track each gold span
+separately, because the answer fails if *any* of them is lost, and the two may be lost at different stages.
+
 ### Step 2: walk the stages in pipeline order
 For each failure, ask the same questions in the order data flows, stopping at the first "no":
 
@@ -61,15 +68,26 @@ For each failure, ask the same questions in the order data flows, stopping at th
    silently; a dimension mismatch or a crashed batch leaves holes.
 6. **Filtering.** Do metadata, tenant or ACL filters exclude it for this user? Run the query with and
    without filters.
-7. **Candidate recall.** At a generous depth (say k=100), what rank does the gold chunk get from dense
+7. **Query transformation.** If the pipeline rewrites, expands, routes or decomposes the query, compare
+   the raw and transformed queries. A rewriter that drops the product code, a router that sends a billing
+   question to the HR index, or a decomposition that loses the constraint all look like recall failures
+   downstream. Re-run retrieval with the raw query: if gold appears, the loss is here.
+8. **Candidate recall.** At a generous depth (say k=100), what rank does the gold chunk get from dense
    search, from BM25, and after fusion? Absent at k=100 is a representation problem: vocabulary
-   mismatch, IDs and codes that embeddings blur, or a query that needs rewriting or decomposition.
-8. **Ranking.** Present at 40 but cut at final top-k 5? That is precision: a reranker, better fusion
-   weights or a larger final k.
-9. **Context assembly.** Did it survive token budgeting, deduplication and ordering, or was it truncated or
+   mismatch, IDs and codes that embeddings blur, or a query that needs rewriting or decomposition. Look
+   at what *did* rank above it: a near-duplicate older version or a generic overview page outranking the
+   specific answer is a different fix (dedup, freshness metadata) from a list of unrelated chunks.
+9. **Ranking.** Present at 40 but cut at final top-k 5? That is precision: a reranker, better fusion
+   weights or a larger final k. Note the asymmetry with the previous step: recall at depth is a property
+   of the representation, ordering within the candidates is a property of the scorer, which is why the
+   two numbers point at different components.
+10. **Context assembly.** Did it survive token budgeting, deduplication and ordering, or was it truncated or
    buried mid-context?
-10. **Generation.** It was in the prompt, near the top, and the model still answered wrong: this is a
-    grounding, prompt or model problem, not retrieval at all.
+11. **Generation.** It was in the prompt, near the top, and the model still answered wrong: this is a
+    grounding, prompt or model problem, not retrieval at all. Sub-cases are worth separating: the context
+    also contained a conflicting passage the model preferred (a retrieval-precision problem in disguise),
+    the model ignored the context in favour of its parametric knowledge, or the answer required arithmetic
+    or combining two passages and the model got the reasoning wrong.
 
 ### Step 3: count, then fix the biggest bucket
 Tally first-loss stage across failures. The distribution decides the work, *because* each fix only helps
@@ -140,6 +158,8 @@ the embedding model is not the bottleneck at all.
   retrieved" from "retrieved and cut", and the symptom is prompt rewrites that do not help.
 - Fixing failures one by one without counting; the symptom is whack-a-mole where each fix regresses another
   query because nobody saw the distribution.
+- Recording gold evidence as chunk IDs; the symptom is measured recall collapsing to near zero right
+  after a chunking change, because the labelled IDs no longer exist, while real answer quality is unchanged.
 
 ## When to use
 Use this whenever answer quality is below target and the cause is not obvious, before any model or index
@@ -169,13 +189,14 @@ rewriting. I would also check generation failures among queries where gold was i
 would not move with any retrieval change.
 
 ## Quiz
-### Q: The gold chunk appears at rank 2 in BM25 results and nowhere in dense results, but the answer is still wrong. What do you check next?
+### Q: The gold chunk, whose parsed text you have confirmed contains the answer intact, appears at rank 2 in BM25 results and nowhere in dense results, but the answer is still wrong. What do you check next?
 - [ ] Re-embed the corpus with a larger embedding model
 - [x] Whether it survived fusion, reranking and final top-k into the actual context
 - [ ] Whether the document was parsed correctly
 - [ ] Whether the LLM temperature is too high
-> Since BM25 found it, parsing, indexing and filtering are already fine. The next stages in order are fusion,
-> reranking and context assembly; only if it reached the context does generation become the suspect.
+> Parsing is ruled out by the stem, and a BM25 hit at rank 2 shows the chunk is indexed and passes the
+> filters. The next stages in order are fusion, reranking and context assembly (a dense miss can still sink
+> it in fusion); only if it reached the context does generation become the suspect.
 
 ### Q: Why is "first stage where the gold evidence is lost" the right unit of attribution?
 - [ ] Because later stages are always more expensive to fix

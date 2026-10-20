@@ -5,7 +5,7 @@ name: Model monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/drift
   - llmops-platform/observability-stack
@@ -90,6 +90,20 @@ concurrent canary. Alert on sudden shifts and on slow trends separately, and req
 per window *because* judged metrics on thirty requests are noise. Route operational breaches to the
 pager and quality shifts to a ticket with the top disagreeing examples attached.
 
+Slicing has a statistical cost that is easy to miss: every slice is another hypothesis test. With 200
+slices each checked hourly at a threshold that fires falsely 5% of the time, you should expect about ten
+false alerts per run from noise alone. Two standard defences: make the threshold depend on the slice's
+own standard error (a drop must exceed roughly two standard errors of the difference, so small slices
+need bigger drops), and require the breach to persist across consecutive windows before alerting.
+
+### From proxies to SLOs
+The proxies that matter most can be written as service-level objectives in the SRE sense: "99% of
+extraction responses pass schema validation over 28 days" or "refusal rate on the billing intent stays
+below 3%". That gives each one an error budget, and you alert on how fast the budget is burning rather
+than on single bad windows: a fast burn (a large fraction of the month's budget gone in an hour) pages,
+a slow burn opens a ticket. This is the same machinery used for availability, applied to behaviour,
+and it is what stops quality alerting from becoming either silent or noisy.
+
 ### Close the loop
 Every metric should be derivable from traces so an alert can drill into the requests behind it, and
 every reviewed failure should become a golden-set case. Monitoring that does not feed the eval suite
@@ -102,7 +116,7 @@ compared per version against a baseline window with a minimum-sample guard.
 ```python
 import math
 from collections import defaultdict
-from statistics import mean
+from statistics import mean, stdev
 
 MIN_N = 200                       # no verdicts on tiny windows
 LIMITS = {"refusal_rate": 0.05, "schema_fail_rate": 0.02, "judge_drop": 0.3}
@@ -119,8 +133,13 @@ def summarise(events):            # events: dicts from the trace store, one per 
                     "schema_fail_rate": mean(not e["schema_ok"] for e in es),
                     "p95_ms": sorted(e["ms"] for e in es)[math.ceil(0.95 * len(es)) - 1],  # nearest rank
                     "cost_per_req": mean(e["cost"] for e in es),
-                    "judge_mean": mean(judged) if judged else None, "judge_n": len(judged)}
+                    "judge_mean": mean(judged) if judged else None, "judge_n": len(judged),
+                    "judge_sd": stdev(judged) if len(judged) > 1 else None}
     return out
+
+def judge_dropped(c, b, z=2.0):   # drop must be large relative to its own noise
+    se = math.sqrt(c["judge_sd"] ** 2 / c["judge_n"] + b["judge_sd"] ** 2 / b["judge_n"])
+    return b["judge_mean"] - c["judge_mean"] > max(LIMITS["judge_drop"], z * se)
 
 def alerts(current, baseline):
     found = []
@@ -131,11 +150,12 @@ def alerts(current, baseline):
         for m in ("refusal_rate", "schema_fail_rate"):
             if c[m] > LIMITS[m] and (b is None or c[m] > 2 * b[m]):
                 found.append((key, m, c[m], "page"))
-        if b and c["judge_n"] >= 50 and b["judge_n"] >= 50 \
-                and b["judge_mean"] - c["judge_mean"] > LIMITS["judge_drop"]:
+        if b and c["judge_n"] >= 50 and b["judge_n"] >= 50 and judge_dropped(c, b):
             found.append((key, "judge_mean", c["judge_mean"], "ticket+examples"))
     return found
 # Run hourly: alerts(summarise(last_hour), summarise(same_hour_last_week)).
+# With sd ≈ 0.8 and 50 judged per side, se ≈ 0.16, so only drops above ~0.32 fire: the
+# floor of 50 judged requests is what bounds the smallest regression this slice can see.
 ```
 
 ## Trade-offs
@@ -163,6 +183,8 @@ def alerts(current, baseline):
   hunt for a single example.
 - Letting the judge model auto-update; the symptom is a step change in every quality series on the
   day the vendor shipped, with no change in your system.
+- Fixed thresholds across hundreds of slices; the symptom is a daily stream of one-window alerts on
+  small tenants that never reproduce, until the whole channel is muted.
 
 ## When to use
 From the first production deployment: operational metrics and the cheapest proxies (schema failures,

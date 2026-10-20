@@ -5,7 +5,7 @@ name: Context compaction / summarization
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/agent-memory
@@ -33,6 +33,9 @@ result, and the next model call receives the whole transcript again. Tool result
 a search returning fifty hits, a test log. Illustratively, if a step adds 3,000 tokens, step 40 sends
 about 120,000 tokens, and the run as a whole has sent 3,000 × (1 + 2 + … + 40) ≈ 2.5 million tokens,
 for work whose *useful* information grew linearly. Cost is quadratic in run length while value is linear.
+Prompt caching softens the bill, because an unchanged prefix is billed at a discount on providers that
+support it, but it changes only the price of re-reading: the window limit and the quality problems below
+are untouched, so caching is a reason to compact rarely, not a reason not to compact.
 
 Three things break before the budget does. First, the hard limit: a 200k-token window ends the run
 mid-task, usually at the worst moment, because long runs are the hard ones. Second, quality: models do
@@ -91,6 +94,23 @@ misses the cache for everything after the first changed message; only the pinned
 tools, task) still hits. Do it rarely and in large chunks rather than a little every step. Tell the model it happened ("earlier context was compacted;
 summary follows"), because otherwise it will refer to things it believes it can still see.
 
+### The second compaction: merge, do not re-summarize
+A long run compacts more than once, and the naive second pass summarizes a transcript that already
+contains a summary, so facts pass through the lossy step repeatedly and drift ("created PR #4812"
+becomes "opened a PR" becomes nothing). The fix is *anchored* (incremental) summarization: keep the
+summary as a structured object the harness owns, and on each compaction ask the model only to summarize
+the *new* span, then merge field by field in code. Append-only fields (decisions, IDs created, errors
+seen) are concatenated and never rewritten by the model; overwrite fields (current state, next step)
+take the newest value. Each fact then goes through the lossy step exactly once.
+
+### Isolate instead of compact
+The cheapest tokens to compact are the ones that never entered the main context. Delegating a noisy
+sub-task (search the codebase for every caller of `charge()`) to a sub-agent with its own fresh context,
+and returning only its condensed answer, keeps thousands of tokens of exploration out of the parent's
+transcript. This is the same idea as compaction applied at the boundary of a task rather than over
+time. Some providers now also offer server-side context editing or compaction features; they implement
+the same layers, and you still own the policy for what must survive.
+
 ### What must survive
 The test is: would forgetting this cause a wrong action? Constraints ("do not touch production"),
 decisions already made and their reasons, identifiers of things created, user preferences and partial
@@ -135,6 +155,13 @@ def compact(messages, llm, count_tokens):
     return pinned + [note] + recent          # system prompt + task statement stay pinned
 ```
 
+Illustrative numbers for one run: at step 28 the transcript is 72k tokens against a 70k trigger, and
+54k of it is tool output older than the last six messages. Pruning stubs that down to about 1k, leaving
+roughly 19k, so no summary call is made and only the cache suffix after the first stub is rebuilt. Many
+steps later, with no large tool outputs left to prune, the trigger fires again and the summary path
+runs; on that and every later pass, a production version would merge the new span into the existing
+summary object rather than re-summarizing the old note, as described above.
+
 ## Trade-offs
 - Compaction is lossy by construction: a bounded, cheaper context in exchange for the guarantee that
   every earlier fact is still visible. It flips when the task depends on exact earlier text (a long diff,
@@ -157,6 +184,8 @@ def compact(messages, llm, count_tokens):
   or a model that invents the missing result.
 - Compacting on every step; the symptom is a collapsing cache hit rate, rising cost per step, and a
   summary that drifts because it is a summary of a summary of a summary.
+- Re-summarizing the previous summary along with the new span; the symptom is identifiers and
+  decisions that were present after the first compaction and are vague or gone after the third.
 - Not telling the model compaction happened; the symptom is references to "the file above" that no
   longer exists, followed by made-up contents.
 - Letting secrets or personal data flow from a tool output into a summary that is then persisted as
@@ -168,7 +197,9 @@ Any agent that runs more than a handful of steps needs at least Layer 1, and any
 summarization first: measure where the tokens are (almost always tool outputs) and prune at the source.
 Track tokens per step, prompt-cache hit rate, the fraction of runs that hit the window limit, and task
 success before and after compaction, because a compaction policy that saves 40% of tokens and loses 10%
-of task completions is a net loss. In interviews, being able to derive the quadratic cost of an
+of task completions is a net loss. To test summary fidelity directly, compact a recorded run and ask the
+agent probe questions whose answers are in the dropped span (which PR did you open? which constraint
+applies?); a wrong answer is a schema gap. In interviews, being able to derive the quadratic cost of an
 uncompacted run and explain why the summary must be structured and cut at tool-call boundaries is the
 expected depth.
 
@@ -191,7 +222,10 @@ the window, summarizing only the oldest span and keeping the system prompt, task
 turns verbatim, cut at message boundaries so tool calls and results stay paired. The summary must be
 structured: goal and acceptance criteria, decisions with reasons, files changed, commands run with
 outcomes, errors seen and fixes, open issues, next step. Persist a progress file so the summary can
-point to it. Measure cache hit rate and task success, not just token savings.
+point to it. On the second and later compactions, summarize only the new span and merge it into the
+existing summary in code, so IDs and decisions are never re-paraphrased. Delegate noisy searches to
+sub-agents so their output never enters the main context. Measure cache hit rate, task success and
+probe-question accuracy after compaction, not just token savings.
 
 ## Quiz
 ### Q: Why should a compaction summary follow a fixed schema rather than being a free-form paragraph?

@@ -5,7 +5,7 @@ name: Agent memory (short-term, long-term, episodic)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agents/memory-retrieval-update-deletion-policies
   - agents/context-compaction-summarization
@@ -58,6 +58,13 @@ old turns, drop verbose tool outputs after they have been used, and keep the pla
 attention is strongest. Compaction (summarising older turns into a short note) is the standard way to
 extend a session beyond the window; the trade is fidelity for room.
 
+Treat the window as a budget you allocate, not a bucket you fill. An illustrative split for a 128k
+window: about 3k for the system prompt and tool schemas, 2k for retrieved long-term memories, 1k for the
+plan, 8k reserved for the model's output, and the rest for conversation and tool results, with a
+compaction trigger well before the limit (say at 70–80%) *because* compacting under pressure, mid-tool
+call, is when constraints get dropped. The point of the split is that each slot has an owner and a cap,
+so a 40k-token tool result cannot silently evict the retrieved memories.
+
 ### Long-term memory
 Persisted outside the model and loaded on demand. Two sub-types matter in practice:
 
@@ -77,8 +84,19 @@ and outcome. It is kept separate from semantic memory *because* an event is evid
 Oct 3 the deploy failed with a missing variable" is useful even if the cause has been fixed, and a
 dozen episodes can be consolidated into one semantic fact ("deploys often fail on missing env vars;
 check first"). Reflexion-style lessons are episodic memory distilled into guidance. Episodes are
-retrieved by a blend of relevance, recency and importance, as in the Generative Agents memory stream,
-so recent and significant events outrank old trivia.
+retrieved by a blend of relevance, recency and importance, as in the Generative Agents memory stream:
+
+```
+score(m) = α·relevance(q, m) + β·recency(m) + γ·importance(m)
+relevance  = cosine(embed(q), embed(m))
+recency    = decay^(time since m was last accessed)      # exponential, e.g. per hour
+importance = a 1-10 rating the model assigns when m is written, rescaled to [0, 1]
+```
+
+Each term is normalised to a common range before weighting. Importance is scored at write time
+*because* it does not depend on the query: "user's production database was deleted" matters more than
+"user said thanks" no matter what is asked later. Without that term, recency lets recent trivia bury a
+significant old event; without recency, a store of thousands of episodes surfaces stale ones forever.
 
 ### The read and write paths
 1. **Write**: at turn or session end, an extraction prompt proposes facts and episodes. Each is
@@ -90,6 +108,14 @@ so recent and significant events outrank old trivia.
    user turn, with timestamps so the model can judge staleness.
 3. **Consolidate**: periodically merge duplicates, summarise episodes into semantic facts, and expire
    what is stale. This is what keeps retrieval quality from degrading as the store grows.
+
+### Scope: whose memory is it
+Every memory belongs to a scope, and the scope is a hard filter, not a ranking signal: **session**
+(working notes that die with the task), **user** (preferences, history), **tenant or organisation**
+(shared facts such as "our staging cluster is `stg-eu`", readable by everyone in that tenant, writable
+by few), and **global** procedural memory (the agent's own instructions and skills, changed by
+engineers through review). Choosing the scope at write time matters *because* a fact written at the
+wrong scope is either invisible where it is needed or leaks where it must not appear.
 
 ### Model-managed memory
 MemGPT-style designs expose memory operations as tools: the model itself decides to save a fact,
@@ -142,7 +168,9 @@ system = "You are a deployment assistant.\n\nKnown about this user (may be stale
 
 The weights, the 0.92 threshold and the half-life are illustrative; the shape to copy is scoping by
 user before scoring, blending relevance with recency, and surfacing timestamps so the model can discount
-old facts. Note the write path: "plan is Pro" and "plan is Basic" embed as near-duplicates, so simply
+old facts. The recency weight is kept small *because* these are semantic facts: "prod DB is Postgres
+15" is not less true for being old, and a heavy decay would let last week's trivia outrank it. An
+episodic store would weight recency more and add the importance term above. Note the write path: "plan is Pro" and "plan is Basic" embed as near-duplicates, so simply
 *skipping* near-duplicates would keep the stale fact and drop the new one. The crude fix here lets the
 newest statement supersede; the update-policy lesson replaces it with an explicit add/update/ignore
 decision and keeps the superseded value for audit.

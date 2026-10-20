@@ -5,6 +5,7 @@ name: Lost-in-the-middle
 kind: concept
 difficulty: core
 est_minutes: 13
+status: reviewed
 related:
   - model-internals/context-window
   - model-internals/attention-mechanism
@@ -83,19 +84,27 @@ every one of these worse: more distractors, and the evidence deeper in the troug
    the key instruction at the end. Anthropic's long-context guidance recommends exactly this layout. The
    question then sits in the recency window immediately before generation, and the prefix of documents
    is stable, which is also what prompt caching wants.
-4. **Structure the context.** Wrap each chunk in a tagged block with an id and source, and ask the model
+4. **Optionally sandwich the question.** In a causal model, document tokens are encoded before the
+   model has seen a question placed after them, so only the final positions can read the documents "with
+   the question in mind". Stating the question briefly *before* the documents as well (query-aware
+   contextualization in the original study) lets every document token be processed in light of it. The
+   study found this helped its synthetic key-value lookup a great deal but changed multi-document QA
+   little, so treat it as something to measure, not a default.
+5. **Structure the context.** Wrap each chunk in a tagged block with an id and source, and ask the model
    to quote the relevant sentences before answering. The quotes land at the end of the prompt, right
    before the answer, which converts a "find it in the middle" problem into a "read what you just wrote"
    problem.
-5. **Compress.** Extract only the relevant sentences from each chunk (an LLM or a small extractive model)
+6. **Compress.** Extract only the relevant sentences from each chunk (an LLM or a small extractive model)
    before the final prompt, so the middle is short.
-6. **Map-reduce.** When a question genuinely needs many passages, answer per passage or per small group
+7. **Map-reduce.** When a question genuinely needs many passages, answer per passage or per small group
    and combine, so no single prompt has a long middle.
-7. **Measure.** Run a position sweep on your model with your chunk size before and after changes.
+8. **Measure.** Run a position sweep on your model with your chunk size before and after changes.
 
 Worked numbers: 20 chunks of 400 tokens is an 8,000-token context with the gold chunk at rank 3 sitting
-at position 3 of 20. Reranking and cutting to 6 chunks gives 2,400 tokens with the same chunk at
-position 2 of 6, and after edge reordering it is the second block from the start.
+at position 3 of 20, behind two lookalikes and ahead of seventeen more. Reranking and cutting to 6 chunks
+gives 2,400 tokens; if the reranker keeps the chunk at rank 3 it sits at position 3 of 6 with only three
+distractors after it, edge reordering then makes it the second block from the start, and a reranker that
+promotes it to rank 1 or 2 puts it at one of the two edges.
 
 ## Example
 The reorder function and a position-sweep harness: `position_sweep` builds k-document prompts with the
@@ -139,8 +148,9 @@ def position_sweep(llm, gold, distractors, question, grader, k=20, trials=30):
   pieces of evidence (multi-hop, aggregation), where compression or map-reduce beats a smaller k.
 - Edge reordering is free but destroys natural order; it flips when order carries meaning (log
   timelines, document sections), where you keep the order and label each chunk explicitly instead.
-- Documents-first, question-last costs nothing and aligns with prompt caching, but in a long chat that
-  re-sends a per-turn document set the whole context is paid every turn either way.
+- Repeating the question before the documents lets a causal model read them with the question in view,
+  but it puts per-query text ahead of the documents and so breaks prefix caching; it flips to
+  question-last-only when many questions reuse the same long document set (chat over one contract).
 - Quote-then-answer prompting improves evidence use and gives you checkable quotes, at the price of
   output tokens and latency; vendor citation features can recover some of that cost.
 - Relying on a newer long-context model shrinks the trough without engineering, but the effect is
@@ -188,8 +198,9 @@ should make things worse. Plan: run error analysis on the failures and classify 
 but unused versus evidence missing; for the first class, add a cross-encoder reranker and cut to the top
 5 to 8, reorder so the strongest chunks sit at the edges, move the question after the documents, and ask
 for quotes before the answer; run a position sweep before and after; re-measure end to end. Only if the
-second class dominates, which means multi-hop or aggregation questions, reach for query decomposition or
-map-reduce rather than a bigger k.
+second class dominates (typically multi-hop or aggregation questions, whose other pieces of evidence a
+single-gold-chunk recall metric does not track) reach for query decomposition or map-reduce rather than
+a bigger k.
 
 ## Quiz
 ### Q: What does the lost-in-the-middle finding say about how models use long contexts?

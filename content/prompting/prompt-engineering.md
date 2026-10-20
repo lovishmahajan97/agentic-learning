@@ -5,7 +5,7 @@ name: Prompt engineering
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - prompting/system-prompt
   - prompting/few-shot
@@ -93,6 +93,15 @@ Prompt engineering is engineering because of the loop, not the wording:
 5. Change one thing, re-run, keep the change only if the metric moves.
 6. Record the version and the score, because the next person will ask why the prompt says that.
 
+### How big a difference is real
+An eval score is an estimate with noise, and the noise is easy to compute. For accuracy *p* on *n*
+cases, the standard error is √(p(1−p)/n). At 80% on 50 cases that is √(0.16/50) ≈ 0.057, about ±6
+points, so a prompt that moves from 80% to 84% has shown you nothing yet; at 200 cases the error halves
+to about ±3. Because both versions run on the same cases, the sharper test is paired: count the cases
+that flipped. If v2 fixes nine cases and breaks two, that is evidence; if it fixes five and breaks four,
+it is a reshuffle. Reading the broken cases also catches the commonest regression, a new rule that
+fixes one class of input by damaging another.
+
 ### Where the module goes from here
 Zero-shot and few-shot are about how much to show; chain-of-thought and ReAct are about giving the
 model computation and tools; the system prompt and templates are about where instructions live and how
@@ -111,7 +120,7 @@ first; V2 enumerates labels, defines them and fixes the output format. The harne
 turns "I think it is better" into a number you can defend, and it is reused for every later change.
 
 ```python
-import anthropic, json
+import anthropic, json, collections
 client = anthropic.Anthropic()
 MODEL = "claude-opus-5-5"
 
@@ -136,16 +145,25 @@ def classify(instruction, ticket):
     try:
         return json.loads(text)["label"]
     except (json.JSONDecodeError, KeyError, TypeError):
-        return text.strip().lower()   # V1 mostly lands here: prose, not a label
+        return None                       # unparseable: a format failure, not a wrong label
 
+RUNS = 3                                  # sampled outputs: score a distribution, not one draw
 for name, prompt in (("v1", V1), ("v2", V2)):
-    hits = sum(classify(prompt, t) == y for t, y in EVAL)
-    print(f"{name}: {hits}/{len(EVAL)} correct")
+    outcome = collections.Counter()
+    for ticket, expected in EVAL:
+        for _ in range(RUNS):
+            got = classify(prompt, ticket)
+            outcome["format" if got is None else "invented" if got not in LABELS
+                    else "correct" if got == expected else "wrong"] += 1
+    print(name, dict(outcome))            # each failure bucket points to a different fix
 ```
 
-Run each version a few times: outputs are sampled, so the score is a distribution. V1 fails mostly on
-format (it answers in sentences) and on label names it invented; V2 fails, if at all, on genuinely
-ambiguous tickets, which is where you would next add a few-shot example or a decision rule.
+The breakdown is the point, not the total. V1 lands almost entirely in `format` (it answers in
+sentences) and `invented` (it says "payment issue" for billing), both specification failures that V2's
+format clause and closed label list remove. Whatever V2 still gets `wrong` is a boundary the
+definitions do not settle, such as "charged twice because the export failed", and that is where a
+decision rule or a few-shot example goes next. With four cases the totals are anecdotes; run the same
+harness on a few hundred real tickets and apply the paired comparison above before believing a delta.
 
 ## Trade-offs
 - Iteration in seconds with no training data, against a per-request cost: every instruction and example

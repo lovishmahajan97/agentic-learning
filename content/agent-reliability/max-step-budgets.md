@@ -5,7 +5,7 @@ name: Max-step budgets
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/loop-detection
@@ -92,10 +92,34 @@ Charge after each model response using the usage fields the API returns (input a
 not estimates; charge tool costs as they occur; and store the counters in the checkpoint so a resumed
 run does not start from zero.
 
+Post-hoc charging has a gap: the check runs *before* a call, but the cost is only known *after* it.
+At 390k of a 400k-token budget, a check that asks "are we over?" says no, and the next call re-sends
+a 60k-token context and lands at 450k. Close the gap by projecting: the next call's input is the
+current context size (known, or counted with the provider's token counter) and its output is bounded
+by `max_tokens`, so refuse the call if `used + context + max_tokens` would exceed the limit. The same
+projection tells you when to fire the wrap-up turn instead of another working step.
+
+### Reserve for the wrap-up
+The partial result that makes exhaustion useful costs a model call of its own. If the hard limit is
+the whole allowance, that call cannot be afforded at exactly the moment it is needed. Hold back a
+reserve (one context-sized call is the natural unit) that only the wrap-up may spend, and send that
+call with tools withheld so the model summarises instead of acting.
+
 ## Example
 The budget tracks three dimensions at once, fires a single soft warning at 80% of whichever is
-closest to its limit, and returns a labelled partial rather than raising when exhausted; `child()`
-hands a sub-agent a slice of what remains.
+closest to its limit, refuses a call whose *projected* cost would breach the token limit, and returns
+a labelled partial rather than raising. `child()` hands a sub-agent a slice of what remains and
+`absorb()` debits the parent when the child returns, so delegation cannot spend more than the parent
+had.
+
+Why the warning also fires on `last`: trace a run whose context grows by about 15k tokens per
+step, so step *n* sends roughly 15k × n and cumulative spend after *n* steps is 15k × n(n+1)/2.
+After five steps it has used 225k (56%). Step six would send 90k, which fits (225k + 90k + 4k ≤ 400k),
+but six and seven together would not, so the warning goes out with step six. After it the run has
+used 315k, still under the 80% line, and step seven would project to 424k, so the loop stops with a
+partial. A purely fractional soft line would never have fired: with quadratic growth the jump from
+"under 80%" to "cannot afford another call" happens in one step, which is why the warning must be
+driven by the projection, not only by the fraction.
 
 ```python
 import time
@@ -103,39 +127,40 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Budget:
-    max_steps: int = 20
-    max_tokens: int = 400_000
-    max_seconds: float = 600
-    soft_fraction: float = 0.8
-    steps: int = 0
-    tokens: int = 0
+    max_steps: int = 20; max_tokens: int = 400_000; max_seconds: float = 600
+    soft_fraction: float = 0.8; steps: int = 0; tokens: int = 0; warned: bool = False
     started: float = field(default_factory=time.monotonic)
-    warned: bool = False
 
     def charge(self, usage):                     # usage block from the API response
         self.steps += 1
         self.tokens += usage.input_tokens + usage.output_tokens
 
     def fraction_used(self) -> float:
-        return max(self.steps / self.max_steps,
-                   self.tokens / self.max_tokens,
+        return max(self.steps / self.max_steps, self.tokens / self.max_tokens,
                    (time.monotonic() - self.started) / self.max_seconds)
 
-    def exhausted(self) -> bool:
-        return self.fraction_used() >= 1.0
+    def can_afford(self, ctx: int, max_out: int, calls: int = 1) -> bool:  # project first
+        return (self.steps + calls <= self.max_steps
+                and time.monotonic() - self.started < self.max_seconds
+                and self.tokens + calls * (ctx + max_out) <= self.max_tokens)
 
-    def child(self, share: float = 0.25) -> "Budget":   # sub-agent allocation
+    def child(self, share: float = 0.25) -> "Budget":   # slice of what is left, never 0
         left = max(0.0, 1 - self.fraction_used()) * share
-        return Budget(max_steps=max(1, int(self.max_steps * left)),   # never 0: avoids
-                      max_tokens=max(1, int(self.max_tokens * left)), # division by zero
-                      max_seconds=max(1.0, self.max_seconds * left))  # in fraction_used
+        return Budget(max_steps=max(1, int(self.max_steps * left)),
+                      max_tokens=max(1, int(self.max_tokens * left)),
+                      max_seconds=max(1.0, self.max_seconds * left))
 
-def run(state, model, budget: Budget):
+    def absorb(self, child: "Budget"):          # parent pays for the child on return
+        self.steps += child.steps; self.tokens += child.tokens
+
+def run(state, model, budget: Budget, max_out=4_000):
     while True:
-        if budget.exhausted():
-            return {"status": "partial", "reason": "budget_exhausted",
-                    "draft": state.last_draft()}
-        if budget.fraction_used() >= budget.soft_fraction and not budget.warned:
+        ctx = state.context_tokens()
+        if not budget.can_afford(ctx, max_out):  # wrap_up: no-tools call, paid from a
+            return {"status": "partial", "reason": "budget_exhausted",   # reserve kept
+                    "draft": state.wrap_up()}                            # outside max_tokens
+        last = not budget.can_afford(ctx, max_out, calls=2)   # room for one more call only
+        if not budget.warned and (last or budget.fraction_used() >= budget.soft_fraction):
             budget.warned = True
             state.push_user("Budget nearly used. Submit your best result now "
                             "and list anything unfinished.")
@@ -154,6 +179,9 @@ def run(state, model, budget: Budget):
   grow; token and money budgets track the real constraint at the price of accurate usage accounting.
 - Hierarchical sub-budgets keep a delegation tree bounded, but starve deep sub-tasks when the parent
   has already spent most of its allowance; dynamic reallocation helps but complicates accounting.
+- Projecting cost before each call never overshoots the limit, but stops runs a step early whenever
+  `max_tokens` is set far above typical output; size `max_tokens` from observed output lengths, or
+  the projection becomes the binding constraint instead of real spend.
 
 ## Pitfalls
 - Counting steps but not tokens, then being surprised by the bill; the symptom is cost per run
@@ -166,6 +194,8 @@ def run(state, model, budget: Budget):
   headroom while complex ones are cut off at a fixed step count regardless of progress.
 - A wall-clock budget without per-call timeouts; the symptom is a run that "times out" long after
   its budget because one tool call hung and nothing interrupted it.
+- Checking the budget only after charging; the symptom is runs that end 10–20% over their token
+  limit, because the final call's cost was unknown until it had already been paid.
 
 ## When to use
 Always on, from the first prototype: the prototype without a cap is the one that runs overnight.

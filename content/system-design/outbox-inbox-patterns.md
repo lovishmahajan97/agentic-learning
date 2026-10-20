@@ -5,7 +5,7 @@ name: Outbox / inbox patterns
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - system-design/event-driven-architecture
   - system-design/exactly-once-processing-limitations
@@ -68,7 +68,11 @@ A separate process moves rows from the outbox to the broker. Two implementations
 **Polling publisher.** A loop runs `SELECT ... FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT n
 FOR UPDATE SKIP LOCKED`, publishes each row, then marks it published (or deletes it). `SKIP LOCKED` lets
 several relay instances run without double-claiming rows. It is simple and database-agnostic; its cost is
-polling latency and load on the table.
+polling latency and load on the table. Selecting by `published_at IS NULL` rather than "rows with `id` above
+the last one I published" is deliberate: ids come from a sequence assigned at insert time, but
+transactions commit in a different order, so row 101 can be visible while row 100's transaction is still
+open. A relay that advances a high-water mark past 101 never returns for 100, and that event is lost
+without any error.
 
 **Log tailing (CDC).** A connector such as Debezium reads the database's write-ahead log, sees committed
 inserts into the outbox table in commit order, and forwards them to the broker. There is no polling, the
@@ -94,7 +98,10 @@ with a lag that covers your debugging needs; a table with hundreds of millions o
 On the consumer, every message handler runs inside a database transaction that does two things: performs
 the business effect and inserts the message's id into an `inbox` table with a unique constraint
 (`INSERT ... ON CONFLICT DO NOTHING`). If the insert affects zero rows the message was already handled,
-and the handler commits nothing. Because the dedupe record and the effect commit together, a crash
+and the handler commits nothing. Doing the inbox insert *first*, before the effect, also handles two
+copies arriving concurrently on different consumer instances: in Postgres the second insert waits on the
+unique index until the first transaction commits, then finds the conflict and does nothing, so the
+unique constraint, not application logic, serialises the duplicates. Because the dedupe record and the effect commit together, a crash
 between them cannot leave the effect applied but unrecorded, or recorded but unapplied. The dedupe key
 must be the producer's `event_id`, not the broker's delivery id, *because* a redelivery carries the same
 event with a new delivery id.
@@ -133,7 +140,7 @@ def place_order(conn, order):                       # producer: one transaction,
                      (order["id"], "OrderPlaced",
                       json.dumps({"event_id": str(uuid.uuid4()), **order})))
 
-def relay_once(conn, broker, batch=100):            # polling publisher; safe to run N copies
+def relay_once(conn, broker, batch=100):            # N copies won't double-claim, but can reorder
     with conn.transaction():
         rows = conn.execute("""SELECT id, aggregate_id, event_type, payload FROM outbox
                                WHERE published_at IS NULL ORDER BY id LIMIT %s
@@ -155,7 +162,11 @@ def handle_order_placed(conn, msg):                 # consumer: effect + inbox i
 ```
 
 Kill the relay between `broker.publish` and the `UPDATE` and the row is published twice; the consumer's
-second `INSERT INTO inbox` conflicts, `rowcount` is zero, and the ledger is written exactly once.
+second `INSERT INTO inbox` conflicts, `rowcount` is zero, and the ledger is written exactly once. Two
+production details the sketch glosses: the relay publishes while holding row locks, so a slow broker
+stretches the transaction, which is why real relays use small batches and a short publish timeout; and
+with several relays running, two events for the same order can be claimed by different relays and
+published in the wrong order, so either run one relay per partition of aggregates or use CDC.
 
 ## Trade-offs
 - You gain a hard guarantee that events match committed state, but every event now costs a database
@@ -181,6 +192,9 @@ second `INSERT INTO inbox` conflicts, `rowcount` is zero, and the ledger is writ
   downstream.
 - Deduplicating on the broker's message or receipt id instead of the producer's `event_id`; redeliveries
   carry new ids and sail past the inbox, so duplicates reappear exactly when the broker retries.
+- A relay that tracks "last published id" instead of querying unpublished rows; events from
+  transactions that committed out of sequence order are skipped forever, showing up as rare, permanent
+  gaps that no retry ever fills.
 - Letting the outbox grow unbounded with no partial index; relay latency creeps from milliseconds to
   seconds as the unpublished scan degrades.
 - Treating the inbox as protection for external calls; the handler emails the customer, then crashes
@@ -217,8 +231,11 @@ write; nothing retried because the process was gone. Redesign: insert the `Docum
 an outbox table inside the same transaction as the document row, so the pair is atomic. A relay, either a
 polling loop using `FOR UPDATE SKIP LOCKED` or Debezium tailing the WAL, publishes unpublished rows to
 Kafka keyed by document id and marks them published. If the relay crashes after publishing and before
-marking, it republishes, so the indexer must be idempotent: it inserts the event id into an inbox table in
-the same transaction as writing the chunks and skips the work on conflict. Backfilling the 37 missing
+marking, it republishes, so the indexer must be idempotent. If the chunks live in Postgres (pgvector),
+the indexer inserts the event id into an inbox table in the same transaction as writing the chunks and
+skips the work on conflict. If the vector store is a separate system, no shared transaction exists, so
+idempotence has to come from the effect: deterministic chunk ids such as `doc_id:chunk_no` and upserts,
+so a republished event overwrites instead of duplicating. Backfilling the 37 missing
 documents is now a one-off insert of outbox rows for them. Add an alert on the age of the oldest
 unpublished outbox row and on inbox duplicate rate.
 

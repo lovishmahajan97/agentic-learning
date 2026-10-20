@@ -5,7 +5,7 @@ name: Regression tests
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -80,8 +80,17 @@ For a significance check on paired pass/fail outcomes use McNemar's test on the 
 300 items where 20 flipped fail-to-pass and 14 flipped pass-to-fail, the statistic is
 (20 − 14)² / (20 + 14) ≈ 1.06, below the 3.84 threshold for p < 0.05 with one degree of freedom, so the
 suite cannot claim the change is a net improvement; it can still hand you the 14 regressed items to
-inspect. State the minimum detectable effect of your suite size so nobody reads a two-item difference
-as a result.
+inspect. Inverting the formula gives the suite's resolution: with 34 discordant pairs the net difference
+must be at least 12 (23 against 11) to clear 3.84. When discordant pairs are few (under about 25), use
+the exact binomial version of the test instead of the chi-squared approximation. Publish this minimum
+detectable effect next to the suite so nobody reads a two-item difference as a result.
+
+### Run the baseline in the same job
+Pair in time as well as by item. A baseline recorded last month and a candidate run today differ by the
+change *and* by whatever drifted in between (a provider snapshot, a rebuilt index), so the flip list
+mixes both. Re-run the current production configuration on the same cases in the same job, or at least
+the same night, and diff against that; the stored baseline then serves only for the no-diff drift run,
+where drift is exactly what you want to see.
 
 ### Gate policy
 Block the change on any smoke failure, on any flip of a case tagged critical (cases born from
@@ -109,7 +118,8 @@ from myapp import answer                      # system under test: (input, conte
 from myapp.graders import GRADERS             # {"schema": fn, "contains": fn, "judge_ref": fn, ...}
 
 CASES = [json.loads(l) for l in pathlib.Path("evals/regression.jsonl").read_text().splitlines()]
-BASELINE = json.loads(pathlib.Path("evals/baseline_results.json").read_text())  # {case_id: pass_rate}
+# {case_id: pass_rate}, written by running the production config in the same CI job just before this
+BASELINE = json.loads(pathlib.Path("evals/baseline_results.json").read_text())
 K = 3                                         # samples per case
 
 @pytest.fixture(scope="session")
@@ -160,6 +170,8 @@ def test_no_regression(case, results):
   weeks later to a provider model update.
 - Letting the suite's expectations go stale after an intended behaviour change; the symptom is a
   permanent red test that everyone has learned to ignore, which hides the next real failure.
+- Diffing against a baseline recorded weeks ago; the symptom is flips on cases the change could not
+  plausibly affect, because provider or index drift is being attributed to the pull request.
 - Letting cases leak into the prompt as few-shot examples; the symptom is a perfect suite score and
   unchanged production quality.
 - Grading with a judge whose prompt was tuned on the same cases; the symptom is a suite that passes

@@ -5,7 +5,7 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -88,12 +88,25 @@ the parent store holds 20 texts.
 
 ### Choosing the score aggregation
 Max-child scoring finds the parent containing the single best passage. Count-based scoring favours
-parents with many moderate hits, which can be broad overview sections. Pick by question type, and
-measure: the two rules rank parents differently on the same child hits.
+parents with many moderate hits, which can be broad overview sections, and it has a size bias: a parent
+with 30 children has more chances to place hits in the top-20 than one with 4, regardless of relevance.
+Normalising by the parent's child count (the fraction rule) removes that bias but then over-rewards tiny
+parents with one lucky hit. Pick by question type, and measure: the rules rank parents differently on
+the same child hits.
+
+### What it does not fix
+Parent-document retrieval fixes what the generator *sees*; it does nothing for what the index can
+*match*. The child is still embedded alone, so a child whose subject lives elsewhere in the section
+("The limit is 50 requests per minute." under a heading that names the endpoint and plan) only matches
+queries that do not mention the endpoint or plan. A query for "search endpoint Pro plan rate limit" can
+miss it, and the parent never gets fetched. The cheap remedy is to embed each child with its heading
+path prepended (`"API > Search > Pro plan: The limit is 50..."`) while storing the bare child for
+citation; the stronger one is contextual retrieval, which writes a chunk-specific context with an LLM.
+The two compose: contextualised children for matching, parents for answering.
 
 ## Example
-A minimal two-store implementation and the query-side join. `embed`, `index.add`, `index.search` and
-`split` are stubs for your encoder, vector store and chunker.
+A minimal two-store implementation and the query-side join, with heading paths prepended to children
+for matching. `embed`, `index.add`, `index.search` and `split` are stubs for your encoder, vector store and chunker.
 
 ```python
 from collections import defaultdict
@@ -101,12 +114,14 @@ from collections import defaultdict
 parents = {}                                   # parent_id -> {"text": ..., "doc": ...}
 
 def ingest(doc_id, text):
-    for p_i, section in enumerate(split(text, by="heading", max_tokens=1500)):
+    # split by heading yields (heading_path, section_text) pairs, e.g. ("API > Search", "...")
+    for p_i, (heading, section) in enumerate(split(text, by="heading", max_tokens=1500)):
         pid = f"{doc_id}#p{p_i}"
         parents[pid] = {"text": section, "doc": doc_id}
         for c_i, child in enumerate(split(section, max_tokens=200)):
-            index.add(id=f"{pid}#c{c_i}", vector=embed(child, kind="passage"),
-                      meta={"parent_id": pid, "child_text": child})
+            index.add(id=f"{pid}#c{c_i}",
+                      vector=embed(f"{heading}\n{child}", kind="passage"),  # heading aids matching
+                      meta={"parent_id": pid, "child_text": child})         # bare child for citing
 
 def retrieve_parents(query, k_children=20, n_parents=4):
     hits = index.search(embed(query, kind="query"), k_children)   # [(score, meta)]
@@ -129,8 +144,9 @@ ctx = retrieve_parents("What is the rate limit for the search endpoint on the Pr
 ## Trade-offs
 - Each hit now costs parent-sized context rather than child-sized, so fewer distinct sources fit a
   budget; this favours depth and flips against you when questions need breadth across many documents.
-- Children give sharp keys but the index holds many more vectors per document, raising storage and ANN
-  cost; the trade is worth it until index size, not quality, is the constraint.
+- Compared with indexing at parent size, children give sharp keys but the index holds several times more
+  vectors per document (125 versus 20 in the manual above), raising storage and ANN cost; the trade is
+  worth it until index size, not quality, is the constraint.
 - Deduplication removes redundant parents but collapses several strong hits into one source; for
   aggregation questions that want evidence from many places, return more parents or use sentence windows.
 - Structural parents (by heading) are coherent but vary wildly in size; fixed-size parents are
@@ -149,6 +165,8 @@ ctx = retrieve_parents("What is the rate limit for the search endpoint on the Pr
   `parent_id` lookups that miss and silently produce an empty context.
 - Children so small they are generic ("See below.", "Note:"); the symptom is high similarity scores on
   sentences that carry no information.
+- Assuming parents fix matching; the symptom is queries that name the product or plan still missing a
+  section whose children never mention it, until heading paths or contexts are prepended to children.
 
 ## When to use
 Use it for long, structured documents where answers depend on surrounding context: manuals, contracts,

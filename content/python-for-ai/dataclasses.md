@@ -5,7 +5,7 @@ name: dataclasses
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
@@ -89,6 +89,21 @@ way, so it is convenient for logging but expensive for large nested structures; 
 exposes the field metadata for generic code. `match_args` (3.10) lets instances be destructured in
 `match` statements positionally.
 
+### Inheritance and frozen derived fields
+Fields are collected by walking the class's bases in reverse MRO order: base-class fields come
+first, in their declaration order, then the subclass's, with a redeclared name keeping its original
+position. The generated `__init__` is one flat parameter list in that order, *which is why* a
+subclass cannot add a required field after a base that has a default: the signature would be
+`(model, temperature=0.0, tenant)`, which Python rejects. `kw_only=True` on the subclass, or a
+`_: KW_ONLY` sentinel before the new fields, moves them out of the positional sequence and the
+conflict disappears.
+
+Frozen classes have one sharp interaction with `__post_init__`. The generated `__init__` sets
+fields through `object.__setattr__` to bypass the freeze, but your `__post_init__` does not get that
+privilege: `self.n_tokens = ...` raises `FrozenInstanceError`. A derived field on a frozen class
+(`n_tokens: int = field(init=False)`) must be set with `object.__setattr__(self, "n_tokens", ...)`,
+the same escape hatch the decorator itself uses.
+
 ### Where it stops
 A dataclass does not validate types: `GenConfig(temperature="hot")` constructs happily. It does not
 parse JSON, generate schemas or coerce input. Those are Pydantic's responsibilities, and Pydantic
@@ -169,6 +184,9 @@ unhashable type`, because a frozen dataclass's hash is built from its fields and
   sets after mutation.
 - Putting a required field after a defaulted one in a subclass; the symptom is `TypeError:
   non-default argument follows default argument` at import, fixed by `kw_only=True`.
+- Assigning a derived field in `__post_init__` of a frozen dataclass; the symptom is
+  `FrozenInstanceError` raised from inside the constructor, which looks like the object was frozen
+  too early. Use `object.__setattr__` for that one assignment.
 - Expecting `GenConfig(temperature="0.7")` to coerce or fail; it stores the string, and the error
   appears later as a `TypeError` in arithmetic. Validate in `__post_init__` or use Pydantic.
 - Storing a list in a frozen dataclass and assuming the whole object is immutable; the reference is

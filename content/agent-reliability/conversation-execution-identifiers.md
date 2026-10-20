@@ -5,7 +5,7 @@ name: Conversation / execution identifiers
 kind: concept
 difficulty: core
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
   - agent-reliability/idempotent-tool-execution
@@ -62,6 +62,10 @@ tenant_id — user_id — conversation_id — turn_id — run_id — step — to
   work starts. A crash-resume continues the same run; a user-initiated "regenerate" or an automatic
   retry after failure starts a new run under the same turn with `attempt = n + 1`. Keys checkpoints
   and leases.
+- **parent_run_id**: for sub-agents. A child run gets its own run id (its own checkpoints, budget
+  and lease) plus a pointer to the parent run and the parent's tool call that spawned it. Because
+  then a crash-resume of the parent can find the child that already exists instead of spawning a
+  second one, and the trace shows the delegation tree rather than unrelated runs.
 - **step**: the index of the model call within the run; with run_id it addresses a checkpoint.
 - **tool_call_id**: assigned by the model API to each requested call (both the Claude and OpenAI
   APIs include one) and echoed back on the result so the API can pair them. It is an opaque,
@@ -88,6 +92,15 @@ Carry the id set as a context object (Python `contextvars`, Node `AsyncLocalStor
 line, metric, tool call and outbound request is tagged without threading parameters by hand. Put
 run_id, tool_call_id and the trace headers into outbound tool requests so the tool service's logs join
 back. Put the full id set into every event in the event log.
+
+### Identifiers are not authorization
+Every id the client sends (conversation id, turn id, run id in a reconnect URL) is a claim, not a
+credential. A server that loads `/conversations/{id}/events` without checking that the conversation
+belongs to the caller's tenant and user has an insecure direct object reference, and unguessable
+UUIDs only make the bug harder to find, not absent: ids leak through logs, shared links and browser
+history. Resolve the caller's identity from the auth token, then look up the object *scoped by*
+that identity (`where tenant_id = $1 and conversation_id = $2`). The same rule applies to tool
+services receiving `X-Run-Id`: it is for correlation, never for deciding what the caller may touch.
 
 ### What each id lets you do
 - Resume after a crash: run_id plus latest step.
@@ -147,11 +160,22 @@ def next_step() -> Ids:
 
 def call_tool(tool, name, args, call_index):
     ids = CURRENT.get()
-    headers = {"X-Run-Id": ids.run_id, "X-Trace-Id": ids.trace_id,
+    headers = {"X-Run-Id": ids.run_id,             # correlation only, never authorization
                "Idempotency-Key": ids.idem_key(call_index)}
+    # the trace context travels as the W3C `traceparent` header; let the OpenTelemetry
+    # propagator inject it (propagate.inject(headers)) rather than inventing a header
     log.info("tool_call", extra={"tool": name, **ids.fields()})
     return tool(name, args, headers=headers)
 ```
+
+Trace the three cases through this code. A user sends turn `t_41` and the POST times out; the client
+re-sends `t_41`, the server finds a run already exists for it and returns that run's stream, so
+nothing is minted. The run `r_a` crashes at step 3 while calling `create_ticket` as call 0; the
+resume restores `Ids(run_id="r_a", step=3)` from the checkpoint, so `idem_key(0)` hashes
+`"r_a:3:0"` again and the ticket API replays the first ticket. The user then clicks regenerate:
+`start_run` mints `r_b` with `attempt=2`, and step 3's key now hashes `"r_b:3:0"`, a different key,
+so a second ticket is possible by design. Whether that is right depends on whether `r_b` was told
+that `r_a` already created one, which is a product decision the ids make visible rather than hide.
 
 ## Trade-offs
 - Client-minted turn ids make submissions retry-safe, but you must validate them (format, uniqueness
@@ -176,6 +200,11 @@ def call_tool(tool, name, args, call_index):
   traces that cannot be joined when an incident needs them.
 - Forgetting to echo tool_call_id on the result; the symptom is provider API errors about unmatched
   tool calls and silently dropped results.
+- Loading objects by a client-supplied id without scoping by the caller's tenant; the symptom shows
+  up in a security review or a bug report, where one customer's conversation renders for another
+  after an id was pasted into a URL.
+- Sub-agents that reuse the parent's run id, or have no link to it; the symptom is children
+  overwriting the parent's checkpoints, or a resumed parent spawning a duplicate child.
 
 ## When to use
 Define the hierarchy on day one of any agent project; it costs nothing then and a migration later.

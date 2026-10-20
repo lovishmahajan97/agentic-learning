@@ -5,6 +5,7 @@ name: Generators
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/async-await
   - python-for-ai/context-managers-resource-cleanup
@@ -103,9 +104,9 @@ def embed_corpus(path: str, batch_size: int = 64) -> int:
     return sent
 ```
 Illustrative sizes: for a 4 GB JSONL corpus, the list-based version holds the parsed corpus plus every
-chunk in memory before the first API call. This pipeline holds one line, one document's chunks and one
-batch of 64 × 800 characters (about 50 KB of text) at a time, and the first batch is embedded within
-milliseconds of starting. A malformed line is skipped and logged rather than killing a long job.
+chunk in memory before the first API call. This pipeline holds one line, one parsed document and one
+batch of 64 × 800 characters (about 50 KB of text) at a time, and the first batch is ready to send within
+milliseconds of starting, instead of after the whole corpus is parsed. A malformed line is skipped and logged rather than killing a long job.
 
 ## Trade-offs
 - Lazy pipelines keep memory flat and deliver first results early, but each item is produced once; if

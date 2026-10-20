@@ -5,7 +5,7 @@ name: Train / validation / test split
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/train-test-leakage
   - training-adaptation/data-curation
@@ -63,6 +63,13 @@ training set is. With ten million rows a 1% test set is 100,000 rows, far more t
 fine-tuning examples a 10% slice is 200 rows with a standard error of about ±2 points, so it cannot
 reliably separate two models two points apart. Choose held-out
 sizes from the effect you need to detect, then give everything else to training.
+
+Comparing two models is a slightly different question from measuring one. If each were scored on an
+independent sample, the noise on the *difference* would be about √2 times the single-model error. Scoring
+both on the same items is better: most items are answered identically by both, and only the items where
+they disagree carry information about which is better. A paired test on those discordant items
+(McNemar's test, or a paired bootstrap over items) is therefore tighter than eyeballing two error bars,
+which is one more reason to keep the test set fixed and shared across every candidate.
 
 ### Ways to cut
 1. **Random.** Only valid when rows are independent and identically distributed, which is rarer than it
@@ -185,8 +192,8 @@ the number that matters. Sizing: 4,000 held-out tickets would give a standard er
 at 90% accuracy if tickets were independent, but tickets from one customer are correlated, so the
 effective sample lies somewhere between the ~300 held-out customers and the 4,000 tickets; expect wider
 error bars (a customer-level bootstrap measures them) and stratify by category so rare ticket types
-appear in every split. Finally, keep the test set untouched until the final
-comparison.
+appear in every split. Finally, keep the test set untouched until the final comparison, and make that
+comparison paired on the same customers so the error bar on the difference is as tight as the data allows.
 
 ## Quiz
 ### Q: Why keep a separate test set when a validation set already measures held-out performance?

@@ -4,8 +4,8 @@ module: rag-retrieval
 name: Inverted indexes
 kind: concept
 difficulty: core
-est_minutes: 13
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -86,6 +86,19 @@ termination: with BM25 you can precompute, per term, the maximum score any docum
 Algorithms like WAND and MaxScore use those upper bounds to skip documents that cannot enter the current
 top k, so a top-10 query over a term in ten million documents reads a small fraction of the list. This is
 why "return the top 10" is far cheaper than "return all matches sorted".
+
+MaxScore makes the idea concrete. Take an OR query "iphone15 case" where the rare term's maximum
+possible contribution is 9.0 and the common term's is 1.5. Fill the top-10 heap from the first documents
+seen; suppose its weakest entry, the threshold θ, is now 4.0. A document containing only "case" can
+score at most 1.5 < θ, so it can never enter the results, and "case" becomes a *non-essential* list: the
+engine stops iterating it and only advances the "iphone15" list, probing "case" (via skips) for the
+candidate ids that list produces. The common list's four million postings shrink to a few thousand
+lookups. WAND reaches the same effect by ordering cursors by current document id and summing upper
+bounds until they exceed θ. Block-max variants keep enough per-block data to bound the score within each block of postings
+rather than only per term (Lucene stores these as *impacts*, frequency and length pairs), so even a
+common term can skip blocks whose local maximum is low.
+The pruning is exact, not approximate: the top k is identical to scoring everything, only cheaper, and
+it gets better as θ rises, which is why engines prefer not to compute an exact total hit count.
 
 Ranking needs per-document data too: BM25 wants document length, which is stored in a separate per-field
 norms structure, and collection-wide N and average length, which are index statistics. In a sharded
@@ -181,6 +194,10 @@ dictionary of terms, sorted lists, and merge-style traversal.
   that pins a CPU, because it expands to thousands of terms and thousands of posting-list reads.
 - Reading per-shard scores as globally comparable; the symptom is the same document scoring differently
   after a reshard, because document frequency was computed per shard.
+- Loading learned sparse vectors (SPLADE-style expansions) into an engine tuned for BM25 postings; query
+  latency can be far higher than BM25 on the same index, because expanded queries have many terms with
+  similar weights, which leaves dynamic pruning little to skip. Measure p99 before assuming "it is just
+  an inverted index".
 
 ## When to use
 Any time text must be found by the terms it contains: lexical search, BM25, keyword filters, log search,

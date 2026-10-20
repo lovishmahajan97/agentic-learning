@@ -5,7 +5,7 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - evals/benchmarking
   - evals/eval-harness

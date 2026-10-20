@@ -5,7 +5,7 @@ name: PostgreSQL transactions & isolation levels
 kind: concept
 difficulty: core
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -49,7 +49,10 @@ levels is cheaper than debugging a tenant whose token usage no longer adds up.
 A transaction (`BEGIN` ... `COMMIT`) is **atomic**: all of its writes become visible together or none do,
 via rollback. **Consistency** means constraints hold at commit. **Isolation** is the subject of this
 lesson. **Durability** means a committed transaction survives a crash, which PostgreSQL achieves by
-writing to the write-ahead log and fsyncing it before acknowledging the commit.
+writing to the write-ahead log and fsyncing it before acknowledging the commit. That fsync is the floor
+on commit latency, which is why batching many small writes into one transaction is faster than committing
+each, and why `synchronous_commit = off` (per transaction if you like) exists: it acknowledges before the
+flush, risking the loss of the last few commits on a crash, but never corruption.
 
 ### MVCC: versions instead of locks
 Every row version carries the id of the transaction that created it (`xmin`) and, once updated or
@@ -82,11 +85,24 @@ because MVCC never exposes uncommitted data):
    a time, with no explicit locking, at the cost of extra bookkeeping and more `40001` aborts under
    contention. Any code using it must retry.
 
+### The anomalies, side by side
+Naming the anomalies makes the levels easy to compare (PostgreSQL behaviour, which is stricter than the
+SQL standard's minimums):
+- **Dirty read** (seeing another transaction's uncommitted write): impossible at every level.
+- **Non-repeatable read and phantom** (a re-read returns changed values or new rows): possible at READ
+  COMMITTED; prevented at REPEATABLE READ and SERIALIZABLE.
+- **Lost update** (two read-modify-writes, one overwrites the other): possible at READ COMMITTED; at
+  REPEATABLE READ the second writer gets `40001` instead.
+- **Write skew** (two transactions read an overlapping condition and write *different* rows): possible
+  at READ COMMITTED and REPEATABLE READ; prevented only at SERIALIZABLE.
+
 ### The lost update, concretely
 Tenant budget 1,000,000 tokens, 999,000 used. Two requests costing 800 each run `SELECT tokens_used`,
 both read 999,000, both compute 999,800 ≤ 1,000,000, both `UPDATE tokens_used = 999800`. Final value:
 999,800, real usage 1,000,600, and the budget was exceeded without any error. Under READ COMMITTED this is
-fully allowed. Three fixes, each with a different cost:
+fully allowed: the second `UPDATE` does wait for the first's row lock and re-checks its `WHERE` on the
+new version, but its `SET` assigns the constant 999,800 that the application computed from a stale read,
+so re-evaluation changes nothing. The fixes below work by moving the read inside the protected step. Three fixes, each with a different cost:
 - **Atomic update:** `UPDATE tenants SET tokens_used = tokens_used + 800 WHERE id = $1 AND
   tokens_used + 800 <= budget RETURNING tokens_used`. The check and the write are one statement that
   waits for the row lock, re-evaluates, and returns zero rows if the budget is now blown. Cheapest, and

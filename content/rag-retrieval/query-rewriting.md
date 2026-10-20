@@ -5,7 +5,7 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/hyde
@@ -71,14 +71,25 @@ because the rewrite is for the index, not for the answer.
 6. **Routing and filtering.** Emit structured filters (product, date range, document type) alongside the
    query so the retriever can restrict the candidate pool, and emit "no retrieval" for greetings or
    requests that are about the conversation itself.
+7. **Document-shaped rewriting.** Instead of a better question, write a hypothetical answer passage and
+   search with that (HyDE). It targets a different mismatch, question shape versus passage shape in
+   embedding space, and has its own lesson.
+
+Each form fixes one specific mismatch, which is why a rewriter should be built from failure analysis
+rather than switched on wholesale: condensing fixes missing references, normalisation fixes spelling and
+aliases, expansion and step-back fix vocabulary and abstraction gaps, extraction fixes dilution, routing
+fixes scope.
 
 The research framing (Ma et al.) treats the rewriter as a trainable module optimised by feedback from
 downstream answer quality, with the LLM reader frozen. In production the same shape is usually a
 prompted small model, because the input is short and the output is shorter.
 
 ### Design choices and why
-- **Always retrieve for the original query too.** A rewrite can drift; fusing results from the original
-  and the rewrite(s) means a bad rewrite degrades gracefully instead of replacing a working path.
+- **Always retrieve for the original query too, but weight it.** A rewrite can drift; fusing results from
+  the original and the rewrite(s) means a bad rewrite degrades gracefully instead of replacing a working
+  path. The original is not always a good list, though: "and on Android?" retrieves noise, and with
+  plain RRF over two lists that noise takes roughly half the fused top-k. Give the original a lower fusion
+  weight when the rewriter reports it is not standalone, and an equal weight when it is.
 - **Protect literals.** Instruct the rewriter never to alter quoted strings, codes, numbers or version
   identifiers. Normalisation that "fixes" `ERR_4012` into `error 4012` breaks the one exact match you had.
 - **Use a small, fast model and cache.** The rewrite adds a sequential LLM call to every request. Keying
@@ -102,7 +113,8 @@ REWRITE_PROMPT = """Conversation so far:
 Latest user message: {query}
 Rewrite the latest message as 1-3 standalone search queries for a product documentation index.
 Keep every code, number and quoted string exactly as written. Use the documentation's own terms
-(plan, seat, workspace). Return JSON: {{"queries": [...], "needs_retrieval": true|false}}"""
+(plan, seat, workspace). Return JSON: {{"queries": [...], "standalone": true|false, "needs_retrieval": true|false}}
+"standalone" means the latest message is understandable without the conversation."""
 
 _cache = {}
 
@@ -113,29 +125,32 @@ def rewrite(history, query):
         try:                                       # validate: never trust the format
             plan = json.loads(raw)
             qs = [q for q in plan["queries"] if isinstance(q, str)][:3]
-            plan = {"queries": qs, "needs_retrieval": plan["needs_retrieval"] is not False}
+            plan = {"queries": qs, "standalone": plan.get("standalone") is not False,
+                    "needs_retrieval": plan["needs_retrieval"] is not False}
         except (ValueError, KeyError, TypeError):
-            plan = {"queries": [], "needs_retrieval": True}   # fall back to the original query
+            plan = {"queries": [], "standalone": True, "needs_retrieval": True}  # original only
         _cache[key] = plan
     return _cache[key]
 
-def rrf(ranked_lists, c=60):
+def rrf(ranked_lists, weights, c=60):            # weighted reciprocal rank fusion
     scores = {}
-    for lst in ranked_lists:
+    for lst, w in zip(ranked_lists, weights):
         for rank, cid in enumerate(lst):
-            scores[cid] = scores.get(cid, 0.0) + 1.0 / (c + rank + 1)
+            scores[cid] = scores.get(cid, 0.0) + w / (c + rank + 1)
     return sorted(scores, key=scores.get, reverse=True)
 
 def search(history, query, k=8):
     plan = rewrite(history, query)
     if not plan["needs_retrieval"]:
         return []
-    queries = [query] + plan["queries"]            # original always included
-    return rrf([retrieve(q, 20) for q in queries])[:k]
+    queries = [query] + plan["queries"]            # original always included...
+    weights = [1.0 if plan["standalone"] else 0.3] + [1.0] * len(plan["queries"])  # ...but down-weighted
+    return rrf([retrieve(q, 20) for q in queries], weights)[:k]
 
 ctx = search("user: how do I turn on push notifications?\nassistant: In Settings > Alerts...",
              "and on Android?")
-# the rewrite becomes e.g. "enable push notifications on Android", which the index can actually match
+# rewrite: "enable push notifications on Android", standalone=false, so the bare "and on Android?"
+# list (generic Android pages) only fills slots the rewrite's list leaves weakly supported
 ```
 
 ## Trade-offs
@@ -155,6 +170,8 @@ ctx = search("user: how do I turn on push notifications?\nassistant: In Settings
   document containing the error code, right after rewriting was introduced.
 - Retrieving only for the rewrite and never the original; the symptom is a regression on simple queries
   that worked before the rewriter shipped.
+- Fusing a non-standalone original at full weight; the symptom is follow-up answers whose context is half
+  generic passages matching only the fragment ("Android", "pricing") rather than the actual question.
 - Rewriting and retrieving for every turn including "thanks"; the symptom is wasted calls and odd snippets
   injected into small talk.
 - Judging the feature by reading rewrites that "look better" instead of measuring recall@k before and

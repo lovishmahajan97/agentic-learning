@@ -5,7 +5,7 @@ name: Exactly-once processing limitations
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - system-design/outbox-inbox-patterns
   - system-design/event-driven-architecture
@@ -66,6 +66,12 @@ Take at-least-once delivery and make processing idempotent. Two mechanisms do th
    `SET status='paid'`, an upsert keyed by order id, `PUT` rather than `POST`. No dedupe state is needed,
    but the effect must be formulated as an absolute state rather than a delta (`balance += 10` is not
    idempotent; `balance = 110 WHERE version = 7` is).
+3. **Store the input position with the effect.** A consumer that writes to a database can save the
+   source offset (topic, partition, offset) in the same transaction as its output, and on restart seek
+   to the stored offset instead of trusting the broker's committed one. The offset *is* the dedupe
+   record: a message is either reflected in both the output and the stored offset or in neither. This
+   works only when one consumer owns each partition's offset row, and it is the usual way to get
+   exactly-once from a log into a relational sink.
 
 ### What Kafka's "exactly-once semantics" actually covers
 The **idempotent producer** attaches a producer id and a per-partition sequence number to every batch;
@@ -111,46 +117,47 @@ yes, the effect is exactly-once within the dedupe window. If no, it is at-least-
 idempotency key honoured by the receiver, a memoised result, or acceptance of duplicates.
 
 ## Example
-An agent tool step that must happen at most once per `(run_id, step_id)`, even though the worker can be
-killed at any point and the step itself (a model call that produces a message) is non-deterministic. The
-result is memoised under the key inside the same transaction that marks the step done; an external send
-is made idempotent by passing the same key to the provider.
+An agent step must email a customer a model-written draft at most once per `(run_id, step_id)`, even
+though the worker can be killed at any instruction and the model is non-deterministic. The step is split
+into phases, each idempotent on its own, with the state persisted between them.
 
 ```python
-import json, psycopg
+import psycopg   # conn opened with autocommit=True: each statement commits on its own
 
-# CREATE TABLE step_results (step_key TEXT PRIMARY KEY, result JSONB NOT NULL,
-#                            committed_at TIMESTAMPTZ DEFAULT now());
+# CREATE TABLE step_results (step_key TEXT PRIMARY KEY, draft TEXT NOT NULL,
+#                            status TEXT NOT NULL);           -- 'drafted' | 'sent'
 
-def run_step_once(conn, run_id, step_id, llm, mailer, prompt):
-    key = f"{run_id}:{step_id}"                       # stable across every retry
-    row = conn.execute("SELECT result FROM step_results WHERE step_key = %s", (key,)).fetchone()
-    if row:
-        return row[0]                                 # replay: reuse the memoised output
+def load(conn, key):
+    return conn.execute("SELECT status, draft FROM step_results WHERE step_key = %s",
+                        (key,)).fetchone()
 
-    draft = llm.complete(prompt)                      # non-deterministic; must not be redone later
-    # the external send is at-least-once from our side; the provider dedupes on this key
-    mailer.send(to="customer@example.com", body=draft, idempotency_key=key)
-
-    with conn.transaction():
-        cur = conn.execute("""INSERT INTO step_results (step_key, result) VALUES (%s, %s)
-                              ON CONFLICT (step_key) DO NOTHING""", (key, json.dumps({"draft": draft})))
-        if cur.rowcount == 0:                         # a concurrent worker won the race
-            return conn.execute("SELECT result FROM step_results WHERE step_key = %s",
-                                (key,)).fetchone()[0]
-    return {"draft": draft}
-
-# Failure analysis:
-# - killed before llm.complete: nothing happened; retry is clean.
-# - killed after mailer.send, before INSERT: retry calls the LLM again (new draft!) and sends again;
-#   the provider's idempotency key suppresses the second email, but the memoised draft may differ
-#   from what was sent. To close that gap, persist the draft BEFORE sending, then send, then mark sent.
-# - killed after INSERT: retry returns the stored result; no model call, no send.
+def email_draft_once(conn, run_id, step_id, llm, mailer, prompt, to):
+    key = f"{run_id}:{step_id}"                    # stable across every retry, never per attempt
+    row = load(conn, key)
+    if row is None:                                # phase 1: generate once, persist before acting
+        draft = llm.complete(prompt)
+        conn.execute("""INSERT INTO step_results (step_key, draft, status)
+                        VALUES (%s, %s, 'drafted') ON CONFLICT (step_key) DO NOTHING""",
+                     (key, draft))
+        row = load(conn, key)                      # if a racing worker inserted first, use ITS draft
+    status, draft = row
+    if status == "sent":
+        return draft                               # replay: no model call, no send
+    mailer.send(to=to, body=draft, idempotency_key=key)   # phase 2: provider dedupes on key
+    conn.execute("UPDATE step_results SET status = 'sent' WHERE step_key = %s",
+                 (key,))                           # phase 3: mark sent
+    return draft
 ```
 
-The comment block is the point: even with a dedupe table and a provider-side idempotency key, the order
-of persist, send and commit decides which duplicates remain possible. The fully safe version is three
-phases (persist draft, send with key, mark sent), each idempotent on its own.
+Walk the kill points. Killed during the model call or before the insert: the retry calls the model again,
+which wastes tokens but has no visible effect, because nothing was sent. Killed after the insert, before
+the send: the retry finds `drafted`, skips the model and sends the *stored* draft, so what is sent is the
+same text whichever attempt sends it. Killed after the send, before the update: the retry sends again
+with the same key and the provider suppresses the duplicate, as long as its key retention outlasts the
+retry delay. Killed after the update: the retry returns immediately. Two workers racing on the same key
+both may call the model, but `ON CONFLICT DO NOTHING` keeps the first draft and both send that one with
+one key. The single residual duplicate is the third kill point with a provider that ignores idempotency
+keys; no ordering of our code can remove it, which is the two-generals result showing up in practice.
 
 ## Trade-offs
 - At-least-once with idempotent consumers is cheap, broker-agnostic and robust, but it pushes dedupe
@@ -214,7 +221,8 @@ marker only after the call returns and accept that a preemption between the post
 produce a duplicate. Reduce that window by making the marker write the very next operation, and add a
 reconciliation that searches the channel for the summary's correlation id before any retry. State the
 residual risk explicitly: with a provider that lacks idempotency keys, the duplicate probability equals
-the crash probability inside a window of a few milliseconds, which is tiny but not zero.
+the probability of a crash between Slack accepting the post and our marker committing, a window of one
+response round trip plus one write, which is small but not zero.
 
 ## Quiz
 ### Q: Why can no protocol over a lossy network guarantee exactly-once delivery?

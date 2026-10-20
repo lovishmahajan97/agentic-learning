@@ -5,7 +5,7 @@ name: Error analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -57,7 +57,10 @@ final output. Attribution is impossible from the final answer alone. Take a rand
 production or from the last eval run for honest prevalence numbers, and add a stratified sample (by
 feature, user segment, input length, or the items that failed) so rare slices appear at all. Keep
 reading until new traces stop producing new categories; qualitative researchers call this saturation.
-In practice that is dozens to low hundreds of traces per round.
+In practice that is dozens to low hundreds of traces per round. The sizing arithmetic is worth knowing:
+a failure mode with prevalence *p* appears at least once in *n* random traces with probability
+1 − (1 − p)ⁿ. At n = 100, a 2% mode shows up about 87% of the time and a 1% mode only about 63%, which
+is why rare-but-severe modes need the stratified sample rather than a bigger random one.
 
 ### 2. Open coding: write what went wrong, in free text
 For each trace record pass/fail and a one- or two-sentence note describing the **first** thing that
@@ -70,7 +73,9 @@ and bring in a second annotator later to measure agreement on the definitions th
 
 ### 3. Axial coding: group notes into failure modes
 Cluster the notes into a taxonomy, typically five to fifteen categories, each with a crisp definition
-and one positive and one negative example. Merge categories you cannot tell apart; split a category
+and one positive and one negative example. An LLM can propose a first clustering of the *human-written*
+notes, which saves time on a few hundred rows, but a person accepts, merges and renames the clusters,
+*because* the model groups by surface wording while the useful grouping is by remediation. Merge categories you cannot tell apart; split a category
 when its members need different fixes. The test of a good category is behavioural: two people given
 the definition label the same trace the same way, and the category implies a specific remediation.
 "Model did not understand" fails that test; "answered for the wrong product tier" passes.
@@ -80,6 +85,16 @@ Tally failures per category and sort: a Pareto chart. Priority is roughly freque
 fixability. Severity matters *because* a wrong refund amount at 6% of failures outranks a formatting
 slip at 20%. Fixability matters *because* a retrieval filter is a day's work while a model-capability
 gap may need a different model or a different product decision.
+
+Two sanity checks belong here. First, **ceiling analysis** (Ng's term): fixing a category perfectly can
+raise the pass rate by at most that category's share of *all* traces, not of failures. A category with
+13 of 100 traces caps the gain at 13 points, so if the target is +20 points, no single fix gets there and
+you know it before writing code. Second, **noise**: counts from one round are estimates. A rate of 13 in
+100 has a standard error of about √(0.13 × 0.87 / 100) ≈ 3.4 points, so a 95% interval of roughly
+6–20%; two categories at 7 and 9 are effectively tied, and the ranking among small categories should
+not drive the roadmap. For classification or extraction tasks with a closed label set, the confusion
+matrix *is* the count table: the off-diagonal cells are the failure modes, and the largest one is where
+to start.
 
 ### 5. Fix one thing and re-measure on the same sample
 Change the top-priority component, then re-run the same traces plus the eval set. Confirm that the
@@ -118,7 +133,11 @@ is mostly a metadata-filter problem, so the first fix is retrieval (hybrid searc
 "guesses account data" is only 6 cases but highest severity, so it is second, fixed with a handoff
 rule and a deterministic grader. Re-running the same 100 traces after the retrieval fix: retrieval
 failures 13 → 4, wrong tier 5 → 2 (the tier filter), contradictions unchanged at 7 (expected,
-generation was untouched), total 36 → 24.
+generation was untouched), total 36 → 24. Ceiling analysis predicted this shape: the two categories
+touched held 18 of 100 traces, so +18 points was the most the fix could buy, and it bought +12. The
+remaining 24 failures are now led by "contradicts context" (7) and "guessed account data" (6), which
+is the next round's agenda; a confirm run on a fresh 100 traces checks that the gain was not specific
+to the traces the fix was tuned on.
 The schema and the counting are a few lines:
 
 ```python

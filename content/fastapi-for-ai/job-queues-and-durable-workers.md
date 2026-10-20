@@ -5,6 +5,7 @@ name: Job queues & durable workers (Celery / ARQ + job-status endpoint)
 kind: pattern
 difficulty: core
 est_minutes: 18
+status: reviewed
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/message-queues
@@ -86,7 +87,12 @@ a database pool) into `ctx`. Enqueue with `await pool.enqueue_job("name", *args,
 id that already exists is not enqueued again, which gives you deduplication for free. Retries are
 requested by raising `arq.Retry(defer=seconds)`. One worker process holds `max_jobs` concurrent
 coroutines, so a single process can keep many LLM calls in flight, which is exactly the shape of
-IO-bound AI work. It is Redis-only and small, with no canvas, routing or RabbitMQ.
+IO-bound AI work. Retries are narrower than in Celery: raising `arq.Retry`, a job interrupted by
+worker shutdown, or a job whose worker died (picked up again once its in-progress marker expires)
+gets another try, up to `max_tries`; any other exception marks the job failed. So classify errors
+yourself: transient ones (a provider 429 or 5xx, a network timeout) become `Retry` with a growing
+`defer`, permanent ones (bad input, a document that no longer exists) fail immediately. It is Redis-only and small: named queues exist, but
+there are no canvas workflows, priorities or RabbitMQ.
 
 ### Choosing
 Pick Celery when the organisation already runs it, when you need RabbitMQ, multiple queues with
@@ -106,7 +112,9 @@ concurrency by provider rate limits and memory, not CPU.
 ## Example
 The FastAPI side of the contract with an ARQ worker. The job row is committed before enqueueing, the
 status endpoint hides other users' jobs, and the worker checks status first so a redelivered job is a
-no-op. `db` stands for your async data-access layer.
+no-op, a retry skips documents already summarised, and only transient provider errors are retried.
+`db` stands for your async data-access layer and `TransientLLMError` for however your client
+signals a 429, 5xx or timeout.
 
 ```python
 import uuid
@@ -128,7 +136,7 @@ async def create(body: Req, request: Request, response: Response):
     return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
 @app.get("/jobs/{job_id}")
-async def status(job_id: str, user_id: str, response: Response):
+async def status(job_id: str, user_id: str, response: Response):      # user_id: from your auth dependency in real code
     job = await db.get_job(job_id)
     if job is None or job.owner != user_id:
         raise HTTPException(404)                                            # 404, not 403: don't leak ids
@@ -137,6 +145,7 @@ async def status(job_id: str, user_id: str, response: Response):
     return {"status": job.status, "progress": job.progress, "result_url": job.result_url, "error": job.error}
 
 # worker.py  — run with:  arq worker.WorkerSettings
+from arq import Retry
 from arq.connections import RedisSettings
 
 async def summarize_corpus(ctx, job_id: str, corpus_id: str):
@@ -146,11 +155,17 @@ async def summarize_corpus(ctx, job_id: str, corpus_id: str):
     try:
         docs = await db.docs(corpus_id)
         for i, doc in enumerate(docs, 1):
+            if await db.has_summary(doc.id):                                 # resume: don't pay twice
+                continue
             await db.upsert_summary(doc.id, await ctx["llm"].summarize(doc))   # idempotent write per doc
             await db.set_progress(job_id, i, len(docs))
         await db.set_status(job_id, "succeeded", result_url=f"/corpora/{corpus_id}/summaries")
+    except TransientLLMError as exc:                                         # 429/5xx/timeout from the provider
+        if ctx["job_try"] < 3:                                               # keep in step with max_tries
+            raise Retry(defer=ctx["job_try"] * 30)                           # back off longer on each try
+        await db.set_status(job_id, "failed", error=type(exc).__name__); raise   # out of tries: row must not stay "running"
     except Exception as exc:
-        await db.set_status(job_id, "failed", error=type(exc).__name__); raise   # raise so ARQ counts the try
+        await db.set_status(job_id, "failed", error=type(exc).__name__); raise   # ARQ records failure; only arq.Retry re-runs
 
 class WorkerSettings:
     functions = [summarize_corpus]
@@ -168,8 +183,8 @@ class WorkerSettings:
 - Polling a status endpoint is simple and stateless, but at scale it becomes your highest-QPS route;
   once clients number in the thousands, push via SSE or webhooks pays for itself.
 - Celery's breadth (brokers, routing, Beat, canvas) buys flexibility at the price of sync task bodies
-  and more configuration; ARQ's asyncio model fits LLM IO perfectly but stops at Redis and a single
-  queue abstraction.
+  and more configuration; ARQ's asyncio model fits LLM IO well but stops at Redis and a deliberately
+  minimal feature set (no canvas, no priorities, retries only on explicit `Retry`).
 
 ## Pitfalls
 - Enqueueing before the job row is committed; the symptom is workers logging "job not found" and
@@ -180,8 +195,9 @@ class WorkerSettings:
   a worker is OOM-killed.
 - A Redis `visibility_timeout` shorter than the longest job; the symptom is the same job id appearing
   twice in worker logs and doubled model spend.
-- Serving status from the broker's result backend; the symptom is `404` for jobs older than the
-  result TTL, typically an hour.
+- Serving status from the broker's result backend; the symptom is finished jobs that look unknown
+  once the result TTL passes (Celery reports an expired id as `PENDING`; its `result_expires` defaults
+  to one day, ARQ's `keep_result` to one hour).
 - No ownership check on the status route; the symptom is a security finding that job ids, often
   sequential, expose other tenants' results.
 - Clients polling in tight loops; the symptom is the status endpoint dominating request volume; send
@@ -210,12 +226,14 @@ beats the result backend, and say what at-least-once forces on job bodies.
 **Q:** A worker crashes halfway through summarising 1,000 documents. Walk through what happens with
 Celery at default settings, with `acks_late=True`, and what your job code must do in each case.
 **A:** At default settings Celery acknowledges the message on receipt, so after the crash the broker
-considers it done: the job row stays `running` forever, 600 summaries are missing, and nobody retries.
+considers it done: the job row stays `running` forever, about 500 summaries are missing, and nobody
+retries.
 A sweeper that marks stale `running` jobs as failed is the minimum mitigation. With `acks_late=True`
-(and `task_reject_on_worker_lost`) the message is redelivered after the visibility timeout, so the
-job runs again from the start on another worker. For that to be correct, the task must be idempotent:
+(and `task_reject_on_worker_lost`) the unacknowledged message is redelivered, after the visibility
+timeout on Redis or SQS or as soon as the worker's connection drops on RabbitMQ, so the job runs again
+from the start on another worker. For that to be correct, the task must be idempotent:
 check the job status first, skip documents that already have a summary (upsert keyed by document id),
-and update progress monotonically, so the second run does the remaining 600 and marks success. In both
+and update progress monotonically, so the second run does only the remaining ~500 and marks success. In both
 cases the row, not the broker, is what the status endpoint and the on-call engineer read.
 
 ## Quiz

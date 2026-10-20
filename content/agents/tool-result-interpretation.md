@@ -5,7 +5,7 @@ name: Tool-result interpretation
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts
@@ -63,6 +63,10 @@ for human readers, not for correctness.
   handle (`result_ref`, `file_id`) that a second tool can expand.
 - **Structured over prose for data**, prose for explanations. JSON or a small table is easier to
   quote accurately than a paragraph.
+- **Freshness and source.** An `as_of` timestamp and the system of record (`"source": "billing"`)
+  let the model reconcile two results that disagree (the CRM says "active", billing says "cancelled
+  yesterday") by preferring the authoritative or newer one and saying so, instead of picking whichever
+  it read last or blending them into a third answer neither system gave.
 - **Errors say what to do.** "order not found; ids look like ORD-123456" lets the model fix the call;
   a stack trace does not and may leak internals.
 
@@ -133,6 +137,16 @@ def wrap_untrusted(text: str, source: str) -> str:
 result_text, is_error = shape_search_result(upstream.search(customer_id="C-9"), limit=20)
 page_text = wrap_untrusted(fetch("https://example.com/policy"), source="web")
 ```
+
+The difference on one real-shaped turn. A user asks "do I have any open orders?" and the search backend
+times out. With a pass-through handler the result is `[]`, and the model, reading an empty list as
+evidence, replies "You have no open orders": a confident false negative, and the user may reorder. With
+the normalizer the model receives `is_error: true` and `kind: upstream_unavailable, retryable: true`; it
+retries once, and if that fails it says the order system is not responding. On success with 340 matches
+and `limit=20`, it receives `returned: 20, total_matches: 340, truncated: true`, so it says "here are
+the 20 most recent of 340" rather than "you have 20 orders". Each fix is one field, and each turns a
+plausible wrong sentence into a correct one, *because* the model can only be as precise as the
+distinctions the result makes explicit.
 
 ## Trade-offs
 - Projecting results to the task's fields saves tokens and improves accuracy, but hides fields the

@@ -5,7 +5,7 @@ name: Python
 kind: tool
 difficulty: intro
 est_minutes: 10
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/async-await
   - python-for-ai/gil
@@ -66,6 +66,26 @@ object rather than a thread stack. This is the shape of an LLM backend: fan out 
 with a `Semaphore` to respect provider rate limits, gather results. The one rule that matters is that
 a blocking call inside a coroutine (a sync HTTP client, `time.sleep`, a heavy loop) freezes the whole
 loop, because nothing else can run until it returns.
+
+The arithmetic is what makes this the right shape. If 500 requests each await a 4-second model call,
+a thread-per-request design needs 500 threads, each with its own stack, and pays OS context switches
+to do nothing; the event loop holds 500 suspended coroutine objects and wakes each one when its socket
+has bytes. Work done *per request* in Python (building the payload, parsing the reply) is typically
+well under a millisecond, so a single loop is idle most of the time even at that concurrency.
+
+### Picking the tool for each kind of work
+The decision follows from two questions: does the work wait or compute, and does it hold the GIL?
+
+| Work | Holds the GIL? | Where it runs |
+|---|---|---|
+| Async I/O (httpx, async DB driver, provider async client) | No, it waits | `await` it on the loop |
+| Blocking I/O from a sync-only library | Released while blocked | `await asyncio.to_thread(fn, ...)` |
+| Native compute that releases the GIL (NumPy, PyTorch, hashing) | Released | a thread (`to_thread`) so the loop stays free |
+| Pure-Python CPU work (parsing, loops over dicts) | Held | `ProcessPoolExecutor`, or move it to a worker service |
+
+Threads are cheaper than processes (shared memory, no pickling of arguments and results) but only help
+when the GIL is released; processes always parallelise but every call pays serialisation, so they pay
+off only when the work is much larger than its inputs and outputs.
 
 ### Types and Pydantic
 Type hints are annotations; the interpreter does not enforce them. That is fine inside your code with
@@ -142,6 +162,9 @@ if __name__ == "__main__":                      # required when workers are spaw
   blocked on sockets, and the fix is concurrency, not multiprocessing.
 - Trusting type hints as validation; a model returns `"confidence": "high"` and the code crashes three
   functions later instead of at the boundary.
+- Firing `asyncio.create_task(...)` and dropping the returned task; the loop keeps only a weak
+  reference, so the task can be garbage-collected mid-flight and the symptom is background work
+  (a log write, a cache fill) that silently never completes. Keep a reference or use a `TaskGroup`.
 - Unpinned dependencies in an AI service; a transitive upgrade of a tokenizer or SDK changes outputs
   and the symptom is evals drifting with no code change.
 
@@ -149,7 +172,10 @@ if __name__ == "__main__":                      # required when workers are spaw
 Default to Python for anything that touches models, tokenizers, embeddings, evals or data preparation,
 and for the service layer that orchestrates them: the library support decides it. Keep CPU-bound hot
 paths in native code or separate processes, and measure before assuming Python is the bottleneck;
-in most LLM services the model call dominates by two or three orders of magnitude. Consider another
+in most LLM services the model call dominates by two or three orders of magnitude. The measurements
+that settle it are event-loop lag (asyncio's debug mode logs any callback that runs longer than
+`slow_callback_duration`, 100 ms by default), CPU utilisation per worker under load, and a profiler
+sample (py-spy) showing whether time is spent in Python frames or waiting on sockets. Consider another
 language for the product edge (TypeScript next to the UI) or for a tiny, extremely high-throughput
 proxy where microseconds matter. In interviews, the expected depth is explaining the GIL precisely
 (what it blocks, when it is released), why `asyncio` fits LLM workloads, and why Pydantic sits at

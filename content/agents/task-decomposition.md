@@ -5,7 +5,7 @@ name: Task decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agents/planning
   - agents/multi-agent-patterns
@@ -91,6 +91,19 @@ and structured results, not raw transcripts, *because* the downstream model will
 irrelevant detail and the token bill grows with every edge. Keep a shared, read-only "task brief" that
 every subtask sees so that terminology and constraints stay consistent.
 
+### The arithmetic of seams
+Three numbers decide whether a decomposition pays. **Reliability compounds along chains:** if each of
+*n* sequential subtasks succeeds independently with probability *p*, the chain succeeds with *pⁿ*, so
+ten steps at 95% each finish cleanly only about 60% of the time (0.95¹⁰ ≈ 0.60). That is why each
+subtask needs a verifier and a retry: a step that is checked and retried once fails only when both
+attempts fail, roughly (1 − p)² if failures are independent, which lifts the chain back up. It is also
+why a long chain is a worse decomposition than a wide fan-out of the same size. **Latency follows the
+critical path:** with unlimited concurrency, wall-clock time is the longest dependency chain, not the
+number of subtasks, so flattening a five-deep chain into one fan-out plus a merge can cut latency by
+several times while doing the same work. **Cost follows the edges:** total tokens ≈ Σ (task brief +
+own inputs + upstream results passed in), so a fat transcript on one edge is paid by every consumer of
+that edge. Sketch these three numbers for a proposed graph before building it.
+
 ### Recomposition
 The final step merges results. It is a subtask like any other, with its own contract: it must resolve
 conflicts between pieces (two researchers found different prices), enforce consistency and produce the
@@ -162,6 +175,8 @@ as its own dependencies finish (one task per node awaiting its parents) to cut w
   that needed two, and a budget blown before any work happens.
 - Hidden dependencies not declared in the graph; the symptom is intermittent failures when a subtask
   happens to run before the one it silently relied on.
+- Long unverified chains; the symptom is end-to-end success far below what any single step's
+  success rate suggests, because per-step failures multiply.
 
 ## When to use
 Decompose when a task has more than a few distinct pieces of work, when parts can be verified
@@ -190,7 +205,9 @@ clause type in the taxonomy is marked present or absent". These chunks are indep
 parallel with small contexts, which fixes both the deep-clause misses (each chunk gets full attention)
 and the cost (no step re-reads the whole document). Add a recomposition subtask that merges per-chunk
 results, resolves conflicts such as a defined term redefined later, and flags clauses found in two
-places. Pass the merge step only the structured extractions plus chunk references so it can fetch the
+places. Chunking cuts across one real dependency: clauses refer to definitions and other sections
+("as defined in Section 1.4"), so either give every chunk the definitions section as part of the shared
+brief, or overlap chunks at boundaries; otherwise a chunk extracts a clause whose meaning it cannot see. Pass the merge step only the structured extractions plus chunk references so it can fetch the
 raw text when needed. Measure recall per clause type before and after, and tokens per contract.
 
 ## Quiz

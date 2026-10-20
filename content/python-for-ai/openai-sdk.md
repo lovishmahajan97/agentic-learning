@@ -5,6 +5,7 @@ name: OpenAI SDK
 kind: tool
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/anthropic-sdk
   - python-for-ai/litellm
@@ -48,7 +49,9 @@ the exact messages, the tool schema, the `usage` counts and the request ID you g
 builds an `httpx` client with connection pooling. `AsyncOpenAI` exposes the same methods as coroutines
 for servers built on asyncio. Create one client per process and reuse it, because each client owns a
 connection pool; constructing one per request defeats keep-alive. `base_url` points the same client at
-any compatible server; Azure has a dedicated `AzureOpenAI` client because its URLs and auth differ.
+any compatible server; Azure has a dedicated `AzureOpenAI` client because its classic deployment-based
+URLs, `api-version` parameter and Entra ID auth differ (Azure's newer v1-style endpoints can also be
+reached with the plain client and a `base_url`; check which one your deployment exposes).
 
 ### Two generation APIs
 - **Chat Completions** (`client.chat.completions.create`) takes a list of role-tagged `messages` and
@@ -74,8 +77,10 @@ agent code.
 
 ### Streaming
 `stream=True` returns an iterator of chunks (Chat Completions) or typed events (Responses) parsed from
-server-sent events, so you can forward tokens to a user as they arrive. Usage totals arrive at the end,
-and only if requested in some APIs, so log them from the final event.
+server-sent events, so you can forward tokens to a user as they arrive. Usage totals arrive only at the
+end: Chat Completions includes them in a final chunk only if you pass
+`stream_options={"include_usage": True}`, while Responses carries them on the closing
+`response.completed` event, so log them from the final event.
 
 ### Errors, retries, timeouts
 Exceptions subclass `openai.APIError`: `APIConnectionError` and `APITimeoutError` for transport,

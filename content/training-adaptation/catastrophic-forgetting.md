@@ -5,7 +5,7 @@ name: Catastrophic forgetting
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/overfitting
   - training-adaptation/supervised-fine-tuning
@@ -74,7 +74,9 @@ asks for), and how sharp the old loss is there.
    parameters. The base is untouched by construction, the adapter can be removed or swapped per task,
    and the low rank limits how far outputs can move. But the model's behaviour still changes wherever the
    adapter is active, so adapters reduce forgetting rather than preventing it, and a high-rank adapter
-   trained hard forgets too.
+   trained hard forgets too. Comparisons of LoRA against full fine-tuning on code and maths have found
+   the trade runs both ways: LoRA forgets less of the source domain and also learns less of the target,
+   so the same constraint that protects old skills caps new ones.
 4. **Average back.** Interpolating the fine-tuned weights with θ* (weight-space ensembling, model merging)
    recovers much of the old behaviour while keeping most of the task gain, with the mixing coefficient
    chosen on the two evaluations; see `training-adaptation/model-merging`.
@@ -88,6 +90,14 @@ and system-prompt handling when training on raw completions, refusals when train
 answers, multilingual ability when training in one language, and tool-call formatting when training on
 prose. Each is invisible to a task-only evaluation and obvious to a user.
 
+### Continued pretraining forgets more
+Continued pretraining on a domain corpus (legal text, a new language, a codebase) runs far more tokens
+than a task fine-tune, usually as full-parameter training, so the displacement from θ* is larger and the
+forgetting is too. The common recipe is to re-warm the learning rate to a peak below the original
+pretraining peak, decay it again, and keep a share of general pretraining-style text in the mix as
+replay. The shift is unavoidable here because moving the model's distribution is the point; the
+question is only how much general ability you are willing to trade, which the regression suite answers.
+
 ### Sequential fine-tunes compound
 Fine-tuning v2 from v1 on the second batch of data, then v3 from v2, forgets a little of each earlier
 batch at every hop. The safer pattern is to fine-tune from the base model on the union of all data each
@@ -96,9 +106,9 @@ time, which also makes the run reproducible.
 ## Example
 A team fine-tunes an instruct model on 5,000 legal-clause extraction examples. The first attempt (full
 fine-tune, three epochs, task data only) lifts the extraction metric but the general evaluation shows
-lower instruction following and a drop in refusal rate on harmful prompts. The second attempt mixes a
-quarter of general instruction data into every batch, trains adapters at a low rate for two epochs, and
-gates on the regression suite. The helpers (`load_jsonl`, `run_suite`, `finetune`) stand in for the
+lower instruction following and a drop in refusal rate on harmful prompts. The second attempt makes
+general instruction data a quarter of the training mix, shuffled so it is spread through every part of
+the run, trains LoRA adapters for two epochs at an ordinary adapter rate, and gates on the regression suite. The helpers (`load_jsonl`, `run_suite`, `finetune`) stand in for the
 team's pipeline functions.
 
 ```python

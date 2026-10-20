@@ -5,6 +5,7 @@ name: Embedding versioning / re-indexing strategy
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/embedding-pipelines
@@ -31,8 +32,9 @@ and hash content so routine runs re-embed only changed chunks.
 Every RAG index silently depends on three things: which model turned text into vectors, how that model was
 called (dimension, normalization, instruction prefix, input truncation) and how documents were cut into
 chunks. None of those appear in the vector itself. A query embedded with model B against an index built
-with model A does not return "slightly worse" results; cosine similarity between vectors from different
-spaces is noise, so retrieval degrades to near-random while the pipeline reports no error at all.
+with model A does not return "slightly worse" results. If the dimensions differ, the store at least
+rejects the query; if they happen to match, cosine similarity between vectors from different spaces is
+noise, so retrieval degrades to near-random while the pipeline reports no error at all.
 
 This is forced on you, not optional. Embedding models improve and vendors deprecate old ones; you will
 want longer context, a multilingual model, or a cheaper one; you will tune the chunker; you may quantize
@@ -67,8 +69,9 @@ model, and the citation offsets you return to users change with them.
 Give each chunk a stable key: `chunk_key = hash(source_id, chunk_text)`. Keep a table mapping
 `(chunk_key, embedding_version) -> vector`. On each ingestion run, chunk the source, compute keys and
 skip any key already embedded under the current version. Chunks whose text changed get new keys and are
-embedded; keys that disappear are deleted. This works *because* embedding is a pure function of (text,
-recipe): the same inputs always yield the same vector, so a cache keyed on both is safe. When the
+embedded; keys that disappear are deleted. This works *because* embedding is, for practical purposes, a
+pure function of (text, recipe): the same inputs yield the same vector up to small floating-point noise
+from batching and hardware, so a cache keyed on both is safe. When the
 embedding version changes, every key is a miss and you pay for a full rebuild, which is correct.
 
 ### Blue-green indexes and the alias swap
@@ -83,8 +86,13 @@ into memory and disk sizing.
 ### Catching up on writes during the build
 Documents keep changing while the rebuild runs. Two patterns: *dual-write*, where ingestion embeds every
 new chunk under both versions until the swap; or *replay*, where the build records its start watermark,
-and after finishing, re-processes everything changed since. Dual-write is simpler to reason about;
-replay costs less during long builds.
+and after finishing, re-processes everything changed since. Embedding cost is roughly the same either
+way, since each changed chunk is embedded once per version; replay is slightly cheaper when the same
+document changes several times during the window, because only its final state is embedded for the new
+version. The real difference is operational. Dual-write keeps the new collection current at every moment
+but means the backfill and live writes race on the same collection (a backfill must not overwrite a newer
+live write, and deletes must reach both). Replay needs a reliable change watermark and a final catch-up
+pass, so there is a short lag to close just before the swap.
 
 ### Evaluate before you swap
 A new model is not better by assumption. Run the retrieval eval set (queries with known relevant chunks)
@@ -112,6 +120,7 @@ swap. The vector store is abstracted as a dict of collections so the logic is vi
 ```python
 import hashlib, json
 
+# "revision" is your own pin; hosted APIs may not expose one, so record the date you validated it
 RECIPE = {"model": "text-embedding-3-small", "revision": "2024-01", "dim": 1536,
           "normalize": True, "chunker": "recursive", "chunk_tokens": 400, "overlap": 40}
 EMB_VERSION = hashlib.sha256(json.dumps(RECIPE, sort_keys=True).encode()).hexdigest()[:12]
@@ -157,11 +166,14 @@ The eval gate is deliberately a comment: in production `swap` runs only after re
 - Blue-green rebuilds give atomic cutover and instant rollback but double vector and index memory during
   the build; if the corpus barely fits one GPU or one node, you need a staged or tiered rebuild instead.
 - Content hashing makes routine runs cheap, but a hash on exact text means a one-character edit re-embeds
-  the chunk and its neighbours when overlap is involved; that is correct, just not free.
+  the chunk and its overlapping neighbours, and with fixed-size chunking an insertion shifts every later
+  boundary in that document, so all following chunks re-embed too; structure-aware chunking that cuts on
+  headings or paragraphs keeps the blast radius local.
 - Pinning a model revision protects consistency but means you consciously own upgrades; letting a vendor
   update silently is cheaper to operate right up until retrieval quality shifts with no deploy to blame.
-- Dual-write keeps the new index current with no catch-up step but doubles embedding cost for the build
-  window; replay is cheaper and flips to being the better choice when builds take days.
+- Dual-write keeps the new index current with no catch-up step but couples live ingestion to the new
+  collection and makes it race the backfill; replay keeps ingestion untouched at the cost of a catch-up
+  pass, and tends to win when builds take days and the change watermark is trustworthy.
 - Keeping old versions for rollback is safe but each held version is storage and an ANN graph; set an
   explicit retirement window rather than letting versions accumulate.
 
@@ -217,8 +229,9 @@ may retrieve differently on your domain, which only the eval gate catches.
 - [ ] Model B normalizes vectors differently, which the index can correct for at query time
 - [ ] The ANN index stores the model name and rejects the query
 > Each model learns its own geometry; the same text lands at unrelated points. Cosine similarity across
-> spaces is noise, which is why retrieval degrades to near-random without any error. Indexes do not
-> validate this for you unless you store and check the version yourself.
+> spaces is noise, which is why retrieval degrades to near-random, with no error when the dimensions
+> happen to match. Indexes check dimension at most, never which model produced a vector, unless you store
+> and check the version yourself.
 
 ### Q: What is the main purpose of keying the embedding cache on both chunk content hash and embedding version?
 - [ ] To allow the same vector to be reused across different embedding models

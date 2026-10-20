@@ -5,7 +5,7 @@ name: Observability stack
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - observability/tracing
   - observability/opentelemetry
@@ -76,13 +76,24 @@ application team getting redaction right independently is the thing that fails. 
 decides after the trace is complete, is chosen over head sampling *because* the traces you want are
 rare and only identifiable at the end.
 
+Two consequences of tail sampling are easy to miss. First, "complete" means "no new spans for a
+configured wait", typically seconds, and all spans of a trace must reach the same collector instance
+(a trace-id-aware load balancer in front). An online judge score that arrives minutes later, or an
+agent session whose spans trickle in over an hour, is outside that window, so the sampler cannot use
+it; such signals need their own path, for example keeping all payloads in a short-retention hot store
+and promoting the ones a later score flags. Second, anything you *count* must be derived before the
+sampler drops spans. The collector's pipelines are ordered so that metrics (and token-usage series)
+are computed from the full stream, and only the trace export is sampled.
+
 ### Layer 3: storage, by signal
 Three signals, three stores, chosen by cardinality and retention. **Traces** (high volume, structured,
 weeks of retention) go to a trace store. **Metrics** (low cardinality, long retention) go to a time
 series database; a spanmetrics connector in the collector derives request rate, error rate and
 latency histograms per model, bundle and tenant from the spans, so nobody hand-instruments counters.
 It does not sum attribute values, so token and cost series come from a token-usage metric emitted by
-the instrumentation or from a job over the trace store.
+the instrumentation (the GenAI conventions define one) or from a job over an *unsampled* copy of the
+model spans; a job over the tail-sampled trace store would undercount spend by roughly the fraction
+of normal traces discarded.
 **Payloads**, the prompts and completions, are the sensitive, bulky part and live in a store with
 their own access control and retention, referenced from spans by id. A full RAG trace with retrieved
 chunks can be tens of kilobytes; at a million requests a day that is tens of gigabytes a day
@@ -143,6 +154,8 @@ def answer(question, tenant, bundle="support-assistant@41", config_version=118):
             s.set_attributes({"gen_ai.response.model": resp.model,
                               "gen_ai.usage.input_tokens": resp.usage.input_tokens,
                               "gen_ai.usage.output_tokens": resp.usage.output_tokens})
+            ref = payloads.put(tenant, question, docs, resp.text)  # full payload: own store, own TTL
+            s.set_attribute("app.payload_ref", ref)                 # span carries only the pointer
             s.add_event("app.completion_preview", {"preview": resp.text[:200]})  # redacted downstream
         return resp.text
 ```
@@ -180,6 +193,8 @@ store, the metrics database and the LLM analysis tool.
   attributable to a bundle or prompt version, so rollback becomes guesswork.
 - Judge scores stored in the eval tool without the trace id; the symptom is a quality dashboard that
   cannot be joined to the requests it describes.
+- Computing cost or volume from the sampled trace store; the symptom is attributed spend that is a
+  small, unstable fraction of the invoice and moves whenever someone changes the sampling rate.
 
 ## When to use
 Build the stack, rather than adopting one tool, as soon as a second team, a second model provider or
@@ -209,7 +224,9 @@ tokens, model and tenant and bundle attributes, and a cost series is computed fr
 (a query or job over the trace store, or a token-usage metric emitted by the instrumentation, since
 spanmetrics only derives call counts and durations) priced per model and grouped by tenant and bundle. If the sum does not match the invoice, either some spans lack tenant or bundle, which means the
 mandatory attributes are not enforced, or some calls bypass the instrumented path, which means keys
-exist outside the gateway. The compliance question is answered by the collector's redaction policy
+exist outside the gateway. Two quieter causes are worth checking: the cost job reads the tail-sampled
+trace store rather than an unsampled metric, so it undercounts by design; or a client library retries
+below the instrumented span, so one span can stand for more than one billed call. The compliance question is answered by the collector's redaction policy
 and the payload store: if account numbers are redacted before export for the relevant classification,
 the answer is a configuration document plus a query over the payload store for that tenant's
 retention window. If prompts were logged as plain log lines in a third-party log service, there is no

@@ -5,6 +5,7 @@ name: API keys / OAuth2 / JWT
 kind: decision
 difficulty: core
 est_minutes: 20
+status: fact-checked
 related:
   - fastapi-for-ai/dependency-injection
   - fastapi-for-ai/cors
@@ -84,9 +85,12 @@ it. Verifying it means:
 1. **Pin the algorithm** to the expected one (`RS256`/`ES256` for IdP-issued tokens). Accepting the
    header's `alg` blindly enables `alg: none` and RS-to-HS key-confusion attacks.
 2. Fetch the issuer's public keys from its **JWKS** endpoint (cache them, refresh on unknown `kid`)
-   and check the signature.
+   and check the signature. The JWKS path differs by IdP; discover it as `jwks_uri` in the issuer's
+   `/.well-known/openid-configuration` rather than guessing (the example hard-codes one for brevity).
 3. Check `exp`/`nbf` (with small clock-skew leeway), `iss`, and **`aud`**, so a token minted for
-   another API can't be replayed against yours.
+   another API can't be replayed against yours. Also *require* `exp`: libraries such as PyJWT validate
+   `exp` only when it is present, so a token without one would never expire unless you list it as
+   required.
 4. Authorize from the claims: scopes, tenant.
 
 Verification needs no network call per request, which is why JWTs scale across services. The cost is
@@ -129,7 +133,8 @@ async def principal(key: str | None = Security(api_key_hdr),
         try:
             signing_key = jwks.get_signing_key_from_jwt(cred.credentials).key
             c = jwt.decode(cred.credentials, signing_key, algorithms=["RS256"],
-                           audience=AUDIENCE, issuer=ISSUER, leeway=30)
+                           audience=AUDIENCE, issuer=ISSUER, leeway=30,
+                           options={"require": ["exp", "sub"]})   # PyJWT accepts a token with no exp otherwise
             return Principal(c["tenant_id"], c["sub"], set(c.get("scope", "").split()))
         except (jwt.PyJWTError, KeyError):
             pass

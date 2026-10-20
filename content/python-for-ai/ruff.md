@@ -5,6 +5,7 @@ name: ruff
 kind: tool
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - python-for-ai/mypy
   - python-for-ai/pytest
@@ -19,7 +20,7 @@ sources:
 
 ## TL;DR
 Ruff is a Python linter and formatter written in Rust that replaces a stack of separate tools (flake8 and
-its plugins, isort, pyupgrade, much of pylint's and bandit's checks, and Black for formatting) with one
+its plugins, isort, pyupgrade, most of bandit's checks and a subset of pylint's, and Black for formatting) with one
 fast binary and one config section. It exists because a slow, fragmented lint toolchain gets skipped;
 fast enough to run on every save makes it a habit. It checks style and likely bugs, not types.
 
@@ -44,9 +45,9 @@ and review time spent on import order is time not spent on design.
 ## How it works
 ### One parse, many rules
 Ruff parses each file once into an AST and token stream and runs every enabled rule over that single
-representation, in parallel across files, with a cache keyed on file content so unchanged files are
-skipped. That architecture, more than the language it is written in alone, is why it is fast: the old
-toolchain re-parsed each file once per tool. The maintainers publish benchmarks showing large speedups
+representation, in parallel across files, with a per-file cache so files unchanged since the last run
+(under the same settings) are skipped. Native Rust code and that architecture together explain the
+speed: the old toolchain ran each Python tool as its own process and re-parsed each file once per tool. The maintainers publish benchmarks showing large speedups
 over flake8; treat any specific multiple as illustrative and measure on your own repository.
 
 ### Rules are namespaced by origin
@@ -94,7 +95,7 @@ ignore = ["E501"]                          # the formatter owns line length
 
 ```python
 import asyncio, json, time                 # F401 json unused; I001 import block unsorted (E401 too)
-from typing import List
+from typing import List                    # UP035 deprecated typing alias import
 import requests
 
 async def log_done(n: int) -> None: ...

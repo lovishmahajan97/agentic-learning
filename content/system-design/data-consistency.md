@@ -5,7 +5,7 @@ name: Data consistency
 kind: concept
 difficulty: core
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - system-design/distributed-systems
   - system-design/saga-pattern-and-distributed-transactions
@@ -87,6 +87,20 @@ Ordered from strongest to weakest, each level is defined by the anomaly it forbi
 - **Eventual.** If writes stop, all copies converge. No bound on *when*, and no promise about what a read
   returns in the meantime. Right for analytics, recommendations, derived indexes, caches with TTLs.
 
+### Converging needs a merge rule
+"All copies converge" hides a decision: when two copies accepted different writes to the same item
+(multi-leader replication, offline clients, two regions), something must decide the merged value.
+**Last-writer-wins** keeps the write with the highest timestamp; it always converges, *because* every
+replica applies the same rule, but it silently discards the other write and, with wall-clock
+timestamps, can discard the genuinely later one. **Version vectors** detect that two writes were
+concurrent rather than ordered and keep both as siblings for the application to merge (two edits to a
+shared prompt template surface as a conflict to resolve). **CRDTs** are data types whose merge is
+defined so that any order of applying updates yields the same result: a grow-only counter sums per-node
+counts, an observed-remove set keeps an add unless the remove saw it, and collaborative text editors
+use sequence CRDTs. They converge without coordination, but only for operations the type defines; an
+invariant such as "balance never below zero" cannot be kept by merging after the fact and needs
+coordination before the write.
+
 ### Where lag comes from and how it is bounded
 Replication lag is the time between a commit on the leader and its visibility on a copy. Asynchronous
 database replicas lag milliseconds to seconds, more under load. Search and vector indexes commonly make
@@ -148,7 +162,11 @@ def read_memory(primary, replica, run_id, token=None):
 The cost is one extra round trip to the replica when the token is present, and a primary read only when
 the replica is behind, which is exactly the small fraction of reads that would otherwise have been
 wrong. A cheaper variant with the same guarantee is to route all reads of a session to the primary for a
-fixed window (a few seconds) after any write, at the price of some unnecessary primary load.
+fixed window (a few seconds) after any write, at the price of some unnecessary primary load, and a
+guarantee that breaks if replica lag ever exceeds the window. The same token also buys **monotonic
+reads** when there are several replicas: if the client keeps the highest LSN it has *read* as well as
+written, and sends that, a request load-balanced to a more-lagged replica is redirected instead of
+showing older data than the previous page did.
 
 ## Trade-offs
 - Linearizable reads make correctness trivial to reason about, but each costs a leader or quorum round

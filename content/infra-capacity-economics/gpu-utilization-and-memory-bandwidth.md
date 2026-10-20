@@ -5,6 +5,7 @@ name: GPU utilization & memory bandwidth
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/continuous-batching
@@ -24,8 +25,7 @@ sources:
 The "GPU-Util" number in `nvidia-smi` only says a kernel was running, not that the chip was busy.
 Real throughput is bounded by the roofline: for every byte moved from GPU memory the chip can do a
 fixed number of floating-point operations, roughly 150 on an A100 and 300 on an H100 at bf16. LLM
-decode does about two operations per weight byte per sequence, so small batches are
-memory-bandwidth-bound and the fix is batching, fewer bytes or faster memory, not more FLOPs.
+decode does about one operation per bf16 weight byte per sequence, so small batches are memory-bandwidth-bound and the fix is batching, fewer bytes or faster memory, not more FLOPs.
 
 ## Why it exists
 Teams buy GPUs for their FLOPs and are then surprised that an H100 serving a chat model produces
@@ -113,7 +113,7 @@ step time, the tokens/s ceiling and the batch at which the step becomes compute-
 for an 8B bf16 model reproduce the figures above; they are upper bounds, not measurements.
 
 ```python
-CARDS = {  # datasheet-level figures, rounded: (HBM bandwidth B/s, dense bf16 FLOP/s)
+CARDS = {  # datasheet-level figures, rounded: (memory bandwidth B/s, dense bf16 FLOP/s)
     "L4":       (300e9,  121e12),
     "A100-80":  (2.0e12, 312e12),
     "H100-SXM": (3.35e12, 989e12),

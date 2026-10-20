@@ -70,7 +70,9 @@ many parties verify without any of them being able to forge.
 
 ### Verifying, in order
 1. Read the raw bytes of the body before any framework parses it. Re-serialising parsed JSON changes
-   whitespace, key order, float formatting and unicode escaping, so the MAC will not match.
+   whitespace, key order, float formatting and unicode escaping, so the MAC will not match. Cap the
+   body size at the edge first, since an unauthenticated sender can otherwise make you buffer and
+   hash arbitrarily large payloads.
 2. Parse the header into a timestamp and one or more signatures; reject anything malformed.
 3. Check `|now − timestamp| ≤ tolerance`. The tolerance is a few minutes (Stripe's libraries default to
    300 seconds), not zero, *because* clocks drift and deliveries queue.
@@ -82,7 +84,10 @@ many parties verify without any of them being able to forge.
 5. Only now parse the JSON and dispatch on the event type.
 
 ### Replay protection
-The timestamp window turns "valid forever" into "valid for five minutes", which is still plenty for a
+The timestamp only helps *because* it is inside the signed content: an attacker who edits it breaks
+the MAC. A timestamp sent in an unsigned header, or no timestamp at all (GitHub's scheme), gives no
+replay bound, so for those senders deduplication by delivery id is the only replay defence and its
+retention has to be long. The timestamp window turns "valid forever" into "valid for five minutes", which is still plenty for a
 double credit. So deduplicate by event id: `SET webhook:seen:{id} 1 NX EX <ttl>` in Redis, or an insert
 into a `processed_events(event_id UNIQUE)` table. Retention must cover the provider's retry horizon
 (often days), not just the tolerance window, *because* legitimate retries arrive later with the same

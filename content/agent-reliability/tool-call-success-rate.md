@@ -5,7 +5,7 @@ name: Tool-call success rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/task-completion-rate
   - agent-reliability/tool-adapters-service-interfaces
@@ -77,6 +77,17 @@ Count both. *Per-attempt* success tells you how healthy the tool is. *Per-step* 
 the model's intent and may include retries, tells you how often the agent got past it. A tool at 85% per
 attempt with automatic retry on retryable classes might be 98% per step; the gap is the value of the retry
 policy, and a widening gap means the tool is degrading while the agent still copes.
+
+### Model-level recovery, and why p^n is a bound
+Adapter retries are not the only recovery. When `invalid_arguments` comes back with the offending field
+named, the model usually fixes the call on its next turn; when a search returns nothing, it may
+rephrase. Track *recovery rate*: of the steps whose first attempt failed, the fraction where a later call
+in the same step or the next one succeeded. It is the number that shows whether structured error results
+are doing their job, and it is why the p^n arithmetic is pessimistic for agents that recover well.
+It can also be optimistic. Failures are not independent: one vendor outage or one expired credential
+fails every call in a run at once, and a model that misunderstood the task produces a chain of
+individually valid calls aimed at the wrong thing. So treat p^n as a planning bound that links per-step
+targets to task completion, and measure the real relation by joining tool events to task outcomes.
 
 ### Attribution
 Each error class points at an owner. `invalid_arguments` rising after a prompt change points at the prompt
@@ -170,13 +181,18 @@ for tool, r in tool_rates(events).items():
   ten-step tasks complete 60% of the time.
 - Treating denied calls as tool failures; the symptom is loosening a permission policy to improve a metric
   that was signalling a model probing beyond its scope.
+- Returning opaque error strings and then wondering why recovery is low; the symptom is a model that
+  repeats the identical failing call two or three times before giving up, visible as consecutive
+  identical `invalid_arguments` events within one step.
 
 ## When to use
 Instrument it from the first tool, because the adapter already sees every outcome and the cost is one
 event per call. Use per-tool, per-class dashboards for operations, with alerts per tool rather than on the
 aggregate, and use the layered breakdown in post-mortems and in trajectory evaluation to assign each
 failure an owner. Derive targets from the compounding formula and the step counts of your real tasks.
-Watch per-attempt and per-step side by side so vendor degradation is visible before it reaches users. In
+Watch per-attempt and per-step side by side so vendor degradation is visible before it reaches users. Add recovery rate
+after model-visible failures, which tells you whether your error results are good enough for the model to
+act on. In
 interviews, the expected answer to "how do you know your tools work" is the four layers, the taxonomy,
 attribution to an owner, and the p^n argument that links tool reliability to task completion.
 

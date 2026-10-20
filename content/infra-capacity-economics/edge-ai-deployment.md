@@ -5,6 +5,7 @@ name: Edge AI deployment
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - infra-capacity-economics/hybrid-on-prem
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -39,8 +40,8 @@ reason to run the model where the data is.
 
 The naive answer, "ship the model we run in the cloud", fails on arithmetic. A 70B-parameter model
 in fp16 is roughly 140 GB of weights; a phone gives an app a few gigabytes at most, and even a
-laptop with 16 GB of unified memory can hold only a quantized 7–8B model with room for the OS and
-the KV cache. Decode speed is bound by memory bandwidth, which on a phone is a small fraction of a
+laptop with 16 GB of unified memory comfortably holds only a 4-bit model of about 7–8B parameters
+(a 13–14B model is a squeeze) once the OS, other apps and the KV cache are counted. Decode speed is bound by memory bandwidth, which on a phone is a small fraction of a
 datacenter GPU's, so the same model that streams at 100 tokens per second in the cloud would crawl
 on device even if it fit. Thermal limits add a third constraint: sustained inference throttles the
 chip and drains the battery. The opposite naive answer, "quantize everything to 4-bit and hope",
@@ -60,9 +61,11 @@ compute. **Power and thermal**: sustained throughput is lower than burst through
 chip throttles, so plan for sustained figures measured on warm devices.
 
 ### Make the model fit
-- **Choose a small model first.** Small language models (hundreds of millions to a few billion
-  parameters) designed for the task beat a crushed large model at the same byte budget, because
-  quality lost to aggressive quantization is not recovered by size.
+- **Choose a small model first.** Down to about 4 bits per weight, a larger quantized model often
+  beats a smaller one at the same byte budget, so 4-bit is a common sweet spot. Below roughly 3 bits
+  quality usually falls off sharply, so a large model that only fits at 2-bit is typically beaten by
+  a small language model (hundreds of millions to a few billion parameters) at 4-bit, especially one
+  trained or distilled for the task. The crossover is model- and task-dependent; measure it.
 - **Quantize**, typically to 4-bit or 8-bit weights, with activations kept at higher precision.
   Post-training quantization methods (GPTQ, AWQ and the k-quant families used by llama.cpp) cut
   memory and raise bandwidth-bound speed roughly in proportion to the bit reduction. The quality
@@ -127,7 +130,7 @@ assert fits(MODEL, N_CTX, kv_bytes_per_token=2 * 28 * 8 * 128 * 2, budget_bytes=
 llm = Llama(model_path=MODEL, n_ctx=N_CTX, n_threads=os.cpu_count() or 4,
             n_gpu_layers=-1, verbose=False)   # offload all layers to Metal/CUDA/Vulkan if present
 
-t = time.time()
+t = time.time()                      # timing below includes prompt processing, not just decode
 out = llm.create_chat_completion(
     messages=[{"role": "system", "content": "Reply in one sentence."},
               {"role": "user", "content": "Summarise why the pump alarm fired."}],
@@ -193,8 +196,9 @@ count and bit width and to explain why decode speed follows memory bandwidth.
 of which the app may use about 3 GB, working in warehouses with poor connectivity. Walk through
 how you would choose and validate the model.
 **A:** Budget first: 3 GB must hold weights, the KV cache for the longest expected interaction and
-the app. A 3B-class model at 4-bit is about 1.5 GB of weights, leaving room for a 2k-token cache
-and the app; an 8B model at 4-bit (about 4 GB) does not fit. Then quality: distil or fine-tune the
+the app. A 3B-class model at 4-bit is about 1.5–2 GB of weights (k-quant formats spend a little
+more than 4 bits per weight), and a 2k-token cache for a model of that shape is a few hundred MB,
+leaving room for the app; an 8B model at 4-bit (about 4 GB) does not fit. Then quality: distil or fine-tune the
 small model on the scanning tasks and evaluate it against the cloud model on a task set, at the
 exact quantization that will ship. Then speed: measure sustained tokens per second on the real
 handheld after thermal steady state, since decode is bound by its memory bandwidth, and check the
@@ -212,14 +216,14 @@ class, carry the model version in telemetry, and keep any policy enforcement on 
 > small fraction of a datacenter GPU's, so the model's byte size divided into that bandwidth gives
 > the ceiling. Quantization helps precisely because it shrinks the bytes read.
 
-### Q: Why is a purpose-built small model usually better on device than a large model quantized aggressively to fit?
+### Q: Why is a purpose-built small model at 4-bit usually better on device than a large model squeezed to 2–3 bits to fit the same memory?
 - [ ] Small models do not need a KV cache
 - [ ] Large models cannot be quantized below 8-bit
-- [x] Quality lost to extreme quantization is not recovered by parameter count, while a small model trained or distilled for the task keeps its quality at the same byte budget
+- [x] Quality degrades sharply below about 4 bits per weight, so the extra parameters do not make up for it, while a small model distilled for the task keeps its quality at the same byte budget
 - [ ] Small models run on the CPU, which is always faster than the NPU
-> At a fixed memory budget the question is where quality per byte is highest. Pushing a large model
-> to very low bit widths degrades it sharply, whereas a distilled small model at 4-bit or 8-bit
-> keeps task performance.
+> At a fixed memory budget the question is where quality per byte is highest. Around 4 bits a larger
+> model often wins, but pushing it to 2–3 bits degrades it sharply, whereas a distilled small model
+> at 4-bit keeps task performance. The crossover still has to be measured per task.
 
 ### Q: Which safeguard belongs on the server even when the model runs entirely on device?
 - [ ] The tokenizer, so that vocabulary stays consistent

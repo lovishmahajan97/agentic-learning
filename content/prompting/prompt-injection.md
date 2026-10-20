@@ -5,7 +5,7 @@ name: Prompt injection
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - prompting/jailbreaks
   - prompting/system-prompt
@@ -59,7 +59,10 @@ In an *indirect* injection the attacker never talks to the model. They plant tex
 will read it: a web page the agent browses, an email the assistant summarises, a PDF, a calendar
 invitation, a code comment, a product review, a document in the retrieval index, the output of a tool.
 Greshake et al. demonstrated all of these against real deployments in 2023. The tool-result boundary is
-the usual entry point, which is why tool results must be treated as untrusted.
+the usual entry point, which is why tool results must be treated as untrusted. The payload need not be
+visible to a human reviewer: white-on-white text, HTML comments, invisible Unicode characters, alt text
+and instructions rendered inside an image all reach a model that reads the raw content or the pixels,
+which is why "a person looked at the document" is not a control.
 
 ### Why the model obeys
 Everything is one token stream, with no type that says "this span is data". Training optimises for
@@ -85,7 +88,10 @@ and the worst outcome is contained. Most design decisions below are ways of remo
 1. **Least privilege.** Tools scoped to the task and the user; read-only where possible; no open
    outbound channel. Disable or domain-restrict rendering of images and links the model produces.
 2. **Separation in the prompt.** Wrap untrusted content in labelled delimiters and tell the model that
-   data never carries instructions. Cheap, defeats casual attacks, defeats nothing determined.
+   data never carries instructions. Variants such as datamarking (interleaving a marker character
+   through the untrusted text) or encoding the span make the boundary harder to forge, because a
+   planted closing tag no longer looks like the real one. Cheap, defeats casual attacks, but it is still
+   a learned behaviour the model may not apply, so it defeats nothing determined.
 3. **Privileged and quarantined models.** The model that reads untrusted text has no tools; a privileged
    model never sees raw untrusted text, only symbolic references to it (Willison's "dual LLM" pattern,
    2023). Debenedetti et al.'s CaMeL extends this
@@ -96,7 +102,10 @@ and the worst outcome is contained. Most design decisions below are ways of remo
    A tripwire, not a boundary.
 6. **Output handling.** Validate tool arguments against the user's authorisation; never execute, render
    or forward model output as trusted.
-7. **Testing.** An injection suite in CI with attack success rate per release and per model upgrade.
+7. **Testing.** An injection suite in CI with attack success rate per release and per model upgrade,
+   measured together with task success on the same cases, *because* a defence that refuses every tool
+   call scores a perfect attack success rate of zero while making the product useless. Agent benchmarks
+   such as AgentDojo report both numbers for this reason.
 
 ## Example
 An email assistant with `read_inbox` and `send_email`. An attacker sends the user an email whose body
@@ -163,6 +172,9 @@ layer here and is kept only because it lowers the attempt rate for free.
   because an attacker's "remember that..." was stored.
 - Testing only with "ignore previous instructions"; the symptom is a clean eval and a successful
   paraphrased attack in another language a week after launch.
+- An approval prompt that shows the model's own summary of the action ("Send the weekly report to
+  your manager?") instead of the literal recipient and body; the symptom is users approving an
+  attacker's send, because the injected text also wrote the summary they were shown.
 - Expecting the vendor's safety classifier to catch it; the symptom is a harmless-looking "forward these
   emails" instruction passing, because it is not harmful content, it is simply not the user's instruction.
 

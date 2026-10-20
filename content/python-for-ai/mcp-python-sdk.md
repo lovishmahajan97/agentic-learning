@@ -5,6 +5,7 @@ name: MCP Python SDK
 kind: tool
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -71,16 +72,43 @@ controlled and prompts are user-controlled, and hosts present them differently.
    allow structured output validated against an output schema, and the SDK can derive it from a typed
    return value.
 
+On the wire, step 4 is one JSON-RPC request and one response matched by `id`, which is what lets many
+calls be in flight on one connection:
+
+```
+-> {"jsonrpc":"2.0","id":3,"method":"tools/call",
+    "params":{"name":"create_ticket","arguments":{"title":"VPN down","priority":"high"}}}
+<- {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"id\": 1, ...}"}],
+    "isError":false}}
+```
+
+Note the two failure channels. A malformed request or unknown tool is a JSON-RPC `error` (a protocol
+failure the host handles). A tool that ran and failed returns a normal `result` with `isError: true`,
+*because* that result is fed back to the model, which can read the message and try something else. Logs
+and progress travel as notifications (messages with no `id`) and need no reply.
+
 ### Transports
 `mcp.run()` defaults to **stdio**: the host spawns your server as a subprocess and exchanges
 newline-delimited JSON-RPC messages over stdin and stdout. It is simple and needs no network, which suits
 local tools. **Streamable HTTP** (`mcp.run(transport="streamable-http")`) serves the same protocol over
 HTTP for remote, multi-client servers and is where authentication becomes your concern. The older
-HTTP+SSE transport is deprecated in favour of it.
+HTTP+SSE transport is deprecated in favour of it. By default a Streamable HTTP server is *stateful*: it
+issues a session ID header after `initialize`, and later requests must reach the process holding that
+session, so behind a load balancer you need sticky routing. FastMCP can instead run stateless
+(`stateless_http=True`), treating each request independently, which scales horizontally but gives up
+server-initiated messages that depend on a live session.
 
-### Context
+### Context, lifespan and server-to-client requests
 A tool can accept a `ctx: Context` parameter, which FastMCP injects (and hides from the schema), to send
-log messages and progress notifications back to the client during long operations.
+log messages and progress notifications back to the client during long operations. MCP is
+bidirectional, so the same session also lets a server *ask the client* for things the client has
+advertised as capabilities: **sampling** (have the host's LLM generate text, so the server needs no model
+key of its own) and **elicitation** (ask the user for missing input mid-call). Hosts vary in which of
+these they support, so check capabilities rather than assuming.
+
+Shared resources such as a database pool belong in a `lifespan` async context manager passed to
+`FastMCP(...)`: it runs once at startup and shutdown and its yielded object is reachable from the
+context, *because* opening a connection per tool call repeats setup and leaks under load.
 
 ### Client side
 `ClientSession` plus a transport helper such as `stdio_client` lets Python code act as a host: initialize,
@@ -130,7 +158,11 @@ asyncio.run(main())
 ```
 
 The `priority` hint becomes an `enum` in the schema, so the model sees exactly two legal values, and a
-call with `"urgent"` is rejected before your code runs.
+call with `"urgent"` is rejected before your code runs. The generated `inputSchema` for `create_ticket`
+is roughly `{"type":"object","properties":{"title":{"type":"string"},"priority":{"enum":["low","high"],
+"type":"string"}},"required":["title","priority"]}`; `ctx` is absent because FastMCP injects it. With the
+SDK's CLI extra installed, `mcp dev server.py` opens the MCP Inspector, where you can see that schema and
+call the tool by hand before any LLM is involved.
 
 ## Trade-offs
 - Writing one MCP server makes a tool usable from every compliant host, but you pay a process boundary
@@ -147,10 +179,15 @@ call with `"urgent"` is rejected before your code runs.
   reporting parse errors or the server "disconnecting" right after a log line.
 - Docstrings written for humans rather than models; the model picks tools from these descriptions, and
   the symptom is the wrong tool chosen or a destructive tool called without the intended precondition.
-- Raising unhandled exceptions for expected failures; return a clear error result instead, otherwise the
-  model gets an opaque failure and the symptom is it retrying the same bad call in a loop.
+- Raising vague exceptions for expected failures; FastMCP catches an exception from a tool and returns it
+  as an `isError` result carrying the exception's message, so `raise Exception("failed")` gives the model
+  nothing to act on, and the symptom is it retrying the same bad call in a loop. Raise (or return) a
+  message that says what was wrong and what to do instead.
 - Blocking calls (sync database drivers, `time.sleep`) inside async tools; the whole server stalls, which
   shows up as every tool timing out whenever one slow call is in flight.
+- Running a stateful Streamable HTTP server behind a round-robin load balancer; requests land on a
+  process that never saw the session, and the symptom is intermittent "session not found" or 4xx errors
+  that vanish with a single replica.
 - Exposing a Streamable HTTP server without authentication or origin checks; the symptom is discovering
   that anything that can reach the port can invoke your tools.
 
@@ -179,7 +216,9 @@ library's progress bar, a warning sent to stdout, corrupts the framing and the h
 Running by hand hides this because you are not parsing the stream. Confirm by checking the host's MCP
 logs for a parse error, grepping that tool's code path for prints, or running it under a real
 `ClientSession`. Fix by logging to stderr or through `ctx` logging, and redirecting noisy libraries.
-A second suspect is an unhandled exception crashing the process, which the server's stderr would show.
+A second suspect is the process itself dying in that code path (a native-extension crash, `sys.exit`,
+an out-of-memory kill), which the server's stderr or exit code would show; an ordinary Python exception
+inside a FastMCP tool does not do this, because it is returned to the client as an `isError` result.
 
 ## Quiz
 ### Q: How does FastMCP produce a tool's input schema?

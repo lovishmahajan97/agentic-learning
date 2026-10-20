@@ -5,7 +5,7 @@ name: NoSQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -42,8 +42,11 @@ into application code where every engineer must know the sharding scheme, and it
 while the data is spread across nodes that cannot be migrated atomically. NoSQL systems make the
 constraint explicit instead: you declare a partition key, the store guarantees cheap operations within a
 partition, and anything across partitions is either unsupported or clearly expensive. A second
-motivation is heterogeneous records: a document store lets items of one collection carry different
-fields, which suits event payloads and tool outputs whose shape varies by type.
+motivation is the data model itself rather than scale: a document store lets items of one collection carry
+different fields and nests read-together data in one record, which suits event payloads and tool outputs
+whose shape varies by type, and a graph database makes multi-hop traversals cheap that would be chains
+of self-joins in SQL. "NoSQL" is therefore a bundle of different answers to different problems, and the
+first design question is which problem you actually have.
 
 The cost is real. Every query you did not design a key or index for is a full scan or impossible, and
 "schemaless" simply means the schema lives in your code, unenforced.
@@ -101,6 +104,16 @@ workloads, but they are not something to design around. Fixes are
 to add a high-cardinality component to the key (tenant + conversation, or tenant + a shard suffix) so a
 busy tenant spreads over several partitions, at the cost of fan-out reads for "everything for this tenant".
 
+### Why wide-column stores write so fast
+Cassandra, ScyllaDB and Bigtable sit on a log-structured merge tree (LSM) rather than the update-in-place
+B-tree of a relational engine. A write is appended to a commit log and inserted into an in-memory sorted
+table; when that fills, it is flushed to disk as an immutable sorted file, and background compaction later
+merges files and discards overwritten and deleted versions. Every write is sequential I/O with no read
+first, which is why ingest rates are high. The cost lands on reads, which may consult several files
+(bloom filters skip most), and on compaction, which consumes disk bandwidth in the background. Deletes
+are written as tombstones, so a partition that receives many deletes gets slower to read until compaction
+removes them, a well-known operational trap with queue-like access patterns.
+
 ### Transactions and indexes
 Modern document stores support multi-document transactions, and DynamoDB offers transactional reads and
 writes across a bounded set of items (up to 100 per transaction at the time of writing), but they cost
@@ -112,7 +125,10 @@ write capacity and storage, so "index everything" shows up directly on the bill.
 Agent sessions and their messages in DynamoDB, designed from two access patterns: "list a user's recent
 sessions" and "load the last 20 messages of a session". Each is a single-partition `Query`. Messages are
 referenced, not embedded, because a session can grow without bound. The sort key carries a zero-padded
-sequence so lexical order is chronological.
+sequence so lexical order is chronological (`MSG#00000010` sorts after `MSG#00000009`; unpadded, `MSG#10`
+would sort before `MSG#9`). The caller assigns `seq` (for example from a counter on the session item), and
+the conditional put is what makes a collision visible: it distinguishes "my own retry already landed"
+from "another writer took this sequence number", which must not be silently swallowed.
 
 ```python
 import boto3, time
@@ -129,13 +145,15 @@ def create_session(tenant, user, session_id, title):
     })
 
 def append_message(session_id, seq, role, content):
+    key = {"pk": f"SESSION#{session_id}", "sk": f"MSG#{seq:08d}"}
     try:
-        table.put_item(
-            Item={"pk": f"SESSION#{session_id}", "sk": f"MSG#{seq:08d}",
-                  "role": role, "content": content},
-            ConditionExpression="attribute_not_exists(sk)")   # never overwrite a message
+        table.put_item(Item={**key, "role": role, "content": content},
+                       ConditionExpression="attribute_not_exists(sk)")  # never overwrite
     except Duplicate:
-        pass                                  # a retry of a write that already landed
+        existing = table.get_item(Key=key, ConsistentRead=True)["Item"]
+        if existing["content"] != content:    # someone else took this seq: caller must retry
+            raise                             # with the next one, or the message is lost
+        # else: our own earlier attempt landed; the retry is a no-op
 
 def recent_sessions(tenant, user, limit=10):
     r = table.query(

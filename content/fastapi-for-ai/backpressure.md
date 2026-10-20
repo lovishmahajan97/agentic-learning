@@ -5,6 +5,7 @@ name: Backpressure
 kind: concept
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - fastapi-for-ai/concurrency-limits
   - fastapi-for-ai/streamingresponse
@@ -69,9 +70,10 @@ clients turn these signals into retries with backoff or into routing to another 
 When a `StreamingResponse` generator yields a chunk, the server's `send` writes it to the socket. If
 the client reads slowly, the kernel's send buffer and the server's write buffer fill, the server
 pauses writing, and the `await` on `send` stops returning, so the generator stops being iterated.
-That is real backpressure from the client to your code. It stops at your code, though: if the
-generator is reading tokens from a provider stream, the provider usually keeps generating on its
-side, and buffers or bills tokens regardless. For an expensive upstream, a stalled or vanished client
+That is real backpressure from the client to your code. It effectively stops at your code, though:
+if the generator is reading tokens from a provider stream, TCP flow control may eventually reach the
+provider's front end once you stop reading, but generation on its side is typically decoupled from
+socket writes, so it keeps decoding and buffers or bills tokens regardless. For an expensive upstream, a stalled or vanished client
 should become an explicit decision to cancel, not an implicit pause.
 
 ### Upstream signals

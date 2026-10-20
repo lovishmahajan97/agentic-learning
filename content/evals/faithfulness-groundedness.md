@@ -5,7 +5,7 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - evals/hallucination-evaluation
   - evals/retrieval-evaluation

@@ -5,6 +5,7 @@ name: Decorators
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-await
@@ -170,8 +171,9 @@ and explain the desugaring.
 agent framework. Latency dashboards show 0.01 ms per tool and the model starts calling tools with wrong
 arguments. Explain both symptoms.
 **A:** The sync wrapper calls the async function, which only creates a coroutine and returns immediately, so
-the timer measures coroutine creation, not the awaited work; the real latency happens later when the
-framework awaits the returned coroutine. Without `functools.wraps`, the wrapper exposes its own name,
+the timer measures coroutine creation, not the awaited work; the real latency happens later, if at all, when
+the framework awaits the returned coroutine. Frameworks that decide how to call a tool with
+`inspect.iscoroutinefunction` now see a sync function, and may never await the result. Without `functools.wraps`, the wrapper exposes its own name,
 missing docstring and `(*args, **kwargs)` signature, so the framework generates tool schemas with no
 parameter names or descriptions, and the model guesses the arguments. The fix is an `async def` wrapper
 that awaits the call, decorated with `functools.wraps(fn)` so name, docstring and signature survive.

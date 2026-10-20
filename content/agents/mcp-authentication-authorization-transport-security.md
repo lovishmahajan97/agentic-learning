@@ -5,7 +5,7 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - agents/model-context-protocol
   - agents/a2a-protocol
@@ -107,13 +107,37 @@ forbidden. It breaks audience binding, lets callers bypass the upstream's own ra
 makes the upstream unable to tell the MCP server from the end user. The server should instead hold its
 own upstream credentials or perform a token exchange for a downstream-scoped token.
 
-### Sessions and the confused deputy
+### Sessions
 Session IDs must be cryptographically random and must never substitute for authentication, *because* a
-guessed or leaked ID would let an attacker inject messages into another user's session. Separately, a
-proxy server that uses one static client ID at a third-party authorization server can be abused: the
-user's earlier consent is cached, so an attacker's dynamically registered client can obtain codes via a
-redirect without a fresh consent screen. The spec's answer is to require user consent per dynamically
-registered client.
+guessed or leaked ID would let an attacker inject messages into another user's session. The server
+still validates the bearer token on every request, and the spec's security guidance suggests binding
+session state to the authenticated subject (key it as `subject:session_id`), so a stolen ID presented
+with someone else's token resolves to nothing.
+
+### The confused deputy
+This attack hits a common shape: an MCP server that fronts a third-party API (say, a SaaS CRM) and
+acts as an OAuth *proxy*, registering with the CRM's authorization server under one static client ID
+while letting MCP clients register dynamically with itself. Walk the steps:
+
+1. A legitimate user connects once; the CRM shows a consent screen for the proxy's static client ID and
+   sets a cookie remembering that consent.
+2. An attacker dynamically registers their own client at the proxy, with a redirect URI they control,
+   and sends the user a crafted authorization link.
+3. The user clicks; the proxy forwards to the CRM under the *same* static client ID, the CRM sees the
+   remembered consent and skips the screen, and the proxy then delivers the authorization code to the
+   attacker's redirect URI.
+
+The deputy (the proxy) holds the authority, and the attacker borrowed it without the user ever seeing
+a prompt. The spec's answer is that such proxies must obtain the user's consent for *each* dynamically
+registered client themselves, and validate redirect URIs exactly, *because* the upstream consent cookie
+only proves the user trusted the proxy, not the attacker's client behind it.
+
+### The client side
+The host is also part of the security surface. It stores tokens per server (never in the model's
+context, where an injected instruction could ask the model to echo them), never sends a token to a
+server other than the one it was issued for, and never accepts tokens in URL query strings, where
+proxies and logs capture them. When a call fails with `403 insufficient_scope`, a well-behaved client
+re-runs authorization asking for the named scope (step-up) rather than requesting everything up front.
 
 ## Example
 A Starlette-style HTTP middleware sketch (register with `@app.middleware("http")` in FastAPI or
@@ -188,6 +212,8 @@ caches it for the endpoint; very old versions hung on that.)
   requests from unknown origins in server logs, the fingerprint of DNS rebinding.
 - Putting authorization rules in the system prompt ("only call delete if the user confirms"); the
   symptom is a destructive call traced back to a tool result that contained instructions.
+- Running an OAuth proxy with one static upstream client ID and no per-client consent; the symptom is
+  authorization codes issued for clients the user never saw a consent screen for.
 
 ## When to use
 Reach for the full OAuth path whenever an MCP server is reachable over a network by more than one

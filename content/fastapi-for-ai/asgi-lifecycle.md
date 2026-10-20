@@ -5,6 +5,7 @@ name: ASGI lifecycle
 kind: concept
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/middleware-ordering
@@ -64,7 +65,10 @@ calls the app. The app awaits `receive()` and gets `{"type": "lifespan.startup"}
 work, then sends `lifespan.startup.complete` (or `lifespan.startup.failed` with a message). It then
 parks on `receive()` until the server sends `lifespan.shutdown`, runs teardown, and answers
 `lifespan.shutdown.complete`. FastAPI's `lifespan` context manager is literally the code before and
-after the `yield` in this exchange. Uvicorn completes the startup handshake *before* it starts
+after the `yield` in this exchange. The lifespan scope also carries a `state` dict; whatever startup
+puts there (Starlette does this when your lifespan yields a dict) is shallow-copied into the `state` of
+every later HTTP and WebSocket scope, which is how a model loaded once reaches `request.state` in every
+request without a global. Uvicorn completes the startup handshake *before* it starts
 accepting connections on its socket, so a worker whose startup fails never receives traffic, and a
 worker that is still loading a model is simply not serving yet. Uvicorn's `--lifespan` flag chooses
 `auto` (tolerate apps that do not implement the protocol), `on` (require it) or `off`.
@@ -76,11 +80,20 @@ worker that is still loading a model is simply not serving yet. Uvicorn's `--lif
    loop, which is why a body can be read only once.
 3. The app sends exactly one `http.response.start` with `status` and `headers`, then one or more
    `http.response.body` events. Setting `more_body: True` keeps the response open, which is how
-   `StreamingResponse` emits tokens as they arrive; the final event has `more_body: False`.
-4. If the client goes away, the next `receive()` returns `http.disconnect`. Nothing is raised
-   automatically, *because* the app is the one doing the awaiting; this is why Starlette offers
-   `request.is_disconnected()` and why a token generator only notices a vanished client when it next
-   tries to send.
+   `StreamingResponse` emits tokens as they arrive; the final event has `more_body: False`. The order
+   is enforced *because* HTTP/1.1 writes the status line and headers before any body bytes: once
+   `http.response.start` has gone out, the status is on the wire and cannot change. An exception
+   raised mid-stream therefore cannot become a 500; the server can only cut the connection, and the
+   client sees a 200 with a truncated body.
+4. If the client goes away, the next `receive()` returns `http.disconnect`. The server does not cancel
+   the app's task; the spec delivers the disconnect as a message *because* only the app knows whether
+   the work should stop (abandon an LLM call) or must finish (write the audit row, record usage).
+   Someone has to read that event.
+   Under ASGI spec 2.4 a server may also raise an `OSError` subclass from a `send()` on a closed
+   connection. Starlette's `StreamingResponse` uses whichever applies: on older-spec servers it listens
+   for `http.disconnect` in a parallel task and cancels the generator, on 2.4 servers the next `send`
+   fails. A non-streaming handler that awaits a 60-second completion and then returns gets no such
+   help; it runs to the end unless it polls `request.is_disconnected()` or races the call against it.
 
 ### WebSockets
 A `websocket` scope begins with a `websocket.connect` event; the app answers `websocket.accept`
@@ -97,7 +110,7 @@ handler and dispatches http/websocket scopes by path.
 
 ### Processes and event loops
 One worker process runs one event loop and one app instance. `uvicorn --workers 4` (or Gunicorn with a
-Uvicorn worker class) forks four processes, each of which runs its own lifespan handshake and holds its
+Uvicorn worker class) starts four processes (Uvicorn spawns them, Gunicorn forks them), each of which runs its own lifespan handshake and holds its
 own copies of anything loaded there. "Load once" therefore means once per worker, which matters when
 the thing loaded is a multi-gigabyte model.
 
@@ -150,12 +163,20 @@ async def app(scope, receive, send):
   model load delays readiness; orchestrators need startup probes tuned to the load time.
 
 ## Pitfalls
-- Reading the request body twice (for example in a logging middleware and then in the endpoint); the
-  second reader hangs or gets an empty body because `http.request` events are consumed once. Symptom:
-  422s or timeouts only when that middleware is enabled.
-- Assuming a client disconnect raises an exception in the handler; it does not, so a long LLM call
+- Draining `receive()` in a pure ASGI middleware (for example to log the body) without replaying the
+  events to the inner app; the endpoint then hangs or gets an empty body because `http.request` events
+  are consumed once. (Starlette's `Request` caches the body, and current `BaseHTTPMiddleware` replays
+  it, so this bites hand-written ASGI layers and older Starlette.) Symptom: 422s or timeouts only when
+  that middleware is enabled.
+- Assuming a client disconnect interrupts every handler; `StreamingResponse` stops its generator, but
+  a handler that awaits the full completion before returning is never interrupted, so a long LLM call
   keeps burning provider tokens for a user who left. Symptom: provider spend higher than responses
   actually delivered.
+- Validating or calling the provider lazily inside a stream generator and expecting errors to become
+  4xx/5xx responses; the 200 and headers were already sent. Symptom: clients get HTTP 200 with a
+  stream that stops mid-sentence, while the server log shows a traceback. Do the checks that can fail
+  before returning the `StreamingResponse`, and send an explicit error event inside the stream for
+  failures after it starts.
 - Treating `app.state` as shared memory across workers; each worker has its own, so caches and
   counters diverge. Symptom: rate limits or cache hit rates that look random under `--workers 4`.
 - Putting model loading at import time instead of the lifespan handshake; tests, migrations and CLI
@@ -188,11 +209,13 @@ message model, explain both symptoms and what you would check.
 the app and the browser is accumulating them until `more_body: False`. Candidates are a
 `BaseHTTPMiddleware` that reads the whole response, a compression layer, or the gateway buffering
 upstream responses; test by curling the app directly with `-N`, then each hop outward. Abandoned chats
-continue because a disconnect arrives as an `http.disconnect` event on `receive()`, not as an
-exception; if the handler never polls `request.is_disconnected()` or tries a send, it keeps awaiting
-the provider. The fix is to check for disconnect between tokens, or run the provider call in a task
-that is cancelled when the disconnect event arrives, and to confirm the gateway actually forwards the
-connection close.
+continue because a disconnect reaches the app only as an `http.disconnect` event (or a failed `send`),
+not as cancellation by the server. A buffering gateway explains both symptoms at once: it keeps
+reading the upstream response after the browser leaves, so the app never sees a disconnect at all.
+If the gateway is not the cause, check for a hand-rolled stream loop or a non-streaming provider call
+that never polls `request.is_disconnected()`; `StreamingResponse` itself stops its generator on
+disconnect. Fixes: disable response buffering for the streaming route at the gateway, confirm it
+forwards the client close upstream, and race long provider calls against the disconnect event.
 
 ## Quiz
 ### Q: When does Uvicorn start accepting HTTP connections for a FastAPI app with a lifespan handler?
@@ -208,8 +231,9 @@ connection close.
 - [ ] The server cancels the handler's task immediately
 - [x] A subsequent `receive()` returns an `http.disconnect` event
 - [ ] The scope's `client` field becomes `None`
-> Disconnect is a message, not an exception; the handler must read it, which is what
-> `request.is_disconnected()` does, otherwise a long model call keeps running for nobody.
+> Disconnect is a message, not a cancellation; the handler must read it, which is what
+> `request.is_disconnected()` does (spec-2.4 servers may also fail the next `send`, but not an arbitrary
+> `await`), otherwise a long model call keeps running for nobody.
 
 ### Q: With `uvicorn --workers 4`, how many times does the lifespan startup code run?
 - [ ] Once, in the master process, with state shared by fork

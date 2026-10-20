@@ -5,7 +5,7 @@ name: Workflows vs agents
 kind: decision
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -49,8 +49,9 @@ spent, like a budget, exactly where the environment is unpredictable, and nowher
 
 ## How it works
 ### The spectrum of control
-Think of a dial for "who decides the next step". At one end, a single prompt: no decision at all. Then
-the workflow patterns, where code owns control flow and the model fills in steps:
+Think of a dial for "who decides the next step". At one end, a single call to an *augmented* model (one
+with retrieval, tools and memory available): no control-flow decision at all. Then the workflow
+patterns, where code owns control flow and the model fills in steps:
 - **Prompt chaining:** a fixed sequence of calls, each transforming the previous output, with
   programmatic checks between them (generate outline, check length, write, check tone). Use when a
   task decomposes into fixed stages.
@@ -73,7 +74,10 @@ decides each next action and when to stop.
 - **Latency:** workflows are predictable and can be parallelized by design; agent loops are serial by
   nature.
 - **Reliability:** workflow failures are per step, retriable in place; agent failures are per
-  trajectory and often only visible at the end.
+  trajectory and often only visible at the end. Both compound across steps (three steps at 99% each
+  succeed about 97% of the time), but a workflow has a fixed, short chain with a check after each link,
+  while an agent's chain length is itself a random variable, and its long runs are both the costly ones
+  and the least reliable ones.
 - **Testing:** workflow steps have unit tests with fixed inputs; agents need trajectory evals and
   golden task sets.
 - **Debuggability:** a workflow trace is the same shape every time; an agent trace is unique per run.
@@ -86,6 +90,14 @@ What is the cost of an error and is it reversible? High and irreversible pushes 
 toward agents with gates and budgets. What volume and latency budget? High volume with tight latency
 pushes toward workflows. Can I evaluate it? If you cannot build a task set with success criteria, you
 cannot safely run an agent on it.
+
+### Moving the boundary over time
+The boundary is not fixed at design time; logged trajectories tell you where to move it. If most of an
+agent's runs follow the same two or three tool sequences, those sequences are a flowchart you did not
+know you had: codify them as workflow branches, route matching inputs to them, and keep the agent for
+the residue. In the other direction, a workflow whose exception queue or router branch count keeps
+growing is telling you that part of the path is not predictable, and that step should become agentic.
+Both moves are driven by the same data: path frequencies from traces and the exception rate.
 
 ### The hybrid, which is the usual answer
 A workflow skeleton with agentic nodes: intake and routing by code, an agent for the investigation step
@@ -143,6 +155,8 @@ exception agent.
   limit.
 - Letting an agent step run without a budget, a restricted tool set or gates inside an otherwise fixed
   workflow; the symptom is the one agentic node producing all of the incidents.
+- Never revisiting the boundary after launch; the symptom is an agent whose traces show the same three
+  tool sequences in nine runs out of ten, paying agent prices for a path that could be code.
 - Treating "agent" as a product requirement rather than a design choice; the symptom is a system that
   is autonomous where it should be deterministic and vice versa.
 
@@ -151,7 +165,8 @@ Default to a workflow, and add autonomy only at the steps where you cannot enume
 investigation, open-ended research, repair after unexpected failures. Keep the agentic islands small,
 budgeted, tool-restricted and gated, and measure them separately: task completion rate on a golden set,
 steps and cost per run at the p95, and the fraction of runs that end at the budget. For the workflow
-parts measure per-step accuracy and latency. In day-to-day work the question arrives as "should this
+parts measure per-step accuracy and latency, plus the exception rate; for the agentic parts, review the
+distribution of tool sequences in traces every few weeks to find paths that can be codified. In day-to-day work the question arrives as "should this
 be an agent?", and the right first answer is "show me the flowchart"; in interviews, the expected depth
 is naming the workflow patterns, explaining what the choice changes for cost, testing and failure
 modes, and describing a hybrid.

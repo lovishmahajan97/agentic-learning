@@ -5,7 +5,7 @@ name: Computer use
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agents/sandboxing
   - agents/tool-calling
@@ -71,13 +71,19 @@ value is generality; its price is cost and reliability, and the engineering is a
 Every step is a vision call. A screenshot costs on the order of a thousand or more input tokens
 depending on resolution and vendor (illustrative), and a realistic task takes tens of steps, each a
 full round trip of a second or more. The transcript fills with images, so context compaction is not
-optional: keep the last few screenshots and drop the rest, retaining only the action log. Latency per
+optional: keep the last few screenshots and drop the rest, retaining only the action log. The arithmetic
+is the same quadratic as any agent transcript. Taking 1,500 tokens per screenshot as an illustrative
+figure, a 30-step run that keeps every image re-sends 1,500 × (1 + 2 + … + 30) ≈ 700k image tokens over
+the run; keeping the last three caps each call at about 4,500 image tokens, so roughly 130k in total,
+and the per-step cost stops growing. Latency per
 task is minutes, not seconds, which shapes where it fits (background jobs, not interactive chat).
 
 ### Hybrid grounding
 When structured information exists, use it. Browser agents pair the screenshot with the accessibility
 tree or DOM so the model can click "the Submit button" by element reference rather than by coordinates,
-falling back to coordinates only for canvas content. Desktop agents can query the accessibility API for
+falling back to coordinates only for canvas content. A related technique, set-of-mark prompting,
+draws numbered labels on the interactive elements in the screenshot so the model answers "click 14"
+and the harness maps 14 to the element's known bounds. Desktop agents can query the accessibility API for
 the focused window. The screenshot provides understanding; the structured layer provides precision. The
 best harnesses treat computer use as a fallback inside a tool set that also includes real APIs.
 
@@ -100,6 +106,14 @@ disposable VM with a session scoped to only the accounts the task needs, no pass
 personal data; block consequential confirmations behind an approval gate detected by the harness
 (buttons labelled Send, Pay, Confirm, Delete); allowlist domains; log every action with its screenshot
 for audit; and set hard step and time budgets.
+
+Gating is harder here than with API tools, because a click at (912, 640) does not say what it does.
+The harness has to recover the target: hit-test the coordinate against the accessibility tree or DOM
+to get the element's role and label, or crop the screenshot around the point and classify it. Asking
+the model to declare its intent with each action ("click Send") helps as a second signal but is not a
+control on its own, since the model is the component being protected against. When the target cannot be
+identified, treat the click as consequential; and remember that keystrokes matter too, because Enter in
+a focused form submits it.
 
 ## Example
 A minimal computer-use loop: fixed-resolution screenshots with coordinate scaling, a small action
@@ -141,7 +155,7 @@ def run(task, ask_model, is_consequential, max_steps=40, keep_shots=3):
         a = ask_model(task, history)                        # one structured action, or {"type": "done"}
         if a["type"] == "done":
             return a.get("summary")
-        if is_consequential(a, shot):                       # e.g. a click on Send, Pay, Confirm, Delete
+        if is_consequential(a, shot):                       # hit-tests the target: Send, Pay, Confirm, Delete?
             raise PermissionError("consequential action requires approval")
         act(a, sx, sy)
         history.append({"step": step, "action": a})
@@ -171,6 +185,8 @@ def run(task, ask_model, is_consequential, max_steps=40, keep_shots=3):
   a cost curve that climbs quadratically.
 - Running on the user's real desktop with their sessions; the symptom is an incident where an injected
   page instruction sent an email or changed a setting with the user's identity.
+- Gating consequential actions by the model's own description of them; the symptom is a click
+  described as "close dialog" that lands on Delete and is never stopped.
 - No per-step verification; the symptom is an agent that reports success on a form it never submitted
   because a validation error it did not read blocked it.
 - Using computer use where an API exists; the symptom is a ten-minute, forty-step run doing what a

@@ -5,7 +5,7 @@ name: Reproducible evaluations
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/experiment-tracking
   - llmops-platform/evaluation-frameworks
@@ -68,6 +68,10 @@ Every run records a manifest, and each field is there *because* a specific drift
   pinned because it is a model.
 - **Environment**: git SHA, dependency lockfile hash, container image digest; because tokenizers, SDK
   defaults and retry behaviour live in dependencies.
+- **Runtime inputs**: anything the application reads at request time that is not in the bundle, such as
+  the current date, a live tool or API result, or a feature-flag value. These are frozen by injecting a
+  fixed clock and replaying recorded tool responses (an agent eval that calls a live search API is not
+  reproducible next week whatever else you pin), and the recording's hash goes into the manifest.
 - **Run policy**: concurrency, timeout and retry settings, cache mode; because timeouts recorded as zero
   scores make a provider incident look like a regression, and a cache that ignores a pin hides a change.
 The run id is a hash of the manifest, so two runs with identical pins are recognisably the same
@@ -83,6 +87,16 @@ forcing zero, *because* an eval at temperature zero of a system that ships at 0.
 system; repeats, not determinism, are how you tame the variance. Deterministic scorers on structured
 outputs from a locally pinned model can show a noise floor near zero, at which point one run suffices;
 measure it before assuming it.
+
+### Two kinds of noise, two different tools
+A score on a golden set is uncertain for two separate reasons, and they need different remedies.
+*Generation noise* is the run-to-run variation on the same items, from sampling, non-deterministic
+serving and a model-graded scorer; repeats measure it, and averaging each item's score over its repeats
+shrinks it. *Item-sampling noise* is the uncertainty from having evaluated these few hundred items rather
+than the whole population of requests; repeats do nothing for it, only more items do, and the confidence
+interval computed over items (bootstrap over per-item scores) is what quantifies it. A delta must clear
+both: a perfectly deterministic run on 100 items still has an item-level interval of several points. The
+practical recipe is to average repeats per item first, then compute the paired interval over items.
 
 ### Detect drift you cannot pin
 Even a dated snapshot is a promise you cannot verify from outside. A *sentinel run* re-executes a frozen
@@ -132,7 +146,8 @@ def comparable(a: dict, b: dict) -> tuple[bool, dict]:
 
 # champion_mean, floor = noise_floor(lambda: run_eval(champion_manifest, cache=False))
 # delta = candidate_mean - champion_mean
-# if abs(delta) <= floor: print("within noise: not a result")  # the gate lesson turns this into a CI test
+# if abs(delta) <= floor: print("within noise: not a result")  # generation noise only; the paired interval
+#                                                               # over items (gate lesson) must also exclude it
 ```
 
 ## Trade-offs
@@ -152,6 +167,9 @@ def comparable(a: dict, b: dict) -> tuple[bool, dict]:
 - A silently upgraded judge; the symptom is champion and candidate shifting together, which preserves the
   delta but breaks every absolute floor in the gate.
 - Datasets referenced by file name; the symptom is two runs "on golden.jsonl" disagreeing on the item count.
+- Treating "three identical repeats" as proof the result is solid; the symptom is a deterministic eval
+  on 80 items whose two-point win vanishes on the next dataset version, because repeats never measured
+  item-sampling noise.
 - Timeouts counted as zero scores; the symptom is eval scores that correlate with the provider's status page.
 - Assuming temperature zero means deterministic; the symptom is a bug report that some outputs differ
   between identical runs (how many depends on the provider, output length and load), filed as a regression.

@@ -4,8 +4,8 @@ module: rag-retrieval
 name: Reranking (cross-encoder)
 kind: pattern
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - rag-retrieval/hybrid-search
   - rag-retrieval/similarity-search
@@ -64,7 +64,10 @@ the query tower runs once per query; the score is a dot product. Cross-encoder: 
 pair costs a forward pass over roughly |query| + |passage| tokens. For a 20-token query and 400-token
 passages, reranking 50 candidates is 50 passes over about 420 tokens each, 21,000 tokens of encoder
 compute per query, which with GPU batching is typically tens of milliseconds for a small model and more
-for a large one (illustrative; measure yours).
+for a large one (illustrative; measure yours). Cost scales linearly with n, and somewhat faster than
+linearly with passage length, because the attention part of each pass is quadratic in the pair's length
+while the rest is linear; longer chunks therefore cost more per candidate as well as risking truncation,
+which is one reason chunk size and reranker choice should be decided together.
 
 ### The pipeline
 1. Retrieve the top-n candidates from the first stage (hybrid or dense), with n chosen so that recall@n
@@ -95,11 +98,20 @@ window and take the maximum.
   tokens, the maximum similarity to any passage token. It keeps token-level matching while remaining
   precomputable, sitting between bi- and cross-encoders in both accuracy and cost, with a much larger
   index.
-- **LLM rerankers.** Prompt a generative model with the query and candidate list and ask for an ordering
-  or per-candidate relevance. Strongest on nuanced relevance, slowest and most expensive, and sensitive
-  to candidate order in the prompt.
+- **LLM rerankers.** Prompt a generative model with the query and candidates and ask for per-candidate
+  relevance (pointwise), a preference between two (pairwise) or an ordering of the whole list
+  (listwise, usually run as a sliding window from the bottom of the list to the top because the full
+  pool does not fit or degrades in one prompt). Strongest on nuanced relevance and instructions such as
+  "prefer the newest policy", slowest and most expensive, and sensitive to candidate order in the prompt.
 - **Hosted rerank APIs.** Several providers (Cohere, Voyage, Jina and others) expose a reranking model,
   typically cross-encoder style though architectures are not always disclosed, behind an endpoint; no GPU to run, but a network call per query and per-call pricing.
+
+### What a reranker does not see
+Each pair is scored in isolation. The reranker does not know what else is in the candidate list, so two
+near-duplicate chunks get two near-identical high scores and both take a slot in the top k, and it cannot
+judge that a general rule and its specific exception are only useful together. Deduplication or a
+diversity step (maximal marginal relevance, or a cap per source document) after reranking handles the
+first; keeping k large enough, or expanding to parent sections, handles the second.
 
 ### Score semantics
 A cross-encoder logit is comparable across candidates for the same query and, if the model was trained
@@ -110,8 +122,9 @@ one.
 ## Example
 A two-stage pipeline with public Sentence-Transformers models: a small bi-encoder retrieves five
 candidates by cosine, then an MS MARCO cross-encoder rescores each (query, passage) pair jointly. The
-lexical distractors (passages about a different policy that share vocabulary with the query) tend to sit
-high after stage one and drop after stage two.
+corpus is built so that vocabulary overlap is a bad guide: the price-match and warranty passages share
+"30 days" and "laptops" with the query but answer nothing, while the real answer needs two passages, the
+general 30-day rule and the 14-day exception for laptops.
 
 ```python
 import numpy as np
@@ -139,8 +152,10 @@ pairs = [(query, passages[i]) for i in stage1]
 scores = ce.predict(pairs)                            # one joint forward pass per pair
 for i, s in sorted(zip(stage1, scores), key=lambda t: -t[1]):
     print(f"{s:+6.2f}  {passages[i][:60]}")
-# Expect the 14-day laptop passage (the actual answer: no) at the top after reranking,
-# and the generic 30-day and price-match passages, which share words but not the answer, lower.
+# Typically the 14-day laptop rule and the general 30-day rule rise to the top two, and the
+# price-match and warranty passages fall. The exact order of the top two varies by model, and
+# neither model reasons that the exception overrides the rule: that is the LLM's job, so both must
+# survive into the top k.
 ```
 
 ## Trade-offs
@@ -167,6 +182,9 @@ for i, s in sorted(zip(stage1, scores), key=lambda t: -t[1]):
   with n because candidates were scored one at a time.
 - Thresholding on raw logits copied from another model or dataset; the symptom is a "no relevant
   context" path that fires on everything or never, since score scales differ between rerankers.
+- Trusting the reranked top k without deduplication; the symptom is a prompt whose five slots hold
+  three copies of the same boilerplate paragraph from different versions of a document, crowding out
+  the passage that differed.
 
 ## When to use
 Add a reranker when retrieval evaluation shows the relevant chunk is usually in the top 30 to 50 but not

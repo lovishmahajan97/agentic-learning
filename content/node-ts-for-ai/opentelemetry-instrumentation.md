@@ -5,6 +5,7 @@ name: OpenTelemetry instrumentation
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -57,15 +58,18 @@ with no SDK registered the API calls are no-ops.
 Auto-instrumentation works by patching modules (`http`, `undici`/`fetch`, `pg`, `ioredis`, `express`,
 `fastify`, `pino` and others) when they are loaded. It must therefore be installed *before* those
 modules are imported, which is why the SDK lives in its own `instrumentation.ts` loaded with
-`node --require` (CommonJS) or `node --import` (ESM, which needs the loader hook that
-`@opentelemetry/auto-instrumentations-node/register` sets up), or via `NODE_OPTIONS`. Importing it from
+`node --require` (CommonJS) or `node --import` (ESM), or via `NODE_OPTIONS`. ESM needs one more piece:
+`import` statements bypass the CommonJS `require` hook, so the file must also register OTel's ESM
+loader hook (`module.register("@opentelemetry/instrumentation/hook.mjs", ...)`), which the zero-code
+entry point `@opentelemetry/auto-instrumentations-node/register` does for you. Importing it from
 `app.ts` after your framework is a classic silent failure: no error, no spans.
 
 ### Context propagation
 Within a process the SDK installs an `AsyncLocalStorage`-based context manager so the active span
 follows `await`, promises, timers and callbacks. Across HTTP it injects and extracts `traceparent` and
 `tracestate` (W3C Trace Context); the `http` and `fetch` instrumentations do this for every outbound
-and inbound request. Across a queue nothing is automatic unless the library supports it: serialise the
+and inbound request. Across a queue nothing is automatic unless the library supports it (BullMQ 5 has an opt-in `telemetry`
+option, provided by the `bullmq-otel` package, that does this): otherwise serialise the
 context into job data on the producer (`propagation.inject(context.active(), carrier)`) and restore it
 in the worker (`propagation.extract(...)`) so the job's spans link to the originating request.
 
@@ -76,8 +80,9 @@ The Anthropic TypeScript SDK emits its own span per request, `anthropic.messages
 `gen_ai.usage.output_tokens`, the cache read and write counts, and `anthropic.request.id`; its tool
 runner adds a parent span plus one span per tool it runs. The feature is in beta, so pin the SDK
 version. Two rules follow. Wrap the call in a span of your own (`agent.plan`, `tool.search_docs`) with
-app-level attributes (tenant, run id, prompt version) and the SDK span nests under it, which is also how
-the `traceparent` header reaches the API. And if a third-party instrumentation already patches the SDK,
+app-level attributes (tenant, run id, prompt version) and the SDK span nests under it; the SDK then
+sends its own span's `traceparent` to the API, so server-side spans (if API tracing is configured) join
+the same trace. And if a third-party instrumentation already patches the SDK,
 turn one of the two off (`openTelemetry: false` or `ANTHROPIC_OPEN_TELEMETRY=false`) or every request
 appears twice. For providers whose SDK emits nothing, set the GenAI semantic-convention attributes
 yourself (`gen_ai.provider.name`, the request model, `gen_ai.usage.*`); the conventions are still
@@ -103,7 +108,8 @@ where traces are sampled. Pino or Winston with the OTel log instrumentation gets
 ### Export, sampling, cost
 Spans go through a `BatchSpanProcessor` to an OTLP exporter (HTTP or gRPC), usually to an OpenTelemetry
 Collector sidecar or gateway that fans out to backends, redacts, and does tail sampling. Head sampling
-in the SDK (`parentbased_traceidratio` at, say, 10%) cuts cost but drops the slow 1% at random; tail
+in the SDK (`parentbased_traceidratio` at, say, 10%) cuts cost but decides before anything has gone
+wrong, so it throws away 90% of the rare slow or failed traces along with the boring ones; tail
 sampling in the collector keeps errors and slow traces *because* it decides after seeing the whole
 trace. Configuration is environment-driven: `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
 `OTEL_TRACES_SAMPLER`, `OTEL_RESOURCE_ATTRIBUTES`. On shutdown call `sdk.shutdown()` so the batch
@@ -111,12 +117,15 @@ processor flushes; otherwise the last spans of every deploy vanish.
 
 ## Example
 `instrumentation.ts` configures the SDK and is loaded before the app with
-`node --import ./instrumentation.js app.js` (or `--require` for CommonJS). The second block shows an
+`node --import ./instrumentation.js app.js` (for a CommonJS build, use `--require` and drop the two
+`register` lines, which only an ES module can run). The second block shows an
 application span around a model call; the Anthropic SDK's own `anthropic.messages.create` span, with
 token usage, nests under it automatically because the SDK uses the registered provider.
 
 ```ts
 // instrumentation.ts — loaded first, never imported by application code except for shutdown
+import { register } from "node:module";
+register("@opentelemetry/instrumentation/hook.mjs", import.meta.url);  // ESM only: lets patches reach `import`ed modules
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";

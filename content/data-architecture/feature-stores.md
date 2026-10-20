@@ -5,6 +5,7 @@ name: Feature stores (hybrid ML only)
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - ml-fundamentals/train-test-leakage
   - data-architecture/training-data-pipelines
@@ -80,9 +81,11 @@ event stream.
 ### Why one definition serves both paths
 The transformation is written once and executed in the batch engine for history and in the materializer
 or stream processor for serving. Skew is prevented structurally rather than by code review, *because*
-there is no second implementation to drift. Where an online-only transformation is unavoidable (a
-feature computed from request payload), the store logs the served values so they can be reused as
-training features later, closing the loop.
+there is no second implementation to drift. Where a transformation depends on the request payload, two
+options exist: run the same transformation code in both paths at request time and at training time
+(Feast's on-demand feature views work this way), or log the values actually served so they can be reused
+as training features later, closing the loop. Logging is the safer of the two when the request-time
+inputs cannot be reconstructed from history.
 
 ### Versioning and lineage
 Feature view definitions are versioned; a model's training run records which versions and which offline
@@ -100,9 +103,10 @@ are handled by the ingestion contract and embedding versioning, not by a feature
 
 ### Products
 Feast is the common open-source option (definitions in Python, pluggable offline and online stores).
-Managed options include Tecton, Databricks Feature Store, Amazon SageMaker Feature Store, Vertex AI
-Feature Store and Hopsworks. The differences are mostly in streaming support, transformation execution
-and how tightly they integrate with a given platform; the concepts above are shared.
+Managed or commercial options include Tecton, the Databricks feature store, Amazon SageMaker Feature
+Store, Vertex AI Feature Store and Hopsworks; this market consolidates and renames products often, so
+check current offerings. The differences are mostly in streaming support, transformation execution and
+how tightly they integrate with a given platform; the concepts above are shared.
 
 ## Example
 A point-in-time join in pure Python, contrasted with the leaking "join to the latest value" that
@@ -158,8 +162,8 @@ metrics overstate production performance.
   time and expire beyond the longest TTL any model needs.
 - Managed stores integrate tightly with their platform and reduce operational work, but lock the feature
   layer to that platform; Feast keeps portability at the cost of assembling the pieces yourself.
-- Logging served features for later training closes the loop on online-only transformations, but doubles
-  write volume on the hot path; sample when the model's traffic is high.
+- Logging served features for later training closes the loop on online-only transformations, but adds a
+  write per prediction to a path that was read-only; make it asynchronous and sample when traffic is high.
 
 ## Pitfalls
 - Joining labels to current feature values; the symptom is offline evaluation far better than production,

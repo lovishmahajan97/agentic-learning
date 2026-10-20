@@ -5,7 +5,7 @@ name: Golden dataset strategy
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/dataset-contamination
@@ -76,6 +76,14 @@ item difficulty cancels in the per-item difference, which is why both must run o
 version (the `evaluation-gates-for-production-releases` lesson does the arithmetic). Size each slice from
 the smallest regression you must be able to detect there, not from a round number.
 
+The sizing rule follows directly. For a target 95% half-width *h* on the candidate-minus-champion
+difference, an unpaired comparison of two pass rates needs n ≈ 1.96² · 2p(1−p) / h² items, while a paired
+one needs n ≈ 1.96² · f / h², where *f* is the fraction of items whose verdict differs between the two
+bundles. At p = 0.8 and h = 2 points, unpaired needs about 3,070 items; paired with f = 10% needs about
+960. Detecting a regression of size *h* reliably rather than just bounding it costs more again (roughly
+double the items for 80% power), and *f* is unknown until you have run the champion against a few
+candidates, so measure it and resize.
+
 ### The sourcing pipeline
 Items come from four places, and the mix matters. *Production traces*, sampled with per-slice quotas and
 stratified by outcome (thumbs-down, escalation, abandoned session) rather than uniformly, *because*
@@ -83,7 +91,11 @@ uniform sampling drowns rare intents in the head of the distribution. *Failure m
 analysis of incidents. *Synthetic generation* for slices with too little real traffic, admitted only after
 a human labels and filters them, *because* a generator shares the model's blind spots and tends to write
 easier cases than users do. *Expert-written* items for policy-critical behaviour that traffic rarely
-exercises. Every item passes an admission workflow: proposed, labeled by the task owner, checked by a
+exercises. What an item stores as "expected" depends on the task: a label for
+classification, executable tests for code, and for free text usually a short list of must-include facts
+and must-not behaviours rather than one reference phrasing, *because* a judge grading against criteria
+penalises legitimate rewording less, and a policy change then edits a named criterion instead of a
+paragraph nobody can diff. Every item passes an admission workflow: proposed, labeled by the task owner, checked by a
 second reviewer (measure inter-annotator agreement; a slice with persistent disagreement has an
 under-specified task, not bad reviewers), then merged into the *next* version. PII is scrubbed or
 replaced with synthetic values before storage, *because* a golden set lives for years and gets copied to
@@ -122,6 +134,9 @@ def half_width_points(p, n):            # 95% half-width in percentage points fo
 
 for n in (40, 50, 200, 1000):
     print(f"n={n:5d}: ±{half_width_points(0.8, n):.1f} points")   # ±12.4, ±11.1, ±5.5, ±2.5
+
+def items_for_paired_gate(h, flip_rate):  # n so the paired 95% half-width on the delta is h (fractions)
+    return math.ceil(1.96**2 * flip_rate / h**2)          # items_for_paired_gate(0.02, 0.10) -> 961
 
 def stratified_sample(candidates, quota_per_slice, seed=7):
     """candidates: labeled production traces; a fixed quota per slice keeps rare intents measurable."""

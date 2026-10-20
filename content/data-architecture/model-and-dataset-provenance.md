@@ -5,6 +5,7 @@ name: Model & dataset provenance
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - data-architecture/data-lineage
   - data-architecture/training-data-pipelines
@@ -43,7 +44,7 @@ README was written has since had rows added and removed. A base model pulled by 
 different revision today. Prose cannot be diffed, verified or traced.
 
 The second naive alternative is "git is enough": commit the training script and call it reproducible.
-Code is one of five inputs. The data snapshot, the base model revision, the environment (library and
+Code is one of six inputs. The data snapshot, the base model revision, the environment (library and
 CUDA versions), the hyperparameters and the random seed all change outputs, and none of them lives in
 the training script. Provenance is the discipline of capturing all of them, as identifiers that can be
 checked, at the moment the artifact is created.
@@ -84,13 +85,19 @@ Model cards (Mitchell et al.) do the same for models: intended use, out-of-scope
 summary, evaluation results broken down by relevant slices, limitations and ethical considerations. The
 provenance manifest is the machine-readable backbone; the model card is the human-readable layer that
 references it. Regulation increasingly expects both: the EU AI Act, for example, requires technical
-documentation of training data and evaluation for higher-risk systems and general-purpose models, and the
-specifics are still being worked out, so check current obligations.
+documentation covering data and evaluation for high-risk systems, and for general-purpose model providers
+technical documentation plus a public summary of training content. Templates, codes of practice and
+application dates are still being phased in, so check current obligations rather than relying on a
+summary.
 
 ### Licence and terms tracking
-Each dataset and base model carries its licence identifier in the manifest. Derived artifacts inherit the
-most restrictive terms of their inputs, which is computed by walking the lineage graph, *because* a
-permissively licensed fine-tune of a restrictively licensed base is still bound by the base's terms.
+Each dataset and base model carries its licence identifier in the manifest. The safe engineering policy
+is that a derived artifact carries the combined obligations of all its inputs, computed by walking the
+lineage graph, *because* publishing a fine-tune under a permissive licence does not release it from the
+base model's terms (many model licences explicitly bind derivatives). Licences are not a simple
+restrictiveness ranking: two inputs can impose different, even incompatible, obligations, and whether a
+given dataset licence reaches the trained weights is a legal question, so the graph's job is to surface
+every applicable term for counsel, not to decide it.
 This is also where "the customer's data may not be used to train shared models" is enforced: the
 manifest of any shared model must show no customer-restricted dataset digests among its inputs.
 
@@ -103,8 +110,10 @@ code embedded in the file; a signed safetensors file is both authentic and inert
 digests too, since a training run is only as trustworthy as the libraries that ran it.
 
 ### Using provenance
-- **Contamination check:** hash the eval set's examples and the training snapshot; any overlap is found
-  by digest comparison without re-reading the pipeline.
+- **Contamination check:** hash the eval set's examples and the training snapshot's examples; exact
+  overlap is found by digest comparison without re-reading the pipeline. Hashes only catch exact copies,
+  so normalize text before hashing and add n-gram or embedding-similarity checks for reformatted or
+  paraphrased leaks.
 - **Data subject requests:** the dataset snapshot digests in a model's manifest, joined with lineage,
   answer whether a person's records contributed to a model.
 - **Reproduction:** the manifest is the command line: same base revision, same snapshot, same commit,
@@ -219,7 +228,8 @@ proprietary documents. How do you establish the truth, and what must have been i
 snapshot digests, its base model revision, and recursively the manifests of any merged or distilled
 inputs. Each dataset snapshot carries a licence or restriction tag and a lineage link to its source
 systems. If no snapshot in the closure carries the customer's restriction tag or derives from their source
-systems, the manifests prove the negative; if one does, you know exactly which run introduced it and which
+systems, the manifests are strong evidence for the negative across everything your own pipelines fed in
+(a third-party base model's pretraining data is covered only by its vendor's documentation); if one does, you know exactly which run introduced it and which
 other models share that ancestor. For this to be credible, the manifests must have been written by the
 jobs at build time with content hashes, signed so they cannot be edited afterwards, and stored with the
 artifact so the deployed digest can be matched to its manifest. Without that, the honest answer is "we

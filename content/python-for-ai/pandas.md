@@ -5,6 +5,7 @@ name: pandas
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/numpy
   - python-for-ai/polars
@@ -44,8 +45,9 @@ why so much of the ecosystem, from scikit-learn inputs to plotting libraries, ac
 A DataFrame is essentially an ordered collection of columns (each a `Series`) sharing one `Index` of row
 labels. Each column is backed by a NumPy array or an extension array, so numeric columns get NumPy speed.
 Strings were historically stored in `object` columns, arrays of pointers to Python objects, which are
-slow and memory-hungry; newer pandas versions offer dedicated string dtypes and, since pandas 2.0,
-optional Arrow-backed columns (`dtype_backend="pyarrow"`) that store data in Arrow's columnar format.
+slow and memory-hungry; newer pandas versions offer dedicated string dtypes (pandas 3.0 makes a
+string dtype the default for text) and, since pandas 2.0, optional Arrow-backed columns
+(`dtype_backend="pyarrow"`) that store data in Arrow's columnar format.
 
 Missing values are a historical compromise: a float column uses `NaN`, so an integer column that gains
 one missing value silently becomes `float64`. Nullable dtypes (`Int64`, `boolean`, `string`) use a
@@ -71,9 +73,10 @@ duplicate key cannot silently multiply rows. `pivot_table` and `melt` switch bet
 ### Indexing, copies and views
 Use `.loc[row_mask, "col"]` for label-based selection and assignment and `.iloc` for positions. Chained
 indexing such as `df[mask]["col"] = x` may assign into a temporary copy and leave `df` unchanged, the
-origin of the `SettingWithCopyWarning`. pandas has been moving to Copy-on-Write semantics, where every
-derived object behaves as a copy and real copying is deferred until a write, which removes this
-ambiguity.
+origin of the `SettingWithCopyWarning`. pandas 3.0 made Copy-on-Write the default: every derived
+object behaves as a copy and real copying is deferred until a write. That removes the ambiguity in one
+direction: chained assignment *never* modifies `df`, and pandas emits a `ChainedAssignmentError`
+warning instead. Code written for pandas 2.x that relied on chained assignment silently stops working.
 
 ### Execution model
 pandas is eager: each operation materializes a full result immediately, mostly on a single core. With
@@ -133,8 +136,8 @@ route that category to the large one.
 ## Pitfalls
 - Using `apply(axis=1)` or `iterrows()` for arithmetic; the symptom is a notebook cell taking minutes on
   a few million rows where the vectorized expression takes under a second.
-- Chained assignment like `df[mask]["col"] = x`; the symptom is `SettingWithCopyWarning` and a frame that
-  appears unchanged afterwards.
+- Chained assignment like `df[mask]["col"] = x`; the symptom is `SettingWithCopyWarning` (pandas 2.x) or
+  `ChainedAssignmentError` (pandas 3.x, Copy-on-Write) and a frame that is unchanged afterwards.
 - Merging on a key that is not unique on the side you assumed; the symptom is the row count growing
   after a join and inflated totals, caught by `validate="many_to_one"`.
 - One missing value turning an ID column into `float64`; the symptom is IDs printed as `1234.0` and
@@ -183,7 +186,8 @@ then `df["cost"] = df["unit"] * df["tokens"]`, both of which operate on whole co
 - [ ] The column must exist before assignment
 - [ ] pandas requires `inplace=True` for all assignments
 > Chained indexing performs two separate operations; the second writes into whatever the first returned,
-> which may be a copy. A single `df.loc[mask, "flag"] = True` modifies the original frame.
+> which may be a copy (under pandas 3's Copy-on-Write it always behaves as one). A single
+> `df.loc[mask, "flag"] = True` modifies the original frame.
 
 ### Q: After a merge, an eval summary reports more rows than there were test cases. What is the most likely cause?
 - [ ] The merge defaulted to an outer join

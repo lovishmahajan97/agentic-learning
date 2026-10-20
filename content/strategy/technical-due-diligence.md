@@ -5,6 +5,7 @@ name: Technical due diligence
 kind: practice
 difficulty: advanced
 est_minutes: 17
+status: reviewed
 related:
   - strategy/vendor-evaluation
   - data-architecture/model-and-dataset-provenance
@@ -16,11 +17,12 @@ related:
 ---
 
 ## TL;DR
-Technical due diligence on an AI company, product or team (for an acquisition, investment, major
-partnership or strategic vendor) tests whether the technical claims behind a deal are true and what they
-will cost to keep true. For AI it centres on five questions: does the AI work on data the target did not
-choose, who owns the data and models it depends on, what happens to margins as usage grows, how exposed
-is it to upstream model providers, and can the system and team be operated by someone else.
+Technical due diligence on an AI company, product or team (for an acquisition, investment or strategic
+partnership) tests whether the technical claims behind a deal are true and what they will cost to keep
+true. For AI it centres on six questions: does the AI work on data the target did not
+choose, who owns its data and models, what happens to margins as usage grows, how exposed
+is it to upstream model providers, is the AI layer secure, and can the system and team be operated by
+someone else.
 
 ## Why it exists
 Deals are priced on claims: "proprietary model", "95% accuracy", "data moat", "70% gross margin",
@@ -52,6 +54,15 @@ held-out sample **you** provide, from your own or your customers' data, scored b
 the eval set was built and whether any of it was used in training or prompt tuning (contamination). A
 gap between their number and yours is the most informative finding in AI diligence.
 
+Then explain the gap, *because* its cause decides the remedy. Break both results down by input segment
+(document type, language, scan quality, customer). If the target is equally good per segment and only the
+mix differs, its overall number simply reflects its own customer base, and you can predict yours by
+re-weighting the per-segment accuracy by your mix. If it is worse on the same segments, the reported
+number was inflated by curation or tuning on the eval set. Deals rarely allow free data flow, so plan the
+mechanics early: the target runs its system on your sample under NDA while you hold the labels and do
+the scoring, or the test runs in a clean room with a small "clean team" who do not share raw data with the
+wider deal team.
+
 ### 3. Map dependencies and their terms
 List every model, API, dataset, and open-source component in the production path, with license and
 contract terms: is a third-party model's output allowed in this use, can the provider change pricing or
@@ -69,12 +80,20 @@ From billing data and traces, compute cost per request and per customer, then pr
 token growth per task, retries, agent steps, human review. Check whether the target's pricing model passes
 those costs on. Margins that depend on a provider's current discount are a risk, not a fact.
 
-### 6. Check operability and the team
+### 6. Check security of the AI layer
+Beyond the usual application review, ask the questions specific to AI systems: is retrieval scoped per
+tenant, so one customer's documents can never appear in another's context, including through shared
+caches or indexes? What can an agentic feature do with its tool credentials if a document contains a
+prompt injection? Where do prompts and outputs get logged, and for how long? Where do model weights and
+datasets come from, and are third-party checkpoints loaded in formats that can execute code? These
+matter *because* a cross-tenant leak in an acquired product becomes the acquirer's incident.
+
+### 7. Check operability and the team
 Is there monitoring, an incident history, an eval-gated release process, reproducible training? Can the
 system be rebuilt from the repository? How concentrated is knowledge (key-person risk)? Interview
 engineers separately from leadership, *because* the most useful information is often the mismatch.
 
-### 7. Classify findings by consequence
+### 8. Classify findings by consequence
 Each finding is a deal-breaker, a price or terms adjustment (escrow, warranty, earn-out tied to a
 metric), or a post-close remediation item with an estimated cost. This converts technical findings into
 decisions the deal team can act on.
@@ -85,8 +104,15 @@ clause-extraction accuracy" and "68% gross margin". All figures are illustrative
 
 **Accuracy.** The startup's eval set has 1,000 contracts it selected; the diligence team learns 300 of
 them were also used to iterate on prompts. The team supplies 200 contracts from its own customers. Result:
-86% on the acquirer's sample, with most failures on scanned contracts and non-English clauses, which make
-up a larger share of the acquirer's customer base. The claim is not false, but it does not transfer.
+86% on the acquirer's sample. With 200 contracts the 95% interval on 86% is about ±5 points, so the gap to
+94% is real, not sampling noise. Segmenting explains most of it: on the 128 clean, digital English
+contracts the system scores about 95%, on the 72 scanned or non-English ones about 70% (an interval of
+roughly ±10 points at that size). The acquirer's mix is 64/36, so 0.64 × 95% + 0.36 × 70% ≈ 86%. The
+startup's own set is about 95% clean documents, and 0.95 × 95% + 0.05 × 70% ≈ 94%. So the headline is
+mostly a mix effect: the product is genuinely strong on clean contracts and weak on the inputs the
+acquirer's customers send more often. The prompt tuning on 300 eval contracts still means the 94% should
+be treated as optimistic, but the actionable finding is the OCR and multilingual gap, which has a cost to
+fix that can be estimated.
 
 **Economics.** Revenue per customer averages $4,000 per month. Current inference cost is $900 per month per
 customer, plus $400 of hosting and support, giving (4,000 − 1,300) / 4,000 ≈ 68%. But the roadmap adds a
@@ -99,7 +125,8 @@ specifically to that model.
 
 **Classification.** Not a deal-breaker. Price adjustment for the margin risk; an earn-out tied to accuracy
 on the acquirer's own held-out set; post-close remediation budget for OCR improvements and a gateway
-abstraction. Without independent testing, the deal would have been priced on 94% and 68%.
+abstraction, sized from the 70% segment. Without independent testing, the deal would have been priced on
+94% and 68%.
 
 ## Trade-offs
 - Independent re-testing on your own data gives the most reliable evidence, but requires data-sharing
@@ -121,6 +148,8 @@ abstraction. Without independent testing, the deal would have been priced on 94%
   tokens and the discount lapses.
 - Skipping data-provenance questions; a later customer audit or deletion request reveals the target
   cannot show the rights to its training data.
+- Leaving the AI layer out of the security review; a post-close penetration test finds one customer's
+  documents retrievable by another through a shared index or response cache.
 - Interviewing only founders; key-person risk and undocumented systems surface only when that person
   leaves after the earn-out period.
 
@@ -128,8 +157,8 @@ abstraction. Without independent testing, the deal would have been priced on 94%
 Run AI-specific technical diligence for any acquisition, investment or strategic partnership where AI is
 part of the value, and in lighter form for a critical vendor whose failure would hurt you (see vendor
 evaluation, which covers the comparative selection process). Scale depth to deal size and to how much
-value depends on the AI claims. The outputs to aim for are an independent accuracy number on your data, a
-dependency and license map, a data-rights summary, a usage-sensitive margin model, and a classified
+value depends on the AI claims. The outputs to aim for are an independent accuracy number on your data
+broken down by segment, a dependency and license map, an AI-layer security summary, a data-rights summary, a usage-sensitive margin model, and a classified
 findings list. In interviews, the strong signal is turning each headline claim into a test you would run.
 
 ## Role lens

@@ -5,6 +5,7 @@ name: Dependency injection (Depends)
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
   - fastapi-for-ai/request-scoped-vs-application-scoped-resources
@@ -57,6 +58,10 @@ the signature, resolves `get_llm`'s own parameters (path, query, header and body
 first, so an endpoint depending on `get_user`, which depends on `get_token`, which reads the
 `Authorization` header, receives a fully built user object.
 
+Siblings are resolved one after another, not concurrently, even when both are `async def`. Two
+independent dependencies that each await a 200 ms lookup add 400 ms before the handler starts. If
+they must overlap, make one dependency that runs both in a task group and returns the pair.
+
 ### Per-request caching
 If the same dependency appears more than once in one request's tree — `get_settings` under both
 `get_llm` and `get_retriever` — it is called once and the value reused, *because* most dependencies are
@@ -76,6 +81,13 @@ endpoint is re-raised at the `yield` point, so `try/except/finally` around it ca
 transaction and still close the session. Exactly when the exit code runs relative to sending the
 response bytes has changed between FastAPI versions, so never use a yielded resource from a background
 task and never rely on teardown having finished before the client sees the response.
+
+### Parameterised dependencies
+A dependency is looked up by the callable object, so an *instance* with `__call__` gives one class
+many configurations: `Depends(RateLimit(per_minute=60))` on the chat route, `Depends(RateLimit(5))`
+on an expensive batch route. Each instance is a distinct dependency for caching and for
+`dependency_overrides`, *because* the key is the object itself; to override it in tests, keep a
+reference to the instance you registered.
 
 ### Side-effect dependencies
 `dependencies=[Depends(verify_api_key)]` on a route, a router or the whole app runs the dependency
@@ -102,8 +114,8 @@ are created inside the dependency and torn down after `yield`.
 
 ## Example
 An API-key dependency, a shared LLM client fetched from `app.state`, a yield dependency holding a
-per-request budget that is recorded even when the handler raises, and the test override that keeps
-the suite from spending tokens. `get_tenant` appears twice in the tree (directly and under `budget`)
+per-request spend cap (here $0.50) whose spend is recorded even when the handler raises a 429,
+and the test override that keeps the suite from spending tokens. `get_tenant` appears twice in the tree (directly and under `budget`)
 but runs once per request.
 
 ```python
@@ -112,7 +124,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.testclient import TestClient
 
 app = FastAPI()
-TENANTS = {"key-acme": {"id": "acme", "daily_budget_usd": 50.0}}
+TENANTS = {"key-acme": {"id": "acme", "max_request_usd": 0.50}}
 
 def get_tenant(x_api_key: Annotated[str, Header()]) -> dict:
     tenant = TENANTS.get(x_api_key)
@@ -130,17 +142,17 @@ class Budget:
         if self.spent > self.limit: raise HTTPException(429, "budget exceeded")
 
 async def budget(tenant: Annotated[dict, Depends(get_tenant)]):
-    b = Budget(tenant["daily_budget_usd"])
+    b = Budget(tenant["max_request_usd"])     # request-scoped: fresh per request
     try:
         yield b
     finally:
-        print("record spend", tenant["id"], b.spent)   # runs even if the handler raised
+        print("record spend", tenant["id"], b.spent)   # persist to the ledger; runs even on 429
 
 @app.post("/chat")
 async def chat(prompt: str, tenant: Annotated[dict, Depends(get_tenant)],
                b: Annotated[Budget, Depends(budget)], llm=Depends(get_llm)):
     text, cost = await llm.complete(prompt)
-    b.charge(cost)
+    b.charge(cost)                  # post-hoc; a real cap also pre-checks an estimated cost
     return {"tenant": tenant["id"], "text": text}
 
 class FakeLLM:                                       # test seam: no production code changes

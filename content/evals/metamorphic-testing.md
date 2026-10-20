@@ -5,7 +5,7 @@ name: Metamorphic testing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - evals/property-based-testing
   - evals/regression-tests
@@ -89,8 +89,12 @@ Choose the strictest definition the task allows, because a lenient comparator hi
 Models are nondeterministic, so first run the identity transformation: the same input twice. Its
 violation rate is the noise floor. A relation reveals a real sensitivity only when its violation rate
 sits clearly above that floor; a 4% paraphrase violation rate against a 3% identity rate is noise, a
-25% document-order violation rate against 3% is a finding. Reporting per relation and per slice shows
-*which* sensitivity you have, which is more actionable than one robustness number.
+25% document-order violation rate against 3% is a finding. "Clearly above" is a statistical claim, so
+size it: on 200 questions, 3% versus 6% is 6 violations against 12, a gap a two-proportion test does not
+distinguish from chance (z ≈ 1.5), while 3% versus 25% is unmistakable. Because both relations run on
+the same questions, the sharper check is paired: count the items that violate under the transform but
+agreed under identity. Reporting per relation and per slice shows *which* sensitivity you have, which is
+more actionable than one robustness number.
 
 ### From violations to action
 A violated pair goes to a human or a correctness judge to decide which side is wrong, and the losing
@@ -138,6 +142,17 @@ def violation_rates(cases: list[tuple[str, list[str]]]) -> dict[str, float]:
 # Read the table against "identity": a relation whose rate sits well above it is a real sensitivity.
 # A high doc_order rate in RAG usually points at position effects in the context window.
 ```
+
+An illustrative run on 300 support questions (made-up numbers, chosen to show how to read the table):
+identity 0.03, whitespace 0.03, paraphrase 0.06, noise_doc 0.11, doc_order 0.21. Whitespace is at the
+floor, so the system is not reacting to formatting. Paraphrase is above it but only modestly; pull the
+18 violating pairs before concluding anything, because a few may be paraphrases that changed the
+question. Noise_doc at roughly four times the floor says one irrelevant newsletter changes about one
+answer in ten, which is weak grounding: the model is using whatever is in the context. Doc_order at
+seven times the floor is the headline: the answer depends on which document comes first, so either the
+retriever's top hit dominates or the model under-reads the middle of the context. Each of those
+diagnoses suggests a different fix (reranking, context ordering, a "cite the passage" instruction), and
+none of them needed a single label.
 
 ## Trade-offs
 - Relations need no labels, so coverage scales with compute instead of annotation budget, but a

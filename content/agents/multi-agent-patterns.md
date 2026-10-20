@@ -5,7 +5,7 @@ name: Multi-agent patterns (orchestrator-worker, handoffs)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - agents/task-decomposition
   - agents/planning
@@ -87,6 +87,20 @@ one fed a summary by a coordinator. Handoffs keep the mental model simple: a sta
 states are agents and whose transitions are tool calls. The cost is that there is no parallelism and
 the receiving agent inherits whatever context was passed, so filtering decisions matter.
 
+### Agents as tools versus handoffs
+A third option sits between the two: call a specialist *as a tool*. The calling agent stays in control,
+the specialist runs in its own context and returns a result, and the caller continues, which is the
+orchestrator-worker pattern with one worker. A handoff instead gives the specialist the conversation
+and does not come back unless the specialist transfers again. The choice turns on who should own the
+next user-facing turn:
+
+| | Orchestrator-worker / agent-as-tool | Handoff |
+|---|---|---|
+| Who talks to the user | the orchestrator, always | whichever agent is active |
+| Parallelism | yes, many workers at once | no, one active agent |
+| What crosses the boundary | a brief down, a structured result up | (filtered) history plus a payload |
+| Typical failure | synthesis misses what a worker found | specialist lacks context, or agents ping-pong |
+
 ### Other shapes, briefly
 Pipelines (fixed sequence of specialists), evaluator-optimizer pairs (generator plus critic, the
 multi-agent form of reflection), hierarchical orchestrators (an orchestrator whose workers are
@@ -95,7 +109,9 @@ production systems are an orchestrator-worker core with handoffs at the user-fac
 
 ### Communication, state and tracing
 Agents share information through structured messages and a shared store (a task table, files, a
-blackboard), not by reading each other's contexts. Give every run a trace id propagated to each worker
+blackboard), not by reading each other's contexts. For bulky outputs, workers can write the artifact
+to the store and return a reference plus a summary, *because* every hop where one model paraphrases
+another's findings loses detail, like a game of telephone. Give every run a trace id propagated to each worker
 so a failure can be followed across agents. Decide explicitly what each worker may write to shared
 state, because concurrent writers produce the hardest bugs. Set a global budget the orchestrator
 enforces, since each worker will happily spend its own.
@@ -106,6 +122,14 @@ own tokens plus k worker runs plus synthesis; it is the parallelism, not the tok
 improves. Using the published 4x (single agent) and 15x (multi-agent) figures relative to a chat turn,
 expect a multi-agent research run to cost several times a single-agent run on the same task. These are
 one vendor's research-task numbers, not a constant; measure your own and budget accordingly.
+
+Why the bill rises even though each context is smaller: an illustrative run with five workers, each
+given a 2k-token brief, doing eight tool calls whose results average 3k tokens, re-reads its own growing
+context each step, so a worker reads roughly 2k×8 + 3k×(0+1+…+7) ≈ 100k input tokens, and five of them
+read about 500k. One agent doing the same 40 tool calls in one context would re-read far more
+(the history term grows with the square of the step count), but in practice a single agent does not
+make 40 calls; it explores less. The multi-agent premium is mostly that it *does more work*, in
+parallel, which is the point when breadth matters and the waste when it does not.
 
 ## Example
 A minimal handoff runtime. Each agent is a prompt plus a tool list; transfers are tools; the loop
@@ -126,20 +150,24 @@ def handoff_history(messages, keep_last=6):
     user_turns = [m for m in messages if m["role"] in ("user", "assistant") and not m.get("tool_calls")]
     return user_turns[-keep_last:]            # specialists do not need triage's tool noise
 
-def run(messages, agent="triage", max_turns=20):
+def run(messages, agent="triage", max_turns=20, max_transfers=3):
+    brief, transfers = {}, 0
     for _ in range(max_turns):
         spec = AGENTS[agent]
-        reply = llm(system=spec["system"], messages=messages,
+        reply = llm(system=spec["system"] + f"\nHandoff brief: {brief}", messages=messages,
                     tools=[TOOL_SCHEMAS[t] for t in spec["tools"]])
         messages.append(reply)
         if not reply.get("tool_calls"):
             return messages, agent                  # agent produced a user-facing answer
         for call in reply["tool_calls"]:
             if call["name"].startswith("transfer_to_"):
+                transfers += 1
+                if transfers > max_transfers:       # ping-pong guard: escalate to a human
+                    return escalate(messages, trace_id=TRACE), agent
                 agent = call["name"].removeprefix("transfer_to_")
-                messages.append(tool_result(call["id"], f"transferred to {agent}"))
+                brief = call["arguments"]           # e.g. {"account_id": "A-17", "reason": "..."}
                 messages = handoff_history(messages) # filtered context crosses the boundary
-                log_event(trace_id=TRACE, event="handoff", to=agent)
+                log_event(trace_id=TRACE, event="handoff", to=agent, brief=brief)
                 break                                # drop the rest of this reply's calls
             else:
                 out = TOOLS[call["name"]](**call["arguments"])
@@ -147,11 +175,14 @@ def run(messages, agent="triage", max_turns=20):
     return messages, agent
 ```
 
-The two deliberate choices are that a transfer is just a tool call the model can make, and that the
-history is filtered at the boundary so the specialist starts with a small, relevant context. The
+The deliberate choices: a transfer is just a tool call the model can make, whose arguments become a
+structured brief in the specialist's system prompt; the history is filtered at the boundary so the
+specialist starts with a small, relevant context; and transfers are capped, because two agents that
+each think the other owns the request will otherwise bounce it until the turn budget runs out. The
 `break` matters: the filter removes the assistant message that issued the calls, so executing its other
 tool calls afterwards would run them under the wrong agent and append results that reference a tool-call
-id no longer in the history, which most chat APIs reject.
+id no longer in the history, which most chat APIs reject. For the same reason no tool result is
+appended for the transfer call itself: the message that made it has just been filtered out.
 
 ## Trade-offs
 - Context isolation lets each agent stay focused and keeps tool lists short, but every boundary is a

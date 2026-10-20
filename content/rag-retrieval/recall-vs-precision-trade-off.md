@@ -5,7 +5,7 @@ name: Recall vs precision trade-off
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/precision-recall-f1
   - rag-retrieval/reranking
@@ -66,6 +66,23 @@ because the two numbers belong to different stages of the pipeline.
 Rank-aware metrics refine the picture: MRR (reciprocal rank of the first relevant hit) and nDCG (graded
 relevance, discounted by position) reward putting the right passage near the top, which matters when
 the generator reads the prompt in order.
+
+### Which recall, and the precision ceiling
+Two details decide whether these numbers mean what you think.
+
+- **Hit rate versus full recall.** Many RAG dashboards report "recall@k" as *hit rate* (did at least one
+  relevant chunk appear?). That is the right number when any single chunk fully answers the question,
+  for example when the same policy is stated in three places. It is the wrong number when the answer
+  needs several chunks together (a table, its definitions and its exclusions): hit rate says 1.0 while a
+  required piece is missing. Label each golden question as "any-of" or "all-of" and score accordingly.
+- **Precision is capped by |R|.** precision@k can never exceed |R| / k. A question with one relevant
+  chunk scores at most 0.2 at k = 5 even with perfect ranking, so averaging precision@k over questions
+  with different |R| mostly measures how many relevant chunks each question happens to have. For
+  ranking quality, nDCG or MRR are steadier; precision@k is more useful as "what fraction of the prompt is
+  noise", which is the cost the generator actually pays.
+- **Labels are incomplete.** Relevance is usually labelled for the chunks someone thought of. A
+  near-duplicate of the answer chunk that nobody labelled counts as a false positive, so measured precision
+  understates true precision, and a better retriever that surfaces the duplicate can appear worse.
 
 ### Why both numbers hurt a generator
 Recall failure is unrecoverable downstream: no prompt engineering retrieves a passage that is absent.
@@ -136,8 +153,11 @@ Illustrative output for the first question: stage-1 top-5 finds `sla-table` and 
 `credit-exclusions`, whose text says "service credits shall not apply" without the word SLA, so
 precision@5 = 0.4 and recall@5 = 0.67. Hybrid top-50 catches all three (recall 1.0) at precision 0.06.
 Reranking those 50 and keeping 5 puts all three in the top-5: recall 1.0, precision 0.6, and the prompt
-carries 5 × 300 = 1,500 tokens instead of 15,000. Over the whole golden set you would then report
-recall@50 for stage 1 and precision@5 for stage 2 as separate dashboards.
+carries 5 × 300 = 1,500 tokens instead of 15,000. The second question shows the ceiling: it has one
+relevant chunk, so even a perfect reranker scores precision@5 = 0.2 on it, and the golden-set average
+of 0.4 (0.6 and 0.2) says nothing bad about ranking. That is why, over the whole golden set, you report
+recall@50 for stage 1 and nDCG@5 (or precision@5 alongside |R|) for stage 2 as separate dashboards, and
+why the first question is scored as "all-of": with hit rate it would have looked perfect at k = 5.
 
 ## Trade-offs
 - A larger k raises recall but costs tokens, latency and position sensitivity; it stops paying once the
@@ -160,6 +180,10 @@ recall@50 for stage 1 and precision@5 for stage 2 as separate dashboards.
   the specific clause that answers the question is still missing from the prompt.
 - Treating precision as a cost-only concern; the symptom is answers that cite a plausible but outdated
   passage that sat next to the correct one in the context.
+- Reporting hit rate as "recall" on questions that need several chunks; the symptom is recall@5 near 1.0
+  while answers to table or multi-condition questions are still incomplete.
+- Trusting incomplete relevance labels; the symptom is a retriever change that "lowers precision" where
+  manual inspection shows the new top results are unlabelled duplicates of the answer.
 
 ## When to use
 This is not an optional technique but a lens to apply whenever a RAG system is being designed or

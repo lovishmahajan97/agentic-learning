@@ -5,7 +5,7 @@ name: Approval gates for consequential actions
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agents/human-in-the-loop
   - agents/tool-calling
@@ -83,11 +83,23 @@ separation of duties applies), which is an RBAC check the executor performs. App
 consumed on use, because a standing approval is a credential. The decision, the approver and the reason
 are written to the audit log.
 
-### 5. Resume and execute once
+### 5. Resume, re-check and execute once
 On approval the run reloads, the executor re-checks the hash, atomically claims the approval for this
 execution (so two workers resuming the same run cannot both use it), and runs the tool with an
 idempotency key derived from the run and step, so that a retry after a network failure does not
 refund twice. The tool result enters the transcript like any other, and the model continues.
+
+The arguments are not the whole story, because the world moves while the request waits. The approver
+saw "this DELETE affects 12 rows" on Monday; by Wednesday the same statement may match 12,000. This is
+the time-of-check versus time-of-use problem, and the fix is to re-run the dry run at execution and
+compare it with the preview that was approved (row count, amount, recipient list). If the effect has
+materially changed, the approval does not apply and a fresh request is raised. The approval binds the
+call *and* the effect the approver saw.
+
+A rejection is also an outcome the model must handle. Return it as a tool result with the approver's
+reason, and keep the classifier keyed on effect rather than tool name, because a model told "refund
+denied" will sometimes look for another route to the same outcome (a store credit, a manual adjustment).
+Every route to the same effect needs the same class.
 
 ### Scoping and fatigue control
 Gates can be widened without becoming soft: "approve this call", "approve this class of call for this
@@ -98,7 +110,10 @@ softer gate.
 
 ## Example
 An executor with a risk classifier that looks at arguments, a pending-approval store that makes the
-pause survive restarts, and an approval bound to the argument hash and consumed on use. The approval is
+pause survive restarts, and an approval bound to the argument hash and consumed on use. Before
+executing for the first time, it re-runs the dry run and compares it with the preview the approver
+saw, so an approval for "12 rows" cannot execute against 12,000; a retry of an already-claimed step
+skips that check, because its own partial effect would change the preview. The approval is
 claimed by exactly one execution key, so a retry of the same step after a network failure can re-run
 (and the tool's idempotency key deduplicates the effect), while any other execution is refused.
 
@@ -128,10 +143,17 @@ def execute(run_id, step, tool, args, env, tools, store, approver):
         if approval is None:
             store.save_pending(run_id, step, tool, args, h, preview=tools[tool].dry_run(**args))
             return {"status": "awaiting_approval", "request": h}   # durable pause: the loop parks here
+        if approval.decision != "approved":      # a rejection comes back to the model with its reason
+            return {"status": "rejected", "reason": approval.reason}
         if approval.expired() or not approver.may_approve(approval.by, tool):
             return {"status": "denied", "reason": "approval expired or approver not authorized"}
-        if not store.claim(run_id, h, key):      # atomic compare-and-set: unused, or already claimed by this key
-            return {"status": "denied", "reason": "approval already consumed by another execution"}
+        if store.claimed_by(run_id, h) != key:   # first use, not a retry of this step after a failure
+            preview = tools[tool].dry_run(**args)
+            if preview != approval.preview:      # the world changed since it was approved: ask again
+                store.save_pending(run_id, step, tool, args, h, preview=preview)   # supersedes the old one
+                return {"status": "awaiting_approval", "request": h, "reason": "effect changed"}
+            if not store.claim(run_id, h, key):  # atomic compare-and-set: one execution key per approval
+                return {"status": "denied", "reason": "approval already consumed by another execution"}
     return tools[tool].run(**args, idempotency_key=key)   # a retry of this step re-runs with the same key
 ```
 
@@ -163,6 +185,10 @@ def execute(run_id, step, tool, args, env, tools, store, approver):
   one bad action sailing through with the rest.
 - No expiry or default on timeout; the symptom is runs pending for weeks, or a "proceed on timeout"
   default that executes an unreviewed action overnight.
+- Executing days later on the strength of a preview computed at request time; the symptom is an
+  approved "delete 12 stale rows" that removes thousands because the data changed while it waited.
+- Classifying by tool name while the model has several tools with the same effect; the symptom is a
+  denied refund followed by an ungated store credit for the same amount.
 - Executing without an idempotency key; the symptom is a double refund after a transient error during
   resume.
 
@@ -198,7 +224,9 @@ otherwise (an email cannot be unsent, but a routine acknowledgement does little 
 are written to a pending-approval store with a preview (the rendered reply, the refund amount and order
 history) and the run checkpoints and exits; nothing waits in memory. The approval is bound to the hash
 of the exact arguments, requires the support-lead role, expires after 48 hours with a default of deny,
-and is consumed on use. Resume reloads the run and executes with an idempotency key. Because the gate is
+and is consumed on use. Resume reloads the run, re-renders the preview and compares it with the approved
+one (the order may have been refunded elsewhere in the meantime), and executes with an idempotency key.
+Store credits and other routes to the same money get the same classification as refunds. Because the gate is
 in the executor, an injected "refund this customer $900" in an email can only produce a pending request
 the lead sees with its evidence. Small refunds execute automatically with a sampled audit, keeping the
 lead's queue to a handful a day.

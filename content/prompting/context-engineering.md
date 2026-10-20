@@ -5,7 +5,7 @@ name: Context engineering
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - prompting/system-prompt
   - prompting/prompt-caching
@@ -36,7 +36,8 @@ Three forces make "put it all in" the wrong default even when it fits.
 First, cost and latency scale with tokens, and in a loop the whole history is re-sent every turn, so a
 context that grows linearly produces a bill that grows quadratically. Second, attention is not uniform:
 models use material at the start and end of a long context better than material in the middle, and
-irrelevant tokens do not merely cost money, they distract, so accuracy can fall as context grows. Third,
+irrelevant tokens do not merely cost money, they distract, so accuracy can fall as context grows (often
+called "context rot"; how fast it sets in varies by model and task). Third,
 without management the window eventually overflows mid-task, usually at the worst moment.
 
 The opposite naive answer, aggressive truncation, fails the other way: it drops the one earlier fact
@@ -82,6 +83,18 @@ compact: summarise the older turns into a structured note (goal, decisions made,
 state of files or records) and keep the recent turns verbatim. Compaction is lossy, so keep the raw log
 outside the context where it can be retrieved. Facts that must survive across sessions go to a memory
 store and are loaded selectively, which the agents module covers.
+
+### The tension between pruning and caching
+Every edit to earlier context (stubbing a tool result, compacting, deleting a reminder) changes the
+prefix from that point, so the next request re-writes everything after the edit instead of reading it
+from cache. Work the numbers with the usual multipliers (writes about 1.25×, reads about 0.1× of base
+input; provider-dependent): in a 100k-token history, stubbing a 30k-token result that sits at position
+20k forces an 80k re-write, about 80k × (1.25 − 0.1) ≈ 92k token-equivalents extra, once. The saving is
+30k tokens no longer read per later turn, which at the cached rate is only about 3k-equivalents a turn,
+so the edit takes roughly thirty turns to pay back in money. The conclusion is not "never prune": the
+real reasons to prune cached content are attention quality and window headroom, not cost. It is to
+prune in batches when a threshold is crossed (one re-write, many tokens removed), to keep edits close
+to the tail where little follows them, and never to edit history on every turn.
 
 ### Isolation through sub-agents
 A read-heavy subtask (explore a codebase, survey twenty documents) can run in a sub-agent with its own
@@ -142,6 +155,10 @@ def assemble(system, tools, retrieved, history, consumed, question, count, summa
     assert total <= WINDOW - OUTPUT_RESERVE, f"{total} tokens over budget"
     return {"system": system, "tools": tools, "messages": messages}
 ```
+
+In a cached agent loop, call `assemble` with a `consumed` set that changes only when the history
+budget trips, not every turn; otherwise each newly stubbed index rewrites the prefix from that message
+on and the cache never covers the history (see the pruning-versus-caching arithmetic above).
 
 ## Trade-offs
 - Loading whole documents is simpler and has no retrieval misses, but costs tokens every turn and

@@ -5,6 +5,7 @@ name: JSON / JSONL
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - prompting/structured-outputs-json-mode
   - python-for-ai/pydantic
@@ -50,16 +51,17 @@ serialized onto one line, so the rule costs nothing in expressiveness.
 RFC 8259 defines six types: object, array, string, number, `true`/`false`, `null`. There are no comments,
 no trailing commas, no dates, no bytes and no NaN or Infinity. Strings are Unicode and, for interchange,
 the text must be UTF-8. Python's `json` maps these to `dict`, `list`, `str`, `int`/`float`, `bool` and
-`None`. Anything else (datetimes, `Decimal`, numpy scalars, sets) raises `TypeError` on `dumps` unless
-you convert it, typically with a `default=` function or by serializing a Pydantic model with
-`model_dump_json()`.
+`None`. Anything else (datetimes, `Decimal`, sets, most numpy scalars such as `np.int64` and
+`np.float32`) raises `TypeError` on `dumps` unless you convert it (`np.float64` slips through only
+because it subclasses Python `float`), typically with a `default=` function or by serializing a
+Pydantic model with `model_dump_json()`.
 
 ### The edges where Python's defaults bite
 - **NaN and Infinity.** `json.dumps(float("nan"))` emits `NaN`, which is *not* valid JSON; JavaScript's
   `JSON.parse` and strict parsers reject it. Pass `allow_nan=False` to fail at write time instead.
 - **Big integers.** Python round-trips any integer exactly, but parsers that use IEEE doubles (JavaScript)
   lose precision above 2^53. IDs from Snowflake-style generators should travel as strings.
-- **Non-ASCII.** `ensure_ascii=True` is the default, so `café` is written as `café`. That is valid,
+- **Non-ASCII.** `ensure_ascii=True` is the default, so `café` is written as `caf\u00e9`. That is valid,
   but inflates files and hurts readability for multilingual data; `ensure_ascii=False` writes UTF-8, which
   is correct as long as the file is opened with `encoding="utf-8"`.
 - **Duplicate keys.** The RFC leaves them undefined; Python keeps the last one silently.
@@ -132,12 +134,13 @@ refuses to parse.
   wrong encoding will mangle it; ASCII escapes are safer when you do not control the reader.
 
 ## Pitfalls
-- Using `json.dump(obj, f, indent=2)` in a JSONL writer; the symptom is `JSONDecodeError: Expecting
-  value` on line 2 because each record now spans many lines.
+- Using `json.dump(obj, f, indent=2)` in a JSONL writer; the symptom is a `JSONDecodeError` on the very
+  first line (a lone `{` is not a complete value) because each record now spans many lines.
 - Serializing NaN from pandas or numpy metrics; the symptom is a JavaScript or Go consumer rejecting
   the file while Python reads it fine.
-- Calling `json.load` or `f.readlines()` on a multi-gigabyte JSONL file; the symptom is memory climbing
-  to several times the file size and the process being OOM-killed.
+- Calling `f.readlines()` or building `[json.loads(l) for l in f]` on a multi-gigabyte JSONL file; the
+  symptom is memory climbing to several times the file size (parsed Python objects are far larger than
+  their text) and the process being OOM-killed. (`json.load` on JSONL fails outright with "Extra data".)
 - Opening files without `encoding="utf-8"`; the symptom is `UnicodeDecodeError` or mojibake on
   Windows or in containers with a non-UTF-8 locale.
 - Passing numpy types into `json.dumps`; the symptom is `TypeError: Object of type float32 is not JSON

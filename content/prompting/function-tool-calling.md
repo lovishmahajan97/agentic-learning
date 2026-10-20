@@ -5,7 +5,7 @@ name: Function / tool calling
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - prompting/structured-outputs-json-mode
   - prompting/react
@@ -67,6 +67,14 @@ order's status") and not merely what the function does.
 The ids exist *because* parallel and out-of-order results need correlation; without them the model
 could not tell which result belongs to which request. The assistant message with the `tool_use` blocks
 must be kept verbatim in history, since the result refers to it.
+
+### Why the model sometimes does not call
+Tool selection is a generation decision like any other: the model emits a `tool_use` block when, given
+the descriptions and the conversation, a call is the most plausible continuation. Nothing forces a
+call when a fact is missing; a model that believes it knows the answer will answer from weights. That is
+why the description's trigger condition matters more than its summary of the function, and why
+"should have called but did not" is a failure class you measure separately from "called the wrong
+tool" and "called with wrong arguments".
 
 ### Who controls the decision
 `tool_choice` is `auto` by default (the model decides), `none` forbids calls, and some providers offer a
@@ -142,6 +150,18 @@ def chat(user_text, max_steps=6):
     raise RuntimeError("step budget exhausted")
 ```
 
+What crosses the wire for "Refund order ORD-10422, it arrived broken" (values illustrative). Request 1
+carries tools, system and the user turn; the model replies with one block,
+`tool_use{id: "toolu_01", name: "get_order", input: {"order_id": "ORD-10422"}}` and
+`stop_reason: "tool_use"`. Your code returns `tool_result{tool_use_id: "toolu_01", content:
+'{"status": "delivered", "total_cents": 3999, "refundable": true}'}`. Request 2 re-sends everything
+so far plus that result; the model now calls `issue_refund` with `{"order_id": "ORD-10422",
+"amount_cents": 3999}`, which passes the 5,000-cent limit and executes. Request 3 re-sends the whole
+history again and the model ends with a text confirmation. Three requests, three full prefills of a
+growing history: the tool definitions alone are paid three times, which is why they belong in the
+cached prefix. Had the customer asked for 7,500 cents, the third request would carry an `is_error`
+result and the model would explain the escalation instead of claiming a refund that never happened.
+
 ## Trade-offs
 - Native tool calling gives reliable structure, parallel calls and a distinct stop reason, but the wire
   format is provider-specific; it flips toward an abstraction layer or MCP when you must stay portable.
@@ -167,6 +187,12 @@ def chat(user_text, max_steps=6):
   the wrong unit, and ids with stray whitespace.
 - Encoding policy only in the prompt ("never refund more than $50"); the symptom is a successful
   injection or jailbreak producing a refund the code happily executed.
+- Letting the model fill required arguments it was never given; the symptom is lookups of plausible
+  but non-existent ids (`ORD-00001`) when the user did not mention one. Say in the description to ask
+  the user when the value is unknown, and check ids against what appeared in the conversation.
+- Returning only the text on `max_tokens` or `refusal`; the symptom is empty or half-finished replies
+  shown to users, or a truncated `tool_use` whose arguments were cut off, because the loop treated every
+  non-`tool_use` stop as success.
 - No step budget; the symptom is a runaway loop on a persistently failing tool and a surprising bill.
 - Passing raw stack traces or secrets back as tool results; the symptom is credentials in traces or the
   model echoing internal paths to the user.

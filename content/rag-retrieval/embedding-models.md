@@ -5,7 +5,7 @@ name: Embedding models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - model-internals/embeddings
   - rag-retrieval/embedding-dimension-and-normalization
@@ -56,13 +56,30 @@ A text embedding model is a transformer encoder (BERT, RoBERTa or XLM-R style) o
 decoder-only LLM repurposed as an encoder. The text is tokenized, run through the network, and the
 per-token outputs are pooled into a single vector: mean pooling over tokens, the [CLS] token, or the
 last token for decoder-based models. An optional linear projection and an L2 normalization follow.
+The pooling choice is part of the trained model, not a free option: training taught the network to put
+its summary where the pooling reads it, so mean-pooling a model trained with [CLS] pooling (or the
+reverse) still returns vectors, just worse ones. Loading the model through its own configuration, as
+sentence-transformers does, keeps this right.
 Query and document pass through the same network independently, which is the whole point: a document's
 vector never depends on the query, so it can be computed once, stored, and compared with a dot product.
 
 ### Training: contrastive learning
 Training data is (query, positive passage) pairs. The loss (InfoNCE and relatives) pulls the positive's
-vector toward the query and pushes negatives away. Negatives are cheap because the other passages in the
-batch serve as in-batch negatives, which is why embedding models are trained with very large batches.
+vector toward the query and pushes negatives away. For a query `q`, its positive `p⁺` and a set of
+candidates `p_j` that includes `p⁺`:
+
+```
+L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine similarity, τ = temperature
+```
+
+This is ordinary softmax cross-entropy in which the "class" to predict is the correct passage among the
+candidates, which is why it trains exactly the operation retrieval performs: rank the right passage
+above the others. The temperature `τ` is small (a few hundredths is common) because cosine lives in
+[−1, 1]; dividing by a small number stretches those differences so the softmax is sharp and the
+gradient concentrates on the negatives that currently score closest to the positive. Negatives are cheap
+because the other passages in the batch serve as in-batch negatives: with a batch of B pairs every query
+gets B − 1 negatives for free, and more negatives make the classification harder and the learned space
+finer, which is why embedding models are trained with very large batches.
 Hard negatives matter more: passages that share topic and vocabulary with the query but do not answer
 it, mined from BM25 or from an earlier version of the model. They teach the model the difference between
 "about the same thing" and "answers the question", which is exactly what retrieval needs; DPR made this
@@ -150,6 +167,9 @@ for q, row in zip(queries, scores):
   models are not comparable even when their dimensions match.
 - Dropping the `query:`/`passage:` prefix or the instruction on an asymmetric model; symptom: a
   measurable recall drop with no error anywhere in the logs.
+- Loading an open model with a pooling or normalization setting different from its training (for
+  example a raw `AutoModel` with mean pooling on a [CLS]-pooled model); symptom: recall noticeably
+  below the model card's reported quality with no error raised.
 - Silent truncation of long chunks; symptom: questions about the tail of long documents never retrieve,
   while the same content pasted as a short chunk works.
 - Choosing by leaderboard rank alone; symptom: the model that scores a point higher on MTEB

@@ -5,7 +5,7 @@ name: Deterministic replay & reproducibility
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/structured-event-streams
@@ -78,11 +78,18 @@ non-determinism error rather than silently serving a mismatched answer. This is 
 workflow engines enforce: code versions and recordings go together, so the runtime records a code version
 with each run and replays against the same version.
 
+Matching by position ("the nth effect") works for a sequential loop and breaks for parallel tool calls,
+whose results arrive in a different order each run. Key each effect by its logical identity instead,
+such as `(step, call_id)` for tool calls and `(step, "llm")` for the model call, and have the replayer
+look up by key. Arrival order then stops mattering, and the orchestrator must merge parallel results in a
+deterministic order (by `call_id`, not by completion time) or replay will still diverge.
+
 ### Fork: replay to a point, then go live
 To test a fix, replay the recording up to step k, then switch the effect interface back to live for steps
 after k. Everything up to the divergence is identical, so the comparison isolates the change. This is what
 "time travel" means in checkpoint-based frameworks: load the state at a checkpoint, optionally edit it,
-continue live.
+continue live. "Live" should mean live model and sandboxed or faked side-effecting tools, *because* a fork
+of an incident run that refunds a real customer a second time turns debugging into a new incident.
 
 ### The three grades of reproducibility
 1. **Exact replay** (recording). Always achievable if the recording is complete. It reproduces the past;
@@ -95,7 +102,10 @@ continue live.
    bit-exact.
 3. **Statistical reproduction.** Accept non-determinism and measure it: run the task N times, report the
    pass rate with an interval, and compare distributions before and after a change. This is the only grade
-   that answers "did my fix help" for a stochastic system.
+   that answers "did my fix help" for a stochastic system. Budget N from the effect size: to show that a
+   10% failure rate fell to 5% with a standard two-proportion test (5% significance, 80% power) takes
+   roughly 430 runs per arm, which is why forking from step k matters for long agents: each of those runs
+   then pays only for the divergent tail, not the whole trajectory.
 
 ### What the recording must contain
 The checklist, in the order people forget it: model id and parameters, exact prompt text or a hash
@@ -106,7 +116,8 @@ diverges at the first step that touches it.
 ## Example
 An effect recorder/replayer wrapped around an agent loop. In `record` mode it logs every boundary; in
 `replay` mode it serves recorded outputs and refuses to continue if the orchestrator asks for something
-different.
+different. The loop runs tool calls sequentially, so matching by position is enough; with parallel calls
+the lookup would be by `(step, call_id)` as described above.
 
 ```python
 import hashlib, json
@@ -179,6 +190,10 @@ def agent(task: str, fx: Effects, max_steps: int = 8) -> str:
   production at roughly its old rate.
 - Tools with live side effects running during replay; the symptom is the incident reproduction creating a
   second real ticket.
+- Replaying parallel tool calls by arrival position; the symptom is non-determinism errors that appear
+  only on runs with parallel calls and vanish when the same task runs sequentially.
+- Keeping recordings under no retention policy; the symptom is a data-protection deletion request that
+  cannot be honoured because customer content sits in years of replay logs.
 
 ## When to use
 Record every production run by default; the event stream you already keep for resumption and audit is

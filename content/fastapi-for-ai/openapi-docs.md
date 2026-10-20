@@ -5,6 +5,7 @@ name: OpenAPI docs
 kind: tool
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - fastapi-for-ai/pydantic-request-response-models
   - fastapi-for-ai/response-model
@@ -73,9 +74,12 @@ FastAPI can emit separate `Model-Input` and `Model-Output` schemas when they dif
 optional on input but always present on output is described honestly on both sides.
 
 ### What it describes poorly
-OpenAPI describes request/response pairs. A Server-Sent Events stream of tokens or a WebSocket protocol
-has no first-class representation; you can declare `text/event-stream` as the content type, but the
-per-event schema has to be documented in prose or a separate model. Customising beyond this means
+OpenAPI describes request/response pairs. In OpenAPI 3.0 and 3.1, which is what FastAPI emits, a
+Server-Sent Events stream of tokens has no first-class per-event schema: you can declare
+`text/event-stream` as the content type, but the shape of each event has to be documented in prose or a
+separate model. OpenAPI 3.2 (2025) adds `itemSchema` for sequential media types such as SSE and JSON
+Lines, but generator and framework support is still uneven, so check your toolchain before relying on
+it. WebSocket protocols are outside OpenAPI altogether (AsyncAPI is the usual alternative). Customising beyond this means
 overriding `app.openapi` to post-process the dict, which is powerful but now hand-maintained.
 
 ## Example
@@ -84,7 +88,8 @@ definition: described fields, a constrained enum, a documented error and a stabl
 
 ```python
 from typing import Literal
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
@@ -111,8 +116,9 @@ class ErrorOut(BaseModel):
           responses={429: {"model": ErrorOut, "description": "Tenant quota exceeded"}},
           summary="Embed a batch of texts")
 async def create(body: EmbedIn) -> EmbedOut:
-    if len(body.texts) > 200:
-        raise HTTPException(status_code=429, detail="quota")
+    if len(body.texts) > 200:                  # stand-in for a real per-tenant quota check
+        err = ErrorOut(code="quota_exceeded", message="Tenant quota exceeded")
+        return JSONResponse(status_code=429, content=err.model_dump())
     return EmbedOut(vectors=[[0.0] * 8 for _ in body.texts], model=body.model, dimensions=8)
 
 schema = app.openapi()
@@ -121,7 +127,10 @@ print(schema["components"]["schemas"]["EmbedIn"]["properties"]["model"]["enum"])
 ```
 
 The generated SDK method is `embeddings_create`, the `model` field is an enum a client or LLM can pick
-from, and the 429 shape is documented even though the handler only raises an exception.
+from, and the 429 shape is documented even though FastAPI cannot infer it from the handler. Note that the
+handler returns a body that really is an `ErrorOut`: a plain `raise HTTPException(429, detail="quota")`
+would send `{"detail": "quota"}`, so the declared model would be a lie unless a custom exception handler
+produces the `code`/`message` envelope.
 
 ## Trade-offs
 - Code-first schemas never drift from validation, but the API design is only as deliberate as the type
@@ -140,6 +149,8 @@ from, and the 429 shape is documented even though the handler only raises an exc
   schema and a generated client whose return type is `Any`.
 - Leaving default operation IDs; the symptom is SDK method names like `complete_v1_chat_completions_post`
   that change whenever a path is edited, breaking downstream code on a refactor.
+- Declaring `responses={...: {"model": ErrorOut}}` while the handler raises a plain `HTTPException`; the
+  symptom is clients that deserialise errors into `ErrorOut` and fail, because the real body is `{"detail": ...}`.
 - Documenting a streaming endpoint as JSON; the symptom is generated clients that wait for a complete
   JSON body and hang or fail to parse an event stream.
 

@@ -5,6 +5,7 @@ name: Vector store sizing
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - data-architecture/vector-database-architecture
   - data-architecture/embedding-versioning-re-indexing-strategy
@@ -64,8 +65,9 @@ rescoring, so disk is not freed, only RAM.
 ### Step 3: index overhead
 HNSW stores neighbour lists. With degree parameter `M`, the base layer holds up to `2M` links per node
 and each link is a 4-byte id, so link storage is about `2 × M × 4` bytes per vector plus a small amount
-for upper layers; `M = 16` gives roughly 128 bytes per vector. The hnswlib documentation estimates total
-memory as about `dim × 4 + M × 2 × 4` bytes per element for float32. IVF adds only centroids and posting
+for upper layers; `M = 16` gives roughly 128 bytes per vector. The hnswlib parameter guide puts the
+link memory at roughly `M × 8–10` bytes per element, which matches this arithmetic; engines add their own
+per-point bookkeeping (ids, versions, locks) on top, so treat it as a lower bound. IVF adds only centroids and posting
 lists of ids, which is negligible next to the vectors.
 
 ### Step 4: payload and secondary indexes
@@ -78,8 +80,10 @@ storage keyed by `chunk_id` and store only ids and filter fields with the vector
 ### Step 5: replicas and headroom
 Multiply by the replication factor for availability. Then add headroom: segment merges and index rebuilds
 temporarily hold two copies of a segment, and operating at the edge of RAM turns every compaction into an
-incident. A factor of 1.5 over the steady-state estimate is a common rule of thumb (Qdrant's capacity
-guidance uses that multiplier for vectors); treat it as a floor, not a target.
+incident. A factor of about 1.5 is a common rule of thumb. Note what it is applied to: Qdrant's capacity
+guidance multiplies raw vector bytes by 1.5 to cover index structures, metadata and temporary segments
+during optimization together, whereas this lesson itemizes links and payload first and then applies 1.5×
+as build headroom, which is the more conservative reading. Treat either as a floor, not a target.
 
 ### Step 6: throughput and shards
 Memory gives one lower bound on node count; queries per second give another. Per-node throughput depends
@@ -107,9 +111,12 @@ each document yields about 4,000 / 350 ≈ 11.4 chunks; with rounding per docume
 Now change two decisions. Scalar int8 quantization makes the vectors 2.4 M × 1,024 B ≈ 2.5 GB, so the
 in-memory total becomes roughly 2.5 + 0.3 + 4.8 ≈ 7.6 GB, and text is now the biggest line. Move text out
 to the chunk table and keep 200 B of ids and filters: 2.5 + 0.3 + 0.5 ≈ 3.3 GB, about 5 GB with headroom
-per replica. The same corpus went from needing a dedicated cluster to fitting in the spare memory of a
-Postgres replica, with full-precision vectors (9.8 GB) kept on disk for rescoring. All figures are
-illustrative order-of-magnitude arithmetic; measure recall after quantizing.
+per replica. The same corpus went from needing large-memory nodes to fitting on one modest node, with
+full-precision vectors (9.8 GB) kept on disk for rescoring. Whether a given engine can do this exact
+configuration varies: pgvector, for instance, offers half-precision (`halfvec`, 2 bytes per dimension) and
+binary (`bit`) types rather than int8, so its nearest equivalent is about 4.9 GB of vectors, still small
+enough for an existing database host. All figures are illustrative order-of-magnitude arithmetic; measure
+recall after quantizing.
 
 ```python
 import math
@@ -133,8 +140,8 @@ for name, r in (("float32 + text in engine", base), ("int8 + ids only", lean)):
           f"{r['cluster_ram_gb']:.1f} GB cluster")
 ```
 
-Run it with your own corpus numbers before any vendor conversation; the two scenarios differ by about an
-order of magnitude in RAM for the same retrieval corpus.
+Run it with your own corpus numbers before any vendor conversation; the two scenarios print about 22.6 GB
+and 4.9 GB per replica, a factor of roughly 4.6 in RAM for the same retrieval corpus.
 
 ## Trade-offs
 - Quantization cuts RAM by 4× (int8) to 32× (binary) and speeds traversal, but costs recall that must be
@@ -205,7 +212,7 @@ labelled query set to confirm quantization did not change the top-k, and load-te
 > that start from document count miss this multiplier entirely; precision and graph layers change the
 > total by much smaller factors.
 
-### Q: After enabling int8 scalar quantization, why does disk usage barely change while RAM drops roughly 4×?
+### Q: After enabling int8 scalar quantization, why does disk usage not fall (it even grows slightly) while vector RAM drops roughly 4×?
 - [ ] The engine compresses the payload instead of the vectors
 - [ ] Quantization only applies to the HNSW links
 - [x] The quantized copy replaces float32 in memory, but full-precision vectors are kept on disk for rescoring the final candidates

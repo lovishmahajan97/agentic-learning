@@ -5,6 +5,7 @@ name: BullMQ & durable jobs
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - node-ts-for-ai/redis
   - node-ts-for-ai/graceful-shutdown
@@ -28,8 +29,8 @@ handlers must be idempotent, and the queue is only as durable as the Redis behin
 
 ## Why it exists
 An agent run takes two minutes, calls the model eight times and calls three tools. Doing that inside an
-HTTP handler means the client holds a connection for two minutes, the load balancer's idle timeout kills
-it at 60 seconds, a deploy that restarts the process loses the run with no record, and a burst of 200
+HTTP handler means the client holds a connection for two minutes, a load balancer idle timeout (60 s is a
+common default) can kill it first, a deploy that restarts the process loses the run with no record, and a burst of 200
 runs starts 200 concurrent model calls that hit the provider's rate limit together. The same shape
 appears for batch embedding, nightly evals, document ingestion, webhook fan-out and scheduled
 re-indexing.
@@ -56,6 +57,8 @@ persistence or an LRU eviction policy means lost jobs.
 - **Job**: `id`, `name`, `data` (JSON), `opts`, `attemptsMade`, `progress`, `returnvalue` and
   timestamps. A custom `jobId` deduplicates: adding a job whose id already exists in the queue is a
   no-op while the earlier job is still stored, which is the simplest exactly-once-enqueue tool you have.
+  Custom ids must not be plain integers or contain `:` (BullMQ uses it as its key separator and throws
+  on `add`), so use `embed-<docId>`, not `embed:<docId>`.
 - **QueueEvents**: a Redis-streams-based listener for `completed`, `failed` and `progress`, so an API
   replica can stream progress to a client without being the worker.
 - **FlowProducer**: adds a parent job with children; the parent runs only after all children complete,
@@ -80,9 +83,9 @@ function; the job runs in a child process or a worker thread) exist *because* of
 
 ### Rate limiting for LLM providers
 `Worker` takes `limiter: { max, duration }` to cap jobs started per window across all workers of a
-queue. For provider 429s, a processor can call `await worker.rateLimit(ms)` and throw
-`Worker.RateLimitError()` so the job returns to the queue without consuming an attempt while the queue
-pauses for that window. Per-group limits (one quota per tenant) are a BullMQ Pro feature; the
+queue. For provider 429s, a processor can call `await queue.rateLimit(ms)` (in BullMQ 5 this replaces
+the deprecated `worker.rateLimit`) and throw `Worker.RateLimitError()` so the job returns to the queue
+without consuming an attempt while the queue pauses for that window. Per-group limits (one quota per tenant) are a BullMQ Pro feature; the
 open-source approach is a queue per tenant tier, or a Redis token bucket checked inside the processor.
 
 ### Delivery semantics, and what BullMQ is not
@@ -98,19 +101,20 @@ history, long timers and human-in-the-loop waits.
 An embedding pipeline: the API enqueues one job per document with a deterministic id (a double-submit is
 harmless), a worker with bounded concurrency and a provider rate limit processes it, and the processor
 is idempotent because the vector write keys on document id and chunk index. Each BullMQ object gets its
-own ioredis connection because workers use blocking commands.
+own ioredis connection from a factory here; BullMQ also duplicates a Worker's connection internally for
+its blocking commands, and refuses a Worker connection whose `maxRetriesPerRequest` is not `null`.
 
 ```ts
 import IORedis from "ioredis";
 import { Queue, Worker, QueueEvents } from "bullmq";
-const conn = () => new IORedis(process.env.REDIS_URL!, { maxRetriesPerRequest: null });  // required by BullMQ
+const conn = () => new IORedis(process.env.REDIS_URL!, { maxRetriesPerRequest: null });  // required for Workers
 
 export const embedQueue = new Queue("embed", { connection: conn(),
   defaultJobOptions: { attempts: 5, backoff: { type: "exponential", delay: 2_000 },
                        removeOnComplete: { count: 1_000 }, removeOnFail: { age: 7 * 24 * 3600 } } });
 
 export async function enqueueEmbedding(docId: string, tenant: string) {
-  await embedQueue.add("embed-doc", { docId, tenant }, { jobId: `embed:${docId}` });   // dedup by id
+  await embedQueue.add("embed-doc", { docId, tenant }, { jobId: `embed-${docId}` });   // dedup by id (no ':' allowed)
 }
 
 // worker.ts — its own process; several replicas share the queue
@@ -123,7 +127,7 @@ const worker = new Worker("embed", async (job) => {
       const vec = await embed(chunks[i].text);                       // provider call
       await upsertEmbedding(docId, i, vec);                           // idempotent: (docId, i) is unique
     } catch (e: any) {
-      if (e.status === 429) { await worker.rateLimit(30_000); throw Worker.RateLimitError(); }
+      if (e.status === 429) { await embedQueue.rateLimit(30_000); throw Worker.RateLimitError(); }
       throw e;                                                       // anything else: retry with backoff
     }
     await job.updateProgress(Math.round(((i + 1) / chunks.length) * 100));
@@ -148,7 +152,7 @@ events.on("progress", ({ jobId, data }) => notifyClient(jobId, data));
 ## Pitfalls
 - A processor that blocks the event loop (large synchronous JSON parse, vector math): the symptom is `stalled` events and jobs processed twice because the lock renewal timer could not fire. Move CPU work to a sandboxed processor or a worker thread.
 - Non-idempotent side effects (send email, charge budget, append message) keyed on nothing: the symptom is duplicates after a deploy or a stall, with every attempt logging success.
-- An ioredis connection with `maxRetriesPerRequest` left at its default: the symptom is BullMQ refusing the connection at startup, or a worker whose blocking wait errors out during a Redis reconnect.
+- An ioredis connection with `maxRetriesPerRequest` left at its default (20): the symptom is a Worker throwing at construction when handed that instance (BullMQ only warns and overrides it when given plain options), or blocking waits erroring out during a Redis reconnect.
 - `removeOnComplete` left off in a high-volume queue: the symptom is Redis memory growing until eviction or out-of-memory, weeks after launch.
 - Treating `queue.add` as part of a database transaction: the symptom is jobs for rows that rolled back, or committed rows with no job; use an outbox table and a relay worker.
 - Exiting with `process.exit()` instead of `await worker.close()`: the symptom is active jobs re-run after every deploy once the stall checker catches them.
@@ -194,7 +198,7 @@ resumes instead of restarting, move CPU-heavy work to a sandboxed processor, and
 - [ ] Because Redis Cluster does not support per-request retries
 - [x] So that commands, including the worker's long blocking waits, queue until Redis reconnects instead of failing after a fixed number of reconnection attempts
 - [ ] To allow the connection to be shared with pub/sub subscribers
-> ioredis's `maxRetriesPerRequest` fails pending commands after N reconnection attempts; BullMQ manages reconnection itself and needs its commands to wait, so it insists on unlimited retries for that connection.
+> ioredis's `maxRetriesPerRequest` fails pending commands after N reconnection attempts (20 by default); a worker's loop is built around long blocking commands that must survive a reconnect rather than reject, so BullMQ insists on `null` (wait indefinitely) for worker connections.
 
 ### Q: Which design keeps a 500-chunk embedding job from restarting at chunk 0 after a transient failure at chunk 499?
 - [ ] Increase `attempts` so the job eventually gets through

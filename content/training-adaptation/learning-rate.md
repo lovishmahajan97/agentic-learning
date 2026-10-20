@@ -5,7 +5,7 @@ name: Learning rate
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/warmup
@@ -88,7 +88,17 @@ use rates around ten times higher. Treat these as common starting points, not la
 low because every weight moves and large moves erase pretrained knowledge (see catastrophic forgetting);
 adapter rates are higher because the trainable set is small and its contribution starts at zero (LoRA's
 B matrix is zero-initialised), so the low-rank update must grow from nothing within the run; the exact
-ratio is empirical.
+ratio is empirical. LoRA's output is also multiplied by a scaling factor α/r, so the learning rate and α
+interact: changing the rank or α changes the effective step on the model's outputs even at the same
+nominal η, which is one reason a LoRA rate rarely transfers between configurations unchanged.
+
+### One rate or several
+Nothing forces every parameter to share η. Discriminative (layer-wise) rates give a freshly initialised
+head a higher rate than the pretrained body, because the head starts from nothing while the body only
+needs nudging; optimisers take this as separate parameter groups. At the other end, width-aware
+parameterisations such as μP rescale initialisation and per-layer rates so that the best rate found on a
+small model transfers to a wider one, which is how some labs tune large runs without sweeping at full
+size.
 
 ### Finding the rate
 The range test increases η exponentially over a short run and plots loss: the usable region ends just
@@ -181,10 +191,11 @@ change.
 **A:** The full fine-tune moves every weight by about the learning rate per step under AdamW, so even a
 modest rate accumulated over hundreds of steps shifts the whole network away from the pretrained solution;
 the regression is forgetting, and the fixes are a lower rate, fewer steps, early stopping on a general
-evaluation, or mixing general data into the set. The LoRA adapters start at zero and are a tiny fraction
-of the parameters, and their update starts at zero because LoRA's B matrix is zero-initialised, so at
-2e-5 the low-rank product barely grows within the run; adapter training
-commonly uses rates around ten times higher. The change is to tune the rate per parameterisation, run a
+evaluation, or mixing general data into the set. The LoRA update is the product B·A scaled by α/r, and B
+starts at zero, so the change to the model begins at exactly zero and can only grow as fast as B's
+entries move, about η per step under Adam. At 2e-5 over a few hundred steps those entries stay tiny and
+the product barely affects the outputs; adapter training commonly uses rates around ten times higher,
+and the right value also depends on the chosen α and rank. The change is to tune the rate per parameterisation, run a
 quick grid at ×3 spacing for each, and watch both the task metric and the general evaluation rather than
 training loss alone.
 

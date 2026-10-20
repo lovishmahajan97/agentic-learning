@@ -5,6 +5,7 @@ name: Pydantic request / response models
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - python-for-ai/pydantic
   - fastapi-for-ai/response-model
@@ -31,7 +32,7 @@ out.
 An AI endpoint takes rich, nested input — a list of messages with roles, optional tool definitions,
 sampling parameters, tenant metadata — and returns rich output. If the handler reads a raw dict, every
 field needs a hand-written check: is `messages` a list, does each item have `role` and `content`, is
-`temperature` a number between 0 and 2, is `max_tokens` an integer. Teams skip those checks, and the
+`temperature` inside the provider's range (0–2 for OpenAI-style APIs, 0–1 for Anthropic's), is `max_tokens` an integer. Teams skip those checks, and the
 failures arrive late and expensively: the provider rejects the call after a network round trip, or
 accepts a nonsense value and returns garbage, or a typo like `"temprature"` silently falls back to the
 default and nobody notices for a month. Output is worse: handlers return whatever dict they built, so
@@ -51,9 +52,13 @@ regardless of which code path produced the data.
 
 ## How it works
 ### Inbound: body → model → handler
-1. FastAPI reads the ASGI body events, parses JSON and, for each parameter annotated with a `BaseModel`
-   subclass, calls Pydantic validation on the parsed data. Query, path and header parameters are
-   validated the same way from their own sources.
+1. FastAPI decides each parameter's source from its declaration, once, when the route is registered: a
+   name that appears in the path template is a path parameter, a `BaseModel` annotation is the body,
+   other plain scalars are query parameters, and `Header()`, `Cookie()`, `Body()` override the default.
+   At request time it reads the ASGI body events, parses JSON and validates it against the model.
+   With a single body model the JSON object *is* the model (`{"messages": [...]}`); with two body
+   models, or `Body(embed=True)`, each is nested under its parameter name. Getting this wrong is a
+   classic source of 422s for clients that send the right fields at the wrong nesting level.
 2. Validation coerces and checks: `"0.7"` becomes `0.7` for a `float` field under Pydantic's default
    lax mode, missing required fields and wrong types produce errors, `Field(ge=0, le=2)` enforces
    ranges, `Literal["user", "assistant", "system"]` restricts enumerations, `max_length` bounds lists
@@ -86,6 +91,10 @@ error instead of shipping a wrong shape. The response model is also what OpenAPI
   `messages: list[Message] = Field(min_length=1, max_length=200)`, and a model validator that caps
   total characters, so prompt-size limits are enforced at the contract rather than discovered as
   provider errors or surprise bills.
+- **Forward only what the client set.** When proxying to a provider, build the outbound payload with
+  `req.model_dump(exclude_unset=True)` (plus your own fixed fields), so a parameter the client omitted
+  falls back to the provider's default instead of being pinned to whatever default your model
+  declares. Pydantic tracks which fields were explicitly provided, which is what makes this exact.
 - **Version by model, not by flag.** A breaking change gets a new request model on a new route;
   additive optional fields with defaults are backward compatible.
 - **Strict where coercion would hide bugs.** Pydantic's strict mode (`ConfigDict(strict=True)` or
@@ -126,7 +135,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")          # "temprature" -> 422, not silently ignored
     messages: list[Message] = Field(min_length=1, max_length=200)
-    temperature: float = Field(default=0.7, ge=0, le=2)
+    temperature: float = Field(default=0.7, ge=0, le=2)    # range is provider-specific
     max_tokens: int = Field(default=1024, ge=1, le=8192)
     stream: bool = False
 
@@ -200,7 +209,8 @@ changes nothing, and separately a security review finds the `system_prompt` your
 appears in API responses. Diagnose both using request and response models.
 **A:** The `top_p` symptom means the request model does not declare the field and allows extra fields
 by default, so Pydantic discards it silently and the provider never sees it; either add
-`top_p: float = Field(ge=0, le=1)` and forward it, or set `extra="forbid"` so unknown fields return a
+`top_p: float | None = Field(default=None, ge=0, le=1)` (optional, so existing clients keep
+working) and forward it when set, or set `extra="forbid"` so unknown fields return a
 422 that tells the customer the parameter is unsupported. The leak means the response model is either
 missing or the same class as the internal object that carries the injected prompt; define a dedicated
 `ChatResponse` with only the public fields and declare it on the route, so FastAPI filters the output

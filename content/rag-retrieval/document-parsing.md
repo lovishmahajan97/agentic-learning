@@ -5,6 +5,7 @@ name: Document parsing (OCR, layout, tables)
 kind: concept
 difficulty: core
 est_minutes: 17
+status: reviewed
 related:
   - multimodal/ocr
   - multimodal/document-understanding
@@ -51,6 +52,13 @@ common. If the page has a text layer with a plausible character count, extract i
 and cheap. If the text layer is empty, tiny or garbage (some scanners add a poor OCR layer), render the
 page to an image and OCR it.
 
+"Plausible" needs a quality check, not just a length check. A text layer can be long and still useless:
+fonts embedded without a proper character-to-Unicode mapping extract as placeholders such as `(cid:42)`
+or as mojibake, and an old scanner's OCR layer can be riddled with errors. Cheap signals are the share of
+tokens that are dictionary words in the expected language, the share of replacement or placeholder
+characters, and whether the text contains the words you can see in a rendered thumbnail. Pages that fail
+go to OCR even though a text layer exists.
+
 ### 2. Extract with coordinates
 For digital pages, extract words or characters with bounding boxes and font information, not just a string.
 Coordinates are what make layout recovery possible; font size and weight are the main signals for headings.
@@ -62,7 +70,19 @@ characters, with a confidence score. Quality depends heavily on input: render at
 Keep the per-word confidence, *because* low-confidence regions are where numbers get corrupted ("0" vs
 "O", "1" vs "l") and are worth flagging or routing to a stronger model.
 
-### 4. Layout analysis
+OCR quality is measured as character error rate against a hand transcription:
+`CER = (substitutions + deletions + insertions) / characters in the reference`, the edit distance
+normalised by length. Word error rate is the same at word level. Measure it on numbers separately, because
+a page can have a low overall CER and still corrupt the one digit in "30 days" that the answer depends on.
+
+### 4. Clean the text stream
+Born-digital text has its own artifacts. Words hyphenated at line ends ("refund-" / "able") must be
+rejoined or neither half matches a query; ligature glyphs (fi, fl) may extract as single unusual
+characters; hard line breaks inside paragraphs should become spaces. Normalise Unicode (for example NFKC)
+so visually identical characters compare equal, *because* both BM25 and embeddings see the bytes, not the
+glyphs.
+
+### 5. Layout analysis
 Group words into blocks and label them: title, heading, paragraph, list, table, figure, caption, header,
 footer. Rule-based approaches cluster by x-coordinates to find columns and recursively cut the page along
 whitespace (XY-cut); learned layout models detect regions directly from the page image and handle irregular
@@ -70,15 +90,24 @@ layouts better. Then order blocks for reading: column by column, top to bottom. 
 footers by detecting text that repeats at the same position across pages. Preserve the heading hierarchy as
 metadata *because* chunking and retrieval both benefit from knowing "this paragraph is under 4.2 Refunds".
 
-### 5. Tables
+### 6. Tables
 Table extraction has two parts: detecting the table region, and recognising its structure (rows, columns,
 merged and spanning cells, multi-row headers). Ruled tables can be recovered from drawn lines; borderless
 tables need alignment heuristics or a learned structure model. Output the table as Markdown or HTML so
 structure survives, and for retrieval also serialise each row with its headers ("Plan: Enterprise; Refund
 window: 30 days"), *because* a row read in isolation must still be meaningful once chunked. Large numeric
-tables are often better loaded into a database and queried with SQL than embedded at all.
+tables are often better loaded into a database and queried with SQL than embedded at all. Tables that
+continue across pages need stitching: the continuation usually repeats or omits the header row, and
+without stitching the second page's rows lose their column labels.
 
-### 6. Vision-language models as parsers
+### 7. Figures and non-PDF formats
+Charts and diagrams carry content that no text extractor sees; at minimum keep the caption, and where the
+figure matters, generate a description with a VLM and mark it as generated. Office and web formats
+(DOCX, PPTX, HTML, XLSX) are easier in one respect, because headings, lists and table cells are explicit
+in the file, so parse their structure directly rather than converting to PDF first and re-inferring it.
+Spreadsheets in particular are tables already and usually belong in the SQL path.
+
+### 8. Vision-language models as parsers
 A VLM given a page image can transcribe it to Markdown, including tables and reading order, and often
 copes with layouts that break rule-based pipelines. The costs: per-page inference cost and latency, and a
 specific risk that the model *generates* plausible text rather than transcribing, silently normalising a
@@ -109,24 +138,29 @@ def parse_pdf(path: str, min_chars: int = 50) -> list[dict]:
                 text = pytesseract.image_to_string(img)
                 source = "ocr"
             out.append({"page": i, "type": "text", "source": source, "text": text})
-            for table in page.extract_tables():
-                header, *rows = table
+            for table in page.extract_tables():             # text layer only: [] on scans
+                if not table:
+                    continue
+                header, *rows = table                         # cells may be None
                 for row in rows:
-                    cells = [f"{h}: {v}" for h, v in zip(header, row) if v]
-                    out.append({"page": i, "type": "table_row", "source": source,
+                    cells = [f"{h or '?'}: {v}" for h, v in zip(header, row) if v]
+                    out.append({"page": i, "type": "table_row", "source": "text-layer",
                                 "text": "; ".join(cells)})
     return out
 
 # A pricing table row becomes:
-# {"page": 4, "type": "table_row", "text": "Plan: Enterprise; Refund window: 30 days; Seats: Unlimited"}
+# {"page": 4, "type": "table_row", "source": "text-layer",
+#  "text": "Plan: Enterprise; Refund window: 30 days; Seats: Unlimited"}
 ```
 
 This is deliberately simple: it does not reorder multi-column pages, strip headers, or handle merged
-header cells, and `extract_tables` only works on text-layer pages. Each of those is a step you add once a
-sample of your real documents shows you need it.
+header cells, and `extract_tables` only works on text-layer pages. It also indexes each table twice:
+`extract_text()` already includes the table's cells as a flattened stream, so a production version crops
+table regions out of the page (for example with `page.filter` or `outside_bbox`) before extracting the
+prose. Each of those is a step you add once a sample of your real documents shows you need it.
 
 ## Trade-offs
-- Text-layer extraction is exact, fast and cheap, but only for born-digital PDFs; on scans or broken layers
+- Text-layer extraction is exact, fast and cheap when the font encoding is sound, but only for born-digital PDFs; on scans or broken layers
   it returns nothing, so per-page detection and OCR fallback are mandatory for mixed corpora.
 - Rule-based layout (column clustering, XY-cut) is deterministic and cheap, yet fails on irregular layouts
   like brochures and forms, where learned layout models or VLMs pay for their cost.
@@ -144,6 +178,10 @@ sample of your real documents shows you need it.
   name or "Confidential" and crowding out real results.
 - Flattening tables to a stream of values; the symptom is the model citing the right chunk but reading the
   wrong cell, such as quoting the Basic plan's price for the Enterprise plan.
+- Trusting a text layer because it is non-empty; the symptom is chunks full of `(cid:NN)` placeholders or
+  mojibake that embed to near-identical vectors and never match any query.
+- Not stitching tables that span pages; the symptom is correct answers for rows on a table's first page
+  and wrong or missing answers for rows that happen to fall on its continuation.
 - Never evaluating the parser; problems surface only as downstream wrong answers, whereas a sample of pages
   compared against hand transcriptions would show them immediately.
 

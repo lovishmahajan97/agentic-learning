@@ -5,7 +5,7 @@ name: Trade-off analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - system-design/nfrs
   - system-design/adrs
@@ -108,6 +108,12 @@ matter; a pre-mortem ("it is a year later and this choice failed, why?") to surf
 missed; and the halving test ("would we still choose this if volume halved or doubled?") as a cheap
 sensitivity check.
 
+When the forecast itself is the uncertainty, score options per scenario rather than at one point:
+compute each option's cost at the low, expected and high ends of the range, and its **regret** in each
+(its cost minus the best option's cost in that scenario). Choosing the option whose worst-case regret is
+smallest is a defensible rule when nobody can honestly narrow the range, and the table makes visible
+which scenario each option is betting on.
+
 ## Example
 The cost dimension of a hosted-versus-self-hosted decision, done as a break-even with an explicit flip
 condition. Every figure is illustrative and must be replaced with your own quotes and a load-tested
@@ -151,6 +157,14 @@ for util in (0.5, 0.4):
 #     50.0B tokens   hosted $  100,000   self-hosted $  110,167
 ```
 
+One input deserves suspicion: utilisation is not a free parameter. It is served tokens divided by the
+capacity you pay for, and two things cap it. A fleet sized for peak traffic idles off-peak, so with a
+peak-to-average ratio of 2 and no autoscaling, utilisation cannot exceed 50%. And a minimum fleet, say two
+GPUs for redundancy running 24/7 (~1,460 GPU-hours, ~$3,650 a month here), is billed at any volume: at
+0.5B tokens it would run about 11% utilised, so the real self-hosted cost is ~$9,650, not $6,833. The floor
+does not move the 18B break-even, where the fleet is already ~16 GPUs, but it shows why the utilisation
+cell should be derived from a traffic profile rather than typed in.
+
 ## Trade-offs
 - A full matrix with evidence grades and sensitivity analysis produces decisions that survive review,
   but it costs days; for two-way doors a one-paragraph analysis with a named flip condition is the
@@ -177,6 +191,8 @@ for util in (0.5, 0.4):
   the leaderboard and loses on your golden set after the contract is signed.
 - Forgetting the fixed operational cost of running things yourself; the symptom is a self-hosting plan
   whose per-token cost looked lower and whose monthly bill is higher.
+- Typing in a utilisation figure instead of deriving it from the traffic profile; the symptom is a GPU
+  bill well above plan because the fleet is sized for peak and idles overnight and at weekends.
 - Treating a hard constraint as a weighted dimension; the symptom is a vendor that "scored best" and
   cannot satisfy the customer's residency requirement.
 - Never recording the inputs; the symptom is the same debate, from scratch, every time a new model or a

@@ -5,7 +5,7 @@ name: Embedding pipelines
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/embedding-models
@@ -91,7 +91,12 @@ backfill runs; cheaper but easy to get wrong. Estimate the backfill before choos
 tokens gives total tokens, and as an illustrative order of magnitude a million 300-token chunks is 300
 million tokens, which at hosted embedding prices of cents per million tokens (vendor- and
 time-dependent) costs on the order of dollars to tens of dollars; the real constraint is usually the
-API rate limit, which turns that into hours, or GPU throughput for a self-hosted model.
+API rate limit, which turns that into hours, or GPU throughput for a self-hosted model. The duration
+is `total tokens ÷ tokens per minute you are allowed (or can serve)`: 300 million tokens against an
+illustrative quota of one million tokens per minute is 300 minutes, five hours before retries. That
+number, more than the bill, decides whether a migration fits overnight, and it also caps concurrency:
+workers × tokens per request × requests per worker per minute must stay under the quota, or extra
+workers only buy 429s.
 
 ### Batch versus streaming
 A nightly batch is enough for slowly changing corpora. When users notice staleness, run the same

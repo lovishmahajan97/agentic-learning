@@ -4,8 +4,8 @@ module: rag-retrieval
 name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - rag-retrieval/dense-vs-sparse-retrieval
   - rag-retrieval/bm25-internals
@@ -69,6 +69,9 @@ with hybrid search offer it (Elasticsearch, OpenSearch, Qdrant and Weaviate amon
 and many RAG frameworks use it by default. Defaults differ and change between releases, so check yours:
 Weaviate, for example, moved its default to a normalized score fusion. Its weakness is that
 it throws away magnitude: a dense hit at cosine 0.92 and the next at 0.55 are treated as adjacent ranks.
+Two refinements are common. Per-arm weights (`w_arm / (k + rank)`) let you trust one arm more without
+touching scores, and k itself is a knob: smaller k makes the curve steeper, so a single arm's top ranks
+count for more; larger k flattens it further toward pure agreement counting.
 
 ### Weighted score fusion
 The alternative keeps scores: normalize each arm's scores per query (min–max to [0, 1], or z-scores),
@@ -76,7 +79,17 @@ then combine as `α·dense + (1 − α)·sparse`. This can exploit a decisive de
 match, and α lets you bias toward the arm that wins on your traffic. The price is fragility:
 normalization depends on the candidate pool (a longer list changes the minimum), per-query normalization
 inflates weak top hits, and α must be tuned on labeled data and re-tuned when either model or the corpus
-changes. Engines expose both styles: Weaviate's `alpha`, OpenSearch's normalization processors,
+changes. A concrete case: for a vague query, BM25's top three might score 2.1, 2.0 and 1.9, a near-tie
+among weak matches, while dense returns 0.81, 0.62 and 0.55, a clear winner. Min–max maps the BM25 list
+to 1.0, 0.5, 0.0 and the dense list to 1.0, 0.27, 0.0, so the BM25 arm's essentially arbitrary first
+place now carries exactly the same weight as the dense arm's decisive one, and its second place
+outweighs the dense second by almost 2×, purely as an artifact of stretching a 0.2-wide range to 1. Z-scores soften this but still assume each arm's top-n has a
+comparable spread, which is the thing that varies most from query to query.
+
+Some systems go one step further and make the weight query-dependent, leaning lexical when the query
+looks like an identifier (digits, hyphens, quoted strings) and dense when it reads as a question. It
+works when the query classes are cleanly separable in your logs; it is one more component that must be
+evaluated per slice. Engines expose both styles: Weaviate's `alpha`, OpenSearch's normalization processors,
 Elasticsearch's RRF and weighted retrievers.
 
 ### Where the arms live
@@ -196,8 +209,10 @@ number. Join them on chunk id with a full outer join and compute reciprocal rank
 summed across arms, ordering by that sum and taking the top 10 for the reranker or the prompt. Because
 both arms live in one table, deletes and filters are naturally consistent, which is a real advantage over
 a separate search engine; the risks are forgetting to apply the same `WHERE` clause to both subqueries,
-and a selective filter starving the HNSW arm, since pgvector applies the filter after the graph search and
-can return fewer than 50 rows unless iterative index scans (pgvector 0.8 and later) are enabled. Also note
+and the HNSW arm returning fewer rows than asked for. pgvector's HNSW scan returns at most
+`hnsw.ef_search` candidates (40 by default), so `LIMIT 50` needs ef_search raised to at least 50 even
+with no filter, and a selective `WHERE` is applied after the graph search, starving the arm further
+unless iterative index scans (pgvector 0.8 and later) are enabled. Also note
 the GIN index accelerates only the match; `ts_rank` is computed for every matching row before sorting. To
 prove it helped, run the labeled query set through dense-only and hybrid, compare recall@10 overall and
 per query type, inspect queries that regressed, and check p95 latency, since the second subquery adds

@@ -5,6 +5,7 @@ name: PyTorch (tensors, autograd, nn.Module, DataLoader, device)
 kind: tool
 difficulty: core
 est_minutes: 20
+status: fact-checked
 related:
   - python-for-ai/numpy
   - python-for-ai/hugging-face
@@ -33,8 +34,9 @@ from the CPU's, and a way to keep a GPU busy while the next batch is being loade
 
 Deriving gradients by hand is error-prone past a few layers, and finite differences are hopeless: one
 extra forward pass per parameter means a billion forward passes per step for a 1B-parameter model.
-Reverse-mode automatic differentiation computes all of them in roughly the cost of one extra backward
-pass, but it needs a record of what was computed. Earlier frameworks such as TensorFlow 1.x asked you to
+Reverse-mode automatic differentiation computes all of them in a single backward pass whose cost is a
+small constant multiple of the forward pass (commonly quoted as about two to three times), independent of
+the parameter count, but it needs a record of what was computed. Earlier frameworks such as TensorFlow 1.x asked you to
 declare that record as a static graph first and then execute it in a session; this made optimisation easy
 and debugging miserable, because errors surfaced inside a runtime you could not step through, and data-
 dependent control flow (a loop that runs a variable number of times) needed special graph operators.
@@ -62,7 +64,8 @@ results into each leaf's `.grad`. Accumulation, not assignment, is a deliberate 
 gradient accumulation across micro-batches work for free, and it is why you must call
 `optimizer.zero_grad()` every step. The graph is freed after `backward()` because holding saved
 activations is the main memory cost of training; `torch.no_grad()` (or `torch.inference_mode()`) stops
-recording entirely, which is why inference must run inside it.
+recording entirely, which is why inference should run inside it: no activations are saved for a backward
+pass that will never happen.
 
 ### nn.Module
 A module is a class whose attributes that are `nn.Parameter`s or other modules get registered
@@ -76,7 +79,7 @@ A `Dataset` answers `len()` and `__getitem__(i)`. A `DataLoader` wraps it with b
 `collate_fn` that stacks samples (or pads variable-length sequences), and `num_workers` subprocesses that
 prefetch batches so tokenisation or image decoding overlaps GPU compute. Worker processes, not threads,
 are used because of the GIL. `pin_memory=True` puts batches in page-locked host memory so the copy to
-GPU can be asynchronous.
+GPU can be asynchronous when you also pass `non_blocking=True` to `.to(device)`.
 
 ### device
 Tensors live on exactly one device (`cpu`, `cuda:0`, `mps`). Ops require all inputs on the same device;
@@ -138,8 +141,9 @@ which forces a sync, so in a real loop you log it every N steps rather than ever
 ## Pitfalls
 - Forgetting `optimizer.zero_grad()`: gradients from every step add up, and the symptom is a loss that
   diverges or oscillates wildly after a few steps.
-- Running inference without `torch.no_grad()` or `inference_mode()`: memory climbs per request until a
-  CUDA out-of-memory error, because each forward pass keeps its graph alive.
+- Running inference without `torch.no_grad()` or `inference_mode()`: every forward pass saves activations
+  for a backward that never comes, so peak memory is higher, and if any output is kept (cached, appended
+  to a list) its graph stays alive and memory climbs per request until a CUDA out-of-memory error.
 - Forgetting `model.eval()` before evaluation: dropout stays active, so the same input gives different
   outputs and validation metrics look noisy and worse than expected.
 - Accumulating `total += loss` instead of `loss.item()`: you keep every step's graph referenced, and the
@@ -151,7 +155,7 @@ which forces a sync, so in a real loop you log it every N steps rather than ever
 Reach for raw PyTorch when you need control a higher-level library hides: a custom loss, a non-standard
 training step, inspecting activations, or debugging why a Hugging Face model misbehaves. For fine-tuning
 standard LLMs, use Transformers, PEFT and TRL on top of it rather than hand-writing loops; for serving
-LLMs at scale, use an inference engine (vLLM, SGLang, TGI) rather than a PyTorch `generate` loop. What
+LLMs at scale, use an inference engine (vLLM, SGLang, TensorRT-LLM) rather than a PyTorch `generate` loop. What
 to measure: GPU utilisation, peak memory (`torch.cuda.max_memory_allocated()`), and samples per second;
 a GPU idling at low utilisation usually means the DataLoader is the bottleneck. In interviews, expect to
 explain why gradients accumulate, what `no_grad` saves, and the difference between `eval()` and

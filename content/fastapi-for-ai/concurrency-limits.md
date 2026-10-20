@@ -5,6 +5,7 @@ name: Concurrency limits (semaphores)
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - fastapi-for-ai/backpressure
   - fastapi-for-ai/rate-limiting
@@ -37,8 +38,9 @@ clients double the load. Nothing in the async machinery pushes back.
 
 The naive answers do not fix it. A rate limit (requests per second) controls arrivals, not how many
 are in flight at once; with LLM calls taking anywhere from one to sixty seconds, the same rate can
-mean ten or six hundred concurrent calls. A bigger connection pool only moves the queue into
-`PoolTimeout`. More workers multiply the problem. What is missing is a direct cap on in-flight work
+mean ten or six hundred concurrent calls. Leaning on the HTTP client's pool limit as the cap only moves
+the queue into the pool wait, where it surfaces as `PoolTimeout` with no clean 503 and no per-dependency
+policy, and a bigger pool just sends more load downstream. More workers multiply the problem. What is missing is a direct cap on in-flight work
 for each scarce resource, enforced before the work starts. The relationship to aim at is Little's law:
 in-flight = throughput × latency. If a dependency can sustain 64 concurrent calls and calls take 4
 seconds on average, its ceiling is about 16 requests per second, whatever you do upstream.
@@ -66,6 +68,26 @@ which is just an unbounded queue with extra steps. Wrap the acquire in a timeout
 return 503 with `Retry-After`, *because* a fast, honest rejection lets the client or load balancer
 retry elsewhere while a slow one burns the client's whole timeout. You can also check
 `sem.locked()` to reject immediately when there is no free slot.
+
+### Choosing n
+For a hosted provider, *n* starts from the quota: `n_per_worker = floor(quota / (workers × replicas))`,
+minus headroom for retries and other services sharing the key. For a self-hosted inference server
+there is no quota, only a curve: run a load test that steps concurrency up and record throughput and
+per-request latency (time per output token, time to first token) at each step. Throughput rises while
+the engine batches more sequences, then flattens; latency stays roughly flat, then climbs. Set *n*
+just before the knee, *because* past it extra concurrency buys no throughput and only adds queueing
+inside the engine, where you can neither see nor reject it. Little's law gives the resulting ceiling:
+`max throughput ≈ n / mean latency`. When the knee moves (longer prompts, a new model), a static *n*
+goes stale; adaptive limiters adjust it from observed latency or 429s, at the cost of a feedback
+loop that must itself be tuned.
+
+### Not all calls cost the same
+A provider quota is often in tokens per minute as well as requests, and a 50k-token prompt holds far
+more of a self-hosted engine's KV cache than a 200-token one. A slot-per-request semaphore treats them
+as equal. A weighted limit charges each call units proportional to its expected tokens. Do not build
+this by calling `acquire()` *k* times on an `asyncio.Semaphore`: acquisition is not atomic, so two
+large requests can each hold half of what they need and wait on each other forever. Use a limiter
+that takes *k* units in one step, or cap request size separately so one slot is a bounded cost.
 
 ### Separate limits per dependency
 One semaphore for the LLM, another for embeddings, another for the reranker or a slow internal tool.
@@ -153,6 +175,8 @@ instead of piling up.
   concurrency against the provider far exceeds the cap.
 - Manual `acquire()` without `try/finally`; a cancelled or failed request leaks a slot, and capacity
   shrinks slowly until the worker seems to hang at zero.
+- Sizing *n* for a self-hosted engine from GPU count or intuition rather than a concurrency sweep; the
+  symptom is throughput that does not rise when *n* is raised while time per token keeps growing.
 
 ## When to use
 Put a semaphore in front of every scarce or quota-bound dependency an async service calls: hosted

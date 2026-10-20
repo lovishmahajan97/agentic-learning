@@ -5,7 +5,7 @@ name: Tool schemas & argument validation
 kind: practice
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts
@@ -144,6 +144,16 @@ def handle_refund(block, session_tenant: str) -> dict:
     return {"type": "tool_result", "tool_use_id": block.id,
             "content": f'{{"status": "refunded", "amount_cents": {args.amount_cents}}}'}
 ```
+
+Trace one bad call through it. The user says "refund $12.90 on order 104233, it arrived broken" and the
+model sends `{"order_id": "104233", "amount_cents": 12.9, "reason": "broken"}`. All three fields fail the
+shape layer at once, and Pydantic reports all three in one pass, so the model receives a single result
+naming each: the pattern `^ORD-\d{6}$` the id must match, that `amount_cents` must be an integer with no
+fractional part, and the four allowed `reason` values. One round trip later it sends
+`{"order_id": "ORD-104233", "amount_cents": 1290, "reason": "damaged"}`, which passes. Reporting every
+error together matters *because* fixing them one per round trip would have cost three model calls instead
+of one. Had it sent `amount_cents: 129000`, shape would pass and the cross-field rule would reject it with
+the paid amount in the message, which is exactly the information needed to correct it.
 
 ## Trade-offs
 - Strict mode gives a hard shape guarantee but limits the schema vocabulary and adds first-call

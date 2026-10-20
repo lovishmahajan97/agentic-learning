@@ -5,6 +5,7 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - backend-fundamentals/redis
   - fastapi-for-ai/redis-caching
@@ -47,7 +48,8 @@ persistence configured deliberately rather than assumed.
 - **Strings** with `SET key value EX ttl`: cached completions, feature flags, idempotency markers
   (`SET ... NX`).
 - **Hashes**: one conversation's metadata or a session, updated field by field with `HSET`, expired as
-  a whole.
+  a whole (Redis 7.4 added per-field TTLs with `HEXPIRE`, but older servers and many managed offerings
+  only expire whole keys).
 - **Lists**: simple queues and recent-messages windows (`LPUSH` plus `LTRIM`).
 - **Sets and sorted sets**: membership and ranking; sorted sets with timestamps as scores implement
   sliding-window rate limits (`ZADD`, `ZREMRANGEBYSCORE`, `ZCARD`).
@@ -77,8 +79,8 @@ Two mainstream clients: `ioredis` (long the de-facto standard and what BullMQ us
 un-awaited commands automatically, ioredis with `enableAutoPipelining` or an explicit `pipeline()`),
 and support Lua scripts, Cluster and Sentinel. Node-specific rules:
 - A connection in subscriber mode or running a blocking command (`BLPOP`, `XREAD BLOCK`) cannot issue
-  other commands, so pub/sub and blocking consumers get their own connection; BullMQ needs a dedicated
-  connection for the same reason.
+  other commands, so pub/sub and blocking consumers get their own connection; BullMQ workers open a
+  separate blocking connection for the same reason and require `maxRetriesPerRequest: null` on it.
 - Configure reconnect and failure behaviour explicitly: ioredis's `maxRetriesPerRequest` and
   `enableOfflineQueue` decide whether a command waits for reconnection or fails fast. On a request path
   you usually want fail-fast *because* a hung Redis should degrade the cache, not take down the API.
@@ -89,20 +91,25 @@ and support Lua scripts, Cluster and Sentinel. Node-specific rules:
 
 ### Typical AI-service uses
 - **Completion cache**: key = SHA-256 of (model, system prompt, messages, parameters), serialised with
-  stable key order; cache only deterministic requests (temperature 0 or explicitly cacheable) and store
-  usage alongside so cost dashboards stay honest.
+  stable key order; cache only requests where one canonical answer is acceptable (temperature 0 or
+  explicitly marked cacheable; note that temperature 0 is not bit-for-bit deterministic on hosted APIs,
+  so the cache *chooses* an answer rather than reproducing one) and store usage alongside so cost
+  dashboards stay honest.
 - **Provider rate limit / semaphore**: a token bucket in Lua keyed by provider and model so N replicas
   together stay under the vendor's requests-per-minute and tokens-per-minute limits.
 - **Run state and locks**: `SET run:{id}:lock token NX PX 30000` to ensure one worker per run, released
-  by a check-and-delete script; refresh the TTL while working.
+  by a check-and-delete script; refresh the TTL while working. A TTL lock can still expire under a
+  paused process, so writes that must never happen twice also need a fencing token or a unique
+  constraint downstream.
 - **Short-term memory**: last-N turns for a conversation with a TTL, while long-term memory lives in
   Postgres or a vector store.
 
 ## Example
 A completion cache and a fixed-window rate limiter using ioredis. The limiter is a Lua script so the
-increment and the expiry are set atomically; the cache key hashes everything that affects the output,
-and every Redis failure on the hot path degrades to calling the provider rather than failing the
-request.
+increment and the expiry are set atomically; the cache key hashes the fields that affect the output in a
+fixed order, and every Redis failure on the hot path degrades rather than failing the request (the
+limiter fails open, the cache falls through to the provider). Fixed windows allow up to twice the limit
+across a window boundary; use a sliding window or token bucket when that matters.
 
 ```ts
 import Redis from "ioredis";
@@ -120,15 +127,18 @@ redis.defineCommand("hitWindow", {
 });
 export async function allow(tenant: string, limit = 60, windowMs = 60_000): Promise<boolean> {
   const bucket = Math.floor(Date.now() / windowMs);
-  const n: number = await (redis as any).hitWindow(`rl:${tenant}:${bucket}`, windowMs);
-  return n <= limit;
+  try {
+    const n: number = await (redis as any).hitWindow(`rl:${tenant}:${bucket}`, windowMs);
+    return n <= limit;
+  } catch { return true; }                                          // Redis down: fail open (a policy choice)
 }
 
 // Cache-aside for deterministic completions.
-export async function cachedComplete(req: { model: string; messages: unknown[]; temperature: number },
+export async function cachedComplete(req: { model: string; system: string; messages: unknown[]; temperature: number; maxTokens: number },
                                      call: () => Promise<string>, ttlSec = 3600): Promise<string> {
-  if (req.temperature !== 0) return call();                      // non-deterministic: do not cache
-  const key = "llm:" + createHash("sha256").update(JSON.stringify(req)).digest("hex");
+  if (req.temperature !== 0) return call();                      // sampled output: do not cache
+  const material = JSON.stringify([req.model, req.system, req.messages, req.temperature, req.maxTokens]);  // fixed field order
+  const key = "llm:" + createHash("sha256").update(material).digest("hex");
   try {
     const hit = await redis.get(key);
     if (hit !== null) return hit;

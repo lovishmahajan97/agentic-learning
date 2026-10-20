@@ -5,7 +5,7 @@ name: Checkpointing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/gradient-checkpointing
   - training-adaptation/distributed-training
@@ -73,8 +73,22 @@ costs about 5% of throughput in exchange for losing at most 30 minutes. Two tech
 asynchronous checkpointing snapshots the state to host memory (a stall of seconds or less per GPU, bounded
 by device-to-host bandwidth) and writes to storage in the background while training continues; incremental
 or differential schemes save only what changed, which pays off mainly when much of the state is static,
-such as large sparse embedding tables. Pick the interval
-from failure rate, save cost and the value of lost minutes, and save more often near the end of a run.
+such as large sparse embedding tables.
+
+The classic first-order answer to "how often" is the Young–Daly interval. If a save stalls training for
+*C* seconds and failures arrive with mean time *M* between them, the overhead per unit time is roughly
+`C/T` (saving) plus `T/(2M)` (expected recomputation), and minimising the sum gives
+
+```
+T_opt ≈ sqrt(2 · C · M)
+```
+
+With a 100-second synchronous save and a failure every three hours (M = 10,800 s), T_opt ≈ 1,470 s, about
+25 minutes, and the two overheads together come to roughly 14% of the run. Cut the stall to 5 seconds
+with an asynchronous snapshot and T_opt drops to about 5.5 minutes with a total overhead near 3%: cheaper
+saves buy both more frequent saves and less waste. The square root also says that save cost matters as
+much as failure rate. The formula ignores restart time and assumes failures are memoryless, so treat it as
+the starting point, then save more often near the end of a run, where losing work costs the most.
 
 ### Distributed layout
 Under data parallelism every rank holds the same state and one rank writes it. Under ZeRO or FSDP the
@@ -86,7 +100,11 @@ evaluation and serving.
 
 ### Atomicity and retention
 Write to a temporary path and rename on completion, so a crash mid-write never leaves a truncated file
-masquerading as the latest checkpoint; a manifest with a hash catches silent corruption. Retention policy:
+masquerading as the latest checkpoint; a manifest with a hash catches silent corruption. On a local or
+network filesystem, flush the file to disk before the rename, or a power loss can still leave the new
+name pointing at incomplete data. Object stores have no atomic rename of a directory of shards, so the
+equivalent is to upload every shard first and write a small manifest or "latest" pointer last; a reader
+trusts only checkpoints whose manifest exists. Retention policy:
 keep the last *k* for resume, the best on validation for selection, and periodic ones (every *n* steps or
 every epoch) for analysis, and delete the rest, because 100 GB per save fills any disk quickly.
 
@@ -186,16 +204,20 @@ why weights alone are insufficient.
   checkpoints and adapter references are stored where the customer's governance requires.
 
 ## Check yourself
-**Q:** A fine-tuning job on spot GPUs was preempted at step 3,200 and resumed from a checkpoint that
-contained only `model.state_dict()`. The loss jumped from 0.9 to 1.6 on resume and never recovered the
-original curve. What went wrong and what should the checkpoint have contained?
-**A:** The resumed run restarted AdamW with empty moment estimates, so its first steps were badly scaled
-and large, and the learning-rate scheduler restarted from step zero, re-running warmup and resetting the
-decay horizon, so the trajectory diverged from the original. The sampler also restarted, so the epoch's
-data order and position were lost. A resumable checkpoint needs the model weights, the optimizer state
-including both Adam moments, the scheduler state and global step, the mixed-precision scaler state if
-used, the RNG states, and the data-loader position (epoch, batches consumed, seed), written atomically
-via rename and retained under a policy that keeps the latest few and the best by validation metric.
+**Q:** A full fine-tune of a 7B model runs on spot GPUs that are preempted about every four hours. The job
+saves `model.state_dict()` once per epoch (every three hours) with a three-minute synchronous write. After
+a preemption at step 3,200 the resumed loss jumps from 0.9 to 1.6 and never rejoins the original curve.
+Diagnose both problems and redesign the scheme.
+**A:** Two separate failures. Correctness: a weights-only checkpoint restarts AdamW with empty moments,
+so the first steps are badly scaled; the scheduler restarts warmup and resets its decay horizon; and the
+sampler restarts, so the epoch's order is lost. The checkpoint must also hold both Adam moments and fp32
+master weights, scheduler state and global step, scaler state if used, RNG states and the data position,
+roughly 100 GB in total, written atomically with a manifest. Frequency: with failures every four hours,
+a three-hour interval loses about 1.5 hours per preemption on average, and often the run is killed before
+its first save. Young–Daly gives sqrt(2 × 180 s × 14,400 s) ≈ 2,280 s, about 38 minutes, at roughly 16%
+total overhead; moving to an asynchronous snapshot with a stall of ten seconds or so brings the interval
+under ten minutes and the overhead to a few percent. Finally, test the design by killing the job on
+purpose and checking that the resumed loss curve overlays the uninterrupted one.
 
 ## Quiz
 ### Q: Why does resuming from a weights-only checkpoint typically produce a loss spike?

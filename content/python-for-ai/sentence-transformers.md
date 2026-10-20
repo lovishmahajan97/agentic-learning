@@ -5,6 +5,7 @@ name: sentence-transformers
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/hugging-face
   - python-for-ai/pytorch
@@ -57,7 +58,8 @@ which is what most vector indexes compute fastest.
 ### Prompts and asymmetry
 Many retrieval models are trained asymmetrically: queries and passages get different instruction
 prefixes (for example E5's `"query: "` and `"passage: "`). The library stores such prompts in the model
-config and applies them via `prompt_name`, because forgetting the prefix measurably hurts retrieval for
+config and applies them via `prompt_name` (and, from v5, through `encode_query` / `encode_document`,
+which pick the right prompt for you), because forgetting the prefix measurably hurts retrieval for
 those models while raising no error.
 
 ### Cross-encoder: `CrossEncoder`
@@ -119,8 +121,9 @@ passes, instead of N cross-encoder passes.
   whole corpus with the new model, since vectors from different models are not comparable.
 
 ## Pitfalls
-- Forgetting `normalize_embeddings=True` when the index uses dot product: longer or unusual texts get
-  inflated scores, and the symptom is retrieval favouring the same few verbose documents for every query.
+- Forgetting `normalize_embeddings=True` with a model that does not already end in a Normalize module,
+  when the index uses dot product: documents whose vectors happen to have a large magnitude get inflated
+  scores, and the symptom is retrieval favouring the same few documents for every query.
 - Omitting a model's required query or passage prefix: no error, just noticeably worse recall than the
   model card claims.
 - Chunks longer than `max_seq_length`: the tail is silently dropped, so facts near the end of a chunk
@@ -175,10 +178,10 @@ latency and a precision metric on labelled queries.
 > The loss contrasts each anchor with its positive against all other in-batch positives. More items per
 > batch means a harder, more informative contrast; dimension and truncation are fixed by the model.
 
-### Q: Dot-product scores in your index favour long documents regardless of the query. What is the likely cause?
+### Q: Dot-product scores in your index favour the same few documents regardless of the query. What is the likely cause?
 - [ ] The cross-encoder was trained on short texts
 - [ ] The model's max sequence length is too large
 - [x] Embeddings were not normalised, so vector magnitude influences the score
 - [ ] The tokenizer is case-sensitive
 > Without unit normalisation, dot product mixes direction with magnitude, and magnitude can correlate
-> with text properties. Normalising makes dot product equal cosine similarity, which compares direction only.
+> with text properties such as length or rarity, so high-norm documents win everywhere. Normalising makes dot product equal cosine similarity, which compares direction only.

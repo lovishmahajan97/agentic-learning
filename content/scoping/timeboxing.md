@@ -5,6 +5,7 @@ name: Timeboxing
 kind: practice
 difficulty: core
 est_minutes: 11
+status: reviewed
 related:
   - scoping/rapid-prototyping-poc
   - scoping/problem-decomposition
@@ -48,8 +49,19 @@ The question form matters *because* it tells you when you are done and what evid
 ### 2. Set the budget from the value of the answer
 The length of the box should match what the answer is worth and how much uncertainty it removes, not how
 long the work "should" take. A question that gates a large contract justifies two weeks; a question about
-which of two chunking strategies to use justifies a day. Typical boxes are hours (a spike), days (a
-feasibility check) or a few weeks (a PoC), and almost never open-ended.
+which of two chunking strategies to use justifies a day. A rough value-of-information test keeps this
+honest:
+
+```
+worth boxing if   cost of box  <  P(answer changes the decision) × cost of deciding wrongly
+```
+
+Three engineers for two weeks is about 30 person-days. If the answer has a one-in-three chance of
+flipping a decision that would otherwise sink six months of a larger team into the wrong design, the box
+is cheap. If the team would make the same choice whatever the result, the box buys nothing and should
+be skipped or shrunk. Typical boxes are hours (a spike), days (a feasibility check) or a few weeks (a
+PoC), and almost never open-ended. Scrum sprints are timeboxes too, but for delivery cadence; the
+discovery-style box here differs in that "stop" is an expected, legitimate outcome.
 
 ### 3. Write the exit criteria before starting
 Before any work, write down the decision rule: what result means go, what means stop, and what means
@@ -64,8 +76,19 @@ else matters and you want to learn that on day two, not day nine. Build the eval
 so every hour of tuning moves a number you trust.
 
 ### 5. Checkpoint at fixed points
-A two-week box gets a midpoint check: are we on a trajectory to the target, or flat? A flat curve at the
-midpoint is an early signal to cut scope or pivot rather than spend the second week hoping.
+A two-week box gets a midpoint check: are we on a trajectory to the target, or flat? Make it arithmetic
+rather than mood:
+
+```
+required rate = (target − current) / days remaining
+observed rate = gain over the last few working days / those days
+```
+
+If the observed rate is well below the required rate, the box will not close the gap by grinding, and
+the second week should cut scope, change approach, or prepare a stop recommendation. Two cautions apply.
+Learning curves bend down, so the observed rate overstates the future one. And a gain only counts if it
+exceeds the eval set's noise: on 100 documents, a one-point move can come from a handful of borderline
+cases flipping, so "we went from 86% to 87%" may be no movement at all.
 
 ### 6. Close the box with a decision record
 At the end, record the question, the evidence, the decision and what was learned, including dead ends.
@@ -81,14 +104,19 @@ a logistics customer's bills of lading.
   review-queue design where the model drafts and a clerk confirms.
 - **Days 1–2:** obtain 150 real documents, have the customer's clerks label 100 of them (1,200 field
   values). This is the must-have; without it every later number is opinion.
-- **Day 3:** baseline with a strong general model and a simple prompt: 71% (852 of 1,200 fields correct).
-- **Days 4–5:** error analysis shows 60% of errors come from two fields, the consignee address on
-  multi-line stamps and the weight unit. Fixing those with explicit format instructions and examples: 83%.
-- **Midpoint check (day 5):** trajectory is rising, so continue; drop the "could" item (a review UI).
+- **Day 3:** baseline with a strong general model and a simple prompt: 71% (852 of 1,200 fields correct,
+  348 wrong).
+- **Days 4–5:** error analysis shows about 40% of the 348 errors (roughly 140, out of only 300 values in
+  those fields) come from three fields: the consignee address on multi-line stamps, the weight unit and
+  the date format. Fixing those with explicit format instructions and examples: 83% (about 996 correct).
+- **Midpoint check (day 5):** at 83% with five days left, the required rate is (90 − 83) / 5 = 1.4 points
+  per day; the last two days delivered about 6 points per day. Even allowing for the curve flattening,
+  continuing is justified. Drop the "could" item (a review UI) to protect the time.
 - **Days 6–9:** OCR preprocessing for stamped regions moves accuracy to 88%; further prompt variants add
   under a point.
-- **Day 10:** 88% lands in the 80–90% band. Decision recorded: one more week, scoped only to the
-  handwritten-weight field, which accounts for half the remaining errors.
+- **Day 10:** 88% (about 1,056 correct, 144 wrong) lands in the 80–90% band. Error analysis shows roughly
+  60% of the remaining errors sit in the ~20 documents with handwritten weights and annotations. Decision
+  recorded: one more week, scoped only to handwritten documents, with its own pass/fail threshold.
 
 The numbers here are illustrative, but the shape is typical: rapid early gains, then a plateau that only a
 pre-written rule stops the team from chasing indefinitely.
@@ -112,6 +140,8 @@ pre-written rule stops the team from chasing indefinitely.
   symptom is accuracy claims that collapse when someone runs a held-out sample.
 - Setting the box length by how long the work feels like it should take rather than by the value of the
   answer, which shows up as two-week investigations into decisions worth a day.
+- Treating a "stop" outcome as a team failure, so nobody ever recommends stopping; the symptom is an
+  organisation whose boxes all end in "promising, continue" and never in a stop.
 
 ## When to use
 Reach for a timebox whenever the outcome is uncertain and the work could expand without limit: feasibility

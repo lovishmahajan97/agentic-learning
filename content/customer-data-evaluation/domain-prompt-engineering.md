@@ -5,6 +5,7 @@ name: Domain prompt engineering
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - prompting/prompt-engineering
   - prompting/few-shot
@@ -84,8 +85,8 @@ so a regression can be traced to the change that caused it.
 
 ## Example
 A freight customer wants shipment exceptions classified. The prompt is assembled from SME-owned parts so
-each piece can be versioned and tested separately, and the eval reports which glossary terms appear in
-failing cases.
+each piece can be versioned and tested separately, and the eval reports how many failing cases involve
+each glossary term as either the gold or the predicted label.
 
 ```python
 GLOSSARY = {
@@ -113,7 +114,7 @@ def build_prompt(version="acme-freight-v7"):
             "Rules, in priority order:\n" + "\n".join(RULES) + f"\nExamples:\n{shots}")
 
 def failures_by_term(results):
-    """results: list of dicts with gold, pred and the raw record."""
+    """results: list of dicts with 'gold' and 'pred' labels (plus the raw record for review)."""
     counts = {t: 0 for t in GLOSSARY}
     for r in results:
         if r["gold"] != r["pred"]:

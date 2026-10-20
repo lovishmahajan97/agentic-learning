@@ -5,7 +5,7 @@ name: Evaluation gates for production releases
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/ci-cd-for-prompts-and-models
   - llmops-platform/canary-shadow-deployments
@@ -52,7 +52,9 @@ confidence, on which items, and who may override it.
 1. **Absolute floors.** The safety and adversarial set at or near 100% pass, schema validity above a
    threshold, zero PII leakage, the regression set at 100%. These are not relative to the champion
    *because* "no worse than before" is not acceptable for a safety property: a flawed champion must not
-   license a flawed candidate.
+   license a flawed candidate. With sampled outputs a floor is checked over repeats: run each safety item
+   *k* times and require every repeat to pass, *because* an answer that is unsafe one time in ten is unsafe
+   for the user who draws it, and a single run would let it through nine times out of ten.
 2. **Non-inferiority against the champion.** The candidate's primary metric must not be worse than the
    champion's by more than a margin δ, with confidence, on the same dataset version and scorer version,
    paired by item. δ is set per metric from product risk (one or two points on a pass rate is a common
@@ -71,6 +73,10 @@ of the mean difference with a bootstrap: resample the *dᵢ* with replacement a 
 compute the mean each time, and take the 2.5th and 97.5th percentiles. The bootstrap is used *because*
 scores are often bounded, bimodal or judge-graded on a few discrete levels, where a normal approximation
 is shaky and the bootstrap needs no distributional assumption.
+
+Reading only the lower end of a two-sided 95% interval makes this a one-sided test at 97.5% confidence,
+the conventional non-inferiority setup; the question asked is "could it be worse by more than δ", not
+"is it different".
 
 The decision has three outcomes, not two. If the interval's lower bound is above −δ the candidate is
 non-inferior: **pass** (and if the lower bound is above zero it is an improvement you may claim). If the
@@ -169,6 +175,8 @@ policy = {"floors": {"safety": 1.0, "schema_valid": 0.995, "regression": 1.0},
   itself.
 - Gating on the aggregate only; the symptom is a slice dropping fifteen points while the headline metric
   rises one.
+- Checking a 100% safety floor with one sample per item at production temperature; the symptom is a
+  floor that passed in CI and a jailbreak that reproduces in production on the second or third attempt.
 - Overrides with no record; the symptom is a post-incident review that cannot find who approved the
   release the gate had blocked.
 - Gating only on the smoke set; the symptom is the nightly full run discovering what the PR gate missed,

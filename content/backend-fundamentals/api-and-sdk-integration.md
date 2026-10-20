@@ -5,7 +5,7 @@ name: API & SDK integration
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -83,6 +83,21 @@ herd. Retry only operations that are idempotent or carry an idempotency key; an 
 usually safe to re-run (it costs money, not correctness), while a tool call that sends an email is
 not. Bound retries per request and per time window so an outage does not triple your traffic.
 
+The arithmetic of a retry policy is worth doing once. With *a* attempts, per-attempt timeout *t* and
+total backoff sleep *S*, worst-case latency is `a·t + S`, and during a full outage the load you
+send the vendor is multiplied by up to *a*. Layering makes it worse: if your adapter makes 3 attempts
+around an SDK that makes 3 per call (its default of 2 retries), one user request can become 9
+upstream calls. Retry in exactly one layer and switch the others off (`max_retries=0` on the SDK client).
+
+### Streams fail differently
+A streaming call can return `200`, send half the answer and then stop: a load balancer recycled the
+connection, or the provider hit an internal error mid-generation. The status code already said
+success, so the only signal is the missing terminal event (a final `finish_reason`, a stop event or a
+`[DONE]` sentinel, depending on the provider). The adapter must treat a stream that ends without its
+terminal event as a retryable failure, not as a short answer. Retrying a stream is also not free of
+user impact: tokens already shown cannot be unshown, so the choice is to restart and replace the
+partial text, or to surface the truncation and let the user retry.
+
 ### Circuit breakers, fallbacks and connection reuse
 After N consecutive failures stop calling the vendor for a cool-down and fail fast or route to a
 fallback model; this protects your own latency and the vendor's recovery. Keep one client per process
@@ -97,8 +112,15 @@ for the failure paths, and run a small contract test against the live sandbox on
 
 ## Example
 A minimal adapter around a model endpoint using `httpx`: explicit per-phase timeouts, a shared client,
-an error taxonomy, bounded retries with jitter that honour `Retry-After`, and an idempotency key so a
-retried `POST` cannot double-execute.
+an error taxonomy, bounded retries with jitter that honour `Retry-After`, an idempotency key so a
+retried `POST` cannot double-execute, and one total deadline that the retries must fit inside.
+
+Walk the worst case to see why the deadline matters. Without it, three attempts that each hit the
+60-second read timeout plus backoff sleeps can hold the caller for over three minutes. With a
+20-second budget, the first attempt times out at the deadline and the caller gets a `TimeoutError` at
+20 seconds that it can turn into a fallback or a clear error. A `Retry-After: 30` hint on a 429 is
+also handled correctly: it cannot fit in the remaining budget, so the adapter fails immediately
+instead of sleeping past the point where the user has given up.
 
 ```python
 import asyncio, os, random
@@ -122,19 +144,22 @@ def classify(r: httpx.Response) -> None:
         raise RetryableError(f"HTTP {r.status_code}", float(ra) if ra and ra.isdigit() else None)
     raise TerminalError(f"HTTP {r.status_code}: {r.text[:200]}")   # 400/401/403/422: retrying won't help
 
-async def complete(payload: dict, idem_key: str, attempts: int = 4) -> dict:
-    for n in range(attempts):
-        try:
-            r = await client.post("/v1/complete", json=payload,
-                                  headers={"Idempotency-Key": idem_key})   # safe to retry
-            classify(r)
-            return r.json()
-        except (RetryableError, httpx.TimeoutException, httpx.TransportError) as e:
-            if n == attempts - 1:
-                raise
-            hinted = getattr(e, "retry_after", None)
-            delay = hinted if hinted else random.uniform(0, min(30.0, 2 ** n))  # full jitter, capped
-            await asyncio.sleep(delay)
+async def complete(payload: dict, idem_key: str, attempts: int = 3, budget_s: float = 20.0) -> dict:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_s                  # total budget across ALL attempts and sleeps
+    async with asyncio.timeout_at(deadline):           # Python 3.11+; raises TimeoutError at the deadline
+        for n in range(attempts):
+            try:
+                r = await client.post("/v1/complete", json=payload,
+                                      headers={"Idempotency-Key": idem_key})   # safe to retry
+                classify(r)
+                return r.json()
+            except (RetryableError, httpx.TimeoutException, httpx.TransportError) as e:
+                hinted = getattr(e, "retry_after", None)
+                delay = hinted if hinted else random.uniform(0, min(8.0, 2 ** n))  # full jitter
+                if n == attempts - 1 or loop.time() + delay >= deadline:
+                    raise                              # retrying cannot finish inside the budget
+                await asyncio.sleep(delay)
     raise RuntimeError("unreachable")
 ```
 
@@ -156,6 +181,10 @@ async def complete(payload: dict, idem_key: str, attempts: int = 4) -> dict:
   vendor four times and a rate-limit ban on top of the original bug.
 - Retrying a non-idempotent `POST` after a timeout without an idempotency key; the symptom is
   duplicate records, double charges or two emails sent.
+- Retrying in two layers (your wrapper and the SDK, or a gateway and the app); the symptom is
+  vendor-side request counts several times your own request count during an incident.
+- Treating a stream that ended without its terminal event as complete; the symptom is answers that
+  stop mid-sentence and parsers failing on truncated JSON with no error in the logs.
 - A new client per request; the symptom is a TLS handshake on every call and "too many open files"
   under load.
 - Parsing vendor error bodies ad hoc in callers; the symptom is a schema change in the error payload

@@ -5,6 +5,7 @@ name: PostgreSQL transactions & migrations
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
   - backend-fundamentals/sql
@@ -31,15 +32,20 @@ for minutes.
 ## Why it exists
 Consider finishing one step of an agent run: insert the tool result, append the assistant message,
 decrement the tenant's monthly token budget, and enqueue the next step. If the process dies between the
-second and third statement the budget is never charged; if two parallel runs for the same tenant both
-read "1,200 tokens left" and both subtract 1,000, the tenant ends at minus 800. Without transactions you
-write compensating code for every interleaving and still miss some.
+second and third statement the budget is never charged. If two parallel runs for the same tenant both
+check "1,200 tokens left", both pass, and both run `remaining = remaining - 1000`, the tenant ends at
+minus 800; if instead each writes back the value it computed in JavaScript (`remaining = 200`), one
+charge is silently lost. Without transactions you write compensating code for every interleaving and
+still miss some.
 
 The Node-specific failure is subtler. `pg`'s `Pool.query()` borrows a connection per call.
 `await pool.query('BEGIN'); await pool.query('INSERT ...'); await pool.query('COMMIT')` is three
-statements on potentially three different connections: the INSERT runs in autocommit on connection B
-while connection A sits idle inside an open transaction. Nothing errors. The data is simply not atomic,
-and the idle-in-transaction connection eventually blocks a migration or exhausts the pool.
+statements on potentially three different connections. Under concurrency the INSERT can autocommit on
+connection B while connection A goes back to the pool still inside an open transaction, where it either
+sits idle in transaction or silently absorbs some other request's statements until a stray `COMMIT`
+lands on it. Nothing errors. In a single-user test the pool often hands back the same connection each
+time, so the bug passes locally; in production the data is simply not atomic, and an idle-in-transaction
+connection holds its locks until it blocks a migration.
 
 Schema change has the same "it works locally" trap. Running `ALTER TABLE` by hand on production means
 staging and local disagree, nobody can reproduce last month's schema for a bug report, and a replica
@@ -62,7 +68,7 @@ back to the pool and escapes the transaction.
 ### Isolation and contention
 Postgres defaults to READ COMMITTED: each statement sees data committed before it started. That is
 enough for most inserts but not for read-modify-write on a shared row such as a budget counter. Three
-tools, in increasing strength:
+tools:
 - `SELECT ... FOR UPDATE` locks the row so concurrent transactions queue behind you. Cheap, explicit,
   and the usual answer for counters and "claim this job" patterns.
 - Atomic updates with a predicate: `UPDATE budgets SET remaining = remaining - $1 WHERE tenant = $2 AND
@@ -86,24 +92,28 @@ transaction and let a relay worker publish it, *because* "commit, then enqueue" 
 ### Migrations
 A migration tool (Drizzle Kit, Prisma Migrate, Knex, node-pg-migrate, or SQL-first tools such as dbmate
 and Flyway) keeps ordered files plus a table recording which have been applied, and `migrate` applies
-the missing ones in order, each inside a transaction where Postgres allows it. The practices that matter
-in production:
+the missing ones in order, usually inside a transaction (tools differ: some wrap each file, some the
+whole batch, and some need an explicit opt-out per file). The practices that matter in production:
 - **Forward-only, expand/contract.** Renaming a column is: add the new column; deploy code that writes
   both and reads new-or-old; backfill in batches; deploy code that uses only the new one; drop the old.
   Each step is compatible with the version before and after *because* during a rolling deploy both
   versions run at once.
-- **Know which statements lock.** `ADD COLUMN` with a constant default is a metadata-only change in
-  modern Postgres; `ALTER COLUMN ... SET NOT NULL` on an existing column, or adding a CHECK or foreign
-  key, scans the table under a strong lock. Use `ADD CONSTRAINT ... NOT VALID` and then
-  `VALIDATE CONSTRAINT` in a later step so the scan runs under a weaker lock.
+- **Know which statements lock.** `ADD COLUMN` with a constant (non-volatile) default is a
+  metadata-only change since Postgres 11; `ALTER COLUMN ... SET NOT NULL` on an existing column, or
+  adding a CHECK or foreign key, scans the table under a lock that blocks writes. Use
+  `ADD CONSTRAINT ... NOT VALID` and then `VALIDATE CONSTRAINT` in a later step so the scan runs under a
+  weaker lock. For NOT NULL specifically: add `CHECK (col IS NOT NULL) NOT VALID`, validate it, then
+  `SET NOT NULL`, which since Postgres 12 uses the validated check instead of rescanning.
 - **Indexes concurrently.** `CREATE INDEX CONCURRENTLY` does not block writes but cannot run inside a
   transaction block, so the migration file must opt out of the tool's wrapping transaction. This matters
-  for pgvector HNSW or IVFFlat indexes on large embedding tables, which can take minutes to build.
+  for pgvector HNSW or IVFFlat indexes on large embedding tables, which can take minutes to hours to
+  build depending on row count, dimensions and `maintenance_work_mem`.
 - **`lock_timeout`.** Set `SET lock_timeout = '5s'` at the top of a migration: a DDL statement waiting
   for a lock queues *every* later query behind it, so failing fast and retrying off-peak is safer than
   waiting.
 - **Run migrations as a separate step** (CI job or init container), not inside every replica's startup,
-  and guard with `pg_advisory_lock` so two runners cannot apply the same file concurrently.
+  and make sure a `pg_advisory_lock` guards the run so two runners cannot apply the same file
+  concurrently (many tools take one automatically; check yours rather than assuming).
 
 ## Example
 A `withTransaction` helper on raw `pg` that pins one client, releases it on every path and retries
@@ -159,7 +169,7 @@ CREATE INDEX CONCURRENTLY documents_embedding_hnsw ON documents USING hnsw (embe
 - Pinning a client per transaction gives atomicity but holds a pooled connection for the transaction's lifetime; with `max: 10` and 20-second LLM calls inside transactions the pool becomes the bottleneck, so keep model calls outside.
 - SERIALIZABLE removes whole classes of anomalies without hand-placed locks, but it aborts under contention and forces retry loops; at low contention it is nearly free, while on hot rows `FOR UPDATE` or atomic predicate updates perform better.
 - ORMs and query builders (Prisma, Drizzle, Kysely) make transaction scoping hard to get wrong and generate migrations from a schema file, but generated migrations know nothing about locks, concurrency or backfills; large tables need hand-edited SQL.
-- Expand/contract migrations are safe under rolling deploys but take three deploys instead of one; for a table of a few thousand rows on a single replica a direct change is fine, and the discipline pays off once the table is large or replicas overlap.
+- Expand/contract migrations are safe under rolling deploys but take several deploys instead of one; for a table of a few thousand rows on a single replica a direct change is fine, and the discipline pays off once the table is large or replicas overlap.
 - Running migrations as a separate pipeline step avoids races between replicas, but code and schema can then be deployed out of order, so every migration must be compatible with the previous code version.
 
 ## Pitfalls
@@ -189,8 +199,10 @@ pool-per-statement trap, the retry on `40001`, and how to add a NOT NULL column 
 **Q:** A worker charges a tenant's token budget and records an agent step. Under load, budgets
 occasionally go negative and some steps appear twice. Diagnose the two bugs and fix them without
 changing the isolation level.
-**A:** Negative budgets mean a read-modify-write race: the code reads `remaining`, computes in JavaScript
-and writes back, so two transactions both see the same value. Replace it with a single predicate
+**A:** Negative budgets mean a check-then-act race: the code reads `remaining`, checks it in JavaScript,
+then decrements, so two transactions both pass the check against the same value and both subtract.
+(Writing back a value computed in JavaScript would instead lose a charge, which is the same race with a
+different symptom.) Replace it with a single predicate
 update, `UPDATE budgets SET remaining = remaining - $1 WHERE tenant = $2 AND remaining >= $1`, and treat
 a zero row count as "exhausted"; or lock with `SELECT ... FOR UPDATE` first. Duplicate steps mean
 at-least-once delivery from the queue with no idempotency: add a unique constraint on the step id, use

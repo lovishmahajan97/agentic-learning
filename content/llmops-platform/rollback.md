@@ -5,7 +5,7 @@ name: Rollback
 kind: practice
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/canary-shadow-deployments
   - llmops-platform/model-registry
@@ -82,6 +82,12 @@ on a sample, thumbs-down rate, escalation rate) usually trigger a human decision
 noisier and slower. Each trigger carries a minimum sample size, *because* a threshold evaluated on
 twenty requests produces flapping.
 
+Automatic triggers should also be scoped to a **bake window** after a promotion (hours to a few days).
+Inside the window a guard breach is most likely caused by the release, so reverting it is the right
+bet. Outside it, a breach is more often external, such as a provider incident, a traffic shift or a
+broken upstream tool, and rolling back to a version that depends on the same provider fixes nothing
+while discarding a good release. After the window, breaches page a human instead.
+
 ### Handle what a pointer flip does not restore
 Rollback restores behaviour, not data. Things to check after the flip:
 - Caches keyed without the version: a semantic or response cache filled by the bad version will keep
@@ -91,6 +97,10 @@ Rollback restores behaviour, not data. Things to check after the flip:
 - Agent memory and side effects: notes the bad version wrote to long-term memory, tickets it filed,
   emails it sent. Rollback does not undo them; the audit log identifies them for cleanup.
 - Downstream consumers: if another team cached embeddings or outputs from the bad version, tell them.
+- State written in a new shape: if the new version stored tool results, memory records or structured
+  outputs in a new schema, the old version may fail to read them after the flip. The fix is the same
+  expand-then-contract discipline used for database migrations: a release must write data the previous
+  manifest can still read, and drop the old shape only once the release is past its bake window.
 
 ### Rehearse it
 A rollback that has never been executed is a hypothesis. Exercise it in CI (deploy v2, roll back to
@@ -102,6 +112,7 @@ metric breaches its threshold with enough samples. Promotion records history so 
 validated target.
 
 ```python
+import time
 from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
@@ -113,11 +124,13 @@ class Registry:
     manifests: dict = field(default_factory=dict)
     alias: dict = field(default_factory=dict)      # env -> manifest id
     history: dict = field(default_factory=dict)    # env -> [manifest ids that served]
+    promoted_at: dict = field(default_factory=dict)
 
     def promote(self, env: str, mid: str):
         assert mid in self.manifests, "unknown manifest"
         self.history.setdefault(env, []).append(mid)
         self.alias[env] = mid                      # O(1): a pointer move, nothing rebuilt
+        self.promoted_at[env] = time.time()
         cache.invalidate(namespace=env)            # cached answers belonged to the old version
 
     def rollback(self, env: str) -> str:
@@ -129,10 +142,14 @@ class Registry:
         return served[-1]
 
 GUARDS = {"schema_fail_rate": (0.02, 200), "p95_ms": (6000, 200), "refusal_rate": (0.10, 200)}
+BAKE_S = 48 * 3600                                 # auto-rollback only while the release is fresh
 
 def check_guards(reg: Registry, env: str, window: dict) -> str | None:
     for metric, (limit, min_n) in GUARDS.items():
         if window["n"] >= min_n and window[metric] > limit:
+            if time.time() - reg.promoted_at[env] > BAKE_S:
+                alerts.page(f"{env}: {metric} breach outside bake window; human decision")
+                return None
             target = reg.rollback(env)
             alerts.page(f"{env}: {metric}={window[metric]:.3f} > {limit}; rolled back to {target}")
             return target
@@ -164,13 +181,17 @@ def check_guards(reg: Registry, env: str, window: dict) -> str | None:
   moment it is needed.
 - Treating rollback as the whole fix; the symptom is memory entries, tickets or emails created by the
   bad version surfacing days later because nobody reconciled the audit log.
+- Auto-rolling back on every breach regardless of release age; the symptom is a good release reverted
+  during a provider outage, with the outage still present on the old version.
 
 ## When to use
 Rollback is the first move whenever a release correlates with a guard breach or a credible quality
 regression, and diagnosis comes second; the cost of being wrong about a rollback is small if the
 previous version was validated, while the cost of debugging live is paid by users. Prefer fixing
 forward only when the previous version is itself broken (a vendor retired it, an index was overwritten)
-or when the fault is clearly outside the release. Measure time-to-rollback in rehearsals, keep it in
+or when the fault is clearly outside the release. A quick test for the latter: if the incumbent arm
+of a still-running canary, or a version that has not changed, shows the same degradation, the release
+is not the cause and a rollback will not help. Measure time-to-rollback in rehearsals, keep it in
 minutes, and make the trigger list part of every release plan. In day-to-day work this looks like
 manifests in a registry, aliases in a control plane and a rollback button that engineers trust. In
 interviews, the strong answer explains why an AI rollback is harder than a container rollback and what

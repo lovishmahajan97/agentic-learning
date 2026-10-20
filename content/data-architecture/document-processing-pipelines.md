@@ -5,6 +5,7 @@ name: Document processing pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - rag-retrieval/document-parsing
   - multimodal/ocr
@@ -41,7 +42,8 @@ appears months later as retrieval that "sometimes misses obvious passages".
 
 The opposite naive approach, sending every page to a vision-capable LLM, fixes most of the quality
 problems and creates a cost and latency problem: it is orders of magnitude more expensive per page than
-native text extraction (illustratively, cents per page versus fractions of a cent), it is slow, and it is
+native text extraction (as an illustrative order of magnitude, somewhere between a tenth of a cent and a
+few cents per page depending on the model, versus milliseconds of CPU time), it is slow, and it is
 non-deterministic, so a re-run produces slightly different text and therefore different chunks and
 embeddings. Neither extreme is a pipeline. The pattern is to classify, route, verify and escalate, so that
 the expensive path is spent only where the cheap path demonstrably failed. The rag-retrieval parsing
@@ -51,8 +53,8 @@ lesson covers the extractors themselves (OCR, layout, tables); this lesson cover
 ### 1. Intake and classification
 Identify the real type by magic bytes, not extension; customers rename files. Record page count, file
 size and, for PDFs, whether pages carry a text layer: a page with an image covering the page and near
-zero extractable characters is a scan. Detect language, because OCR engines and layout models are
-language-specific. Detect encrypted or malformed files early and park them.
+zero extractable characters is a scan. Detect language, because OCR engines need the right language
+packs and the quality heuristics below (dictionary-word ratios, hyphen repair) are language-specific. Detect encrypted or malformed files early and park them.
 
 ### 2. Routing tiers
 Order extractors by cost and by what they preserve, and route each document to the first tier that is
@@ -117,35 +119,39 @@ def text_layer_ratio(pdf):
     pages = [p.get_text() for p in pdf]
     return sum(len(t.strip()) > MIN_CHARS_PER_PAGE for t in pages) / max(len(pages), 1)
 
-def quality(blocks):
-    text = " ".join(b["text"] for b in blocks if b["type"] not in ("header", "footer"))
-    words = re.findall(r"[A-Za-z]{2,}", text)
+def quality(blocks):                              # English prose heuristic; tables scored separately
+    text = " ".join(b["text"] for b in blocks if b["type"] not in ("header", "footer", "table"))
     tokens = text.split()
     if not tokens:
         return 0.0
-    garbage = text.count("�") + len(re.findall(r"(.)\1{5,}", text))
-    return (len(words) / len(tokens)) * (0.0 if garbage > 20 else 1.0)
+    wordlike = sum(1 for t in tokens if re.search(r"[A-Za-z]{2,}", t))
+    garbage = text.count("\ufffd") + len(re.findall(r"(.)\1{5,}", text))
+    return (wordlike / len(tokens)) * (0.0 if garbage > 20 else 1.0)
 
 def process(path, tiers):
     """tiers: ordered list of (name, extractor) producing canonical blocks."""
     pdf = fitz.open(path)
     start = 0 if text_layer_ratio(pdf) > 0.8 else 1          # scans skip native extraction
+    errors = []
     for name, extract in tiers[start:]:
         try:
             blocks = extract(pdf)                               # run under a worker timeout in production
         except Exception as e:                                  # malformed file must not kill the batch
-            blocks, err = [], repr(e)
+            errors.append((name, repr(e)))
             continue
         q = quality(blocks)
         if q >= MIN_WORD_RATIO:
-            return {"blocks": blocks, "parser_tier": name, "quality": q}
-    return {"blocks": [], "parser_tier": "needs_review", "quality": 0.0}
+            return {"blocks": blocks, "parser_tier": name, "quality": q, "errors": errors}
+    return {"blocks": [], "parser_tier": "needs_review", "quality": 0.0, "errors": errors}
 
 # tiers = [("native", native_extract), ("ocr", ocr_extract), ("layout", layout_extract), ("vlm", vlm_extract)]
 ```
 
 Each returned record is stored with the raw file's hash; a document that landed in `needs_review` is
-counted on the pipeline dashboard rather than silently indexed as an empty document.
+counted on the pipeline dashboard rather than silently indexed as an empty document. The word-ratio score
+is deliberately crude and English-specific, and it excludes table blocks because a correct financial
+table is mostly numbers and would otherwise fail the gate; tables need their own check (consistent column
+counts per row, numeric cells that parse).
 
 ## Trade-offs
 - Tiered routing keeps average cost near the cheapest extractor, but it adds a scoring step and a second

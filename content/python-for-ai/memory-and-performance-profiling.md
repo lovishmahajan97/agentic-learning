@@ -5,6 +5,7 @@ name: Memory & performance profiling
 kind: practice
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/gil
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
@@ -24,8 +25,8 @@ sources:
 ## TL;DR
 Profiling replaces guessing with measurement: a CPU profiler tells you which functions consume time, a
 memory profiler tells you which lines allocate the bytes that are still alive. In AI services the answer is
-often surprising, because most wall time is spent waiting on the network or a GPU, and most memory is held by
-native buffers (NumPy, PyTorch, tokenizers) that Python's own tools cannot see. Pick the tool by the
+often surprising: most wall time is spent waiting on the network or a GPU, and much memory is held by native
+buffers (PyTorch tensors, tokenizers) that Python's own tools cannot see. Pick the tool by the
 question: CPU or wall time, Python heap or native memory, dev box or live process.
 
 ## Why it exists
@@ -70,10 +71,14 @@ per-line timings for one function once you know which function matters.
 `tracemalloc` (stdlib) records a traceback for every allocation made through Python's allocator. Take a
 snapshot, run the workload, take another, and `compare_to` shows which source lines' live allocations grew.
 That is the right tool for leaks in Python objects: growing lists, dicts, caches and closures. It slows the
-program, and it generally cannot see allocations that native libraries make with their own allocators.
+program, and it cannot see allocations that native libraries make with their own allocators unless the
+library reports them explicitly. NumPy is the notable exception: it registers its array data buffers with
+tracemalloc (via `PyTraceMalloc_Track`), so large arrays do show up; PyTorch CPU tensors, Hugging Face
+`tokenizers` (Rust) and most C/C++ parsers do not.
 
 ### Native and GPU memory
-`memray` tracks native allocations as well (C extensions, NumPy buffers, tokenizers), records to a file and
+`memray` intercepts the allocator calls themselves (`malloc`, `mmap` and friends), so it sees native
+allocations as well (C extensions, PyTorch CPU tensors, tokenizers), records to a file and
 produces flame graphs of what was live at peak (`memray run`, then `memray flamegraph`). For PyTorch on GPU,
 use `torch.cuda.memory_allocated()`, `max_memory_allocated()` and `memory_summary()`; RSS and tracemalloc
 know nothing about VRAM, and the caching allocator keeps freed blocks reserved, so `nvidia-smi` shows more
@@ -110,7 +115,8 @@ for i in range(5_000):
     handle(i)
 after = tracemalloc.take_snapshot()
 for stat in after.compare_to(before, "lineno")[:3]:
-    print(stat)                                  # top lines by growth: the HISTORY append and normalize
+    print(stat)    # top lines by growth: the `doc = ...` line (strings kept alive by HISTORY),
+                   # normalize's join (cached results) and the call site (lru_cache entries)
 tracemalloc.stop()
 
 prof = cProfile.Profile()
@@ -165,8 +171,9 @@ distinguishing CPU-bound from waiting, and Python heap from native and GPU memor
 ## Check yourself
 **Q:** A document-ingestion worker's RSS climbs from 1.5 GB to 9 GB over six hours and the pod is
 OOM-killed. tracemalloc shows the Python heap stable at about 300 MB. How do you proceed?
-**A:** A stable Python heap with growing RSS means the growth is outside Python's allocator: native buffers
-(PDF parsers, NumPy arrays, tokenizers), memory-mapped files, or fragmentation. I would run the worker under
+**A:** A stable traced heap with growing RSS means the growth is outside what tracemalloc sees: native
+buffers (PDF parsers, PyTorch tensors, tokenizers; NumPy arrays would have shown up because NumPy reports
+them to tracemalloc), memory-mapped files, or fragmentation. I would run the worker under
 memray, or attach it in a staging replica, and look at what is live at the high-water mark, checking for
 native objects kept alive by Python references such as a cache of parsed documents or arrays. I would also
 check whether growth plateaus (fragmentation, possibly mitigated by recycling workers after N jobs) or is

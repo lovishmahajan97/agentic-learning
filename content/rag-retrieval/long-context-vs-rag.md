@@ -5,6 +5,7 @@ name: Long-context vs RAG
 kind: decision
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - model-internals/context-window
   - rag-retrieval/lost-in-the-middle
@@ -51,6 +52,19 @@ corpus is an identical prefix across calls, many providers bill cached input tok
 much of the prefill. That only holds while the prefix is byte-identical and the cache stays warm, so a
 corpus that changes hourly or differs per user gets little benefit.
 
+Written out, with per-token input price *p*, cached-read discount factor *d* (the fraction of full price a
+cached token costs) and cache hit rate *h*:
+
+```
+cost_long ≈ p × C × (h × d + (1 − h))        + cache-write cost on each miss
+cost_rag  ≈ p × (R + q)                       + embedding, index and rerank costs
+```
+
+The hit rate *h* is not a free parameter. Provider caches expire after a short idle period (minutes, and
+vendor-specific), so *h* depends on whether requests sharing the prefix arrive closer together than the
+TTL, and some providers price the cache *write* above a normal input token. A busy single-tenant workload
+can sit near *h* ≈ 1; a workload with few queries per prefix pays the write premium again and again.
+
 ### The quality model
 A model accepting N tokens is not the same as a model using N tokens well. Known effects: facts in the
 middle of long contexts are recalled less reliably than those at the start or end (lost in the middle),
@@ -72,6 +86,13 @@ The two combine. Retrieve at the *document* level, then put whole retrieved docu
 instead of tiny chunks. This keeps retrieval's selectivity and permission filtering while giving the model
 full sections to reason over, and it tolerates imprecise ranking because the window is generous.
 
+There is also a third shape that neither pure approach handles: *global* questions over a corpus larger
+than the window ("what are the recurring complaints across 30,000 tickets?"). Top-k retrieval returns a
+handful of examples and calls it an answer; long-context cannot fit the corpus. The workable pattern is
+map-reduce (process each document or batch independently, then aggregate the partial results) or
+precomputed summaries that retrieval can target. It is expensive per question, which is why it is usually
+run offline or on a schedule.
+
 ## Example
 An illustrative calculation. Prices and latencies below are made-up round numbers for the arithmetic, not
 any vendor's rates.
@@ -84,6 +105,11 @@ of retrieved context per question.
 - **Long-context, cached prefix:** 3B × $0.30/M ≈ $900/day, plus periodic cache writes. Only valid if every
   user may see the whole manual and it changes rarely.
 - **RAG:** 6k × 20,000 = 120M tokens/day → $360/day, plus embedding and vector store costs.
+
+Check the cache assumption before trusting the middle number: 20,000 questions a day is one every four
+seconds or so, comfortably inside any cache TTL, so *h* stays near 1. At 50 questions a day spread across
+office hours, gaps between requests often exceed the TTL, so many requests pay full price plus a cache
+write, and the $900 figure is not reachable.
 
 Now change one fact: the manual has per-customer editions and 40 customers. Long-context needs 40 cached
 prefixes, each with its own warm-up cost and eviction risk. RAG just adds a `customer_id` filter.
@@ -111,6 +137,10 @@ context wins.
   multi-fact, distractor-heavy or cross-document questions in a proper eval set.
 - Forgetting latency; the symptom is a time-to-first-token of many seconds on every request because the
   full corpus is prefilled each time without a warm cache.
+- Modelling cached long-context cost at a 100% hit rate; the symptom is a bill several times the forecast
+  because traffic is bursty or low-volume and the cache keeps expiring between requests.
+- Answering corpus-wide aggregate questions with top-k retrieval; the symptom is confident "trends" built
+  from five retrieved examples that a count over the full corpus would contradict.
 - Building heavy RAG infrastructure for a corpus of a few documents; the symptom is weeks spent tuning
   chunking for a problem the model could have solved by reading everything.
 
@@ -119,7 +149,9 @@ Start with long-context when the corpus fits comfortably in the window with head
 has a single permission scope, and query volume is modest, or when tasks need synthesis across a whole
 document. Prefer RAG when the corpus exceeds the window or grows, changes frequently, needs per-user
 filtering, must cite verifiable sources, or volume makes per-token cost dominant. Measure both on the same
-eval set: accuracy split by question type, cost per query, and p95 time-to-first-token. In interviews,
+eval set: accuracy split by question type, cost per query, and p95 time-to-first-token, and log the real
+cache hit rate rather than assuming one. If the questions are aggregates over a corpus that does not fit,
+neither option is right; plan a map-reduce or offline summarisation job instead. In interviews,
 the expected answer is "it depends on these five variables, here is the arithmetic", not a preference.
 
 ## Role lens

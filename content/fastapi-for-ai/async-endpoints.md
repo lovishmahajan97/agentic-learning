@@ -5,6 +5,7 @@ name: Async endpoints
 kind: concept
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - python-for-ai/async-await
   - python-for-ai/asyncio
@@ -58,8 +59,11 @@ When a request reaches a route, FastAPI resolves dependencies and calls the endp
   `to_thread.run_sync`. The loop keeps running while the thread blocks. AnyIO's default thread limiter
   allows 40 concurrent threads per process, so the 41st blocking call queues behind the others; you can
   raise it, at the cost of memory and GIL contention.
-Pydantic validation and response serialisation happen on the loop in both cases; they are CPU work, but
-normally sub-millisecond, which is acceptable *because* they are bounded, unlike a model forward pass.
+Request parsing and body validation happen on the loop in both cases; response-model validation runs
+on the loop for `async def` endpoints and in the thread pool for `def` ones. This is CPU work, normally
+sub-millisecond for chat-sized payloads, which is acceptable *because* it is bounded, unlike a model
+forward pass; it grows with payload size, so megabyte documents or thousands of vectors are the
+exception worth measuring.
 
 ### What counts as blocking
 Blocking means the thread cannot be used for anything else until the call returns. In an AI service
@@ -84,11 +88,26 @@ PyTorch and NumPy do for most heavy kernels, so a `def` endpoint running `model.
 loop keep serving health checks while the GPU works. It does not make the GPU any less of a single
 shared resource; concurrency limits still apply.
 
+### Capacity arithmetic
+Little's law, `concurrency = throughput × latency`, turns the two paths into numbers. With hosted LLM
+calls that take 10 s:
+- `def` endpoint: at most 40 requests in flight (the thread limiter), so the ceiling is 40 ÷ 10 s =
+  4 requests/s per process, however idle the CPU is. Request 41 waits for a thread.
+- `async def` endpoint: in-flight requests are bounded by the HTTP client's connection pool instead
+  (`httpx` defaults to 100 connections), giving 100 ÷ 10 s = 10 requests/s per client, and you can
+  raise that limit cheaply because a parked coroutine costs kilobytes, not a thread.
+- Blocking call on the loop: each request holds the *whole process* for its blocking time *b*, so
+  throughput can never exceed 1 ÷ *b*; 40 ms of synchronous work caps the worker at 25 requests/s.
+The async path does not remove limits; it moves them from threads to sockets and provider quotas,
+which are the limits you actually want to be bound by.
+
 ### Cancellation and disconnects
-On the async path, a request's coroutine can be cancelled when the client disconnects (if your code
-checks for it), which stops spending on a provider call nobody will read. A blocked thread cannot be
-cancelled; it runs to completion. That asymmetry is another reason to keep remote model calls on the
-async path.
+Uvicorn does not cancel a handler when the client leaves; it delivers a disconnect event. On the async
+path your code can act on it: race the provider call against `request.is_disconnected()` in a task
+group and cancel the call, so you stop paying for tokens nobody will read. Cancelling a coroutine
+raises `CancelledError` at its current `await`, which closes the provider socket. A thread blocked in a
+sync call cannot be cancelled from outside in Python; it runs to completion. That asymmetry is another
+reason to keep remote model calls on the async path.
 
 ### Choosing per endpoint
 - Calls a hosted LLM, embedding API, vector database, Redis, or Postgres over an async driver →
@@ -192,8 +211,10 @@ nowhere near its limits. Explain and fix.
 **A:** The embedding call is synchronous CPU work executed on the event loop. At 40 ms per call the
 loop can do at most about 25 such calls per second, and while each one runs no other coroutine
 progresses, so the asynchronous vector-database and LLM calls never overlap as they should. Moving the
-embedding to `await run_in_threadpool(embed, query)` frees the loop; the thread pool then bounds
-embedding concurrency and NumPy or PyTorch release the GIL during the heavy kernels. Beyond that,
+embedding to `await run_in_threadpool(embed, query)` frees the loop, so the vector-database and LLM
+waits overlap again; NumPy and PyTorch release the GIL during the heavy kernels. It does not make the
+CPU faster: if one 40 ms embedding already uses every core through PyTorch's intra-op threads,
+embedding throughput stays near the same ceiling, now without stalling everything else. Beyond that,
 batch embeddings across concurrent requests or move the embedder to a separate service, so the API
 process is purely I/O-bound and its throughput is set by provider latency and connection limits rather
 than by CPU time spent on the loop.

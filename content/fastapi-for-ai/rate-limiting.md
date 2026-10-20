@@ -5,6 +5,7 @@ name: Rate limiting (slowapi)
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - fastapi-for-ai/api-keys-oauth2-jwt
   - fastapi-for-ai/concurrency-limits
@@ -54,8 +55,11 @@ handler turns that into a 429.
 
 ### The key function decides fairness
 The default `get_remote_address` uses the socket peer's IP. Behind a load balancer that is the
-balancer's IP, so every user shares one bucket, unless uvicorn is started with `--proxy-headers` and a
-trusted `--forwarded-allow-ips`, so the client IP comes from `X-Forwarded-For`. For an authenticated
+balancer's IP, so every user shares one bucket, unless uvicorn trusts the balancer. Uvicorn's
+`--proxy-headers` is on by default, but it only rewrites the client address from `X-Forwarded-For`
+when the connection comes from an address in `--forwarded-allow-ips`, which defaults to 127.0.0.1.
+Set it to the balancer's range (never `*` on a port the internet can reach directly, or anyone can
+forge the header). For an authenticated
 AI API, key by API key or tenant instead. IPs are shared by whole offices (NAT) and rotated by
 attackers.
 
@@ -87,22 +91,25 @@ know the cost, so token budgets are usually a small custom dependency on the sam
 ### Alternatives
 Limits at the edge (nginx `limit_req`, Envoy, an API gateway, a cloud WAF) run before Python and are
 cheaper per rejected request, but they rarely know tenant or token cost. `fastapi-limiter` offers a
-dependency-style, Redis-only alternative. Many teams combine a coarse edge limit (IP, DDoS) with
+dependency-style alternative, so limits sit next to your other `Depends`. Many teams combine a coarse edge limit (IP, DDoS) with
 slowapi or custom limits per tenant in the app.
 
 ## Example
 Per-API-key request limits with slowapi, plus a token-per-minute budget as a dependency.
 
 ```python
-import time
+import hashlib, time
 from fastapi import Depends, FastAPI, HTTPException, Request
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 import redis.asyncio as redis
 
 def caller(request: Request) -> str:            # key by credential, not IP
-    return request.headers.get("x-api-key", "anon")[:16]
+    # production: key on the *validated* principal; a raw header lets random keys mint new buckets
+    key = request.headers.get("x-api-key")
+    return hashlib.sha256(key.encode()).hexdigest()[:16] if key else get_remote_address(request)
 
 limiter = Limiter(key_func=caller, storage_uri="redis://redis:6379",
                   default_limits=["600/hour"])
@@ -120,6 +127,7 @@ async def token_budget(request: Request) -> int:
     used = await r.incrby(key, est)
     await r.expire(key, 120)
     if used > TPM:
+        await r.decrby(key, est)                  # release the rejected reservation
         raise HTTPException(429, "token budget exceeded",
                             headers={"Retry-After": str(60 - int(time.time()) % 60)})
     return est
@@ -131,10 +139,14 @@ async def chat(request: Request, body: dict, est: int = Depends(token_budget)):
     return {"reply": "..."}
 ```
 
-Scenario: a caller sends 30 short requests in 40 s (about 600 tokens each, 18k total), so request 31
-gets slowapi's 429. Another caller sends 3 requests, each a 15k-token document: the third pushes the
-estimate to 45k, which exceeds 40k, so it gets 429 with `Retry-After`. The request limit alone would
-have let it through.
+Scenario: a caller sends 30 short requests within one minute window (about 600 tokens each, 18k
+total), so request 31 gets slowapi's 429. Another caller sends 3 requests, each estimated at about 15k
+tokens (document plus `max_tokens`): the third pushes the reservation to about 45k, which exceeds 40k,
+so it gets 429 with `Retry-After` and its 15k is released. The request limit alone would have let it
+through. One ordering detail: FastAPI resolves `Depends` before it calls the endpoint, and slowapi's
+decorator does its check inside the endpoint wrapper, so request 31 has already reserved its tokens
+when slowapi rejects it. Stash the reservation on `request.state` and release it in the
+`RateLimitExceeded` handler, or run both checks as dependencies in a fixed order.
 
 ## Trade-offs
 - In-memory storage needs no infrastructure and adds no latency, but it is only correct with a
@@ -185,8 +197,8 @@ says they're throttled at low volume. Explain both and the fix.
 separately and a client spread across them gets up to 8x the limit. Pointing `storage_uri` at Redis
 makes all workers share one atomic counter. Second, the key function is IP-based and either sees the
 ALB's address (if proxy headers aren't trusted) or the NAT's single public IP, so many people share
-one bucket. Key by API key or tenant, and if IPs are needed, run uvicorn with `--proxy-headers` and
-the ALB's range in `--forwarded-allow-ips`. For LLM routes, add a tokens-per-minute budget.
+one bucket. Key by API key or tenant, and if IPs are needed, put the ALB's range in uvicorn's
+`--forwarded-allow-ips` (proxy headers are honoured by default, but only from trusted addresses). For LLM routes, add a tokens-per-minute budget.
 
 ## Quiz
 ### Q: Why can a fixed-window limit of 100/minute admit about 200 requests in two seconds?

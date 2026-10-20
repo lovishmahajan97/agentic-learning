@@ -4,8 +4,8 @@ module: evals
 name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - evals/model-evaluation
   - evals/task-specific-acceptance-criteria
@@ -85,10 +85,18 @@ labels it is checked against.
 ### Size and statistics
 For a pass rate *p* on *n* items the standard error is √(p(1−p)/n). At p = 0.8: n = 100 gives ±4
 points standard error (roughly ±8 at 95%); n = 400 gives ±2; n = 1,000 gives ±1.3. Per-slice
-numbers need per-slice *n*, which is why stratification matters more than total size. Paired
-comparisons on the same items need fewer items than the formula suggests, because only items that
-flip contribute noise. A workable starting point (illustrative, not a rule) is tens to a hundred items
-per slice you need to decide on, grown by every failure found afterwards.
+numbers need per-slice *n*, which is why stratification matters more than total size.
+
+The question a dataset must answer is not "how precise is one score" but "can it detect the
+improvement I care about". For two *independent* runs at 80% power and α = 0.05 the textbook
+approximation is n ≈ (1.96 + 0.84)² · 2p(1−p) / δ² per version: detecting δ = 5 points at p = 0.8
+needs about 1,000 items. Paired comparisons on the same items need far fewer, *because* only items
+that flip carry information: with a fraction *d* of items discordant between versions,
+n ≈ (1.96 + 0.84)² · d / δ². If about 13% of items flip (a typical prompt change; measure yours from
+two runs), the same 5-point effect needs roughly 400 items. That arithmetic is why harnesses pair
+runs and why "how many items do we need" depends on how much versions disagree, not only on the pass
+rate. A workable starting point (illustrative, not a rule) is tens to a hundred items per slice you
+need to decide on, grown by every failure found afterwards.
 
 ### Splits and hygiene
 Keep a *dev* split for iterating on prompts and a *held-out* split you look at only when deciding to
@@ -98,8 +106,12 @@ your own eval, and its symptom is a perfect offline score with unchanged product
 
 ### Maintenance
 Items go stale when the product or policy changes; labels turn out to be wrong when a "failure" is
-inspected and found correct. Treat the dataset like code: changes go through review, versions are
-tagged, and a changelog says why an item was added, relabeled or retired.
+inspected and found correct. A set can also saturate: once every candidate passes 97% of it, it no
+longer separates good versions from great ones, and the remaining budget belongs on harder items
+drawn from recent failures. Treat the dataset like code: changes go through review, versions are
+tagged, and a changelog says why an item was added, relabeled or retired. When a version changes,
+re-run the baseline on the new version before comparing, *because* a score on v3 and a score on v4
+are different metrics.
 
 ## Example
 A stratified sample from logs with per-intent quotas, a deterministic dev/held-out split by id hash,
@@ -168,6 +180,8 @@ are inside the noise, and the billing slice alone cannot resolve anything under 
   tracks what the system is supposed to do, and arguments about whether old failures still count.
 - No per-slice quotas; the symptom is a rare but critical intent represented by three items, so its
   pass rate swings between 33% and 100% run to run.
+- Comparing a new run on dataset v4 with an old baseline scored on v3; the symptom is a "regression"
+  or "improvement" that vanishes when the baseline is re-run on the same version.
 
 ## When to use
 Build one as soon as a prompt or pipeline is going to be changed more than once, which is always.

@@ -5,7 +5,7 @@ name: async / await
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -64,6 +64,25 @@ ready. A network read registers interest in a socket and returns a `Future`; whe
 readiness, the loop resolves the Future and reschedules the coroutine awaiting it. The loop runs
 one callback at a time, which is why there is no data race between two `await` points and also why
 a long computation inside a coroutine blocks every other one.
+
+### A trace: two calls on one thread
+Say tasks A and B each send a request and await a reply that takes 1 s. At t=0 the loop runs A
+until it awaits the socket read; A's frame is parked with a pending Future and control returns to
+the loop. The loop runs B the same way. Now nothing is ready, so the loop sleeps inside
+`epoll`/`kqueue` with no CPU used. At t≈1 s both sockets become readable; the loop resolves both
+Futures and resumes A, then B, each from exactly the line after its `await`. Total ≈1 s, not 2 s,
+and at no moment did two pieces of Python run at once. That last fact is both the safety property
+(no torn updates between awaits) and the hazard: if A had computed for 1 s instead of awaiting, B
+would not even have *sent* its request until A finished.
+
+### Function colouring
+`await` is legal only inside `async def`, so a function that needs to await something must itself
+become async, and so must its callers, up to `asyncio.run` or a framework that owns the loop. This
+"colouring" is the cost of making suspension points explicit: you can see every place your code
+can be interleaved, *because* each one is spelled `await`. The practical consequences are that an
+async SDK cannot be called from plain sync code without starting a loop, a sync helper cannot
+await, and libraries often ship both a sync and an async client (`OpenAI` and `AsyncOpenAI`,
+`httpx.Client` and `httpx.AsyncClient`) rather than one that works in both worlds.
 
 ### Concurrency: tasks, gather, groups
 `await a(); await b()` is sequential: `b` starts after `a` finishes. To overlap them, wrap each in a
@@ -169,6 +188,10 @@ time with `peak in-flight=1`: the blocking call never yields, so no other corout
   so the task can be garbage-collected mid-execution and silently disappear.
 - Firing `gather` over thousands of provider calls with no semaphore; the symptom is a burst of 429
   responses followed by a retry storm that can end up slower than running sequentially.
+- Reading shared state, awaiting, then writing based on what you read (`if budget > cost: await
+  call(); budget -= cost`); every task passes the check before any of them subtracts, and the
+  symptom is a token budget or quota overspent by roughly the concurrency factor. Hold an
+  `asyncio.Lock` across the check-and-act, or reserve before awaiting.
 - Calling `asyncio.run()` from inside a running loop (notebooks, some frameworks); it raises
   `RuntimeError`, and the fix is to `await` directly or use the framework's loop.
 - Catching `BaseException` or bare `except:` around awaits; it swallows `CancelledError` and

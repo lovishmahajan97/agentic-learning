@@ -4,8 +4,8 @@ module: evals
 name: Task-specific acceptance criteria
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -75,8 +75,22 @@ Hard criteria are 100%: a single violation blocks the release, *because* the cos
 unacceptable (PII leak, invalid output that crashes a downstream parser). Soft criteria are statistical:
 a pass-rate threshold on the golden dataset, with a floor per slice, *because* an overall 92% can be
 a 60% on the slice the biggest customer uses. Thresholds come from the business (what error rate the
-downstream human reviewer can absorb) and from the baseline (never worse than the current system on
-any slice), not from round numbers.
+downstream human reviewer can absorb) and from the baseline, not from round numbers.
+
+Two statistical facts shape how those thresholds are written. First, "100%" on a finite set is weaker
+than it sounds. Zero violations in *n* items only bounds the true violation rate: the 95% upper bound
+is about 3/*n* (the "rule of three"), so a PII check that passes all 300 golden items is consistent
+with a leak rate of up to 1%. That is why a hard criterion usually needs two layers: an offline gate,
+plus a runtime guard (a validator, a redaction step, a schema check with retry) that enforces it on
+every production request, because the eval alone can never certify "never". Second, "never worse than
+baseline" must be written as a non-inferiority margin, such as "no slice more than 3 points below the
+baseline on the same items", *because* a strict "never worse" on a noisy measurement blocks harmless changes by chance: with no
+true effect, each slice lands below its baseline close to half the time (ties aside), and with several
+slices checked, most harmless changes fail somewhere.
+
+The arithmetic also tells you how to size the slice behind each floor: a floor of 85% on a slice of
+40 items carries an interval of roughly ±11 points, so the gate either needs more items in that slice
+or a looser floor that the slice can actually resolve.
 
 ### Writing one down
 Each criterion has a name, the scope it applies to (all items, or a slice or condition), the check
@@ -164,6 +178,9 @@ average and which are not.
   the document says is forbidden.
 - No per-slice floors; the symptom is a merged change that raised the average by regressing the one
   category the enterprise customer cares about.
+- Treating a clean offline run as proof a hard criterion holds in production; the symptom is the first
+  real violation arriving weeks after launch on an input pattern the golden set never contained, with
+  no runtime guard to catch it.
 
 ## When to use
 Write criteria for any LLM feature before committing to a delivery date, and revise them after the

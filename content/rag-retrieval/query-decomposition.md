@@ -5,7 +5,7 @@ name: Query decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/multi-hop-retrieval
@@ -61,11 +61,23 @@ Sub-questions are either independent (the refund window of plan A does not depen
 dependent (the second question needs the first answer, such as "who manages the author of the report").
 Independent ones fan out in parallel; dependent ones must run in sequence, and at that point the pattern
 is multi-hop retrieval. A planner can emit this as a small DAG; in practice two levels, "parallel batch"
-then "sequential follow-up", cover most cases.
+then "sequential follow-up", cover most cases. Least-to-most prompting (Zhou et al.) is the sequential
+form of the idea: order the sub-problems from simplest to hardest and feed each answer into the next,
+which is why a dependent sub-question is written *after* its predecessor is answered, not up front.
+
+### The limit: decomposition needs the parts to be nameable
+The planner can only split what the question names. "Compare Standard and Enterprise" decomposes because
+both entities are in the text. "List all plans that allow EU data residency" does not: the members of the
+answer set are what you are trying to find, so the planner cannot write one sub-question per plan
+without already knowing the plans. Such enumeration questions need a metadata filter or structured query
+over the corpus, or an enumeration step that first retrieves the list of entities and then fans out over
+it, which is a two-hop pattern rather than plain decomposition.
 
 ### Step 3: retrieve per sub-question
 Each sub-question gets its own top-k, often a smaller k than a single query would use, because each
-sub-question is now a sharp key and the total context budget is shared across them. Metadata filters
+sub-question is now a sharp key and the total context budget is shared across them. The arithmetic is
+simple and binding: with a budget of 8 chunks and 3 sub-questions, each facet gets 2 or 3 chunks, so
+per-facet precision matters more than it did for one query with 8. Metadata filters
 derived from the sub-question (product = Enterprise) apply here too.
 
 ### Step 4: combine the evidence
@@ -107,14 +119,17 @@ atomic, return it unchanged. Return JSON: {{"sub_questions": [...]}}"""
 async def retrieve_async(q, k):
     return await asyncio.to_thread(retrieve, q, k)   # wrap a sync retriever
 
-async def decomposed_search(question, k_each=5):
-    subs = json.loads(llm(PLAN.format(q=question)))["sub_questions"]
+async def decomposed_search(question, k_each=4):
+    try:
+        subs = [s for s in json.loads(llm(PLAN.format(q=question)))["sub_questions"]
+                if isinstance(s, str)][:4] or [question]
+    except (ValueError, KeyError, TypeError):
+        subs = [question]                             # planner failed: treat as atomic
     results = await asyncio.gather(*(retrieve_async(s, k_each) for s in subs))
-    evidence, seen = [], set()
+    evidence = {}                                     # chunk id -> text and every sub that found it
     for sub, hits in zip(subs, results):
-        for cid, text in hits:
-            if cid not in seen:                       # dedupe across sub-questions
-                seen.add(cid); evidence.append({"sub": sub, "id": cid, "text": text})
+        for cid, text in hits:                        # dedupe, but keep all facet tags
+            evidence.setdefault(cid, {"text": text, "subs": []})["subs"].append(sub)
     return subs, evidence
 
 ANSWER = """Original question: {q}
@@ -127,7 +142,7 @@ say so instead of guessing."""
 
 async def answer(question):
     subs, evidence = await decomposed_search(question)
-    ev = "\n".join(f"[{e['id']}] ({e['sub']}) {e['text']}" for e in evidence)
+    ev = "\n".join(f"[{cid}] ({'; '.join(e['subs'])}) {e['text']}" for cid, e in evidence.items())
     # list every sub-question, so one whose chunks are absent or irrelevant is still visible
     return llm(ANSWER.format(q=question, subs="\n".join(subs), ev=ev))
 
@@ -144,8 +159,9 @@ print(asyncio.run(answer(
   atomic questions alone matters as much as the splitter.
 - Per-sub-question answers give traceability and surface missing evidence, but they lose cross-evidence
   reasoning that a single merged context would allow; merge when facets interact, separate when they don't.
-- Sharper sub-queries rank facet-specific passages higher but demote a single passage covering both facets;
-  deduplicated merging makes this harmless, but it changes which chunk is "best".
+- Sharper sub-queries rank facet-specific passages higher but demote a single passage covering both facets,
+  such as a plan-comparison table; if it still appears under both sub-questions, tag it with both rather
+  than keeping only the first tag, or the synthesis treats one facet as unsupported.
 
 ## Pitfalls
 - Over-decomposition of simple questions; the symptom is that lookups which used to be fast and right
@@ -158,12 +174,16 @@ print(asyncio.run(answer(
   whichever sub-question came last.
 - No deduplication across sub-questions; the symptom is repeated passages in the prompt and a model that
   over-weights whatever was repeated.
+- Letting the planner decompose an enumeration question ("all plans with EU residency"); the symptom is
+  sub-questions about a member list the planner made up, which silently omits real members and can
+  include ones that do not exist.
 - Treating a dependent chain as independent; the symptom is a second sub-question like "what is the
   manager's email?" that is vague on its own and retrieves nothing useful.
 
 ## When to use
-Reach for decomposition when the question shape is "compare", "list all", "A and also B", or anything
-that names several entities or facets; a cheap gate (the planner's atomic branch, or a classifier on
+Reach for decomposition when the question shape is "compare", "A and also B", "X before and after Y", or
+anything that names several entities or facets ("list all" questions whose members are unknown need a
+filter or an enumeration hop instead); a cheap gate (the planner's atomic branch, or a classifier on
 question length and conjunctions) keeps it away from simple lookups. Do not use it when latency is
 tight and the corpus is small enough that a single wide retrieval plus a reranker already covers both
 facets. Measure per-sub-question recall, final-answer accuracy on the compound-question slice of the

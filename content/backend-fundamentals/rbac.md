@@ -5,7 +5,7 @@ name: RBAC
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/authentication-vs-authorization
   - backend-fundamentals/oauth-2-0-oidc
@@ -67,8 +67,17 @@ The NIST model layers refinements on this core. **Hierarchical** RBAC lets a sen
 junior role's permissions (`admin ⊇ editor ⊇ viewer`), because without inheritance the admin's
 permission list duplicates the editor's and the two drift apart. **Constrained** RBAC adds separation
 of duty: nobody may hold both "submit payment" and "approve payment", because fraud should require
-collusion. These exist as named levels because they are the two extensions every real deployment
-reinvents.
+collusion. *Static* separation forbids the two roles being assigned to one person at all; *dynamic*
+separation allows both assignments but forbids activating them in the same session, which is where the
+session set earns its place. These exist as named levels because they are the two extensions every real
+deployment reinvents.
+
+Sessions also carry least privilege in time. An operator assigned `admin` should normally act as
+`viewer` and elevate for a bounded window, with a reason and an audit record, *because* standing
+privilege is what a stolen session or a prompt-injected agent inherits. Cloud IAM systems add a second
+refinement, explicit deny: a deny statement overrides any allow, so a guardrail ("nobody outside the
+security team may delete audit logs") holds regardless of which roles are later granted. Order of
+evaluation is then deny, then allow, then the implicit default deny.
 
 ### Scope: where a role applies
 Flat RBAC answers "can this user read documents?", but the production question is "can this user read
@@ -115,8 +124,11 @@ customer's policy demands them.
 ## Example
 A scoped, hierarchical RBAC check with permission-named guards. Roles inherit downward, assignments
 carry a scope, and a role at any ancestor scope applies to the resource. `current_user` stands in for the
-authentication dependency from the OAuth lesson; the point here is that handlers name *permissions*,
-never roles, so adding a role touches one table instead of every endpoint.
+authentication dependency from the OAuth lesson. Two points carry the lesson: handlers name
+*permissions*, never roles, so adding a role touches one table instead of every endpoint; and the scope
+is derived from the resource's stored owner, never from the URL, because checking `project:{id}` from
+the path while deleting `doc_id` lets an editor of project 42 delete project 7's documents by sending
+`/projects/42/documents/<a project-7 doc>` (an insecure direct object reference).
 
 ```python
 from fastapi import Depends, FastAPI, HTTPException
@@ -139,6 +151,7 @@ def permissions_of(role: str) -> set[str]:
 # (subject, scope) -> roles. Scopes form a tree: project -> org.
 ASSIGNMENTS = {("alice", "org:acme"): {"viewer"}, ("alice", "project:42"): {"editor"}}
 PARENT = {"project:42": "org:acme", "project:7": "org:acme"}
+DOC_SCOPE = {101: "project:42", 202: "project:7"}      # each document's real owning scope
 
 def allowed(subject: str, perm: str, scope: str) -> bool:
     while scope:                            # a role at any ancestor scope applies here
@@ -147,20 +160,22 @@ def allowed(subject: str, perm: str, scope: str) -> bool:
         scope = PARENT.get(scope, "")
     return False                            # deny by default
 
-def require(perm: str):
-    def guard(project_id: int, user: str = Depends(current_user)) -> str:
-        if not allowed(user, perm, f"project:{project_id}"):
-            raise HTTPException(403)        # authenticated, but not authorized
+def require_on_doc(perm: str):
+    def guard(doc_id: int, user: str = Depends(current_user)) -> str:
+        scope = DOC_SCOPE.get(doc_id)       # scope from the resource, not from the path
+        if scope is None or not allowed(user, perm, scope):
+            raise HTTPException(404)        # 404, not 403: do not confirm the doc exists
         return user
     return guard
 
-@app.delete("/projects/{project_id}/documents/{doc_id}")
-def delete_doc(project_id: int, doc_id: int, user: str = Depends(require("documents:delete"))):
+@app.delete("/documents/{doc_id}")
+def delete_doc(doc_id: int, user: str = Depends(require_on_doc("documents:delete"))):
     return {"deleted_by": user}
 
 assert allowed("alice", "documents:write", "project:42")       # editor at the project
 assert allowed("alice", "documents:read", "project:7")         # viewer inherited from the org
 assert not allowed("alice", "documents:delete", "project:42")  # admin nowhere
+assert not allowed("alice", "documents:write", DOC_SCOPE[202]) # doc 202 lives in project 7
 ```
 
 ## Trade-offs
@@ -183,6 +198,9 @@ assert not allowed("alice", "documents:delete", "project:42")  # admin nowhere
   are missed.
 - Forgetting scope, so an editor in one tenant can edit in every tenant; the symptom is a
   cross-tenant finding from a penetration test or, worse, a customer.
+- Taking the scope from the request (a path or body `project_id`) instead of from the stored resource;
+  the symptom is that changing one ID in a URL reaches another project's object while every
+  permission check still passes.
 - Enforcing only at the HTTP layer while the retrieval query or background job reads the index
   unfiltered; the symptom is the assistant quoting a document the user cannot open in the source
   system.

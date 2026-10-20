@@ -5,7 +5,7 @@ name: Pydantic
 kind: tool
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/type-hints
   - python-for-ai/dataclasses
@@ -48,6 +48,8 @@ the schema you send to the model and the validator you run on its answer are gen
 same class, so they cannot disagree, and the validation error list is structured enough to feed
 back to the model for a repair attempt. FastAPI, the OpenAI and Anthropic SDK structured-output
 helpers, `instructor`, LangChain and most agent frameworks build on exactly this property.
+(SDK support for passing a Pydantic class directly varies by provider and version; the generated
+JSON Schema is the portable part.)
 
 ## How it works
 ### From annotations to a validator
@@ -74,9 +76,31 @@ rules relative to v1; for example an `int` is no longer accepted for a `str` fie
 Unknown fields are *ignored* by default; `ConfigDict(extra="forbid")` makes them errors, which is
 what you want for tool arguments, where a hallucinated field is a signal, not noise.
 
+### The order things happen in
+Knowing the pipeline tells you where each piece of custom logic belongs. For one
+`model_validate(data)` call:
+
+1. `@model_validator(mode="before")` sees the raw input (a dict, or whatever was passed) and can
+   reshape it, for example unwrapping `{"ticket": {...}}` that a model insisted on adding.
+2. Each field, in declaration order, is looked up by name or alias, then runs its
+   `field_validator(mode="before")` functions on the raw value, then the core type validation and
+   coercion (`"1200"` to `1200`), then declared constraints (`ge`, `min_length`), then its
+   `mode="after"` validators, which receive an already-typed value. `mode="wrap"` surrounds the core
+   step and can short-circuit it.
+3. Errors from every field are collected rather than stopping at the first, *because* a repair
+   prompt that lists all five problems converges in one retry instead of five.
+4. If all fields passed, `@model_validator(mode="after")` runs on the built instance; this is where
+   cross-field invariants such as `start < end` go, since only here are all fields typed and present.
+
+Validation happens at construction only. Assigning `t.affected_users = "lots"` afterwards is not
+checked unless the model sets `validate_assignment=True`, and `Model.model_construct(**data)` skips
+validation entirely, which is the fast path for data you already validated and a hole for data you
+did not. `frozen=True` makes instances immutable and hashable.
+
 ### Validators, serialization, schema
-`@field_validator("name")` runs custom logic on one field (before or after type coercion);
-`@model_validator(mode="after")` checks cross-field invariants such as `start < end`.
+`field_validator` is for single-field normalisation and checks, `model_validator` for the
+reshaping and cross-field cases above. `Field(alias="userId")` maps a wire name onto a Python name
+(set `populate_by_name=True` to accept both).
 `@computed_field` exposes derived values in dumps. `model_dump()` produces a dict and
 `model_dump_json()` a string, with `exclude`, `by_alias` and `mode="json"` to control the output.
 `model_json_schema()` emits a JSON Schema for the class, including `enum` for `Literal` and `Enum`
@@ -144,8 +168,12 @@ print(type(t.affected_users))   # <class 'int'>: "1200" was coerced in lax mode
 print(t.model_dump_json())      # {"title":"Login broken","severity":"high","affected_users":1200,"tags":["auth"]}
 ```
 
-The second call succeeds because the only error was the `severity` literal; the string `"1200"`
-was coerced and the tags were normalized by the validator. The feedback string is what an
+The first call shows the pipeline at work: `affected_users` passed (lax coercion of `"1200"`
+happened in the core step), `tags` passed (the after-validator received a real `list[str]`), and
+only `severity` failed, yet the error list would have named every failing field had there been more.
+The second call succeeds for the same reasons, and the after-validator collapsed `"Auth"` and
+`"auth "` into one tag. Because of `extra="forbid"`, the schema also carries
+`"additionalProperties": false`, so the model is told the same rule the validator enforces. The feedback string is what an
 `instructor`-style retry loop sends back to the model.
 
 ## Trade-offs
@@ -174,6 +202,9 @@ was coerced and the tags were normalized by the validator. The feedback string i
   a wall of deprecation warnings, then breakage when the compatibility shims are removed.
 - Using a mutable default like `tags: list[str] = []`; Pydantic copies defaults per instance so this
   does not share state, but readers assume it does, and `default_factory` states the intent.
+- Mutating a validated model and assuming the new value was checked; with the default
+  `validate_assignment=False`, `t.severity = "critical"` succeeds and the bad value surfaces later
+  in serialization or a downstream consumer.
 - Validating inside a per-token streaming loop; the symptom is CPU-bound latency that disappears
   when you accumulate chunks and validate once at the end.
 

@@ -5,7 +5,7 @@ name: Epochs
 kind: concept
 difficulty: intro
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/learning-rate
   - training-adaptation/overfitting
@@ -84,6 +84,23 @@ supervised fine-tuning is a small number of epochs, with the count rising only f
 epoch is a few steps, but the actual control is total steps × learning rate judged against the
 validation curve, not a magic integer.
 
+### Reading the curve across epochs
+In LLM fine-tuning a characteristic shape appears once the model starts memorising: training loss is
+roughly flat within an epoch and then drops abruptly at the start of the next one, giving a staircase.
+The drop happens *because* the model is now seeing examples it has already seen, and it predicts them
+better than it predicts the unseen remainder of the first pass. A staircase on training loss with flat or
+rising validation loss is direct evidence that further epochs are buying memorisation, not skill. The
+control that turns this into a decision is early stopping with patience: evaluate at a fixed cadence,
+keep the best checkpoint, and stop after *p* evaluations without improvement, so the epoch count you
+configure is an upper bound rather than a commitment.
+
+### What "an example" means with packing
+Fine-tuning frameworks often pack several short examples into one fixed-length sequence to avoid
+padding waste. An epoch is still one pass over the examples, but steps per epoch now follow from total
+tokens divided by tokens per batch, not from `N / B`. A dataset of many short examples and one of a few
+long ones can have the same row count and very different step counts, so compute steps from tokens when
+packing is on.
+
 ### Pretraining counts tokens
 A corpus of trillions of tokens with a compute budget that covers a fraction of it has no meaningful
 epoch; the schedule, the warmup and the evaluation cadence are all defined in tokens or steps. Partial
@@ -160,6 +177,8 @@ divide an epoch, gradients from the last batches of one epoch land in the first 
   data being credited to the data rather than to ten times the updates.
 - Resuming from a checkpoint without the sampler position; the symptom is some examples seen twice and
   others never in that epoch, and a resumed run that no longer matches an uninterrupted one.
+- Reading the staircase drop in training loss at each epoch boundary as the model "learning more"; the
+  symptom that shows it is memorisation is validation loss flat or rising across the same boundaries.
 - Evaluating only at epoch boundaries on a large dataset; the symptom is the best checkpoint sitting
   between two evaluations and never being saved.
 

@@ -5,6 +5,7 @@ name: Security scanning & dependency auditing (pip-audit, Bandit)
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/uv-poetry-pip
@@ -60,7 +61,10 @@ Bandit parses each Python file into an abstract syntax tree and runs plugins tha
 constructs, each with a test ID, severity and confidence. Examples: `B101` assert used (asserts vanish under
 `python -O`, so they must not enforce security), `B301` pickle deserialization, `B307` `eval`, `B506`
 unsafe `yaml.load`, `B602` subprocess with `shell=True`, `B105` hard-coded password strings, `B608` SQL built
-by string formatting. Run `bandit -r src -ll` to report medium severity and above; configure skips per
+by string formatting. Run `bandit -r src -ll` to report medium severity and above, remembering that some
+useful checks are rated low (B105 and B101 among them) and disappear under that floor. B105 is also a
+name heuristic: it fires on literals assigned to names containing words such as `password`, `secret` or
+`token`, so `API_KEY = "sk-..."` slips past it, which is one more reason to run a real secret scanner. Configure skips per
 project (passing the config file explicitly), and suppress a reviewed line with `# nosec B602` plus a
 reason. Ruff implements many of the same checks as its `S` rules (from flake8-bandit), which lets teams run
 them inside the linter they already have.
@@ -88,7 +92,7 @@ a classifier, runs a shell tool and stores results.
 import pickle, sqlite3, subprocess, shlex
 import yaml
 
-API_KEY = "sk-live-123"                                  # B105: hard-coded secret -> load from env/secrets
+API_TOKEN = "sk-live-123"                                # B105 (low severity): hard-coded secret -> env/secrets
 clf = pickle.load(open("router.pkl", "rb"))              # B301: executes code from an untrusted file
 cfg = yaml.load(open("agent.yaml"), Loader=yaml.Loader)  # B506: full loader can build arbitrary objects
 
@@ -113,8 +117,9 @@ cfg_safe = yaml.safe_load(open("agent.yaml"))
 # Weights: store as safetensors; for any pickle-based checkpoint, load only from trusted, pinned sources.
 
 # CI (fails the build on findings):
-#   uv export --format requirements-txt --no-hashes --no-emit-project > req.txt && pip-audit -r req.txt
-#   bandit -r src -ll
+#   uv export --format requirements-txt --no-hashes --no-emit-project > req.txt
+#   pip-audit -r req.txt --no-deps --disable-pip   # export is already fully resolved; skip pip install
+#   bandit -r src -ll                              # medium+ only: hides B105/B101, so run -l periodically
 ```
 
 ## Trade-offs

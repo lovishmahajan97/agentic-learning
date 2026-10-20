@@ -5,6 +5,7 @@ name: Contract testing
 kind: practice
 difficulty: advanced
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/test-doubles-mocks-fixtures
   - python-for-ai/integration-and-end-to-end-testing
@@ -88,13 +89,13 @@ This hand-rolled version shows the mechanism that Pact automates with matchers a
 from pydantic import BaseModel, ConfigDict
 
 class Hit(BaseModel):                      # consumer side: only fields the agent reads
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", strict=True)   # strict: "0.9" is not a float
     doc_id: str
     score: float
     text: str
 
 class SearchResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", strict=True)
     hits: list[Hit]
 
 CONTRACT = {                               # published by the consumer's CI
@@ -103,7 +104,7 @@ CONTRACT = {                               # published by the consumer's CI
         "description": "search returns scored hits",
         "provider_state": "index contains doc d1 about refunds",
         "request": {"method": "POST", "path": "/search", "json": {"query": "refund policy", "k": 3}},
-        "response": {"status": 200, "schema": SearchResponse},
+        "response": {"status": 200, "schema": SearchResponse},  # shipped as model_json_schema()
     }],
 }
 
@@ -118,12 +119,15 @@ def test_retrieval_honours_agent_contract():
         req = it["request"]
         r = client.request(req["method"], req["path"], json=req["json"])
         assert r.status_code == it["response"]["status"]
-        body = it["response"]["schema"].model_validate(r.json())   # raises on missing or retyped field
+        body = it["response"]["schema"].model_validate_json(r.content)  # missing/retyped field raises
         assert body.hits, "provider state promised at least one hit"
 ```
 
 If the retrieval team renames `text` to `content`, this test fails in their pull request, while adding
-a new `chunk_id` field passes because the consumer ignores extras.
+a new `chunk_id` field passes because the consumer ignores extras. `strict=True` matters: Pydantic's
+default lax mode would coerce a `score` that became the string `"0.9"` back into a float, and the
+retype would pass verification while breaking any consumer that does not coerce. In a real setup the
+consumer publishes the JSON Schema (or Pact matchers) rather than a Python class.
 
 ## Trade-offs
 - Contracts catch interface breaks in seconds per build, but only interface breaks; a provider that

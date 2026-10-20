@@ -5,7 +5,7 @@ name: Tool adapters / service interfaces
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/tool-permissions-and-least-privilege
   - agent-reliability/idempotent-tool-execution
@@ -71,7 +71,10 @@ An adapter has an inner and an outer face.
    inside the adapter's stack frame.
 5. **Bound the call**: a timeout, a retry policy for retryable classes only, and an idempotency key derived
    from the run and step so that a retry after a lost response cannot create a second ticket. If the
-   vendor does not honour an idempotency header, the adapter deduplicates locally by that key.
+   vendor does not honour an idempotency header, the adapter deduplicates locally by that key. Transient
+   failures are retried *inside* the adapter, a small bounded number of times with jittered backoff,
+   *because* a retry the model has to decide on costs a full model turn of latency and tokens; only when
+   that budget is spent does the failure reach the model, as a result it can plan around.
 6. **Normalize the outcome** into one shape: `{"ok": true, ...}` or `{"ok": false, "error": <code>,
    "retryable": <bool>, ...}`. The error code comes from a small taxonomy you own (`invalid_arguments`,
    `not_found`, `denied`, `rate_limited`, `upstream_timeout`, `upstream_error`), *because* the model should
@@ -81,6 +84,24 @@ An adapter has an inner and an outer face.
    back to, and a cursor if the full result is paged. Large payloads go to a blob store and the model gets
    a reference plus a summary.
 8. **Emit telemetry**: a span with latency and error class, and an event on the run's stream.
+
+### Composite calls and partial failure
+Hiding a three-call sequence behind one tool creates a new failure mode: call two succeeds and call
+three fails. The adapter must not report a plain failure, *because* the model will try again and create
+a second ticket. It either compensates (undo the earlier calls, if they can be undone) or reports the
+partial state explicitly: `{"ok": false, "error": "partial", "created": {"ticket_id": "T-88"},
+"failed_step": "attach_file"}`. The rule of thumb is that one model-facing tool should map to at most one
+non-idempotent service write; when a workflow needs several, either make it a durable sub-workflow with
+its own checkpoints or expose the writes as separate tools.
+
+### Evolving the contract
+The model-facing contract is an API with a fussy client. Additive changes (a new optional argument with
+a default, a new result field) are safe. Renaming an argument, narrowing an enum or changing what a field
+means is a breaking change, *because* prompts, few-shot examples and recorded eval trajectories all
+encode the old shape, and the model will keep producing it. Version breaking changes as a new tool name
+(`create_ticket_v2`), run the trajectory suite against both, and retire the old one when its call volume
+reaches zero. The service interface behind it can change freely as long as the contract tests, which run
+the adapter against recorded vendor responses, keep passing.
 
 ### Where the boundary lives
 In-process adapters are plain classes, fastest and simplest. MCP standardizes the boundary as a protocol:
@@ -137,7 +158,8 @@ class TicketAdapter:
             return {"ok": False, "error": "rate_limited", "retryable": True,
                     "retry_after_s": int(ra) if ra.isdigit() else 5}
         if r.status_code >= 400:                                          # 6. one error vocabulary
-            return {"ok": False, "error": "upstream_error", "retryable": r.status_code >= 500,
+            err = {401: "denied", 403: "denied", 404: "not_found"}.get(r.status_code, "upstream_error")
+            return {"ok": False, "error": err, "retryable": r.status_code >= 500,
                     "http_status": r.status_code}       # raw vendor body goes to the trace, not the model
         d = r.json()                                                       # 7. project the response
         return {"ok": True, "ticket_id": d["id"], "status": d["status"],
@@ -171,6 +193,10 @@ class TicketAdapter:
   ticket" and the adapter cannot resolve it.
 - Hiding non-idempotent writes behind automatic retries; the symptom is duplicate tickets, emails or
   refunds after a transient timeout.
+- Reporting a composite call's partial failure as a plain failure; the symptom is orphaned or duplicated
+  records created by the model's well-meaning second attempt.
+- Renaming an argument in place; the symptom is a jump in `invalid_arguments` for that tool right after
+  deploy, because the model still emits the old name it learned from examples.
 
 ## When to use
 Introduce an adapter the moment a tool does anything beyond a pure in-memory computation: any network

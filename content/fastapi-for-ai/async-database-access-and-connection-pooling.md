@@ -5,6 +5,7 @@ name: Async database access & connection pooling
 kind: concept
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
   - fastapi-for-ai/async-endpoints
@@ -77,10 +78,19 @@ and an average 8-second model call, the process can serve at most about two requ
 checkouts time out, while the database sits idle. The fix is structural: read what you need, release
 the connection (`commit()` or `close()`), call the model, then open a short second session to write.
 
+### Sizing from hold time
+The pool size a process needs follows from Little's law: connections busy on average = request rate ×
+time each request holds a connection. A route doing 200 requests per second that holds a connection for
+10 ms of queries keeps about 2 connections busy; give it headroom for bursts and 5 to 10 is plenty. The
+same route holding its session across a 4-second model call needs 200 × 4 = 800 connections, which no
+pool or server will give you. That is why hold time, not query speed or pool size, is the number to
+measure and attack first: shrinking it shrinks the pool you need linearly, while raising the pool only
+moves the queue from the pool to Postgres.
+
 ### Process and loop boundaries
 The engine and its pool belong to one process and one event loop. Create them in the lifespan handler
-rather than at import time: with gunicorn `--preload` a pool created before the fork is shared by
-every child and connections get corrupted, and asyncpg connections are bound to the loop that made
+rather than at import time: with gunicorn `--preload` a pool that has opened connections before the
+fork hands the same sockets to every child and the protocol streams get corrupted, and asyncpg connections are bound to the loop that made
 them, which is also why tests that spin up their own loop break with import-time engines. Call
 `engine.dispose()` on shutdown.
 
@@ -92,9 +102,12 @@ is 97, and 60 + 30 + 5 = 95 fits, barely. Add one replica of either tier and it 
 PgBouncer enters: application pools connect to PgBouncer, which multiplexes them onto a small server
 pool. In transaction pooling mode a server connection is assigned per transaction, so anything that is
 session-scoped breaks: `SET` session variables, advisory locks held across transactions,
-`LISTEN/NOTIFY`, and prepared statements. asyncpg prepares statements implicitly, so with PgBouncer in
-transaction mode set `statement_cache_size=0` in `connect_args`, or rely on a PgBouncer version with
-protocol-level prepared-statement support.
+`LISTEN/NOTIFY`, and prepared statements. asyncpg prepares statements implicitly and SQLAlchemy's
+asyncpg dialect keeps its own prepared-statement cache on top, so with PgBouncer in transaction mode
+disable both: `statement_cache_size=0` in `connect_args` and `prepared_statement_cache_size=0` on the
+URL (SQLAlchemy's docs also suggest unique statement names via `prepared_statement_name_func`). The
+alternative is a PgBouncer version with protocol-level prepared-statement support (1.21 and later,
+enabled with `max_prepared_statements`).
 
 ### Concurrency inside one request
 A session is not safe for concurrent use. `asyncio.gather(session.execute(a), session.execute(b))`
@@ -154,8 +167,8 @@ async def chat(conv_id: int, body: Ask, request: Request):
 - `pool_pre_ping` costs a round trip per checkout but eliminates "server closed the connection
   unexpectedly" after failovers; if every microsecond matters and `pool_recycle` is short, turn it off.
 - Transaction-mode PgBouncer multiplexes thousands of client connections, but forbids session state
-  and complicates prepared statements; session mode keeps the semantics and gives back most of the
-  savings.
+  and complicates prepared statements; session mode keeps the semantics but surrenders most of the
+  multiplexing savings, since each client holds a server connection for its whole session.
 
 ## Pitfalls
 - Holding a session across a model or HTTP call; the symptom is `QueuePool limit ... reached` under
@@ -197,7 +210,8 @@ many clients already" and surface as 500s. Short-term, cut the per-process pool 
 example `pool_size=8, max_overflow=4` for 72, leaving headroom for workers and migrations. Then check
 why the pool fills: if handlers hold sessions across model calls, restructuring them to release before
 the slow call will drop real usage far below the cap. If the fleet must grow beyond the budget, put
-PgBouncer in front in transaction mode, set asyncpg's `statement_cache_size=0`, and audit for
+PgBouncer in front in transaction mode, disable asyncpg's and SQLAlchemy's prepared-statement caches
+(or use PgBouncer's protocol-level prepared-statement support), and audit for
 session-scoped features such as `SET` and advisory locks that transaction pooling breaks.
 
 ## Quiz
@@ -223,5 +237,5 @@ session-scoped features such as `SET` and advisory locks that transaction poolin
 - [ ] Connection pooling in SQLAlchemy, which must be disabled
 - [ ] TLS between the application and the database
 > Transaction mode hands out a different server connection per transaction, so a statement prepared on
-> one may not exist on the next. Set `statement_cache_size=0` or use protocol-level prepared statement
-> support.
+> one may not exist on the next. Disable the driver and dialect statement caches, or use PgBouncer's
+> protocol-level prepared statement support.

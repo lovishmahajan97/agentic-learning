@@ -5,6 +5,7 @@ name: OpenTelemetry instrumentation
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - fastapi-for-ai/structured-logging
   - fastapi-for-ai/shared-httpx-asyncclient
@@ -39,7 +40,7 @@ re-instrumenting every service, and libraries cannot ship instrumentation for ev
 timing logs do not propagate across process boundaries and cannot be assembled into a tree. OTel separates
 the concerns: libraries and your code call a stable API, the SDK decides sampling and batching, and an
 exporter speaks OTLP to a collector or backend, so the backend is a deployment choice rather than a code
-change. It has become the common substrate that LLM observability tools also ingest.
+change. Many LLM observability tools now accept OTLP as well, so the same instrumentation can feed them.
 
 ## How it works
 ### Data model
@@ -74,8 +75,11 @@ never half-sampled across services. Tail-based sampling (keep all errors and slo
 collector, because only after a trace ends do you know whether it was interesting.
 
 ### Process model
-The batch processor's export thread does not survive `fork`. With Gunicorn `--preload` or any pre-fork
-server, initialise the tracer provider in each worker (a `post_fork` hook or lifespan), not in the master.
+Threads do not survive `fork`, and SDK state created before a fork is not safe to inherit. Recent SDK
+releases register an at-fork hook that restarts the batch span processor's worker thread in the child, but
+the OTLP gRPC exporter's channel is not fork-safe and metric readers have the same problem, so the official
+guidance still stands: with Gunicorn `--preload` or any pre-fork server, initialise the tracer provider in
+each worker (a `post_fork` hook or lifespan), not in the master.
 
 ## Example
 Initialisation in lifespan (per worker), auto-instrumentation for FastAPI and httpx, and a manual span
@@ -111,6 +115,7 @@ tracer = trace.get_tracer("chat-api")
 @app.post("/v1/chat")
 async def chat(body: dict):
     with tracer.start_as_current_span("chat model-a") as span:
+        span.set_attribute("gen_ai.operation.name", "chat")
         span.set_attribute("gen_ai.request.model", "model-a")
         r = await app.state.http.post("/v1/chat/completions", json=body)   # child client span
         usage = r.json().get("usage", {})
@@ -135,7 +140,7 @@ the generator: a span ended when the handler returns would close before the firs
 
 ## Pitfalls
 - Initialising the provider before a pre-fork server forks workers; the symptom is a service that works
-  but exports no spans from workers, or exports only from the first process.
+  but exports no spans from workers, or exports them only intermittently, with gRPC errors or hangs.
 - Ending the LLM span before a `StreamingResponse` finishes; the symptom is model spans that last a few
   milliseconds while the server span lasts the full 30 seconds of streaming.
 - Calling `instrument_app` and also adding the instrumentation middleware manually, or instrumenting twice
@@ -191,8 +196,8 @@ streams, part of that time is token streaming that a manual span closed early.
 
 ### Q: Spans export from a local run but not from production behind Gunicorn with `--preload`. What is the likely cause?
 - [ ] The OTLP exporter is incompatible with Uvicorn workers
-- [x] The tracer provider and its background export thread were created in the master before fork
+- [x] The tracer provider and its exporter were initialised in the master process before fork
 - [ ] Gunicorn strips the `traceparent` header
 - [ ] Sampling is always disabled under Gunicorn
-> Threads do not survive `fork`, so workers inherit a batch processor without its export thread and queued
-> spans are never sent. Initialise the provider per worker in `post_fork` or lifespan.
+> Workers inherit SDK state created before fork: an export thread that did not survive it (older SDKs) or
+> a gRPC exporter channel that is not fork-safe, so spans are not sent. Initialise per worker in `post_fork` or lifespan.

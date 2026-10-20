@@ -5,6 +5,7 @@ name: GraphRAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
+status: reviewed
 related:
   - rag-retrieval/knowledge-graphs
   - rag-retrieval/multi-hop-retrieval
@@ -58,7 +59,8 @@ paying for up front when many queries need a corpus-level view.
    are grouped by name and type, and an LLM writes one consolidated description. This is a crude form of
    entity resolution, and name variants ("IBM" vs "International Business Machines") remain a known weak
    spot.
-4. **Build the graph:** nodes are entities, edges are relationships, weighted by how often they co-occur.
+4. **Build the graph:** nodes are entities, edges are relationships, weighted by how many times the
+   relationship was extracted across chunks (some versions also fold in the LLM's strength score).
 5. **Detect communities** hierarchically with the Leiden algorithm, which partitions the graph into
    densely connected groups and recursively subdivides them. Leiden is used *because* it guarantees
    well-connected communities, which the older Louvain method does not.
@@ -70,12 +72,27 @@ paying for up front when many queries need a corpus-level view.
 - **Global search** answers whole-corpus questions by map-reduce over community reports at a chosen level.
   Map: each report (or batch) produces a partial answer plus a helpfulness score. Reduce: the highest-scoring
   partial answers are packed into the context and synthesised. Choosing a higher level is cheaper and
-  broader; a lower level is more detailed and costs more calls.
+  broader; a lower level is more detailed and costs more calls. The map step reads every report at the
+  chosen level whatever the question, so cost scales with the number of communities, not with relevance;
+  newer versions can first rate reports for relevance and skip whole branches of the hierarchy that do
+  not matter to the query.
 - **Local search** answers questions about specific entities. It finds entities whose descriptions match the
   query (by embedding), then fans out to their relationships, neighbouring entities, the community reports
   they belong to and the original source chunks, ranks all of that, and fits it into a context budget. This
   is where multi-hop connection pays off.
-- Hybrid variants combine the two, starting from local results and expanding with community context.
+- Hybrid variants combine the two. Microsoft's DRIFT search, for example, starts from the community
+  reports most relevant to the query to draft a broad answer and follow-up questions, then refines those
+  with local search over entities and source chunks.
+
+### Variants that move the cost
+The expensive part is LLM extraction and summarisation of everything at index time, so most variants
+move or shrink it. LazyGraphRAG (Microsoft) builds its graph from cheap NLP noun-phrase co-occurrence
+instead of LLM extraction and defers all LLM summarisation to query time, which makes indexing roughly
+as cheap as vector RAG and pays per query instead; it fits corpora that change often or are queried
+rarely. LightRAG and similar systems keep LLM extraction but skip the community hierarchy, retrieving
+over entity-level and theme-level keys and merging new documents into the graph incrementally rather
+than re-clustering. The choice is the same in every case: pay once at index time when many queries need
+the corpus-level view, pay at query time when they do not.
 
 ### Why each piece is there
 Extraction converts unstructured text into joinable keys (entities). Communities give the corpus a
@@ -90,15 +107,20 @@ incident reports totalling about 4 million tokens.
 **Indexing.** With 1,200-token chunks there are roughly 3,300 chunks. One extraction call per chunk plus one
 gleaning pass is about 6,600 calls, each reading a chunk plus a long extraction prompt and writing structured
 output: on the order of 15 to 25 million tokens processed. Entity merging and community summarisation add
-thousands more calls. Plain vector RAG over the same corpus costs one embedding pass of 4 million tokens,
-which is far cheaper per token. GraphRAG indexing is therefore one to two orders of magnitude more expensive,
-and must be partly rerun as documents change.
+thousands more calls. Plain vector RAG over the same corpus costs one embedding pass of 4 million tokens.
+So GraphRAG processes several times more tokens, and every one of them goes through a generative LLM,
+which is typically one to three orders of magnitude more expensive per token than an embedding model
+(output tokens more still). The indexing bill is therefore commonly two or more orders of magnitude larger
+in dollars, with the exact multiple set by the extraction model you choose, and parts of it must be rerun
+as documents change.
 
 **Global query:** "What are the most common root causes across all incidents?" Vector RAG retrieves 10
 chunks, about 0.3% of the corpus, and reports whatever those happen to say. GraphRAG uses, say, the 40
 level-1 community reports: 40 map calls produce scored partial answers ("deployment config drift, seen in
 communities about service X and Y"), and one reduce call synthesises the top-scoring ones. Fewer than 50
-calls give an answer grounded in a summary of the whole corpus.
+calls give an answer grounded in a summary of the whole corpus. The index-free way to get the same
+coverage, map-reduce over every chunk at query time, is about 3,300 calls per question; the community
+reports are that reading done once and reused, which is the whole economic argument.
 
 **Local query:** "Which teams were involved in incidents touching the payments database?" Local search
 matches the entity PAYMENTS-DB, follows its edges to incidents and from incidents to TEAM entities, and
@@ -130,6 +152,9 @@ buys little; if analysts ask thematic and relational questions daily, it is repa
   because it was synthesised by the indexing model.
 - Evaluating only with a judge on "comprehensiveness"; broad, fluent answers win those comparisons even
   when specific facts are wrong, so add fact-level checks.
+- Building one graph and one set of community reports over documents with different permissions; the
+  symptom is a theme summary that mentions a restricted project to users who could not open any of its
+  source documents, because a report inherits the content of every chunk it summarises.
 
 ## When to use
 Reach for GraphRAG when a meaningful share of questions is thematic ("what are the main issues"),

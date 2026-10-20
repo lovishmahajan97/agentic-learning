@@ -5,7 +5,7 @@ name: Exceptions and custom exception hierarchies
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -76,6 +76,15 @@ validation errors. Give leaves a clear `__str__` for logs. Keep the tree shallow
 usually enough, and every class must correspond to a different decision somewhere, otherwise it is
 noise.
 
+Two refinements keep the tree honest. First, a leaf may also inherit a built-in when callers outside
+your code already catch that built-in: `class ProviderTimeout(Transient, TimeoutError)` is caught by
+your retry loop *and* by any generic `except TimeoutError` in a framework, because `except` checks
+the whole MRO. Second, when the handling decision depends on data rather than kind (the same
+`ProviderHTTPError` is retryable for 503 and not for 400), an attribute such as `retryable: bool`
+can beat a class split; the rule of thumb is classes for decisions made by `except`, attributes for
+decisions made by an `if` inside the handler. Prefer classes where you can, because an `except`
+clause cannot forget to check a flag.
+
 ### Chaining: keep the cause
 Raising a domain exception inside an `except` block links the original automatically as
 `__context__`, and the traceback prints "During handling of the above exception, another exception
@@ -130,7 +139,8 @@ def call_provider(client: httpx.Client, prompt: str) -> str:
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
         if status == 429:
-            raise RateLimited(float(e.response.headers.get("retry-after", 2))) from e
+            ra = e.response.headers.get("retry-after", "2")      # may also be an HTTP date
+            raise RateLimited(float(ra) if ra.isdigit() else 2.0) from e
         if status >= 500:                           # check before parsing: 5xx bodies are often HTML
             raise Transient(f"provider returned {status}") from e
         is_json = "json" in e.response.headers.get("content-type", "")
@@ -141,17 +151,27 @@ def call_provider(client: httpx.Client, prompt: str) -> str:
     return r.json()["text"]
 
 def answer(client: httpx.Client, prompt: str, attempts: int = 3) -> str:
+    last: LLMError | None = None
     for n in range(attempts):
         try:
             return call_provider(client, prompt)
         except RateLimited as e:                    # subclass handler before its base
-            time.sleep(e.retry_after)
-        except Transient:
-            time.sleep(2 ** n)
+            last = e; time.sleep(min(e.retry_after, 30))   # cap a hostile or huge hint
+        except Transient as e:
+            last = e; time.sleep(2 ** n)
         except ContextTooLong as e:                 # recoverable: shrink, then try again
-            prompt = prompt[: len(prompt) * e.limit * 9 // (10 * e.tokens)]  # ~10% margin
-    raise Permanent(f"gave up after {attempts} attempts")
+            last = e; prompt = prompt[: len(prompt) * e.limit * 9 // (10 * e.tokens)]
+    raise Permanent(f"gave up after {attempts} attempts") from last   # Permanent: propagates
 ```
+
+Trace one failure through it. The provider answers 429 with `retry-after: 7`. The adapter turns the
+`HTTPStatusError` into `RateLimited(7.0)`, chained to the original so the vendor trace survives.
+`answer` matches `except RateLimited` first (it is listed before its base), sleeps seven seconds and
+loops. A 401 instead becomes `Permanent`, which no handler in `answer` names, so it propagates
+immediately to the request handler with zero retries spent. A `KeyError` from a changed response
+body (`r.json()["text"]`) is not an `LLMError` at all, so it escapes on the first attempt as the bug
+it is. The handlers never inspect a status code or a message string; the classification happened
+once, in the adapter.
 
 ## Trade-offs
 - A policy-based tree lets callers catch exactly what they can handle, but every class must map to a
@@ -173,6 +193,9 @@ def answer(client: httpx.Client, prompt: str, attempts: int = 3) -> str:
   `retry_after` hint is ignored, so you hammer a rate-limited endpoint with exponential backoff instead.
 - Raising a domain error without `from e`; the traceback says "during handling of the above
   exception, another exception occurred", and the on-call engineer chases a phantom second bug.
+- Using `assert` to reject bad model output or tool arguments; asserts are removed under
+  `python -O`, so the symptom is validation that works in tests and silently vanishes in an
+  optimised deployment. Raise a real exception.
 - Matching on `str(e)` from an SDK; it works until a minor SDK release rewords the message and every
   rate limit becomes a permanent failure overnight.
 - Logging with `logger.exception` at every layer and re-raising; the symptom is one failure producing

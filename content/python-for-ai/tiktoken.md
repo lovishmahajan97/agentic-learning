@@ -5,6 +5,7 @@ name: tiktoken
 kind: tool
 difficulty: intro
 est_minutes: 11
+status: fact-checked
 related:
   - model-internals/tokenization
   - model-internals/context-window
@@ -134,7 +135,8 @@ Use tiktoken whenever you assemble prompts dynamically for OpenAI models: packin
 trimming conversation history, enforcing per-user token limits, chunking documents to a token size, and
 estimating cost for a batch job before you run it. For other providers, use it only as a rough
 estimate and prefer their official counter, or the Hugging Face tokenizer for an open model. Measure the
-gap between your local estimate and the API's reported `usage.prompt_tokens` on real traffic; a stable
+gap between your local estimate and the API's reported input count (`usage.prompt_tokens` in Chat
+Completions, `usage.input_tokens` in the Responses API) on real traffic; a stable
 small gap is chat overhead, a large or growing gap means the wrong encoding. Interviewers like asking why
 character heuristics fail for code and non-English text.
 

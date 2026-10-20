@@ -5,7 +5,7 @@ name: Chunk overlap
 kind: concept
 difficulty: intro
 est_minutes: 10
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -62,7 +62,11 @@ and a table header is immediately above its rows. Repeating anything further bac
 Overlap measured in raw tokens can itself cut mid-sentence, giving the next chunk a half-sentence
 preamble. Better splitters snap the overlap to the nearest sentence boundary: "repeat the last one or
 two complete sentences" rather than "repeat the last 64 tokens". Recursive splitters implement this by
-choosing which trailing pieces to carry forward when they start a new chunk.
+choosing which trailing pieces to carry forward when they start a new chunk. The consequence is that
+overlap there is a *ceiling*, not a guarantee: LangChain's recursive splitter, for example, carries
+forward only whole trailing pieces whose combined length fits within `chunk_overlap`, so if the last
+piece is a 150-token paragraph and the overlap is 100, nothing is carried and that boundary has zero
+overlap.
 
 ### Choosing the amount
 Common practice is an overlap of roughly 10–20% of the chunk size (illustrative, not a benchmark).
@@ -76,7 +80,9 @@ Because adjacent chunks share text, a query that matches the shared region retur
 identical scores. Without handling, the top-5 can contain three copies of the same passage, wasting
 context slots and starving the answer of diversity. The fix is to collapse neighbours: group hits by
 document, merge chunks whose indices are adjacent into one span (keep the max score), and only then
-take the top-k. This is the first step toward parent-document retrieval, where the index unit and the
+take the top-k. Merging must use the stored token or character offsets, not plain concatenation:
+two neighbours joined naively repeat the shared `O` tokens in the middle of the merged span. This is
+the first step toward parent-document retrieval, where the index unit and the
 returned unit are deliberately different.
 
 ### What overlap does not fix
@@ -133,6 +139,10 @@ gain from 100 to 200 is usually small while the cost doubles, which is why moder
   or three times in the prompt and the answer missing information that ranked sixth.
 - Setting overlap as a fraction of a tiny chunk, such as 20 tokens on a 128-token chunk; the symptom
   is overlaps that rarely hold a complete sentence, so boundary failures persist unchanged.
+- Assuming the configured overlap is what the splitter produced; with piece-based recursive splitters
+  the symptom is boundary failures persisting at exactly the boundaries where a long paragraph or
+  sentence ended the previous chunk, because no whole piece fit inside the overlap budget. Inspect
+  actual shared text between neighbours, not the config.
 - Letting overlap exceed half the chunk size; the symptom is an index two or three times larger than
   the corpus with no measurable recall gain, and slower queries from the extra vectors.
 - Treating overlap as the fix for missing headings or definitions far from the boundary; the symptom

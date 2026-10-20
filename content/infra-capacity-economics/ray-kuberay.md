@@ -5,6 +5,7 @@ name: Ray / KubeRay
 kind: tool
 difficulty: advanced
 est_minutes: 18
+status: fact-checked
 related:
   - infra-capacity-economics/keda-autoscaling
   - infra-capacity-economics/inference-clusters
@@ -61,11 +62,12 @@ Each task or actor states `num_cpus`, `num_gpus`, memory or custom resources, an
 places it where those are free. These are *logical* reservations: `num_gpus=1` sets `CUDA_VISIBLE_DEVICES`
 for the worker but does not stop it using memory it was not granted, and `num_gpus=0.5` lets two actors
 share a card with no memory isolation. **Placement groups** reserve bundles atomically (gang scheduling)
-with strategies such as `PACK` (same node, for tensor parallelism over NVLink) or `SPREAD` (fault
-isolation). Engines like vLLM use Ray for multi-node tensor and pipeline parallelism for exactly this.
+with strategies such as `STRICT_PACK` (all bundles on one node, for tensor parallelism over NVLink;
+`PACK` is only a best-effort preference for that) or `SPREAD` (fault isolation). Engines like vLLM use Ray for multi-node tensor and pipeline parallelism for exactly this.
 
 ### Cluster anatomy
-A Ray cluster has one **head node** running the Global Control Store (cluster metadata), the dashboard,
+A Ray cluster has one **head node** running the Global Control Service (GCS, cluster metadata; the
+original paper called it the Global Control Store), the dashboard,
 the job-submission API and the autoscaler, plus **worker nodes** each running a raylet (local scheduler
 and object store). The head is a single point of failure: lose it and, by default, the cluster's state
 goes with it. The **autoscaler** scales on *pending logical demand*, not utilisation: if tasks are queued
@@ -83,11 +85,13 @@ KubeRay adds three CRDs. **RayCluster** declares a head group and worker groups 
 edits worker-group replica counts, and a node autoscaler (cluster autoscaler or Karpenter) supplies GPU
 nodes. **RayJob** creates a cluster, submits an entrypoint and can tear the cluster down when it
 finishes, so a nightly batch run pays for GPUs only while it runs. **RayService** runs a Serve application
-and handles upgrades by bringing up a new cluster, waiting until it is healthy, then switching traffic.
+and handles cluster-spec upgrades by bringing up a new cluster, waiting until it is healthy, then
+switching traffic; changes to only the Serve config are applied in place on the running cluster.
 
 ```yaml
 apiVersion: ray.io/v1
 kind: RayJob
+metadata: {name: nightly-embed}
 spec:
   entrypoint: python embed.py
   shutdownAfterJobFinishes: true

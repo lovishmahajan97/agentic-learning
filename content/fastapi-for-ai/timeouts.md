@@ -5,6 +5,7 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - fastapi-for-ai/shared-httpx-asyncclient
   - fastapi-for-ai/cancellation-on-client-disconnect
@@ -79,9 +80,11 @@ application deadline.
 
 ### Deadlines and cancellation
 `async with asyncio.timeout(t):` cancels the enclosed task when `t` elapses and raises `TimeoutError`
-at the `async with`. Cancellation propagates into httpx, which closes the connection. Closing the
-connection is the only way to tell an LLM provider to stop generating. Even so, tokens generated before
-the close may still be billed, depending on the provider. Two consequences follow. First, code inside
+at the `async with`. Cancellation propagates into httpx, which closes the connection. For a plain
+HTTP completion call, closing the connection is usually the only stop signal you can send. Whether the
+provider actually halts generation on disconnect, and whether tokens generated before the close are
+billed, depends on the provider (self-hosted servers such as vLLM abort on disconnect; some hosted APIs
+offer an explicit cancel only for background or batch jobs). Two consequences follow. First, code inside
 the block must not swallow `CancelledError`, or the timeout silently stops working. Second, a deadline
 is a *budget*: compute the time left before each step (`deadline - loop.time()`) and give each call
 the minimum of its own limit and what remains, so a retry can't overrun the request.
@@ -135,9 +138,12 @@ async def chat(req: Request, body: dict):
         raise HTTPException(503, "model provider unreachable", headers={"Retry-After": "5"})
 ```
 
-Walkthrough: retrieval takes 0.4 s, so generation gets about 7.6 s. If the model stalls at 7.6 s, the
-`asyncio.timeout` cancels the call, httpx closes the socket, and the client gets *your* 504 with a clear
-message at 8 s, two seconds before the proxy would have returned an anonymous one.
+Walkthrough: retrieval takes 0.4 s, so the generation call is built with about 7.6 s on every phase.
+If the model has not answered by the 8 s mark, whichever fires first (httpx's 7.6 s read timeout or the
+outer `asyncio.timeout`) ends the call, the socket is closed, and both paths map to *your* 504 with a
+clear message at about 8 s, two seconds before the proxy would have returned an anonymous one. The
+outer deadline is the backstop: it also covers time spent in code between calls, which no per-call
+timeout sees.
 
 ## Trade-offs
 - Short timeouts free capacity quickly and surface outages early, but they cut off legitimately slow

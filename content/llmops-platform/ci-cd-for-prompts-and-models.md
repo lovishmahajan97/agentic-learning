@@ -5,7 +5,7 @@ name: CI/CD for prompts and models
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/ci-cd
   - llmops-platform/evaluation-gates-for-production-releases
@@ -106,6 +106,16 @@ registry is the source of truth, a label change is the deploy, and the pipeline 
 registry webhook to run the same eval gate before the `production` label moves. Most mature teams land
 on the hybrid: registry as source of truth, pipeline as the only thing allowed to move production labels.
 
+### When the yardstick changes
+A baseline is only meaningful relative to the dataset version and scorer version it was measured with.
+Adding twenty items to the golden set, relabeling a slice, or upgrading the judge model changes every
+score without any change to the bundle, so the pipeline treats those as their own kind of change: it
+re-runs the current champion under the new yardstick, writes a new baseline tagged with the dataset hash
+and scorer version, and only then compares candidates. A baseline file that records its own dataset hash
+and scorer version lets the job refuse a comparison that would otherwise blame a prompt for a judge
+upgrade. For the same reason, changes to `data/golden/**` or to scorer code should trigger the eval job
+too.
+
 ### Model changes are releases too
 Pin the model snapshot in the bundle. Run a scheduled "model upgrade" job that opens a PR with the new
 snapshot and the full eval when the provider announces a new version or a deprecation; treat a retrained
@@ -114,14 +124,17 @@ adapter arriving in the model registry the same way. The trigger differs; the la
 ## Example
 A PR-time smoke eval that sits as one job in the pipeline. The YAML fragment shows where it runs; the
 script shows the content-addressed cache wrapped around the model client and the comparison against the
-baseline written by the last green build of `main`. `call_app`, `llm_call` and `score` are your
-application's entrypoint (accepting an injected model client), your raw provider call and your scorer.
+baseline written by the last green build of `main`, refused if that baseline used a different dataset or
+scorer. `call_app`, `llm_call`, `score` and `SCORER_VERSION` are your application's entrypoint (accepting
+an injected model client), your raw provider call, your scorer and its version string. With a 100-item
+smoke set and a warm cache, a PR that edits one prompt used by 30 items pays for 30 application model calls
+(and 30 judge calls, if a judge scorer goes through the same cache), not 100 of each.
 
 ```yaml
 # .github/workflows/llm-ci.yml (fragment): trigger on anything that changes the bundle
 on:
   pull_request:
-    paths: ["app/**", "prompts/**", "release.json"]
+    paths: ["app/**", "prompts/**", "release.json", "data/golden/**", "evals/scorers/**"]
 jobs:
   smoke-eval:
     runs-on: ubuntu-latest
@@ -136,7 +149,9 @@ import hashlib, json, pathlib, sys
 
 bundle = json.load(open("release.json"))   # {"model": "vendor-model-2025-04-14", "prompt": "support_answer@v12", "params": {...}}
 subset = sys.argv[sys.argv.index("--subset") + 1]
-items = [json.loads(l) for l in open(f"data/golden/{subset}.jsonl")]
+data = pathlib.Path(f"data/golden/{subset}.jsonl").read_bytes()
+items = [json.loads(l) for l in data.splitlines()]
+yardstick = {"dataset": hashlib.sha256(data).hexdigest()[:12], "scorer": SCORER_VERSION}
 cache = pathlib.Path(".evalcache"); cache.mkdir(exist_ok=True)
 
 def cached_llm(messages):   # key = model + params + the exact rendered request, so any change that alters it misses
@@ -153,10 +168,12 @@ def run_item(item):
 
 results = [run_item(i) for i in items]
 mean = sum(r["score"] for r in results) / len(results)
-baseline = json.load(open("eval_baselines/main.json"))["mean"]   # written by the last green build of main
-json.dump({"bundle": bundle, "mean": mean, "items": results}, open("eval_out.json", "w"))  # stored as a build artifact
-print(f"candidate={mean:.3f} baseline={baseline:.3f} n={len(results)}")
-sys.exit(0 if mean >= baseline - 0.02 else 1)   # smoke tolerance; the release gate uses a paired CI instead
+base = json.load(open(f"eval_baselines/main-{subset}.json"))   # written by the last green build of main
+if base["yardstick"] != yardstick:                              # new items or a new judge: scores are not comparable
+    sys.exit("baseline was measured with a different dataset or scorer; re-baseline the champion first")
+json.dump({"bundle": bundle, "yardstick": yardstick, "mean": mean, "items": results}, open("eval_out.json", "w"))
+print(f"candidate={mean:.3f} baseline={base['mean']:.3f} n={len(results)}")
+sys.exit(0 if mean >= base["mean"] - 0.02 else 1)   # smoke tolerance; the release gate uses a paired CI instead
 ```
 
 ## Trade-offs
@@ -183,6 +200,8 @@ sys.exit(0 if mean >= baseline - 0.02 else 1)   # smoke tolerance; the release g
   is an incident whose timeline contains a prompt change with no PR, no eval and no author.
 - Using `-latest` model aliases in the bundle; the symptom is a score change on a day with no commits,
   traced eventually to a provider update.
+- Comparing against a baseline measured on an older golden-set or judge version; the symptom is every
+  PR failing (or passing) by the same few points the day the dataset grew, with no prompt to blame.
 
 ## When to use
 Introduce this the moment more than one person edits prompts or a prompt is deployed to real users:

@@ -5,7 +5,7 @@ name: Distributed systems
 kind: concept
 difficulty: core
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - system-design/data-consistency
   - system-design/exactly-once-processing-limitations
@@ -55,6 +55,20 @@ even one crashed process, no deterministic protocol can guarantee that agreement
 result). Working systems live between those poles, and knowing where is the skill this lesson orients.
 
 ## How it works
+### System models: what you assume can go wrong
+Every protocol is correct only under a stated model, so name it before trusting a design. On faults:
+**crash-stop** (a node halts and never returns), **crash-recovery** (it halts and comes back, possibly
+having lost in-memory state but keeping its disk, which is the realistic case for a restarted pod), and
+**Byzantine** (nodes may lie; relevant to blockchains and adversarial settings, almost never inside one
+company's backend). On timing: **synchronous** (known bounds on delay and pauses, which real networks do
+not give you), **asynchronous** (no bounds at all, the setting of the FLP result) and **partially
+synchronous** (bounds hold most of the time but can be violated for unknown periods). Practical systems
+assume crash-recovery and partial synchrony, and split their guarantees accordingly: **safety** (nothing
+bad ever happens, such as two leaders committing conflicting entries) must hold under any timing, while
+**liveness** (something good eventually happens, such as a leader being elected) is promised only while
+the network behaves. Raft is built this way, which is how it coexists with FLP: timeouts drive elections
+and can stall progress, but they never make two nodes commit different values.
+
 ### Failure detection is a timeout
 Machines do not announce their deaths. A heartbeat or request that gets no answer within *T* is the
 only signal, and it conflates a dead node, a partitioned network, an overloaded node and a paused
@@ -78,7 +92,12 @@ across nodes, asynchronous ones create **replication lag**, the window in which 
 returns stale data. **Multi-leader** and **leaderless** designs accept writes in many places and must
 resolve conflicts. Leaderless (Dynamo-style) systems use quorums: with *N* replicas, writing to *W* and
 reading from *R* such that *W + R > N* guarantees at least one replica in every read saw the latest write,
-which is how availability is traded against the size of the quorum.
+which is how availability is traded against the size of the quorum. With *N = 3, W = 2, R = 2* the system
+tolerates one replica down for both reads and writes. The overlap is necessary but not sufficient for
+"always read the latest": concurrent writes still need a rule to pick a winner, a write that reached
+fewer than *W* replicas is reported as failed yet is not rolled back on the replicas it did reach, and
+"sloppy" quorums that accept writes on fallback nodes during outages break the overlap. Quorum reads
+give you probably-fresh data, not linearizability, unless the system adds more machinery.
 
 ### Partitioning
 When data outgrows one node it is split by key. The partition key decides which operations stay local
@@ -88,8 +107,12 @@ id is often a poor sole key for an AI platform.
 
 ### Consensus and leases
 Some decisions need all nodes to agree: who is the leader, what is the next log entry, who holds a lock.
-Raft solves this with terms, leader election and majority-replicated logs; a majority quorum tolerates
-the failure of fewer than half the nodes. Systems such as etcd and Consul (Raft) and ZooKeeper (its own
+Raft solves this with terms, leader election and majority-replicated logs. A cluster of *2f + 1* nodes
+tolerates *f* failures, *because* any two majorities overlap in at least one node: the majority that
+elects a new leader always contains a node holding every committed entry, and Raft's voting rule
+refuses any candidate whose log is behind the voter's, so committed entries survive leader changes.
+Three nodes survive one failure, five survive two, and a fourth node adds cost without adding
+tolerance. Systems such as etcd and Consul (Raft) and ZooKeeper (its own
 Zab protocol, same majority principle) package consensus so applications store small, critical state (configuration, leadership, locks) there and keep bulk data
 elsewhere, *because* each consensus write costs a majority round trip. Locks and leadership are granted
 as **leases** with an expiry, since a holder that dies must not hold the lock forever. The subtle part is
@@ -181,6 +204,9 @@ lock when it started.
   blips, impossible to reproduce and blamed on "a race".
 - Reading from a replica immediately after writing to the leader; users report that their upload or
   setting "disappeared" and then reappears seconds later.
+- Treating a quorum store with *W + R > N* as linearizable; during a slow or partially failed write,
+  one client reads the new value and a moment later another reads the old one, an anomaly that only
+  appears under load or replica failure.
 - Running consensus-backed stores with an even number of nodes or across two data centres; a clean split
   leaves neither side with a majority and the whole cluster unavailable.
 

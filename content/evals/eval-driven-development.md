@@ -5,7 +5,7 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -54,7 +54,8 @@ from the specification alone.
 ## How it works
 ### The loop
 1. **Define before building.** With the domain owner, write the task, the acceptance criteria (metric,
-   threshold, and the slices on which it must hold), and a handful of hand-written good and bad outputs.
+   threshold, and the slices on which it must hold), the budgets that are also requirements (p95
+   latency, cost per request, benign refusal rate), and a handful of hand-written good and bad outputs.
    Doing this before seeing model outputs matters *because* criteria written afterwards anchor on
    current behaviour; Shankar et al. observed this drift in people grading outputs.
 2. **Seed the golden set.** A few dozen items (an illustrative size) covering the main input types and
@@ -75,11 +76,28 @@ from the specification alone.
 7. **Ship and close the loop.** Sample production traces back into the golden set; use online metrics to
    check that the offline score still predicts what users experience.
 
+### One iteration, concretely
+An illustrative round: a user reports that the assistant quotes the 30-day refund window to customers
+on the annual plan, whose window is 14 days. The engineer first adds six items for annual-plan refund
+questions and runs the current system: 1 of 6 passes, so the bug is now a failing eval rather than an
+anecdote. The fix, adding plan tier to the retrieval filter, is one change. The eval diff on the
+pull request then reads: the six new items 1 → 6 passing; across the other 194 items, 3 improved, 2
+regressed, mean 0.81 → 0.84; every slice still above its floor. The reviewer reads the two regressed
+traces, finds one is noise (it passes on re-run) and one is a real loss on a question spanning both
+tiers, adds that case as an item, and the next iteration starts from there. Nothing in this loop
+required anyone to have "tried it in the playground".
+
 ### Why thresholds rather than exact assertions
 Because of sampling noise, an item may pass seven times in ten. Temperature zero reduces but does not
 remove variance. So the gate runs *k* samples per item and compares against the previous accepted run
 with a tolerance band, and lists per-item regressions rather than asserting 100%. A flaky gate is worse
 than none, *because* people learn to re-run it until it is green.
+
+Compare runs *paired*, item by item, rather than as two independent means. Most of the variance in a
+pass rate comes from which items are hard, and that variance is identical in both runs, so the
+per-item difference (candidate minus baseline) has a much smaller spread than either mean. A paired
+test, or simply counting items that flipped in each direction, detects a real 2-point change on a set
+where comparing two unpaired means could not.
 
 ### Keeping the evals honest
 Keep a held-out subset you rarely inspect, *because* tuning a prompt against the items you look at
@@ -151,7 +169,8 @@ now and then. A larger set, or a paired per-item test, narrows it.
 - A tolerance band absorbs sampling noise but lets slow drift through across many small accepted drops;
   pair the gate with a trend chart across runs.
 - Deterministic graders are cheap and trustworthy but cover only part of quality; judge graders cover
-  the rest at the cost of calibration work and per-run spend.
+  the rest at the cost of calibration work and per-run spend. Use a judge in the gate only once its
+  agreement with human labels has been measured; until then it informs review but should not block.
 - Holding out items prevents overfitting but means you cannot freely inspect their failures; rotate
   items between the dev and held-out sets periodically.
 

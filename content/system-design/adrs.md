@@ -5,7 +5,7 @@ name: ADRs (architecture decision records)
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - system-design/trade-off-analysis
   - system-design/nfrs
@@ -83,7 +83,24 @@ is never edited except for status; changing a decision means writing a new ADR t
 one and linking both ways. This immutability is the feature: the history of why the system looks the
 way it does is the chain of records. Keep each to one or two pages and write it at decision time; an
 ADR reconstructed months later is a story, not a record. Link ADRs from the C4 diagrams and README so
-the "why" is one click from the "what".
+the "why" is one click from the "what". A longer design doc or RFC often comes first: it explores the
+space and may run to ten pages; the ADR is the one-page outcome that links back to it. Tooling is
+optional, since a numbered Markdown file is enough; tools such as adr-tools or log4brains only script the
+numbering, linking and index.
+
+### Who decides, and how a decision stays true
+An ADR also records *decision rights*: the Deciders line says who could accept it. Some teams route every
+significant decision through an architect; others use an advice process, in which anyone may decide after
+consulting the people affected and those with expertise, and the ADR is the evidence that the advice was
+sought. Either works if it is written down; what fails is an unstated rule that surfaces as a veto after
+merge.
+
+An accepted decision that nothing checks decays quietly: six months later someone imports the provider
+SDK directly "just for this one feature" and the gateway decision is void without anyone deciding so.
+MADR's **confirmation** section exists for this. Wherever possible, confirm with an automated check,
+what *Building Evolutionary Architectures* calls a fitness function: an import-lint rule, a CI test, a
+policy-as-code rule, or a dashboard alert. A decision with an automated confirmation is enforced; one
+without is a suggestion.
 
 ### What AI systems add to the template
 - **Evidence snapshot.** The evaluation set version and the scores, latency percentiles and cost per
@@ -107,7 +124,8 @@ with no ADRs behind it is a snapshot nobody can question.
 ## Example
 A MADR-style record for a decision almost every AI team makes early. The figures are illustrative
 scenario values, not benchmarks; the point is the structure: neutral context, real options, named
-drivers, honest negative consequences, an evidence snapshot and explicit revisit triggers.
+drivers, honest negative consequences, an evidence snapshot, an automated confirmation and explicit
+revisit triggers.
 
 ```markdown
 # ADR-0007: Serve v1 through a hosted model API behind our own gateway
@@ -134,6 +152,9 @@ caching and per-tenant metering. We will not self-host any generation model in v
 - Harder: per-token cost grows linearly with usage; dependence on provider rate limits and uptime;
   residency relies on the provider's EU endpoint and DPA.
 - Follow-up: contract tests against the gateway interface; monthly cost and quality review.
+
+**Confirmation.** CI import rule: only `gateway/` may import a provider SDK; provider keys exist only in
+the gateway's secret scope.
 
 **Evidence at decision time.** Golden set v3 (312 cases): hosted model faithfulness 0.91 vs best
 open-weight candidate 0.84; p95 TTFT 0.9 s vs 1.3 s on a single GPU under load test. Illustrative.
@@ -166,6 +187,8 @@ provider price changes by more than 30%.
   generations old because "there is an ADR", with no way to tell whether its reasons still hold.
 - No revisit trigger; the symptom is the same, discovered only when a competitor's cost per conversation
   is a third of yours.
+- Accepting a decision with no confirmation mechanism; the symptom is code that contradicts an accepted
+  ADR (a direct provider call, a second vector store) discovered months later during an incident.
 - Storing ADRs in a wiki away from the code; the symptom is that nobody updates status, and engineers
   learn about a decision from the code rather than the record.
 

@@ -5,7 +5,7 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/chunk-overlap
@@ -78,6 +78,18 @@ retrieval and auto-merging retrievers in common frameworks.
   unit carries its own subject and no dangling references. Research on this (Chen et al., 2023)
   reports gains on question answering at the cost of an LLM pass over the whole corpus at indexing
   time.
+- **Multi-vector (late interaction):** the finest match granularity is the token. ColBERT-style models
+  keep one vector per token and score a passage by summing, over query tokens, each one's best match
+  among the passage tokens. The returned unit stays the passage, so this is decoupling taken to its
+  limit: matching sees fine detail without a separate parent lookup, paid for with an index that holds
+  one vector per token instead of one per chunk.
+
+### Making the small unit self-sufficient
+A sentence like "The cap is twelve months of fees" embeds well only if the vector knows *which* cap.
+Small units therefore benefit most from carrying context into their own embedded text: the heading
+path, the document title, or a short generated description of where the span sits (contextual
+retrieval). The rule of thumb is that the finer the match unit, the more it depends on this, because
+a sentence has less of its own context to lean on than a 500-token passage.
 
 ### Scoring parents
 Max-child scoring is simple and favours sections with one strongly matching sentence; sum or

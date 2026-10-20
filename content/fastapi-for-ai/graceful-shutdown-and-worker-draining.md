@@ -5,6 +5,7 @@ name: Graceful shutdown & worker draining
 kind: practice
 difficulty: advanced
 est_minutes: 15
+status: fact-checked
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/uvicorn-gunicorn-workers
@@ -47,8 +48,9 @@ window and refuses them. Graceful shutdown is the protocol that sequences these 
 - **SIGTERM:** "please stop". Uvicorn and Gunicorn treat it as a graceful shutdown.
 - **SIGKILL:** sent by the orchestrator when the grace period expires. It cannot be caught; nothing after
   it runs, including lifespan shutdown.
-- On Kubernetes, `terminationGracePeriodSeconds` (default 30) is the whole budget from SIGTERM to SIGKILL,
-  and it includes the `preStop` hook.
+- On Kubernetes, `terminationGracePeriodSeconds` (default 30) is the whole budget from the start of
+  termination to SIGKILL. The clock starts when the `preStop` hook starts (SIGTERM is sent only after the
+  hook returns), so the hook's duration is taken out of the same budget.
 
 ### The sequence
 1. **Stop new traffic first.** A `preStop` hook (often a short sleep of a few seconds) delays SIGTERM so
@@ -57,7 +59,9 @@ window and refuses them. Graceful shutdown is the protocol that sequences these 
    that polls `/readyz` does not know, and the app itself does not learn about SIGTERM until lifespan
    shutdown, which runs only *after* draining. So the preStop hook can also tell the app it is draining
    (for example a local `POST /internal/drain` that sets a flag): readiness then fails, and long streams
-   know a cutoff is coming.
+   know a cutoff is coming. An in-memory flag is per process: with several workers in one pod, a single
+   request reaches only one of them, so either run one worker per pod or have the hook touch a file
+   (`/tmp/draining`) that every worker's readiness check reads.
 2. **Stop accepting, keep serving.** On SIGTERM, Uvicorn closes the listening socket, closes idle
    keep-alive connections, and waits for in-flight requests to finish. `--timeout-graceful-shutdown`
    bounds that wait; without it Uvicorn waits indefinitely and leaves the bound to SIGKILL. Under
@@ -85,9 +89,11 @@ Three strategies, in order of robustness:
   answer. This must happen before the server's drain timeout; after that the connection is just closed.
 
 ### Containers
-The process must actually receive the signal. A Dockerfile `CMD` in shell form runs the server under
-`/bin/sh`, which by default does not forward SIGTERM to the child, so the server is SIGKILLed after the
-grace period with no drain at all. Use the exec form (`CMD ["uvicorn", ...]`) or an init process.
+The process must actually receive the signal. A Dockerfile `CMD` in shell form wraps the server in
+`/bin/sh -c`; the shell becomes PID 1 and does not forward SIGTERM to a child, so the server is SIGKILLed
+after the grace period with no drain at all. Some shells exec a single simple command directly, which
+hides the bug until someone adds `&&` or a second command, so do not rely on it. Use the exec form
+(`CMD ["uvicorn", ...]`), `exec` in an entrypoint script, or an init process such as tini.
 
 ## Example
 A timeline for an SSE chat service whose answers take up to 50 seconds, on a rolling deploy.

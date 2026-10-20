@@ -5,6 +5,7 @@ name: Outlines
 kind: tool
 difficulty: advanced
 est_minutes: 15
+status: reviewed
 related:
   - python-for-ai/instructor
   - python-for-ai/pydantic
@@ -56,15 +57,23 @@ which is too slow. Outlines' contribution was making the check effectively a loo
    sample (greedy, temperature, whatever you configured) from the survivors, then follow the transition
    to the next state. Per-step overhead is a lookup and a mask, not a vocabulary scan.
 
+Formally, with allowed set A(s) in state *s*, the sampled distribution is
+`p'(t) = p(t) · 1[t ∈ A(s)] / Σ_{u ∈ A(s)} p(u)`: the model's probabilities restricted to legal tokens and
+renormalized. Building the index costs roughly (number of FSM states) × (vocabulary size) × (average token
+length) character steps. That is why a schema with long enumerations or many optional fields, which
+multiplies states, takes visibly longer to compile than a two-field one, and why the work happens once.
+
 Working at the token level, not the character level, matters *because* tokens span several characters:
-the token `"name"` might move the FSM four characters forward in one step, and the index records that.
+a single token such as `name` moves the FSM four characters forward in one step, and the index records
+that, including tokens that are valid only because they straddle a boundary such as `":"`.
 
 ### Grammars
 Regular expressions cannot describe arbitrarily nested structures. JSON with recursive schemas, or
 code in a programming language, needs a context-free grammar, which requires a pushdown automaton
 (a state plus a stack). Outlines supports grammar-constrained generation too, but it is costlier and
 less mature than the regex path; engines such as vLLM also offer alternative grammar backends for this
-reason.
+reason. Outlines' own core was later rewritten as a separate `outlines-core` package, and recent
+versions can delegate to other backends; which one runs is a version detail to check.
 
 ### Where it runs
 Outlines wraps local model runtimes (Hugging Face Transformers, llama.cpp, MLX and others) and its core
@@ -75,7 +84,19 @@ Schema)`; the 1.x API passes the output type when calling the model), so check t
 ### What constraining does to quality
 Masking renormalizes probability over the allowed tokens. If the model strongly wanted a token you
 forbade, it is pushed onto a path it considered unlikely, and the content on that path can be worse even
-though the format is perfect. Constraints guarantee syntax, never correctness.
+though the format is perfect. Two mechanisms make this worse than it sounds:
+- **The mask is greedy, not look-ahead.** It only asks "can this token still lead to a valid string?",
+  not "is this a good continuation?". If the model's mass sits on prose like `Sure! {"intent"...`, the
+  mask removes `Sure` and the model is renormalized into a state it was not planning for. Describing the
+  format in the prompt (or showing an example) keeps the model's own preference aligned with the mask, so
+  little probability is removed.
+- **Non-canonical tokenization.** The index allows any token sequence that spells a valid string, including
+  splits the tokenizer would never produce for that text (for example `"` + `int` + `ent` where training
+  data always had `"intent`). The model has rarely seen such sequences, so its later predictions degrade.
+  Mature implementations handle forced boundaries carefully; it is still a reason to measure accuracy, not
+  just parse rate.
+
+Constraints guarantee syntax, never correctness.
 
 ## Example
 A worked scenario: classifying 50,000 support tickets on a self-hosted 7B model into
@@ -84,8 +105,9 @@ A worked scenario: classifying 50,000 support tickets on a self-hosted 7B model 
 Unconstrained with a careful prompt, suppose 4% of outputs fail to parse (an illustrative figure; measure
 your own). With parse-and-retry, 2,000 tickets need at least one more generation, some need several, and
 the p99 latency is now two or three generations long. With Outlines, the JSON Schema compiles once into an
-index. The model can only emit `{"intent":"`, then the first token of one of the six labels, then the
-closing quote, `,"urgent":`, then `true` or `false`, then `}`. Every output parses; no retries exist.
+index. Apart from whatever optional whitespace the generated pattern permits, the model can only emit
+`{"intent":"`, then the tokens of one of the six labels, then the closing quote, `,"urgent":`, then
+`true` or `false`, then `}`. Every output parses; no retries exist.
 
 Two more things happen. First, the model emits far fewer free tokens: most of the structure is forced, and
 when only one token is allowed in a state there is nothing to sample, and some implementations append
@@ -127,8 +149,11 @@ print(Ticket.model_validate_json(raw))   # always parses; may still be the wrong
   accuracy on a labelled set, because format and truth are different properties.
 - Putting the answer field before any reasoning field; the label is committed first, and the symptom is
   lower accuracy than the same model achieves in free-form chain-of-thought.
-- Copying tutorial code across major versions; the API was reorganised, and the symptom is
-  `AttributeError` on `outlines.generate` or `outlines.models` after an upgrade.
+- Copying tutorial code across major versions; the API was reorganised (the `outlines.generate.*`
+  functions and the old `outlines.models.transformers(...)` loader are pre-1.0 idioms), and the symptom
+  is `AttributeError` or `TypeError` on those calls after an upgrade.
+- Constraining the output without describing the format in the prompt; the mask then fights the model's
+  preferred opening, and the symptom is valid JSON with odd or degenerate field values on easy inputs.
 - Forgetting the chat template for instruct models; passing a bare prompt degrades quality, which shows
   up as worse labels than the same model gives through its usual chat interface.
 

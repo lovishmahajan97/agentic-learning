@@ -4,7 +4,8 @@ module: scoping
 name: Rapid prototyping / PoC
 kind: practice
 difficulty: core
-est_minutes: 13
+est_minutes: 14
+status: reviewed
 related:
   - scoping/timeboxing
   - scoping/demos
@@ -46,7 +47,9 @@ A **prototype** tests the experience: the workflow, the interaction, what output
 be crude, even partly faked (a "Wizard of Oz" prototype where a person produces the "AI" output behind the
 scenes), *because* the question is about the human, not the model. A **PoC** tests technical feasibility:
 it must use the real model, real data and a real metric, *because* faking any of those invalidates the
-answer. Mixing the two questions into one build usually answers neither well.
+answer. Mixing the two questions into one build usually answers neither well. Neither is a pilot (real
+users doing real work, measuring business impact) or an MVP (the smallest version you would actually
+ship and support); a PoC that passes earns a pilot, not a launch.
 
 ### 1. Find the riskiest assumption
 List what must be true for the project to succeed (the data is accessible, the model can read these
@@ -62,16 +65,36 @@ need, *because* "it works pretty well" cannot be passed or failed.
 ### 3. Build the eval set from real data first
 Collect real inputs, including messy ones, and label expected outputs with domain experts. Fifty to a few
 hundred examples is a common scale for a PoC, enough to see error categories, though small sets give
-wide confidence intervals. This comes first *because* every later decision is read off this set.
+wide confidence intervals. This comes first *because* every later decision is read off this set. Size it
+with the binomial interval for a measured accuracy *p* on *n* examples:
+
+```
+95% half-width ≈ 1.96 × sqrt(p(1 − p) / n)
+n ≈ 1.96² × p(1 − p) / E²     (examples needed for half-width E)
+```
+
+At *p* = 0.85, 100 examples give about ±7 points and 400 give about ±3.5; resolving ±3 points needs
+roughly 550. If the business threshold and the likely result are close, the set has to be large; if
+they are far apart, 100 is plenty.
+
+Split the set before tuning: a *dev* portion you read and iterate on, and a *held-out* portion nobody
+looks at until the readout. Every prompt change chosen because it fixed dev failures fits the system to
+those examples, so the dev score drifts upward faster than true accuracy; the held-out number is the one
+the decision uses.
 
 ### 4. Build the thinnest end-to-end slice
 Wire input to output with the least code possible. Start with the strongest available model to establish
-the ceiling, *because* if the best model cannot do it, cheaper ones will not; cost optimization comes
-after feasibility.
+the ceiling, *because* if the best general-purpose model cannot do it with your prompt and retrieval,
+cheaper off-the-shelf models almost certainly will not; cost optimization comes after feasibility. The
+ceiling is approach-specific, not absolute: fine-tuning, a specialized component (say, a dedicated OCR or
+table parser) or a redesigned pipeline can beat it, so a failed PoC rules out the approach tested, not
+the use case.
 
 ### 5. Iterate with error analysis, inside a timebox
-Read failures, group them, fix the largest group, re-run. Stop when the threshold is met, the curve
-flattens, or the box closes.
+Read failures on the dev split, group them, fix the largest group, re-run. Largest group first *because*
+fixes are roughly one category at a time, so the biggest category is the biggest available gain. Track
+latency and cost per example alongside accuracy, since a design that passes on quality but takes 40
+seconds per answer has not passed. Stop when the threshold is met, the curve flattens, or the box closes.
 
 ### 6. Write the findings and decide
 Record the result, the error breakdown, what was stubbed, and what production would require. Decide:
@@ -83,7 +106,7 @@ A minimal PoC harness: real labeled examples, one function under test, a pre-wri
 decision printed at the end. The model call is a placeholder for whichever provider SDK you use.
 
 ```python
-import json, collections
+import json, math, collections, time
 
 THRESHOLD = 0.85  # written down before any tuning, from the business requirement
 
@@ -99,27 +122,35 @@ def judge(pred: str, expected: str) -> bool:
     """Start with expert labels or a strict string/regex check; add an LLM judge later if needed."""
     return expected.lower() in pred.lower()
 
-def run_poc(path: str = "eval_set.jsonl") -> None:
-    rows = [json.loads(line) for line in open(path)]   # {"q", "expected", "category"}
-    errors = collections.Counter()
-    correct = 0
+def run_poc(path: str = "eval_set.jsonl", split: str = "dev") -> None:
+    rows = [json.loads(l) for l in open(path)]           # {"q", "expected", "category", "split"}
+    rows = [r for r in rows if r["split"] == split]      # iterate on dev; read held-out once
+    errors, correct, secs = collections.Counter(), 0, []
     for r in rows:
+        t0 = time.monotonic()
         pred = call_model(r["q"], retrieve(r["q"]))
+        secs.append(time.monotonic() - t0)
         if judge(pred, r["expected"]):
             correct += 1
         else:
             errors[r["category"]] += 1
-    acc = correct / len(rows)
-    print(f"accuracy {acc:.1%} on {len(rows)} real examples (threshold {THRESHOLD:.0%})")
+    n = len(rows); acc = correct / n
+    half = 1.96 * math.sqrt(acc * (1 - acc) / n)          # binomial 95% half-width
+    p95 = sorted(secs)[int(0.95 * (n - 1))]
+    print(f"[{split}] accuracy {acc:.1%} ±{half:.1%} on {n} real examples, p95 {p95:.1f}s")
     print("errors by category:", errors.most_common())
-    print("DECISION:", "proceed to pilot" if acc >= THRESHOLD else "pivot or stop; see error categories")
-
-if __name__ == "__main__":
-    run_poc()
+    if split == "heldout":
+        verdict = ("pass" if acc - half >= THRESHOLD else
+                   "fail" if acc + half < THRESHOLD else "inconclusive: need more data")
+        print("DECISION:", verdict)
 ```
 
-The design choices are the point: the threshold is a constant set before the loop, errors are grouped by
-category so the next iteration targets the biggest one, and the output is a decision, not a vibe.
+The design choices are the point: the threshold is a constant set before the loop; errors are grouped by
+category so the next iteration targets the biggest one; latency is measured, not assumed; and the
+decision is only printed for the held-out split, with an explicit "inconclusive" band when the interval
+straddles the threshold. Run on a 200-example held-out split, 88% gives about ±4.5 points, so the verdict
+is "inconclusive" against 85%, which is the honest answer and tells you to label more data, not to
+celebrate.
 
 ## Trade-offs
 - Disposable prototypes are fast because they ignore quality, but teams are tempted to ship them; keep
@@ -142,6 +173,8 @@ category so the next iteration targets the biggest one, and the output is a deci
   well-received demo followed by months of silence.
 - Shipping the prototype code into production because "it already works", which brings hard-coded
   credentials, no retries and no tests; the symptom is the first production incident.
+- Tuning and reporting on the same examples, so the reported accuracy is fitted to the eval set; the
+  symptom is a readout number several points above what a fresh sample or the pilot shows.
 
 ## When to use
 Build a prototype when the main unknown is what users need or how they will interact; build a PoC when
@@ -180,10 +213,11 @@ untested. Otherwise the PoC passes and the pilot fails on the very data the cura
 ### Q: Why start a PoC with the strongest available model rather than the cheapest?
 - [ ] Cheap models are not allowed on customer data
 - [ ] The strongest model is always cheapest per correct answer
-- [x] It establishes the ceiling: if the best model fails, cheaper ones will too, and cost can be optimized later
+- [x] It establishes a ceiling for the approach: if the best model fails, cheaper off-the-shelf ones almost certainly will too
 - [ ] Strong models need no evaluation set
-> Feasibility first: the strongest model bounds what is achievable. The exception is when cost itself is the
-> riskiest assumption, in which case it must be tested directly.
+> Feasibility first: the strongest model bounds what this prompt-and-retrieval approach can achieve, and cost
+> can be optimized later. The exception is when cost itself is the riskiest assumption, in which case it
+> must be tested directly. Fine-tuning or specialized components can still exceed that ceiling.
 
 ### Q: A PoC reaches 86% against an 85% threshold on 100 examples. What is the soundest conclusion?
 - [ ] The PoC has clearly passed and the team should commit to full production

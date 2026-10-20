@@ -5,7 +5,7 @@ name: Typed tool contracts
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - agents/tool-schemas-and-argument-validation
   - agents/tool-result-interpretation
@@ -60,6 +60,10 @@ also why cross-process protocols such as MCP transport tools as schemas rather t
 4. **Metadata the harness uses.** Side-effect class (read-only, idempotent write, destructive),
    whether the tool is safe to run in parallel, a timeout, perhaps a cost tag. The model never sees
    these; the harness uses them to decide gating, concurrency and retries without parsing descriptions.
+   For writes, the contract should also say how a retry is made safe: the harness derives an
+   idempotency key (for example from the `tool_use` id) and passes it to the handler, *because* a
+   `transient` error after the downstream system committed the write is indistinguishable, from the
+   harness's side, from one before it, and only a key lets the retry be a no-op instead of a double charge.
 
 ### Derivation, not duplication
 A registry maps each tool name to its contract. At startup the registry produces the provider-format
@@ -158,6 +162,16 @@ def search_orders(args: SearchOrdersIn) -> dict:
 SEARCH = Tool("search_orders", "Find a customer's orders. Call when the user asks about their "
               "orders without giving an order id.", SearchOrdersIn, SearchOrdersOut, search_orders)
 ```
+
+What the three outcomes look like to the model. `{"customer_id": "C-10492", "status": "shipped"}`
+returns `{"orders": [{"order_id": "O-1", ...}], "total_matches": 1, "truncated": false}`: the same keys
+in the same order on every call, so "nothing matched" (`total_matches: 0`) can never be confused with
+"the tool broke". `{"customer_id": "C-10492", "limit": 100}` returns an error result of kind
+`invalid_argument` naming `limit` and the bound of 50, which the model can fix in one retry.
+`{"customer_id": "C-99999"}` returns `not_found` with `retryable: false`, which tells the model to ask
+the user for the right id rather than call again. If a later refactor made `search_orders` return
+`total` instead of `total_matches`, the output check would turn that into an `internal` error on the
+first call, and your alerting, not a customer, would notice.
 
 ## Trade-offs
 - One source of truth prevents drift, but it couples the model-facing schema to internal types; when

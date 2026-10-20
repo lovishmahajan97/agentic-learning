@@ -5,6 +5,7 @@ name: Cloud AI architecture (AWS Bedrock, Azure OpenAI, Vertex AI)
 kind: concept
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - infra-capacity-economics/api-provider-quotas-and-regional-limits
   - infra-capacity-economics/hybrid-on-prem
@@ -37,7 +38,8 @@ answer to every one of them for its cloud provider: IAM or Entra identities, pri
 audit logging, consolidated billing against a committed spend, and a signed compliance package.
 
 The cloud AI platforms exist to let the model inherit those answers. A request to Bedrock is a
-SigV4-signed AWS API call over a VPC endpoint, logged to CloudWatch, billed on the AWS invoice. An
+SigV4-signed AWS API call that can travel over a VPC endpoint, with opt-in model invocation logging
+to CloudWatch Logs or S3, billed on the AWS invoice. An
 Azure OpenAI deployment is a resource in a resource group with Entra RBAC, a private endpoint and
 diagnostic settings. A Vertex AI call is a Google Cloud API call under a project's IAM, VPC Service
 Controls and Cloud Audit Logs. From the security reviewer's point of view, the model becomes "just
@@ -64,7 +66,8 @@ All three platforms present the same architectural layers, and your design decis
 3. **Model catalog and endpoint.** Bedrock offers models from several vendors (Amazon's own,
    Anthropic, Meta, Mistral and others) behind one API, with the Converse API as the model-agnostic
    interface. Azure OpenAI hosts OpenAI models, and you create a named *deployment* of a model
-   version with a capacity setting; the wider Azure AI Foundry catalog adds other vendors' models.
+   version with a capacity setting; the wider Azure AI Foundry catalog (since rebranded Microsoft
+   Foundry; these product names change often) adds other vendors' models.
    Vertex serves Gemini natively and partner models (Anthropic, Meta, Mistral and others) through
    Model Garden. Decision: which models, which versions, pinned how.
 4. **Capacity model.** Two modes everywhere, with different names. Pay-as-you-go shares a regional
@@ -100,11 +103,14 @@ All three platforms present the same architectural layers, and your design decis
   region and request increases early, since increases are tickets, not API calls.
 - **SDK shape.** Bedrock has its own SDK (boto3) and the Converse API, plus vendor SDKs that
   support Bedrock as a backend; Azure OpenAI uses the OpenAI SDK with an Azure client where
-  `model` means the deployment name; Vertex uses the Google Gen AI SDK or vendor SDKs with a Vertex
+  `model` means the deployment name (Azure has also added a versionless "v1" endpoint usable from
+  the standard OpenAI client, so check which style the current docs recommend); Vertex uses the Google Gen AI SDK or vendor SDKs with a Vertex
   backend. An internal gateway or an abstraction such as LiteLLM usually hides this so that
   application code is not rewritten when a model moves.
 - **Version pinning and retirement.** Each platform retires model versions on its own schedule;
-  Azure deployments can be set to auto-upgrade or pinned, Bedrock and Vertex pin by model id.
+  Azure deployments can be set to auto-upgrade or pinned, Bedrock and Vertex pin by model id. A pin
+  is not forever: when a pinned version reaches its retirement date you must migrate (or, on Azure,
+  you may be upgraded), so the retirement calendar is part of the plan.
   Unplanned upgrades change behaviour under your evals, so pinning plus a scheduled re-evaluation
   is the safe pattern.
 
@@ -216,8 +222,9 @@ risks you would raise.
 application's VNet, with Entra ID identities and diagnostic logging to the bank's workspace. Check
 model availability in that region first, then request quota early; for the latency target, size
 provisioned throughput for peak and keep a pay-as-you-go deployment for overflow, or accept 429s
-with queueing if the SLO allows. Use a regional Standard deployment and avoid Global or Data Zone
-types unless legal confirms the geography satisfies residency. Pin the model version and schedule
+with queueing if the SLO allows. Use regional deployment types (regional Standard and regional
+Provisioned) and avoid Global types; an EU Data Zone deployment keeps processing inside the EU and
+may be acceptable, but only if legal confirms that the wider geography satisfies the residency rule. Pin the model version and schedule
 re-evaluation before any upgrade. Confirm the abuse-monitoring retention terms and apply for the
 exemption if required. Put all calls behind a gateway so a second region or provider can be added
 as fallback. The biggest risks are quota lead time, model availability in the region, and

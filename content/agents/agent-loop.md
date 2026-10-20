@@ -5,7 +5,7 @@ name: Agent loop
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agents/tool-calling
   - agents/workflows-vs-agents
@@ -82,11 +82,26 @@ finished; treat it as a failure to retry, never as a result to execute.
 The model is stateless, so every iteration sends the entire history. Over *n* steps the tokens
 processed grow roughly as 1 + 2 + … + n, quadratic in the number of steps. Prompt caching makes this
 affordable *because* the history is append-only: the cached prefix stays valid and only the new tail
-is processed. This is why harnesses never edit earlier messages in place; an edit invalidates the cache
-from that point onward. Reasoning output adds a harder constraint on some APIs: Claude's thinking blocks
+is processed. Illustrative arithmetic: a 3,000-token system prompt plus tool definitions, and 1,500 new
+tokens of call-and-result per step, means step *k* sends about 3,000 + 1,500·*k* tokens. Twenty steps send
+roughly 20 × 3,000 + 1,500 × (1 + … + 20) ≈ 60k + 315k = 375k input tokens to produce a transcript whose
+final length is only ~33k. With caching, most of those 375k are cache reads billed at a fraction of the
+normal rate; without it, every one is processed and billed in full. This is why harnesses never edit
+earlier messages in place; an edit invalidates the cache from that point onward. Reasoning output adds a harder constraint on some APIs: Claude's thinking blocks
 carry a signature and must be passed back unmodified within a tool-use turn, and OpenAI's reasoning
 items are returned encrypted for the same reason, so tampering with them gets the request rejected. When the history must shrink, it is compacted explicitly (summarized, or old tool results
 cleared) as a separate, deliberate operation.
+
+### Stopping well
+A harness-imposed stop is not the same as a finished task, so what the loop returns matters. When a
+budget trips, the useful move is one last call with tools disabled (on the Claude API,
+`tool_choice: {"type": "none"}`) asking the model to report what it did, what it found and what is left,
+*because* a partial result with an honest status is actionable while a bare exception throws away every
+step already paid for. The return value should carry an explicit status (`completed`, `budget_exhausted`,
+`needs_human`, `error`) so the caller, not a string-matcher on prose, decides what happens next. Budgets
+are best set from measured traces (for example, the 95th-percentile step count of successful runs plus
+headroom) rather than guessed, since a budget below the typical successful path converts good runs into
+failures and one far above it only delays discovery of stuck ones.
 
 ### Where reasoning fits
 Before native tool calling, ReAct-style prompting made the model write "Thought / Action / Observation"

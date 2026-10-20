@@ -5,6 +5,7 @@ name: Async cancellation & exception propagation
 kind: concept
 difficulty: advanced
 est_minutes: 18
+status: fact-checked
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-await
@@ -60,9 +61,11 @@ that swallows it reports as completed, and whoever cancelled it (a timeout, a Ta
 shutting down) believes the cancellation failed or never happened.
 
 ### Timeouts are cancellation plus translation
-`asyncio.timeout(delay)` (3.11+) and the older `asyncio.wait_for` schedule a cancel of the current
-task at the deadline. When the resulting `CancelledError` reaches the `async with` exit, the context
-manager recognises it as its own and converts it into `TimeoutError`. That is why a swallowed
+`asyncio.timeout(delay)` (3.11+) schedules a cancel of the current task at the deadline. When the
+resulting `CancelledError` reaches the `async with` exit, the context manager recognises it as its own
+and converts it into `TimeoutError`. The older `asyncio.wait_for` is built on `asyncio.timeout` since
+3.12; before that it ran the awaitable as a separate inner task and cancelled that task instead, with
+the same cancel-then-translate shape. That is why a swallowed
 cancellation inside a timeout block makes the deadline silently not fire. Python 3.11 added
 `Task.cancelling()` and `Task.uncancel()` so these constructs can tell their own cancellation apart
 from one requested from outside.

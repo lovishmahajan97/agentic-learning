@@ -5,6 +5,7 @@ name: httpx
 kind: tool
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-await
@@ -46,8 +47,11 @@ layer you can swap for a mock in tests.
 pool of keep-alive connections, so repeated calls to the same host skip TCP and TLS handshakes, often the
 largest part of a short request's latency. That is *why* you create one client per process (or per
 upstream) and reuse it, closing it on shutdown with a context manager or `aclose()`. Pool size is set by
-`httpx.Limits(max_connections=..., max_keepalive_connections=...)`; when the pool is full, further
-requests wait for a free connection, and that wait has its own timeout.
+`httpx.Limits(max_connections=..., max_keepalive_connections=...)` (defaults 100 and 20); when the pool
+is full, further requests wait for a free connection, and that wait has its own timeout. The pool is
+therefore also your concurrency limit to that upstream: by Little's law, sustainable throughput is about
+`max_connections ÷ average request duration`, so 50 connections holding 10-second streams carry about 5
+requests per second, whatever the CPU could do.
 
 ### Timeouts are per phase
 `httpx.Timeout` separates **connect** (establishing the socket), **read** (waiting for the next chunk
@@ -60,8 +64,8 @@ a total deadline you wrap the call in `asyncio.timeout(...)` (or anyio's equival
 ### Streaming
 `client.stream("POST", url, json=...)` is a context manager that returns once headers arrive; you then
 iterate `aiter_bytes()`, `aiter_text()` or `aiter_lines()`. Leaving the context closes the response and
-returns the connection to the pool, *which is why* the context-manager form matters: an abandoned
-stream holds its connection until garbage collection.
+returns the connection to the pool, *which is why* the context-manager form matters: a streamed
+response that is never closed keeps its connection checked out of the pool.
 
 ### Behaviour that differs from requests
 - Redirects are **not** followed by default (`follow_redirects=True` to enable).
@@ -70,12 +74,20 @@ stream holds its connection until garbage collection.
   subclasses such as `ConnectError`, `ReadTimeout` and `PoolTimeout`.
 
 ### Transports
-Every client sends through a transport. `httpx.HTTPTransport(retries=n)` retries only connection
-failures, not HTTP 429 or 5xx, so application retries with backoff remain your job (Tenacity, or the
+Every client sends through a transport. `httpx.HTTPTransport(retries=n)` (or `AsyncHTTPTransport` for
+an `AsyncClient`) retries only failures to establish a connection, not HTTP 429 or 5xx, so application retries with backoff remain your job (Tenacity, or the
 SDK's built-in retries). `httpx.MockTransport(handler)` routes requests to a Python function, giving
 fast deterministic tests with no network. `httpx.ASGITransport(app=app)` sends requests straight into an
 ASGI app such as FastAPI, in-process. HTTP/2 needs the optional extra (`httpx[http2]`) and `http2=True`,
 and multiplexes many requests over one connection.
+
+### Hooks and SDK integration
+`event_hooks={"request": [...], "response": [...]}` runs your functions on every request and response,
+the usual place to add trace headers, log latency per upstream or redact payloads, *because* it covers
+every call made through the client, including calls an SDK makes for you. Provider SDKs accept a
+pre-built client (`OpenAI(http_client=httpx.Client(...))`, `AsyncOpenAI(http_client=httpx.AsyncClient(...))`)
+so you control proxies, certificates, limits and hooks; the SDK still applies its own timeout and retry
+settings on top, so set those on the SDK rather than assuming httpx's 5 s default is in force.
 
 ## Example
 Streaming an OpenAI-compatible completion with deliberate limits, a total deadline and a mock for tests.
@@ -111,8 +123,14 @@ async def main():
 asyncio.run(main())
 ```
 
-Drop the `transport=` argument and the same code talks to a real server; the 50-connection cap means a
-burst of 200 calls queues inside the pool instead of opening 200 sockets.
+Drop the `transport=` argument and the same code talks to a real server. Now walk the limits against a
+burst of 200 concurrent calls whose streams last about 8 s each. The first 50 get connections; the other
+150 wait in the pool. Throughput is 50 ÷ 8 ≈ 6 requests per second, so the burst takes about 32 s to drain
+and the last request would wait about 24 s for a connection. With `pool=2.0`, every request still waiting
+after 2 s fails with `PoolTimeout`, so roughly 150 of the 200 fail fast instead of queueing. That is a
+deliberate choice: fail fast and shed load (return 503, let the caller retry) versus a long pool timeout
+where users wait in line. Pick it consciously, and if you want queueing, put an explicit `asyncio.Semaphore`
+or job queue in front so the wait is visible and bounded, rather than hiding it in the pool.
 
 ## Trade-offs
 - One API for sync and async lets scripts, services and tests share code, but async only helps if every
@@ -125,6 +143,9 @@ burst of 200 calls queues inside the pool instead of opening 200 sockets.
   but adds a dependency and can concentrate load on one backend behind a connection-level load balancer.
 
 ## Pitfalls
+- Sizing `max_connections` for short calls, then routing long streamed completions through the same
+  client and short pool timeout; the symptom is bursts of `PoolTimeout` during spikes while the upstream
+  itself reports normal latency.
 - Creating a new `AsyncClient` per request; every call repeats the TLS handshake, and the symptom is
   higher latency plus "too many open files" or ephemeral-port exhaustion under load.
 - Keeping the 5 s default read timeout for LLM calls; long prompts or reasoning models delay the first
@@ -133,7 +154,8 @@ burst of 200 calls queues inside the pool instead of opening 200 sockets.
   which shows up as requests hanging for minutes without any timeout firing.
 - Expecting `HTTPTransport(retries=3)` to retry 429 or 503; it only retries connection failures, and the
   symptom is rate-limit errors surfacing straight to users.
-- Exiting a `stream()` block early without the context manager; connections leak, and the symptom is
+- Opening streams with `client.send(request, stream=True)` and abandoning the response without
+  `aclose()` (for example on an early `break` or exception); connections leak, and the symptom is
   `PoolTimeout` after a period of normal traffic.
 
 ## When to use
@@ -141,7 +163,8 @@ Use httpx whenever Python code makes HTTP calls in an AI system: direct calls to
 APIs, webhooks, and as the `http_client` you pass to provider SDKs to control proxies, timeouts and
 limits. Choose `AsyncClient` inside async frameworks and agents; the sync client is fine for scripts and
 batch jobs. Prefer `requests` only in legacy synchronous code where nothing else changes. Measure p50/p99
-latency per upstream, timeout counts per phase and pool wait time. In interviews, expect questions on why
+latency per upstream, time to first byte, timeout counts per phase, and pool wait time; pool wait rising
+while upstream latency is flat means your connection limit, not the provider, is the bottleneck. In interviews, expect questions on why
 a read timeout is not a deadline and why clients must be shared.
 
 ## Role lens
@@ -156,7 +179,8 @@ a read timeout is not a deadline and why clients must be shared.
 **Q:** Your service streams completions through httpx with `timeout=30`. Short prompts work; 100k-token
 prompts fail with `ReadTimeout`, and occasionally a request hangs for ten minutes. Explain both.
 **A:** A single number sets every phase, so read is 30 s between chunks. With a 100k-token prompt the
-server's prefill takes longer than 30 s before the first byte, so the read timeout fires. The ten-minute
+server's prefill, plus any queueing on a busy server, can take longer than 30 s before the first byte,
+so the read timeout fires. The ten-minute
 hang is the opposite case: once tokens flow, each chunk resets the read timer, so a stream that keeps
 trickling never trips it. Fix both by raising the read timeout to cover worst-case time to first token,
 and wrapping the whole call in `asyncio.timeout` for a total deadline, plus metrics on time to first

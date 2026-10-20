@@ -5,6 +5,7 @@ name: Problem decomposition
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - scoping/workflow-analysis
   - scoping/domain-modeling
@@ -115,9 +116,11 @@ for i, (name, tech, r) in enumerate(nodes):
 ```
 
 End-to-end success is about 75%, worse than any single node. Raising the classifier from 88% to 99% lifts
-the chain to about 85%; perfecting the ERP join adds almost nothing because it is already deterministic.
-That points effort at the classifier, perhaps by adding a fixed reason-code list, few-shot examples, or
-routing low-confidence cases to a human.
+the chain to about 85%, while raising the extractor to 99% reaches only about 80%; the ERP join is already
+at 99%, so the "improvement" there changes nothing. That points effort at the classifier, perhaps by adding
+a fixed reason-code list, few-shot examples, or routing low-confidence cases to a human. Treat the product
+as a rough guide, not a forecast: real failures are often correlated (a bad scan breaks both parsing and
+extraction), and a validator that catches an error before it propagates breaks the simple multiplication.
 
 ## Trade-offs
 - Fine-grained decomposition makes each node testable and replaceable, but adds interfaces, latency and

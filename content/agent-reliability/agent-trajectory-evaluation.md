@@ -5,7 +5,7 @@ name: Agent trajectory evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/task-completion-rate
   - agent-reliability/tool-call-success-rate
@@ -72,15 +72,20 @@ and a policy (forbidden tools, budgets).
    step. Judges are calibrated against human labels on a sample and used for diagnosis more than for gates.
 
 ### Repetition and the statistics
-Agent runs are high-variance, so a task is scored over N runs, not one. Two aggregates matter and they
-are different. pass@k is the probability that at least one of k attempts succeeds, which is the right
-number when a human or a verifier will pick the best attempt. pass^k is the probability that all k
-attempts succeed, which is the right number for an agent that runs unattended, because the user who gets
-attempt three does not care that attempt one would have worked. With per-run success p and independence,
-pass^k = p^k for that task: a task the agent solves 80% of the time is at about 51% for pass^3. The
-unbiased estimate from n trials with c successes on a task is C(c, k) / C(n, k), computed per task and then
-averaged over tasks. Do not raise the pooled suite rate to the k-th power: success rates differ across
-tasks, and the mean of p^k is at least (mean p)^k, so the pooled shortcut understates pass^k on a suite
+Agent runs are high-variance, so a task is scored over N runs, not one. Three aggregates matter and they
+answer different questions. The per-run pass rate is the expected fraction of single attempts that
+succeed. pass@k is the probability that at least one of k attempts succeeds, which is the right number
+when a human or a verifier will pick the best attempt. pass^k is the probability that all k attempts
+succeed, a consistency measure. It is the number for an agent that runs unattended, *because* such an
+agent meets the same kind of task over and over, from many users and on many days, and a task class can
+only be handed over without review if it works every time. It also separates two agents with the same
+80% pass rate: one that reliably solves 80% of task types and always fails the rest (you can route the
+rest to humans), and one that solves every task 80% of the time (nothing can be automated safely). With
+per-run success p and independence, pass^k = p^k for that task: a task the agent solves 80% of the time
+is at about 51% for pass^3. The unbiased estimates from n trials with c successes on a task are
+C(c, k) / C(n, k) for pass^k and 1 − C(n − c, k) / C(n, k) for pass@k, computed per task and then
+averaged over tasks; both need n ≥ k. Do not raise the pooled suite rate to the k-th power: success
+rates differ across tasks, and the mean of p^k is at least (mean p)^k, so the pooled shortcut understates pass^k on a suite
 where some tasks always pass and others always fail. Report confidence intervals; with ten
 tasks and three runs each you cannot distinguish 70% from 80%.
 
@@ -89,6 +94,14 @@ When a reference exists, compare at the level of required actions and their orde
 "Must call `lookup_order` before `refund`; must not call `refund` more than once; may call `search` any
 number of times" is a specification the harness can check on any valid path. Exact-match baselines are
 useful only as a diagnostic for drift.
+
+### Simulated users
+Conversational agents need a counterpart that answers clarifying questions, changes its mind and
+withholds details the way real users do. Benchmarks such as τ-bench drive the conversation with an LLM
+playing the user from a scripted goal and persona, then score the end state of the environment. This
+makes multi-turn tasks repeatable, but the simulator is a second stochastic component: its own mistakes
+(revealing the answer, forgetting the goal) show up as agent failures, so failed runs need a check that
+the simulated user stayed on script before the failure is blamed on the agent.
 
 ### Live versus simulated environments
 Simulated or recorded tools make runs cheap, deterministic and safe, and let the suite run in CI. Live
@@ -153,9 +166,9 @@ task = {"forbidden_tools": {"delete_order"}, "reference_steps": 3,
 - Process metrics are precise and judgment-free, yet they encode assumptions about the right path; a
   strict step budget penalizes a legitimately harder instance, so treat them as diagnostics unless the
   budget is a product requirement.
-- Repeating each task N times gives trustworthy rates at N times the cost; for expensive live suites, use
-  fewer tasks with more repeats rather than many tasks run once, because variance is the thing you are
-  trying to measure.
+- Repeating each task N times gives trustworthy per-task rates at N times the cost, while adding tasks
+  covers more of the input space; spend repeats when the question is consistency (pass^k needs at least
+  k runs per task) and spend on more tasks when the question is coverage of task types.
 - LLM judges scale to transcripts no human will read but are lenient and drift; calibrate on a labelled
   sample and never let a judge be the only gate on a side-effecting agent.
 
@@ -196,8 +209,9 @@ number for an autonomous agent.
 to ship. What is wrong with that number, and what do you report instead?
 **A:** One run per task gives a point estimate with wide uncertainty; at n = 50 a 95% interval spans
 roughly ten points either side, so 85% is not distinguishable from 75% or 93%, and a prompt tweak could
-move it by noise alone. It is also the wrong statistic for an unattended agent: users get one attempt, so
-the relevant question is consistency, pass^k, not the per-run average. And outcome alone hides policy
+move it by noise alone. One run per task also cannot say whether failures are concentrated on a few task
+types the product could route to humans, or spread across all tasks so that none can be trusted
+unattended; that is the consistency question pass^k answers. And outcome alone hides policy
 violations and expensive paths. Rerun the suite with at least five runs per task, report the pass rate
 with an interval, report pass^3 per task averaged over the suite (a task solved 85% of the time independently is around 61%
 for pass^3, and the per-task view shows which tasks drag the figure down), report the
@@ -208,7 +222,7 @@ figures.
 ## Quiz
 ### Q: Why is pass^k rather than pass@k the right headline metric for an unattended agent?
 - [ ] pass^k is easier to compute from a single run
-- [x] Unattended users get one attempt, so consistency across attempts matters; pass^k requires all k runs to succeed while pass@k rewards any one success
+- [x] An unattended agent meets the same task repeatedly with no one choosing among attempts, so consistency matters; pass^k requires all k runs to succeed while pass@k rewards any one success
 - [ ] pass@k only applies to code generation benchmarks
 - [ ] pass^k includes policy violations and pass@k does not
 > pass@k models "a verifier picks the best of k". An unattended agent meets the same kind of task again and

@@ -5,6 +5,7 @@ name: MCP TypeScript SDK
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -52,19 +53,28 @@ handler enforces, and the host can validate what it sends.
 `McpServer` (from `@modelcontextprotocol/sdk/server/mcp.js`) is the high-level API. You construct it
 with a name and version, then register capabilities: `registerTool(name, { description, inputSchema,
 outputSchema? }, handler)`, `registerResource(name, uriOrTemplate, metadata, reader)` and
-`registerPrompt(name, { argsSchema }, builder)`. `inputSchema` is a Zod shape; the SDK converts it to
-JSON Schema for `tools/list` and validates incoming `tools/call` arguments against it before your
-handler runs, so the handler receives a typed object. A handler returns `{ content: [...] }` where
-content items are `text`, `image`, `audio` or embedded resources, optionally `structuredContent` when
-an `outputSchema` is declared, and optionally `isError: true`. That flag is the important design
-decision: a *tool-level* failure (order not found, validation of business rules failed) is returned as
-a normal result with `isError`, so the model sees the message and can recover, whereas *throwing* from
-a handler becomes a JSON-RPC error that signals a broken call to the host. Conflating the two means
-either the model never learns why a call failed or the host treats a routine "not found" as an outage.
+`registerPrompt(name, { argsSchema }, builder)`. `inputSchema` is a Zod shape (recent 1.x releases
+also accept a full Zod object schema); the SDK converts it to JSON Schema for `tools/list` and
+validates incoming `tools/call` arguments against it before your handler runs, so the handler
+receives a typed object. A handler returns `{ content: [...] }` where content items are `text`,
+`image`, `audio`, resource links or embedded resources, optionally `structuredContent` (required, and
+validated, when an `outputSchema` is declared), and optionally `isError: true`.
+
+That flag reflects the spec's split between two kinds of failure. A *tool execution* error (order not
+found, a business rule violated, an upstream API down) is a normal result with `isError: true`, so
+the model reads the message and can adapt. A *protocol* error (unknown method, malformed request) is a
+JSON-RPC error aimed at the host, which typically treats it as a broken call rather than something to
+show the model. In `McpServer` a handler that throws is caught and converted into an `isError` result
+whose text is the raw exception message, so throwing "works", but you lose control of what the model
+reads and may leak stack-level detail into its context. Return `isError` results deliberately, with a
+message written for the model. With the low-level `Server`, an exception in your request handler does
+become a JSON-RPC error, which is exactly the conflation to avoid: the host then treats a routine "not
+found" as an outage and the model never learns why the call failed.
 
 `Server` (the low level) exposes `setRequestHandler(RequestSchema, handler)` for every method in the
-spec and is what `McpServer` is built on; drop to it for custom capabilities, dynamic tool lists with
-`tools/list_changed` notifications, or when you need to intercept raw requests. Both levels implement
+spec and is what `McpServer` is built on; drop to it for custom capabilities, fully dynamic tool lists
+computed per request, or when you need to intercept raw requests. (`McpServer` already sends
+`tools/list_changed` when you enable, disable or remove a registered tool.) Both levels implement
 the handshake, capability advertisement, progress and logging notifications and cancellation for you.
 
 ### Transports
@@ -106,8 +116,9 @@ becomes a provider tool definition (`inputSchema` is already JSON Schema, so it 
 becomes `callTool`; the returned `content` becomes the tool result sent back. Name collisions across
 servers are the host's problem, usually solved with a server prefix. Anthropic's API additionally
 offers a server-side MCP connector that performs this bridging for remote servers inside the request,
-which removes the loop from your code but also removes your chance to filter or approve calls, so it
-suits trusted servers and simple hosts. Keep the exposed tool set small: a host that forwards forty
+which removes the loop from your code but also removes per-call inspection and approval (you keep
+only the static tool allow-list the connector configuration offers), so it suits trusted servers and
+simple hosts. Keep the exposed tool set small: a host that forwards forty
 tools from three servers pays in tokens and in tool-selection accuracy on every turn.
 
 ## Example
@@ -160,14 +171,16 @@ for (const block of reply.content) {
 
 ## Trade-offs
 - The SDK handles handshake, schemas and transports so a server is a few dozen lines, but you inherit
-  its release cadence; the high-level API has been renamed between minors, so pin versions.
+  its release cadence; the high-level API has been renamed between minors (`tool()` to `registerTool`)
+  and error-handling behaviour has shifted too, so pin versions and read release notes on upgrade.
 - Stdio is simple and secure by construction, yet it ties the server's lifetime to one host process;
   the moment two hosts or a remote user need the same server, Streamable HTTP and auth are required.
 - Stateful HTTP sessions enable server-initiated requests and stream resumption, while stateless mode
   scales horizontally with no affinity; choose stateless unless you actually use sampling or
   elicitation.
 - Returning `isError` results keeps the model in the loop on failures, but also lets a server leak
-  internal detail into model context; format tool errors for the model, not from stack traces.
+  internal detail into model context, and an uncaught throw in `McpServer` does so automatically with
+  the raw exception message; format tool errors for the model, not from stack traces.
 - A server-side MCP connector in the model API removes the bridging loop, at the cost of losing the
   host's ability to filter, approve or rate-limit calls; use it for trusted servers only.
 - Exposing many tools through MCP is cheap to build and expensive per turn in tokens and selection
@@ -176,8 +189,10 @@ for (const block of reply.content) {
 ## Pitfalls
 - A `console.log` in a stdio server; the symptom is the host reporting a JSON parse error or hanging
   at `initialize` while the server appears to run fine.
-- Throwing from a tool handler for expected failures; the symptom is the agent loop aborting with a
-  protocol error instead of the model reading "not found" and trying something else.
+- Throwing from a tool handler for expected failures; with `McpServer` the symptom is the model
+  reading raw exception text (a driver error, an internal hostname) instead of a useful message, and
+  with the low-level `Server` it is the agent loop aborting on a protocol error instead of the model
+  reading "not found" and trying something else.
 - Deploying a stateful Streamable HTTP server behind a round-robin balancer; the symptom is
   intermittent "session not found" errors after the first request.
 - Registering tools with vague descriptions or untyped `z.any()` inputs; the symptom is the model
@@ -197,7 +212,7 @@ HTTP, stateless where possible, with OAuth, for shared or remote servers. Write 
 agent must consume third-party servers. Do not reach for MCP for a single in-process tool used by one
 service; a plain function with a Zod schema is less code. Measure the number of tools exposed per
 host, tool-call error rate split by `isError` versus protocol error, and p95 call latency. Interviews
-ask what the SDK does and does not do (it never calls a model), the `isError`-versus-throw
+ask what the SDK does and does not do (it never calls a model), the tool-error-versus-protocol-error
 distinction, and why stdout is sacred.
 
 ## Role lens
@@ -232,13 +247,15 @@ elicitation, so stateless is the usual answer, together with OAuth now that the 
 > model never sees server logs unless a tool returns them.
 
 ### Q: A tool handler cannot find the requested record. What should it do?
-- [ ] Throw an error so the SDK returns a JSON-RPC error to the host
+- [ ] Throw an error and let the SDK report the failure to the host
 - [ ] Return an empty `content` array and let the model infer the failure
 - [x] Return a normal result with `isError: true` and a message, so the model sees why the call failed and can adapt
 - [ ] Call `process.exit(1)` to signal the failure unambiguously
-> `isError` marks a tool-level failure the model is expected to handle; throwing signals a broken
-> protocol call that typically aborts the agent step. An empty result hides the cause. Exiting kills
-> the server for every other call.
+> `isError` marks a tool-level failure the model is expected to handle, with a message you control.
+> Throwing is the tempting option but is wrong either way: `McpServer` catches it and forwards the raw
+> exception text as an `isError` result, while a low-level `Server` turns it into a JSON-RPC error that
+> typically aborts the agent step. An empty result hides the cause. Exiting kills the server for every
+> other call.
 
 ### Q: What does the MCP TypeScript SDK not do for a host application?
 - [ ] Perform the `initialize` handshake and capability negotiation

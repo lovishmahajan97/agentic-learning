@@ -5,6 +5,7 @@ name: Knowledge graphs
 kind: concept
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - rag-retrieval/graphrag
   - rag-retrieval/multi-hop-retrieval
@@ -88,6 +89,13 @@ questions. Start from the questions the graph must answer and model only what th
 The graph is derived data. Sync it from systems of record with change feeds, re-extract changed documents,
 and delete edges whose provenance disappears; otherwise it confidently answers with stale facts.
 
+Many facts are true only for a period: Priya led project X until March, service A depended on pg-main
+before the migration. If edges carry no time, a re-extraction either overwrites history or leaves both
+versions asserted at once, and the graph answers "who owns X?" with two people. Put validity on the
+edge (`valid_from`, `valid_to`, plus the source's timestamp) because the relationship, not the node, is
+what changed, and default queries to "currently valid". Text-extracted edges should also carry the
+extraction confidence and run id, so a bad prompt version can be rolled back by deleting its edges.
+
 ## Example
 A miniature in-memory graph showing why a join beats similarity. In production the same logic is one Cypher
 query, shown in the comment.
@@ -128,6 +136,12 @@ would likely return the advisory and maybe an SBOM, but nothing connects library
 traversal returns exactly Acme and Globex, excludes Initech because its service uses a different library
 version, and carries a source for every hop, which becomes the citation trail in the answer.
 
+This fixed three-hop query is also three SQL joins, so it alone does not justify a graph database. Real
+dependency data is transitive: svc-billing uses libbar, which bundles libfoo 2.1. The question becomes
+"any path of `USES|DEPENDS_ON` edges of length 1 to 6", which is one pattern in Cypher
+(`(s)-[:USES|DEPENDS_ON*1..6]->(l)`) and a recursive CTE with cycle handling in SQL. That
+variable-length case is where the graph model starts to pay for itself.
+
 ## Trade-offs
 - Exact joins, counts and multi-hop paths become reliable, but you pay for schema design, extraction and
   entity resolution; when questions are mostly "explain this topic", vector RAG gives more for less.
@@ -138,7 +152,8 @@ version, and carries a source for every hop, which becomes the citation trail in
 - RDF and OWL give standard vocabularies and inference, but steeper tooling and skills; property graphs
   are quicker to ship unless cross-organisation integration or formal reasoning is a requirement.
 - A dedicated graph database suits deep variable-length traversal, but adds an operational system; for
-  shallow, fixed joins, relational tables with recursive CTEs are often enough.
+  shallow, fixed joins plain relational joins are enough, and recursive CTEs cover moderate
+  variable-length cases such as reporting chains of bounded depth.
 
 ## Pitfalls
 - Modelling everything as a generic `RELATED_TO` edge; traversals return everything or nothing and the graph
@@ -149,6 +164,8 @@ version, and carries a source for every hop, which becomes the citation trail in
   unbounded path query that times out the database.
 - Building the graph once from a document dump; it drifts from source systems and answers with
   reorganised teams or retired services weeks later.
+- Storing time-bound relationships without validity dates; the symptom is "who owns service X?"
+  returning both the current and the previous owner, or history vanishing after a re-extraction.
 - Dropping provenance; graph answers cannot be cited, and when an extracted fact is wrong nobody can find
   which document or extraction run produced it.
 

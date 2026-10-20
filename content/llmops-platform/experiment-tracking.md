@@ -5,7 +5,7 @@ name: Experiment tracking (MLflow, W&B)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - llmops-platform/model-registry
   - llmops-platform/reproducible-evaluations
@@ -54,8 +54,29 @@ not the model), **metrics** logged as time
 series against a step or epoch (so you can see divergence or over-fitting at step *k*, not just the
 final number), **artifacts** which are files (checkpoints, per-item eval outputs, plots, configs),
 **tags** for free-form filtering, and automatically captured context: git commit, command line, Python
-environment, and system metrics such as GPU utilisation. Runs can be nested for hyperparameter sweeps.
+environment and, where enabled, system metrics such as GPU utilisation (W&B records them by default;
+MLflow does once system-metrics logging is switched on). Runs can be nested for hyperparameter sweeps.
 Everything is queryable, so "all runs where `lora_r=16` sorted by `eval_acc`" is one call.
+
+### What happens when you call `log`
+Both clients are thin writers to a store, and their transport explains several sharp edges. MLflow's
+client sends each logging call to the tracking server over REST (or writes to a local `mlruns`
+directory with no server), and the server writes rows into its SQL backend: params as key/value
+*strings*, metrics as `(key, value, timestamp, step)` rows, plus a "latest value" per metric that the
+run table and search use. Batch calls (`log_metrics`, `log_params`) exist *because* one HTTP round trip
+per scalar at every training step is slow; recent versions also offer asynchronous logging. W&B's
+`init` starts a background process that buffers everything to a local run directory and streams it to
+the server, *because* a training loop must never block on the network; the same design gives offline
+mode (`WANDB_MODE=offline`, uploaded later with `wandb sync`) for air-gapped clusters. Artifacts take a
+separate path: large files go to the artifact store (bucket or W&B storage) and only a reference lands
+in the run.
+
+Three consequences follow. MLflow params are strings, so a filter such as `params.lr > 0.001` is not a
+numeric comparison; put numbers you will want to range-query into metrics or tags you control. MLflow's
+search and run table sort on a metric's *last* logged value, not its best, so log a separate
+`best_eval_acc` if that is what you will rank by. W&B requires the `step` passed to `log` to increase
+monotonically; a call with an earlier step is dropped with a warning, which bites when resuming a run or
+logging evaluation results after the training loop has advanced.
 
 ### MLflow
 MLflow is Apache-licensed open source that started at Databricks. Its tracking server has a backend
@@ -120,6 +141,10 @@ with mlflow.start_run(run_name="lora-r16-lr2e-4") as run:
     mlflow.log_artifacts("outputs/adapter", artifact_path="model")    # raw files; use a flavour's log_model for pyfunc loading
     print("register with run id:", run.info.run_id)
 
+# Comparison is the point: params are strings (quote them); ordering uses each metric's LAST value
+best = mlflow.search_runs(experiment_names=["support-classifier"], filter_string="params.lora_r = '16'",
+                          order_by=["metrics.eval_acc DESC"], max_results=5)
+
 # --- W&B: SaaS or self-hosted server; config + log + a versioned Artifact with lineage --------
 run = wandb.init(project="support-classifier", name="lora-r16-lr2e-4", config=cfg)
 for step, (train_loss, eval_acc) in enumerate(train_and_eval(cfg)):
@@ -153,6 +178,10 @@ run.finish()
   recorded learning rate differs from the one actually used.
 - Treating the tracker as a backup for weights; the symptom is a bucket bill that doubles monthly and a
   cleanup that deletes the one checkpoint the registry still points to.
+- Ranking runs by a metric whose final value is not its best, such as eval accuracy after over-fitting;
+  the symptom is the run table hiding the checkpoint that actually peaked, because sorting uses the last value.
+- Resuming a W&B run or logging post-training evals with a step lower than the last one logged; the symptom
+  is eval points that silently never appear on the chart, with only a warning in the console.
 - Running evals outside the tracker "because it is just a prompt change"; the symptom is a team arguing
   from memory about whether version 11 or 12 did better on the hard slice.
 

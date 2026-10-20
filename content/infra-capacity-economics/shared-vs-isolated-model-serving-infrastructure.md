@@ -5,6 +5,7 @@ name: Shared vs isolated model-serving infrastructure
 kind: decision
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - infra-capacity-economics/inference-clusters
   - infra-capacity-economics/cost-allocation-by-tenant-and-feature
@@ -41,7 +42,8 @@ replicas per team can multiply the GPU bill several times for the same total tok
 The naive conclusion, "share everything", fails the first time one tenant submits a batch job of
 50k-token documents. Those requests fill the KV cache, every other tenant's TTFT jumps, and the
 platform has no way to say whose fault it is or to stop it, because the engine's scheduler is
-first-come-first-served and knows nothing about tenants. It fails again when a regulated tenant asks
+first-come-first-served by default (some engines offer a request-priority policy) and knows nothing
+about tenants or fair shares. It fails again when a regulated tenant asks
 whether their prompts ever shared a GPU with another company's, or when a tenant needs a different
 model, a longer context limit, a fine-tuned adapter or a different region. Sharing without
 isolation mechanisms is a cost optimisation that quietly removes fairness, blast-radius control and
@@ -57,8 +59,8 @@ From cheapest to most isolated, each level buys a specific guarantee:
 2. **Shared pool with logical isolation.** Per-tenant rate limits and token budgets at the
    gateway, priority classes, fair-share admission so one tenant cannot hold more than a share of
    in-flight sequences, and per-tenant metrics and chargeback. This buys fairness and attribution
-   while keeping the batching economics. It exists *because* the engine scheduler is FCFS; fairness
-   must be enforced before requests reach it.
+   while keeping the batching economics. It exists *because* the engine scheduler is FCFS or at
+   best priority-ordered, never tenant-fair; fairness must be enforced before requests reach it.
 3. **Reserved capacity inside a shared cluster.** A tenant gets a guaranteed minimum (their own
    replicas, or a reserved share of the pool) and may burst into the shared remainder. This is the
    self-hosted analogue of what hosted providers sell as provisioned throughput next to a
@@ -74,9 +76,11 @@ From cheapest to most isolated, each level buys a specific guarantee:
 Sharing a *replica* means sharing GPU memory: tenants' KV caches sit in the same pool of blocks,
 and the batch holds their sequences side by side. Within a correct engine, one sequence cannot read
 another's cache, so this is not a data-leak path in itself; the risks are side-channel timing,
-engine bugs and, more practically, prefix caching: if a cached prefix keyed only by its text could
-be hit by another tenant's identical text, you have cross-tenant reuse of computation, not data,
-but it still has to be explicitly decided and keyed. Sharing a *node* but not a replica removes
+engine bugs and, more practically, prefix caching: if a cached prefix keyed only by its text can
+be hit by another tenant's identical text, the cached KV is never returned to the caller, but the
+faster TTFT of a hit is a timing side channel that can reveal that someone else recently sent that
+prefix. Cross-tenant cache sharing therefore has to be an explicit decision, and the usual answer is
+to salt the cache key with the tenant id (some engines accept a per-request cache salt). Sharing a *node* but not a replica removes
 cache co-residency and leaves shared host RAM, network and the node's failure domain. Sharing a
 *cluster* leaves shared control plane and shared operators. The compliance question is always "what
 exactly is shared", and the answer should be precise, because "dedicated" is sold at every level.
@@ -114,10 +118,11 @@ sequences within the latency budget.
 
 - **Isolated per team:** every team needs its own replica, since no team's traffic can be combined
   with another's. 10 replicas, each averaging perhaps 6 of 48 slots busy over the day.
-  Utilization near 12%.
+  Utilization near 12%, and that is before giving each team its own spare for N+1.
 - **Shared with logical isolation:** peak of the sum is 80, so ceil(80 / 48) = 2 replicas, plus
-  one for N+1 and headroom gives 3. Average utilization is several times higher, and the bill is
-  about 30% of the isolated design for the same tokens.
+  one for N+1 and headroom gives 3. The same 60 average busy slots now sit on 144 slots instead of
+  480, about 42% utilization (roughly 3.3x higher), and the bill is 3/10 = 30% of the isolated
+  design for the same tokens.
 - **Hybrid:** one team runs nightly document batches with 60k-token prompts. In the shared pool
   those jobs would fill the KV cache during the batch window. Give that team a dedicated replica
   for batch (or route their batch traffic to a low-priority pool), keep their interactive traffic

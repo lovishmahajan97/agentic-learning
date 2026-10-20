@@ -4,8 +4,8 @@ module: rag-retrieval
 name: BM25 internals
 kind: concept
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - rag-retrieval/inverted-indexes
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -103,6 +103,27 @@ counts, roughly a quarter lower score for the document four times longer. A thir
 "contract" (in 600 documents, IDF ≈ 0.51) ten times at average length scores only 0.51 × 1.96 ≈ 1.0 for
 that term: a common word repeated ten times is worth an eighth of a rare word mentioned three times.
 
+### Where the shape comes from
+The two halves of the formula have different origins in the probabilistic framework. The IDF factor is
+the Robertson–Spärck Jones term weight with no relevance information available: the log-odds that a
+term appears in relevant versus non-relevant documents, estimated by assuming almost every document is
+non-relevant. The term-frequency factor comes from the "eliteness" idea: a document is either about a
+term or not, and occurrence counts are modelled as a mixture of two Poisson distributions, one for
+elite and one for non-elite documents. The exact weight under that model has no usable closed form, but
+its shape is known: zero at f = 0, increasing, and bounded. `f/(f + k1)` is the simplest function with
+that shape, and length normalization is applied by rescaling k1. That lineage is why BM25 has so few
+parameters and why the saturation is not an arbitrary engineering hack.
+
+### How an engine evaluates it
+Nothing in the formula needs the document text at query time. The posting list for each query term
+stores, per document, the term frequency f; the per-document length |D| lives in a per-field norms
+structure (Lucene encodes it lossily into a single byte, so long lengths are approximate); N, n(q) and
+avgdl are index statistics. Scoring is therefore a walk over the query terms' postings, adding one
+precomputable IDF times one small arithmetic expression per matching document. Because each term's
+contribution is bounded by IDF × (k1 + 1), the engine also knows the maximum any document can gain from
+a term, which is what dynamic pruning (WAND, MaxScore; see inverted indexes) uses to skip documents that
+cannot reach the top k.
+
 ### What BM25 does not do
 It treats terms as independent, ignores order and proximity (phrase matching is a separate query feature
 over positions), and has no notion of synonymy; everything semantic is delegated to the analyzer
@@ -186,8 +207,9 @@ term" prefers B. Set `k1=0` and watch A's advantage from repetition disappear.
   collections, and a corpus of tweets or of 200-page manuals can want very different values. The symptom
   is a silent shift in which documents win.
 - Forgetting that avgdl and IDF are collection statistics; in sharded engines each shard may compute its
-  own unless the engine fetches global statistics first, which makes the same document score differently
-  depending on where it lives.
+  own unless the engine fetches global statistics first (Elasticsearch's `dfs_query_then_fetch` search
+  type does this at extra cost), which makes the same document score differently depending on where it
+  lives. The symptom is most visible on small or unevenly filled shards and in tests with few documents.
 
 ## When to use
 BM25 is the right first retriever for any corpus, and the baseline every other retriever must beat on
@@ -211,17 +233,21 @@ importantly, the failure each piece prevents.
 **Q:** A customer indexes product manuals that range from two pages to four hundred pages. Users complain
 that the complete manual for a product ranks below a short FAQ stub that mentions the product name once.
 Using the BM25 formula, explain why and what you would change.
-**A:** Two forces push the stub up. Length normalization with b = 0.75 divides the manual's term counts
-by a factor near |D|/avgdl, which for a document many times longer than average is large, so even dozens
-of mentions of the product name are discounted heavily; meanwhile the stub is shorter than average, so
-its single mention is amplified. Saturation then caps whatever advantage remains: since the count is
-effectively divided by the length factor before saturating, the manual's many mentions behave like a
-handful in an average document, and no number of mentions can push the term's contribution past
-(k1 + 1) × IDF. I would first ask whether the
-whole manual is the right unit at all; indexing sections or pages as documents usually fixes this
-outright because each becomes near average length. If whole manuals must be documents, lower b toward
-0.3 to reduce the length penalty and raise k1 so term density keeps counting, then re-measure recall on
-labeled queries rather than trusting the change.
+**A:** BM25 rewards term *density*, not completeness. Put numbers on it with k1 = 1.2, b = 0.75 and
+look only at the product-name term (IDF is identical for both documents, so it cancels). The stub is a
+fifth of average length with one mention: L = 0.25 + 0.75 × 0.2 = 0.40, so the term factor is
+2.2 / (1 + 0.48) ≈ 1.49. The manual is twenty times average length with thirty mentions: L = 0.25 +
+0.75 × 20 = 15.25, so the factor is 66 / (30 + 18.3) ≈ 1.37. The manual's thirty mentions, spread over a
+document twenty times longer, are a lower density than the stub's one, and saturation means no count can
+push either past (k1 + 1) = 2.2. Raising k1 does not help: it moves the curve toward length-normalized
+raw counts, f / L, where the stub is still denser (with k1 = 2 the factors become 1.67 versus 1.49).
+Lowering b does: at b = 0.3 the stub's L rises to 0.76 and the manual's falls to 6.7, giving 1.15 versus
+1.74. But I would first question the unit. Indexing sections or pages as documents brings each near
+average length and lets the section that actually discusses the product win. If whole manuals must rank,
+the signal "this document is the manual for X" is not a term-density fact at all; put it where BM25 can
+see it, in a title or product field with its own boost (or BM25F), rather than bending b until the body
+text happens to agree. Then re-measure recall on labeled queries, because lowering b also helps every
+long, loosely relevant document.
 
 ## Quiz
 ### Q: Why does BM25 saturate term frequency instead of using raw counts?

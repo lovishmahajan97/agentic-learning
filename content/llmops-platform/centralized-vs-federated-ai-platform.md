@@ -5,7 +5,7 @@ name: Centralized vs federated AI platform
 kind: decision
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - strategy/platform-strategy
   - llmops-platform/ai-control-plane-vs-data-plane
@@ -74,6 +74,13 @@ deprecation calendar, so a provider sunset is handled once; and the approved-mod
 tiers. These form the mandatory core. It is kept thin *because* every mandatory item is friction,
 and friction breeds workarounds.
 
+Centralizing keys has a consequence specific to LLM providers: rate limits and quotas are typically
+set per account or per project, so pooling everyone onto shared keys pools their quota too. One
+team's overnight batch summarisation job can then consume the tokens-per-minute budget that a
+customer-facing assistant needs, and the assistant sees 429s it did nothing to cause. A central
+gateway is therefore only safe if it also owns per-team quotas and priority classes (interactive
+before batch), so that the shared pool is partitioned rather than first-come-first-served.
+
 ### What must stay with the domain
 Quality is domain knowledge. The prompts, the golden sets, the rubrics, the retrieval corpora, the
 agent designs and the acceptance thresholds for a claims extractor can only be owned by the claims
@@ -86,7 +93,10 @@ Between mandatory and federated sits the shared-but-optional layer: a reference 
 template with tracing, evals and guardrails pre-wired; a managed judge; dataset tooling; golden-path
 documentation. The paved road works when it is easier to use than to bypass, which is a product
 requirement on the platform team: self-service onboarding, a published SLA for requests, and a
-roadmap driven by adoption metrics rather than feature counts. Governance in a federated model is
+roadmap driven by adoption metrics rather than feature counts. Money is part of "easier": if the
+platform charges teams a markup over provider prices, bypassing it becomes the cheaper path, so
+charge back at cost (or start with showback, reporting spend without billing it) until the pooled
+discount makes the gateway visibly cheaper than a private key. Governance in a federated model is
 **computational**: conformance checks in CI (spans carry mandatory attributes, model pins are on the
 approved list, bundles are registered) replace review meetings, *because* review scales with
 headcount and checks scale with code.
@@ -158,6 +168,8 @@ onboarding under two days via self-service, and zero unregistered use cases at t
   domain it does not understand, and the domain team disowning the result.
 - Governance by review meeting; the symptom is a monthly committee that cannot keep up and approvals
   that become rubber stamps.
+- Pooling provider keys without per-team quotas; the symptom is a customer-facing assistant throwing
+  429s every night when another team's batch job runs, followed by that team asking for its own key back.
 
 ## When to use
 Decide explicitly as soon as the second team starts an LLM project; the cheapest moment to make the

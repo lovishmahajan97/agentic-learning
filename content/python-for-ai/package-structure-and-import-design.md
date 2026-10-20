@@ -5,6 +5,7 @@ name: Package structure & import design
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
   - python-for-ai/protocols-generics-structural-typing
@@ -53,9 +54,12 @@ gets the partially initialized first one, and `from a import X` fails if `X` has
 ### src layout
 Put code in `src/myapp/` with `tests/` beside `src/`, and install it in editable mode (`uv sync`, or
 `pip install -e .`). Because the project root no longer contains an importable `myapp` directory, tests can
-only import the installed package. This removes the "works in the repo, broken in the wheel" class of bug.
-A flat layout (`myapp/` at the root) is fine for scripts and small tools, but it lets the current directory
-shadow the installed package.
+only import the package through the installation, so an undeclared dependency or a module that is not
+actually part of the package shows up instead of being silently picked up from the working directory. One
+caveat: an editable install still points back at `src/`, so files that exist on disk but are missing from the
+wheel (prompt templates, package data) are only caught when CI builds the wheel and runs the tests against a
+non-editable install of it. A flat layout (`myapp/` at the root) is fine for scripts and small tools, but it
+lets the current directory shadow the installed package.
 
 ### Layering and direction
 Pick layers and allow imports only downward:
@@ -192,7 +196,8 @@ the network or environment at import time.
 - [x] Tests import the installed package instead of the working-directory copy, exposing packaging mistakes
 - [ ] It prevents circular imports between subpackages
 > With src/, the repository root has no importable package directory, so tests use what installation
-> provides. It does not affect import speed or cycles, and build backends support flat layouts too.
+> provides (pair it with a test run against the built wheel to catch missing package data). It does not
+> affect import speed or cycles, and build backends support flat layouts too.
 
 ### Q: A type annotation is the only reason module A imports module B, and this creates a cycle. Best fix?
 - [ ] Merge A and B into one module

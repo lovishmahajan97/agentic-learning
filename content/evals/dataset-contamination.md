@@ -4,8 +4,8 @@ module: evals
 name: Dataset contamination
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - evals/benchmarking
   - evals/golden-dataset
@@ -77,6 +77,13 @@ Most of the time you have only the model, so detection is behavioural:
   guided prompt (naming the dataset and split) against a generic one sharpens the signal.
 - **Likelihood gaps.** Memorized text tends to have lower perplexity than fresh paraphrases of the
   same content; a large gap between the original item and a rewritten equivalent is suspicious.
+  Variants such as Min-K% Prob score only the item's least likely tokens, *because* unseen text almost
+  always contains a few surprising tokens while memorized text does not. These membership-inference
+  signals need token log-probabilities (often unavailable from hosted APIs) and have proved weak and
+  noisy on large pretrained models, so treat them as hints, not verdicts.
+- **Masked-option probes.** For multiple-choice items, hide one *wrong* option and ask the model to
+  supply it. A wrong option has no reason to be guessable from the question, so reproducing it
+  exactly points to having seen the item.
 - **Fresh-equivalent sets.** Build new items matching the benchmark's distribution and difficulty
   (the GSM1k study did this for grade-school math) and compare; a model whose score drops markedly on
   the fresh set was leaning on memorization, while one that holds steady was not. Across model families
@@ -142,9 +149,17 @@ def split_scores(eval_items, flagged: dict, correct: dict) -> dict:
 index = build_index(iter_training_docs())       # your fine-tuning set, or an open pretraining shard
 flagged = flag_items(eval_items, index)
 print(split_scores(eval_items, flagged, model_correct))
-# e.g. {'clean': (712, 0.78), 'flagged': (288, 0.93)}  -> a 15-point gap on flagged items is a
-# memorization signal; report the clean-subset score and remove flagged items from fine-tuning data.
+# e.g. {'clean': (712, 0.78), 'flagged': (288, 0.93)}  -> a 15-point gap is a candidate memorization
+# signal; report the clean-subset score and remove flagged items from fine-tuning data.
 ```
+
+Read the gap carefully before calling it memorization. Flagged items are not a random subset: items
+that get copied around the web tend to be the famous, simpler or more canonical ones, so they may be
+easier for any model. The cleaner test is whether the gap is larger for the model trained on the
+corpus than for a comparable model that could not have seen it (an earlier cutoff, or a model trained
+without that data). If both models show the same 15 points, the flagged items are just easier; the
+GPT-3 report found that for many benchmarks the clean-subset score barely moved, which is the kind of
+null result this analysis exists to produce.
 
 A short n-gram (5 or 8 words) over-flags common phrasing; a long one (20+) misses light edits. Thirteen
 is the GPT-3 report's choice and a common compromise, not a law (other reports use different lengths
@@ -173,6 +188,9 @@ near-verbatim overlap, so a clean result is "not detectably contaminated", not "
   benchmark's answers for paraphrased questions while passing the overlap check.
 - Using a model to generate "new" eval items from public documents; the symptom is items the model
   already answers from memory because the source documents were in its crawl.
+- Reading a clean-versus-flagged gap as proof of memorization without a control; the symptom is a
+  "contamination effect" that an uncontaminated model shows just as strongly, because the flagged
+  items were simply the easier, more widely quoted ones.
 - Publishing the golden set in a public repository for convenience; the symptom is that next year's
   model aces it and the team cannot tell improvement from memorization.
 

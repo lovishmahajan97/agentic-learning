@@ -5,6 +5,7 @@ name: Vendor evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - system-design/model-selection
   - system-design/build-vs-buy
@@ -56,14 +57,33 @@ Use a few hundred real, representative, labelled examples from your workflow, in
 ugly cases (scanned PDFs, long threads, other languages). Keep it private and never send it to vendors
 for "tuning" before the test, *because* then you are measuring their preparation, not their product.
 
+Size the set for the differences you need to detect. The 95% interval on an accuracy *p* measured on *n*
+items is roughly ±1.96 × √(p(1−p)/n): at p = 0.95 and n = 400 that is about ±2 points. So two vendors 1
+point apart on 400 items are tied, and the decision must rest on cost, latency or terms. Because every
+vendor runs on the same items, compare them *paired*: count the items A gets right and B gets wrong, and
+vice versa. Only the disagreements carry information, which makes paired comparison more sensitive than
+comparing two headline percentages, and reading those disagreements tells you *what kind* of input each
+vendor fails on.
+
 ### 3. Run a controlled bake-off
-Same harness, same prompts adapted minimally per vendor, same scoring. For each candidate measure:
+Same harness, same scoring, and an equal prompt-engineering budget per vendor, tuned on a separate
+development split and scored once on the held-out test split. Reusing prompts tuned for the incumbent
+quietly favours it, *because* those prompts encode that model's quirks. If outputs are sampled, run each
+item more than once or fix the decoding settings, and report the spread. For each candidate measure:
 - **Quality** on your metric (accuracy, faithfulness, pass rate on acceptance criteria).
 - **Latency** at p50 and p95 at your expected concurrency, not single requests, *because* rate limits and
   queueing appear only under load.
 - **Cost per successful task:** total cost (tokens, retries, fixed fees, human review of failures)
-  divided by tasks completed correctly. This is the number that makes different pricing models comparable.
+  divided by tasks completed correctly. Count each cost once: if a human fixes a failure, that task is
+  delivered and its review cost is in the numerator; if failures are simply discarded, there is no review
+  cost but they drop out of the denominator. This is the number that makes different pricing models
+  comparable.
 - **Operational fit:** quotas in your region, SLA terms, observability hooks, SDK quality, support.
+
+The same structure applies to non-model vendors with different metrics: a vector database is measured on
+recall@k and p95 query latency at your corpus size and with your metadata filters, plus ingestion and
+update throughput, *because* index behaviour changes with scale and filter selectivity in ways a small
+demo corpus never shows.
 
 ### 4. Assess the vendor, not just the product
 Financial and roadmap stability, model deprecation policy and notice period, how they communicate
@@ -94,7 +114,8 @@ weights = {"cost": 0.5, "latency": 0.2, "accuracy": 0.3}   # fixed before the ba
 P95_BUDGET = 3.0
 
 def cost_per_success(acc, call, review):
-    return (call + (1 - acc) * review) / acc   # failures need a human fix and still cost a call
+    # every invoice ends correct: the model's output, or a human fix of a flagged failure
+    return call + (1 - acc) * review   # each pays one call; failures also pay a review
 
 rows = {}
 for v, (ok, acc, p95, call, review) in vendors.items():
@@ -108,12 +129,18 @@ for v, (acc, p95, cps) in rows.items():
              + weights["accuracy"] * acc)
     print(f"{v}: acc={acc:.2f} p95={p95}s cost/success=${cps:.4f} score={score:.3f}")
 # C excluded by gate
-# A: acc=0.96 p95=2.8s cost/success=$0.0313 score=0.874
-# B: acc=0.91 p95=1.2s cost/success=$0.0516 score=0.776
+# A: acc=0.96 p95=2.8s cost/success=$0.0300 score=0.874
+# B: acc=0.91 p95=1.2s cost/success=$0.0470 score=0.792
 ```
 
 B's call price is five times lower, but its extra 5 points of errors each need a 50-cent human fix, so
-its cost per successful extraction is higher than A's. C has the best accuracy and is out anyway.
+its cost per successful extraction is higher than A's ($0.047 vs $0.030). C has the best accuracy and is
+out anyway, and its one-point lead over A is inside the ±2-point noise on 400 items, so it was not a
+clear winner even before the gate. A's 5-point lead over B is outside it. The model assumes failures are
+caught (by validation rules or review); if they slip through undetected, their downstream cost belongs in
+the review term and usually dwarfs the call price. Note that accuracy enters twice, inside cost per
+success and as its own weighted term; that is defensible only if the accuracy weight stands for something
+cost does not capture (undetected errors, user trust). Otherwise drop it, or the scoring double-counts.
 
 ## Trade-offs
 - A rigorous bake-off on your data gives decisions that transfer to production, but costs weeks of
@@ -136,12 +163,16 @@ its cost per successful extraction is higher than A's. C has the best accuracy a
   audit or new stakeholder challenges it.
 - Ignoring deprecation policy; a pinned model is retired with short notice and the team must re-validate
   prompts and evals in a hurry.
+- Running challengers on prompts tuned for the incumbent; the incumbent wins every bake-off, and the gap
+  shrinks or vanishes once someone spends a few days prompting the challenger properly.
+- Declaring a winner on a one- or two-point gap from a few hundred items; the "better" vendor's lead
+  evaporates on the next re-run or the production sample.
 
 ## When to use
 Run a structured evaluation whenever the choice is expensive to reverse or touches sensitive data:
 primary model provider, vector store, platform vendors, anything inside the customer's data boundary.
 Use a light version (gates plus a small bake-off) for tools that are cheap to swap. Measure quality on
-your own set, p95 latency at load, cost per successful task, and exit cost. Re-run when new models ship
+your own set with its confidence interval, p95 latency at load, cost per successful task, and exit cost. Re-run when new models ship
 or prices change. In interviews, the signal is separating gates from scores, insisting on your own data,
 and converting pricing to cost per correct outcome.
 
@@ -157,7 +188,8 @@ and converting pricing to cost per correct outcome.
 **Q:** Vendor X's model is cheaper per token than Vendor Y's and scores slightly lower on your eval.
 Procurement wants X. What do you check before agreeing?
 **A:** First, that X passes every gate: data use and retention terms, residency, security answers,
-deployment mode. Then convert both to cost per successful task: X may need longer prompts, more retries or
+deployment mode. Next, whether "slightly lower" is real: on a few hundred items a one- or two-point gap
+may be noise, so I would look at the paired disagreements and what kind of inputs X gets wrong. Then convert both to cost per successful task: X may need longer prompts, more retries or
 more human correction, and if failures cost real review time, a small accuracy gap can outweigh a
 large token discount. I would also check p95 latency and rate limits at our concurrency, the deprecation
 policy and version pinning, and the exit cost. If X still wins on cost per success within the latency

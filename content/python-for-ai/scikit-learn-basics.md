@@ -5,6 +5,7 @@ name: scikit-learn basics
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - ml-fundamentals/train-test-leakage
   - ml-fundamentals/classification
@@ -73,8 +74,8 @@ depth in the ML fundamentals module; here the point is that the library encodes 
 
 ### Metrics and baselines
 `sklearn.metrics` provides `classification_report`, `confusion_matrix`, `f1_score`, `roc_auc_score`,
-`precision_recall_curve` and regression metrics, and they are what most LLM eval harnesses call
-underneath. `DummyClassifier` gives the majority-class baseline every result should beat.
+`precision_recall_curve` and regression metrics, and many LLM eval harnesses call them underneath
+rather than reimplementing them. `DummyClassifier` gives the majority-class baseline every result should beat.
 
 ### What it is not
 It runs on CPU, mostly in memory, with no GPU deep learning. Persisting a model with `joblib` or pickle
@@ -116,8 +117,9 @@ print(dict(zip(pipe.classes_, probs.round(2))))
 Suppose there are 4,000 tickets across 6 intents and `billing` is 40% of them. The dummy baseline then
 scores 40% accuracy but a macro-F1 near 0.1, since it gets one class partly right and five wrong, which
 is why macro-F1 is the headline metric. If the pipeline reaches a macro-F1 close to what an LLM prompt
-achieves on the same test set, the classifier is the cheaper, faster router; swapping `TfidfVectorizer`
-for precomputed sentence embeddings is a one-line change to the pipeline's input.
+achieves on the same test set, the classifier is the cheaper, faster router. Trying precomputed
+sentence embeddings instead is a small change: drop `TfidfVectorizer` from the pipeline and pass the
+`(n_samples, dim)` embedding matrix as `X`; the splits, scoring and baseline stay identical.
 
 ## Trade-offs
 - A uniform API makes swapping models trivial, but the abstractions assume in-memory, tabular `X`;

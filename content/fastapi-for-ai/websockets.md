@@ -5,6 +5,7 @@ name: WebSockets
 kind: concept
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - fastapi-for-ai/server-sent-events
   - fastapi-for-ai/streamingresponse
@@ -75,7 +76,12 @@ FastAPI wraps this: `@app.websocket("/ws")`, a `WebSocket` parameter, `await web
 `receive_text/json/bytes` and `send_text/json/bytes`, and a `WebSocketDisconnect` exception when the
 peer closes. Dependencies, path and query parameters, cookies and headers all work in WebSocket routes.
 `HTTPException` does not fit a connection that is no longer HTTP; raise `WebSocketException(code=...)`
-from a dependency instead, and FastAPI closes with that code.
+from a dependency instead, and FastAPI closes with that code. Note where in the lifecycle you are: a
+close *before* `accept()` never reaches the browser as a WebSocket close code, because no WebSocket
+exists yet; the server rejects the upgrade with HTTP 403 and the browser's `close` event reports the
+generic 1006 (abnormal closure). Reject before accept when you want unauthenticated clients to cost
+nothing; accept first and then close with 1008 or a 4000-range application code when the client needs
+to know *why*, for example to refresh its token instead of retrying blindly.
 
 ### Concurrency inside the handler
 A handler is one coroutine. If it awaits `receive_json()` it is not producing tokens, and if it is
@@ -95,10 +101,12 @@ minute of idle time, so application-level pings matter. Rolling deploys must clo
 numbers yourself: there is no `Last-Event-ID` equivalent.
 
 ### Backpressure
-`await websocket.send_text()` blocks when the peer reads slowly and the buffers fill, which throttles
-the generation loop, exactly what you want. Sending with fire-and-forget tasks removes that coupling
-and lets memory grow without bound. On the receive side the libraries keep a bounded queue and apply
-TCP backpressure when it is full.
+With uvicorn's protocol implementations, `await websocket.send_text()` waits when the peer reads
+slowly and the transport's write buffer passes its high-water mark, which throttles the generation
+loop, exactly what you want. Sending with fire-and-forget tasks removes that coupling and lets memory
+grow without bound. On the receive side the `websockets`-based implementation keeps a bounded queue of
+incoming messages (uvicorn's `--ws-max-queue`, default 32) and stops reading from the socket when it
+is full, so TCP pushes back on the sender; check your implementation before relying on it.
 
 ## Example
 A chat socket where the server streams tokens from a generation task while the reader loop stays free
@@ -149,8 +157,9 @@ async def chat(ws: WebSocket, token: str):           # ?token=... (short-lived);
 - Full-duplex messaging with tiny per-message overhead, but the connection is stateful and pinned to a
   process, so cross-process delivery needs pub/sub; when traffic is one-way the statelessness of SSE
   is worth more than the duplex channel.
-- Binary frames carry audio and images without base64, but text frames must be valid UTF-8 and the
-  server validates every one; for JSON-only protocols that validation is wasted work compared with SSE.
+- Binary frames carry audio and images without base64's roughly one-third size overhead, but you
+  must define your own message typing and framing on top; for JSON-only, server-to-client protocols
+  that freedom buys nothing over SSE's built-in `event:` and `id:` fields.
 - One long-lived connection avoids a handshake and auth check per message, but thousands of idle
   sockets each hold memory and a slot in load balancers and worker processes, and shutdowns become a
   coordination problem instead of waiting for in-flight requests to finish.
@@ -166,7 +175,10 @@ async def chat(ws: WebSocket, token: str):           # ?token=... (short-lived);
   connect, or every socket dying after exactly the same number of silent seconds.
 - Raising `HTTPException` in a WebSocket route or dependency; the symptom is an unhelpful 500 or an
   abrupt close instead of a meaningful close code.
-- Sending from several tasks or with fire-and-forget `create_task`; the symptom is interleaved frames,
+- Expecting the browser to see your auth close code when you reject before `accept()`; the symptom is a
+  client that only ever sees 1006 and retries in a tight loop instead of refreshing its credentials.
+- Sending from several tasks or with fire-and-forget `create_task`; the symptom is messages arriving
+  in an order no single task produced (a `done` before the last token),
   `RuntimeError: Cannot call "send" once a close message has been sent`, or memory growth with slow
   clients.
 - Not cancelling the generation task on `WebSocketDisconnect`; the symptom is model spend continuing

@@ -5,6 +5,7 @@ name: Shared httpx AsyncClient
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: reviewed
 related:
   - python-for-ai/httpx
   - fastapi-for-ai/lifespan
@@ -28,8 +29,11 @@ on shutdown.
 ## Why it exists
 A request to a hosted LLM over HTTPS starts with a DNS lookup, a TCP handshake and a TLS handshake
 before a single byte of the prompt is sent. On a reused keep-alive connection all of that is skipped.
-How much it saves depends on network distance and TLS version, but it is a fixed tax of one or more
-round trips on every call, and agent loops make many calls per user request.
+How much it saves depends on network distance and TLS version: TCP costs one round trip, TLS 1.3 one
+more (TLS 1.2 two), plus DNS if it is not cached. With an illustrative 40 ms round trip to the
+provider that is roughly 80–120 ms before the request is even sent, and an agent loop making ten
+sequential calls pays it ten times, about a second of pure setup per user request. Building a client
+also builds an SSL context and loads the CA bundle, synchronous CPU work on the event loop.
 
 The naive pattern is `async with httpx.AsyncClient() as c: await c.post(...)` inside the endpoint. It
 looks tidy and is correct in a script. In a server it has three costs. Every request opens fresh
@@ -48,7 +52,18 @@ An `AsyncClient` wraps a connection pool (in `httpcore`). Each pooled connection
 one origin (scheme, host, port), already through TLS. When you send a request the pool hands back an
 idle connection to that origin if one exists, otherwise opens a new one if under the limit, otherwise
 waits. After the response is read the connection returns to the pool, *because* HTTP/1.1 keep-alive
-lets one socket carry many sequential requests.
+lets one socket carry many sequential requests. Note that `max_connections` caps the whole client,
+across every origin it talks to, not each origin separately.
+
+### Streams hold a connection until closed
+A connection goes back to the pool only when the response body has been fully read or the response
+is closed. `await client.post(...)` reads the body for you. A streamed response does not: with
+`async with client.stream("POST", ...) as r:` the block's exit closes it, but `client.send(req,
+stream=True)` hands you a response you must `await r.aclose()` yourself, including on error and
+cancellation paths. This matters most when relaying a provider stream through a `StreamingResponse`,
+*because* a stream that is abandoned mid-way (the client disconnected, an exception in your
+generator) and never closed keeps its connection checked out. Leak `max_connections` of them and every
+later call waits for a free connection and fails with `PoolTimeout`, while the provider is healthy.
 
 ### Limits, and why you set them
 `httpx.Limits` has three knobs: `max_connections` (total open sockets), `max_keepalive_connections`
@@ -61,8 +76,9 @@ callers wait, and that wait is bounded by the pool timeout.
 ### Timeouts are four numbers
 `httpx.Timeout` separates `connect`, `read`, `write` and `pool`. The default is five seconds for each,
 which is too short for a non-streaming completion that may legitimately take a minute. For a streaming
-call, `read` is the maximum gap between chunks, not total duration, so a generous total with a tight
-read timeout catches stalled streams. `pool` is how long to wait for a free connection; a
+call, `read` is the maximum gap between chunks, not total duration. httpx has no overall deadline of its
+own, so pair a tight `read` timeout (catches stalled streams) with an outer `asyncio.timeout(...)` or
+`asyncio.wait_for(...)` around the whole call if you need a cap on total generation time. `pool` is how long to wait for a free connection; a
 `PoolTimeout` under load is your signal that concurrency exceeds the pool, not that the provider is
 down.
 
@@ -133,7 +149,8 @@ version shows them only while the pool warms up.
 - One client per upstream (LLM, vector store, internal tools) isolates pools and timeouts per
   dependency; one client for everything is simpler but lets a slow upstream starve the others.
 - Long `keepalive_expiry` keeps connections warm for bursty traffic, but idle sockets can be silently
-  dropped by NATs or load balancers, so the first reuse fails and must be retried.
+  dropped by NATs or load balancers, so the first reuse fails and must be retried; keep the expiry
+  below the shortest idle timeout on the path, which flips the trade towards shorter values.
 
 ## Pitfalls
 - Creating `AsyncClient()` inside the endpoint; traces show a TLS handshake on every call and the host
@@ -146,6 +163,9 @@ version shows them only while the pool warms up.
   errors such as a future attached to a different loop.
 - Constructing a new OpenAI or Anthropic SDK client per request, which hides the same per-request pool
   problem inside a library call that looks cheap.
+- Streaming with `send(..., stream=True)` and not closing the response on every path; the symptom is
+  `PoolTimeout` appearing after a burst of cancelled or failed streams, with idle CPU and a healthy
+  upstream, and clearing only on restart.
 
 ## When to use
 Always, in any FastAPI service that makes outbound HTTP calls: one client (or one SDK client) per
@@ -181,7 +201,8 @@ example in Redis) if replicas scale dynamically.
 - [ ] The client blocks the event loop while it is constructed
 - [ ] Response bodies cannot be streamed from a short-lived client
 > The pool is what makes keep-alive reuse possible. A per-request client starts empty and is thrown
-> away, so every call pays connection setup and pool limits cap nothing across requests.
+> away, so every call pays connection setup and pool limits cap nothing across requests. Construction
+> does do some synchronous work (building an SSL context), but that is a secondary cost, not the main one.
 
 ### Q: Your streaming completions fail with `ReadTimeout` after five seconds even though tokens keep arriving slowly. What is the most likely cause?
 - [ ] The pool timeout is too short

@@ -5,7 +5,7 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -53,6 +53,16 @@ that breaks your code. The skill is knowing which problem each framework actuall
 the layer you need and no more.
 
 ## How it works
+### The common core
+Strip any of these frameworks down and the same loop remains: assemble messages (system prompt,
+history, tool schemas), call the model, validate and execute any tool calls, append the results, and
+repeat until a final answer or a budget. They differ on three questions. Who owns control flow: the
+model inside a loop, or an explicit graph or event flow you wrote? Where does state live: a message
+list, a typed state object, or event payloads? What is first-class: integrations, retrieval, types or
+prompt optimization? Answering those three for a framework tells you most of what it will be like to
+debug, and it is also how to evaluate frameworks not covered here, such as vendor agent SDKs or
+multi-agent libraries.
+
 ### LangChain
 The broad integration layer: a common interface over chat models, embeddings, vector stores, document
 loaders and tools, plus composition primitives (prompt templates, output parsers, and the Runnable
@@ -71,7 +81,10 @@ Pregel-style bulk synchronous processing, which is what makes parallel branches 
 well-defined. The parts that matter for production: checkpointers persist the state after every step
 to a store, which gives resume after crash, time travel for debugging, and interrupts, which pause a
 graph at a node for human input and resume later from the checkpoint. It is the state-machine lesson
-made concrete. Sharp edges: verbosity for simple cases, a learning curve around reducers and streaming
+made concrete. An interrupt does not freeze a Python frame: on resume, the interrupted node runs again
+from its first line, with `interrupt()` now returning the human's answer. So any side effect placed
+before the interrupt inside that node executes twice; put side effects in their own node after the
+approval, or make them idempotent. Sharp edges: verbosity for simple cases, a learning curve around reducers and streaming
 modes, and a pull toward the vendor's hosted platform and tracing product for the full experience.
 
 ### LlamaIndex
@@ -89,7 +102,8 @@ A deliberately small agent library from the Pydantic team: an `Agent` with a mod
 tools registered with a decorator, a dependency type injected into tools through a run context, and a
 typed output validated by Pydantic, with retries driven by validation failures (the model is shown the
 validation error and asked again). It is model-agnostic, integrates natively with Logfire for tracing,
-and ships a companion graph library for explicit state machines. Under the hood it is the plain agent
+and ships a companion graph library for explicit state machines; recent versions also integrate with
+durable-execution engines such as Temporal for runs that must survive restarts. Under the hood it is the plain agent
 loop with schemas generated from type hints; little is hidden. Sharp edges: younger than the others,
 so fewer integrations, and an API that moved fast before its 1.0 release (2025), with names such as
 `result_type` renamed to `output_type`, so older tutorials no longer run as written.
@@ -161,6 +175,39 @@ print(triage(ticket="I was charged twice this month"))
 #                 .compile(triage, trainset=examples)
 ```
 
+LangGraph on the part neither of those addresses: pausing for a person and resuming later from a
+checkpoint. The first `invoke` runs `draft`, reaches the interrupt and returns with the state saved
+under the thread id; the second, possibly days later in another process sharing the same checkpoint
+store, re-runs `legal_approval` from its top with the human's answer.
+
+```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+class Review(TypedDict, total=False):
+    doc: str
+    verdict: str
+    approved: bool
+
+def draft(state: Review) -> dict:
+    return {"verdict": f"flag clause 7 of {state['doc']}"}   # a model call in practice
+
+def legal_approval(state: Review) -> dict:
+    answer = interrupt({"verdict": state["verdict"]})        # pause; nothing above this may have side effects
+    return {"approved": answer == "approve"}
+
+g = StateGraph(Review)
+g.add_node("draft", draft); g.add_node("legal_approval", legal_approval)
+g.add_edge(START, "draft"); g.add_edge("draft", "legal_approval"); g.add_edge("legal_approval", END)
+app = g.compile(checkpointer=InMemorySaver())   # a Postgres or SQLite saver is what survives restarts
+
+cfg = {"configurable": {"thread_id": "review-17"}}
+app.invoke({"doc": "msa.pdf"}, cfg)              # stops at the interrupt
+print(app.invoke(Command(resume="approve"), cfg))   # later: resumes from the checkpoint
+```
+
 ## Trade-offs
 - A framework buys the loop, persistence and tool wiring in an afternoon but makes you a dependent of
   its release cadence; it flips toward hand-rolling when the agent is small and the team can own two
@@ -188,6 +235,8 @@ print(triage(ticket="I was charged twice this month"))
   the demo PDF and fails on the customer's scanned contracts.
 - Running DSPy optimization on a metric that does not match the business outcome; the symptom is a
   compiled prompt that scores well and ships worse answers.
+- Putting a side effect before `interrupt()` in a LangGraph node; the symptom is a notification or
+  ticket created twice, once when the graph paused and again when it resumed.
 - Letting a framework's hidden system prompts conflict with yours; the symptom is behaviour you cannot
   explain until you print the final rendered prompt.
 
@@ -217,9 +266,11 @@ pause for legal approval, resume days later, and produce a strictly structured v
 reason about the choice?
 **A:** Separate the requirements. Pausing for days and resuming is the decisive one: it needs persisted
 state and an interrupt-and-resume mechanism, which LangGraph provides natively through checkpointers
-and interrupts; Pydantic AI can do it with its graph library plus your own persistence, and DSPy does
-not address it at all, because DSPy is about optimizing the model calls, not orchestrating them. The
-structured verdict is served by any of them: typed state and structured outputs in LangGraph, a
+and interrupts; Pydantic AI can do it with its graph library's state persistence or a durable-execution
+integration, and DSPy does
+not address it at all, because DSPy is about optimizing the model calls, not orchestrating them. In LangGraph the
+approval node must contain nothing with a side effect before the interrupt, because LangGraph re-runs
+the node on resume. The structured verdict is served by any of them: typed state and structured outputs in LangGraph, a
 validated output type with retries in Pydantic AI, typed output fields in DSPy. So the shape is
 LangGraph, or a small hand-rolled state machine, for control flow, and if the review prompt proves
 fragile across models and the team has labelled examples, a DSPy-compiled module inside the review

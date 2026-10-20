@@ -5,6 +5,7 @@ name: Data lineage
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - data-architecture/model-and-dataset-provenance
   - data-architecture/data-contracts
@@ -70,8 +71,10 @@ The job emits lineage events as it runs: a start event naming the job, run id an
 versions; a complete event naming outputs with their versions and facets such as row counts, schema and
 the code commit. This design is chosen *because* declared lineage (a YAML file describing the DAG) tells
 you the intended graph, not the actual one for a specific run. OpenLineage is the common open standard for
-these events; orchestrators and transformation tools can emit them, and catalogs such as Marquez, DataHub
-or Atlas store and render the graph. Even without the tooling, a table of `(run_id, job, direction,
+these events; orchestrators and transformation tools (Airflow, Spark, dbt among them) can emit them,
+Marquez is the reference backend that stores and renders the graph, and catalogs such as DataHub can
+ingest the events. Other catalogs (Apache Atlas, for example) use their own lineage model, so check
+which format your catalog actually consumes. Even without the tooling, a table of `(run_id, job, direction,
 dataset, version, facets)` rows gives you the same power.
 
 ### Facets that make lineage useful
@@ -98,8 +101,11 @@ c, from document d at version v, ingested by run r".
 
 ### Lineage for training
 A training run's inputs are dataset versions and a base model version; its outputs are checkpoints and
-eval results. Recording the exact data snapshot hash is what lets you answer "was example x in the
-training set" without re-running the filter pipeline, and it is what dataset contamination checks need.
+eval results. Recording the exact data snapshot, as an immutable version that is retained and addressed
+by its hash, is what lets you answer "was example x in the training set" by looking it up rather than
+re-running the filter pipeline; a hash on its own proves which bytes were used but cannot be searched,
+so the snapshot must be kept for as long as that question can be asked. It is also what dataset
+contamination checks need.
 
 ## Example
 A minimal lineage recorder for a RAG ingestion step. It writes versioned dataset nodes and run edges to an
@@ -108,7 +114,6 @@ root cause from a chunk.
 
 ```python
 import hashlib, uuid, time
-from collections import defaultdict
 
 edges = []          # (run_id, direction, dataset_id)
 runs = {}           # run_id -> facets

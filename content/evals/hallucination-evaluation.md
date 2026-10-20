@@ -5,7 +5,7 @@ name: Hallucination evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - evals/faithfulness-groundedness
   - model-internals/hallucination
@@ -108,6 +108,12 @@ questions whose answer is missing from the context, false-premise questions, que
 that do not exist, and questions about facts past the model's training cutoff. Fabrication concentrates
 in the last four, so they are where the metric moves when you change the prompt or add retrieval.
 
+### Size the slices before trusting a difference
+The slices that matter are small, so their rates are noisy. A fabrication rate of 10% measured on 50
+unanswerable items has a 95% interval of roughly ±8 points (1.96 · √(0.1 · 0.9 / 50)), so "12% → 8%"
+on that slice is not evidence of anything. Either grow the critical slices to a few hundred items or
+compare versions on the same items and look at which items flipped, as a regression suite does.
+
 ### Trust the verifier only after measuring it
 The verifier is itself a model. Measure its agreement with human claim labels on a few hundred claims
 (Cohen's kappa) before using its numbers, and use a different model family from the generator, because
@@ -150,12 +156,23 @@ def mean(rows: list[dict], key: str) -> float:     # skips undefined values; boo
 def evaluate(items: list[dict]) -> dict:   # item: {"question", "answerable": bool, "response"}
     rows = [{**it, **score_response(it["response"])} for it in items]
     ans = [r for r in rows if r["answerable"]]
+    answered = [r for r in ans if not r["abstained"]]   # abstentions would dilute the rate toward 0
     unans = [r for r in rows if not r["answerable"]]
-    return {"claim_precision": mean(ans, "claim_precision"),
-            "response_hallucination_rate": mean(ans, "hallucinated"),
+    return {"claim_precision": mean(answered, "claim_precision"),
+            "response_hallucination_rate": mean(answered, "hallucinated"),
             "false_abstention": mean(ans, "abstained"),
             "fabrication_on_unanswerable": 1 - mean(unans, "abstained")}
 ```
+
+Reading the output (illustrative numbers, not a benchmark). Prompt A on 400 answerable and 100
+unanswerable items: claim precision 0.95, response hallucination rate 0.22, false abstention 0.03,
+fabrication on unanswerable 0.41. Prompt B adds "answer only from the documents; say so if they do not
+contain the answer": 0.96, 0.15, 0.09, 0.12. Claim precision barely moved, which is why it is a poor
+headline: the gain is in the other three. B fabricates on roughly one unanswerable item in eight instead
+of two in five, and the price is six more points of false abstention, about 24 answerable questions now
+refused. Whether that trade is good is a product decision, but it is only visible because all four
+numbers are reported. Note also that the rates are computed over *answered* items: had abstentions
+counted as "not hallucinated", B's response rate would look better simply because it answers less.
 
 ## Trade-offs
 - Claim decomposition gives precise, actionable numbers but costs several model calls per response;

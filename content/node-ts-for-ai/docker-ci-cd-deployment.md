@@ -5,7 +5,7 @@ name: Docker / CI/CD deployment
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/ci-cd
@@ -94,9 +94,15 @@ are where Node services discover this.
 
 ### Health, readiness and config
 Expose a liveness endpoint that only proves the event loop is responsive and a readiness endpoint that
-checks dependencies (database, cache, and whether the process is draining). Readiness must flip to
-false the moment `SIGTERM` arrives so the load balancer stops routing new requests while existing
-streams finish. Configuration comes from the environment, parsed once at startup with a schema so a
+checks dependencies (database, cache, and whether the process is draining). Keep the two apart
+*because* a liveness probe that checks the database turns a database blip into a restart of every
+replica at once. On shutdown, readiness flips to false the moment `SIGTERM` arrives, which is the
+signal a plain load balancer uses to stop routing. Kubernetes adds a race: a terminating pod is
+removed from the Service's endpoints, but that removal reaches kube-proxy and ingress controllers
+asynchronously, so for a few seconds after `SIGTERM` new connections can still arrive. If the
+process closes its listener immediately, those requests fail. The usual fix is a short `preStop`
+sleep (or a delay in the handler) before `server.close()`, and the grace period must cover that
+delay plus the longest stream, since `preStop` time counts against it. Configuration comes from the environment, parsed once at startup with a schema so a
 missing `ANTHROPIC_API_KEY` or a non-numeric `PORT` fails before the first request. Secrets are
 mounted or injected by the platform at runtime (Kubernetes Secrets, a secret manager, CI-provided
 environment), never passed as `ARG`/`ENV` at build time: build args are recorded in image history.
@@ -105,7 +111,11 @@ environment), never passed as `ARG`/`ENV` at build time: build args are recorded
 A pull request runs, in parallel where possible: `tsc --noEmit`, lint, unit tests, and integration
 tests against service containers started by CI. `main` additionally builds the image once with
 BuildKit, tags it with the git SHA (and a semver tag at release), pushes it to a registry, and deploys
-that digest, so staging and production run byte-identical images and a rollback is a tag swap. Prompt
+that digest, so staging and production run byte-identical images and a rollback is a tag swap. Note
+the gap this leaves: the PR tests ran against the source on the CI runner, not against the image.
+A file missing from a `COPY`, a native addon built for the wrong libc, or a `dist/` path typo only
+appears in the image, so a smoke test against the deployed digest in staging (start, hit readiness,
+make one request through a stubbed or cheap model) is what makes "the artifact we tested" true. Prompt
 files, tool schemas and the model identifier are part of the repository and therefore of the image;
 changing them is a deploy like any other. Beside the gate, an eval job runs the golden set against
 the real model with a budget and publishes its score; a drop blocks promotion to production without
@@ -204,8 +214,9 @@ jobs:
   (exit code 137) with no JavaScript heap error in the logs.
 - Running `npm install` instead of `npm ci`; the symptom is a dependency version in production that no
   developer machine or CI run ever tested.
-- A readiness probe that stays green while draining; the symptom is new requests landing on a process
-  that is shutting down and failing with connection resets.
+- A readiness probe that stays green while draining, or a listener closed the instant `SIGTERM`
+  arrives with no `preStop` delay; the symptom is a burst of 502s or connection resets at every
+  rollout even though the drain code looks correct.
 - Deploying prompt or model-id changes with no eval in the pipeline; the symptom is a quality
   regression reported by users days after a deploy that "only touched a text file".
 
@@ -236,8 +247,8 @@ it means the process never acted on `SIGTERM`. Three causes are common: the `CMD
 `sh` is PID 1 and the signal never reaches Node; Node is PID 1 but installs no `SIGTERM` handler, and
 the kernel ignores default-action signals for PID 1; or the handler exists but nothing stops the HTTP
 server and in-flight streams. In each case the orchestrator finally sends `SIGKILL` mid-response. Fix it by switching to exec-form
-`CMD` (or `exec` in the entrypoint script), handling `SIGTERM` by flipping readiness to false, calling
-`server.close()`, aborting or finishing active streams with an `AbortController`, and closing pools;
+`CMD` (or `exec` in the entrypoint script), handling `SIGTERM` by flipping readiness to false, waiting a few seconds
+(a `preStop` sleep) for endpoint removal to propagate, then calling `server.close()`, aborting or finishing active streams with an `AbortController`, and closing pools;
 then set the grace period above the longest allowed completion. Verify with a deploy under synthetic
 streaming load and confirm zero truncated responses.
 

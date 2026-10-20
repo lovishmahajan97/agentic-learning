@@ -5,7 +5,7 @@ name: Chain-of-thought prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - prompting/zero-shot
   - prompting/few-shot
@@ -73,6 +73,17 @@ left to right and a field cannot influence one already emitted. With tags, `<rea
   effort control instead of a prompt trigger. On these models an explicit "think step by step" is usually
   redundant and can produce a second, visible chain that duplicates the hidden one; tune the effort
   setting and measure instead. The reasoning-models lesson covers the mechanism.
+
+### Why voting works, in numbers
+Suppose a single chain reaches the right answer with probability 0.6. With five independent chains and a
+strict majority vote, the answer is right when at least three chains are: 10·0.6³·0.4² + 5·0.6⁴·0.4 +
+0.6⁵ ≈ 0.35 + 0.26 + 0.08 = 0.68. Plurality voting does better still when wrong chains scatter across
+different wrong numbers, because the correct answer can win with two votes against four singletons. The
+same arithmetic shows when it backfires: if the model makes one *consistent* mistake more often than it
+reaches the truth, voting amplifies the mistake, and if chains are not independent (identical sampling,
+a shared misreading of the question), five votes carry little more information than one. Measure the
+vote margin as well as the answer: a 5/5 majority and a 2/5 plurality deserve different confidence, and
+the margin is a cheap uncertainty signal for routing low-agreement cases to a person.
 
 ### What the chain is, and is not
 The chain is a computation, and a useful debugging artefact: reading failed chains tells you whether the

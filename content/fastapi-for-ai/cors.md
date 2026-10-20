@@ -5,6 +5,7 @@ name: CORS
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/api-keys-oauth2-jwt
@@ -81,7 +82,10 @@ header, you must expose it.
 ### In FastAPI
 `CORSMiddleware` (from Starlette) answers preflights itself and adds headers to normal responses.
 Its defaults are restrictive: no origins, only GET, no extra headers, no credentials. You have to
-opt in to each one. Because middleware wraps the app in order, it must sit outside anything that might
+opt in to each one. One sharp edge: with `allow_origins=["*"]` *and* `allow_credentials=True`,
+Starlette does not send a literal `*` (which browsers would reject). It echoes back whatever `Origin`
+arrived, so every website is allowed to make credentialed calls. The combination that browsers refuse
+on the wire is silently turned into "reflect any origin" by the middleware. Because middleware wraps the app in order, it must sit outside anything that might
 short-circuit a request (auth middleware returning 401, rate limiters returning 429). Otherwise
 those responses lack CORS headers and the browser reports a CORS error instead of the real status.
 
@@ -142,8 +146,10 @@ which is why the bearer token must be validated.
   browser console showing "CORS error" when the real response was a 401, 429 or 500.
 - Forgetting `Access-Control-Expose-Headers`. The symptom is front-end code reading `null` for
   `Retry-After` or a request ID that is visible in the network tab.
-- Reflecting any `Origin` with credentials enabled. The symptom only shows up in a security review or
-  pentest: any website can read logged-in users' conversations.
+- Reflecting any `Origin` with credentials enabled, including by passing `["*"]` with
+  `allow_credentials=True`, which Starlette implements as reflection. The symptom only shows up in a
+  security review or pentest: any website can read logged-in users' conversations (where the session
+  cookie is `SameSite=None`, so the browser attaches it to cross-site requests).
 - Expecting a trailing slash or a different port to match. The symptom is that the allowlist works
   in staging and fails in prod because `https://chat.acme.com/` was listed with a slash.
 
@@ -185,15 +191,16 @@ response.
 > Only a few content types count as "simple". application/json does not, so the browser checks
 > permission with a preflight first. A form-encoded POST from another origin would be sent directly.
 
-### Q: You set `allow_origins=["*"]` and `allow_credentials=True` and the front end uses cookies. What happens?
-- [ ] It works: any origin can call with cookies
-- [ ] The server rejects all requests with 403
-- [x] Browsers refuse a wildcard origin on credentialed requests, so the call fails unless the server echoes the exact origin
-- [ ] Cookies are sent but the response is cached without Vary
-> The Fetch standard forbids "*" for credentialed responses because it would let any site act as the
-> user. You need an exact origin per request, which is why an explicit allowlist with Vary: Origin is used.
+### Q: In FastAPI you set `CORSMiddleware(allow_origins=["*"], allow_credentials=True)` for a cookie-authenticated API. What is the effect?
+- [ ] Every credentialed call fails, because browsers reject `Access-Control-Allow-Origin: *` with credentials
+- [ ] The middleware refuses to start because the combination is invalid
+- [x] Starlette echoes each request's Origin back with Allow-Credentials, so any website's script can make credentialed calls and read the responses
+- [ ] Only same-origin requests carry cookies, so the setting has no effect
+> The Fetch standard forbids a literal "*" on credentialed responses, which makes the first option tempting,
+> but Starlette works around it by reflecting the caller's Origin. That turns the wildcard into an open,
+> credentialed policy, which is why production code needs an explicit allowlist with Vary: Origin.
 
-### Q: The browser console shows a CORS error, but server logs show the request returned 429. Most likely cause?
+### Q: Most calls from your UI work, but one shows a CORS error in the console while server logs show that request returned 429. Most likely cause?
 - [ ] The client's origin is missing from the allowlist
 - [x] The rate limiter short-circuits before CORS middleware runs, so the 429 has no CORS headers
 - [ ] Browsers always report 429 as a CORS error

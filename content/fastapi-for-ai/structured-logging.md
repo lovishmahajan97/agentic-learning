@@ -5,6 +5,7 @@ name: Structured logging
 kind: practice
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/opentelemetry-instrumentation
@@ -53,14 +54,14 @@ same calls.
 Python's `contextvars` give each asyncio task its own view of a variable, and a task copies the current
 context when it is created. A middleware at the top of the stack generates or accepts a `request_id`
 (from an incoming `X-Request-ID` header, or the trace id if tracing is on), binds it together with tenant
-and route, and clears it when the request ends. Every log call during that request, in any function or
+and route, and clears any stale values at the start of each request (structlog's recommended pattern). Every log call during that request, in any function or
 library that goes through the same logging pipeline, inherits those fields without receiving them as
 arguments. structlog does this with `bind_contextvars` and the `merge_contextvars` processor.
 
 ### The pipeline
 A typical structlog chain: merge contextvars, add log level, add an ISO timestamp, render exceptions as
-structured fields, then render JSON. Configure the standard library `logging` to use the same formatter
-so third-party loggers (httpx, SQLAlchemy, Uvicorn errors) come out as JSON with the same fields rather
+structured fields, then render JSON. Configure the standard library `logging` to use the same pipeline (structlog's `ProcessorFormatter`, with
+`merge_contextvars` in its pre-chain) so third-party loggers (httpx, SQLAlchemy, Uvicorn errors) come out as JSON with the same fields rather
 than as stray plain-text lines.
 
 ### What to log for LLM calls
@@ -72,7 +73,7 @@ need them for debugging, put them behind an explicit, sampled, access-controlled
 limits, and redact before writing.
 
 ### Access logs
-Uvicorn's access logger prints its own plain-text line per request. Most teams disable it
+Uvicorn's access logger prints its own plain-text line per request. A common pattern is to disable it
 (`--no-access-log`) and emit one structured `request_finished` event from the middleware instead, with
 status, route template (not the raw path, to avoid high-cardinality ids) and duration.
 

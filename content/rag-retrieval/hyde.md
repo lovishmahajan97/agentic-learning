@@ -5,7 +5,7 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -17,6 +17,8 @@ related:
   - model-internals/embeddings
 sources:
   - Gao et al., 2022 — Precise Zero-Shot Dense Retrieval without Relevance Labels
+  - Wang, Yang and Wei, 2023 — Query2doc: Query Expansion with Large Language Models
+  - Nogueira et al., 2019 — Document Expansion by Query Prediction
 ---
 
 ## TL;DR
@@ -71,7 +73,13 @@ entity-level error: if the model writes about the wrong product or confuses two 
 services, the vector lands in the wrong neighbourhood and no amount of averaging rescues it.
 
 ### Where it fits with neighbouring techniques
-- It is a special case of query rewriting: rewriting the query into document-shaped text.
+- It is a special case of query rewriting: rewriting the query into document-shaped text. Query2doc is
+  a close relative that concatenates the original query with the generated pseudo-document (repeating
+  the query so it is not drowned out) and was shown to help sparse BM25 retrieval as well as dense.
+- The mirror image works at index time. Doc2query-style expansion has a model write the questions each
+  chunk answers and indexes them with (or as keys for) the chunk, so the corpus side becomes
+  question-shaped instead. The generation cost moves from every query to ingestion, which suits high
+  query volume and stable corpora; HyDE suits the reverse, or a corpus you cannot re-index.
 - It can feed the sparse leg of hybrid search too, since the hypothetical contains answer vocabulary the
   question lacked; but it also contains invented terms, so keep the original query for BM25 as well.
 - It is query-side; contextual retrieval and parent-document retrieval are index-side, and they combine.
@@ -131,13 +139,18 @@ hits, hypos = hyde_search("How do I rotate an API key without downtime?")
   details and the vector drifts toward old passages, so the symptom is retrieval of outdated versions.
 - Adopting it because the paper reported gains, without measuring; the symptom is added latency and a
   flat recall@k.
+- Running the reranker against the hypothetical instead of the question; the symptom is a top result
+  that matches the invented details (the "48 hours" passage from an old version) over the true answer.
 - Letting the hypothetical exceed the encoder's input limit; the symptom is silent truncation and a
   vector that represents only the opening sentences.
 
 ## When to use
 Reach for HyDE when queries are question-shaped, the corpus is passage-shaped, and the embedding model
 was not trained for that asymmetry; in practice that means a generic or older encoder, or a domain far
-from its training data. Try instruction-prefixed embeddings and hybrid search first, since they are
+from its training data. If the corpus is itself question-shaped (an FAQ indexed on its questions, or
+chunks expanded with generated questions), the shapes already match and HyDE has little left to fix. If
+query volume is high and the corpus stable, compare against index-time question generation, which pays
+the generation cost once per chunk rather than once per query. Try instruction-prefixed embeddings and hybrid search first, since they are
 free at query time. Avoid it for identifier lookups, for time-sensitive facts, and for domains the LLM
 knows nothing about. Measure recall@k and MRR on a golden set with and without it, and the latency it
 adds at p95. In interviews, HyDE is the standard answer to "how would you improve dense retrieval

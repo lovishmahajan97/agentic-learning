@@ -5,7 +5,7 @@ name: Parallel tool calls
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - agents/tool-calling
   - agents/agent-loop
@@ -48,7 +48,10 @@ Models trained for tool use emit multiple `tool_use` blocks in one turn when the
 on the major APIs this is on by default, and it can be switched off: `disable_parallel_tool_use: true`
 inside `tool_choice` on the Claude API, `parallel_tool_calls: false` on OpenAI's. What the model cannot express in a single turn is a dependency: "use the
 customer id from call A as the argument of call B". For that it emits A, waits for the result, then
-emits B, which is correct and sequential. If the chain is long, programmatic tool calling (the model
+emits B, which is correct and sequential. How eagerly a model batches varies by model and by context;
+if traces show independent reads arriving one per turn, an explicit system-prompt instruction ("when
+several lookups do not depend on each other, request them in the same turn") usually raises the batch
+rate, and the calls-per-turn metric below tells you whether it did. If the chain is long, programmatic tool calling (the model
 writes a script that calls tools from inside a sandbox) is the alternative that keeps intermediate
 results out of the transcript (Anthropic offers this as "programmatic tool calling"; code-as-action
 agent frameworks implement the same idea).
@@ -58,7 +61,11 @@ agent frameworks implement the same idea).
 2. Classify each by the tool's contract metadata: read-only calls are parallel-safe; side-effecting
    calls run one at a time, in the order the model emitted them, or go through an approval gate.
    Idempotency does not make a write parallel-safe: "set status to shipped" and "set status to
-   cancelled" are each idempotent, yet run concurrently they race on which lands last.
+   cancelled" are each idempotent, yet run concurrently they race on which lands last. Running the
+   safe reads first and the writes after, as the example below does, also reorders the model's turn; that
+   is acceptable *because* calls in one turn are by definition ones the model considered independent, but
+   if a read and a write in the same turn touch the same record, the read reports the pre-write state and
+   the write tool should return the new state itself.
 3. Run the safe set concurrently (`asyncio.gather`, a thread pool, a task group) under a concurrency
    cap, because a model that emits ten calls to the same API is a burst your rate limits did not plan for.
 4. Isolate failures. Each call gets its own result, and one exception must not cancel the others,
@@ -112,7 +119,7 @@ async def run_one(block) -> dict:
         return {"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(out)}
     except asyncio.TimeoutError:
         return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
-                "content": f"timed out after {TIMEOUT_S}s; retry once or narrow the request"}
+                "content": f"timed out after {TIMEOUT_S}s; outcome unknown, check before retrying"}
     except Exception as e:                                      # isolate: one failure, one error result
         return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
                 "content": f"{type(e).__name__}: {e}"}
@@ -153,6 +160,9 @@ async def execute_turn(response) -> dict:
   under load.
 - No per-call timeout; the symptom is a whole turn stalled on one slow upstream while the others
   finished long ago.
+- Telling the model to "retry" a write that timed out; the timeout cancelled your wait, not necessarily
+  the downstream operation, so the symptom is a double charge or a duplicate ticket unless the write
+  carries an idempotency key or the model is told the outcome is unknown and checks first.
 - Dropping the result for a call the policy refused to run; the symptom is a protocol error, when the
   correct move is an `is_error` result saying the call was declined.
 

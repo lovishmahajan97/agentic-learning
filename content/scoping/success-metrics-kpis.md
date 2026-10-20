@@ -5,6 +5,7 @@ name: Success metrics / KPIs
 kind: metric
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - scoping/baseline-measurement-before-deployment
   - scoping/roi-model
@@ -80,8 +81,8 @@ decoration, and the review turns into a negotiation.
 For each metric you optimise, name the cheap way to game it and add a guardrail that would catch it.
 Deflection pairs with reopen rate and escalations within 24 hours. Handle time pairs with a QA score.
 Auto-approval rate pairs with the error rate on auto-approved items, audited by sampling. This does not
-assume bad faith. Optimisation pressure, including the model's own prompt tuning, finds the cheap path
-by default.
+assume bad faith. Optimisation pressure, including the team's own prompt iteration against the metric, finds the
+cheap path by default.
 
 ## Example
 Here is a worked scenario with illustrative numbers. An insurer wants an assistant that reads

@@ -5,7 +5,7 @@ name: Structured event streams
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -64,7 +64,10 @@ payload     type-specific body
 
 `seq` exists *because* timestamps are not a total order: two processes with skewed clocks, or two
 parallel tool calls, produce ties and inversions. One writer per run assigns `seq`, consumers sort by it,
-and `(run_id, seq)` is the idempotency key that lets at-least-once delivery dedupe.
+and `(run_id, seq)` is the idempotency key that lets at-least-once delivery dedupe. Workers that execute
+parallel tool calls do not write to the stream themselves; they report back to the writer, which appends
+their results in the order it receives them. The order of two parallel results is then arbitrary but
+fixed, and that is enough: what matters is that every replay sees the same order.
 
 ### The vocabulary
 A workable minimum, named as dotted lifecycle pairs:
@@ -103,9 +106,26 @@ the agent, so live fan-out is buffered or dropped for deltas, while state-changi
 durable before the agent proceeds. The rule "durable first, then act" is what makes the stream
 trustworthy: if a tool call ran, there is an event saying it was requested.
 
+Live subscribers tail the durable log rather than receiving a second copy from the agent, *because*
+writing to the log and publishing to a socket separately is a dual write: one can succeed while the
+other fails, and the UI then shows events the history does not contain. Tailing also handles late joins
+for free: a client that opens the page mid-run reads from `seq` 0 (or its last seen `seq`) and then
+follows.
+
+Durable-first does not remove ambiguity; it makes ambiguity visible. After a crash, a
+`tool.call.requested` with no matching `tool.call.result` means the call may or may not have executed.
+The fold surfaces it as pending, and the runtime resolves it by re-issuing the call with the same
+idempotency key or by asking the tool for the operation's status, never by assuming it did not happen.
+
 ### Versioning
 Event types evolve. The `version` field lets old runs replay through a reader that knows both shapes, and
-a new consumer can refuse versions it does not understand instead of silently misparsing them.
+a new consumer can refuse versions it does not understand instead of silently misparsing them. The usual
+technique is an upcaster: a small function that converts a version-1 payload to version 2 on read, so
+the fold only ever handles the current shape and stored history is never rewritten.
+
+Standard vocabularies are emerging (OpenTelemetry's generative-AI conventions for the trace projection,
+and agent-to-UI event protocols for the live one), but they are young and still changing. Owning your
+internal schema and mapping it to those standards at the edges keeps you independent of their churn.
 
 ## Example
 A minimal typed stream: a discriminated union of events, a single-writer emitter, a pure fold that
@@ -190,6 +210,8 @@ def to_sse(ev: Event) -> str:                     # UI transport; client resends
   network rather than the model's.
 - Emitting events after the side effect instead of before; the symptom is a crash between the tool
   running and the event being written, leaving a run that resumes and runs the tool again.
+- Publishing to live subscribers and to the durable log as two independent writes; the symptom is a user
+  who saw a step in the UI that is missing when the run is resumed or replayed.
 
 ## When to use
 Adopt a structured stream as soon as more than one consumer needs to know what the agent is doing, which

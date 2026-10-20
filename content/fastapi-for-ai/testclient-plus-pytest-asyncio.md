@@ -5,6 +5,7 @@ name: TestClient + pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - python-for-ai/pytest
   - python-for-ai/pytest-asyncio
@@ -76,6 +77,21 @@ that calls httpx directly, `httpx.MockTransport` or the `respx` library intercep
 transport and returns canned responses. Clear overrides after each test, or one test's fake leaks into
 the next.
 
+The override dict is keyed by the *callable object* that appears in `Depends(...)`. FastAPI looks up
+each dependency function in `dependency_overrides` while resolving the request, so the key must be
+that exact function. Overriding a lookalike (a wrapper, a re-import of a different function, or a
+dependency produced by a factory call such as `Depends(make_llm("gpt"))`, which creates a new closure
+at import time) silently does nothing, and the real client runs.
+
+### Exceptions surface differently in tests
+By default `TestClient(app)` re-raises an unhandled exception from the app into your test instead of
+returning a 500 (`raise_server_exceptions=True`), *because* a traceback is more useful than a status
+code while debugging. `ASGITransport` behaves the same way through `raise_app_exceptions`. Exceptions
+your app handles, `HTTPException` and registered exception handlers, still become normal responses.
+So to assert what a client actually sees when something unhandled breaks, construct the client with
+`raise_server_exceptions=False`; otherwise the test fails with the exception rather than checking the
+status.
+
 ## Example
 A fake LLM via dependency override, tested once synchronously with `TestClient` and once asynchronously
 with `ASGITransport`. Requires `pytest-asyncio`.
@@ -123,7 +139,12 @@ async def test_async_skips_model_on_empty(fake):
 ```
 
 Both tests exercise routing, dependency injection and serialisation, run in milliseconds and cost
-nothing. Real-model behaviour belongs in a separate, smaller suite.
+nothing. Note what each assertion proves: the sync test checks that the request reached the fake
+exactly once through the override; the async test checks a negative, that the empty-input branch never
+touched the model, which no amount of mocking the HTTP layer would show as clearly. The same fake
+pattern extends to failure paths: a `FailingLLM` whose `complete` raises your provider-error type lets
+you assert that the endpoint maps it to, say, 502 with your error body. Real-model behaviour belongs
+in a separate, smaller suite.
 
 ## Trade-offs
 - `TestClient` keeps tests synchronous and simple, but runs the app on a different loop in another
@@ -141,6 +162,10 @@ nothing. Real-model behaviour belongs in a separate, smaller suite.
 - Using `TestClient` inside an `async def` test that also created an async engine or client; the
   symptom is "attached to a different loop" or a hang, because two loops share one object.
 - Forgetting to clear `app.dependency_overrides`; a later test passes or fails depending on test order.
+- Overriding a different function object from the one in `Depends(...)`; the symptom is a test that
+  passes slowly, needs network, or fails with an authentication error from the real provider.
+- Writing a test that expects a 500 from an unhandled error with default `TestClient` settings; the
+  test errors with the app's exception instead of seeing the status code.
 - Missing the asyncio marker in strict mode; the coroutine is never awaited, and depending on the
   pytest version the test is skipped with a warning or fails, but its assertions never run.
 - Asserting on time-to-first-chunk through an in-process transport; buffering behaviour differs from

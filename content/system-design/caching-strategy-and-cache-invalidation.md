@@ -4,7 +4,7 @@ module: system-design
 name: Caching strategy & cache invalidation
 kind: pattern
 difficulty: core
-est_minutes: 16
+est_minutes: 18
 status: reviewed
 related:
   - serving-inference/caching

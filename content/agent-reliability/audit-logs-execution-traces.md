@@ -5,7 +5,7 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/structured-event-streams
   - agent-reliability/deterministic-replay-and-reproducibility
@@ -61,7 +61,10 @@ conventions define attribute names for many of these (they are still evolving, s
 adopt), and tools such as Langfuse, LangSmith and Phoenix render the tree. Span inputs and outputs are
 attached as references to a blob store, *because* a trace of a long run with inline payloads is megabytes
 and the tracing backend is the wrong place for customer data. Traces are sampled under load; keeping 100%
-of failed or escalated runs and a fraction of successful ones is a common policy.
+of failed or escalated runs and a fraction of successful ones is a common policy. That policy requires
+*tail-based* sampling: the keep-or-drop decision is made after the run ends, by a collector that buffers
+its spans, *because* head-based sampling decides at the root span, before anyone knows the run will fail,
+and so drops failures at the same rate as successes.
 
 ### Audit log
 An audit record is written at each authority-bearing moment: a permission decision, an approval, a
@@ -72,7 +75,7 @@ fixed-shape:
 ts, run_id, step_id, actor (user), principal (agent identity),
 action (tool name), target (resource id), args_hash,
 policy_version, decision (allow|ask|deny), approval_id, credential_id,
-outcome (ok | error class), prev_hash, hash
+phase (authorized | completed), outcome (ok | error class), prev_hash, hash
 ```
 
 Each design choice has a reason. It stores an `args_hash` and a reference rather than the arguments
@@ -88,6 +91,14 @@ touch (a WORM bucket, a separate account, a signed checkpoint), because anyone a
 could also recompute the whole chain. It is complete, never sampled, *because* "we dropped that one" is not an
 acceptable answer in an incident review. And it is queryable by actor, action, target and time, which
 means a table with indexes, not a text file.
+
+Two write-ordering rules follow from "complete". The authorization record is written *before* the
+side effect and the outcome record after, *because* a crash in between must leave evidence that an
+action was authorized and may have run; an outcome-only log loses exactly the actions that crashed
+mid-flight, which are the ones an investigation cares about. And for side-effecting tools the audit
+write fails closed: if the audit store is unavailable the tool does not run. That costs availability, so
+read-only tools are often allowed to proceed with a buffered record, but an unrecorded refund is worse
+than a delayed one.
 
 ### One source, two sinks
 Both artifacts are projections of the run's event stream. `tool.call.permission`, `tool.call.result`,
@@ -106,8 +117,10 @@ operate in, restricted access, complete. Redaction rules differ too: a trace may
 ingestion; an audit log should never have contained it.
 
 ## Example
-A tool-execution wrapper that emits a trace span and an append-only, hash-chained audit record from the
-same call. Arguments are hashed into the audit row and stored by reference for the trace.
+A tool-execution wrapper that emits a trace span and append-only, hash-chained audit records from the
+same call: one for the decision before anything runs, one for the outcome after. Arguments are hashed
+into the audit rows and stored by reference for the trace. (In a stream-based runtime both would be
+projections of the run's events; the direct writes keep the example short.)
 
 ```python
 import hashlib, hmac, json, os, time
@@ -142,17 +155,18 @@ def run_tool(name, args, *, ctx, policy, tools, blobs, audit: AuditLog):
         args_ref = blobs.put(args, ttl_days=30)                     # payload lives in the blob store
         span.set_attributes({"agent.tool.name": name, "agent.args_ref": args_ref,
                              "agent.permission": decision, "agent.policy_version": policy.version})
+        base = dict(run_id=ctx.run_id, step_id=ctx.step_id, actor=ctx.user_id,
+                    principal=ctx.agent_id, action=name, target=args.get("id"),
+                    args_hash=_args_hash(args), args_ref=args_ref, policy_version=policy.version,
+                    decision=decision, credential_id=ctx.credential_id)
+        audit.write(ts=time.time(), phase="authorized", **base)    # before the effect; raises -> no run
         t0 = time.time()
         # "ask" would go to an approval flow (omitted); here only "allow" executes
         result = tools[name](**args) if decision == "allow" else {"ok": False, "error": decision}
         span.set_attributes({"agent.ok": bool(result.get("ok")),
                              "agent.error": result.get("error", ""),
                              "agent.latency_ms": int((time.time() - t0) * 1000)})
-        audit.write(ts=time.time(), run_id=ctx.run_id, step_id=ctx.step_id,
-                    actor=ctx.user_id, principal=ctx.agent_id, action=name,
-                    target=args.get("id"), args_hash=_args_hash(args), args_ref=args_ref,
-                    policy_version=policy.version,
-                    decision=decision, credential_id=ctx.credential_id,
+        audit.write(ts=time.time(), phase="completed", **base,
                     outcome="ok" if result.get("ok") else result.get("error", "error"))
         return result
 ```
@@ -182,6 +196,10 @@ def run_tool(name, args, *, ctx, policy, tools, blobs, audit: AuditLog):
   to say which user asked, which policy allowed it, or who approved it.
 - Separate run identifiers in the trace and the audit log; the symptom is an investigator manually matching
   timestamps between two systems.
+- Writing the audit record only after the tool returns; the symptom is an effect visible in the target
+  system (a refund, an email) with no audit row, traced to a worker that crashed mid-call.
+- Head-based trace sampling with a "keep all failures" policy on paper; the symptom is that failed runs
+  are missing from the tracing backend at the same rate as successful ones.
 
 ## When to use
 Every agent that acts on behalf of a user needs the trace from the first week, because it is how you

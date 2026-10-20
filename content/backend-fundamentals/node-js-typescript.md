@@ -5,7 +5,7 @@ name: Node.js / TypeScript
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/runtime-schema-validation
@@ -68,6 +68,13 @@ reading slower than you are writing; honouring that signal (stop pulling from up
 classic way a streaming proxy runs out of memory. Web Streams express the same idea through
 `desiredSize` and pull-based reads, and `pipeTo` handles it for you.
 
+### Cancellation
+The other direction matters as much for AI traffic: when the user closes the tab, the upstream model
+is still generating tokens you are billed for. Node signals the hang-up as a `close` event on the
+response before it finished writing; wiring that to an `AbortController` whose `signal` was passed to
+`fetch` tears down the upstream connection. That saves money only if the upstream in turn stops
+generating when its client disconnects, so check that both hops propagate cancellation.
+
 ### TypeScript: static types, no runtime
 TypeScript's types are erased at compile time. Inside your code they catch mistakes; at the boundary
 they guarantee nothing, *because* the data arrives at runtime from a model, a webhook or an API that
@@ -86,7 +93,7 @@ client from the Python service's OpenAPI schema is how the two sides stay in syn
 
 ## Example
 A minimal Node gateway that relays a streaming response from the Python core while honouring
-backpressure, plus a Zod schema that validates a model-produced tool call at runtime and provides the
+backpressure and cancelling the upstream call when the client disconnects, plus a Zod schema that validates a model-produced tool call at runtime and provides the
 static type for free.
 
 ```ts
@@ -111,17 +118,21 @@ async function* relay(upstream: Response): AsyncGenerator<string> {
 }
 
 http.createServer(async (req, res) => {
-  const upstream = await fetch("http://python-core:8000/v1/chat", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: Readable.toWeb(req) as ReadableStream,  // forward the client body without buffering it
-    duplex: "half",
-  } as RequestInit);
-  res.writeHead(200, { "content-type": "text/event-stream" });
-  for await (const chunk of relay(upstream)) {
-    if (!res.write(chunk)) await new Promise((r) => res.once("drain", r)); // honour backpressure
-  }
-  res.end();
+  const ac = new AbortController();               // client hangs up -> cancel upstream generation
+  res.on("close", () => { if (!res.writableFinished) ac.abort(); });
+  try {
+    const upstream = await fetch("http://python-core:8000/v1/chat", {
+      method: "POST", headers: { "content-type": "application/json" }, signal: ac.signal,
+      body: Readable.toWeb(req) as ReadableStream, // forward the client body without buffering it
+      duplex: "half",
+    } as RequestInit);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    for await (const chunk of relay(upstream)) {
+      if (!res.write(chunk))                       // buffer past high-water mark: client is slow
+        await new Promise((r) => { res.once("drain", r); res.once("close", r); });
+    }
+    res.end();
+  } catch (e) { if (!ac.signal.aborted) res.destroy(e as Error); } // abort is expected, not an error
 }).listen(3000);
 
 const parsed = ToolCall.safeParse(JSON.parse('{"name":"lookup_order","arguments":{"orderId":"ord_42x"}}'));
@@ -143,6 +154,8 @@ if (!parsed.success) console.error(parsed.error.issues);   // never trust model 
   runtime `undefined is not a function` far from the boundary that produced the bad data.
 - Buffering a whole model stream before writing it to the client; the symptom is time-to-first-token
   equal to total generation time and memory spikes under concurrent chats.
+- Not propagating client disconnects upstream; the symptom is token spend that exceeds what users
+  received, and open upstream connections that outnumber open client connections.
 - Running tokenization or large JSON transforms synchronously in a route handler; the symptom is
   every concurrent request's latency rising together, visible as event-loop lag.
 - Letting the Python service's API and the hand-written TypeScript client drift; the symptom is a
@@ -153,7 +166,9 @@ Use Node/TypeScript for the layer that faces the product: UI streaming routes, a
 serverless glue, MCP servers for product data, and lightweight agent orchestration where the SDKs are
 excellent. Keep inference, evaluation, fine-tuning and data pipelines in Python. If a team is entirely
 TypeScript and the AI work is API calls to a provider, a TypeScript-only stack is reasonable until
-evals or custom models appear. Measure event-loop lag and streaming memory; generate the client from
+evals or custom models appear. Measure event-loop lag (`perf_hooks.monitorEventLoopDelay` gives a
+histogram), heap and RSS under many concurrent slow streams, and the ratio of upstream to client
+connections; generate the client from
 OpenAPI rather than typing it by hand. In interviews, expect to explain why types are erased, how
 backpressure works in a streaming proxy, and where the Python boundary belongs. The `node-ts-for-ai`
 module goes deep on each.

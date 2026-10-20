@@ -5,7 +5,7 @@ name: State persistence & conversation recovery
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-and-checkpoint-stores
@@ -79,7 +79,8 @@ not create two turns.
 On server restart, scan turns in `running` or `awaiting_tool` whose run lease has expired. Either
 resume from the run's checkpoint (if durable execution is in place) or mark the turn `interrupted`,
 append an event saying so, and make the log well-formed: every tool call event gets a matching result
-event (synthesize `{"error": "interrupted"}` when the real one is missing) and no assistant message
+event (synthesize `{"error": "interrupted: outcome unknown"}` when the real one is missing; say
+"unknown", not "failed", because a side-effecting call may have completed downstream) and no assistant message
 is left half-written without an end marker. Model APIs reject a history in which a tool call has no
 result, so an unrepaired log makes the conversation permanently unusable.
 
@@ -87,6 +88,29 @@ result, so an unrepaired log makes the conversation permanently unusable.
 When the derived context exceeds the window, summarize older events into a summary event, store it,
 and build later contexts from summary plus recent events. The original events stay. Record which
 summary version each turn used so behaviour can be reproduced later.
+
+### Edits, regenerations and branches
+Users edit an earlier message or click regenerate. Overwriting events in place breaks the
+append-only property and every client cursor that pointed past the edit. Model it instead as a
+branch: each turn event records its parent turn, an edit creates a new user turn whose parent is the
+turn before the edited one, and a regenerate creates a new run (a new attempt) under the same turn.
+The conversation's "current path" is a pointer to the active leaf, and the model context is derived
+by walking parents from that leaf, so abandoned branches stay in the log for audit and for the
+"previous response 1/2" navigation without ever leaking into the context.
+
+### What goes in the log
+Keep events small enough to scan. A tool that returns a 3 MB web page should write the payload to
+object storage and put a reference plus size and hash in the event; the context builder fetches or
+truncates it when building the view. Log the *rendered* inputs that mattered too (which summary,
+which retrieved documents by id), because "why did the assistant say that" is answered by the exact
+context, and the log is the only place it can be re-derived from.
+
+### Deletion against an append-only log
+Append-only and "delete my data" pull in opposite directions. Two workable answers: delete or
+tombstone the conversation's events and blobs outright (simple when deletion is per conversation or
+per user), or encrypt each conversation's payloads under its own key and destroy the key (crypto-
+shredding), which also reaches backups and archives that cannot be rewritten. Summaries are derived
+data and must be deleted with their sources, or the "deleted" content survives in the summary.
 
 ### Concurrency across devices
 Allow one active turn per conversation: reject or queue a new submission while one is running, using
@@ -126,7 +150,8 @@ class ConversationStore:
         calls = {e["payload"]["id"] for e in log if e["type"] == "tool_call"}
         results = {e["payload"]["id"] for e in log if e["type"] == "tool_result"}
         for call_id in calls - results:
-            self.append(cid, "tool_result", {"id": call_id, "error": "interrupted"})
+            self.append(cid, "tool_result", {"id": call_id,
+                        "error": "interrupted: outcome unknown, check before retrying"})
         return len(calls - results)
 
 def build_context(store, cid, recent=40):
@@ -140,6 +165,18 @@ def build_context(store, cid, recent=40):
     return msgs + [{"role": e["type"], "content": json.dumps(e["payload"])} for e in tail]
 ```
 
+Trace one crash. The log for conversation `c1` holds: seq 1 user ("refund order 1182"), seq 2
+assistant tool call `t_a` (`lookup_order`), seq 3 its result, seq 4 tool call `t_b` (`issue_refund`).
+The worker dies before seq 5 is written. The client's last rendered seq was 3. On restart the
+recovery job finds the turn `running` with an expired lease and no checkpoint to resume from, so
+`repair` appends seq 5, an `interrupted` result for `t_b`, and the turn is marked `interrupted`.
+When the client reconnects with `after_seq=3` it receives seq 4 and 5 and renders "the refund step
+was interrupted; retry?". The next model call sees a well-formed history: every tool call has a
+result. Note what the repair cannot know: whether `issue_refund` reached the payment system. The
+synthesized result must therefore say "outcome unknown", and a retry must reuse the original
+idempotency key or check the refund's status first, which is where the durable-execution and
+idempotent-tool lessons take over.
+
 ## Trade-offs
 - An append-only log with derived views preserves every detail and enables resumable streams, but
   costs more storage and a derivation step per model call than storing the model-ready array directly.
@@ -151,6 +188,9 @@ def build_context(store, cid, recent=40):
   side effects.
 - Locking a conversation to one active turn prevents interleaving, but blocks eager users who send a
   follow-up mid-run; queueing the follow-up as the next turn keeps both properties.
+- Branching on edit keeps the log immutable and auditable, but every context build walks a parent
+  chain and every UI must understand "active leaf"; for products without edit or regenerate, a
+  linear log is simpler and the trade flips.
 
 ## Pitfalls
 - Using the model's context array as the storage format, so compaction erases history; the symptom
@@ -163,6 +203,11 @@ def build_context(store, cid, recent=40):
   the assistant's answer and showing a message that starts mid-sentence.
 - Keeping the turn state only in memory; the symptom is spinners that never stop after a deploy, for
   turns no worker is running.
+- Synthesizing a plain "error" result for an interrupted side-effecting call; the symptom is the model
+  confidently re-issuing the refund or email on the next turn, because the history told it the first
+  attempt failed rather than that its outcome is unknown.
+- Editing messages in place; the symptom is reconnecting clients rendering a mix of old and new
+  content, and audits unable to show what the assistant actually saw.
 
 ## When to use
 Any assistant used more than once by the same person needs the conversation store; anything that

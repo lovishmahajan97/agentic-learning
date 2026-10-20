@@ -5,7 +5,7 @@ name: OAuth 2.0 / OIDC
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/authentication-vs-authorization
   - backend-fundamentals/rbac
@@ -71,7 +71,9 @@ only ever carries a short-lived, single-use authorization code; tokens move on t
 5. **Back channel.** The client POSTs `code`, `redirect_uri`, `code_verifier` and, for a confidential
    client, its `client_secret` to `/token`. The server checks the code is unused and unexpired, that
    `SHA256(code_verifier)` equals the challenge from step 2, and that `redirect_uri` is identical to the
-   one sent in step 2 (which `/authorize` already matched against the registered list). PKCE exists *because* public clients (SPAs, mobile apps, CLIs) cannot keep a secret and a
+   one sent in step 2 (which `/authorize` already matched exactly against the registered list; exact
+   matching matters *because* the redirect URI is where the code is delivered, so a wildcard or prefix
+   match lets an attacker steer codes to a page they control). PKCE exists *because* public clients (SPAs, mobile apps, CLIs) cannot keep a secret and a
    code can be intercepted (a malicious app registering the same custom URL scheme, a proxy log). Binding
    the code to a value the interceptor never saw makes the stolen code worthless. The IETF security
    best current practice (RFC 9700) makes PKCE mandatory for public clients and recommends it for
@@ -84,8 +86,9 @@ only ever carries a short-lived, single-use authorization code; tokens move on t
   the client must treat it as opaque either way. Sent as `Authorization: Bearer …`. The API validates it:
   for a JWT, signature against the issuer's JWKS plus `iss`, `aud`, `exp` and the required scopes; for an
   opaque token, a call to the introspection endpoint (RFC 7662).
-- **ID token.** For the client; always a JWT. Claims: `iss`, `sub` (the stable user identifier; key
-  your user table on this, not on email, which can change or be re-issued), `aud` (must equal your
+- **ID token.** For the client; always a JWT. Claims: `iss`, `sub` (the stable user identifier, unique
+  only *within* that issuer, so key your user table on the pair `(iss, sub)`, not on email, which can
+  change or be re-issued), `aud` (must equal your
   `client_id`), `exp`, `iat`, plus `nonce` (present when the request sent one) and `auth_time` (when requested), and
   optionally `email`, `name`. Never send it to an
   API as a credential; its audience is you.
@@ -104,6 +107,11 @@ which is how a provider rotates signing keys without breaking anyone.
   and gets a token carrying its own identity. Use it for batch jobs and for agents acting as themselves.
 - **Device code.** For TVs and CLIs that cannot host a browser: the device polls while the user
   approves on a phone.
+- **Token exchange (RFC 8693).** A service holding a user's token trades it at the authorization server
+  for a new token with a different audience and usually narrower scope ("on-behalf-of"). This is the
+  clean way for an API to call a downstream API, or for an agent's tool runtime to obtain a token for
+  one tool, *because* forwarding the original token sends a credential whose audience is wrong and
+  whose scope is wider than the downstream call needs.
 - **Deprecated.** The implicit grant (token in the URL fragment, front channel) and the resource-owner
   password grant (the client sees the password) are both removed in the OAuth 2.1 draft. Do not build
   anything new on them.
@@ -149,8 +157,8 @@ def handle_callback(code, returned_state, session):   # 2. browser returns ?code
                         audience=CLIENT_ID, issuer=disc["issuer"])
     if claims.get("nonce") != session["nonce"]:
         raise PermissionError("nonce mismatch: token not minted for this login")
-    user_id = claims["sub"]                       # stable identifier; email is a display attribute
-    return user_id, tok["access_token"], tok.get("refresh_token")   # keep tokens server-side
+    user_key = (claims["iss"], claims["sub"])     # sub is unique per issuer; email is a display attribute
+    return user_key, tok["access_token"], tok.get("refresh_token")   # keep tokens server-side
 ```
 
 After `handle_callback` the app issues its own HttpOnly session cookie; the access token is used only
@@ -176,8 +184,12 @@ the server.
   `aud` and `nonce`.
 - Omitting or not checking `state`; the symptom is login CSRF, where a victim's browser completes the
   attacker's login and the victim then uploads data into the attacker's account.
-- Keying users on `email` instead of `sub`; the symptom is duplicate accounts after a rename, or account
-  takeover at providers that re-issue addresses.
+- Keying users on `email` instead of `(iss, sub)`; the symptom is duplicate accounts after a rename, or
+  account takeover at providers that re-issue addresses, or when a second, multi-tenant issuer lets
+  anyone assert an email they do not own.
+- Registering wildcard or prefix-matched redirect URIs ("any path under app.example.com"); the symptom
+  is codes delivered to an open-redirect or user-content page on your own domain, from where an
+  attacker reads them out of the URL. Register exact URIs only.
 - Decoding the JWT without pinning `algorithms`, `audience` and `issuer`; the symptom is that any token
   from the same provider for any other app is accepted, or that an `alg: none` token passes.
 - Storing tokens in browser `localStorage`; the symptom is that one XSS exfiltrates every user's tokens.
@@ -218,7 +230,7 @@ client; the fix is to require an ID token and validate signature, `iss`, `aud` e
 `exp` and `nonce`. Second, tokens live in JavaScript, so a single XSS steals them. Third, the backend
 trusts a client-asserted email. Redesign as a backend-for-frontend: the browser hits `/login`, the server
 builds the authorize URL with `state`, `nonce` and PKCE, handles the callback on the back channel,
-validates the ID token, keys the user on `sub`, and sets an HttpOnly session cookie. Access and refresh
+validates the ID token, keys the user on `(iss, sub)`, and sets an HttpOnly session cookie. Access and refresh
 tokens stay server-side and are used only for calls to Google on the user's behalf, with refresh-token
 rotation enabled.
 

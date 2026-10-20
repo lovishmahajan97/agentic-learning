@@ -5,7 +5,7 @@ name: A2A protocol (Agent2Agent)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -64,6 +64,19 @@ call: the remote agent can pause and ask the caller for more information, and th
 same task by sending another message with the same task id. Outputs are returned as **Artifacts**, each
 a list of parts, so a task can produce a report, a spreadsheet and a JSON summary as separate items.
 
+The states fall into three groups, and a client must branch on the group, not the individual name:
+
+| Group | States | What the caller does |
+|---|---|---|
+| Active | `submitted`, `working` | wait: stream, poll or await a push |
+| Interrupted | `input-required`, `auth-required` | supply the missing input or credential on the *same* task id |
+| Terminal | `completed`, `failed`, `canceled`, `rejected` | read artifacts or the status message; the task is finished |
+
+Terminal tasks are immutable: a follow-up ("now refund the second invoice too") is a *new* task in the
+same `contextId`, not a reopening of the old one. That rule exists *because* it keeps every task's
+artifacts and outcome a stable record that both sides can audit and refer back to, while `contextId`
+carries the conversational thread across tasks.
+
 ### Transport and messaging
 The reference binding is JSON-RPC 2.0 over HTTPS. Core methods include `message/send` for
 request-response, `message/stream` for a Server-Sent Events stream of task status and artifact updates,
@@ -78,6 +91,14 @@ API key, HTTP bearer, OpenID Connect), credentials travel in standard HTTP heade
 never carries them. The server authenticates the *calling agent* (or the user it acts for) and makes
 its own authorization decisions per skill. Because agents are opaque, the caller never receives the
 remote agent's internal tool results, only the artifacts it chooses to return.
+
+Push notifications add a reverse channel with its own risks. The server will POST to whatever URL the
+client registers, so a server should validate that URL (or it becomes a tool for making requests into
+internal networks, a server-side request forgery), and the client's webhook must verify that each
+notification really came from the server (a token or signature agreed at registration) and then fetch
+the authoritative task state with `tasks/get` rather than trusting the payload alone. Finally, a remote
+agent's artifacts and questions are *untrusted input* to the caller's model, exactly like a web page: a
+compromised or malicious peer can embed instructions in its output.
 
 ### How it relates to MCP
 The two protocols are complementary and are commonly used together. MCP is vertical: an agent calling
@@ -161,6 +182,10 @@ of polling, and would persist `task["id"]` and `contextId` so the conversation s
   scratch every message, with no memory of earlier clarifications.
 - Assuming field names are stable across protocol versions; the symptom is clients breaking when a
   server upgrades, because part type keys or well-known paths moved.
+- Feeding a peer agent's artifacts straight into your model's context as trusted text; the symptom is
+  your agent taking actions that trace back to instructions inside a remote agent's reply.
+- Accepting push notifications without verifying the sender; the symptom is task "completions" in
+  your logs that `tasks/get` on the real server does not confirm.
 
 ## When to use
 Use A2A when the thing on the other side reasons rather than merely executes: it may take long, ask

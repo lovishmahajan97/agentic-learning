@@ -5,6 +5,7 @@ name: Race conditions & synchronization primitives (asyncio.Lock, Semaphore)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -135,8 +136,9 @@ only under load.
 - Assuming single-threaded means race-free; the symptom is duplicate refreshes, duplicate writes or
   double-spent budgets that only show up under concurrent load.
 - Creating a primitive at module import time and using it from different event loops, as tests often
-  do; recent Python versions bind a primitive to the loop where it is first used and raise a
-  `RuntimeError` when another loop touches it.
+  do; since 3.10 a primitive binds to the loop on which it first has to wait and raises `RuntimeError`
+  ("bound to a different event loop") when it must wait on another loop, so the failure appears only
+  under contention and looks flaky.
 - Using a semaphore to enforce a requests-per-minute quota; the symptom is 429s returning when
   provider latency drops, because the same concurrency then produces more requests per minute.
 - Re-acquiring the same `asyncio.Lock` in a nested call; the coroutine waits on itself forever and the

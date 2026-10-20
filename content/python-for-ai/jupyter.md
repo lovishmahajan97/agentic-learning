@@ -5,6 +5,7 @@ name: Jupyter
 kind: tool
 difficulty: intro
 est_minutes: 12
+status: reviewed
 related:
   - python-for-ai/pandas
   - python-for-ai/async-await
@@ -57,6 +58,19 @@ edited or deleted. The file on disk shows the current text of each cell, which m
 produced the variables in memory. Execution counts (`[7]`, `[3]`) out of order are the visible clue.
 The only proof that a notebook works is **Restart Kernel and Run All** producing the same results.
 
+### Kernels, environments and memory
+Which Python a notebook uses is set by its **kernelspec**, a small JSON file naming the interpreter to
+launch, not by the shell you started Jupyter from. Registering a virtual environment
+(`python -m ipykernel install --user --name myenv`) is how a project's environment becomes a selectable
+kernel. This explains the install trap: `!pip` runs whatever `pip` is first on the server's `PATH`, which
+may belong to another environment, while `%pip` installs with the kernel's own interpreter.
+
+Because the kernel lives until you restart it, so does everything it references. IPython also keeps
+every displayed result in its output history (`Out`, `_`, `__`), so a large DataFrame or tensor you
+displayed stays referenced even after you `del` the variable. Re-running a "load model" cell creates a
+second copy before the first can be freed. On a GPU that is the classic notebook out-of-memory error:
+the first load fits, the re-run does not, and only a kernel restart reliably gives the memory back.
+
 ### Useful machinery
 - Magics: `%timeit` for micro-benchmarks, `%autoreload` to pick up edits to imported modules, `!pip`
   and `%pip` (the latter installs into the kernel's environment, which is what you usually want).
@@ -73,13 +87,13 @@ A worked scenario: error analysis on an eval run of 2,000 RAG answers.
 Cell 1 loads the eval results JSONL into a pandas DataFrame and, once, the embedding model (about 30
 seconds). Cell 2 filters the 140 rows the judge scored as failures (illustrative numbers). Cell 3 shows
 ten of them with question, retrieved chunks and answer side by side. You notice many failures involve
-tables, so cell 4 adds a `has_table` column by regex over the retrieved chunks and cross-tabulates it with
-the score. Cell 5 plots failure rate by document type. Each question takes seconds because the model and
-data stay in memory.
+tables, so cell 4 adds a `has_table` flag by regex over the retrieved chunks and stores a cross-tab of
+document type against `has_table` for the failing rows in a variable, `by_type`. Cell 5 plots `by_type`.
+Each question takes seconds because the model and data stay in memory.
 
 Then the trap. You edit cell 2's filter to include "partial" scores and re-run cells 2 and 5 but not
-cell 4, so `has_table` was computed on the old subset and the chart is wrong. The notebook file shows the
-new filter, so a reviewer cannot tell. Before sharing, you Restart and Run All: cell 4 now runs on the new
+cell 4, so `by_type` still holds counts from the old subset and the chart is silently wrong; nothing
+errors. The notebook file shows the new filter, so a reviewer cannot tell. Before sharing, you Restart and Run All: cell 4 now runs on the new
 subset and the chart changes. That is the habit that makes the notebook trustworthy. Finally, the
 `has_table` heuristic moves into `analysis/features.py` with a test, and the notebook imports it, so the
 logic outlives the exploration.
@@ -112,6 +126,8 @@ pd.crosstab(fails.doc_type, fails.has_table)
   appearing in the repository history and in rendered previews.
 - Calling `asyncio.run()` in a cell; it raises because the kernel's loop is already running, and the
   usual hack, patching nested loops, hides the problem instead of using top-level `await`.
+- Re-running a model-loading cell, or displaying large tensors, in a long session; the symptom is CUDA
+  out-of-memory on a cell that worked an hour ago, cleared only by restarting the kernel.
 - Installing with `!pip` into a different interpreter than the kernel's; the symptom is a successful
   install followed by `ModuleNotFoundError` in the next cell.
 - Shipping a notebook as the production service; the symptom is no tests, no error handling, and an

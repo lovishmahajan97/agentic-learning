@@ -5,7 +5,7 @@ name: Planning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agents/agent-loop
   - agents/task-decomposition
@@ -64,6 +64,9 @@ flailing when the world disagrees with the model's expectations.
    them with a value prompt or an external checker, expand the best, backtrack from dead ends. This is
    worth its cost only when a partial state can be evaluated cheaply and reliably, such as puzzles,
    code with tests, or formal constraints. Without an evaluator it degenerates into expensive sampling.
+   At the formal extreme, the LLM only translates the goal into a planning language (PDDL) and a
+   classical planner finds a provably valid plan, which works when the domain's actions and
+   preconditions can be written down exactly, and not otherwise.
 
 **Hierarchical** planning layers these: a top-level planner emits goals, each goal is handled by its
 own interleaved loop. It keeps each context small and matches how task decomposition is done.
@@ -90,8 +93,9 @@ what went wrong, and returns a revised plan. Bounding replans (for example, thre
 the loop from planning forever instead of acting.
 
 ### Cost model
-Interleaved planning costs one call per action with the whole history re-read each time, roughly
-O(steps × context). Plan-then-execute costs one large planner call plus cheap executor calls, and
+Interleaved planning costs one call per action with the whole history re-read each time. Because the
+history grows by one observation per step, total input tokens grow roughly with steps² (prompt caching
+lowers the price of re-reading but not the attention dilution). Plan-then-execute costs one large planner call plus cheap executor calls, and
 ReWOO drops to a small constant number of model calls. Search multiplies cost by branching factor and
 depth. Pick the cheapest scheme that survives your failure cases, then measure.
 
@@ -121,16 +125,18 @@ def agent(goal):
         for step in plan:
             if step.get("status") == "done":
                 continue
-            if used >= MAX_STEPS:
-                return {"status": "budget_exhausted", "plan": plan}
-            obs = run_step(step, context=[s for s in plan if s.get("status") == "done"])
-            used += 1
-            check = verify(step, obs)
-            if check["done"]:
-                step["status"], step["result"] = "done", obs
-            else:
-                history.append(f'step {step["id"]} failed: {check["why"]}')
-                break                      # leave the inner loop and replan
+            for attempt in (1, 2):             # retry once: one failure may be transient
+                if used >= MAX_STEPS:
+                    return {"status": "budget_exhausted", "plan": plan}
+                obs = run_step(step, context=[s for s in plan if s.get("status") == "done"])
+                used += 1
+                check = verify(step, obs)
+                if check["done"]:
+                    step["status"], step["result"] = "done", obs
+                    break
+                history.append(f'step {step["id"]} try {attempt} failed: {check["why"]}')
+            if step.get("status") != "done":
+                break                          # failed twice: the plan's premise is suspect
         else:
             return {"status": "complete", "plan": plan}
         if replan == MAX_REPLANS:
@@ -140,9 +146,21 @@ def agent(goal):
     return {"status": "gave_up", "plan": plan, "history": history}
 ```
 
-The two deliberate choices are the `done_when` criterion written at planning time, and keeping finished
-steps across replans *and telling the replanner about them*, so it plans only the remaining work and the
-agent does not redo verified steps.
+The deliberate choices: the `done_when` criterion is written at planning time, *because* that is when
+the intent is clearest; a step gets one retry before it triggers a replan, *because* a single failure is
+often transient while two suggest the plan itself is wrong; and finished steps are kept across replans
+*and named to the replanner*, so it plans only the remaining work and nothing verified is redone. Where a
+step's `done_when` can be checked by code (a test passes, a row exists), replace the LLM `verify` call
+with that check; a model judging its own executor's output is the weakest verifier available.
+
+Trace it on "upgrade the auth library and make the tests pass". The planner returns four steps: bump
+the dependency (`done_when`: lockfile shows the new version), fix compile errors (build exits 0), update
+the deprecated token call sites (grep finds no old API), run tests (suite green). Steps 1 and 2 pass.
+Step 3 fails twice because the "deprecated" call has no direct replacement, which contradicts the
+plan's assumption. The replanner sees steps 1 and 2 done plus the failure history and returns two new
+steps (add an adapter function, migrate call sites to it) followed by the test step. Total: two planner
+calls, about seven executor calls, versus a reactive loop that would likely have kept patching call
+sites one compile error at a time.
 
 ## Trade-offs
 - Up-front plans give reviewability and progress tracking, but they are written with the least
@@ -195,8 +213,10 @@ representation, not the model. Have a planner produce a structured plan where ea
 of invoices) is a step with `done_when: "match stored for invoice X"`, keep the status table in a
 scratchpad that is re-injected at the top of each turn, and gate completion on the table, not on the
 last message. Independent invoices can run as parallel steps. Cost: one planner call, then one executor
-call per invoice with a small context, instead of one growing-context call per action, so cost falls
-from roughly O(n²) tokens to O(n), and replans are bounded to a few per batch.
+call per invoice with a small context, instead of one growing-context call per action, so the dominant
+cost falls from roughly O(n²) tokens to O(n) (the status table still grows with n, but at a few tokens
+per invoice, or summarise it as counts plus the next pending ids), and replans are bounded to a few per
+batch. Better still, "matched" should be a deterministic check on stored records, not the model's opinion.
 
 ## Quiz
 ### Q: Why does plan-then-execute often beat interleaved ReAct on long tasks?

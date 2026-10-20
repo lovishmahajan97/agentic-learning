@@ -5,7 +5,7 @@ name: Stopping conditions / termination
 kind: concept
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/max-step-budgets
   - agent-reliability/loop-detection
@@ -78,7 +78,10 @@ every exit must record *why* it exited.
 After every step evaluate the signals in a fixed order: external aborts, then hard budgets, then
 progress checks, then the verifier, then the model's signal. Cheap and safe checks come first because
 a budget breach should win even if the model simultaneously claims success; the claim can be recorded,
-but the status is "exhausted". The function returns one of `continue`, `done(result)` or
+but the status is "exhausted". One refinement: if the response that crosses the budget also carries a
+submit, run the verifier on it before declaring exhaustion. A *verified* result on the last step is a
+success; an unverified claim is still `partial`. The verifier can jump the queue this way because it
+is the one check that does not depend on the model's judgement. The function returns one of `continue`, `done(result)` or
 `abort(reason)`, and the run's final record carries `status ∈ {succeeded, partial, aborted, failed}`
 plus a reason code.
 
@@ -87,6 +90,32 @@ Consumers (the UI, downstream workflows, evaluation pipelines) need to distingui
 success" from "model says success" from "budget ran out with a draft". Collapsing these into one
 return value means your task-completion metric counts truncations as completions. Make the status a
 first-class field and let the caller decide what to show.
+
+### Ending cleanly
+Deciding to stop is half the job; the other half is stopping without leaving debris. An abort can
+arrive while tool calls are in flight, so termination has two modes. **Graceful**: stop issuing new
+model calls, let in-flight tool calls finish or hit their per-call timeout, record their results,
+then write the outcome; use it for budgets and verifier decisions, because the in-flight work is
+legitimate and its results belong in the record. **Hard**: cancel in-flight calls (cooperative
+cancellation tokens, killing subprocesses), because the reason to stop is that continuing is unsafe
+or unwanted: a user cancel, a policy guard, a denied approval. Either way, release what the run holds
+(leases, sandboxes, temp branches, locks) in a `finally`-style cleanup, and remember that a
+cancelled call may still have taken effect downstream, so the outcome should list such calls as
+"possibly executed" rather than "not run".
+
+### The wrap-up turn
+When a budget or progress check fires, the most useful artefact is often the model's own account of
+where it got to. Rather than returning the last raw message, make one final model call with tools
+withheld (omit the tool list, or set tool choice to none where the API supports it) and a prompt
+asking for a summary of what was done, what remains and what blocked it. Withholding tools matters
+because otherwise the model treats the request as another chance to act. Reserve budget for this
+call, or it cannot be afforded at exactly the moment it is needed.
+
+### Sub-agents and termination
+A sub-agent's outcome is an input to its parent, so it must return the same labelled status, never a
+bare string. A parent that receives `partial` from a child should decide explicitly (retry with more
+budget, try another approach, or propagate `partial` upward) instead of treating the child's draft as
+an answer. Without this, a truncation three levels down surfaces at the top as a confident success.
 
 ### The state-machine view
 Termination is a set of transitions in the run's state machine:
@@ -98,6 +127,13 @@ outcome.
 ## Example
 This loop makes "done" a tool call that an external check must accept, treats truncation as failure
 instead of completion, and nudges exactly once when the model ends its turn without submitting.
+Cancellation is checked first; a verified submit is accepted even if it lands on the last allowed
+step (the trade-off below), and only then does budget exhaustion produce a `partial` built from the
+wrap-up turn. Walk one run through it: step 6 submits with 2 of 40 tests failing, so the submit is
+rejected with the failure names and the run continues; step 9 submits with all tests green and the
+run ends `succeeded/verified`. Had step 9 instead been the twelfth and last allowed step with tests
+still red, the outcome would be `partial/budget_exhausted` carrying the model's summary, and the
+dashboard would count it as not done.
 
 ```python
 from dataclasses import dataclass
@@ -112,15 +148,15 @@ def decide(state, resp, verify) -> Outcome | None:
     """Return an Outcome to stop, or None to continue. Order matters."""
     if state.cancelled:
         return Outcome("aborted", "user_cancelled")
-    if state.steps >= state.max_steps or state.tokens >= state.max_tokens:
-        return Outcome("partial", "budget_exhausted", state.last_draft())
     if resp.stop_reason == "max_tokens":
         return Outcome("failed", "output_truncated")
     submit = next((c for c in resp.tool_calls if c.name == "submit_result"), None)
+    ok, detail = verify(submit.args) if submit else (False, "")   # independent check
+    if ok:                                           # verified success wins even on the last step
+        return Outcome("succeeded", "verified", submit.args)
+    if state.steps >= state.max_steps or state.tokens >= state.max_tokens:
+        return Outcome("partial", "budget_exhausted", state.wrap_up())  # no-tools summary call
     if submit:
-        ok, detail = verify(submit.args)             # independent check
-        if ok:
-            return Outcome("succeeded", "verified", submit.args)
         # every tool call needs a matching result, or the next API request is rejected
         state.push_tool_result(submit, f"rejected: {detail}. Keep working.")
         return None
@@ -150,8 +186,12 @@ def run(state, model, tools, verify):
   open-ended tasks such as writing a memo you fall back to rubric-based LLM judges, which carry their
   own error rate and cost.
 - Checking hard budgets before the model's signal guarantees a cap, but can reject a success that
-  arrived on the last step; mitigate by still evaluating a present submit and recording both the
-  result and the exhaustion.
+  arrived on the last step; evaluating a present submit first (as the example does) recovers it, and
+  is safe only because verification is cheap and bounded; if the verifier itself is expensive (a
+  long test suite), the budget has to cover it too.
+- Graceful termination preserves in-flight results and leaves a coherent record, but a hung tool
+  delays the stop until its timeout; for user cancels and safety aborts the trade flips toward hard
+  cancellation and accepting "possibly executed" calls.
 - Nudging the model after a bare `end_turn` rescues "narrated but did not act" turns, but on a
   genuinely finished task it wastes a model call; cap it at one nudge per run.
 
@@ -167,6 +207,10 @@ def run(state, model, tools, verify):
   resubmits after a rejection.
 - Ignoring parallel tool calls where `submit_result` arrives alongside other calls; the symptom is
   tools executing after the run has already been marked done.
+- Asking for a final summary with tools still enabled; the symptom is the "wrap-up" call emitting
+  another tool call, which either runs past the budget or is dropped, leaving no summary at all.
+- Aborting without cleanup; the symptom is orphaned sandboxes, leases that block the next attempt
+  until they expire, and temp branches piling up in the customer's repository.
 
 ## When to use
 Every agent loop needs this; the choice is how rich to make it. For a single-tool chatbot, branching

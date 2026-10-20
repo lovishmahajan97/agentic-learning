@@ -5,6 +5,7 @@ name: safetensors
 kind: tool
 difficulty: intro
 est_minutes: 11
+status: fact-checked
 related:
   - python-for-ai/pytorch
   - python-for-ai/hugging-face
@@ -38,7 +39,9 @@ across GPUs or to load one layer for inspection, was awkward.
 
 The naive fix, `torch.load(..., weights_only=True)`, restricts the unpickler to an allow-list of types
 and is the right default for legacy files (recent PyTorch releases made it the default). But it still
-runs a pickle interpreter over untrusted input and does not solve lazy or zero-copy loading.
+runs a pickle interpreter over untrusted input, and its safety rests on the allow-list having no holes.
+(`torch.load(..., mmap=True)` on the newer zip-based checkpoint format narrows the speed gap, but not
+the security one.)
 safetensors removes the interpreter entirely: the format has no way to express code, so there is nothing
 to restrict.
 
@@ -123,7 +126,8 @@ The embedding is 32,000 × 512 × 2 bytes = 32,768,000 bytes, exactly `end - beg
 - Loading legacy `.bin` files with `weights_only=False` because a load error appeared: this re-enables
   arbitrary code execution, and the symptom you were fixing was the safety check working.
 - Saving a model with tied weights via `save_file` directly: it raises an error about shared tensors,
-  and naive workarounds that clone the tensors double the stored size and break the tie on reload.
+  and naive workarounds that clone the tensors store the bytes twice; the tie then survives only if the
+  loading code re-ties the parameters, which `save_model` / `load_model` handle for you.
 - Forgetting the index file when copying sharded checkpoints: loaders fail to find tensors or load
   only part of the model, and the error names a missing key rather than a missing file.
 

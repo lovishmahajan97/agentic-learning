@@ -5,7 +5,7 @@ name: Vitest / Jest & integration testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/dependency-injection
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -67,7 +67,11 @@ because migrating a large suite buys little.
 
 Both run test files in parallel workers with an isolated module registry per file (Vitest's default
 `isolate: true`), *because* module state (a cached client, a memoised config) would otherwise leak
-between files. Separately, `vi.mock` / `jest.mock` calls are hoisted above imports by the transform:
+between files. Jest's workers are child processes; Vitest lets you choose `pool: "forks"` (child
+processes, its default since v2) or `"threads"` (worker threads, lighter but unable to use
+`process.chdir` and fragile with some native addons). Parallelism is per file, not per test: tests
+inside one file run sequentially unless marked concurrent, and `fileParallelism: false` (Vitest) or
+`--runInBand` (Jest) serialises files when a shared resource forces it. Separately, `vi.mock` / `jest.mock` calls are hoisted above imports by the transform:
 ESM imports resolve before any statement runs, so a mock registered in normal source order would
 arrive too late. (Jest's hoisting is a Babel/ts-jest transform for CommonJS output; under native ESM
 Jest you need `jest.unstable_mockModule` plus a dynamic `import()` instead.)
@@ -82,7 +86,11 @@ Jest you need `jest.unstable_mockModule` plus a dynamic `import()` instead.)
    is the exact JSON the provider would receive, and the response you return is parsed by the real SDK
    code. This is the layer that catches a wrong field name or a stream-event handler that never fires.
    Set `maxRetries: 0` on the client so a deliberate 500 does not trigger the SDK's default two
-   retries (three attempts) with backoff.
+   retries (three attempts) with backoff. Streams are intercepted the same way: the handler returns
+   `new HttpResponse(body, { headers: { "content-type": "text/event-stream" } })` where `body` is a
+   `ReadableStream` emitting recorded `event: …\ndata: {…}\n\n` frames, so the SDK's real SSE
+   parser runs. Splitting a frame across two chunks, or ending the stream before `message_stop`, is
+   how you test the reassembly and early-termination paths that hand-written fakes never exercise.
 3. **Recorded fixtures.** Capture a handful of real responses once (including tool-call turns and a
    full stream transcript), store them as JSON, and replay them through the interceptor. They are the
    only cheap way to test against the real response shape of a provider, and the only way to notice
@@ -100,8 +108,12 @@ and exports connection strings, or a service started by CI (a GitHub Actions `se
 compose file locally). Isolation then has to be designed, since the runner is parallel: give each
 worker its own database or schema (derive the name from `VITEST_POOL_ID` / `JEST_WORKER_ID`), or run
 every test inside a transaction that is rolled back in `afterEach`, or truncate between tests and
-accept running those files serially. Shared mutable state across workers is the number-one source of
-flaky integration suites.
+accept running those files serially. The rollback trick has a precondition people miss: the code
+under test must run on the *same connection* as the test's transaction. If it takes its own client
+from a pool, it neither sees the test's uncommitted fixtures nor gets rolled back, so inject the
+transaction-bound client (the dependency-injection lesson again), and if the code opens its own
+transactions, map them to savepoints. Shared mutable state across workers is the most common source
+of flaky integration suites.
 
 ### Async, streams, time and cancellation
 Model code is asynchronous and often streamed, so the fakes must be too. An `async function*` is a
@@ -124,9 +136,15 @@ above a floor). They publish a metric; they do not block a merge on one bad samp
 covers how to build that set and the harness around it.
 
 ## Example
-A `summarize` service that depends on a narrow `ModelClient` interface. The first test uses an
-injected fake to check the repair loop; the second constructs the real Anthropic SDK and intercepts
-the HTTP call with `msw`, so the request body and the response parsing are the real ones.
+A `summarize` service that depends on a narrow `ModelClient` interface,
+`{ complete(prompt: string): Promise<string> }`. It calls `complete`, tries to parse
+`{"bullets": string[]}`, and on failure calls once more with a repair prompt that quotes the bad
+output. `anthropicAdapter(client)` implements `complete` with `client.messages.create` and joins the
+text blocks. The first test drives the repair loop with a scripted fake; the second constructs the
+real Anthropic SDK and intercepts the HTTP call with `msw`, so the request body and the response
+parsing are the real ones. Note that the handler *captures* the body and the assertion runs in the
+test: an `expect` thrown inside an msw handler becomes a 500, which surfaces as the SDK's
+`InternalServerError` rather than as the assertion message you wanted to read.
 
 ```ts
 import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from "vitest";
@@ -147,11 +165,10 @@ describe("summarize (unit, injected fake)", () => {
   });
 });
 
+let sent: { max_tokens: number; messages: unknown[] } | undefined;   // the exact JSON on the wire
 const server = setupServer(
   http.post("https://api.anthropic.com/v1/messages", async ({ request }) => {
-    const body = (await request.json()) as { max_tokens: number; messages: unknown[] };
-    expect(body.max_tokens).toBeGreaterThan(0);   // asserts the real wire shape; a failing expect here
-    expect(body.messages).toHaveLength(1);        // surfaces as a 500 from msw, so the SDK call rejects
+    sent = (await request.json()) as typeof sent;
     return HttpResponse.json({
       id: "msg_test", type: "message", role: "assistant", model: "test",
       content: [{ type: "text", text: '{"bullets":["x"]}' }],
@@ -160,7 +177,7 @@ const server = setupServer(
   }),
 );
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));  // any other network call fails loudly
-afterEach(() => server.resetHandlers());
+afterEach(() => { server.resetHandlers(); sent = undefined; });
 afterAll(() => server.close());
 
 describe("summarize (integration, real SDK over intercepted HTTP)", () => {
@@ -168,6 +185,8 @@ describe("summarize (integration, real SDK over intercepted HTTP)", () => {
     const client = new Anthropic({ apiKey: "test-key", maxRetries: 0 });
     const out = await summarize("long text", anthropicAdapter(client));
     expect(out.bullets).toEqual(["x"]);
+    expect(sent?.max_tokens).toBeGreaterThan(0);    // required field present in the real request
+    expect(sent?.messages).toHaveLength(1);
   });
 });
 ```
@@ -176,7 +195,8 @@ describe("summarize (integration, real SDK over intercepted HTTP)", () => {
 - An injected fake makes tests fast and deterministic but can drift from the real client's behaviour;
   the interception layer is what keeps it honest, so you need both, not one.
 - Real containers in integration tests catch database semantics fakes miss, at the cost of slower
-  startup and CI complexity; below a handful of queries an in-memory repository is acceptable.
+  startup and CI complexity; an in-memory repository is acceptable only while the code relies on no
+  constraint, isolation or JSON semantics, and stops being acceptable the day it does.
 - Recorded fixtures pin the provider's response shape, which is the point, but they go stale when the
   provider adds fields; refresh them on SDK upgrades rather than letting them rot or auto-updating.
 - Vitest's Vite pipeline gives fast TS/ESM with little config, while Jest's maturity and ecosystem win
@@ -197,8 +217,10 @@ describe("summarize (integration, real SDK over intercepted HTTP)", () => {
   is slowed by real backoff sleeps and sees three requests where it expected one.
 - Snapshotting model text; the symptom is a snapshot file updated with `-u` on every change, so the
   test no longer tests anything.
-- Leaving `onUnhandledRequest` at its default; the symptom is a test that silently hit the real
-  network because a URL did not match the handler.
+- Using rollback-per-test isolation while the code under test takes its own pooled connection; the
+  symptom is "row not found" for fixtures the test just inserted, and rows that survive between tests.
+- Leaving `onUnhandledRequest` at its default (`"warn"`); the symptom is a test that hit the real
+  network because a URL did not match the handler, with only a warning buried in the output.
 
 ## When to use
 Reach for the injected fake whenever logic surrounds the model: prompt assembly, parsing, repair loops,

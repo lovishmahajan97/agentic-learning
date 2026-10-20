@@ -5,7 +5,7 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/agentic-rag
@@ -19,6 +19,7 @@ sources:
   - Yang et al., 2018 — HotpotQA: A Dataset for Diverse, Explainable Multi-hop Question Answering
   - Press et al., 2022 — Measuring and Narrowing the Compositionality Gap in Language Models
   - Trivedi et al., 2023 — Interleaving Retrieval with Chain-of-Thought Reasoning for Knowledge-Intensive Multi-Step Questions
+  - Xiong et al., 2021 — Answering Complex Open-Domain Questions with Multi-Hop Dense Retrieval
 ---
 
 ## TL;DR
@@ -86,12 +87,31 @@ Alice Chen report to", not "who is the manager?". Few-shot examples in the plann
 extraction step are the cheapest way to get this right. Where entities are ambiguous (two Alices), the
 planner should carry a disambiguating attribute (team, email) from hop one.
 
+### What to carry between hops
+The evidence grows every hop, and the planner prompt grows with it. Two options: carry the full passages
+(faithful, but by hop three the planner reads thousands of tokens, mostly irrelevant to the next query),
+or have each hop also emit a short note of the bridging fact ("INC-4812 author: Alice Chen, Payments")
+and give the planner the notes plus the passage ids. Notes keep the planner focused and cheap; the final
+answer prompt still receives the full passages, because notes are model-written and cannot be cited.
+Passing the list of queries already tried also helps, because a planner that can see its previous query
+is less likely to reissue it.
+
 ### Compounding error
-If hop one retrieves the right passage with probability r1 and hop two, given a correct hop one, with
-probability r2, the chain succeeds at roughly r1 × r2 (treating hops as independent, which is a
-simplification). Illustratively, 0.9 × 0.9 ≈ 0.81 for two hops and ≈ 0.73 for three. This is why
-per-hop precision, usually via a reranker, buys more in multi-hop than in single-shot RAG, and why hop
-count should be the smallest that answers the question.
+If hop one retrieves the right passage with probability r1 and hop two succeeds with probability r2
+*given* a correct hop one, the chain succeeds at r1 × r2, assuming a wrong first hop is never recovered
+(the realistic case, since a wrong bridge entity produces a confidently wrong second query).
+Illustratively, 0.9 × 0.9 ≈ 0.81 for two hops and ≈ 0.73 for three. Three responses follow from the
+product. Raise per-hop precision, usually with a reranker, which buys more here than in single-shot RAG.
+Keep hop count minimal. And do not commit greedily when hop one is ambiguous: keep the top two or three
+candidate bridge entities (a small beam), run the next hop for each, and let the final step pick the
+chain whose evidence agrees, which costs b times the retrievals but turns one fragile chain into several.
+
+### Learned alternatives
+The loop above uses an off-the-shelf retriever and puts the intelligence in the prompt. Multi-hop dense
+retrieval (Xiong et al.) instead trains the query encoder to take the question plus the previously
+retrieved passage as input, so the second-hop vector is computed from both without a generated query.
+It removes an LLM call per hop but needs multi-hop training data resembling your domain, which is why
+prompted loops dominate in enterprise settings.
 
 ### Evaluating
 Score each hop's supporting-fact recall (HotpotQA labels supporting sentences for exactly this), the
@@ -108,6 +128,7 @@ import json
 PLAN = """Question: {q}
 Evidence so far:
 {ev}
+Queries already tried: {tried}
 If the evidence answers the question, return {{"done": true}}.
 Otherwise extract the entity or fact you still need, and return
 {{"done": false, "query": "<a specific search query naming that entity>"}}"""
@@ -116,8 +137,12 @@ def multi_hop(question, max_hops=3, k=5):
     evidence, seen, trace = [], set(), []
     for hop in range(max_hops):
         ev = "\n".join(f"[{i}] {t}" for i, t in evidence) or "(none)"
-        plan = json.loads(llm(PLAN.format(q=question, ev=ev)))
-        if plan.get("done"):
+        tried = "; ".join(t["query"] for t in trace) or "(none)"
+        try:
+            plan = json.loads(llm(PLAN.format(q=question, ev=ev, tried=tried)))
+        except ValueError:
+            break                        # malformed plan: answer from what we have
+        if plan.get("done") or not plan.get("query"):
             break
         hits = retrieve(plan["query"], k)
         new = [(i, t) for i, t in hits if i not in seen]
@@ -135,6 +160,7 @@ ans, trace = multi_hop("Who manages the engineer who wrote the report for incide
 #   hop 0  query="INC-4812 incident report author"      -> report: "Author: Alice Chen (Payments)"
 #   hop 1  query="Alice Chen Payments team manager"     -> org page: "Alice Chen reports to Bob Ruiz"
 #   hop 2  planner returns done=true; answer cites both passages
+# Cost of this 2-hop answer: 3 planner calls + 2 retrievals + 1 answer call, all sequential.
 ```
 
 ## Trade-offs
@@ -142,6 +168,9 @@ ans, trace = multi_hop("Who manages the engineer who wrote the report for incide
   decide, so single-hop questions never pay for a loop.
 - The model can recover from a weak retriever by reformulating, but a wrong bridge entity poisons every
   later hop; reranking each hop raises per-hop precision and pays for itself here.
+- A small beam over candidate bridge entities protects against a wrong first hop but multiplies later
+  retrievals by the beam width; it pays when hop-one entities are ambiguous (common names, duplicate
+  reports) and is waste when the bridge is an exact identifier.
 - Versus a knowledge graph there is no offline extraction and fresh data works immediately, but each
   question pays runtime cost; when the same relations are queried constantly, build the graph.
 - Versus long-context stuffing the cost is bounded per hop rather than per corpus; for a corpus that fits
@@ -202,13 +231,14 @@ slice.
 > Bob" has no meaningful similarity to "incident 4812" until the name Alice is known, which requires
 > reading the first hop.
 
-### Q: Which termination condition is sufficient on its own for a multi-hop loop?
-- [ ] The model's "done" signal
-- [ ] A fixed hop cap
-- [ ] A check that the last hop added no new passages
-- [x] None alone; the three are combined because each fails in a different way
-> The model alone can loop or stop early, a cap alone wastes hops on simple questions, and no-progress
-> detection alone never stops a planner that keeps finding marginally new passages.
+### Q: Why does a well-built multi-hop loop combine a "done" signal, a hop cap and a no-progress check?
+- [ ] Because the hop cap alone cannot guarantee the loop terminates
+- [ ] Because the no-progress check is needed to detect when the answer is found
+- [x] Because each covers a different failure: the model can stop early or never stop, the cap bounds cost but cannot end a solved question early, and the progress check catches repeated queries before the cap
+- [ ] Because frameworks such as ReAct require all three
+> The cap guarantees termination and bounds cost, but on its own it spends every hop even after the
+> answer is found; the done signal ends solved questions early, and the progress check stops a planner
+> reissuing the same query without waiting for the cap.
 
 ### Q: Per-hop retrieval succeeds 90% of the time. Roughly how often does a three-hop chain succeed, treating hops as independent?
 - [ ] About 90%, since each hop is independent

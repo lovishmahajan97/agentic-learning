@@ -5,6 +5,7 @@ name: pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - python-for-ai/pytest
   - python-for-ai/asyncio
@@ -70,7 +71,8 @@ version you have pinned, because this API changed more than once.
 ### The alternative
 anyio ships its own pytest plugin (`@pytest.mark.anyio`) that can run the same test under asyncio and
 trio. If your code is written against anyio (as Starlette and httpx internals are), that plugin is a
-reasonable alternative; mixing both plugins on one test is a source of confusing double-runs.
+reasonable alternative. Pick one per suite: with pytest-asyncio in auto mode both plugins can try to
+claim the same coroutine tests, and the resulting errors are confusing to debug.
 
 ## Example
 A fan-out helper must never exceed a concurrency limit, and a timeout must leave no request in
@@ -139,14 +141,17 @@ The suite runs in well under a second because the delays are tiny; a real limit 
 ## Pitfalls
 - A session-scoped async fixture (pool, client) used by function-loop tests; the symptom is
   `RuntimeError` mentioning a Future or Task "attached to a different loop", often only in CI ordering.
-- Forgetting the marker or the `pytest_asyncio.fixture` decorator in strict mode; the symptom is a
-  test that is skipped or fails with "coroutine ... was never awaited" instead of exercising your code.
+- Forgetting the marker or the `pytest_asyncio.fixture` decorator in strict mode. A missing marker
+  makes recent pytest fail the test as an unsupported `async def` (older pytest warned and skipped it);
+  a missing fixture decorator hands the test an un-awaited coroutine or async generator object instead
+  of the value, so it fails on the first attribute access or with a "never awaited" warning.
 - Calling blocking code (`time.sleep`, sync HTTP, sync DB drivers) inside an async test or fixture;
   the test passes but serialises everything, so concurrency assertions are silently meaningless.
 - Spawning tasks with `asyncio.create_task` and never awaiting or cancelling them; the symptom is
   "Task was destroyed but it is pending" warnings and assertions failing in a later, unrelated test.
-- Copying an `event_loop` fixture override from an old blog post into a pinned recent version; it is
-  deprecated or removed there, so the symptom is a deprecation warning or an outright collection error.
+- Copying an `event_loop` fixture override from an old blog post into a pinned recent version; on
+  0.2x releases the symptom is a deprecation warning, and on 1.x the plugin no longer consults that
+  fixture at all, so your custom loop or policy silently stops applying.
 
 ## When to use
 Use pytest-asyncio whenever the unit under test is a coroutine and the property you care about
@@ -170,13 +175,15 @@ pytest fixtures.
 **Q:** Your suite has a session-scoped async fixture that opens an `httpx.AsyncClient`. Tests pass
 when run one at a time but fail in CI with "attached to a different loop". What is happening and how
 do you fix it?
-**A:** The client and its connection pool were created on the event loop that existed when the
-session fixture first ran. Each test, by default, gets its own function-scoped loop, so later tests
-await futures bound to a loop that is no longer running; run alone, the first test happens to share
-the loop. Fixes: give the fixture and the tests that use it the same wider loop scope (session or
-module via `loop_scope`), or make the fixture function-scoped and accept the cost, or create the
-client inside each test. The principle is that async resources are bound to the loop they were made
-on, so fixture scope and loop scope must match.
+**A:** The client lives for the whole session, but each test by default runs on its own
+function-scoped loop that is closed when the test ends. The client's pooled connections are bound to
+whichever loop was running when they were opened, typically the first test that made a request. The
+next test pulls those keep-alive connections from the pool and awaits I/O tied to a dead loop. Run
+alone, only one test loop ever exists, so nothing is shared across loops and it passes. Fixes: run the
+fixture and the tests that use it on the same wider loop (`loop_scope="session"` on both
+`pytest_asyncio.fixture` and the `asyncio` marker), or make the fixture function-scoped and accept
+the cost, or create the client inside each test. The principle is that async resources are bound to
+the loop they were made on, so fixture lifetime and loop lifetime must match.
 
 ## Quiz
 ### Q: In pytest-asyncio's strict mode, what happens to an unmarked `async def` test?
@@ -185,7 +192,8 @@ on, so fixture scope and loop scope must match.
 - [ ] It runs on the session event loop instead of a function-scoped one
 - [ ] It is converted into a synchronous test by wrapping it in asyncio.run
 > Strict mode only treats tests with `@pytest.mark.asyncio` as asyncio tests, so multiple async
-> plugins can coexist. Automatic claiming of every coroutine test is what auto mode does.
+> plugins can coexist; an unclaimed coroutine test is then failed (or, on older pytest, skipped) by pytest
+> itself. Automatic claiming of every coroutine test is what auto mode does.
 
 ### Q: Why does an async generator fixture run its teardown on the same loop as its setup?
 - [ ] Because pytest requires all fixtures to share one thread

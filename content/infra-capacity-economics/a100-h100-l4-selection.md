@@ -5,6 +5,7 @@ name: A100 / H100 / L4 selection
 kind: decision
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - infra-capacity-economics/gpu-sizing
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -62,8 +63,9 @@ Rounded figures from NVIDIA's datasheets; variants differ (A100 40 GB has ~1.55 
 The bandwidth column is the decode column: the H100 streams weights ~11× faster than the L4 and
 ~1.7× faster than the A100, and single-stream tokens/s follow those ratios almost directly. The
 memory column is the fit column. The FP8 row matters *because* fp8 weights halve the bytes per decode
-step and double the KV room with far less quality loss than int4; the A100 cannot use it and must
-fall back to int8 weight-only or int4 schemes. MIG matters for packing many small models onto one
+step and double the KV room with far less quality loss than int4. The A100 has no fp8 tensor cores:
+it falls back to int8 or int4 schemes, or to engine-specific fp8 *weight-only* kernels that dequantise
+to bf16 on the fly, which save memory and bandwidth but not compute. MIG matters for packing many small models onto one
 card with isolation; the L4 cannot do it, but at its price you simply buy more L4s.
 
 ### The procedure
@@ -93,7 +95,8 @@ and 3 dominate, which is why the "A100 is obsolete" claim is wrong for inference
 60% of an H100's at a typically lower price, and for models under 30B it is often the best value.
 
 ### Neighbours you will see
-A10G (24 GB) and L40S (48 GB) sit around the L4 in price and above it in bandwidth; H200 is an H100
+A10G (24 GB, ~600 GB/s) and L40S (48 GB, ~860 GB/s) sit between the L4 and the A100 in price and
+bandwidth; H200 is an H100
 with more and faster memory for long contexts; newer generations exist and follow the same procedure
 with their own datasheet numbers.
 
@@ -116,7 +119,8 @@ $4.00; the L4 wins five to one, and per-user decode (≤19 tokens/s) is acceptab
 tool.
 
 *Scenario B, public product:* 10 requests/s averaging 300 tokens is 3,000 tokens/s. That needs 25 L4s
-($20/h) or one H100 at ~60% of ceiling ($4/h), and the H100 users also get ~10× faster decode.
+($20/h) or one H100 at ~60% of ceiling ($4/h), and the H100 users also get several times faster
+per-stream decode (the batch-1 bandwidth ratio is ~11×; at these batch sizes the gap is smaller).
 
 The crossover is wherever the H100's higher hourly price is covered by the tokens it actually serves:
 here, somewhere around 500 tokens/s of sustained demand. Below it buy L4s; above it buy H100s; and
@@ -169,7 +173,7 @@ A100s or H100s. Reason it through.
 int4 (~7 GB), which needs a quality evaluation. Both 80 GB cards fit it with tens of gigabytes of KV
 headroom. Latency next: decode on the A100 is bounded near 26 GB ÷ 2 TB/s ≈ 13 ms per step, around
 75 tokens/s per stream, comfortably interactive; the H100 would be ~1.7× faster. Load: 200 daily
-users is likely a few requests per second at peak, well inside one A100's ceiling, so a second H100's
+users is likely a few requests per second at peak, well inside one A100's ceiling, so an H100's extra
 throughput would sit idle. Recommendation: one A100 80 GB (two for redundancy), or an int4 L4 pair if
 the quality evaluation passes and budget dominates; revisit if traffic grows past the A100's ceiling
 or fp8 becomes necessary.
@@ -186,12 +190,12 @@ or fp8 becomes necessary.
 
 ### Q: A team validated fp8 serving of a 70B model on H100s and now must deploy on A100s. What changes?
 - [ ] Nothing; fp8 checkpoints run on any card with 80 GB
-- [ ] The A100 runs fp8 but without tensor-core acceleration
-- [x] The A100 has no fp8 support, so they must switch to int8 or int4 weight quantisation and re-evaluate quality
+- [ ] The A100 runs fp8 tensor-core matmuls at about half the H100's rate
+- [x] The A100 has no fp8 tensor cores, so they need a different quantisation path and must re-evaluate quality and speed
 - [ ] They must use the A100 40 GB variant, which supports fp8
-> FP8 tensor cores arrived with Hopper and Ada (H100, L4); Ampere lacks them. The memory relief must
-> come from integer quantisation schemes with different kernels and different quality behaviour,
-> which invalidates the earlier evaluation.
+> FP8 tensor cores arrived with Hopper and Ada (H100, L4); Ampere lacks them. Memory relief must come
+> from int8/int4 schemes, or from fp8 weight-only kernels that dequantise to bf16 where the engine
+> offers them; either way the kernels and numerics differ, which invalidates the earlier evaluation.
 
 ### Q: An internal tool serves an 8B model at 0.3 requests per second. Why is an L4 usually the better choice than an H100 here?
 - [ ] The L4 has higher memory bandwidth for small models

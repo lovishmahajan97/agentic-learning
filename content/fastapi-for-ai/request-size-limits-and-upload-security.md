@@ -5,6 +5,7 @@ name: Request-size limits & upload security
 kind: practice
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - fastapi-for-ai/uploadfile
   - fastapi-for-ai/middleware-ordering
@@ -37,8 +38,8 @@ script, a filename like `../../app/main.py`, or a Word document with an XML exte
 And for AI specifically, the *content* is an attack surface: a valid PDF can contain hidden text that
 instructs your model to exfiltrate data once it is retrieved into a prompt.
 
-The naive defences each miss something. "Check `Content-Length`" fails for chunked uploads that send
-no length, and for clients that lie. "Check the `.pdf` extension" or the multipart `Content-Type`
+The naive defences each miss something. "Check `Content-Length`" fails for chunked uploads, which
+send no length at all, and it is a claim about the body rather than a measurement of it. "Check the `.pdf` extension" or the multipart `Content-Type`
 trusts values the client chose. "Limit at nginx" is necessary but blind to the file's insides, and
 bypassed if the app is ever exposed another way. "We validate after `await file.read()`" is too late:
 the bytes are already in memory or on disk. Upload security is defence in depth, because each layer
@@ -57,7 +58,10 @@ middleware (or a dependency on a streaming route) that:
 1. rejects early with **413 Content Too Large** if `Content-Length` exceeds the route's cap, *because*
    that avoids reading anything; and
 2. wraps `receive` and counts bytes as `http.request` messages arrive, aborting once the running
-   total passes the cap, *because* chunked requests and lying clients have no trustworthy length.
+   total passes the cap, *because* chunked requests declare no length, and only a count of bytes
+   actually received holds regardless of what the headers say. (An HTTP/1.1 server frames the body by
+   `Content-Length` when it is present, so a client cannot simply send more than it declared; the gap
+   is the request with no length.)
 
 Multipart parsing (used by `UploadFile`) spools files to temporary disk, so a missing cap there
 fills the disk instead of RAM. Recent Starlette versions limit the number of multipart fields and
@@ -71,8 +75,9 @@ files and the size of non-file parts, but they don't cap total file size for you
   only as escaped metadata, so path traversal and overwrite are impossible. Store outside any served
   directory, in object storage with private ACLs, scoped by tenant.
 - **Bound decompression and decoding.** Cap total uncompressed size, entry count and compression
-  ratio when expanding archives. Cap pixel count for images (Pillow raises a decompression-bomb error
-  above a configurable `MAX_IMAGE_PIXELS`). Cap page count for PDFs. Disable external entities in XML
+  ratio when expanding archives. Cap pixel count for images (Pillow warns above its configurable
+  `Image.MAX_IMAGE_PIXELS` and raises `DecompressionBombError` above twice that; set the value to your
+  own cap and treat the warning as an error). Cap page count for PDFs. Disable external entities in XML
   parsers (`defusedxml`).
 - **Scan** with antivirus (e.g. ClamAV) when files are shared with other users or downloaded later.
 
@@ -135,8 +140,8 @@ async def upload(file: UploadFile):
     return {"job_id": "job_123", "detected_type": kind}
 ```
 
-The `Content-Length` check rejects an honest 3 GB upload in microseconds. A chunked request lying
-about its size is cut off after 50 MiB. Because the counter raises inside FastAPI's form parsing, the
+The `Content-Length` check rejects an honest 3 GB upload in microseconds. A chunked request that
+declares no size is cut off once it passes 50 MiB. Because the counter raises inside FastAPI's form parsing, the
 exception surfaces as a 413. A file named `report.pdf` that starts with `<svg` gets 415 regardless
 of its name or declared type.
 
@@ -199,11 +204,12 @@ Check magic bytes per entry. Keep the app-level byte counter in case the app is 
 ## Quiz
 ### Q: Why is checking `Content-Length` insufficient to enforce an upload size limit?
 - [ ] Content-Length is measured in kilobytes, not bytes
-- [x] Chunked requests omit it and clients can lie, so the server must count bytes as they arrive
+- [x] Chunked requests omit it entirely, so only counting bytes as they arrive bounds every request
 - [ ] FastAPI strips Content-Length before middleware runs
 - [ ] Content-Length counts only headers
-> The header is client-supplied and absent for chunked transfer encoding. Counting bytes received in
-> receive() enforces the cap regardless of what the client claims, while the header check is a fast path.
+> The header is client-supplied and absent under chunked transfer encoding, so a header-only check lets
+> those bodies through uncapped. Counting bytes in receive() enforces the cap on what actually arrives,
+> while the header check remains a cheap fast path for honest large requests.
 
 ### Q: Which is the most reliable way to decide what kind of file a user uploaded?
 - [ ] The file extension in the filename

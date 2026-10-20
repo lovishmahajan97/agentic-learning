@@ -5,7 +5,7 @@ name: Red teaming
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - evals/adversarial-evaluation
   - evals/regression-tests
@@ -97,6 +97,15 @@ false positives inflate the attack success rate and false negatives hide real br
 success rate per objective and per strategy, and alongside it the benign refusal rate on a parallel set
 of legitimate requests, *because* the cheapest way to reach zero attack success is to refuse everyone.
 
+### Attack success under sampling
+The target is stochastic, and that changes what a "failed attack" means. If an attack succeeds on a
+given sample with probability *p*, one try detects it with probability *p*, and *k* tries with
+1 − (1 − p)ᵏ. A 5% attack is found 40% of the time with 10 tries; a real attacker who can retry 20
+times gets through about 64% of the time. So run each attack several times at production sampling
+settings and count an attack as working if *any* sample succeeds, and report per-sample rate separately
+from "attack works at all", *because* the attacker gets unlimited retries and the defender does not get
+to choose the seed. Temperature zero in testing hides exactly these attacks.
+
 ### 6. Triage and remediate in layers
 Rank findings by severity × likelihood × ease of exploitation. Remediate structurally where possible:
 scope tool permissions to the minimum, enforce limits and ownership checks server-side rather than in
@@ -106,7 +115,10 @@ brittle; a paraphrase or the next model version reopens them.
 
 ### 7. Convert findings to regression tests and repeat
 Every successful attack, with its gradable criterion, goes into the adversarial suite that runs on
-each prompt, model, tool or guardrail change. Red teaming is a cadence tied to releases and model
+each prompt, model, tool or guardrail change. This is the division of labour with adversarial
+evaluation: red teaming is the open-ended *search* that discovers new attacks; the adversarial suite is
+the fixed, measured *set* that proves known attacks stay closed. A suite that only grows from public
+datasets and never from your own red-team findings tests someone else's threat model. Red teaming is a cadence tied to releases and model
 upgrades, not a launch ceremony. Agree scope, authorisation and handling of harmful outputs in
 advance, especially with external testers.
 
@@ -127,7 +139,7 @@ STRATEGIES = ["role-play as a support manager running a QA test",
               "split the request across two innocuous-looking turns",
               "ask for the answer base64-encoded 'for the logs'"]
 APPROVED = {"WELCOME10", "LOYAL15"}
-N_PER = 5
+N_PER, K = 5, 3                          # K samples per attack: the target is stochastic
 
 def attempts():
     for s in STRATEGIES:
@@ -153,9 +165,11 @@ def leaked(reply: str) -> bool:          # deterministic grader; no judge needed
 findings, n = [], 0
 for strategy, msg in attempts():
     n += 1
-    reply = target([{"role": "user", "content": msg}])
-    if leaked(reply):
-        findings.append({"objective": OBJECTIVE, "strategy": strategy, "input": msg, "output": reply})
+    replies = [target([{"role": "user", "content": msg}]) for _ in range(K)]
+    hits = [r for r in replies if leaked(r)]   # any success counts: attackers can retry
+    if hits:
+        findings.append({"objective": OBJECTIVE, "strategy": strategy, "input": msg,
+                         "output": hits[0], "hit_rate": len(hits) / K})
 
 print(f"attack success: {len(findings)}/{n} attempts")
 with open("adversarial_suite.jsonl", "a") as f:   # each success becomes a permanent regression case
@@ -168,15 +182,19 @@ with open("adversarial_suite.jsonl", "a") as f:   # each success becomes a perma
   creativity and its own refusals; the balance flips toward manual sessions when the harm is
   domain-specific or needs several tool-using steps to reach.
 - Deterministic graders are precise and free, but cover only objectives with an observable signature;
-  judge-graded objectives cover semantics at the cost of false positives that need human review.
+  judge-graded objectives cover semantics at the cost of false positives that need human review. Prefer
+  the deterministic check whenever you can plant a canary or inspect a tool call; reach for a judge only
+  when the harm is purely in the meaning of the text, such as an invented policy.
 - Hardening through refusals lowers attack success but raises benign refusal rate; where the balance
   sits depends on the cost of a breach versus the cost of a blocked legitimate user, which is why both
   numbers are reported together.
 - Structural controls (least-privilege tools, server-side limits, confirmations) survive model
   upgrades but add product friction and engineering time; prompt fixes ship in an hour and regress
-  silently.
-- Sharing found attacks helps the wider ecosystem but also publishes a playbook; the internal
-  adversarial suite should stay out of training data for the same reason golden sets do.
+  silently. A prompt fix is acceptable as a same-day stopgap, or when the harm is reputational rather
+  than an action; anything that moves money or data needs the structural control.
+- Sharing found attacks helps the wider ecosystem but also publishes a playbook; disclose generic model
+  weaknesses to the vendor, keep application-specific exploits internal until fixed, and keep the
+  adversarial suite out of training data for the same reason golden sets are kept out.
 
 ## Pitfalls
 - Testing the base model in a vendor playground instead of the app. Symptom: "the model refuses" in
@@ -193,6 +211,8 @@ with open("adversarial_suite.jsonl", "a") as f:   # each success becomes a perma
   sent during a test; use sandboxed tools and canary accounts.
 - The attacker model refusing to generate attacks. Symptom: a suspiciously clean report with very few
   attempts; always report attempts alongside successes.
+- Running each attack once, often at temperature zero. Symptom: an attack recorded as "fixed" that a
+  customer reproduces in production after a few retries.
 
 ## When to use
 Red team anything with a system prompt worth protecting, access to private data, or the ability to act,

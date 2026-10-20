@@ -5,6 +5,7 @@ name: numpy
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/pandas
   - python-for-ai/pytorch

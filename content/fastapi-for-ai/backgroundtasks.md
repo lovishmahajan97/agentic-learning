@@ -5,6 +5,7 @@ name: BackgroundTasks
 kind: pattern
 difficulty: core
 est_minutes: 12
+status: reviewed
 related:
   - fastapi-for-ai/job-queues-and-durable-workers
   - fastapi-for-ai/dependency-injection
@@ -34,8 +35,8 @@ theirs: a slow analytics endpoint should never turn a good answer into a 500.
 
 The naive escapes each fail. `asyncio.create_task(...)` and forgetting the handle looks right, but the
 event loop keeps only weak references to tasks, so a task with no strong reference can be garbage
-collected mid-flight, and its exception is swallowed; the asyncio documentation warns about exactly
-this. Spawning a thread per request has no limit and loses exceptions the same way. A full job queue
+collected mid-flight, and its exception surfaces only as a "Task exception was never retrieved" log
+line when the task is collected, if at all; the asyncio documentation warns about exactly this. Spawning a thread per request has no limit and loses exceptions the same way. A full job queue
 (Celery, ARQ) is the correct tool for durable work, but it is a broker, a worker fleet and a
 serialisation boundary, which is a lot of machinery for a fifty-millisecond insert.
 
@@ -61,10 +62,12 @@ sequentially in insertion order: an `async def` is awaited on the event loop, a 
 
 ### What the server sees
 The ASGI call for the request has not returned while tasks run. That means uvicorn's graceful shutdown
-waits for them (up to its shutdown timeout), anything counting in-flight requests counts them, and the
+waits for them (indefinitely by default, or up to `--timeout-graceful-shutdown` if set), anything counting in-flight requests counts them, and the
 handler's resources stay allocated. It also means the work dies with the process: an orchestrator that
 sends SIGKILL after its grace period takes every pending task with it, and nothing recorded that they
-existed.
+existed. Kubernetes, for example, allows 30 seconds by default between SIGTERM and SIGKILL, so the
+honest budget for a background task is "finishes well inside the grace period, or is acceptable to
+lose"; a task that calls a model for 40 seconds fails that test on every deploy.
 
 ### Exceptions
 An exception in a task propagates out of the application after the response is gone. The server logs
@@ -83,7 +86,10 @@ task. Create the session, client or file handle inside the task.
 Sync tasks share the default thread pool (anyio's limiter, 40 threads) with sync endpoints and sync
 dependencies, so a burst of "cheap" sync tasks can starve ordinary sync routes. Async tasks share the
 event loop, so a CPU-heavy task, computing embeddings locally, hashing a large upload, blocks every
-request for its duration. Treat a task as part of the request's cost, just paid after the response.
+request for its duration. Treat a task as part of the request's cost, just paid after the response. A useful back-of-envelope:
+background work in flight ≈ request rate × task duration, so 200 requests per second each followed by a
+250 ms trace write means about 50 tasks running at any moment per process, on top of the requests
+themselves; if those tasks are sync, that alone exceeds the 40-thread pool.
 
 ## Example
 An LLM endpoint that answers immediately and records a trace afterwards. The task opens its own
@@ -144,8 +150,8 @@ async def answer(body: Ask, bg: BackgroundTasks):
   freezing for the duration of each task, visible as periodic stalls in every route.
 - Assuming the client would have noticed a failure; the symptom is silent data loss in traces or
   counters discovered weeks later during an audit.
-- Reaching for bare `asyncio.create_task` instead; the symptom is tasks that sometimes never run,
-  because nothing held a reference to them.
+- Reaching for bare `asyncio.create_task` instead; the symptom is tasks that occasionally vanish
+  mid-flight with no error, because nothing held a strong reference to them.
 
 ## When to use
 Use `BackgroundTasks` for short, idempotent, loss-tolerant follow-ups: trace and metric writes, cache

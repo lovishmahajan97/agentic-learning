@@ -5,6 +5,7 @@ name: pydantic-settings
 kind: tool
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - python-for-ai/pydantic
   - python-for-ai/python-dotenv

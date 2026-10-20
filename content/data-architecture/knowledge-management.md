@@ -5,6 +5,7 @@ name: Knowledge management
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - data-architecture/document-processing-pipelines
   - data-architecture/ingestion-pipelines
@@ -20,8 +21,8 @@ related:
 A retrieval system cannot answer better than the corpus it searches, and most enterprise corpora are
 stale, duplicated, contradictory and unowned. Knowledge management is the practice of deciding which
 sources are canonical, who owns each, how documents enter, age and leave the index, and what metadata
-travels with them, so that the retriever is choosing among correct candidates. Most "the model
-hallucinated" reports in RAG trace back to this layer, not to the model.
+travels with them, so that the retriever is choosing among correct candidates. In enterprise RAG, a
+large share of "the model hallucinated" reports trace back to this layer, not to the model.
 
 ## Why it exists
 Point a crawler at a company wiki, a ticketing system and a shared drive, embed everything, and you get
@@ -111,9 +112,11 @@ pages deprecated and 800 archived, which ingestion now respects. Content hashing
 pass removes about 1,900 chunks. Price-list PDFs are excluded entirely because the catalogue API is now
 ingested directly. The reranker is given `authority` and `last_verified_at` as features.
 
-Re-running the eval gives 81 percent correct. The remaining failures are mostly the 19 genuine retrieval
-problems plus a handful of questions whose answers exist nowhere in writing, which are logged as content
-requests to the docs team. A weekly report now lists deprecated pages still receiving retrieval hits and
+Re-running the eval gives 81 percent correct (243 of 300), so the content fixes recovered 69 of the 107
+content-caused failures. Of the 57 that remain, 19 are the genuine retrieval or generation problems, which
+now get attention as a clean, isolated bucket. The rest are content issues the first pass missed (pages
+superseded but not yet labelled, near-duplicates below the dedup threshold) and questions whose answers
+exist nowhere in writing, which are logged as content requests to the docs team. A weekly report now lists deprecated pages still receiving retrieval hits and
 unanswered question clusters, owned by the support leads.
 
 ## Trade-offs
@@ -144,8 +147,8 @@ unanswered question clusters, owned by the support leads.
 
 ## When to use
 Knowledge management is required for any RAG system over content that people maintain, which is nearly
-all of them; it can be skipped only for immutable corpora such as a fixed legal code or a product's own
-generated logs. Start it before the first index, since the ingestion schema must carry the metadata.
+all of them; it can be skipped only for corpora that are effectively immutable and single-sourced, such
+as a frozen archive of closed case files or a product's own generated logs. Start it before the first index, since the ingestion schema must carry the metadata.
 Measure: share of eval failures attributed to content versus retrieval versus generation, count of
 deprecated pages still receiving hits, duplicate ratio in top-k, and median `last_verified_at` of cited
 chunks. In day-to-day work it shows up as the ingestion contract and the weekly content report. In
@@ -165,7 +168,7 @@ the corpus, not with a bigger model.
 do first, and how do you argue for it?
 **A:** Before touching the model, sample the failures and classify each by cause: missing document, stale or
 superseded document, duplicates crowding out the right chunk, access-filtered content, or a true retrieval
-or generation error. In most enterprise corpora the first three dominate, and no model fixes them because
+or generation error. In enterprise corpora the first three often dominate, and no model fixes them because
 the model only sees the candidates it is given. Show the customer the breakdown with concrete cited pages:
 "this answer came from a 2021 page that your own wiki marks obsolete". Then propose the fixes that address
 the largest buckets: canonical sources with authority ranks, lifecycle labels read by ingestion,

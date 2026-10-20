@@ -5,6 +5,7 @@ name: LiteLLM
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -71,7 +72,9 @@ Callbacks send each call's inputs, outputs, latency and cost to logging and obse
 The proxy runs the same machinery as a server exposing OpenAI-compatible endpoints, configured by a
 YAML file of models, routing and fallbacks. It adds virtual API keys mapped to teams or users, budgets
 and rate limits per key, spend logs in a database, and central guardrail hooks. Applications then use any
-OpenAI-compatible client, in any language, pointed at the proxy's `base_url`.
+OpenAI-compatible client, in any language, pointed at the proxy's `base_url`. The core is open source,
+but some proxy features aimed at enterprises (for example SSO and certain audit and admin controls) sit
+behind a commercial licence, so check which ones you need before standardising on it.
 
 ## Example
 A router with a logical "chat" model, two deployments, retries and a cross-provider fallback.
@@ -88,7 +91,7 @@ router = Router(
                                                   "api_base": "https://example-eu.openai.azure.com"}},
         {"model_name": "chat-backup", "litellm_params": {"model": "anthropic/claude-haiku-5-5"}},
     ],
-    num_retries=2,                                # per deployment, for transient errors
+    num_retries=2,                                # retries within the group; may pick another deployment
     fallbacks=[{"chat": ["chat-backup"]}],        # if all "chat" deployments fail
     timeout=20,
 )
@@ -102,9 +105,11 @@ print(resp.model, resp.choices[0].message.content)
 print(resp.usage.prompt_tokens, resp.usage.completion_tokens, litellm.completion_cost(resp))
 ```
 
-Scenario: OpenAI returns 429s for a minute. The router retries, cools down that deployment, sends
-traffic to the EU Azure deployment, and only if both fail does the request go to the Anthropic
-backup, with the caller still receiving an OpenAI-shaped response.
+Scenario: OpenAI returns 429s for a minute. By default the router spreads "chat" traffic across both
+deployments (simple shuffle); the failing calls are retried, the OpenAI deployment is put in cooldown
+after repeated failures, so traffic lands on the EU Azure deployment, and only if the "chat" group as a
+whole fails does the request go to the Anthropic backup, with the caller still receiving an
+OpenAI-shaped response.
 
 ## Trade-offs
 - One interface across providers makes switching and A/B testing cheap, but the lowest common

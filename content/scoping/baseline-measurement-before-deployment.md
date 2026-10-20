@@ -5,6 +5,7 @@ name: Baseline measurement before deployment
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - scoping/success-metrics-kpis
   - scoping/workflow-analysis
@@ -71,7 +72,8 @@ and percentiles are more honest than means, and a log transform helps when testi
 ### 5. Stratify by case type
 Report each metric per segment (category, channel, region, complexity). This matters *because* of mix
 shift. If the AI pilot happens to receive easier cases, the overall number improves even when no
-segment does, which is Simpson's paradox in practice. Comparing within segments and re-weighting to
+segment does. This is a composition (mix) effect; its extreme form, where the aggregate trend runs
+opposite to every segment's trend, is Simpson's paradox. Comparing within segments and re-weighting to
 the baseline mix removes that illusion.
 
 ### 6. Size the comparison
@@ -201,8 +203,9 @@ where review should stay mandatory.
 - [ ] The model improved only on the largest category
 - [x] The pilot received a different mix of case types, with more easy cases, than the baseline
 - [ ] Handle time should have been measured with medians instead of means
-> If no segment improved but the total did, the weights changed: this is mix shift, or Simpson's
-> paradox. Stratifying the baseline and re-weighting pilot results to the baseline mix exposes it.
+> If no segment improved but the total did, the weights changed: this is mix shift, the composition
+> effect behind Simpson's paradox. Stratifying the baseline and re-weighting pilot results to the
+> baseline mix exposes it.
 > Medians would not fix a composition change.
 
 ### Q: Why record the standard deviation of a baseline metric, not just its mean?

@@ -5,7 +5,7 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/redis-caching
   - node-ts-for-ai/redis
@@ -51,7 +51,11 @@ job queues.
 Each key maps to one typed value: a **string** (also used for integers, with `INCR`), a **hash** (field
 to value map, good for an object), a **list** (push/pop at either end: a queue), a **set** and **sorted
 set** (members with a score, kept ordered: leaderboards, sliding windows, scheduled jobs), and a
-**stream** (an append-only log with consumer groups, the closest thing to Kafka inside Redis). Commands
+**stream** (an append-only log with consumer groups, the closest thing to Kafka inside Redis). Separately,
+**pub/sub** broadcasts a message to whoever is subscribed at that instant and stores nothing, so a
+subscriber that is disconnected for a second misses what was published in that second; it suits live
+notifications (push a token stream to whichever web node holds the user's socket), never work that must
+be done. Commands
 operate on the structure in place, so "push onto the list and trim it" is two commands rather than a
 round trip to fetch, modify and write back. Keys can carry a TTL, after which they are deleted; TTLs are
 how caches and rate-limit windows expire without a cleanup job.
@@ -94,20 +98,32 @@ features diverge, so check which one your platform ships.
 - **Cache-aside:** look up `cache:{model}:{sha256(prompt+params)}`; on miss, call the model, `SET` with
   a TTL. Only safe when the call is deterministic enough for your use (temperature 0, or you accept a
   stored sample).
-- **Rate limiting:** `INCR` a per-tenant-per-window key and set its TTL on first increment, or a sorted
-  set of timestamps for a sliding window. Atomic, so it is correct across all servers.
+- **Rate limiting:** `INCR` a per-tenant-per-window key and set its TTL on first increment. Atomic, so it
+  is correct across all servers, but a *fixed* window lets a client spend its whole limit in the last
+  second of one window and again in the first second of the next: up to 2× the limit in two seconds.
+  When that burst matters, keep a sorted set of request timestamps per client (`ZREMRANGEBYSCORE` the
+  expired ones, `ZCARD`, `ZADD`, in one script) for an exact sliding window, at one entry of memory per
+  request, or weight the previous window's count to approximate one in constant memory.
 - **Concurrency semaphore:** cap concurrent calls to a model provider with a counter bounded by a Lua
   script, so a burst does not trip the provider's limits.
 - **Locks:** `SET lock:key token NX PX 30000` acquires only if absent and expires if the holder dies.
-  Release by checking the token in a Lua script. Expiry means a slow holder can lose the lock while
-  still working, so protected resources need a fencing token if correctness matters.
+  Release by checking the token in a Lua script, *because* a plain `DEL` from a holder whose lease
+  already expired would delete the next holder's lock. Expiry means a slow holder can lose the lock while
+  still working, so protected resources need a fencing token if correctness matters: a number from `INCR`
+  issued with each acquisition, which the resource stores and uses to reject writes carrying an older one.
+  Redlock (acquiring on a majority of independent nodes) addresses losing the lock on failover, but its
+  safety under clock drift and process pauses is disputed (Kleppmann's critique is the usual reference),
+  so treat Redis locks as an efficiency mechanism, not a correctness guarantee, unless fenced.
 - **Queues and streams:** lists for simple job queues (`LPUSH`/`BRPOP`), streams with consumer groups
   for acknowledged, replayable delivery; BullMQ, Celery and RQ build on these.
 
 ## Example
 Three primitives in redis-py: an LLM response cache, a fixed-window rate limiter made atomic with a Lua
 script, and a lock with a safe release. The script runs server-side so the increment and the TTL cannot
-be separated by a crash.
+be separated by a crash: with two client calls, a process that dies after `INCR` and before `EXPIRE`
+leaves a key with no TTL, and that tenant is rate-limited forever once it reaches the limit. The cache key
+hashes every parameter that changes the output, because two requests that differ only in temperature or
+system prompt must not share an entry.
 
 ```python
 import hashlib, json, redis, time, uuid
@@ -115,12 +131,13 @@ from contextlib import contextmanager
 
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
-def cached_completion(model, prompt, call):
-    key = "cache:" + model + ":" + hashlib.sha256(prompt.encode()).hexdigest()
+def cached_completion(model, prompt, call, **params):
+    spec = json.dumps({"prompt": prompt, **params}, sort_keys=True)   # stable across dict order
+    key = f"cache:{model}:" + hashlib.sha256(spec.encode()).hexdigest()
     hit = r.get(key)
     if hit is not None:
         return json.loads(hit)
-    out = call(model, prompt)                 # the expensive provider call
+    out = call(model, prompt, **params)       # the expensive provider call
     r.set(key, json.dumps(out), ex=3600)      # 1-hour TTL; eviction handles the rest
     return out
 
@@ -132,8 +149,8 @@ return n
 rate_script = r.register_script(RATE_LUA)
 
 def allow(tenant, limit=60, window_s=60):
-    key = f"rl:{tenant}:{int(time.time() // window_s)}"
-    return rate_script(keys=[key], args=[window_s]) <= limit
+    key = f"rl:{tenant}:{int(time.time() // window_s)}"   # e.g. rl:t42:29361600, one key per minute
+    return rate_script(keys=[key], args=[window_s]) <= limit   # 61st call this minute -> False
 
 RELEASE_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end

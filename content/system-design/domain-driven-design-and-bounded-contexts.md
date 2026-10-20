@@ -5,7 +5,7 @@ name: Domain-driven design & bounded contexts
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - system-design/modular-monolith-vs-microservices
   - system-design/event-driven-architecture
@@ -70,6 +70,15 @@ example are three contexts, each with its own Customer, and that is correct. A c
 a module in a modular monolith, or a schema in one database; the boundary is about ownership and
 meaning, and deployment is a separate decision.
 
+### Finding the boundaries
+Boundaries are discovered, not decreed, and the usual technique is to map the business process with
+domain experts as a timeline of domain events (event storming) and then look for seams. Four signals
+mark a seam: a term that changes meaning ("customer", "active", "account"); a change in who decides
+(finance owns the dunning rule, support owns the escalation rule); a change in rate of change (pricing
+rules change weekly, ledger rules almost never); and a set of rules that must hold together at the same
+instant, which belongs inside one context. When two candidate contexts must constantly ask each other
+questions to make any decision, the seam is in the wrong place.
+
 ### Subdomain classification
 Not every context deserves the same investment. The *core* subdomain is where the business
 differentiates, and it gets the most careful modelling and your best people. *Supporting* subdomains are
@@ -94,11 +103,20 @@ The relationships between contexts are named so teams can discuss them:
 
 ### Inside a context: aggregates, entities, value objects, domain events
 An *aggregate* is a cluster of objects changed together under one transaction through one entry point
-(the root), with invariants that hold at the end of every transaction. Cross-aggregate and cross-context
-changes are eventually consistent through *domain events* ("InvoicePaid"), *because* a single transaction
-spanning contexts would couple their storage and their uptime. This is where DDD hands over to
-event-driven architecture and sagas. *Entities* have identity over time; *value objects* are defined by
-their attributes and are immutable, which makes them safe to pass across boundaries.
+(the root), with invariants that hold at the end of every transaction. Take an `Order` with its lines
+and the invariant "total must not exceed the approved credit of 10,000". Lines are changed only through
+`order.add_line(...)`, *because* if code could insert a line row directly, nothing would recheck the
+total. The design rules follow from that purpose. Keep aggregates as small as the true invariants
+allow, *because* the aggregate is the unit of locking and a large one serializes unrelated edits.
+Reference other aggregates by id, not by object, so loading an order does not drag in the customer.
+Change one aggregate per transaction, and let the others catch up through *domain events*
+("OrderPlaced", "InvoicePaid"); cross-context changes are always eventually consistent, *because* a
+single transaction spanning contexts would couple their storage and their uptime. This is where DDD
+hands over to event-driven architecture and sagas. *Entities* have identity over time (the order is the
+same order after its lines change); *value objects* are defined by their attributes and are immutable
+(`Money(120, "EUR")`), which makes them safe to share and pass across boundaries. A *repository* loads
+and saves whole aggregates, one per aggregate type, which keeps the invariant check from being bypassed
+by partial writes.
 
 ### Applying it to an AI system
 - One tool, or tool group, per bounded context, speaking that context's published language; the agent's
@@ -138,13 +156,17 @@ class SupportCustomer:
     payment_blocked: bool
     open_tickets: int
 
+PLAN_TO_TIER = {"ent": "enterprise", "pro": "pro", "free": "free"}
+
 class BillingAdapter:              # anticorruption layer: billing model -> support language
     def __init__(self, billing_api, mapping_repo):
         self.api, self.map = billing_api, mapping_repo
     def payment_status(self, customer_id: str) -> dict:
         acct: BillingAccount = self.api.get_account(self.map.billing_id_for(customer_id))
         blocked = acct.past_due_since is not None and (date.today() - acct.past_due_since).days > 14
-        return {"payment_blocked": blocked, "tier": {"ent": "enterprise", "pro": "pro"}.get(acct.plan, "free")}
+        if acct.plan not in PLAN_TO_TIER:            # fail loudly: a silent default corrupts meaning
+            raise UnmappedUpstreamValue(f"billing plan {acct.plan!r}")
+        return {"payment_blocked": blocked, "tier": PLAN_TO_TIER[acct.plan]}
 
 def lookup_customer(customer_id: str, tickets, billing: BillingAdapter) -> SupportCustomer:
     """Published language for the agent: no billing field names leak into its context."""
@@ -158,8 +180,15 @@ TOOLS = [{"name": "lookup_customer", "description": "Fetch the support view of a
                            "required": ["customer_id"]}}]
 ```
 
-The rule "payment is blocked after 14 days past due" is a support-context rule, so it lives in the
-support side's adapter, versioned and tested there, and neither billing nor the prompt needs to know it.
+Run one lookup. Billing returns `BillingAccount("B-881", "Acme GmbH", "ent", 2026-09-30)`; on
+2026-10-20 the account is 20 days past due, more than 14, so the agent sees
+`SupportCustomer(tier="enterprise", payment_blocked=True, open_tickets=3)` and never the words "ent" or
+`past_due_since`. The rule "payment is blocked after 14 days past due" is a support-context rule, so it
+lives in the support side's adapter, versioned and tested there, and neither billing nor the prompt needs
+to know it. Now billing launches a "team" plan. With a `.get(plan, "free")` default, every team-plan
+customer would silently be treated as free tier by the agent, a wrong answer with no error anywhere. The
+explicit map turns the upstream change into a failing call and an alert on day one, which is the point of
+an anticorruption layer: translation is a contract, and an unmapped value is a contract break.
 
 ## Trade-offs
 - Separate models per context remove cross-team coupling and keep each model small, but the same
@@ -184,6 +213,9 @@ support side's adapter, versioned and tested there, and neither billing nor the 
   appearing in your prompts, your UI and your tests.
 - Asking the model to reconcile conflicting vocabularies at runtime; the symptom is answers that mix the
   billing and support meanings of a term, and evals that cannot agree on correctness.
+- Translation tables in adapters with catch-all defaults; the symptom is a new upstream enum value
+  (a new plan, a new status) quietly mapped to the wrong meaning and discovered weeks later through
+  customer complaints rather than errors.
 - Transactions that span contexts; the symptom is distributed locks, timeouts under load, and partial
   updates nobody can compensate.
 

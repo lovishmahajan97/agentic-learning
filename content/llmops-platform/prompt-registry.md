@@ -5,7 +5,7 @@ name: Prompt registry
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - prompting/prompt-versioning
   - prompting/prompt-templates
@@ -61,6 +61,12 @@ Attached to a version, not a label, are the **evidence** records: eval run finge
 named golden-set version, and links to the review that approved it. Evidence belongs to content, not to
 pointers, because the question "was this text tested" has one answer regardless of where it is deployed.
 
+Label moves are themselves recorded as an append-only log (`who`, `from`, `to`, `when`, `why`), *because*
+rollback needs to know what the label pointed at before, and an audit needs to know what was live at
+02:14 on Tuesday, which is a question about the label's history, not about any version. Moves should be
+compare-and-set ("move `production` from v12 to v13, only if it is still v12") so that two people
+promoting at once cannot silently overwrite each other.
+
 ### Prompt and model are a pair
 A prompt is tuned to a model. The same text that works on one model family may over-refuse, ignore the
 schema or change tone on another, so a version stores model id and decoding parameters alongside the
@@ -78,9 +84,19 @@ Every model call logs the prompt name, version and digest into the trace. Observ
 include prompt management, Langfuse being the common open-source example, link a trace to the prompt
 version automatically, which turns "find every answer produced by v12" into a filter.
 
+The TTL sets the propagation delay of every label move, rollback included: with a 60-second TTL and
+fifty replicas, for up to a minute after a move some replicas serve the old version and some the new.
+That is fine for a planned deploy and too slow for an emergency rollback of a harmful prompt, which is why
+some SDKs and home-grown registries add a push invalidation (a webhook or pub/sub message that evicts the
+cached entry) on top of the TTL.
+
 ### Change workflow
 Create a draft version, run the eval suite against it (the registry or the CI pipeline triggers this),
-attach the results, get a review, move the label. The pipeline's service account should be the only
+attach the results, get a review, move the label. The declared variables are an interface between the
+prompt and the code that renders it: a version that adds `{{customer_tier}}` can only be labeled
+`production` once the deployed code supplies that variable, so the label move should validate the
+version's variable set against what the running application declares it provides, and rendering should
+fail loudly on a missing variable rather than send the literal placeholder to the model. The pipeline's service account should be the only
 principal allowed to move `production`, so that an edit in the UI can create a version but cannot
 deploy it. A diff view between two versions, both text and settings, is the review artifact.
 
@@ -95,8 +111,9 @@ not the vendor.
 
 ## Example
 A minimal registry showing the three operations that matter: register an immutable version (identical
-content maps to the existing version, so re-registering is idempotent), move a label, and fetch with a
-TTL cache that serves stale on failure. A real deployment backs `store` with a database.
+content maps to the existing version, so re-registering is idempotent), move a label with compare-and-set
+and a move log, and fetch with a TTL cache that serves stale on failure. A real deployment backs `store`
+with a database and adds the bundled-file fallback for a cold start while the registry is down.
 
 ```python
 import hashlib, json, time
@@ -117,8 +134,12 @@ class PromptRegistry:
         versions.append(v)                     # append-only: a version is never edited or deleted
         return v["version"]
 
-    def set_label(self, name, label, version, by):      # deploy and rollback are both this one call
+    def set_label(self, name, label, version, by, expected):   # deploy and rollback are both this one call
+        cur = self.store["labels"].get((name, label), {}).get("version")
+        if cur != expected:                    # compare-and-set: a concurrent move must not be clobbered
+            raise RuntimeError(f"{name}:{label} is v{cur}, not v{expected}")
         self.store["labels"][(name, label)] = {"version": version, "by": by, "at": time.time()}
+        self.store.setdefault("moves", []).append((name, label, cur, version, by, time.time()))  # rollback target
 
     def get(self, name, label="production", ttl=60):
         now, hit = time.time(), self._cache.get((name, label))
@@ -140,7 +161,7 @@ v1 = reg.register("support_answer",
                    {"role": "user", "content": "{{question}}"}],
                   model="vendor-model-2025-04-14",        # a dated snapshot id, never a floating alias
                   params={"temperature": 0.2, "max_tokens": 600}, author="ana", note="initial")
-reg.set_label("support_answer", "production", v1, by="ci:release-42")
+reg.set_label("support_answer", "production", v1, by="ci:release-42", expected=None)
 p = reg.get("support_answer")
 # Log p["version"] and p["digest"] on every trace so any answer resolves to its exact prompt.
 ```
@@ -171,6 +192,8 @@ p = reg.get("support_answer")
   apart.
 - Allowing the `production` label to be moved from the UI by anyone with edit rights; the symptom is a
   behaviour change with no pipeline run and no evidence attached.
+- Promoting a version whose new template variable the deployed code does not yet supply; the symptom is
+  model inputs containing a literal `{{customer_tier}}` or an empty slot, and answers that ignore the tier.
 
 ## When to use
 Reach for a registry as soon as a second person edits prompts, a prompt needs per-tenant or per-locale

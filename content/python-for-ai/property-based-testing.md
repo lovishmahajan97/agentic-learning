@@ -5,6 +5,7 @@ name: Property-based testing (Hypothesis)
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/pytest
   - python-for-ai/pydantic
@@ -85,8 +86,9 @@ generates sequences of operations and checks invariants after each step against 
 finds bugs that only appear after a specific order of calls.
 
 ## Example
-A chunker for retrieval with overlap. Two properties fully specify it: no chunk exceeds `size`, and
-dropping each later chunk's overlap rejoins the original text exactly. An earlier version used
+A chunker for retrieval with overlap. A few properties pin down its contract: no chunk exceeds `size`,
+only the last chunk may be short, consecutive chunks really share `overlap` characters, and dropping
+each later chunk's overlap rejoins the original text exactly. An earlier version used
 `range(0, len(text), step)`; Hypothesis failed it immediately and shrank the counterexample to
 `text=''`, where that version returned no chunks at all.
 
@@ -106,6 +108,8 @@ def test_chunk_properties(text, size, data):
     chunks = chunk(text, size, overlap)
     assert chunks, "always at least one chunk"
     assert all(len(c) <= size for c in chunks)
+    assert all(len(c) == size for c in chunks[:-1])           # only the last chunk may be short
+    assert all(a[len(a) - overlap:] == b[:overlap] for a, b in zip(chunks, chunks[1:]))
     assert chunks[0] + "".join(c[overlap:] for c in chunks[1:]) == text
 
 json_values = st.recursive(
@@ -121,10 +125,12 @@ def test_empty_text_regression():          # the shrunk counterexample, pinned a
     assert chunk("", size=4, overlap=1) == [""]
 ```
 
-The chunker property encodes the whole specification in three assertions; no hand-written example
-set would have covered size 1, overlap `size - 1`, empty text and non-ASCII text all at once. The
-round-trip test excludes floats on purpose, because `NaN` breaks equality, which is itself the kind of
-fact property tests force you to decide explicitly.
+The chunker test encodes the specification in five assertions. The full-length and shared-overlap
+checks matter: without them a chunker that emitted one character per chunk would still rejoin
+correctly and pass whenever `overlap` is 0. No hand-written example set would have covered size 1,
+overlap `size - 1`, empty text and non-ASCII text all at once. The round-trip test excludes floats on
+purpose, because `NaN` breaks equality, which is itself the kind of fact property tests force you to
+decide explicitly.
 
 ## Trade-offs
 - Properties cover far more of the input space than examples, but are harder to write; for code whose

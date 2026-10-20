@@ -5,6 +5,7 @@ name: Context managers / resource cleanup
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - python-for-ai/generators
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -95,7 +96,7 @@ async def open_client(name: str):
         await client.aclose()              # runs on success, error or cancellation
 
 @asynccontextmanager
-async def lifespan():                      # the shape FastAPI's lifespan expects
+async def lifespan(app=None):              # FastAPI calls lifespan(app) with this shape
     async with AsyncExitStack() as stack:
         llm = await stack.enter_async_context(open_client("llm-http"))
         db = await stack.enter_async_context(open_client("vector-db"))

@@ -5,7 +5,7 @@ name: State & checkpoint stores
 kind: decision
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -28,8 +28,9 @@ Redis only for ephemeral leases and stream buffers, with a tenant id on every ro
 
 ## Why it exists
 Checkpointing puts a durable write on the critical path of every agent step. That single fact drives
-the storage decision: a store that takes hundreds of milliseconds per write (illustrative) adds
-minutes to a hundred-step run and is felt in every streaming response, while a store that
+the storage decision: a store that takes a few hundred milliseconds per write (illustrative) adds
+tens of seconds to a hundred-step run, and more once a step writes several times (intents, each tool
+result, the snapshot), and it is felt in every streaming response, while a store that
 acknowledges writes before they are durable silently loses the last step on a crash, which is
 precisely the step you needed. Agent state also has an awkward shape. It is mostly small structured
 records (run status, step index, budgets) plus a long append-only log plus occasional very large
@@ -66,11 +67,32 @@ a resume whose pending intents disagree with the log, so it re-issues calls that
 results. Relational stores give this for free; with a key-value store you emulate it with a single
 document per run (and then size becomes the problem) or accept a repair step on resume.
 
+### What "durable" actually means
+"The write succeeded" can mean three different things: the store accepted it into memory, it reached
+the local disk with an fsync, or it reached a replica as well. Only the last two survive a crash of
+the node, and only the last survives losing the node. Postgres by default waits for its write-ahead
+log to be flushed before acknowledging a commit; turning `synchronous_commit` off trades a window of
+recently acknowledged commits for lower latency. Redis's append-only file is fsynced according to
+`appendfsync` (`always`, `everysec` or `no`), and with `everysec` a crash can lose about the last
+second of writes. With asynchronous replication, a failover can promote a replica that never received
+the latest commits. For a checkpoint store, the lost write is by definition the most recent step,
+the one a resume needs, so ask which of the three your configuration gives before calling it
+durable.
+
 ### Leases, not locks
 Resume must be exclusive. A lease is a conditional update: set `owner` and `lease_until` only where
 the row is unowned or the lease has expired, returning the row on success. A lease expires if the
 worker dies; a lock would not. Renew on a heartbeat and stop working if renewal fails, because another
 worker may have taken over.
+
+Leases have a failure mode of their own: a worker pauses (a long GC, a stalled VM), its lease
+expires, a second worker takes over, and the first wakes up still believing it owns the run.
+Checking the lease inside every state write, as the example does, stops the stale worker from
+corrupting the store, because the check and the write share one transaction. It does not stop that
+worker's *external* calls. For those, give each claim a monotonically increasing epoch (a fencing
+token), send it with side-effecting calls, and have adapters or the downstream reject an epoch lower
+than one they have already seen. Where the downstream cannot do that, idempotency keys are what keep
+a stale worker's duplicate call harmless.
 
 ### The options
 - **In-memory** (a dict, LangGraph's `InMemorySaver`, formerly `MemorySaver`): zero latency, zero
@@ -159,6 +181,17 @@ def save_step(conn, run_id, tenant_id, worker, step, new_events, state, blobs, b
                      (run_id, tenant_id, step, json.dumps(state)))
 ```
 
+Walk a step through it. Worker `w2` claims run `r7` with a 30-second lease and renews it every 10
+seconds. Step 12 produces three events: the model response (2 KB, inline), a tool call (1 KB,
+inline) and a tool result of 900 KB of HTML, which goes to `acme/r7/37.json` with a reference row in
+`events`. The transaction then upserts checkpoint 12 and commits; a crash anywhere before the commit
+leaves neither the events nor the checkpoint, so the resume sees a consistent step 11. If `w2` had
+stalled for 40 seconds and `w3` had claimed the run meanwhile, `w2`'s next `save_step` would find
+`owner = w3`, update zero rows and stop. One gap remains visible in the code: the blob is written
+before the transaction commits, so a rollback can leave an orphan object. That is harmless,
+because nothing references it, and it is cleaned up by a sweep or a bucket lifecycle rule, which is
+cheaper than trying to make object storage transactional.
+
 ## Trade-offs
 - Postgres gives transactions and durability with simple operations, but a single primary caps
   write throughput; shard by tenant or move the event log to a wide-column store once writes per
@@ -169,6 +202,9 @@ def save_step(conn, run_id, tenant_id, worker, step, new_events, state, blobs, b
 - Offloading large payloads to object storage keeps the database small and fast, but adds a second
   write and a fetch on resume; set the threshold from your payload distribution rather than
   offloading everything.
+- Relaxing durability (asynchronous commit, `everysec` fsync) cuts per-step write latency, which is
+  acceptable when losing the last step only costs a repeated model call; it flips the moment that
+  step's record is what stands between a crash and a duplicated side effect.
 - Short TTLs on checkpoints control growth and limit exposure of sensitive tool outputs, but shorten
   the window for resume and debugging; keep events longer than checkpoints and archive rather than
   delete when audit demands it.
@@ -184,6 +220,9 @@ def save_step(conn, run_id, tenant_id, worker, step, new_events, state, blobs, b
   joins and still misses archived objects.
 - Locks instead of leases; the symptom is a run stuck forever as "owned" by a worker that died,
   resumable only by manual intervention.
+- Calling a store durable because writes succeed, without checking fsync and replication settings;
+  the symptom is a resume after a node failure or failover that restarts a step the run had already
+  completed and acknowledged.
 
 ## When to use
 Make the decision when you first persist a run, because migrating state stores later is painful.

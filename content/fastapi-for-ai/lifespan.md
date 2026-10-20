@@ -5,6 +5,7 @@ name: Lifespan (load model / client once)
 kind: pattern
 difficulty: core
 est_minutes: 13
+status: reviewed
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/request-scoped-vs-application-scoped-resources
@@ -38,8 +39,10 @@ Building them **per request** pays the full cost every call: a model reload per 
 latency and a copy of the weights per concurrent call, and a fresh client per call means a new TCP and
 TLS handshake every time with sockets piling up under load. Building them **at import time** as module
 globals fixes the repetition but loses control: every `import app` (tests, Alembic migrations, a CLI
-script, the OpenAPI generator) now loads a model; there is no async context for `await`-based setup;
-and there is no hook to close the client or flush buffers when the process stops. Building them **lazily
+script, the OpenAPI generator) now loads a model; there is no running event loop for `await`-based
+setup, and loop-bound objects (an asyncpg pool, an `aiohttp` session) created on one loop fail with
+"attached to a different loop" errors when a test or server runs them on another; and there is no hook
+to close the client or flush buffers when the process stops. Building them **lazily
 on first request** hides the cost inside a user's request, races when two first requests arrive
 together, and lets a worker report healthy before it can actually serve.
 
@@ -57,8 +60,9 @@ does the server treat the app as ready. If the code before `yield` raises, Starl
 `lifespan.startup.failed` and the server exits instead of serving a half-initialised app. This is the
 fail-fast property you want: a missing API key or a corrupt weights file stops the deploy instead of
 producing a fleet of workers that 500 on every request. At shutdown (for example on SIGTERM), the
-server stops accepting new connections, gives in-flight requests a grace period, then sends
-`lifespan.shutdown`, and the code after `yield` runs. Teardown therefore normally happens after
+server stops accepting new connections, waits for in-flight requests to finish (Uvicorn waits
+indefinitely unless `--timeout-graceful-shutdown` bounds it), then sends `lifespan.shutdown`, and
+the code after `yield` runs. Teardown therefore normally happens after
 requests have drained, which is why closing the shared client there is safe.
 
 ### Writing it
@@ -94,6 +98,11 @@ connection pools and four engines; size the DB pool and GPU memory with that mul
 When the per-worker model copy no longer fits, the model belongs in a dedicated inference server and
 lifespan just builds a client to it.
 
+The tempting shortcut, loading the model once in a Gunicorn master with `--preload` and letting the
+forked workers share pages copy-on-write, is outside lifespan entirely and has sharp edges: CPython's
+reference counting writes to object headers, so "shared" pages get copied gradually, and CUDA cannot be
+re-initialised in a forked child, so a GPU model initialised in the master is unusable in the workers.
+
 ### Blocking work during startup
 `from_pretrained`-style loaders are synchronous. During startup no requests are being served, so a
 blocking load mostly just delays readiness; still, `await asyncio.to_thread(load)` keeps the loop
@@ -118,7 +127,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Annotated
 import httpx
 from fastapi import Depends, FastAPI, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
 @asynccontextmanager
@@ -140,7 +149,7 @@ def get_model(request: Request) -> SentenceTransformer:
     return request.app.state.model                   # override this in tests
 
 class EmbedIn(BaseModel):
-    texts: list[str]
+    texts: list[str] = Field(min_length=1, max_length=256)   # empty list would break .shape[1]
 
 @app.post("/embed")
 async def embed(body: EmbedIn, model: Annotated[SentenceTransformer, Depends(get_model)]):
@@ -160,9 +169,9 @@ accepts a request; with `with TestClient(app) as c:` the same lifespan runs in t
   optional resources degrade at request time instead.
 - One shared client or model per worker maximises reuse, but multiplies by the worker count; once N
   copies of the weights exceed host memory, a separate model server beats more workers.
-- `app.state` is explicit and easy to read, while lifespan state via `yield {...}` keeps resources
-  scoped to the app instance and typed; the choice matters little until several apps share a process
-  or tests need isolated instances.
+- `app.state` is explicit and easy to read, while lifespan state via `yield {...}` is rebuilt on each
+  lifespan run and can be described with a `TypedDict`; the choice matters little until several apps
+  share a process or tests start the same app repeatedly and need fresh state each time.
 
 ## Pitfalls
 - Using `TestClient(app)` without `with`, or an `httpx` ASGI transport, in tests; symptom: handlers

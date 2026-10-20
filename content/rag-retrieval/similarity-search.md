@@ -4,8 +4,8 @@ module: rag-retrieval
 name: Similarity search (cosine, dot product)
 kind: concept
 difficulty: core
-est_minutes: 13
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/embedding-dimension-and-normalization
@@ -77,6 +77,20 @@ Conversely, a cosine-trained model has no incentive to keep norms meaningful, so
 outputs adds noise. The rule: use the similarity the model card names. If it is silent, normalize and use
 cosine; it is the choice that cannot be badly wrong.
 
+### Inner product is not a distance, and indexes notice
+L2 is a proper metric: a vector is its own nearest neighbor and the triangle inequality holds, so "close
+to close is close". Cosine distance (1 − cos) is not itself a metric, but on unit vectors it is a
+monotone function of L2, so it ranks and navigates like one. Raw inner product has neither property. Under dot product a vector's best match is not itself but any longer
+vector pointing roughly the same way, and two documents that both score highly against a query need not
+score highly against each other. This search problem has its own name, maximum inner product search
+(MIPS), and it matters because graph and cluster indexes are built on the intuition that neighbors of
+neighbors are good candidates; with widely varying norms that intuition weakens and recall at a given
+search effort can drop. Libraries accept inner product directly, but the standard reduction is worth
+knowing: let M be the largest document norm, append the coordinate √(M² − ‖d‖²) to every document and 0
+to the query. Every augmented document now has norm M, the query's dot product is unchanged, and
+nearest-neighbor search by L2 on the augmented vectors returns exactly the MIPS ranking. If your vectors
+are normalized, none of this applies, which is one more reason normalization is the default.
+
 ### How the computation runs
 Exact search is a matrix–vector product: stack N document vectors into a matrix D (N × d) and compute
 `D·q`. The cost is N·d multiply-adds, but in practice the bound is memory bandwidth, because every byte
@@ -84,7 +98,8 @@ of D is read once per query. One million 1024-dimensional fp32 vectors is 4 GB. 
 of magnitude, streaming that through a single CPU core takes hundreds of milliseconds; a GPU with roughly
 a terabyte per second of bandwidth does it in a few milliseconds. Batching queries into a matrix–matrix
 product (D·Qᵀ) amortizes the read across many queries, which is why offline evaluation is cheap while
-online single-query latency is not. Past a few million vectors you stop scanning and build an approximate
+online single-query latency is not. Selecting the top k from N scores does not need a full sort: a heap
+or partial selection (`np.argpartition`) is O(N), so the scan, not the selection, dominates. Past a few million vectors you stop scanning and build an approximate
 index (see ANN indexes), trading a little recall for sublinear search.
 
 ### Scores are not probabilities

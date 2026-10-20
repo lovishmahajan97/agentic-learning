@@ -5,7 +5,7 @@ name: Secrets management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agent-runtime-architecture/secrets-and-credential-isolation
   - backend-fundamentals/oauth-2-0-oidc
@@ -69,6 +69,15 @@ anyone who can create a Pod there, since a Pod can mount any Secret in its names
 hop, populated from a real manager by the External Secrets Operator, the Secrets Store CSI driver or a
 Vault agent sidecar.
 
+A key-management service (AWS KMS, Cloud KMS, Key Vault keys, Vault's transit engine) is a different
+tool from a secrets store, and the distinction matters for signing and encryption keys. A secrets
+store *returns* the value to the caller; a KMS never does: the caller sends data and asks the service to
+sign, encrypt or decrypt it, and the key stays non-exportable inside the service. Use it for JWT
+signing keys, webhook signing and field-level encryption, *because* a key that never enters application
+memory cannot leak through a heap dump, a log line or a compromised dependency; the attacker who owns
+the process can still call `sign` while they hold it, but loses that power the moment access is
+revoked.
+
 ### 3. Authenticate the workload: the secret-zero problem
 To fetch secrets a workload needs a credential, and if that credential is a static key you have gained
 nothing. The way out is identity that the platform can attest without a stored secret: an EC2 instance
@@ -88,9 +97,14 @@ life of the process and leaky as above. Never bake into the image; `docker build
 during one build step without writing it to any layer.
 
 ### 5. Rotate, and prefer dynamic
-Static secrets rotate on a schedule and immediately after any suspected exposure, using two-key overlap:
-issue the new value, let consumers pick it up, then revoke the old, *because* an atomic swap across many
-consumers is impossible. Dynamic secrets remove the schedule: Vault's database engine creates a
+Static secrets rotate on a schedule and immediately after any suspected exposure, using two-key overlap,
+*because* an atomic swap across many consumers is impossible. For a database password the sequence is:
+(1) create the new credential at the database while the old one still works; (2) store it in the manager
+as the pending version; (3) verify a login with it; (4) promote it to current, so consumers pick it up on
+their next refresh; (5) wait at least one consumer refresh interval (the cache TTL, plus restart time for
+anything that reads only at boot); (6) revoke the old credential. AWS Secrets Manager models exactly this
+with the staging labels `AWSPENDING`, `AWSCURRENT` and `AWSPREVIOUS`. Revoking at step 4 instead of 6 is
+the classic rotation outage. Dynamic secrets remove the schedule: Vault's database engine creates a
 per-workload database user with a TTL and drops it on expiry; cloud STS tokens expire within hours.
 Rotation only works if consumers re-read, so cache with a TTL and refetch on an authentication failure.
 
@@ -190,6 +204,11 @@ value.
   rotation until a restart. Re-read on a TTL and on 401.
 - Assuming Kubernetes Secrets are encrypted; the symptom is any namespace reader dumping them. Enable
   encryption at rest, restrict RBAC on secrets, and source them from a manager.
+- Mounting a Kubernetes Secret with `subPath`, or reading it through `env`; the symptom is that the
+  manager and the Secret show the new value but the Pod keeps the old one until it restarts, because
+  neither path receives in-place updates (whole-volume mounts do, after a short sync delay).
+- Revoking the old credential as soon as the new one is written; the symptom is a burst of
+  authentication failures across every consumer whose cache has not yet refreshed.
 
 ## When to use
 There is no setting where this does not apply; what varies is the tooling. Day to day, adding a secret

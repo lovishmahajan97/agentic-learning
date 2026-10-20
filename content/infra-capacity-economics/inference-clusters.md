@@ -5,6 +5,7 @@ name: Inference clusters
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - infra-capacity-economics/gpu-infrastructure
   - infra-capacity-economics/ray-kuberay
@@ -57,8 +58,9 @@ behind. Each layer answers a different question.
    (each layer's matrices are sliced across GPUs and the shards exchange activations every layer).
    TP stays within a node *because* it needs an all-reduce per layer per token, which is only
    affordable over NVLink-class bandwidth; crossing the network for it would make every decode
-   step wait on the slowest link. Pipeline parallelism across nodes is used only when a model cannot
-   fit in one node.
+   step wait on the slowest link. (Rack-scale systems whose NVLink domain spans several trays move
+   that boundary from "node" to "NVLink domain", but the rule is the same.) Pipeline parallelism
+   across nodes is used only when a model cannot fit in one node or NVLink domain.
 2. **Model pool.** All replicas of one model (and one configuration: quantization, max context,
    adapters). Scaling happens per pool, because a 7B chat model and a 70B reasoning model have
    completely different capacity curves and traffic.
@@ -76,17 +78,22 @@ A good router does not round-robin. The usual signals, in rough order of value:
   land on a replica that is already at its concurrency cap. Replicas expose these as metrics
   (vLLM publishes running/waiting request counts and KV-cache usage).
 - **Prefix-cache affinity.** Requests sharing a long system prompt or a conversation are hashed to
-  the replica that already holds that prefix, which turns a full prefill into a cache hit. This is
-  consistent hashing on the prompt prefix, with spillover to least-loaded when the preferred replica
-  is saturated *because* affinity is worth little if it adds queueing delay.
+  the replica that already holds that prefix, which turns a full prefill into a cache hit. The
+  simple version is consistent (or rendezvous) hashing on a fixed-length prompt prefix, so adding a
+  replica remaps only a small share of keys; more advanced routers track which prefixes each replica
+  actually holds (for example a radix tree of cached prefixes). Either way there is spillover to
+  least-loaded when the preferred replica is saturated *because* affinity is worth little if it adds
+  queueing delay.
 - **Session stickiness for multi-turn chats**, a special case of the above.
 - **Priority classes**, so interactive traffic is admitted ahead of batch jobs that share the pool.
 
 ### Disaggregated prefill and decode
 Prefill is compute-bound (big matrix multiplies over the whole prompt); decode is bandwidth-bound
-(one token per step, reading the whole cache). Running both on the same replica makes a 40k-token
-prefill stall every decode stream on that GPU for hundreds of milliseconds, which shows up as TPOT
-jitter. Larger clusters therefore split them: prefill replicas compute the KV cache and ship it over
+(one token per step, reading the weights and the whole cache). Running both on the same replica
+makes a 40k-token prefill stall every decode stream on that GPU for hundreds of milliseconds to
+several seconds depending on model size, which shows up as TPOT jitter. Chunked prefill, which
+splits a long prompt into pieces interleaved with decode steps, is the first mitigation inside one
+replica. Larger clusters go further and split the phases: prefill replicas compute the KV cache and ship it over
 a fast interconnect to decode replicas, each class sized and scaled separately. The cost is the KV
 transfer and more moving parts, so it pays only at scale with long prompts.
 
@@ -129,8 +136,9 @@ print("replicas:", replicas_needed(6_000, 1_500))      # -> ceil(5.2)+1 = 7
 pool = [Replica(f"r{i}", max_seqs=48) for i in range(7)]
 
 def route(prompt: str, prefix_chars: int = 2048) -> Replica:
+    # Affinity only works if the shared prefix (system prompt) is at least prefix_chars long.
     key = hashlib.sha1(prompt[:prefix_chars].encode()).hexdigest()
-    preferred = pool[int(key, 16) % len(pool)]          # prefix affinity via consistent choice
+    preferred = pool[int(key, 16) % len(pool)]  # modulo for brevity; use consistent hashing in prod
     if preferred.running < preferred.max_seqs:
         preferred.hot_prefixes.add(key); preferred.running += 1
         return preferred
@@ -144,8 +152,10 @@ def route(prompt: str, prefix_chars: int = 2048) -> Replica:
 
 The sizing function makes the two hidden assumptions explicit: a replica's capacity is the
 concurrency at which it still meets the latency budget (not its raw maximum), and one extra replica
-covers a node loss without breaching it. The router prefers the replica that already holds the
-prompt prefix, but only while it has admission room.
+covers a node loss without breaching it (if one node hosts several replicas, N+1 must be counted in
+nodes, not replicas). The router prefers the replica that already holds the prompt prefix, but only
+while it has admission room. The modulo hash is a shortcut: when the pool resizes, almost every key
+moves and the cache affinity resets, which is why real routers use consistent or rendezvous hashing.
 
 ## Trade-offs
 - Many small replicas (TP=1) give fine-grained scaling and isolation; a few large TP replicas give
@@ -218,7 +228,8 @@ replica, and add a readiness gate so new replicas take traffic only after warm-u
 - [ ] Cross-node tensor parallelism would duplicate the model weights on every node
 - [ ] The KV cache must be contiguous in memory, which a network cannot provide
 > Tensor parallelism slices each layer and exchanges partial results per layer per step; over a
-> network that round-trip would dominate every decode step. Pipeline parallelism is the cross-node
+> network that round-trip would dominate every decode step (rack-scale NVLink domains extend the
+> boundary but do not change the reasoning). Pipeline parallelism is the cross-node
 > option because it exchanges activations only at stage boundaries.
 
 ### Q: Which signal is the best basis for autoscaling an LLM model pool?

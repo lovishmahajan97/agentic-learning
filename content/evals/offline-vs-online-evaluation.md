@@ -5,7 +5,7 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - evals/a-b-testing
   - evals/golden-dataset
@@ -87,6 +87,16 @@ the offline judge and with the online outcome, and look at the agreement. When o
 the A/B test says flat or worse, the offline metric is wrong; fix the grader, do not argue with the
 users.
 
+Make that agreement a tracked number rather than an impression. Keep a launch log with one row per
+change that went through an online test: the offline delta, the online delta with its interval, and the
+decision. Two readings matter. Directional agreement: of the changes where the online result was
+conclusive, how often did the offline metric point the same way? And rank agreement: does a bigger
+offline gain predict a bigger online gain? A metric that agrees on direction but not magnitude is
+still a usable gate; one that agrees no better than a coin flip should stop gating releases until it is
+repaired. Expect agreement to decay over time even with no one changing the grader, because teams
+optimise against whatever the offline metric rewards (Goodhart's law), which is a second reason to
+re-validate it on every A/B test you run.
+
 ### Signal quality online
 Implicit signals are biased. Thumbs come from users at the extremes; "regenerate" may mean a bad answer
 or a curious user; a longer session may mean engagement or struggle. Define one primary outcome per
@@ -140,6 +150,8 @@ iteration. Had the team shipped on the 86%, they would have paid 35% more for no
   while the silent majority escalates.
 - Never feeding production traces back into the golden set; the symptom is an offline score that stays
   high while the intent mix in production has moved on.
+- Treating the offline metric's validity as settled once; the symptom is a run of launches that each
+  win offline by a few points while the online outcome stays flat quarter after quarter.
 - Comparing this week's online metric to last week's as if it were an experiment; the symptom is a
   "regression" that was a holiday, a campaign or a provider update.
 

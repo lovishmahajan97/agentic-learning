@@ -5,7 +5,7 @@ name: C4 diagrams
 kind: practice
 difficulty: intro
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - system-design/ai-solution-architecture
   - system-design/reference-architectures
@@ -46,8 +46,9 @@ meaning of each flow is exactly what that audience needs.
 
 ## How it works
 ### The four levels
-1. **System Context.** Your system is one box. Around it are the people who use it and the external
-   systems it depends on: the identity provider, the CRM it reads tickets from, the hosted model
+1. **System Context.** Your system is one box. A *software system* here is the thing one team builds
+   and owns; anything owned by someone else, including another team's platform, is drawn as external.
+   Around the box are the people who use it and the external systems it depends on: the identity provider, the CRM it reads tickets from, the hosted model
    provider. No technology inside the box yet. This exists because the first thing any audience needs is
    the system's place in the world, and it is the diagram you show executives and customers.
 2. **Container.** Zoom into the system box. A *container* here is a separately runnable or deployable
@@ -99,11 +100,21 @@ view, draw the boundary between the customer's environment and yours and mark wh
 customer documents or prompts. A Dynamic diagram of one request is usually worth more than a Component
 diagram of everything.
 
+C4 has no first-class trust-boundary element, and it does not pretend to be a threat model. Draw
+boundaries with deployment nodes (the customer's VPC, your cloud account, the provider's region) or with
+named groups, and state in the legend what crossing one means. A security team running a STRIDE-style
+review will still want a data-flow diagram; a good Deployment view gives them most of it.
+
 ## Example
-A Structurizr DSL workspace for a support assistant. One model feeds two views, so the Context diagram
-for stakeholders and the Container diagram for engineers cannot disagree. The model provider is external,
-the vector-capable database is tagged so it renders as a cylinder, and every relationship states intent
-and protocol.
+A Structurizr DSL workspace for a support assistant. One model feeds three views, so the Context
+diagram for stakeholders, the Container diagram for engineers and the Dynamic view of one request cannot
+disagree. The model provider is external, the vector-capable database is tagged so it renders as a
+cylinder, and every relationship states intent and protocol. The dynamic view numbers the steps of one
+reply in order, and Structurizr checks each step against the relationships in the model, so if someone
+deletes the `api -> gateway` arrow the workspace fails to build instead of the request story silently
+going stale. Notice also
+what the Context view reveals once rendered: two arrows leave the system, to the CRM and to the model
+provider, and the second is the data egress a privacy review will ask about first.
 
 ```
 workspace "Support Copilot" "Drafts ticket replies grounded in the knowledge base" {
@@ -129,6 +140,14 @@ workspace "Support Copilot" "Drafts ticket replies grounded in the knowledge bas
     views {
         systemContext copilot "Context"    { include * autolayout lr }
         container     copilot "Containers" { include * autolayout lr }
+        dynamic copilot "DraftReply" "One grounded reply" {
+            agent -> web "Opens a ticket and asks for a draft"
+            web -> api "Sends ticket text"
+            api -> db "Fetches top-8 chunks for this tenant"
+            api -> gateway "Requests a draft grounded in the chunks"
+            gateway -> llm "Forwards prompt; streams completion"
+            autolayout lr
+        }
         styles {
             element "External" { background #999999 color #ffffff }
             element "Database" { shape Cylinder }
@@ -146,6 +165,9 @@ workspace "Support Copilot" "Drafts ticket replies grounded in the knowledge bas
   than it changes.
 - A single model with many views guarantees consistency, but it demands that someone own the model;
   without that owner, C4-PlantUML files per diagram are easier to keep alive.
+- C4 is deliberately lighter than UML or ArchiMate, which makes it learnable in an afternoon, but it
+  says nothing about behaviour beyond numbered arrows or about formal semantics; for enterprise-wide
+  capability mapping or protocol-level design, those heavier notations (or sequence diagrams) earn their cost.
 - Component diagrams explain a container's internals, but they rot fastest and are read least; draw them
   for the containers whose structure others depend on and skip the rest.
 

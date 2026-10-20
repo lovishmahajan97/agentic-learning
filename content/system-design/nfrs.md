@@ -4,8 +4,8 @@ module: system-design
 name: NFRs (non-functional requirements)
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - system-design/trade-off-analysis
   - system-design/adrs
@@ -85,6 +85,26 @@ pipelines. Security and residency attributes become review checklist items and a
 attributes become a per-tenant, per-feature dashboard with budgets. Use percentiles, never averages, for
 anything latency-shaped, and state the window over which a percentile is computed.
 
+Statistical targets need one more field: the uncertainty of the measurement. A proportion measured on
+*n* cases has a standard error of about √(p(1−p)/n). At p = 0.90 and n = 300 that is ≈ 0.017, so the 95%
+interval is roughly ±3.4 points, and a run scoring 0.91 cannot be told apart from one scoring 0.88. Write
+the gate accordingly: either "the lower bound of the interval is at least 0.90", or "no statistically
+significant regression against the current release on the same cases". The paired form needs far fewer
+cases to detect a small drop, because each case is compared with itself.
+
+### Decomposing a target into budgets
+An end-to-end NFR is not actionable for one team until it is split along the request path. Latency
+budgets add: a 1.5 s p95 time-to-first-token might be allotted as 50 ms for auth and tenant resolution,
+100 ms for query embedding, 150 ms for vector search, 200 ms for guardrails and prompt assembly, leaving
+about 1 s for the model's own first token (illustrative). Summing component p95s usually overestimates the
+end-to-end p95, because components rarely hit their tails on the same request, so budgets set this way
+are conservative; the end-to-end measurement is still the one that counts. Availability multiplies
+instead: a chat path that depends serially on your stack at 99.95% and a provider at 99.9% delivers about
+0.9995 × 0.999 ≈ 99.85%, below a 99.9% target before your own bugs. That one multiplication is why the
+availability row in the example below forces a provider fallback rather than a better runbook. A 99.9%
+monthly target is about 43 minutes of allowed unavailability in a 30-day month; stating the error budget
+in minutes makes the cost of each dependency concrete.
+
 ### Prioritising, because they conflict
 Not every NFR drives structure. The **architecturally significant requirements** are the handful whose
 satisfaction forces a design choice: a 1.5-second time-to-first-token forces streaming and a model-tier
@@ -148,6 +168,8 @@ hard cases) rather than a single small model. Change the priority and the archit
   seconds for a first token.
 - A quality NFR with no named evaluation set or sample size; the symptom is "accuracy 92%" that cannot
   be reproduced and silently changes when someone edits the test cases.
+- Gating releases on a point estimate from a small eval set; the symptom is a gate that flips between
+  pass and fail on reruns of the same build, and a team that learns to rerun until green.
 - A latency target with no load condition; the symptom is a staging pass followed by a launch-day
   collapse at ten times the concurrency.
 - Copying "99.99% availability" from a template; the symptom is a multi-region design and on-call

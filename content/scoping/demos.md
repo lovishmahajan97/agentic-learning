@@ -4,7 +4,8 @@ module: scoping
 name: Demos
 kind: practice
 difficulty: core
-est_minutes: 11
+est_minutes: 12
+status: reviewed
 related:
   - scoping/rapid-prototyping-poc
   - scoping/success-metrics-kpis
@@ -32,6 +33,12 @@ afternoon to find five inputs where a prototype looks brilliant; it takes weeks 
 good. A demo built on those five inputs creates expectations the system cannot meet, and the gap surfaces
 in the pilot as "it worked in the demo".
 
+The arithmetic makes the problem concrete. Suppose the system is right on 76% of real inputs. Show ten
+hand-picked successes and the audience's implied estimate is close to 100%, a 24-point overstatement
+nobody said out loud. Pick five inputs genuinely at random instead, and the chance all five succeed is
+0.76⁵ ≈ 0.25, so three demos in four would show at least one failure. Neither extreme is acceptable:
+the first misleads, the second leaves the story to chance. The demo has to be *designed*.
+
 The naive alternatives both fail. The polished-showcase demo (curated inputs, rehearsed path, everything
 green) wins the meeting and loses the account later. The opposite, refusing to demo until the system is
 "ready", leaves stakeholders without anything concrete to react to, so feedback on the workflow arrives
@@ -53,8 +60,9 @@ synthetic data lacks: scanned pages, abbreviations, missing fields. Recognizable
 audience trust what they see.
 
 ### 3. Choose inputs representatively, and say how
-Pick demo inputs from the evaluation set: some typical cases, one hard case, and one case the system gets
-wrong or escalates. Then state the aggregate: "On 200 of your past tickets, it routed 87% correctly; here
+Pick demo inputs from the evaluation set, roughly in proportion to its error categories: some typical
+cases, one hard case, and one case the system gets wrong or escalates. Selection is fine; *undisclosed*
+selection is the problem. Then state the aggregate: "On 200 of your past tickets, it routed 87% correctly; here
 are three of them." The demo is the anecdote, the eval is the evidence, and showing both prevents the
 anecdote from standing in for the evidence.
 
@@ -65,8 +73,13 @@ know nothing is flawless, and they want to see that failures are contained.
 
 ### 5. Control the live risks
 Live demos of non-deterministic systems fail in ways rehearsals miss: provider latency spikes, rate
-limits, a different output on the same input. Mitigations: lower sampling temperature for the demo path,
-pre-warm caches, have a recorded backup of each segment, and test on the actual network you will present
+limits, a different output on the same input. Run-to-run variance compounds across segments: if each of
+four live inputs gives the intended result on 9 of 10 rehearsal runs, the chance at least one goes wrong
+on the day is 1 − 0.9⁴ ≈ 34%. So rehearse each live input many times and measure its stability; inputs
+that flip between runs belong in the recorded or narrated part, or should be shown deliberately as a
+variance example. Mitigations: lower sampling temperature for the demo path
+where the model exposes it (this reduces variance but does not guarantee identical outputs, and some
+reasoning models do not accept a temperature setting), pre-warm caches, have a recorded backup of each segment, and test on the actual network you will present
 from. If you show cached or recorded output, say so, *because* hidden caching also hides real latency.
 
 ### 6. Label what is real
@@ -115,6 +128,10 @@ the session ends on the decision it was built to inform.
   is timeouts or long spinners during the live segment.
 - Treating the demo as the evaluation, with no aggregate number behind it; the symptom is stakeholders
   quoting a single impressive example as the expected performance.
+- Special-casing the demo inputs in code (a hard-coded lookup, a prompt tuned to those three documents);
+  the symptom is the same inputs behaving differently once the pilot build replaces the demo branch.
+- Letting the demo screens become the specification by default; the symptom is change requests and SOW
+  lines that cite "as shown in the demo" for behavior nobody designed or estimated.
 
 ## When to use
 Demo at decision points: after discovery to confirm you understood the workflow, at the end of a PoC to

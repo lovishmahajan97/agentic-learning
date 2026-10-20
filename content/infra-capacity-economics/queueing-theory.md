@@ -5,6 +5,7 @@ name: Queueing theory
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - infra-capacity-economics/capacity-planning
   - infra-capacity-economics/latency-budgets
@@ -77,9 +78,11 @@ Wq ≈ ( ρ / (1 − ρ) ) × ( (Ca² + Cs²) / 2 ) × mean_service_time
 where Ca and Cs are the coefficients of variation (std dev / mean) of inter-arrival times and service
 times. This splits the problem into three levers: utilization, *arrival* variability (bursts, retry
 storms, batch jobs released on the hour) and *service* variability (output-length spread, tool calls,
-cache hits vs misses). LLM workloads usually have Cs well above 1, which is why their queues are worse
-than a textbook M/M/1 at the same utilization, and why capping `max_tokens` or splitting long jobs
-onto a separate queue reduces latency for everyone else.
+cache hits vs misses). LLM workloads often have Cs around or above 1 (an exponential has exactly 1),
+and agentic traffic with tool calls and long-tail outputs can push it higher; when Cs > 1 their queues
+are worse than a textbook M/M/1 at the same utilization. Measure Cs from your own traffic rather than
+assuming it. Capping `max_tokens` or splitting long jobs onto a separate queue lowers Cs and so reduces
+latency for everyone else.
 
 ### Many servers: M/M/c and pooling
 With c servers sharing one queue, the Erlang C formula gives the probability an arriving request must
@@ -100,7 +103,8 @@ single-request benchmark, because per-request speed depends on load.
 ## Example
 A fleet exposes 16 concurrency slots in total; a request holds a slot for 4 s on average. Erlang C
 shows how waiting behaves as arrival rate rises, and what pooling buys. Exponential service is an
-idealization; LLM traffic with higher variance will wait longer than this at every row.
+idealization; LLM traffic whose service-time variance exceeds the exponential's (Cs > 1) will wait
+longer than this at every row.
 
 ```python
 from math import factorial
@@ -120,11 +124,11 @@ mu = 1 / 4.0                          # 4 s mean service per slot
 for lam in (2.0, 3.0, 3.5, 3.8, 3.95):
     rho, pw, wq, w = mmc(lam, mu, c=16)
     print(f"lam={lam}/s rho={rho:.2f} P(wait)={pw:.2f} Wq={wq:.2f}s L={lam*w:.1f}")
-# lam=2.0  rho=0.50 P(wait)=0.01 Wq=0.00s  L=8.0
-# lam=3.0  rho=0.75 P(wait)=0.20 Wq=0.20s  L=12.6
-# lam=3.5  rho=0.88 P(wait)=0.51 Wq=1.02s  L=17.6
-# lam=3.8  rho=0.95 P(wait)=0.78 Wq=3.90s  L=30.0
-# lam=3.95 rho=0.99 P(wait)=0.94 Wq=18.84s L=90.2
+# lam=2.0/s rho=0.50 P(wait)=0.01 Wq=0.00s L=8.0
+# lam=3.0/s rho=0.75 P(wait)=0.20 Wq=0.20s L=12.6
+# lam=3.5/s rho=0.88 P(wait)=0.51 Wq=1.02s L=17.6
+# lam=3.8/s rho=0.95 P(wait)=0.78 Wq=3.90s L=30.0
+# lam=3.95/s rho=0.99 P(wait)=0.94 Wq=18.84s L=90.2
 
 print(mmc(3.5, mu, 16)[2], mmc(1.75, mu, 8)[2])   # pooled 16 slots: ~1.0 s; split 2x8: ~2.5 s each
 ```
@@ -197,10 +201,11 @@ validate with a load test replaying real output-length distributions before laun
 > Pooling is statistical multiplexing: one shared queue never leaves a slot idle while requests wait
 > elsewhere. Utilization stays 85%, but the probability and length of waits fall.
 
-### Q: In Kingman's approximation, which change reduces queueing delay without adding capacity?
+### Q: Kingman's approximation separates utilization from variability. Which change shrinks the variability term (Ca² + Cs²)/2 rather than utilization?
 - [ ] Raising the batch size so each replica processes more tokens per step
 - [x] Capping output length or routing long jobs elsewhere to reduce service-time variability
 - [ ] Adding retries with no backoff so failed requests finish sooner
-- [ ] Moving to faster GPUs with the same memory bandwidth
-> Kingman's wait scales with (Ca² + Cs²)/2. Reducing service-time spread lowers Cs and therefore
-> waiting, at the same utilization. Immediate retries increase arrival burstiness and make it worse.
+- [ ] Moving to faster GPUs so the mean service time drops
+> Reducing service-time spread lowers Cs, so waiting falls even at the same utilization. Bigger
+> batches and faster GPUs act on capacity and mean service time, i.e. on ρ, not on the variability
+> term; immediate retries raise arrival burstiness (Ca) and make waiting worse.

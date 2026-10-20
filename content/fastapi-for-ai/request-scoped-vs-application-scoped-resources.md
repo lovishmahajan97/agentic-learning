@@ -5,6 +5,7 @@ name: Request-scoped vs application-scoped resources
 kind: decision
 difficulty: core
 est_minutes: 13
+status: reviewed
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/dependency-injection
@@ -64,6 +65,14 @@ A loaded PyTorch model in eval mode can serve concurrent forward passes, but the
 work, so a concurrency limit belongs next to it. A raw SQLAlchemy `Session` is not safe to share and
 does not belong here.
 
+"Safe for concurrent use" means two different things depending on how it is called. Coroutines on one
+loop interleave only at `await`, so a plain object used from `async def` code without awaits in the
+middle of a mutation is effectively single-threaded. The same object used from `def` endpoints or
+`run_in_threadpool` is touched by real threads at the same time. Some objects that are fine in the
+first case are not in the second: Hugging Face fast tokenizers, for example, have been reported to
+raise "Already borrowed" when one instance is called from several threads at once. Check which kind
+of concurrency each shared object will actually see.
+
 ### Request scope: once per request, torn down with it
 A dependency with `yield` builds the object, hands it to the handler and cleans up afterwards. This is
 the home for a DB session and its transaction (commit on success, roll back on exception), the
@@ -71,6 +80,23 @@ authenticated principal, the tenant's resolved configuration, a per-request toke
 span, the request ID. FastAPI's per-request dependency cache guarantees that one request sees one
 instance even when several dependencies ask for it, which is how a handler and its auth dependency
 share a single transaction.
+
+### Request scope is not the same as unit of work
+In a CRUD service a request lasts milliseconds, so "one session per request" and "one transaction per
+unit of work" coincide. In an AI service the request includes a 5–30 s model call, and a session that
+has run a query holds a pooled connection until its transaction ends. Hold it across the provider call
+and pool size, not the provider, sets your concurrency. With SQLAlchemy's defaults (`pool_size=5`,
+`max_overflow=10`) a worker has 15 connections; at 15 s per call that is 1 request/s per worker, and
+request 16 waits up to `pool_timeout` (30 s by default) before failing. Keep the session request-scoped
+but the transactions short: read, commit (returning the connection), call the model, then write in a
+second short transaction.
+
+### Scopes in between
+Some objects are neither global nor per request: a client per tenant (different API key or region),
+a per-model tokenizer, a compiled prompt template. Treat them as application scope keyed by tenant or
+model: a bounded dict built in lifespan or lazily behind an `asyncio.Lock`, so two first requests do not
+build the same client twice. Conversation memory spans many requests and many workers, so it is not
+in-process at all; it belongs in Redis or the database.
 
 ### The hand-off between scopes
 Request-scoped objects are typically *derived from* application-scoped ones: the session comes from the
@@ -93,8 +119,10 @@ is exactly the isolation a module global cannot give.
 
 ## Example
 Lifespan creates the application-scoped objects; dependencies derive request-scoped ones; the handler
-mixes them without ever creating a client or sharing a session. `Document` and `Summary` are ORM
-classes defined elsewhere.
+mixes them without ever creating a client or sharing a session, and commits before the model call so
+its pooled connection is not held for the 10–30 s the provider takes. `expire_on_commit=False` is what
+lets `doc.text` still be read after that commit. `Document` and `Summary` are ORM classes defined
+elsewhere.
 
 ```python
 from contextlib import asynccontextmanager
@@ -114,10 +142,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-async def db(request: Request):              # request scope: one session, one transaction
+async def db(request: Request):              # request scope: one session per request
     async with request.app.state.sessions() as session:
-        async with session.begin():           # commits on success, rolls back on exception
-            yield session
+        yield session                         # closing it rolls back anything uncommitted
 
 def principal(x_api_key: Annotated[str, Header()]) -> str:
     return x_api_key.split("-")[0]           # request scope: derived from this request's headers
@@ -127,9 +154,11 @@ async def summarise(doc_id: int, request: Request,
                     session: Annotated[AsyncSession, Depends(db)],
                     who: Annotated[str, Depends(principal)]):
     http = request.app.state.http             # borrow the shared client; never httpx.AsyncClient() here
-    doc = await session.get(Document, doc_id)
+    doc = await session.get(Document, doc_id)  # checks out a pooled connection
+    await session.commit()                     # short read transaction: connection back to the pool
     r = await http.post("/v1/complete", json={"text": doc.text}, headers={"x-tenant": who})
     session.add(Summary(doc_id=doc_id, text=r.json()["text"], by=who))
+    await session.commit()                     # second short transaction for the write
     return {"ok": True}
 ```
 
@@ -141,6 +170,9 @@ async def summarise(doc_id: int, request: Request,
   lifespan and keep only a cheap handle per request.
 - Sharing a concurrency-safe client gives connection reuse and pool limits in one place, but one bad
   setting (a tiny pool, a global timeout) now affects every endpoint at once.
+- Splitting a request into short transactions around the model call frees pool connections, but the
+  read and the write are no longer atomic; when the write must match what was read (a document edited
+  meanwhile), add a version check on the write rather than holding the transaction open.
 - `contextvars` remove the need to thread request context through signatures, but values set inside a
   thread-pool call or a separate task do not flow back, so the mechanism is only as predictable as the
   task structure around it.
@@ -152,6 +184,9 @@ async def summarise(doc_id: int, request: Request,
   memory growing with concurrency, and OOM kills once several workers run.
 - Storing the current user or request-specific data on `app.state` or a module global; symptom:
   intermittent wrong-user responses that reproduce only under concurrent load.
+- Holding a DB transaction open across the model call; symptom: the database is idle and the provider
+  is under quota, yet requests queue and fail with SQLAlchemy `QueuePool limit ... reached` /
+  `TimeoutError` once concurrency passes the pool size.
 - Sharing one DB session across requests; symptom: "session already in a transaction" errors and
   commits that contain other requests' changes.
 - Expecting an in-process cache or counter on `app.state` to be global; symptom: rate limits enforced

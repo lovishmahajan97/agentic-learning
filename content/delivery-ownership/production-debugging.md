@@ -5,6 +5,7 @@ name: Production debugging
 kind: practice
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - delivery-ownership/failure-analysis
   - delivery-ownership/incident-severity-and-escalation
@@ -84,7 +85,25 @@ Bisecting is logarithmic in the number of stages, which is why it beats reading 
 Replay the reconstructed input N times at the logged parameters to measure the failure rate, then change
 exactly one factor (current index instead of historical, new prompt version, other model) and measure
 again. Repeating matters because a single stochastic sample proves nothing; changing one factor at a time
-matters because changing two leaves you unable to say which one fixed it.
+matters because changing two leaves you unable to say which one fixed it. Do not assume temperature 0
+makes a hosted model deterministic: batching and floating-point effects on the provider side can still
+vary outputs, and seed parameters, where offered, are typically best-effort. So even a "deterministic"
+replay deserves a handful of repeats before you trust it.
+
+Stub side-effecting tools during replay. Feed the model the recorded tool results instead of calling the
+live tools, *because* a replay that re-executes `issue_refund` is a second incident, and because live
+tools return today's data, which silently changes the input you were trying to hold fixed.
+
+### When the failure is latency, cost or errors rather than a wrong answer
+The same scope-trace-bisect loop applies, but the evidence is the span waterfall rather than the content.
+Find the critical path in a slow trace: is the time in queueing before the model call, in the provider's
+time to first token, in a long generation (output length often dominates end-to-end latency,
+because each output token is a separate decode step), in retries, or in a tool? Compare p50 against p99, because a
+healthy median with a terrible tail usually means a minority of requests are doing something different
+(retry storms, oversized contexts, one slow tool, agent loops that ran many more steps), and the fix is
+to find what distinguishes them, not to speed up the average request. Cost spikes yield to the same
+slicing: tokens per request by tenant, route and prompt version usually reveal one path whose context or
+step count grew.
 
 ### 7. Correlate with change
 Most production regressions follow a change: a deploy, prompt edit, config or flag flip, index rebuild,
@@ -129,7 +148,10 @@ print(f"at temperature 0: {replay(trace, params={**trace['params'], 'temperature
 ```
 
 If the baseline reproduces at, say, 40% and swapping in today's chunk drops it to 0% while temperature
-0 still fails, the defect is stale retrieval, not sampling, and the fix belongs in index freshness.
+0 still fails, the defect is stale retrieval, not sampling, and the fix belongs in index freshness. Keep
+the sample size honest: 0 failures in 20 replays only bounds the true rate below roughly 3/20 ≈ 15% at 95%
+confidence (the "rule of three"), so a failure that was rare to begin with needs a few hundred replays
+before "0%" means fixed.
 
 ## Trade-offs
 - Logging full rendered prompts and tool results makes reconstruction possible, but costs storage and
@@ -152,6 +174,8 @@ If the baseline reproduces at, say, 40% and swapping in today's chunk drops it t
   why, so it returns on the next unrelated change.
 - Debugging before mitigating; the symptom is an hour of elegant diagnosis while the incident's impact
   keeps growing.
+- Replaying with live tools instead of recorded results; the symptom is duplicate side effects (a second
+  email or refund) or replays whose tool outputs differ from the trace, so the "reproduction" is not one.
 
 ## When to use
 Use this practice whenever a live system produces wrong, slow or failed results and the cause is not
@@ -190,7 +214,7 @@ then swap only the retrieved context to confirm the cause, and add the case to t
 > With temperature above zero a failure may occur in only a fraction of samples; measuring the failure
 > rate across many replays, before and after a change, is the only way to show the change mattered.
 
-### Q: An answer was wrong, and the trace shows the correct document was retrieved but placed after a truncation limit. Where is the defect?
+### Q: An answer was wrong. The trace shows the correct document was the top retrieval result, but the prompt assembler's token budget cut it before the model call. Where is the defect?
 - [ ] In the embedding model, which ranked the document too low
 - [ ] In the generation step, which should have inferred the missing content
 - [x] In prompt assembly, which dropped retrieved content before it reached the model

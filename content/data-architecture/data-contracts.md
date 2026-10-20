@@ -5,6 +5,7 @@ name: Data contracts
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - data-architecture/ingestion-pipelines
   - data-architecture/data-lineage
@@ -80,11 +81,17 @@ narrowing a type, changing a unit), and breaking changes require a new major ver
 window during which both versions are produced.
 
 ### Compatibility rules
-*Backward* compatible means new data is readable with the old schema: you may add optional fields with
-defaults and may not remove or rename. *Forward* compatible means old data is readable with the new
-schema. For AI consumers, backward compatibility is the one that matters most, *because* a chunker or
-feature pipeline deployed last month must keep working on today's data; the opposite direction matters
-for reprocessing history under a new schema.
+The two directions are easy to swap, so use the schema-registry definitions. *Backward* compatible means
+a consumer using the new schema can read data written with the old one; it lets you upgrade consumers
+first, and permits deleting fields and adding fields that have defaults. *Forward* compatible means data
+written with the new schema can be read by consumers still on the old one; it lets producers upgrade
+first, and permits adding fields and deleting only fields that had defaults. *Full* compatibility is
+both. Renaming a field breaks both directions. For AI consumers fed by an independent producer, forward
+compatibility is the one that matters most day to day, *because* the producer ships first and a chunker or
+feature pipeline deployed last month must keep working on today's data; backward compatibility matters
+when you deploy a new consumer and reprocess history written under older schemas. Write the direction
+into the contract explicitly, since teams outside the streaming world often use the words the other way
+round.
 
 ### Contracts specific to AI pipelines
 The datasets that feed AI have fields the rest of the company does not think about, and the contract is
@@ -127,13 +134,13 @@ class Ticket(BaseModel):
     contains_pii: bool                                                  # decides redaction before embedding
 
     @model_validator(mode="after")
-    def semantics(self):
+    def semantics(self):                    # tz check first: naive-vs-aware compare raises TypeError
+        if any(t is not None and t.tzinfo is None for t in (self.opened_at, self.closed_at)):
+            raise ValueError("timestamps must be timezone-aware (UTC)")
         if self.closed_at and self.closed_at < self.opened_at:
             raise ValueError("closed_at before opened_at")
         if self.closed_at and not self.resolution:
             raise ValueError("closed ticket must carry a resolution")
-        if self.opened_at.tzinfo is None:
-            raise ValueError("opened_at must be timezone-aware (UTC)")
         return self
 
 def publish(raw_records: list[dict]):
@@ -207,8 +214,8 @@ compatibility checks in CI and versioned records, not with "we validate inputs".
 **Q:** A customer's CRM team wants to change the `region` field from free text to a code list and add a
 `segment` field next month. Your RAG metadata filters and a fine-tuned router depend on `region`. How do you
 handle the change?
-**A:** Classify the two changes. Adding `segment` as an optional field is backward compatible and can ship
-under the current contract version once documented. Changing `region` from free text to codes is a
+**A:** Classify the two changes. Adding `segment` as an optional field with a default is compatible in both
+directions and can ship under the current contract version once documented. Changing `region` from free text to codes is a
 breaking semantic change even though the type stays string: existing filters compare against the old
 values and the router was trained on them. So it requires a new major contract version. Agree a migration
 window in which the producer emits both `region` (old values) and `region_code` (new), with the version

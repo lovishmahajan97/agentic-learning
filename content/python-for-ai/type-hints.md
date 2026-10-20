@@ -5,7 +5,7 @@ name: Type hints
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/mypy
   - python-for-ai/protocols-generics-structural-typing
@@ -98,6 +98,27 @@ The important vocabulary:
 - `cast(T, value)` tells the checker "trust me" with no runtime effect; `reveal_type(x)` prints what
   the checker thinks `x` is, which is the fastest way to debug an inference surprise.
 
+### Narrowing: how the checker learns more inside a branch
+A declared type is an upper bound; inside control flow the checker tracks something tighter. After
+`if msg.content is not None:`, `msg.content` is `str` in that block, *because* the checker models
+the test as evidence. The same happens for `isinstance(x, ToolCall)`, `if not x: return`,
+`assert x is not None`, and a `match` case. Narrowing is what makes `X | None` usable rather than a
+nuisance: you pay one explicit check at the point of use and the rest of the block is precise. When
+the test lives in a helper (`def is_tool_turn(m) -> bool`), the checker cannot see inside it and
+narrows nothing; annotate it `-> TypeIs[ToolTurn]` (3.13, or `typing_extensions`) or the older
+`-> TypeGuard[ToolTurn]` so a call to the helper narrows like an `isinstance`. Narrowing ends when
+the name is reassigned, and checkers are conservative about carrying it into a nested function or
+lambda that runs later, which is why you sometimes copy `msg.content` into a local first.
+
+### Where types come from for libraries you did not write
+A checker only knows a third-party package's types if the package ships them inline and says so
+with a `py.typed` marker file (PEP 561), or if a separate stub package exists (`types-requests`,
+`types-PyYAML`) containing `.pyi` signature-only files. Otherwise every import from it is `Any`,
+silently. mypy reports "missing library stubs or py.typed marker" for exactly this case; silencing
+it with `ignore_missing_imports` makes the error go away and keeps the hole. The major LLM SDKs ship
+inline types; many older data and ML packages are partially typed or not at all, so the boundary
+with them is where to put your own typed wrapper.
+
 ### Why runtime libraries read them
 Pydantic, dataclasses and `attrs` introspect annotations at class creation, FastAPI does it when a
 route is registered, and libraries such as `instructor` reuse Pydantic's models. A `BaseModel` with `temperature: float = 0.7` becomes a
@@ -150,14 +171,21 @@ print(cfg.temperature, type(cfg.temperature))            # 0.2 <class 'float'>
 
 Run `mypy` on this file and delete the `if text is None` branch: the checker reports that
 `str | None` has no attribute `strip`. That is the whole value proposition, delivered before the
-first API call. Note the division of labour on the last lines: writing
+first API call. Now do the opposite experiment: keep the branch deleted but also delete
+`first_text`'s return annotation. mypy goes silent, because an unannotated function is not
+checked and returns `Any`, and `Any.strip()` is accepted. Same bug, same file, no error: that is
+the `Any` hole from the previous section made concrete, and why the annotation on the function
+that touches raw JSON matters more than any other in the file. Note the division of labour on the last lines: writing
 `GenConfig(model="x", temperature="0.2")` directly would run fine (Pydantic coerces it) but a
-checker that understands Pydantic's `__init__` flags the `str` argument, which is why untyped input
+checker that understands Pydantic's `__init__` through `dataclass_transform` flags the `str`
+argument (Pydantic's mypy plugin, if enabled, deliberately types `__init__` parameters as `Any`
+unless you set `init_typed = True`), which is why untyped input
 goes through `model_validate` at the boundary instead.
 
 ## Trade-offs
 - You gain compile-time detection of shape bugs across the call graph, but you pay the annotation
-  effort up front; the payoff flips negative only for throwaway notebooks under a few hundred lines.
+  effort up front; the payoff flips negative for throwaway notebooks and one-off scripts whose
+  whole life is a single run, where the runtime error *is* the cheapest check.
 - Gradual typing lets you adopt incrementally, but every `Any` leak silently disables checking
   downstream, so a codebase that is "typed" at 60% often catches far fewer bugs than it looks.
 - Annotations double as runtime schemas for Pydantic and FastAPI, saving duplicated validation code,
@@ -178,6 +206,9 @@ goes through `model_validate` at the boundary instead.
 - Forward-reference `NameError` at import time (Python 3.13 and earlier) when one class annotates a
   field with another class defined below it; fix by quoting the name or using `from __future__ import annotations`, and know
   that some runtime libraries then need `get_type_hints` to resolve the strings.
+- Writing an `is_valid(x) -> bool` helper and expecting the checker to narrow after
+  `if is_valid(x):`; the symptom is the same "may be None" error right after the check. Annotate
+  the helper with `TypeIs`/`TypeGuard` or inline the test.
 - Using `Optional[X]` without a default and expecting it to mean "optional argument"; `Optional`
   only means "may be None", and the checker will still require the argument be passed.
 
