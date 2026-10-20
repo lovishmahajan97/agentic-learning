@@ -5,6 +5,7 @@ name: Post-training
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - training-adaptation/pre-training
   - training-adaptation/supervised-fine-tuning
@@ -62,8 +63,8 @@ Raters see two or more responses to the same prompt and rank them. This data is 
 than demonstrations and captures judgements people find easy to make but hard to write down. Two
 families consume it. RLHF trains a reward model on the comparisons and then optimises the policy
 against it with PPO, with a KL penalty that stops the policy drifting too far from the SFT model. DPO
-skips the reward model and optimises the policy directly on the pairs with a loss that is
-mathematically equivalent under the same KL constraint. The choice is an engineering one: RLHF is
+skips the reward model and optimises the policy directly on the pairs with a classification-style
+loss derived from the same KL-constrained objective. The choice is an engineering one: RLHF is
 on-policy and can keep improving as the policy changes; DPO is simpler, cheaper and offline. Both
 raise the quality of answers the SFT model already produces and are where refusal behaviour and tone
 are mostly shaped.
@@ -73,11 +74,12 @@ For tasks with a checkable answer, such as maths with a known result, code with 
 that must parse as JSON, the reward can be computed by a program rather than learned from humans.
 The model samples many attempts per prompt, is rewarded for the correct ones, and is pushed toward
 whatever reasoning got it there. GRPO is the common algorithm because it needs no value model. This is
-the stage that produces long chain-of-thought reasoning behaviour in recent models, and it is the one
-whose compute cost is closest to pre-training, because it generates far more tokens than it trains on.
+the stage that produces long chain-of-thought reasoning behaviour in recent models, and it is the most
+expensive post-training stage, because generating many long samples per prompt dominates the cost,
+though it remains orders of magnitude below pre-training.
 
 ### The recurring design constraints
-- **A reference model and a KL leash.** Every stage after SFT penalises distance from the previous
+- **A reference model and a KL leash.** Nearly every stage after SFT penalises distance from the previous
   checkpoint, because an unconstrained optimiser finds degenerate outputs that score well on the reward
   and badly with users. The strength of that leash is the central hyperparameter.
 - **Iteration.** Production recipes run several rounds: train, sample from the new model, collect new
@@ -107,7 +109,8 @@ product. All sizes are illustrative.
    wall of text where the policy is a short, specific procedure.
 2. **Preference optimisation.** For 2,000 held-out tickets they sample four responses each from the SFT
    model and have agents rank them, with a rubric that penalises invented features and rewards
-   concision. DPO on the resulting 6,000 pairs cuts hallucinated feature names by more than half in
+   concision. DPO on the resulting pairs (the top-ranked response against each of the other three, 6,000 in all)
+   cuts hallucinated feature names by more than half in
    the held-out set and shortens answers. A capability benchmark run before and after confirms the
    model's general question-answering has not regressed.
 3. **Verifiable rewards.** Some answers must emit a JSON block that opens a ticket in the help-desk

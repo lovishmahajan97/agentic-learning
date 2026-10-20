@@ -5,6 +5,7 @@ name: Reasoning models / test-time compute
 kind: concept
 difficulty: core
 est_minutes: 18
+status: fact-checked
 related:
   - prompting/chain-of-thought
   - model-internals/sampling-strategies

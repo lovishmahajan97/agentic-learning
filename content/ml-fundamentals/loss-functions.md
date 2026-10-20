@@ -5,6 +5,7 @@ name: Loss functions (cross-entropy, contrastive)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/regression
@@ -140,7 +141,7 @@ def info_nce(a, b, tau=0.07):
 N, d = 256, 64
 q = torch.randn(N, d); pos = q + 0.3 * torch.randn(N, d)   # positives: noisy copies of the anchors
 print(round(info_nce(q, pos).item(), 3))                   # near 0: each anchor finds its own positive
-print(round(info_nce(q, torch.randn(N, d)).item(), 3))     # >= log(256) ≈ 5.5: unrelated, chance level
+print(round(info_nce(q, torch.randn(N, d)).item(), 3))     # ~7 here, above log(256) ≈ 5.5: no better than chance
 ```
 
 ## Trade-offs

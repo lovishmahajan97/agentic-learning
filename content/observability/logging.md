@@ -5,6 +5,7 @@ name: Logging
 kind: practice
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - observability/tracing
   - observability/monitoring
@@ -225,7 +226,7 @@ exempt from sampling or the numerator is unknown.
 > The join between logs and traces fails the first time one call site forgets the id. Injecting the
 > fields from a context variable guarantees every record in the request carries them.
 
-### Q: Your JSON parser fails on about 1% of model outputs. Which log design lets you diagnose it later?
+### Q: Your JSON parser fails on about 1% of model outputs. Which log design lets you diagnose it later without paying for full-payload logging on every call?
 - [ ] Log the parsed object at INFO on success and nothing on failure
 - [ ] Log the exception message only, to keep volume down
 - [x] Log a WARNING with the raw completion, prompt version and model on every parse failure

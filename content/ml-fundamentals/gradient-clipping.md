@@ -5,6 +5,7 @@ name: Gradient clipping
 kind: practice
 difficulty: core
 est_minutes: 11
+status: fact-checked
 related:
   - ml-fundamentals/backpropagation
   - ml-fundamentals/optimizers
@@ -89,8 +90,10 @@ gradient is a sum, and clipping the pieces changes both its magnitude and its di
 Under data parallelism the gradient is all-reduced before the step, so clipping the local gradient after
 the reduction is equivalent to clipping the global one. Under sharded training (FSDP, ZeRO) each rank
 holds only part of the gradient, so the norm must be computed as a sum of squares across ranks followed by
-a collective; sharding frameworks expose their own clipping function for this reason, and calling the
-plain PyTorch utility on sharded parameters silently computes the wrong norm.
+a collective. Frameworks handle this in one of two ways: either they expose their own clipping entry point
+(FSDP1's `model.clip_grad_norm_`, DeepSpeed's `gradient_clipping` config) or, as FSDP2 does by storing
+gradients as DTensors, they make the standard utility reduce across ranks. Calling the plain utility on
+the local shards of a framework that does neither silently computes a per-rank norm.
 
 ### The norm as a health signal
 The pre-clip gradient norm is one of the most informative training curves. It should be large in the
@@ -147,8 +150,8 @@ With bf16 there is no scaler; drop the `scaler` calls and call `clip_grad_norm_`
   the first real gradient spike still corrupts the run.
 - Clipping each micro-batch in a gradient-accumulation loop, which changes the direction of the summed
   gradient and makes the effective threshold depend on the accumulation count.
-- Calling the plain PyTorch utility on FSDP-sharded parameters; the norm is computed over the local shard
-  only, so clipping behaves differently on every rank.
+- Calling the plain PyTorch utility on parameters sharded by FSDP1 instead of its `clip_grad_norm_` method;
+  the norm is computed over the local shard only, so clipping behaves differently on every rank.
 - Using clipping to paper over divergence caused by a too-high learning rate or missing warmup; the clip
   fires on nearly every step, which is the signal that the root cause is still there.
 - Not logging the pre-clip norm, which throws away the single best early-warning signal for bad data,

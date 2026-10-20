@@ -5,6 +5,7 @@ name: OpenTelemetry
 kind: tool
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - observability/tracing
   - observability/spans
@@ -49,7 +50,8 @@ A **trace** is a tree of **spans** that share a 128-bit `trace_id`. Each span ha
 parent span id, a name, a kind (`SERVER`, `CLIENT`, `INTERNAL`, `PRODUCER`, `CONSUMER`), start and end
 timestamps, key–value **attributes**, timestamped **events** (an exception is an event), links to other
 spans and a status (`UNSET`, `OK`, `ERROR`). **Resource** attributes describe the emitter
-(`service.name`, `service.version`, `deployment.environment`) and ride along with every span. **Metrics**
+(`service.name`, `service.version`, `deployment.environment.name`; the older `deployment.environment`
+is deprecated) and ride along with every span. **Metrics**
 are counters, up/down counters, gauges and histograms (explicit or exponential buckets) with attributes.
 **Logs** are records that carry `trace_id` and `span_id` so a log line can be joined to the span that
 produced it.
@@ -92,14 +94,17 @@ layout: an agent per host or pod plus a central gateway tier.
 
 ### Semantic conventions and generative AI
 Attribute names are standardised so dashboards work across services: `http.request.method`,
-`db.system`, `server.address`. The **GenAI semantic conventions** add `gen_ai.system`,
-`gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`,
-`gen_ai.usage.output_tokens` and operation names such as `chat`, with prompt and completion content as
-opt-in events because content is sensitive and large. At the time of writing these conventions are still
-marked experimental and names have already changed once (token-count attributes were renamed), so pin your
-instrumentation library versions. Instrumentation packages (OpenLLMetry, Arize's OpenInference
-instrumentors, provider-specific instrumentations) emit such spans automatically for OpenAI, Anthropic,
-Bedrock, LangChain and others.
+`db.system`, `server.address`. The **GenAI semantic conventions** add `gen_ai.provider.name`
+(formerly `gen_ai.system`), `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`,
+`gen_ai.usage.output_tokens` and `gen_ai.operation.name` with values such as `chat`, and recommend the span
+name `{operation} {model}`. Prompt and completion content is opt-in (off by default) because it is
+sensitive and large. At the time of writing these conventions are still marked experimental and names have
+already changed more than once (the token-count attributes were renamed from `prompt`/`completion` to
+`input`/`output`, then `gen_ai.system` became `gen_ai.provider.name`), so pin your instrumentation library
+versions. Instrumentation packages emit such spans automatically for OpenAI, Anthropic, Bedrock, LangChain
+and others: OpenLLMetry and the provider-specific `opentelemetry-instrumentation-*` packages follow the
+GenAI conventions, while Arize's OpenInference instrumentors emit plain OTel spans with their own,
+LLM-specific attribute vocabulary (`openinference.span.kind`, `llm.token_count.*`).
 
 ### Auto-instrumentation
 `opentelemetry-instrument python app.py` (Python) patches supported libraries at start-up; per-library
@@ -122,7 +127,7 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExport
 from opentelemetry.trace import SpanKind, Status, StatusCode
 
 provider = TracerProvider(
-    resource=Resource.create({"service.name": "support-bot", "deployment.environment": "prod"}),
+    resource=Resource.create({"service.name": "support-bot", "deployment.environment.name": "prod"}),
     sampler=ParentBased(TraceIdRatioBased(0.25)),   # keep 1 trace in 4; children follow the root decision
 )
 provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint="otel-collector:4317", insecure=True)))
@@ -136,7 +141,8 @@ def answer(question: str) -> str:
             docs = retrieve(question)
             s.set_attribute("retrieval.document_count", len(docs))
         with tracer.start_as_current_span("chat gpt-4o-mini", kind=SpanKind.CLIENT) as s:
-            s.set_attributes({"gen_ai.system": "openai", "gen_ai.request.model": "gpt-4o-mini"})
+            s.set_attributes({"gen_ai.provider.name": "openai", "gen_ai.operation.name": "chat",
+                              "gen_ai.request.model": "gpt-4o-mini"})
             try:
                 resp = llm.chat.completions.create(model="gpt-4o-mini", messages=build(question, docs))
             except Exception as e:

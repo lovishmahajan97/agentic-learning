@@ -5,6 +5,7 @@ name: Inference optimization
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/continuous-batching
@@ -34,8 +35,9 @@ roughly a few hundred floating-point operations per byte loaded to keep its arit
 transformer matmul applied to a batch of *B* tokens performs about 2·B FLOPs per weight element while
 reading that element once, so its arithmetic intensity is about *B* FLOPs per byte. A single-request
 decode step has *B* = 1. The GPU spends essentially all of its time streaming weights and cache through
-memory and almost none computing. That is a utilization in the low single digits of percent, and it is
-the default state of a naive LLM server.
+memory and almost none computing. That is a tensor-core utilization well under one percent (an 8B model
+at batch 1 does ~16 GFLOPs in a ~5 ms step, a few TFLOP/s against a peak near a thousand), and it is the
+default state of a naive LLM server.
 
 The naive response, "buy a bigger GPU", fails because a GPU with more FLOPs and similar bandwidth makes
 decode no faster. The second naive response, "run more requests at once", is actually correct, but it
@@ -134,6 +136,8 @@ ms4, _ = decode_step_ms(8, 1, 2048, KV8B, weight_bytes=0.5)   # 4-bit weights, f
 print(f"4-bit batch=1: {ms4:.2f} ms/step  -> weight bytes were the floor, so ~3-4x faster")
 # Illustrative output shape: ~5.4 ms at batch 1 (~180 tok/s); by batch 256 the step is
 # ~5x longer while aggregate tok/s is ~50x higher, and the growth is all KV-cache traffic.
+# Note the roofline is not a capacity check: 256 x 2048 tokens of cache is 64 GiB, which would
+# not fit beside 16 GB of weights on an 80 GB card; the memory-estimation lesson covers that.
 ```
 
 Read it as: at batch 1 the step time is almost entirely weight traffic, so quantizing weights is the lever;

@@ -5,6 +5,7 @@ name: Calibration
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - ml-fundamentals/roc-auc
   - ml-fundamentals/class-imbalance
@@ -181,7 +182,7 @@ logits_test, y_test = make(5_000)        # reporting split: never used to fit T
 T = fit_temperature(logits_cal, y_cal)
 print(f"T={T:.2f}  ECE {ece(F.softmax(logits_test, 1), y_test):.3f} -> "
       f"{ece(F.softmax(logits_test / T, 1), y_test):.3f}  (T > 1 means the model was overconfident)")
-# On this data T comes out close to 2 and ECE falls from roughly 0.16 to roughly 0.02; accuracy is identical
+# On this data T comes out close to 2 (about 1.94) and ECE falls from roughly 0.16 to below 0.02; accuracy is identical
 ```
 
 ## Trade-offs

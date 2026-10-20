@@ -5,6 +5,7 @@ name: Normalization (LayerNorm, RMSNorm)
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - ml-fundamentals/residual-connections
   - ml-fundamentals/warmup
@@ -107,8 +108,9 @@ x ← x + Attention(LN(x));   x ← x + MLP(LN(x));   logits = W_out · LN_final
 
 The difference is the gradient path. In Post-LN the residual stream itself passes through a norm at
 every layer, so the gradient reaching early layers is scaled by a product of per-layer factors; the 2020
-analysis showed that at initialization the expected gradient norm near the output grows with depth,
-which is why Post-LN needs a long warmup and a small learning rate to survive the first steps. In Pre-LN
+analysis showed that at initialization the expected gradient norm at the layers nearest the output is
+large and independent of depth (while Pre-LN's scales down roughly as `1/√L`), and that it decays toward
+the input, which is why Post-LN needs a long warmup and a small learning rate to survive the first steps. In Pre-LN
 the skip path is a pure identity from the embeddings to the final norm, so gradients at initialization
 are roughly uniform across layers, warmup can be short, and deep models train without heroics. The price
 is that the residual stream's norm grows with depth, since every layer adds to it and nothing rescales
@@ -228,8 +230,8 @@ mechanism, what you would change, and what you give up.
 **A:** In Post-LN the residual stream passes through a LayerNorm at every layer, so the gradient reaching
 layer k is the loss gradient multiplied by a chain of per-layer Jacobians of norms and sublayers. At
 initialization that chain is badly balanced: layers nearest the output receive gradients whose expected
-norm grows with depth, so a full-size update there is far too large while early layers see small
-gradients. The long warmup and the low peak rate are compensating for that imbalance, not fixing it.
+norm is large and does not shrink as layers are added, so a full-size update there is far too large while
+early layers see small gradients. The long warmup and the low peak rate are compensating for that imbalance, not fixing it.
 Moving the norm to the sublayer input (Pre-LN) makes the skip path an identity from the embeddings to the
 final norm, so gradients at initialization are similar in size at every depth; warmup can drop to a few
 hundred steps and the peak rate can rise. What you give up is a normalized residual stream: its norm now
@@ -259,8 +261,8 @@ better final loss when it can be trained, but at 48 layers trainability dominate
 ### Q: Why does a Pre-LN transformer tolerate a much shorter warmup than a Post-LN one?
 - [ ] Pre-LN has fewer normalization layers, so fewer parameters need to settle
 - [ ] Pre-LN normalizes the gradients directly during backpropagation
-- [x] In Pre-LN the residual path is an identity from the embeddings to the final norm, so gradients at initialization are similar in size across layers instead of growing toward the output
+- [x] In Pre-LN the residual path is an identity from the embeddings to the final norm, so gradients at initialization are similar in size across layers instead of being large near the output and small near the input
 - [ ] Pre-LN uses RMSNorm, which has no bias to warm up
-> Post-LN puts a norm on the residual stream at every layer, which at initialization makes gradients near
-> the output grow with depth; warmup compensates for that. Pre-LN leaves the skip path untouched, so the
+> Post-LN puts a norm on the residual stream at every layer, which at initialization leaves gradients near
+> the output large and those near the input small; warmup compensates for that. Pre-LN leaves the skip path untouched, so the
 > imbalance never arises. RMSNorm versus LayerNorm is independent of placement.

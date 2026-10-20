@@ -5,6 +5,7 @@ name: Softmax
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - model-internals/logits
   - model-internals/attention-mechanism
@@ -135,8 +136,9 @@ all three cases; only the confidence changed.
 ## Pitfalls
 - Exponentiating in half precision or without subtracting the max; the symptom is NaN or inf
   probabilities on long or confident rows, often only on some batches.
-- Applying a mask by multiplying probabilities by zero *after* softmax instead of adding `−∞` before; the
-  symptom is rows that no longer sum to one and attention leaking to masked positions.
+- Masking after the softmax (multiplying probabilities by zero) instead of adding `−∞` before it; the
+  symptom is rows that no longer sum to one. The sibling bug, masking with a large finite negative such
+  as −1e4 that underflows to nothing in fp16, shows up as attention leaking to masked positions.
 - Treating "99% probability" as 99% correctness; softmax outputs are scores shaped by training, and
   calibration must be measured rather than assumed.
 - Evicting the first tokens of a long context to save KV memory; attention weights that used to land on
@@ -193,7 +195,7 @@ scale was introduced to prevent.
 
 ### Q: Why do attention sinks arise in trained transformers?
 - [ ] Because the first token has a special embedding
-- [ ] Because of the causal mask
+- [ ] Because rotary position encoding gives position zero a distinctive rotation
 - [x] Because attention weights must sum to one even when no position is relevant, so the model learns to dump excess mass onto a convenient token
 - [ ] Because of weight decay
 > The normalization constraint forces every query to allocate its full weight somewhere. Early tokens

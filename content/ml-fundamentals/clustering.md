@@ -5,6 +5,7 @@ name: Clustering
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - ml-fundamentals/supervised-vs-unsupervised-vs-self-supervised-learning
   - ml-fundamentals/classification
@@ -64,7 +65,7 @@ Objective: minimise the within-cluster sum of squared distances, Σ ||x − μ_c
 alternates two steps: assign every point to its nearest centroid, then move every centroid to the mean of
 its points. Each step can only lower the objective, so it converges, but to a local minimum that depends
 on the starting centroids. k-means++ initialisation picks each new seed with probability proportional to
-its squared distance from the seeds chosen so far, spreading them out, and running several
+its squared distance from the nearest seed chosen so far, spreading them out, and running several
 initialisations and keeping the best is standard. Cost is O(n·k·d) per iteration, so it scales to
 millions of points, and mini-batch variants scale further. The assumptions are the price: clusters are
 roughly spherical, similar in size, and you choose k. Choosing k is by the elbow of the objective curve,

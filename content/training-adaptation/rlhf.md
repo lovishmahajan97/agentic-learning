@@ -5,6 +5,7 @@ name: RLHF
 kind: concept
 difficulty: advanced
 est_minutes: 18
+status: fact-checked
 related:
   - training-adaptation/dpo
   - training-adaptation/grpo
@@ -45,8 +46,9 @@ policy against it, and keep collecting comparisons on the new policy's behaviour
 then InstructGPT applied it to language, and the result was the jump from "completes text" to "helps".
 
 The naive alternative of optimising directly against human ratings is hopeless at RL's data appetite:
-PPO needs millions of scored samples. The reward model is the amortisation trick: tens of thousands of
-human comparisons train a model that can score millions of samples for free. The price is that the
+PPO scores every sampled response, which over a run is hundreds of thousands of samples or more,
+far beyond what raters could label. The reward model is the amortisation trick: tens of thousands of
+human comparisons train a model that can score every sample for free. The price is that the
 reward model is wrong in places, and the policy will find those places.
 
 ## How it works
@@ -57,8 +59,8 @@ guidelines, calibration sessions and agreement measurement are a large part of t
 reward model trained on inconsistent labels learns noise.
 
 ### Step 2: train the reward model
-The reward model r_φ(x, y) is usually the SFT model with its output head replaced by a scalar head, so
-it reads prompt and response and emits one number. It is trained with the Bradley–Terry pairwise
+The reward model r_φ(x, y) is often the SFT model (or a smaller sibling, as in InstructGPT) with its
+output head replaced by a scalar head, so it reads prompt and response and emits one number. It is trained with the Bradley–Terry pairwise
 loss, which says the probability that y_w beats y_l is the sigmoid of their score difference:
 
 ```
@@ -125,23 +127,27 @@ print("RM loss:", rm_loss(s_w, s_l).item())          # 0.341 ; falls as the gap 
 
 # --- PPO reward shaping for one sampled response of T tokens ---
 beta = 0.05
-logp_policy = torch.tensor([-2.1, -0.4, -1.7, -0.9, -3.0])   # log pi_theta(y_t | x, y_<t)
-logp_ref    = torch.tensor([-2.0, -0.6, -1.5, -0.9, -1.2])   # log pi_ref(y_t | x, y_<t)
+logp_policy = torch.tensor([-2.1, -0.4, -1.7, -0.9, -0.3])   # log pi_theta(y_t | x, y_<t)
+logp_ref    = torch.tensor([-2.0, -0.6, -1.5, -0.9, -2.1])   # log pi_ref(y_t | x, y_<t)
 rm_score    = 0.8                                            # r_phi(x, y) for the whole response
 
 per_token_kl = logp_policy - logp_ref                        # positive where policy drifted up
 rewards = -beta * per_token_kl                               # KL penalty at every token ...
 rewards[-1] += rm_score                                      # ... plus the RM score at the end
-print("shaped rewards:", rewards.tolist())
-print("sequence KL estimate:", per_token_kl.sum().item())    # watched as a drift gauge during training
+print("shaped rewards:", rewards.tolist())                   # [0.005, -0.01, 0.01, 0.0, 0.71]
+print("sequence KL estimate:", per_token_kl.sum().item())    # 1.7 ; watched as a drift gauge
 # PPO then computes advantages from these rewards with a value model and applies the clipped
 # surrogate objective to the policy's token log-probs. If the KL estimate climbs while held-out
 # human win-rate stalls, beta is too low: the policy is optimising the reward model's mistakes.
 ```
 
-The last token above carries a large negative KL contribution (the policy put far more mass on it than
-the reference did). That is exactly the pattern of a policy starting to exploit the reward model, and
-why per-token KL, not just the final score, is logged during training.
+The last token above carries a large KL penalty: its log-ratio is +1.8, meaning the policy puts about
+six times (e^1.8) more mass on it than the reference did, so −β·1.8 ≈ −0.09 is subtracted from the
+0.8 reward model score at that position. A few tokens where the policy has drifted far up is exactly
+the pattern of a policy starting to exploit the reward model, and why per-token KL, not just the
+final score, is logged during training. Note that this single-sample log-ratio can be negative on
+individual tokens (tokens 1 and 3 above, where the policy moved down); only its sum or expectation
+over a sequence estimates the KL, which is why the sequence-level number is the one watched.
 
 ## Trade-offs
 - A learned reward model lets you optimise against millions of samples from tens of thousands of
@@ -203,7 +209,7 @@ own score.
 ## Quiz
 ### Q: Why does RLHF train a reward model instead of optimising the policy directly on human ratings?
 - [ ] Human ratings are not differentiable, but a neural reward model is
-- [x] RL needs millions of scored samples; the reward model amortises tens of thousands of human comparisons over all of them
+- [x] RL scores far more sampled responses than raters could label; the reward model amortises tens of thousands of human comparisons over all of them
 - [ ] PPO can only consume scalar rewards from a network of the same size as the policy
 - [ ] Humans cannot compare responses reliably
 > Policy-gradient methods are sample-hungry. A reward model turns a modest number of human comparisons

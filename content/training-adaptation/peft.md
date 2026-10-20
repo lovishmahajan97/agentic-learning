@@ -5,6 +5,7 @@ name: PEFT (LoRA, QLoRA)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/quantization
@@ -80,8 +81,9 @@ matrices (16 × (4,096 + 11,008) ≈ 242k each) brings the total to about 40M tr
 Note what LoRA does *not* save: the frozen base still has to be in memory (≈13.4 GB in bf16 for 7B), and
 backpropagation still flows through every layer to reach the adapters, so compute per step is only
 modestly lower than full fine-tuning (the weight-gradient matmuls for frozen matrices are skipped,
-roughly a third of the backward FLOPs). The win is memory for optimizer state, master weights and weight
-gradients, plus a checkpoint measured in tens of megabytes.
+which is about half of the backward FLOPs, or a third of the forward-plus-backward total). The win is memory for optimizer state, master weights and weight
+gradients, plus a checkpoint measured in tens to a few hundred megabytes (40M adapter parameters are
+about 80 MB in bf16 or 160 MB in fp32, against 13.4 GB for the base).
 
 At export time you either **merge** (W = W₀ + (α/r)BA, a dense matrix of the original shape, zero extra
 latency) or keep adapters separate so a server can hold one base and many adapters, batching requests for
@@ -142,13 +144,13 @@ print(q.lora_A["default"].weight.shape, q.lora_B["default"].weight.shape)   # [1
 print(float(q.lora_B["default"].weight.abs().max()))     # 0.0: training starts at the base model
 
 # ... train with TRL's SFTTrainer or a plain loop; LoRA LRs of 1e-4 to 2e-4 are typical ...
-model.save_pretrained("adapter/")                        # only A and B: tens of MB, not 16 GB
+model.save_pretrained("adapter/")                        # only A and B: ~85 MB bf16 / ~170 MB fp32, not 16 GB
 # To ship without the peft runtime: load the base in bf16, attach the adapter, then
 # merged = model.merge_and_unload(); merged.save_pretrained("merged/")  -> re-evaluate after merging
 ```
 
 ## Trade-offs
-- Memory falls by an order of magnitude and checkpoints by three, but per-step compute barely drops
+- Memory falls by an order of magnitude and checkpoints by about two, but per-step compute barely drops
   because backprop still traverses the frozen base; PEFT makes fine-tuning *fit*, not fast.
 - LoRA learns less and forgets less than full fine-tuning: on narrow tasks that is a feature (base
   capabilities survive), but for large distribution shifts such as a new language or heavy code

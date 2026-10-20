@@ -5,6 +5,7 @@ name: Knowledge distillation
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/synthetic-data-generation
@@ -45,7 +46,7 @@ label, and train the student on all of it.
 
 Why not just compress the teacher with quantization or pruning? Those keep the architecture and shave a
 constant factor. Distillation lets you change the architecture entirely, fewer layers, narrower width, a
-different family, and it combines with both: the standard recipe for a small model today is prune a big
+different family, and it combines with both: a common recipe for a small model today is prune a big
 one, then distil from the original to repair it.
 
 ## How it works
@@ -60,8 +61,9 @@ p_i(T) = exp(z_i / T) / Σ_j exp(z_j / T)
 At *T* = 1 a confident teacher's distribution is almost one-hot, so the information in the small
 probabilities is invisible. Raising *T* flattens the distribution and amplifies the ratios between the
 wrong answers. For teacher logits [6, 2, 1], *T* = 1 gives [0.976, 0.018, 0.007]; *T* = 4 gives
-[0.605, 0.222, 0.173]. Only the second version tells the student that class 2 is three times as plausible
-as class 3 relative to the margin, with enough gradient to learn it.
+[0.605, 0.222, 0.173]. Both encode the same ratio between the wrong answers (p₂/p₃ = e^(1/T), about 2.7
+at *T* = 1 and 1.3 at *T* = 4), but at *T* = 1 those two classes hold 2.5% of the mass and produce almost no
+gradient; at *T* = 4 they hold 40% of it, so the student actually gets to learn the ranking.
 
 The loss mixes two terms:
 
@@ -126,7 +128,8 @@ import torch
 import torch.nn.functional as F
 
 def kd_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5, ignore_index=-100):
-    """student/teacher logits: [batch, seq, vocab]; labels: [batch, seq] (next-token targets)."""
+    """student/teacher logits: [batch, seq, vocab]; labels: [batch, seq], a copy of input_ids with
+    ignore_index at masked positions (HF convention: unshifted, the shift happens below)."""
     s = student_logits[:, :-1].float()          # position t predicts token t+1
     t = teacher_logits[:, :-1].float()
     y = labels[:, 1:]

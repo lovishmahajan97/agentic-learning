@@ -5,6 +5,7 @@ name: Gradient checkpointing
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - training-adaptation/checkpointing
   - training-adaptation/peft
@@ -83,8 +84,11 @@ Not every activation costs the same to store or to recompute. Korthikanti et al.
 attention scores and their softmax/dropout outputs are the entire s² term yet are cheap to recompute, so
 recomputing *only* those gives most of the memory benefit for a fraction of the overhead. FlashAttention
 does exactly this implicitly: it saves the per-row log-sum-exp and rebuilds score tiles in backward. The
-two techniques compose cleanly: FlashAttention deletes the s² term and per-block checkpointing deletes the
-34·s·b·h term.
+two techniques compose: per-block checkpointing cuts *both* terms from "n layers' worth" to "one live
+layer's worth", and FlashAttention then removes the s² term from that one live layer as well. The second
+step matters more than it sounds: the live block's eager-attention score tensors are `5·a·s²·b` bytes,
+about 2.7 GB for one 7B layer at 4k and ~10.7 GB at 8k, so without FlashAttention that single block sets
+a memory floor that no amount of checkpointing lowers.
 
 ### Framework mechanics and the reentrant trap
 PyTorch exposes `torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)`. There are two
@@ -153,8 +157,9 @@ for flag in (False, True):
 - The freed memory usually lets you raise the micro-batch, and a GPU at micro-batch 1 is badly
   under-utilised, so tokens/second often goes *up* overall despite the recompute; this flips once the
   batch already saturates the GPU.
-- Per-block granularity is simple and matches FSDP wrapping, but coarser segments store less and recompute
-  more; the √n split is the theoretical optimum and rarely worth the engineering over per-block.
+- Per-block granularity is simple and matches FSDP wrapping; coarser segments store fewer boundary inputs
+  but hold a larger live segment during recompute (total recompute is one extra forward either way), and
+  the √n split that balances the two is rarely worth the engineering over per-block.
 - Non-reentrant mode handles frozen inputs and nested checkpoints correctly; reentrant mode can have
   slightly lower overhead in some stacks but fails silently in the LoRA case, so the default should be
   non-reentrant.
@@ -164,8 +169,9 @@ for flag in (False, True):
   for resumability, losing a multi-day run, and discovering nothing was ever written.
 - Reentrant mode with frozen embeddings in a LoRA run; the symptom is a flat loss curve and adapter
   gradients that are `None`, fixed by `enable_input_require_grads()` or `use_reentrant=False`.
-- Enabling checkpointing and still hitting OOM at long context; the symptom is peak memory barely moving,
-  because the s² attention-score term is materialised and only FlashAttention/SDPA removes it.
+- Enabling checkpointing and still hitting OOM at long context; the symptom is a peak that fell a lot but
+  stalls at a floor of several GB per live block, because eager attention materialises that block's s²
+  score tensors (~10 GB for one 7B layer at 8k) during recompute and only FlashAttention/SDPA removes them.
 - Measuring "steps got slower" and switching it off globally instead of raising the micro-batch to recover
   utilisation; the right metric is tokens per second, not seconds per step.
 - Side effects inside a checkpointed function (counters, logging, in-place updates, custom RNG not covered
@@ -220,10 +226,12 @@ cuts stored activations to one block input per layer (~67 MB each, ~2 GB total) 
 > embeddings produce inputs that do not, so the adapters inside get no gradient. `enable_input_require_grads()`
 > or `use_reentrant=False` fixes it.
 
-### Q: After enabling checkpointing at 8k context, peak memory barely moved. What is the most likely cause?
+### Q: A 7B QLoRA run at 8k context enables per-block checkpointing; peak memory drops sharply but the run still OOMs on a 24 GB card during backward. What is the most likely cause?
 - [ ] Optimizer state dominates and checkpointing does not touch it
-- [x] The attention-score matrices (the s² term) are still materialised because FlashAttention/SDPA is off
+- [x] The one live block being recomputed still materialises its s² attention-score tensors because FlashAttention/SDPA is off
 - [ ] Too many gradient-accumulation steps are keeping old activations alive
 - [ ] The checkpoint files on disk are too large for the page cache
-> Per-block checkpointing removes the linear 34·s·b·h term, but the quadratic score term lives inside the
-> block and is only eliminated by an attention kernel that never materialises the full matrix.
+> Per-block checkpointing shrinks stored activations to the block inputs plus one live block, but inside that
+> live block eager attention still builds the full `5·a·s²·b` score tensors, about 10 GB for a single 7B layer
+> at 8k, so the floor is set by one block and only a kernel that never materialises the matrix removes it.
+> Optimizer state in QLoRA is tiny, and accumulation steps do not keep activations alive between micro-batches.

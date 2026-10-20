@@ -5,6 +5,7 @@ name: Small language models (SLMs)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - model-internals/scaling-laws
   - model-internals/hallucination
@@ -144,8 +145,9 @@ so the blended cost stays close to the SLM figure while the quality ceiling is p
   a benchmark score far above the in-house eval on your own data.
 - Quantising to 4-bit and skipping re-evaluation; the symptom is subtle regressions in JSON validity and
   multilingual output, because small models lose more under quantisation than large ones.
-- Serving single-stream on a server GPU; the symptom is a 3B model whose cost per token rivals a 30B model's,
-  because the card is bandwidth-bound and idle at batch 1.
+- Serving single-stream on a server GPU; the symptom is a 3B model whose cost per token rivals that of a
+  well-batched 30B model, because the card is bandwidth-bound and mostly idle at batch 1 while the larger
+  model amortises each weight read over dozens of requests.
 - Front-loading a 6k-token system prompt plus retrieved context onto a small model; the symptom is slow
   prefill and answers that ignore the middle of the context, since small models degrade faster with long
   inputs.

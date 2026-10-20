@@ -5,6 +5,7 @@ name: Embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - model-internals/tokenization
   - model-internals/transformer
@@ -123,7 +124,7 @@ sents = ["How do I reset my password?",
          "Steps to recover access to my account",
          "Best pizza places in Naples"]
 v = st.encode(sents, normalize_embeddings=True)        # [3, 384], unit length
-print((v @ v.T).round(2))     # cosine matrix: [0,1] high, [0,2] and [1,2] near zero
+print((v @ v.T).round(2))     # cosine matrix: [0,1] clearly highest, [0,2] and [1,2] low
 ```
 
 ## Trade-offs

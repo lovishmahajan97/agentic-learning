@@ -5,6 +5,7 @@ name: ROC-AUC
 kind: metric
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/precision-recall-f1

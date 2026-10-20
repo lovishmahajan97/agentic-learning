@@ -5,6 +5,7 @@ name: KV cache
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - model-internals/self-attention
   - model-internals/grouped-query-attention
@@ -22,7 +23,7 @@ sources:
 A decoder-only transformer generates one token at a time, and every new token must attend to every
 earlier token. The KV cache stores the key and value vectors already computed for earlier positions so
 each step only computes attention for the new token instead of recomputing the whole prefix. It turns
-generation from quadratic-per-token into linear-per-token at the cost of GPU memory that grows with
+generating *n* tokens from O(n²) token-forward-passes into O(n), at the cost of GPU memory that grows with
 sequence length, which is why memory, not compute, usually limits how many requests a server can run.
 
 ## Why it exists
@@ -38,9 +39,12 @@ weights. In a causal decoder they never change once computed, because position *
 that work per layer.
 
 The naive alternative, "just recompute, GPUs are fast", fails for two reasons. First, the quadratic cost
-makes long outputs unaffordable. Second, and less obvious, recomputation reads the whole weight matrix
-for every prefix token every step, so it is memory-bandwidth bound as well as FLOP bound. The cache
-converts that into reading a much smaller per-token slice.
+makes long outputs unaffordable: step *t* costs *t* tokens of compute, so a long answer spends most of
+its FLOPs re-deriving results it already had. Second, it buys nothing: the recomputed K and V are
+bit-for-bit what the previous step computed, so no quality or flexibility is gained for the extra work.
+Caching does change the character of a decode step, though. With a single new token per step, the
+weights are read once for very little arithmetic, so decode becomes memory-bandwidth bound rather than
+FLOP bound; that regime is what batching and speculative decoding later exploit.
 
 ## How it works
 ### What is stored
@@ -114,7 +118,8 @@ for flag in (False, True):
     torch.cuda.synchronize(); t = time.time(); generate(flag); torch.cuda.synchronize()
     print(f"use_cache={flag}: {time.time()-t:.2f}s")
 # Expect the cached loop to be several times faster, with the gap widening as steps grows.
-# Inspect size: past[0][0].shape -> [batch, n_kv_heads, seq_len, head_dim] for layer 0 keys.
+# Inspect size: layer-0 keys have shape [batch, n_kv_heads, seq_len, head_dim]. On recent Transformers
+# `past` is a DynamicCache (past.layers[0].keys); older versions return tuples (past[0][0]).
 ```
 
 ## Trade-offs
@@ -132,9 +137,9 @@ for flag in (False, True):
   out-of-memory errors or aggressive request preemption once traffic has long contexts.
 - Assuming a faster GPU will speed decode proportionally; decode is bandwidth-bound, so tokens/second
   tracks memory bandwidth more than peak FLOPs.
-- Editing or truncating conversation history in the middle and reusing the old cache; cached K and V
-  encode absolute positions and earlier content, so any change before position *i* invalidates
-  everything from *i* onward.
+- Editing or truncating conversation history in the middle and reusing the old cache; cached keys carry
+  their position (RoPE is applied to them) and every entry depends on all earlier content, so any change
+  before position *i* invalidates everything from *i* onward.
 - Benchmarking "time per token" on a single request and extrapolating to a batch; with batching, the
   cache of all concurrent requests competes for the same memory bandwidth.
 

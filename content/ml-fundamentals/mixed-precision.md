@@ -5,6 +5,7 @@ name: Mixed precision
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - ml-fundamentals/gradient-clipping
   - ml-fundamentals/gradient-accumulation

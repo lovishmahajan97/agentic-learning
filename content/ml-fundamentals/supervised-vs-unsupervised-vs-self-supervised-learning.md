@@ -5,6 +5,7 @@ name: Supervised vs unsupervised vs self-supervised learning
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/regression
@@ -59,8 +60,9 @@ cross-entropy when y is a class, squared error when y is a number (see the class
 regression lessons). Gradient descent pushes θ toward reproducing the human judgements. Two
 consequences follow directly. Generalisation depends on the labelled set covering the distribution you
 will see in production, because the model has no signal about anything else. And the quality ceiling is
-the label quality: if two annotators disagree on 15% of examples, no model can be scored above roughly
-85% against either of them.
+the label quality: if two annotators disagree on 15% of examples, a model cannot agree with both of them
+on more than about 85% of examples, and whichever annotator's labels you score against, roughly that
+much of the "error" is label noise rather than model error.
 
 ### Unsupervised: the target is a property of the data
 Only x is available. The objective is defined on the data itself. k-means minimises the distance from
@@ -131,7 +133,7 @@ def next_token_pairs(ids):
     """Autoregressive pretext task: every prefix is an input, the token after it is the label."""
     return [(ids[:i], ids[i]) for i in range(1, len(ids))]
 
-def masked_pairs(ids, mask_id=0, p=0.15, seed=0):
+def masked_pairs(ids, mask_id=0, p=0.15, seed=1):
     """Masked-LM pretext task: hide ~15% of tokens; the hidden originals are the labels."""
     rng = random.Random(seed)
     corrupted, targets = list(ids), {}
@@ -142,7 +144,7 @@ def masked_pairs(ids, mask_id=0, p=0.15, seed=0):
 
 ids = [312, 7, 2201, 54, 887, 19]          # token ids for the same sentence (illustrative values)
 print(len(next_token_pairs(ids)))          # 5 labelled examples from one unlabelled line
-print(masked_pairs(ids))                   # e.g. ([312, 7, 0, 54, 887, 19], {2: 2201})
+print(masked_pairs(ids))                   # ([0, 7, 2201, 54, 887, 19], {0: 312}) with seed=1; seed=0 happens to mask nothing
 ```
 
 ## Trade-offs

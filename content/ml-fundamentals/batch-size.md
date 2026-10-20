@@ -5,6 +5,7 @@ name: Batch size
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/gradient-accumulation
@@ -37,9 +38,10 @@ unbiased estimate of the full gradient with variance proportional to `1/B`. Smal
 noisy steps; large `B` gives expensive, accurate ones.
 
 Hardware pushes in one direction. A GPU multiplies matrices efficiently only when they are large, and
-the batch dimension is what makes the activations large. A batch of one sequence leaves most of the chip
-idle and makes the step memory-bandwidth bound (weights are read once per step regardless of batch, so
-more examples per step amortize that read). Doubling the batch until the GPU is compute-bound is close to
+the number of tokens flowing through each layer (batch × sequence length) is what makes the activations
+large. A batch of only a few hundred tokens leaves most of the chip idle and makes the step
+memory-bandwidth bound (weights are read once per step regardless of batch, so more tokens per step
+amortize that read). Doubling the batch until the GPU is compute-bound is close to
 free in wall-clock per example. Data parallelism pushes the same way: each additional GPU usually adds
 its share of examples to the batch rather than splitting a fixed batch finer.
 
@@ -90,8 +92,8 @@ big batches. The practical reading: a large batch is not harmful by itself, but 
 recipe to a large batch is.
 
 ### Memory and the effective batch
-Activation memory scales linearly with the batch (and with sequence length), while weight, gradient and
-optimizer memory do not. On a given GPU the largest *micro-batch* that fits is a hardware fact; the
+Activation memory scales linearly with the batch (and roughly linearly with sequence length under fused
+attention kernels, quadratically without them), while weight, gradient and optimizer memory do not. On a given GPU the largest *micro-batch* that fits is a hardware fact; the
 *effective batch* that the optimizer sees is
 
 ```

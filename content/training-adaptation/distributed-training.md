@@ -5,6 +5,7 @@ name: Distributed training (data / tensor / pipeline parallelism, FSDP, DeepSpee
 kind: concept
 difficulty: advanced
 est_minutes: 18
+status: fact-checked
 related:
   - training-adaptation/pre-training
   - training-adaptation/gradient-checkpointing

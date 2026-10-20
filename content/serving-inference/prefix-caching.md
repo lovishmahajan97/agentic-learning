@@ -5,6 +5,7 @@ name: Prefix caching
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - prompting/prompt-caching
   - serving-inference/kv-cache-paging-and-eviction

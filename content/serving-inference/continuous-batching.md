@@ -5,6 +5,7 @@ name: Continuous batching
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/prefill-vs-decode
@@ -44,8 +45,11 @@ is to stop thinking of the batch as a unit of work. The model does not care whic
 every step is just "take one token from each of these sequences". So the batch membership can change
 between steps. A finished sequence frees its slot and its KV memory immediately; a waiting request is
 prefilled and joins the next step. The scheduler becomes a loop that runs once per iteration, which is why
-the original paper called it iteration-level scheduling. It needed one more enabler to be practical:
-paged KV memory, so that joining and leaving sequences do not require contiguous allocation or copying.
+the original paper called it iteration-level scheduling. Orca, which introduced it, still reserved each
+sequence's maximum length contiguously, so only a small batch fit in memory; paged KV memory (vLLM) was
+the enabler that let the batch grow to the sizes the hardware could use, because joining and leaving
+sequences no longer require contiguous allocation or copying and no slot is reserved for tokens that
+may never be generated.
 
 ## How it works
 ### The scheduler loop
@@ -205,14 +209,14 @@ enter the conversation.
 > waiting requests fill them, so occupancy stays high regardless of length skew. Padding is what static
 > batching does; disaggregation and batch sizing are separate techniques.
 
-### Q: Why does continuous batching depend on paged KV-cache memory to be practical?
+### Q: Why does continuous batching gain so much from paged KV-cache memory?
 - [ ] Paging compresses the cache so more sequences fit in a static batch
-- [x] Sequences joining and leaving at arbitrary times need allocation in uniform blocks; contiguous reservations would fragment and require copying
+- [x] Without paging each sequence reserves its maximum length contiguously, so few fit and the batch stays small; blocks let sequences join, grow and leave without reservations or copies
 - [ ] Paging allows prefill to be skipped for new sequences
 - [ ] Paging makes decode compute-bound
-> With contiguous per-sequence reservations, dynamic membership either wastes memory on worst-case
-> reservations or forces copies as sequences grow. Block-based allocation makes join and leave cheap. Skipping
-> prefill is prefix caching, a different feature.
+> Iteration-level scheduling works without paging (Orca did it), but contiguous worst-case reservations
+> cap the number of resident sequences far below what memory could hold, and growing in place forces
+> copies. Block-based allocation removes both limits. Skipping prefill is prefix caching, a different feature.
 
 ### Q: What problem does chunked prefill solve inside a continuous-batching scheduler?
 - [ ] It reduces the total compute required to prefill a long prompt

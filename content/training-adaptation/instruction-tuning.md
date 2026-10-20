@@ -5,6 +5,7 @@ name: Instruction tuning
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/post-training
@@ -60,8 +61,9 @@ because the model must not key on the exact wording; it has to learn the intent.
 Experiments across the FLAN line found that adding more *tasks* improves held-out performance more
 than adding more examples of the same tasks, and that gains saturate quickly per task. The mechanism
 is that each task teaches the model one more point in "instruction space", and generalisation is
-interpolation between those points. A mixture of a thousand tasks with a few hundred examples each
-beats ten tasks with a hundred thousand each. The same logic says that mixtures should be *balanced*:
+interpolation between those points. As a rule of thumb from those ablations, a mixture of hundreds of tasks
+capped at a few thousand examples each generalises better than a handful of tasks with a hundred
+thousand each. The same logic says that mixtures should be *balanced*:
 sample tasks roughly in proportion to their size but cap the large ones, so a giant dataset does not
 dominate the gradient.
 

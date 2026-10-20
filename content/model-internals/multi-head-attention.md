@@ -5,6 +5,7 @@ name: Multi-head attention
 kind: concept
 difficulty: core
 est_minutes: 12
+status: fact-checked
 related:
   - model-internals/self-attention
   - model-internals/attention-mechanism

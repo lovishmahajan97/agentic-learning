@@ -5,6 +5,7 @@ name: Dropout / regularization
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - ml-fundamentals/optimizers
   - ml-fundamentals/normalization
@@ -43,10 +44,12 @@ Second, inject noise so the training problem is harder than the test problem: co
 network to find features that are robust to perturbation, and robust features are exactly the ones
 that transfer to unseen data.
 
-Dropout exists because the obvious noise, Gaussian jitter on activations, does not stop
-*co-adaptation*: a unit can still learn to fix up the specific mistakes of its neighbours, and that
-fragile arrangement only works on the training distribution. Randomly deleting units breaks those
-alliances, because a unit cannot depend on a partner that is absent 10–50% of the time.
+Dropout exists to attack *co-adaptation*: a unit can learn to fix up the specific mistakes of its
+neighbours, and that fragile arrangement only works on the training distribution. Randomly deleting
+units breaks those alliances, because a unit cannot depend on a partner that is absent 10–50% of the
+time. What matters is that the noise is multiplicative and per unit, not that it is Bernoulli: the
+original paper also tried multiplicative Gaussian noise of matching variance and found it works about
+as well, whereas additive jitter leaves a unit's dependence on its neighbours intact.
 
 ## How it works
 ### The dropout mechanism
@@ -69,12 +72,13 @@ sub-networks sharing weights. The inference-time full network is a cheap approxi
 all of their predictions, which is the ensemble interpretation of why dropout generalizes.
 
 ### Where it sits in a transformer
-Dropout appears in three places in the original Transformer and its descendants, with one rate
-(0.1 in the base model) shared by all: on the token embeddings, on the attention probabilities after
-the softmax ("attention dropout", which randomly removes some tokens from each head's view), and on
-each sub-layer's output just before it is added to the residual stream ("residual dropout"). Because
-the residual path itself is never dropped, information always has a clean route forward; dropout
-only perturbs the *corrections* each block adds.
+The original Transformer paper names two dropout sites, sharing one rate (0.1 in the base model): on
+the sum of token and positional embeddings, and on each sub-layer's output just before it is added to
+the residual stream ("residual dropout"). Its reference implementation and most descendants (BERT,
+GPT-2) add a third, on the attention probabilities after the softmax ("attention dropout", which
+randomly removes some tokens from each head's view). Because the residual path itself is never
+dropped, information always has a clean route forward; dropout only perturbs the *corrections* each
+block adds.
 
 ### Weight decay, and why AdamW is not "Adam plus L2"
 L2 regularization adds (λ/2)‖w‖² to the loss, whose gradient is λw. With plain SGD the update becomes
@@ -141,8 +145,9 @@ opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
   but too much under-fits; the right λ falls as the dataset grows relative to the model.
 - Keeping dropout active at inference (Monte Carlo dropout) gives a cheap uncertainty estimate from
   the spread of several passes, at the cost of several forward passes and non-deterministic outputs.
-- Label smoothing softens over-confident targets and often helps accuracy, but it distorts the
-  probabilities the model emits, so a calibration step is needed before using them downstream.
+- Label smoothing softens over-confident targets and often helps accuracy and reduces
+  overconfidence, but it caps the confidence the model can express and changes the probability
+  scale, so re-measure calibration before anything downstream consumes the probabilities.
 - Early stopping is the cheapest regularizer, but it ties your model to the validation split; if that
   split leaks or drifts, you stop at the wrong point.
 
